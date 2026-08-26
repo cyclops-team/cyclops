@@ -456,7 +456,7 @@ fn generation_matches(expected: ProcessInstanceId, observed: Option<ProcessInsta
 }
 
 #[cfg(target_os = "macos")]
-fn observe_process(pid: i32) -> Option<ProcessInstanceId> {
+pub(crate) fn observe_process(pid: i32) -> Option<ProcessInstanceId> {
     if pid <= 0 {
         return None;
     }
@@ -479,7 +479,7 @@ fn observe_process(pid: i32) -> Option<ProcessInstanceId> {
 }
 
 #[cfg(target_os = "linux")]
-fn observe_process(pid: i32) -> Option<ProcessInstanceId> {
+pub(crate) fn observe_process(pid: i32) -> Option<ProcessInstanceId> {
     if pid <= 0 {
         return None;
     }
@@ -502,7 +502,7 @@ fn parse_linux_process_stat(pid: i32, stat: &str) -> Option<ProcessInstanceId> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn observe_process(_pid: i32) -> Option<ProcessInstanceId> {
+pub(crate) fn observe_process(_pid: i32) -> Option<ProcessInstanceId> {
     None
 }
 

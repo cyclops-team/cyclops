@@ -4,13 +4,15 @@
 //! is read only through `cyclops-state` held descriptors. PATH and directory
 //! inventories have fixed count and byte ceilings.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
+use std::io::Read as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
-use cyclops_proto::{Hello, ProcessInstanceId};
+use cyclops_proto::{Hello, ProcessInstanceId, SessionIdentityBinding, StatusResult, WorkspaceId};
 use cyclops_state::{InspectedEntry, InspectedKind, InspectionLimits, StateInspector};
 use serde_json::{json, Value};
 
@@ -24,6 +26,7 @@ const STATE_ENTRY_LIMIT: usize = 2_048;
 const STATE_NAME_BYTES_LIMIT: usize = 128 * 1_024;
 const STATE_DEPTH_LIMIT: usize = 8;
 const FILE_BYTES_LIMIT: usize = 512 * 1_024;
+const PROCESS_BYTES_LIMIT: usize = 2 * 1_024 * 1_024;
 
 #[derive(Clone)]
 struct Issue {
@@ -70,7 +73,62 @@ struct DaemonReport {
     process: Option<ProcessInstanceId>,
     uptime_ms: Option<u64>,
     build_matches_client: Option<bool>,
+    status: Option<StatusResult>,
+    status_error: Option<String>,
     transport_error: Option<String>,
+}
+
+struct DaemonProcess {
+    process: ProcessInstanceId,
+    command: String,
+    selected: bool,
+}
+
+struct DaemonProcessReport {
+    state: &'static str,
+    processes: Vec<DaemonProcess>,
+    duplicate: Option<bool>,
+    truncated: bool,
+    error: Option<String>,
+}
+
+struct WorkspaceMappingReport {
+    state: &'static str,
+    daemon: Option<WorkspaceId>,
+    recorded: Option<WorkspaceId>,
+    error: Option<String>,
+}
+
+struct SessionMappingReport {
+    name: String,
+    attached: bool,
+    configured: bool,
+    state: &'static str,
+    binding: Option<SessionIdentityBinding>,
+}
+
+struct SessionConfigReport {
+    state: &'static str,
+    configured: Vec<String>,
+    stale: Vec<String>,
+    dynamic: Vec<String>,
+    duplicates: Vec<String>,
+    error: Option<String>,
+}
+
+struct WatcherReport {
+    state: &'static str,
+    slots: usize,
+    duplicate_names: Vec<String>,
+}
+
+struct OperationalReport {
+    workspace: WorkspaceMappingReport,
+    sessions: Vec<SessionMappingReport>,
+    config: SessionConfigReport,
+    watchers: WatcherReport,
+    daemons: DaemonProcessReport,
+    session_record_error: Option<String>,
 }
 
 struct StateReport {
@@ -176,6 +234,7 @@ struct HealthReport {
     build_cache: ExternalStateReport,
     update_scratch: ExternalStateReport,
     rollback: RollbackReport,
+    operational: OperationalReport,
     issues: Vec<Issue>,
 }
 
@@ -231,6 +290,7 @@ fn collect() -> HealthReport {
     let setup = inspect_setup(&home);
     let (build_cache, update_scratch) = inspect_operational_state(&home);
     let rollback = inspect_rollback(&binaries);
+    let operational = inspect_operational(&home, &daemon);
     let mut issues = Vec::new();
 
     if binaries.shadowed {
@@ -356,6 +416,88 @@ fn collect() -> HealthReport {
             path: Some(cyclops_proto::socket_path()),
         });
     }
+    if daemon.running && daemon.status.is_none() {
+        issues.push(Issue {
+            code: "daemon_status_unavailable",
+            message: daemon
+                .status_error
+                .clone()
+                .unwrap_or_else(|| "the authenticated daemon returned no status snapshot".into()),
+            path: Some(cyclops_proto::socket_path()),
+        });
+    }
+    if operational.daemons.duplicate == Some(true) {
+        issues.push(Issue {
+            code: "duplicate_daemons",
+            message: "more than one live cyclopsd process belongs to this user".into(),
+            path: None,
+        });
+    }
+    if operational.daemons.state == "unproven" {
+        issues.push(Issue {
+            code: "daemon_process_inventory_unproven",
+            message: operational
+                .daemons
+                .error
+                .clone()
+                .unwrap_or_else(|| "running daemon process inventory is unproven".into()),
+            path: None,
+        });
+    }
+    if operational.watchers.state == "duplicate" {
+        issues.push(Issue {
+            code: "duplicate_watchers",
+            message: format!(
+                "duplicate session watcher slots: {}",
+                operational.watchers.duplicate_names.join(", ")
+            ),
+            path: None,
+        });
+    }
+    if operational.config.state == "stale" || operational.config.state == "invalid" {
+        issues.push(Issue {
+            code: "stale_session_config",
+            message: operational.config.error.clone().unwrap_or_else(|| {
+                format!(
+                    "configured sessions are stale or duplicated: {}",
+                    operational.config.stale.join(", ")
+                )
+            }),
+            path: Some(home.join("config.toml")),
+        });
+    }
+    if daemon.running && operational.workspace.state != "current" {
+        issues.push(Issue {
+            code: "workspace_mapping_unproven",
+            message: operational
+                .workspace
+                .error
+                .clone()
+                .unwrap_or_else(|| "daemon and state workspace identities do not match".into()),
+            path: Some(home.join("identity/workspace-id")),
+        });
+    }
+    if let Some(error) = &operational.session_record_error {
+        issues.push(Issue {
+            code: "session_mapping_record_invalid",
+            message: error.clone(),
+            path: Some(home.join("identity/sessions.ndjson")),
+        });
+    }
+    for session in operational
+        .sessions
+        .iter()
+        .filter(|session| session.state != "current")
+    {
+        issues.push(Issue {
+            code: "session_mapping_unproven",
+            message: format!(
+                "session {} has {} durable identity mapping",
+                session.name, session.state
+            ),
+            path: Some(home.join("identity/sessions.ndjson")),
+        });
+    }
     if let Some(error) = &state.error {
         issues.push(Issue {
             code: "state_inspection_failed",
@@ -474,6 +616,7 @@ fn collect() -> HealthReport {
         build_cache,
         update_scratch,
         rollback,
+        operational,
         issues,
     }
 }
@@ -726,6 +869,8 @@ fn daemon_stopped() -> DaemonReport {
         process: None,
         uptime_ms: None,
         build_matches_client: None,
+        status: None,
+        status_error: None,
         transport_error: None,
     }
 }
@@ -762,19 +907,33 @@ fn inspect_daemon(home: &Path, state: &StateReport) -> DaemonReport {
         );
     }
 
-    let client = match Client::connect() {
+    let mut client = match Client::connect() {
         Ok(client) => client,
         Err(ClientError::NotRunning) => return daemon_stale_socket(),
         Err(error) => return daemon_unproven(crate::copy::client_error(&error, None)),
     };
     let hello = client.hello().clone();
+    let (status, status_error) = match client.request("status", json!({})) {
+        Ok(value) => match serde_json::from_value::<StatusResult>(value) {
+            Ok(status) => (Some(status), None),
+            Err(error) => (None, Some(format!("decode daemon status: {error}"))),
+        },
+        Err(error) => (None, Some(crate::copy::client_error(&error, None))),
+    };
     daemon_from_hello(
         hello,
         socket_identity_is_stable(home, expected_root, expected_socket),
+        status,
+        status_error,
     )
 }
 
-fn daemon_from_hello(hello: Hello, authenticated_socket: bool) -> DaemonReport {
+fn daemon_from_hello(
+    hello: Hello,
+    authenticated_socket: bool,
+    status: Option<StatusResult>,
+    status_error: Option<String>,
+) -> DaemonReport {
     let mut transport_error = None;
     let executable = hello.daemon_executable.map(PathBuf::from);
     let executable = match executable {
@@ -797,6 +956,7 @@ fn daemon_from_hello(hello: Hello, authenticated_socket: bool) -> DaemonReport {
     if !authenticated_socket {
         transport_error = Some("state root or socket changed during daemon inspection".into());
     }
+    let uptime_ms = status.as_ref().map(|status| status.uptime_ms);
     DaemonReport {
         running: true,
         authenticated_socket,
@@ -807,8 +967,403 @@ fn daemon_from_hello(hello: Hello, authenticated_socket: bool) -> DaemonReport {
         executable,
         boot_id: Some(hello.boot_id),
         process: hello.daemon_process,
-        uptime_ms: None,
+        uptime_ms,
+        status,
+        status_error,
         transport_error,
+    }
+}
+
+fn inspect_operational(home: &Path, daemon: &DaemonReport) -> OperationalReport {
+    let (config_state, configured, config_error) = inspect_configured_sessions(home);
+    let configured_set = configured.iter().cloned().collect::<BTreeSet<_>>();
+    let (recorded_workspace, workspace_error) = inspect_recorded_workspace(home);
+    let (recorded_sessions, session_record_error) = inspect_recorded_sessions(home);
+    let status = daemon.status.as_ref();
+
+    let daemon_workspace = status.and_then(|status| status.workspace_id);
+    let workspace_state = match (
+        daemon_workspace,
+        recorded_workspace,
+        workspace_error.as_ref(),
+    ) {
+        (_, _, Some(_)) => "invalid",
+        (Some(daemon), Some(recorded), None) if daemon == recorded => "current",
+        (Some(_), Some(_), None) => "mismatch",
+        (Some(_), None, None) => "missing_record",
+        _ => "unproven",
+    };
+    let workspace_error = workspace_error.or_else(|| match workspace_state {
+        "mismatch" => Some("daemon workspace identity differs from the durable record".into()),
+        "missing_record" => Some("daemon workspace identity has no durable record".into()),
+        "unproven" if daemon.running => {
+            Some("daemon status did not carry a durable workspace identity".into())
+        }
+        _ => None,
+    });
+
+    let mut sessions = Vec::new();
+    if let Some(status) = status {
+        for session in &status.sessions {
+            let state = match (&session.identity, session_record_error.as_ref()) {
+                (_, Some(_)) => "invalid_record",
+                (None, None) => "unproven",
+                (Some(binding), None)
+                    if recorded_sessions.iter().any(|recorded| recorded == binding) =>
+                {
+                    "current"
+                }
+                (Some(binding), None)
+                    if recorded_sessions.iter().any(|recorded| {
+                        recorded.live_session_key() == binding.live_session_key()
+                            || recorded.session_instance_id() == binding.session_instance_id()
+                    }) =>
+                {
+                    "conflict"
+                }
+                (Some(_), None) => "missing_record",
+            };
+            sessions.push(SessionMappingReport {
+                name: session.name.clone(),
+                attached: session.attached,
+                configured: configured_set.contains(&session.name),
+                state,
+                binding: session.identity.clone(),
+            });
+        }
+    }
+
+    let runtime_counts = sessions
+        .iter()
+        .fold(BTreeMap::new(), |mut counts, session| {
+            *counts.entry(session.name.clone()).or_insert(0usize) += 1;
+            counts
+        });
+    let duplicate_watchers = runtime_counts
+        .iter()
+        .filter(|(_, count)| **count > 1)
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let watcher_state = if status.is_none() {
+        "unproven"
+    } else if duplicate_watchers.is_empty() {
+        "current"
+    } else {
+        "duplicate"
+    };
+
+    let mut duplicates = Vec::new();
+    let mut seen = BTreeSet::new();
+    for name in &configured {
+        if !seen.insert(name.clone()) && !duplicates.contains(name) {
+            duplicates.push(name.clone());
+        }
+    }
+    let mut stale = Vec::new();
+    if status.is_some() {
+        for name in &seen {
+            let matches = sessions
+                .iter()
+                .filter(|session| &session.name == name)
+                .collect::<Vec<_>>();
+            if matches.is_empty() || matches.iter().all(|session| !session.attached) {
+                stale.push(name.clone());
+            }
+        }
+    }
+    let dynamic = sessions
+        .iter()
+        .filter(|session| !configured_set.contains(&session.name))
+        .map(|session| session.name.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let config_state = match (config_state, status.is_some()) {
+        ("invalid", _) => "invalid",
+        (_, false) => "unproven",
+        (_, true) if !stale.is_empty() || !duplicates.is_empty() => "stale",
+        _ => "current",
+    };
+    let config_error = config_error.or_else(|| {
+        (!duplicates.is_empty()).then(|| {
+            format!(
+                "sessions contains duplicate names: {}",
+                duplicates.join(", ")
+            )
+        })
+    });
+
+    OperationalReport {
+        workspace: WorkspaceMappingReport {
+            state: workspace_state,
+            daemon: daemon_workspace,
+            recorded: recorded_workspace,
+            error: workspace_error,
+        },
+        sessions,
+        config: SessionConfigReport {
+            state: config_state,
+            configured,
+            stale,
+            dynamic,
+            duplicates,
+            error: config_error,
+        },
+        watchers: WatcherReport {
+            state: watcher_state,
+            slots: status.map_or(0, |status| status.sessions.len()),
+            duplicate_names: duplicate_watchers,
+        },
+        daemons: inspect_daemon_processes(daemon.process),
+        session_record_error,
+    }
+}
+
+fn inspect_configured_sessions(home: &Path) -> (&'static str, Vec<String>, Option<String>) {
+    match read_asset(home, Path::new("config.toml")) {
+        AssetRead::Missing => ("absent", Vec::new(), None),
+        AssetRead::Truncated => (
+            "invalid",
+            Vec::new(),
+            Some("config.toml exceeds the bounded health read".into()),
+        ),
+        AssetRead::Unproven => (
+            "invalid",
+            Vec::new(),
+            Some("config.toml cannot be read through one safe state descriptor".into()),
+        ),
+        AssetRead::Bytes(bytes) => {
+            let parsed = std::str::from_utf8(&bytes)
+                .map_err(|error| error.to_string())
+                .and_then(|text| {
+                    text.parse::<toml::Table>()
+                        .map_err(|error| error.to_string())
+                });
+            let table = match parsed {
+                Ok(table) => table,
+                Err(error) => {
+                    return (
+                        "invalid",
+                        Vec::new(),
+                        Some(format!("config.toml is invalid: {error}")),
+                    )
+                }
+            };
+            let Some(value) = table.get("sessions") else {
+                return ("current", Vec::new(), None);
+            };
+            let Some(values) = value.as_array() else {
+                return (
+                    "invalid",
+                    Vec::new(),
+                    Some("config.toml sessions must be an array of strings".into()),
+                );
+            };
+            let mut sessions = Vec::with_capacity(values.len());
+            for value in values {
+                let Some(name) = value.as_str() else {
+                    return (
+                        "invalid",
+                        Vec::new(),
+                        Some("config.toml sessions must contain only strings".into()),
+                    );
+                };
+                sessions.push(name.to_string());
+            }
+            ("current", sessions, None)
+        }
+    }
+}
+
+fn inspect_recorded_workspace(home: &Path) -> (Option<WorkspaceId>, Option<String>) {
+    match read_asset(home, Path::new("identity/workspace-id")) {
+        AssetRead::Missing => (None, None),
+        AssetRead::Bytes(bytes) => match std::str::from_utf8(&bytes)
+            .map(str::trim)
+            .ok()
+            .and_then(|value| value.parse().ok())
+        {
+            Some(id) => (Some(id), None),
+            None => (None, Some("identity/workspace-id is invalid".into())),
+        },
+        AssetRead::Truncated => (
+            None,
+            Some("identity/workspace-id exceeds the bounded health read".into()),
+        ),
+        AssetRead::Unproven => (
+            None,
+            Some("identity/workspace-id cannot be read safely".into()),
+        ),
+    }
+}
+
+fn inspect_recorded_sessions(home: &Path) -> (Vec<SessionIdentityBinding>, Option<String>) {
+    match read_asset(home, Path::new("identity/sessions.ndjson")) {
+        AssetRead::Missing => (Vec::new(), None),
+        AssetRead::Truncated => (
+            Vec::new(),
+            Some("identity/sessions.ndjson exceeds the bounded health read".into()),
+        ),
+        AssetRead::Unproven => (
+            Vec::new(),
+            Some("identity/sessions.ndjson cannot be read safely".into()),
+        ),
+        AssetRead::Bytes(bytes) => {
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                return (
+                    Vec::new(),
+                    Some("identity/sessions.ndjson is not UTF-8".into()),
+                );
+            };
+            let mut bindings = Vec::new();
+            let mut by_live_key = BTreeMap::new();
+            let mut by_instance = BTreeMap::new();
+            for (index, line) in text.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<SessionIdentityBinding>(line) {
+                    Ok(binding) => {
+                        let live_key = binding.live_session_key().clone();
+                        let instance = binding.session_instance_id();
+                        let duplicate = by_live_key.insert(live_key.clone(), instance).is_some()
+                            || by_instance.insert(instance, live_key).is_some();
+                        if duplicate {
+                            return (
+                                Vec::new(),
+                                Some(format!(
+                                    "identity/sessions.ndjson line {} repeats or conflicts with an earlier binding",
+                                    index + 1
+                                )),
+                            );
+                        }
+                        bindings.push(binding);
+                    }
+                    Err(error) => {
+                        return (
+                            Vec::new(),
+                            Some(format!(
+                                "identity/sessions.ndjson line {} is invalid: {error}",
+                                index + 1
+                            )),
+                        )
+                    }
+                }
+            }
+            (bindings, None)
+        }
+    }
+}
+
+fn inspect_daemon_processes(selected: Option<ProcessInstanceId>) -> DaemonProcessReport {
+    let ps = [Path::new("/bin/ps"), Path::new("/usr/bin/ps")]
+        .into_iter()
+        .find(|path| path.is_file());
+    let Some(ps) = ps else {
+        return daemon_processes_unproven("no fixed ps executable is available");
+    };
+    let mut child = match Command::new(ps)
+        .args(["-Ao", "pid=,uid=,comm="])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return daemon_processes_unproven(format!("start ps: {error}")),
+    };
+    let Some(stdout) = child.stdout.take() else {
+        return daemon_processes_unproven("ps returned no stdout pipe");
+    };
+    let mut bytes = Vec::new();
+    if let Err(error) = stdout
+        .take((PROCESS_BYTES_LIMIT + 1) as u64)
+        .read_to_end(&mut bytes)
+    {
+        return daemon_processes_unproven(format!("read ps output: {error}"));
+    }
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => return daemon_processes_unproven(format!("wait for ps: {error}")),
+    };
+    if bytes.len() > PROCESS_BYTES_LIMIT {
+        let mut report = daemon_processes_unproven("ps output reached its fixed byte limit");
+        report.truncated = true;
+        return report;
+    }
+    if !status.success() {
+        return daemon_processes_unproven(format!("ps exited with {status}"));
+    }
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        Err(_) => return daemon_processes_unproven("ps output is not UTF-8"),
+    };
+    // SAFETY: geteuid reads process credentials and has no pointer arguments.
+    parse_daemon_processes(text, unsafe { libc::geteuid() }, selected)
+}
+
+fn parse_daemon_processes(
+    text: &str,
+    uid: libc::uid_t,
+    selected: Option<ProcessInstanceId>,
+) -> DaemonProcessReport {
+    parse_daemon_processes_with(text, uid, selected, crate::daemon::observe_process)
+}
+
+fn parse_daemon_processes_with(
+    text: &str,
+    uid: libc::uid_t,
+    selected: Option<ProcessInstanceId>,
+    mut observe: impl FnMut(i32) -> Option<ProcessInstanceId>,
+) -> DaemonProcessReport {
+    let mut processes = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(row_uid), Some(command)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (Ok(pid), Ok(row_uid)) = (pid.parse::<i32>(), row_uid.parse::<libc::uid_t>()) else {
+            continue;
+        };
+        if row_uid != uid
+            || Path::new(command).file_name().and_then(OsStr::to_str) != Some("cyclopsd")
+        {
+            continue;
+        }
+        let Some(process) = observe(pid) else {
+            continue;
+        };
+        processes.push(DaemonProcess {
+            process,
+            command: command.to_string(),
+            selected: selected == Some(process),
+        });
+    }
+    processes.sort_by_key(|process| process.process.pid());
+    let selected_missing = selected.is_some() && !processes.iter().any(|process| process.selected);
+    if selected_missing {
+        return daemon_processes_unproven(
+            "the authenticated daemon was not stable across the process inventory",
+        );
+    }
+    DaemonProcessReport {
+        state: "proven",
+        duplicate: Some(processes.len() > 1),
+        processes,
+        truncated: false,
+        error: None,
+    }
+}
+
+fn daemon_processes_unproven(error: impl Into<String>) -> DaemonProcessReport {
+    DaemonProcessReport {
+        state: "unproven",
+        processes: Vec::new(),
+        duplicate: None,
+        truncated: false,
+        error: Some(error.into()),
     }
 }
 
@@ -1284,6 +1839,61 @@ fn external_json(report: &ExternalStateReport) -> Value {
     })
 }
 
+fn operational_json(report: &OperationalReport) -> Value {
+    json!({
+        "workspace_mapping": {
+            "state": report.workspace.state,
+            "daemon": report.workspace.daemon.map(|id| id.to_string()),
+            "recorded": report.workspace.recorded.map(|id| id.to_string()),
+            "error": report.workspace.error.as_deref(),
+        },
+        "session_mappings": report.sessions.iter().map(|session| {
+            let binding = session.binding.as_ref();
+            let live = binding.map(SessionIdentityBinding::live_session_key);
+            json!({
+                "name": session.name.as_str(),
+                "attached": session.attached,
+                "configured": session.configured,
+                "state": session.state,
+                "session_instance_id": binding.map(SessionIdentityBinding::session_instance_id).map(|id| id.to_string()),
+                "workspace_id": live.map(|key| key.workspace_id().to_string()),
+                "os_boot_id": live.map(|key| key.os_boot_id().to_string()),
+                "tmux_server": live.map(|key| json!({
+                    "pid": key.tmux_server().pid(),
+                    "birth": key.tmux_server().birth(),
+                })),
+                "tmux_session_id": live.map(|key| key.tmux_session_id().to_string()),
+            })
+        }).collect::<Vec<_>>(),
+        "session_mapping_record_error": report.session_record_error.as_deref(),
+        "session_config": {
+            "state": report.config.state,
+            "configured": &report.config.configured,
+            "stale": &report.config.stale,
+            "dynamic": &report.config.dynamic,
+            "duplicates": &report.config.duplicates,
+            "error": report.config.error.as_deref(),
+        },
+        "watchers": {
+            "state": report.watchers.state,
+            "slots": report.watchers.slots,
+            "duplicate_names": &report.watchers.duplicate_names,
+        },
+        "daemon_processes": {
+            "state": report.daemons.state,
+            "duplicate": report.daemons.duplicate,
+            "truncated": report.daemons.truncated,
+            "error": report.daemons.error.as_deref(),
+            "instances": report.daemons.processes.iter().map(|process| json!({
+                "pid": process.process.pid(),
+                "birth": process.process.birth(),
+                "command": process.command.as_str(),
+                "selected": process.selected,
+            })).collect::<Vec<_>>(),
+        },
+    })
+}
+
 fn report_json(report: &HealthReport) -> Value {
     let state_files = report
         .state
@@ -1365,7 +1975,9 @@ fn report_json(report: &HealthReport) -> Value {
                 "reason": report.daemon.executable.is_none().then_some("the authenticated daemon did not report one stable absolute path"),
             },
             "transport_error": report.daemon.transport_error.as_deref(),
+            "status_error": report.daemon.status_error.as_deref(),
         },
+        "operational": operational_json(&report.operational),
         "state": {
             "root": cyclops_proto::cyclops_home().display().to_string(),
             "socket": cyclops_proto::socket_path().display().to_string(),
@@ -1417,6 +2029,7 @@ fn report_json(report: &HealthReport) -> Value {
             "state_name_bytes": STATE_NAME_BYTES_LIMIT,
             "state_depth": STATE_DEPTH_LIMIT,
             "file_bytes": FILE_BYTES_LIMIT,
+            "process_bytes": PROCESS_BYTES_LIMIT,
             "inspection_path_components": cyclops_state::INSPECTION_PATH_COMPONENT_LIMIT_MAX,
             "inspection_path_bytes": cyclops_state::INSPECTION_PATH_BYTES_LIMIT_MAX,
             "operational_asset_entries": crate::cleanup::ENTRY_LIMIT,
@@ -1542,6 +2155,93 @@ fn render_plain(report: &HealthReport, style: &Style) -> String {
     if let Some(error) = &report.daemon.transport_error {
         lines.push(format!("    identity unavailable · {error}"));
     }
+    if let Some(error) = &report.daemon.status_error {
+        lines.push(format!("    status unavailable · {error}"));
+    }
+    lines.push(format!(
+        "    daemon processes {} · duplicate {} · {} live",
+        report.operational.daemons.state,
+        match report.operational.daemons.duplicate {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "unproven",
+        },
+        report.operational.daemons.processes.len()
+    ));
+    for process in &report.operational.daemons.processes {
+        lines.push(format!(
+            "      pid {} birth {} · {}{}",
+            process.process.pid(),
+            process.process.birth(),
+            process.command,
+            if process.selected { " · selected" } else { "" }
+        ));
+    }
+    if let Some(error) = &report.operational.daemons.error {
+        lines.push(format!("      process inventory unavailable · {error}"));
+    }
+    lines.push(format!(
+        "  mapping  workspace {} · daemon {} · recorded {}",
+        report.operational.workspace.state,
+        report
+            .operational
+            .workspace
+            .daemon
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "unproven".into()),
+        report
+            .operational
+            .workspace
+            .recorded
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "unproven".into())
+    ));
+    for session in &report.operational.sessions {
+        lines.push(format!(
+            "    session {} · {} · mapping {} · {}",
+            session.name,
+            if session.attached {
+                "attached"
+            } else {
+                "detached"
+            },
+            session.state,
+            if session.configured {
+                "configured"
+            } else {
+                "dynamic"
+            }
+        ));
+    }
+    if let Some(error) = &report.operational.session_record_error {
+        lines.push(format!("    session mapping record invalid · {error}"));
+    }
+    lines.push(format!(
+        "    config {} · {} configured · {} stale · {} dynamic",
+        report.operational.config.state,
+        report.operational.config.configured.len(),
+        report.operational.config.stale.len(),
+        report.operational.config.dynamic.len()
+    ));
+    if !report.operational.config.stale.is_empty() {
+        lines.push(format!(
+            "      stale {}",
+            report.operational.config.stale.join(", ")
+        ));
+    }
+    lines.push(format!(
+        "    watchers {} · {} slots{}",
+        report.operational.watchers.state,
+        report.operational.watchers.slots,
+        if report.operational.watchers.duplicate_names.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " · duplicate {}",
+                report.operational.watchers.duplicate_names.join(", ")
+            )
+        }
+    ));
     lines.push(format!(
         "  state    {} · {}",
         cyclops_proto::cyclops_home().display(),
@@ -1864,6 +2564,8 @@ mod tests {
         let report = daemon_from_hello(
             hello,
             socket_identity_is_stable(&home, root, expected_socket),
+            None,
+            None,
         );
 
         assert!(report.running, "the connected peer answered hello");
@@ -1873,6 +2575,87 @@ mod tests {
             Some("state root or socket changed during daemon inspection")
         );
         drop((replacement_listener, original_listener));
+    }
+
+    #[test]
+    fn operational_health_compares_runtime_and_durable_session_identity() {
+        let scratch = tempfile::tempdir().unwrap();
+        let home = scratch.path().join("state");
+        let root = cyclops_state::StateRoot::open_or_create(&home).unwrap();
+        let workspace: WorkspaceId = "11111111-1111-4111-8111-111111111111".parse().unwrap();
+        let session_id = "22222222-2222-4222-8222-222222222222".parse().unwrap();
+        let binding = SessionIdentityBinding::new(
+            cyclops_proto::LiveSessionKey::new(
+                workspace,
+                cyclops_proto::OsBootId::new("boot-test").unwrap(),
+                ProcessInstanceId::new(81, 9001).unwrap(),
+                "$7".parse().unwrap(),
+            ),
+            session_id,
+        );
+        root.replace_file(
+            Path::new("identity/workspace-id"),
+            format!("{workspace}\n").as_bytes(),
+        )
+        .unwrap();
+        root.replace_file(
+            Path::new("identity/sessions.ndjson"),
+            format!("{}\n", serde_json::to_string(&binding).unwrap()).as_bytes(),
+        )
+        .unwrap();
+        root.replace_file(
+            Path::new("config.toml"),
+            b"sessions = [\"main\", \"gone\", \"main\"]\n",
+        )
+        .unwrap();
+        let status: StatusResult = serde_json::from_value(json!({
+            "daemon_version": "0.1.0",
+            "proto": 1,
+            "boot_id": "daemon-boot",
+            "uptime_ms": 1,
+            "tmux_version": "3.6a",
+            "workspace_id": workspace,
+            "sessions": [{
+                "name": "main",
+                "attached": true,
+                "identity": binding,
+                "panes": [],
+            }],
+        }))
+        .unwrap();
+        let mut daemon = daemon_stopped();
+        daemon.running = true;
+        daemon.status = Some(status);
+
+        let report = inspect_operational(&home, &daemon);
+        assert_eq!(report.workspace.state, "current");
+        assert_eq!(report.sessions.len(), 1);
+        assert_eq!(report.sessions[0].state, "current");
+        assert_eq!(report.config.state, "stale");
+        assert_eq!(report.config.stale, vec!["gone"]);
+        assert_eq!(report.config.duplicates, vec!["main"]);
+        assert_eq!(report.watchers.state, "current");
+    }
+
+    #[test]
+    fn process_inventory_names_duplicate_live_daemons_without_path_guessing() {
+        let selected = ProcessInstanceId::new(41, 101).unwrap();
+        let report = parse_daemon_processes_with(
+            "41 501 /opt/cyclopsd\n42 501 cyclopsd\n43 501 other\n44 502 cyclopsd\n",
+            501,
+            Some(selected),
+            |pid| match pid {
+                41 => Some(selected),
+                42 => ProcessInstanceId::new(42, 102).ok(),
+                _ => None,
+            },
+        );
+
+        assert_eq!(report.state, "proven");
+        assert_eq!(report.duplicate, Some(true));
+        assert_eq!(report.processes.len(), 2);
+        assert!(report.processes[0].selected);
+        assert!(!report.processes[1].selected);
     }
 
     #[test]

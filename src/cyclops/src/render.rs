@@ -1668,9 +1668,11 @@ mod tests {
             boot_id: "b-test".into(),
             uptime_ms: 2 * 60 * 1000,
             tmux_version: "3.6a".into(),
+            workspace_id: None,
             sessions: vec![SessionStatus {
                 name: "main".into(),
                 attached: true,
+                identity: None,
                 panes: vec![
                     pane(
                         "%1",
@@ -2140,6 +2142,7 @@ mod tests {
         res.sessions.push(SessionStatus {
             name: "ops".into(),
             attached: true,
+            identity: None,
             panes: Vec::new(),
         });
         let got = render_list(&res, &Style::none(), Path::new("/second/.cyclops"), &[]);

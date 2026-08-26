@@ -2048,6 +2048,7 @@ fn status_result_with_refresh(
             SessionStatus {
                 name: slot.name(),
                 attached: link.attached,
+                identity: link.identity.clone(),
                 panes: rows
                     .iter()
                     .map(|r| {
@@ -2276,6 +2277,7 @@ fn status_result_with_refresh(
         boot_id: inner.boot_id.clone(),
         uptime_ms: inner.started.elapsed().as_millis() as u64,
         tmux_version: inner.tmux_version.clone(),
+        workspace_id: Some(inner.workspace_id),
         sessions,
         mailbox_routes,
         admin_unread,
@@ -4378,7 +4380,7 @@ mod tests {
                 root: Some(root_process),
             },
         );
-        slot.link.lock().unwrap().identity = Some(SessionIdentityBinding::new(
+        let binding = SessionIdentityBinding::new(
             LiveSessionKey::new(
                 workspace,
                 OsBootId::new("boot-test").unwrap(),
@@ -4386,8 +4388,12 @@ mod tests {
                 TmuxSessionId::from_str("$1").unwrap(),
             ),
             session,
-        ));
+        );
+        slot.link.lock().unwrap().identity = Some(binding.clone());
         inner.sessions.lock().unwrap().push(Arc::clone(&slot));
+        let status = status_result(&inner, false);
+        assert_eq!(status.workspace_id, Some(workspace));
+        assert_eq!(status.sessions[0].identity.as_ref(), Some(&binding));
         inner
             .registry
             .lock()

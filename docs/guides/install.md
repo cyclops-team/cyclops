@@ -475,6 +475,34 @@ Use it when `/private/tmp` is not writable, and when you want to check
 that nothing has hardcoded a path: a relocated run on macOS takes the same
 code path Linux does. CI runs both.
 
+## Inspect health and cleanup candidates
+
+`cyclops health` is read-only. It reports the selected client and daemon pair,
+the authenticated running daemon, same-user daemon process inventory, durable
+workspace and session mappings, configured and detached sessions, duplicate
+watcher slots, setup files, state permissions, caches, logs, and rollback
+proof. JSON callers receive the same facts under `operational` and `rollback`.
+An `unproven` replay result is not rollback approval. It means the installed
+selection record does not carry durable replay evidence.
+
+```bash
+cyclops health
+cyclops --json health
+```
+
+Cleanup accepts only named rebuildable asset classes. The default is a dry run;
+`--apply` removes only candidates that still pass the descriptor-relative,
+no-follow ownership checks. It never accepts an arbitrary path and never
+touches message journals. Every executed cleanup appends one content-free
+record to `operations/cleanup.ndjson` under the Cyclops state root. The command
+reports a failed record append instead of claiming an unrecorded cleanup.
+
+```bash
+cyclops cleanup build-cache
+cyclops cleanup build-cache --apply
+cyclops cleanup update-scratch --apply
+```
+
 ## Update
 
 ```bash

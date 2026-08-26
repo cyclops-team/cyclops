@@ -227,15 +227,18 @@ fn a_late_source_removal_keeps_the_transferred_pane_focusable() {
         boot_id: "boot".into(),
         uptime_ms: 1_000,
         tmux_version: "3.6a".into(),
+        workspace_id: None,
         sessions: vec![
             SessionStatus {
                 name: "source".into(),
                 attached: true,
+                identity: None,
                 panes: vec![pane],
             },
             SessionStatus {
                 name: "destination".into(),
                 attached: true,
+                identity: None,
                 panes: Vec::new(),
             },
         ],
