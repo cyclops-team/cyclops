@@ -1859,6 +1859,7 @@ pub(crate) fn bind_turn(
         }
         let end_already_present =
             turnkey::PaneEnds::holds(&turn_ends, &pane, agent, &manifest, &turn);
+        let prior_ready = readiness_key(entry);
         entry.turn = Some(turn);
         // Only a hold that is still WAITING takes the mark. One that
         // already carries a witnessed edge has stronger evidence than an
@@ -1866,7 +1867,6 @@ pub(crate) fn bind_turn(
         if entry.hold.is_waiting() {
             entry.hold = ComposerHold::TurnStarted { since_ms };
         }
-        let prior_ready = readiness_key(entry);
         entry.detection = entry.detection.clone().stamped(entry.in_mode, entry.hold);
         (
             prior_ready,
@@ -6508,7 +6508,10 @@ contains = ["working"]
         // The delivery holding the barrier binds its own turn, and the
         // hold leaves the screen lifecycle for it.
         start(entry(Some("m-1#1"), ComposerHold::Staged, None));
+        let route_before = inner.route_evidence_id(0, "%1");
         assert!(bind_turn(&inner, 0, "%1", "m-1#1", t1.clone(), 500).is_some());
+        let route_after = inner.route_evidence_id(0, "%1");
+        assert_eq!(route_after.generation, route_before.generation + 1);
         assert_eq!(
             bound(),
             (
@@ -6521,6 +6524,7 @@ contains = ["working"]
         // Binding the same turn again is idempotent: an acknowledgement
         // can arrive more than once, and the first witnessed edge stands.
         assert!(bind_turn(&inner, 0, "%1", "m-1#1", t1.clone(), 900).is_some());
+        assert_eq!(inner.route_evidence_id(0, "%1"), route_after);
         assert_eq!(
             bound(),
             (

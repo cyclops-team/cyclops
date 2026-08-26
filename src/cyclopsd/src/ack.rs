@@ -763,20 +763,25 @@ pub(crate) async fn handle_report(
         }
     }
 
-    // Reconcile on the edge; the recompute emits the state event and the
-    // ledger line if the fused verdict moved. Detached sessions have no
-    // sensors to reconcile; the stored reading waits for reattach.
+    // Reconcile on the authenticated edge. It is causal route evidence even
+    // when the fused verdict stays put: a pre-write block can be appended
+    // after this recompute, and the later generation is what reopens that
+    // exact attempt. Detached sessions have no sensors to reconcile; their
+    // stored reading waits for reattach.
     let live = watcher.is_some();
     if let Some(w) = watcher {
-        fusion::recompute_pane(
+        let route_evidence = inner.advance_route_evidence(session_idx, &pane_id);
+        fusion::recompute_pane_for_route_evidence(
             inner,
             session_idx,
             &w,
             &pane_id,
             is_turn_end && lifecycle_confirmed,
             "hook_report",
+            &route_evidence,
         )
         .await;
+        crate::messaging::schedule_route_evidence(inner, session_idx, &pane_id, &route_evidence);
     }
     if is_turn_end && lifecycle_confirmed {
         if let (Some(turn), Some(manifest)) = (exact_turn.as_ref(), origin.manifest.as_deref()) {
