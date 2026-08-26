@@ -461,6 +461,11 @@ pub fn render_chat(
     );
 
     let mut timeline_lines: Vec<String> = Vec::new();
+    let watermark = queue.watermark();
+    timeline_lines.push(fit(
+        &format!("── Head #{watermark} ({}) ──", queue.scope().word()),
+        width,
+    ));
 
     if width < 24 {
         // Ultra-narrow mode: 1-2 lines per entry using initials (never icon only)
@@ -606,19 +611,19 @@ pub fn render_chat(
                     message_id,
                     origin_label,
                     ..
-                } => format!("── Reply to @{origin_label} ({message_id}) ──"),
+                } => format!("── Reply to @{origin_label} ({message_id}) [identity unknown until confirmed] ──"),
                 ComposerMode::Announce { recipients } => {
                     let preview = recipients
                         .iter()
                         .map(|(_, l)| l.as_str())
                         .collect::<Vec<_>>()
                         .join(", ");
-                    format!("── Announce to @all ({preview}) ──")
+                    format!("── Announce to @all ({preview}) [identity unknown until confirmed] ──")
                 }
                 ComposerMode::Direct {
                     recipient_label, ..
                 } => {
-                    format!("── Direct to @{recipient_label} ──")
+                    format!("── Direct to @{recipient_label} [identity unknown until confirmed] ──")
                 }
             };
             out.push(fit(&mode_header, width));

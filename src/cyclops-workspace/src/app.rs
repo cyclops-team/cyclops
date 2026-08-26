@@ -189,6 +189,10 @@ enum AppMsg {
     MessageDetailLoaded(Box<cyclops_ui::Detail>),
     /// Messages group-chat composer send outcome from background worker.
     MessagesSendFinished(crate::daemon::SendOutcome),
+    /// Messages projection changed invalidation signal from cyclopsd.
+    MessagesChanged {
+        workspace_seq: u64,
+    },
 }
 
 /// Work item for sending a message asynchronously from the group-chat composer.
@@ -1674,7 +1678,20 @@ fn subscribe_decoration_once(
         // drops it the same way (`cyclops_ui`'s own subscribe loop). It
         // still becomes a wake-only `ThemeChanged`. Every other vocabulary,
         // known or not, becomes an entry.
-        if ev.event != "theme" {
+        if ev.event == "messages.changed" {
+            let workspace_seq = ev
+                .data
+                .get("workspace_seq")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| ev.data.get("seq").and_then(serde_json::Value::as_u64))
+                .unwrap_or(0);
+            if stream_tx
+                .blocking_send(AppMsg::MessagesChanged { workspace_seq })
+                .is_err()
+            {
+                return;
+            }
+        } else if ev.event != "theme" {
             let entry = cyclops_ui::Entry::from_event(&ev, now_ms());
             if stream_tx
                 .blocking_send(AppMsg::StreamEntry(Box::new(entry)))
@@ -2350,6 +2367,17 @@ async fn handle_app_msg(
         AppMsg::StreamEntry(entry) => {
             crate::event_record::live(&mut app.record, &mut app.intake, *entry);
             arm(debounce);
+        }
+        AppMsg::MessagesChanged { workspace_seq } => {
+            if app.model.messages_visible
+                && !app.messages_snapshot_in_flight
+                && workspace_seq > app.messages_queue.watermark()
+            {
+                if let Some(tx) = &app.messages_snapshot_tx {
+                    let _ = tx.try_send(128);
+                    app.messages_snapshot_in_flight = true;
+                }
+            }
         }
         AppMsg::StreamGap { why } => {
             if app.stream_reconciling {
@@ -3587,11 +3615,19 @@ async fn handle_messages_key(
             return Ok(Some(InputOutcome::Redraw));
         }
         KeyCode::Char('j') | KeyCode::Down if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.messages_queue.select_next();
+            if let Some(detail) = app.messages_detail.as_mut() {
+                detail.scroll_by(1);
+            } else {
+                app.messages_queue.select_next();
+            }
             return Ok(Some(InputOutcome::Redraw));
         }
         KeyCode::Char('k') | KeyCode::Up if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.messages_queue.select_previous();
+            if let Some(detail) = app.messages_detail.as_mut() {
+                detail.scroll_by(-1);
+            } else {
+                app.messages_queue.select_previous();
+            }
             return Ok(Some(InputOutcome::Redraw));
         }
         KeyCode::Char('s') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
