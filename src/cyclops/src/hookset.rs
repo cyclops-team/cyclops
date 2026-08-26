@@ -205,41 +205,60 @@ fn is_cyclops_hook_command(command: &str, own_bins: &[&str]) -> bool {
 
 /// The bin paths our own rendering (`src`) uses for its hook commands.
 fn own_hook_bins(src: &[serde_json::Value]) -> Vec<&str> {
-    src.iter()
-        .filter_map(|group| group.get("hooks").and_then(serde_json::Value::as_array))
-        .flatten()
-        .filter_map(|hook| hook.get("command").and_then(serde_json::Value::as_str))
-        .filter_map(|command| command.split_whitespace().next())
-        .collect()
+    let mut bins = Vec::new();
+    for entry in src {
+        let direct = std::iter::once(entry);
+        let nested = entry
+            .get("hooks")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten();
+        for bin in direct
+            .chain(nested)
+            .filter_map(|hook| hook.get("command").and_then(serde_json::Value::as_str))
+            .filter_map(|command| command.split_whitespace().next())
+        {
+            if !bins.contains(&bin) {
+                bins.push(bin);
+            }
+        }
+    }
+    bins
 }
 
-/// Strip only this project's own command hooks out of one event group,
-/// keeping the group's matcher and every sibling hook the operator wrote.
-/// Returns `None` when nothing remains, so the group is dropped whole.
+/// Strip only this project's own command hooks out of one event entry.
+///
+/// Lifecycle and Cursor entries are direct command objects. Tool hooks use a
+/// group with a nested `hooks` array. An unrelated direct object is cloned
+/// whole; a mixed group keeps its matcher and every operator-owned sibling.
 fn without_cyclops_hooks(
-    group: &serde_json::Value,
+    entry: &serde_json::Value,
     own_bins: &[&str],
 ) -> Option<serde_json::Value> {
     use serde_json::Value;
-    let Some(hooks) = group.get("hooks").and_then(Value::as_array) else {
-        return Some(group.clone());
-    };
-    let kept: Vec<Value> = hooks
-        .iter()
-        .filter(|hook| {
-            !hook
-                .get("command")
-                .and_then(Value::as_str)
-                .is_some_and(|command| is_cyclops_hook_command(command, own_bins))
-        })
-        .cloned()
-        .collect();
-    if kept.is_empty() {
-        return None;
+    if let Some(hooks) = entry.get("hooks").and_then(Value::as_array) {
+        let kept: Vec<Value> = hooks
+            .iter()
+            .filter(|hook| {
+                !hook
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|command| is_cyclops_hook_command(command, own_bins))
+            })
+            .cloned()
+            .collect();
+        if kept.is_empty() {
+            return None;
+        }
+        let mut stripped = entry.clone();
+        stripped["hooks"] = Value::Array(kept);
+        return Some(stripped);
     }
-    let mut stripped = group.clone();
-    stripped["hooks"] = Value::Array(kept);
-    Some(stripped)
+    let own_direct = entry
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|command| is_cyclops_hook_command(command, own_bins));
+    (!own_direct).then(|| entry.clone())
 }
 
 /// Merge `src` into `dst`, replacing only this project's own entries.
@@ -258,18 +277,18 @@ fn merge_into(dst: &mut serde_json::Value, src: &serde_json::Value) {
             }
         }
         (d @ Value::Array(_), Value::Array(s)) => {
-            // Groups are `{ "matcher"?: .., "hooks": [ .. ] }`. Only the
-            // exact Cyclops command hooks inside each group are ours to
-            // replace; a mixed group keeps its operator hooks and its
-            // matcher, an emptied group goes, and exactly one current
-            // Cyclops group is appended. Running this twice is a no-op.
+            // Vendor arrays contain direct command objects, nested hook
+            // groups, or both. Only exact Cyclops commands are replaced; an
+            // unrelated direct object stays whole, a mixed group keeps its
+            // matcher and operator hooks, and the current source is appended
+            // once. Running this twice is a no-op.
             let own_bins = own_hook_bins(s);
             let kept: Vec<Value> = d
                 .as_array()
                 .map(|groups| {
                     groups
                         .iter()
-                        .filter_map(|group| without_cyclops_hooks(group, &own_bins))
+                        .filter_map(|entry| without_cyclops_hooks(entry, &own_bins))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -1882,6 +1901,180 @@ mod tests {
                 .as_str()
                 .unwrap_or_else(|| panic!("cursor: {event} entry shape"));
             assert_eq!(cmd, format!("cyclops hook {event} --agent r"));
+        }
+    }
+
+    #[test]
+    fn cursor_direct_hooks_replace_a_stale_path_once_and_keep_operator_entries() {
+        let current_bin = "/tmp/target/debug/deps/cyclops-0123abcd";
+        let operator_entries = serde_json::json!([
+            { "command": "echo mine", "timeout": 7 },
+            { "command": "cyclops hook beforeSubmitPrompt && echo mine" },
+            { "command": "sh -c 'cyclops hook beforeSubmitPrompt'" },
+            { "command": "cyclops hook beforeSubmitPrompt --verbose" }
+        ]);
+        let mut doc = serde_json::json!({
+            "hooks": {
+                "beforeSubmitPrompt": [
+                    { "command": "/old/prefix/bin/cyclops hook beforeSubmitPrompt" },
+                    { "command": format!("{current_bin} hook beforeSubmitPrompt") },
+                    { "command": "echo mine", "timeout": 7 },
+                    { "command": "cyclops hook beforeSubmitPrompt && echo mine" },
+                    { "command": "sh -c 'cyclops hook beforeSubmitPrompt'" },
+                    { "command": "cyclops hook beforeSubmitPrompt --verbose" }
+                ]
+            },
+            "version": 1
+        });
+        let ours: serde_json::Value =
+            serde_json::from_str(&render_shared(CliKind::Cursor, current_bin)).unwrap();
+
+        merge_into(&mut doc, &ours);
+
+        let entries = doc["hooks"]["beforeSubmitPrompt"].as_array().unwrap();
+        let operator_count = operator_entries.as_array().unwrap().len();
+        assert_eq!(
+            serde_json::to_vec(&entries[..operator_count]).unwrap(),
+            serde_json::to_vec(operator_entries.as_array().unwrap().as_slice()).unwrap()
+        );
+        assert_eq!(entries.len(), operator_count + 1);
+        assert_eq!(
+            entries.last().unwrap()["command"],
+            format!("{current_bin} hook beforeSubmitPrompt")
+        );
+        assert!(!doc.to_string().contains("/old/prefix/bin/cyclops"));
+
+        let once = serde_json::to_vec(&doc).unwrap();
+        merge_into(&mut doc, &ours);
+        assert_eq!(serde_json::to_vec(&doc).unwrap(), once);
+    }
+
+    #[test]
+    fn agy_mixed_hook_shapes_replace_stale_paths_once_and_keep_operator_entries() {
+        let current_bin = "/tmp/target/debug/deps/cyclops-0123abcd";
+        let operator_direct = serde_json::json!([
+            { "type": "command", "command": "echo mine", "timeout": 7 },
+            { "type": "command", "command": "cyclops hook PreInvocation && echo mine" },
+            { "type": "command", "command": "sh -c 'cyclops hook PreInvocation'" },
+            { "type": "command", "command": "cyclops hook PreInvocation --verbose" }
+        ]);
+        let operator_registration = serde_json::json!({
+            "Stop": [ { "type": "command", "command": "/bin/operator-stop" } ]
+        });
+        let mut doc = serde_json::json!({
+            (SHARED_NAME): {
+                "PreInvocation": [
+                    { "type": "command", "command": "/old/prefix/bin/cyclops hook PreInvocation" },
+                    { "type": "command", "command": format!("{current_bin} hook PreInvocation") },
+                    { "type": "command", "command": "echo mine", "timeout": 7 },
+                    { "type": "command", "command": "cyclops hook PreInvocation && echo mine" },
+                    { "type": "command", "command": "sh -c 'cyclops hook PreInvocation'" },
+                    { "type": "command", "command": "cyclops hook PreInvocation --verbose" }
+                ],
+                "PreToolUse": [
+                    {
+                        "matcher": "operator-tool",
+                        "hooks": [
+                            { "type": "command", "command": "/old/prefix/bin/cyclops hook PreToolUse" },
+                            { "type": "command", "command": "/bin/operator-tool" }
+                        ]
+                    }
+                ]
+            },
+            "operator-registration": operator_registration.clone()
+        });
+        let ours: serde_json::Value =
+            serde_json::from_str(&render_shared(CliKind::Agy, current_bin)).unwrap();
+
+        merge_into(&mut doc, &ours);
+
+        let lifecycle = doc[SHARED_NAME]["PreInvocation"].as_array().unwrap();
+        let operator_count = operator_direct.as_array().unwrap().len();
+        assert_eq!(
+            serde_json::to_vec(&lifecycle[..operator_count]).unwrap(),
+            serde_json::to_vec(operator_direct.as_array().unwrap().as_slice()).unwrap()
+        );
+        assert_eq!(lifecycle.len(), operator_count + 1);
+        assert_eq!(
+            lifecycle.last().unwrap()["command"],
+            format!("{current_bin} hook PreInvocation")
+        );
+        let tools = doc[SHARED_NAME]["PreToolUse"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["matcher"], "operator-tool");
+        assert_eq!(
+            tools[0]["hooks"],
+            serde_json::json!([{ "type": "command", "command": "/bin/operator-tool" }])
+        );
+        assert_eq!(doc["operator-registration"], operator_registration);
+        assert!(!doc.to_string().contains("/old/prefix/bin/cyclops"));
+
+        let once = serde_json::to_vec(&doc).unwrap();
+        merge_into(&mut doc, &ours);
+        assert_eq!(
+            serde_json::to_vec(&doc).unwrap(),
+            once,
+            "the direct source binary path must be recognized on update two"
+        );
+    }
+
+    #[test]
+    fn claude_and_codex_nested_hooks_replace_stale_paths_once() {
+        let current_bin = "/tmp/target/debug/deps/cyclops-0123abcd";
+        let operator_hooks = serde_json::json!([
+            { "type": "command", "command": "/bin/operator-stop", "timeout": 7 },
+            { "type": "command", "command": "cyclops hook Stop && echo mine" },
+            { "type": "command", "command": "sh -c 'cyclops hook Stop'" },
+            { "type": "command", "command": "cyclops hook Stop --verbose" }
+        ]);
+        for kind in [CliKind::Claude, CliKind::Codex] {
+            let mut doc = serde_json::json!({
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                { "type": "command", "command": "/old/prefix/bin/cyclops hook Stop" },
+                                { "type": "command", "command": format!("{current_bin} hook Stop") }
+                            ]
+                        },
+                        {
+                            "matcher": "operator-stop",
+                            "hooks": [
+                                { "type": "command", "command": "/old/prefix/bin/cyclops hook Stop --agent r" },
+                                { "type": "command", "command": "/bin/operator-stop", "timeout": 7 },
+                                { "type": "command", "command": "cyclops hook Stop && echo mine" },
+                                { "type": "command", "command": "sh -c 'cyclops hook Stop'" },
+                                { "type": "command", "command": "cyclops hook Stop --verbose" }
+                            ]
+                        }
+                    ]
+                },
+                "operator": { "deep": ["kept", 1] }
+            });
+            let ours: serde_json::Value =
+                serde_json::from_str(&render_shared(kind, current_bin)).unwrap();
+
+            merge_into(&mut doc, &ours);
+
+            let stop = doc["hooks"]["Stop"].as_array().unwrap();
+            assert_eq!(stop.len(), 2, "{} stale group survived", kind.name());
+            assert_eq!(stop[0]["matcher"], "operator-stop");
+            assert_eq!(stop[0]["hooks"], operator_hooks);
+            assert_eq!(
+                stop[1]["hooks"][0]["command"],
+                format!("{current_bin} hook Stop")
+            );
+            assert_eq!(doc["operator"], serde_json::json!({ "deep": ["kept", 1] }));
+            assert!(!doc.to_string().contains("/old/prefix/bin/cyclops"));
+
+            let once = serde_json::to_vec(&doc).unwrap();
+            merge_into(&mut doc, &ours);
+            assert_eq!(
+                serde_json::to_vec(&doc).unwrap(),
+                once,
+                "{} changed on update two",
+                kind.name()
+            );
         }
     }
 
