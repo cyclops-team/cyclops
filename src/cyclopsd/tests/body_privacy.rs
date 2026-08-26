@@ -9,6 +9,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use common::*;
+use cyclops_proto::NotificationState;
 use serde_json::{json, Value};
 
 const IDENTITY_MANIFEST: &str = r#"
@@ -614,12 +615,13 @@ async fn authenticated_claim_withdraws_exact_blocked_attempt_and_releases_fifo()
         .into_iter()
         .next()
         .expect("blocked notification keeps its attempt identity");
+    let blocked_state = serde_json::to_value(NotificationState::BlockedPreWrite).unwrap();
     let blocked = workspace_lines(&rig)
         .into_iter()
         .find(|line| {
             line["id"] == first_id
                 && line["data"]["type"] == "notification_transition"
-                && line["data"]["state"] == "blocked_pre_write"
+                && line["data"]["state"] == blocked_state
         })
         .expect("blocked transition is durable");
     assert_eq!(blocked["data"]["pre_write_cause"], "binding_unprovable");
