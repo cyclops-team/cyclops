@@ -291,8 +291,9 @@ notification to release the recipient FIFO.
 The transition also records the exact closed scheduler outcome when no live
 worker owns the wake. Replay, send receipts, status, and message detail read
 that same `wake_block`; they do not reconstruct a generic reason from the
-notification state. Legacy rows without the additive field remain readable
-and report `scheduler_state_unavailable`.
+notification state. A terminal row without the additive field remains
+readable and reports `scheduler_state_unavailable`; new scheduler failures
+record a specific outcome or fail the request if that fact cannot be persisted.
 An exact positive route and composer-readiness observation may reopen the same
 attempt once. The cached verdict must carry the same pane-root, foreground
 leader, agent process generation, and manifest as the fresh route proof.

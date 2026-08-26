@@ -434,8 +434,10 @@ retains it across replay and exposes it on
 `MessageNotificationSummary.wake_block`. Current values distinguish daemon
 shutdown, missing route, pending attention resolution, worker fault, worker
 supervisor exit, enqueue refusal, and unproven complete composer ownership.
-`scheduler_state_unavailable` is reserved for legacy blocked facts that did
-not journal the exact outcome.
+`scheduler_state_unavailable` is the compatibility fallback for a terminal
+row that has no journaled exact scheduler outcome, including legacy facts.
+New scheduler failures record a specific outcome or fail the request if that
+fact cannot be persisted.
 
 The sole live correction out of `writing` is
 `blocked_pre_write` with `pre_write_cause: "paste_command_unwritten"`. It is

@@ -1,7 +1,7 @@
 //! Coordinates the durable mailbox with the existing pane notification worker.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use cyclops_proto::{
@@ -54,33 +54,25 @@ pub(crate) enum RecipientScheduleOutcome {
         head: ScheduledHead,
         block: MessageWakeBlock,
     },
-    /// Scheduling failed before an exact attempt could be recovered. This
-    /// may describe the accepted message only when it is still FIFO position
-    /// zero; followers must never inherit it.
-    SchedulerUnavailable,
 }
 
-impl RecipientScheduleOutcome {
-    fn wake_block_for(
-        &self,
-        message_id: &MessageId,
-        attempt_id: Option<NotificationAttemptId>,
-        position_ahead: Option<u32>,
-    ) -> Option<MessageWakeBlock> {
-        match self {
-            Self::Blocked { head, block }
-                if head.message_id == *message_id && attempt_id == Some(head.attempt_id) =>
-            {
-                Some(*block)
-            }
-            Self::SchedulerUnavailable if position_ahead == Some(0) => {
-                Some(MessageWakeBlock::SchedulerStateUnavailable)
-            }
-            Self::WorkerOwned { .. }
-            | Self::NoWakeNeeded
-            | Self::Blocked { .. }
-            | Self::SchedulerUnavailable => None,
-        }
+/// Build one receipt only from the exact current mailbox projection.
+fn receipt_from_disposition(
+    disposition: crate::mailbox::MessageDisposition,
+    pane: Option<String>,
+) -> DeliveryReceipt {
+    DeliveryReceipt {
+        to: disposition.label,
+        state: DeliveryState::Queued,
+        notification_state: Some(disposition.notification_state),
+        quota_state: disposition.quota_state,
+        notification_settlement: disposition.notification_settlement,
+        pre_write_cause: disposition.pre_write_cause,
+        wake_block: disposition.wake_block,
+        position: disposition.position_ahead,
+        held_by: None,
+        note: None,
+        pane,
     }
 }
 
@@ -343,12 +335,19 @@ fn park_unowned_notification(
     cause: NotificationPreWriteCause,
     block: MessageWakeBlock,
 ) -> Result<RecipientScheduleOutcome, MailboxServiceError> {
+    record_unowned_notification(&inner.mailbox_publication, context, cause, block)
+}
+
+/// Publish the scheduler stop before exposing it to a sender.
+fn record_unowned_notification(
+    publication: &StdMutex<()>,
+    context: &NotificationContext,
+    cause: NotificationPreWriteCause,
+    block: MessageWakeBlock,
+) -> Result<RecipientScheduleOutcome, MailboxServiceError> {
     let head = ScheduledHead::new(context.message_id().clone(), context.attempt_id());
     let recorded = {
-        let _publication = inner
-            .mailbox_publication
-            .lock()
-            .expect("mailbox publication lock");
+        let _publication = publication.lock().expect("mailbox publication lock");
         context
             .record_gating()
             .and_then(|_| context.record_pre_write_block_with_wake_block(cause, None, Some(block)))
@@ -550,8 +549,24 @@ async fn observe_first_durable_dispositions(
     service: &MailboxService,
     message_id: &MessageId,
     outcomes: &HashMap<RecipientKey, RecipientScheduleOutcome>,
+    events: tokio::sync::broadcast::Receiver<cyclops_proto::Event>,
+    deadline: Instant,
+) -> Result<Vec<crate::mailbox::MessageDisposition>, MailboxServiceError> {
+    observe_first_durable_dispositions_with(message_id, outcomes, events, deadline, || {
+        service.message_dispositions(message_id)
+    })
+    .await
+}
+
+async fn observe_first_durable_dispositions_with(
+    message_id: &MessageId,
+    outcomes: &HashMap<RecipientKey, RecipientScheduleOutcome>,
     mut events: tokio::sync::broadcast::Receiver<cyclops_proto::Event>,
     deadline: Instant,
+    mut read_projection: impl FnMut() -> Result<
+        Vec<crate::mailbox::MessageDisposition>,
+        MailboxServiceError,
+    >,
 ) -> Result<Vec<crate::mailbox::MessageDisposition>, MailboxServiceError> {
     let mut pending: HashMap<RecipientKey, ScheduledHead> = outcomes
         .iter()
@@ -565,7 +580,7 @@ async fn observe_first_durable_dispositions(
         .collect();
 
     loop {
-        let dispositions = service.message_dispositions(message_id)?;
+        let dispositions = read_projection()?;
         pending.retain(|recipient, head| {
             dispositions
                 .iter()
@@ -580,7 +595,7 @@ async fn observe_first_durable_dispositions(
             // The deadline is only a response bound. It never records a
             // delivery decision. Take one final authoritative projection
             // snapshot so a fact committed at the boundary is not lost.
-            return service.message_dispositions(message_id);
+            return read_projection();
         }
     }
 }
@@ -596,7 +611,7 @@ async fn finish_acceptance(
     let events = inner.events.subscribe();
     let schedule_outcomes = schedule_accepted_notifications(&accepted, |recipient| {
         schedule_recipient(inner, service, recipient)
-    });
+    })?;
     let deadline = Instant::now() + Duration::from_millis(inner.cfg.receipt_block_ms);
     let dispositions = observe_first_durable_dispositions(
         service,
@@ -614,48 +629,35 @@ async fn finish_acceptance(
             .map(|disposition| {
                 let pane = notification_route(inner, service, disposition.recipient)?
                     .map(|route| route.pane_id);
-                Ok(DeliveryReceipt {
-                    to: disposition.label,
-                    state: DeliveryState::Queued,
-                    notification_state: Some(disposition.notification_state),
-                    quota_state: disposition.quota_state,
-                    notification_settlement: disposition.notification_settlement,
-                    pre_write_cause: disposition.pre_write_cause,
-                    wake_block: disposition.wake_block.or_else(|| {
-                        schedule_outcomes
-                            .get(&disposition.recipient)
-                            .and_then(|outcome| {
-                                outcome.wake_block_for(
-                                    &accepted.message_id,
-                                    disposition.attempt_id,
-                                    disposition.position_ahead,
-                                )
-                            })
-                    }),
-                    position: disposition.position_ahead,
-                    held_by: None,
-                    note: None,
-                    pane,
-                })
+                Ok(receipt_from_disposition(disposition, pane))
             })
             .collect::<Result<Vec<_>, MailboxServiceError>>()?,
         inserted: Some(accepted.inserted),
     })
 }
 
+/// Attempt every broadcast recipient, then propagate the first failure whose
+/// durable disposition could not be recorded.
 fn schedule_accepted_notifications(
     accepted: &AcceptResult,
     mut schedule: impl FnMut(RecipientKey) -> Result<RecipientScheduleOutcome, MailboxServiceError>,
-) -> HashMap<RecipientKey, RecipientScheduleOutcome> {
+) -> Result<HashMap<RecipientKey, RecipientScheduleOutcome>, MailboxServiceError> {
     let mut outcomes = HashMap::new();
+    let mut first_error = None;
     for recipient in accepted.recipient_keys.iter().copied() {
-        let outcome = schedule(recipient).unwrap_or_else(|error| {
-            error!(%recipient, %error, "cannot schedule accepted mailbox notification");
-            RecipientScheduleOutcome::SchedulerUnavailable
-        });
-        outcomes.insert(recipient, outcome);
+        match schedule(recipient) {
+            Ok(outcome) => {
+                outcomes.insert(recipient, outcome);
+            }
+            Err(error) => {
+                error!(%recipient, %error, "cannot schedule accepted mailbox notification");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
     }
-    outcomes
+    first_error.map_or(Ok(outcomes), Err)
 }
 
 pub(crate) async fn send(
@@ -961,6 +963,63 @@ mod tests {
         }
     }
 
+    fn test_directory() -> (WorkspaceId, MailboxDirectory, RecipientKey, RecipientKey) {
+        let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let session = SessionInstanceId::from_str("00000000-0000-4000-8000-000000000002").unwrap();
+        let reviewer = RecipientKey::agent(workspace, session, TmuxPaneId::from_str("%3").unwrap());
+        let observer = RecipientKey::agent(workspace, session, TmuxPaneId::from_str("%4").unwrap());
+        let directory = MailboxDirectory::new(
+            workspace,
+            [
+                MailboxIdentity {
+                    key: reviewer,
+                    label: "reviewer".into(),
+                },
+                MailboxIdentity {
+                    key: observer,
+                    label: "observer".into(),
+                },
+            ],
+        )
+        .unwrap();
+        (workspace, directory, reviewer, observer)
+    }
+
+    fn send_to(service: &MailboxService, addresses: &[&str], subject: &str) -> AcceptResult {
+        service
+            .send(
+                service.admin(),
+                MailboxSend {
+                    addresses: addresses.iter().map(|address| (*address).into()).collect(),
+                    recipient_keys: None,
+                    subject: subject.into(),
+                    body: "Body".into(),
+                    fyi: false,
+                    client_key: None,
+                    supersedes: None,
+                },
+            )
+            .unwrap()
+    }
+
+    fn prepare_context(
+        service: &Arc<MailboxService>,
+        recipient: RecipientKey,
+    ) -> (cyclops_proto::NotificationRecord, NotificationContext) {
+        let record = service
+            .prepare_oldest_notification(recipient)
+            .unwrap()
+            .unwrap();
+        let context = NotificationContext::new_with_changes(
+            service.store_handle(),
+            record.message_id.clone(),
+            recipient,
+            record.attempt_id,
+            service.change_publisher(),
+        );
+        (record, context)
+    }
+
     fn mailbox_service(
         tag: &str,
         event_capacity: usize,
@@ -972,25 +1031,7 @@ mod tests {
         RecipientKey,
     ) {
         let scratch = Scratch::new(tag);
-        let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
-        let session = SessionInstanceId::from_str("00000000-0000-4000-8000-000000000002").unwrap();
-        let recipient =
-            RecipientKey::agent(workspace, session, TmuxPaneId::from_str("%3").unwrap());
-        let observer = RecipientKey::agent(workspace, session, TmuxPaneId::from_str("%4").unwrap());
-        let directory = MailboxDirectory::new(
-            workspace,
-            [
-                MailboxIdentity {
-                    key: recipient,
-                    label: "reviewer".into(),
-                },
-                MailboxIdentity {
-                    key: observer,
-                    label: "observer".into(),
-                },
-            ],
-        )
-        .unwrap();
+        let (workspace, directory, recipient, observer) = test_directory();
         let store = MessageStore::open(
             &scratch.root(),
             Path::new("workspaces/current/messages.ndjson"),
@@ -1010,32 +1051,9 @@ mod tests {
     fn queued_attempt(
         service: &Arc<MailboxService>,
     ) -> (AcceptResult, NotificationContext, ScheduledHead) {
-        let accepted = service
-            .send(
-                service.admin(),
-                MailboxSend {
-                    addresses: vec!["reviewer".into()],
-                    recipient_keys: None,
-                    subject: "Receipt".into(),
-                    body: "Body".into(),
-                    fyi: false,
-                    client_key: None,
-                    supersedes: None,
-                },
-            )
-            .unwrap();
+        let accepted = send_to(service, &["reviewer"], "Receipt");
         let recipient = accepted.recipient_keys[0];
-        let record = service
-            .prepare_oldest_notification(recipient)
-            .unwrap()
-            .unwrap();
-        let context = NotificationContext::new_with_changes(
-            service.store_handle(),
-            record.message_id.clone(),
-            recipient,
-            record.attempt_id,
-            service.change_publisher(),
-        );
+        let (record, context) = prepare_context(service, recipient);
         let head = ScheduledHead::new(record.message_id.clone(), record.attempt_id);
         (accepted, context, head)
     }
@@ -1055,6 +1073,23 @@ mod tests {
                 birth: 300,
             },
             manifest: "claude".into(),
+        }
+    }
+
+    fn durable_observation(recipient: RecipientKey) -> NotificationPreWriteObservation {
+        let pane_root = ProcessInstanceId::new(4000, 818_000).unwrap();
+        NotificationPreWriteObservation {
+            pane_root: Some(pane_root),
+            selected_manifest: Some(NotificationManifestId::new("claude").unwrap()),
+            binding: Some(NotificationBinding {
+                recipient,
+                pane_root: Some(pane_root),
+                leader: Some(ProcessInstanceId::new(4001, 818_001).unwrap()),
+                agent: ProcessInstanceId::new(4002, 818_002).unwrap(),
+                manifest: NotificationManifestId::new("claude").unwrap(),
+            }),
+            pane_width: Some(120),
+            required_pane_width: None,
         }
     }
 
@@ -1094,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn a_scheduler_failure_is_not_scoped_to_an_unknown_attempt() {
+    fn a_scheduler_persistence_failure_does_not_skip_later_broadcast_recipients() {
         let workspace = "00000000-0000-4000-8000-000000000001".parse().unwrap();
         let session = "00000000-0000-4000-8000-000000000002".parse().unwrap();
         let first = RecipientKey::agent(workspace, session, "%3".parse().unwrap());
@@ -1109,7 +1144,7 @@ mod tests {
         };
 
         let mut attempted = Vec::new();
-        let outcomes = schedule_accepted_notifications(&accepted, |recipient| {
+        let error = schedule_accepted_notifications(&accepted, |recipient| {
             attempted.push(recipient);
             if recipient == middle {
                 Err(MailboxServiceError::Poisoned)
@@ -1122,59 +1157,217 @@ mod tests {
                     observe_first_disposition: false,
                 })
             }
-        });
+        })
+        .unwrap_err();
         assert_eq!(attempted, vec![first, middle, last]);
-        assert!(matches!(
-            outcomes[&first],
-            RecipientScheduleOutcome::WorkerOwned { .. }
-        ));
-        assert_eq!(
-            outcomes[&middle],
-            RecipientScheduleOutcome::SchedulerUnavailable
-        );
-        assert!(matches!(
-            outcomes[&last],
-            RecipientScheduleOutcome::WorkerOwned { .. }
-        ));
+        assert!(matches!(error, MailboxServiceError::Poisoned));
     }
 
     #[test]
     fn a_blocked_head_never_contaminates_a_follower_receipt() {
-        let old_message = MessageId::new("m-old-head").unwrap();
-        let new_message = MessageId::new("m-new-follower").unwrap();
-        let old_attempt = NotificationAttemptId::generate();
-        let outcome = RecipientScheduleOutcome::Blocked {
-            head: ScheduledHead::new(old_message.clone(), old_attempt),
-            block: MessageWakeBlock::SchedulerStateUnavailable,
-        };
+        let (_scratch, service, _events, recipient, _) = mailbox_service("follower-block", 8);
+        let first = send_to(&service, &["reviewer"], "First");
+        let second = send_to(&service, &["reviewer"], "Second");
+        let (_record, context) = prepare_context(&service, recipient);
+        context.record_gating().unwrap();
+        context
+            .record_pre_write_block_with_wake_block(
+                NotificationPreWriteCause::WorkerFailed,
+                None,
+                Some(MessageWakeBlock::WorkerSupervisorExited),
+            )
+            .unwrap();
 
+        let head = service.message_dispositions(&first.message_id).unwrap();
         assert_eq!(
-            outcome.wake_block_for(&old_message, Some(old_attempt), Some(0)),
-            Some(MessageWakeBlock::SchedulerStateUnavailable)
+            head[0].wake_block,
+            Some(MessageWakeBlock::WorkerSupervisorExited)
         );
-
+        let follower = service.message_dispositions(&second.message_id).unwrap();
+        assert_eq!(follower[0].position_ahead, Some(1));
+        assert_eq!(follower[0].attempt_id, None);
+        assert_eq!(follower[0].pre_write_cause, None);
         assert_eq!(
-            outcome.wake_block_for(&new_message, None, Some(1)),
-            None,
+            follower[0].wake_block, None,
             "a follower may not inherit the FIFO head's scheduler block"
         );
+    }
+
+    #[test]
+    fn a_recorded_scheduler_failure_is_identical_live_replayed_and_in_the_receipt() {
+        let (scratch, service, _events, recipient, _) =
+            mailbox_service("scheduler-block-replay", 8);
+        let (accepted, context, _head) = queued_attempt(&service);
+        let outcome = record_unowned_notification(
+            &StdMutex::new(()),
+            &context,
+            NotificationPreWriteCause::WorkerFailed,
+            MessageWakeBlock::WorkerSupervisorExited,
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            RecipientScheduleOutcome::Blocked {
+                block: MessageWakeBlock::WorkerSupervisorExited,
+                ..
+            }
+        ));
+
+        let live = service.message_dispositions(&accepted.message_id).unwrap();
+        let live_receipt = receipt_from_disposition(live[0].clone(), None);
         assert_eq!(
-            RecipientScheduleOutcome::SchedulerUnavailable.wake_block_for(
-                &new_message,
-                None,
-                Some(1)
-            ),
-            None,
-            "an unscoped failure may only describe FIFO position zero"
+            live_receipt.wake_block,
+            Some(MessageWakeBlock::WorkerSupervisorExited)
         );
         assert_eq!(
-            RecipientScheduleOutcome::SchedulerUnavailable.wake_block_for(
-                &new_message,
+            live_receipt.pre_write_cause,
+            Some(NotificationPreWriteCause::WorkerFailed)
+        );
+
+        drop(context);
+        drop(service);
+        let (workspace, directory, replayed_recipient, _) = test_directory();
+        assert_eq!(replayed_recipient, recipient);
+        let store = MessageStore::open(
+            &scratch.root(),
+            Path::new("workspaces/current/messages.ndjson"),
+            workspace,
+            "boot-replay",
+        )
+        .unwrap();
+        let replayed = MailboxService::new(directory, store)
+            .message_dispositions(&accepted.message_id)
+            .unwrap();
+        assert_eq!(replayed, live);
+        let replayed_receipt = receipt_from_disposition(replayed[0].clone(), None);
+        assert_eq!(
+            serde_json::to_value(replayed_receipt).unwrap(),
+            serde_json::to_value(live_receipt).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_scheduler_disposition_append_failure_is_propagated() {
+        let (_scratch, service, _events, _recipient, _) =
+            mailbox_service("scheduler-block-append-failure", 8);
+        let (accepted, context, _head) = queued_attempt(&service);
+        service
+            .store_handle()
+            .lock()
+            .unwrap()
+            .inject_next_pre_write_block_append_failure();
+
+        let error = record_unowned_notification(
+            &StdMutex::new(()),
+            &context,
+            NotificationPreWriteCause::WorkerFailed,
+            MessageWakeBlock::WorkerSupervisorExited,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            MailboxServiceError::NotificationSchedule(_)
+        ));
+        let dispositions = service.message_dispositions(&accepted.message_id).unwrap();
+        assert_eq!(
+            dispositions[0].notification_state_raw,
+            Some(NotificationState::Gating)
+        );
+        assert_eq!(dispositions[0].pre_write_cause, None);
+        assert_eq!(dispositions[0].wake_block, None);
+    }
+
+    #[tokio::test]
+    async fn a_reopened_attempt_does_not_keep_its_stale_schedule_block() {
+        let (_scratch, service, events, reviewer, observer) =
+            mailbox_service("reopened-receipt", 8);
+        let accepted = send_to(&service, &["reviewer", "observer"], "Broadcast");
+
+        let (reviewer_record, reviewer_context) = prepare_context(&service, reviewer);
+        reviewer_context.record_gating().unwrap();
+        reviewer_context
+            .record_pre_write_block_with_wake_block(
+                NotificationPreWriteCause::SessionUnavailable,
                 None,
-                Some(0)
+                Some(MessageWakeBlock::RouteUnavailable),
+            )
+            .unwrap();
+
+        let (observer_record, observer_context) = prepare_context(&service, observer);
+        observer_context.record_gating().unwrap();
+
+        let outcomes = HashMap::from([
+            (
+                reviewer,
+                RecipientScheduleOutcome::Blocked {
+                    head: ScheduledHead::new(
+                        reviewer_record.message_id.clone(),
+                        reviewer_record.attempt_id,
+                    ),
+                    block: MessageWakeBlock::RouteUnavailable,
+                },
             ),
-            Some(MessageWakeBlock::SchedulerStateUnavailable),
-            "the accepted FIFO head keeps the existing scheduler failure contract"
+            (
+                observer,
+                RecipientScheduleOutcome::WorkerOwned {
+                    head: ScheduledHead::new(
+                        observer_record.message_id.clone(),
+                        observer_record.attempt_id,
+                    ),
+                    observe_first_disposition: true,
+                },
+            ),
+        ]);
+        let receiver = events.subscribe();
+        let observe = observe_first_durable_dispositions(
+            &service,
+            &accepted.message_id,
+            &outcomes,
+            receiver,
+            Instant::now() + Duration::from_secs(1),
+        );
+        let advance = async {
+            tokio::task::yield_now().await;
+            let reopened = service
+                .reopen_oldest_notification_after_route_evidence(
+                    reviewer,
+                    durable_observation(reviewer),
+                    true,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(reopened.attempt_id, reviewer_record.attempt_id);
+            observer_context
+                .record_pre_write_block_with_wake_block(
+                    NotificationPreWriteCause::WorkerFailed,
+                    None,
+                    Some(MessageWakeBlock::WorkerSupervisorExited),
+                )
+                .unwrap();
+        };
+        let (dispositions, ()) = tokio::join!(observe, advance);
+        let dispositions = dispositions.unwrap();
+        let disposition = dispositions
+            .into_iter()
+            .find(|disposition| disposition.recipient == reviewer)
+            .unwrap();
+        assert_eq!(
+            disposition.attempt_id,
+            Some(reviewer_record.attempt_id),
+            "the same durable attempt must remain current"
+        );
+        assert_eq!(
+            disposition.notification_state_raw,
+            Some(NotificationState::Gating)
+        );
+        assert_eq!(disposition.pre_write_cause, None);
+        assert_eq!(disposition.wake_block, None);
+
+        let receipt = receipt_from_disposition(disposition, None);
+        assert_eq!(receipt.pre_write_cause, None);
+        assert_eq!(
+            receipt.wake_block, None,
+            "a stale scheduling result must not override the exact projection"
         );
     }
 
@@ -1220,6 +1413,11 @@ mod tests {
         assert_eq!(
             dispositions[0].pre_write_cause,
             Some(NotificationPreWriteCause::BindingUnprovable)
+        );
+        assert_eq!(
+            dispositions[0].wake_block,
+            Some(MessageWakeBlock::SchedulerStateUnavailable),
+            "a terminal row without an exact scheduler outcome keeps the compatibility fallback"
         );
     }
 
@@ -1271,6 +1469,54 @@ mod tests {
             Some(NotificationState::Gating)
         );
         assert_eq!(service.journal_lines().unwrap().len(), lines_before);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn receipt_timeout_takes_one_final_projection_read() {
+        let (_scratch, service, events, recipient, _) = mailbox_service("timeout-final-read", 8);
+        let (accepted, context, head) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        let outcomes = HashMap::from([(
+            recipient,
+            RecipientScheduleOutcome::WorkerOwned {
+                head,
+                observe_first_disposition: true,
+            },
+        )]);
+        let receiver = events.subscribe();
+        let mut reads = 0;
+
+        let dispositions = observe_first_durable_dispositions_with(
+            &accepted.message_id,
+            &outcomes,
+            receiver,
+            Instant::now() + Duration::from_secs(10),
+            || {
+                reads += 1;
+                if reads == 2 {
+                    context
+                        .record_pre_write_block_with_wake_block(
+                            NotificationPreWriteCause::WorkerFailed,
+                            None,
+                            Some(MessageWakeBlock::WorkerSupervisorExited),
+                        )
+                        .unwrap();
+                }
+                service.message_dispositions(&accepted.message_id)
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reads, 2, "timeout must take one final projection read");
+        assert_eq!(
+            dispositions[0].notification_state_raw,
+            Some(NotificationState::BlockedPreWrite)
+        );
+        assert_eq!(
+            dispositions[0].wake_block,
+            Some(MessageWakeBlock::WorkerSupervisorExited)
+        );
     }
 
     #[tokio::test(start_paused = true)]

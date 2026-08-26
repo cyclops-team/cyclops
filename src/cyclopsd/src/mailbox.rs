@@ -578,6 +578,21 @@ fn notification_pre_write_width_block(record: &NotificationRecord) -> Option<(u3
         .filter(|(observed, required)| observed < required)
 }
 
+/// Exact recorded scheduler outcome, with one compatibility fallback for a
+/// terminal row that has no additive `wake_block` value.
+fn notification_wake_block(record: &NotificationRecord) -> Option<MessageWakeBlock> {
+    record.wake_block.or_else(|| {
+        matches!(
+            record.state,
+            NotificationState::BlockedPreWrite
+                | NotificationState::QuotaHeld
+                | NotificationState::QuotaResetObserved
+                | NotificationState::AttentionRequired
+        )
+        .then_some(MessageWakeBlock::SchedulerStateUnavailable)
+    })
+}
+
 struct ReplyDerivation {
     recipient: RecipientKey,
     recipient_label: String,
@@ -4795,16 +4810,7 @@ impl MailboxService {
         let Some(record) = store.projection().notification(recipient, &message_id) else {
             return Ok(None);
         };
-        let block = record.wake_block.or_else(|| {
-            matches!(
-                record.state,
-                NotificationState::BlockedPreWrite
-                    | NotificationState::QuotaHeld
-                    | NotificationState::QuotaResetObserved
-                    | NotificationState::AttentionRequired
-            )
-            .then_some(MessageWakeBlock::SchedulerStateUnavailable)
-        });
+        let block = notification_wake_block(record);
         Ok(block.map(|block| NotificationScheduleBlock {
             message_id,
             attempt_id: record.attempt_id,
@@ -4959,7 +4965,7 @@ impl MailboxService {
                     quota_state,
                     notification_settlement,
                     pre_write_cause: record.and_then(|record| record.pre_write_cause),
-                    wake_block: record.and_then(|record| record.wake_block),
+                    wake_block: record.and_then(notification_wake_block),
                     position_ahead,
                 }
             })

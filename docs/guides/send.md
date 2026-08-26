@@ -40,6 +40,14 @@ This field explains why the wake has no current owner; it does not prove that
 the composer was written or that the message was claimed. The protocol
 reference owns the closed [`wake_block` vocabulary](../reference/PROTOCOL.md#msgsend).
 
+A durable failure before terminal bytes reports `wake blocked before write
+(<reason>)`. Its `pre_write_cause` is separate from `wake_block`: the first
+names the failed write-boundary proof, while the second names why no scheduler
+worker owns the wake. The plain and JSON commands exit 1 when either field is
+present, but the message remains durably accepted and claimable. Inspect the
+named cause before requeueing; a retry without changed evidence cannot clear a
+terminal pre-write block.
+
 A position such as `2 ahead` is the recipient mailbox's FIFO position. The
 daemon never bypasses an older pending message. When the oldest pending
 message is not moving (`attention_required`, quota held, or blocked before
