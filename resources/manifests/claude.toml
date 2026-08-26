@@ -9,14 +9,23 @@
 # "✳ <conversation summary>" and the pre-OSC title is the tmux hostname
 # seed; the ^ anchors cover both, do not tighten them to fixed strings.
 #
-# Sensor summary for this CLI:
-#   title  AUTHORITATIVE for busy/idle. Tracks hooks within 30-80 ms, below the
-#          100 ms sample interval used to measure it (claude_busy_titles.json).
-#   hooks  CANDIDATE prompt start and dispatch ACK only. UserPromptSubmit can
-#          precede a sibling hook that rejects the prompt, so later visual
-#          evidence decides acceptance and turn completion.
-#   screen LAST RESORT. Needed only for modal and permission states, which
-#          neither the title nor any hook reports.
+# Sensor summary for this CLI (revised 2026-08-26, findings F72):
+#   hooks  the authenticated lifecycle authority. UserPromptSubmit is a
+#          candidate start that a visual Working frame promotes to a
+#          persistent start on the exact agent generation; SessionStart or any
+#          authenticated edge is the process-bound liveness that admits a
+#          clean, idle-shaped pane as idle before its first turn. No end hook
+#          is declared, so termination is never hook-derived here.
+#   screen the only sensor that can confirm idle or end a turn: the
+#          completed-turn suffix rule (lifecycle_evidence) is the terminal;
+#          the composer rows prove composer state (clean, ghost, typed) but
+#          are measured mid-turn and never confirm idle on their own. Modal,
+#          permission, and quota states are screen-only too.
+#   title  working-tier evidence only (spinner). The idle sparkle stays in
+#          the title for a whole turn (MEASURED: 1203 title-idle flaps in six
+#          hours on one pane, 25 doorbell writes admitted behind them), so a
+#          title never asserts idle over a screen tier that has not confirmed
+#          it.
 
 [agent]
 id = "claude"
@@ -100,6 +109,10 @@ id = "composer_empty"
 state = "idle"
 composer_semantic = "clean"
 priority = 900
+# MEASURED mid-turn: the bare prompt row stays on screen during a turn, so
+# this row carries the clean composer semantic but never confirms idle or
+# ends a turn on its own.
+lifecycle_evidence = false
 region = "bottom_non_empty_lines(6)"
 line_regex = ['^\s*❯\s*$']
 note = """On 2.1.221 the empty composer stays visible below streaming output,
@@ -122,8 +135,37 @@ evidence = "MEASURED claude_idle_composer.txt; matches mid-turn on 2.1.221"
 id = "composer_working_spinner_status"
 state = "working"
 priority = 1150
-region = "bottom_non_empty_lines(10)"
-line_regex_esc = ['\x1b\[38;5;215m[·✶✽✳✢✻]\x1b\[39m\s+\x1b\[38;5;215m[A-Z][a-z]+…\s+\x1b\[38;5;246m\(\d+[smhd]']
+# MEASURED 2026-08-26 (Claude Code 2.1.246, probe a91f): long tool output
+# pushes the active row past ten rows, the gerund can be painted 38;5;222
+# with 38;5;215 inserted between the ellipsis and the timer, and multi-word
+# statuses exist. The glyph stays 38;5;215; the gerund accepts any SGR.
+region = "bottom_non_empty_lines(24)"
+line_regex = ['^[·✶✽✳✢✻]\s+\S+…(?:\s+\(.*\))?\s*$']
+line_regex_esc = ['^\x1b\[38;5;215m[·✶✽✳✢✻]\x1b\[39m\s+(?:\x1b\[[0-9;:]*m)*[A-Z][^\s…]*…(?:\x1b\[[0-9;:]*m)*\s+(?:\x1b\[[0-9;:]*m)*\(']
+
+# MEASURED 2026-08-26 (Claude Code 2.1.246, probe a91f, sanitized NDJSON
+# db34242c…): after every Stop hook round has finished, the transcript's
+# current completed row renders in uniform 38;5;246, the composer box
+# follows with a clean prompt, and no active 38;5;215 row sits between
+# them. While a Stop hook still runs (additionalContext can resume work) an
+# active row is painted below the completed row, so the ordered plain
+# suffix rejects any later activity-glyph row and the higher-priority
+# active rule is the second defense. This is the only shipped Claude rule
+# that is lifecycle evidence of idle; it requires the escaped capture.
+[[rule]]
+id = "composer_completed_terminal_suffix_2_1_246"
+state = "idle"
+composer_semantic = "clean"
+lifecycle_evidence = true
+priority = 1148
+region = "bottom_non_empty_lines(24)"
+regex = ['(?m)^[·✶✽✳✢✻]\s+\S+\s+for\s+\d+[smhd]\s+·\s+done\s+\d{1,2}:\d{2}\s+(?:AM|PM)\s*\n(?:[^·✶✽✳✢✻\n][^\n]*\n)*─{32,}\s*\n❯\s*\n─{32,}\s*\n(?:\s{0,4}(?:\S[^·\n]*(?: · [^·\n]+){2,} · \d+K window(?: · \d+K used)?|(?:Opus|Sonnet|Haiku) \d+(?:\.\d+)?(?: \([^·\n]*\))? · (?:xhigh|high|medium|low)(?: · [^·\n]+)* · [^·\n]*…)\s*(?:\n\s{0,4}paste again to expand\s*)?(?:\n\s{0,4}(?:⏸|⏵⏵) [^·\n]*\b(?:on|off)\b(?: \([^)]*\))?(?: · .+)?\s*)?|\s{0,4}(?:⏸|⏵⏵) [^·\n]*\b(?:on|off)\b(?: \([^)]*\))?(?: · .+)?\s*)\z']
+# One ordered escaped pattern, anchored at the end of the region: the
+# uniform-246 completed row, then only rows that do not open with the active
+# 38;5;215 color, then the 244 rule, the styled composer, the 244 rule, and
+# the trailer. Styling is proven on the same rows, in the same order, as the
+# plain suffix above; per-line escaped clauses could not tie them together.
+regex_esc = ['(?m)^\x1b\[38;5;246m[·✶✽✳✢✻]\x1b\[39m\s+\x1b\[38;5;246m\S+\s+for\s+\d+[smhd]\s+·\s+done\s+\d{1,2}:\d{2}\s+(?:AM|PM)\x1b\[39m\s*\n(?:(?:[^\x1b\n][^\n]*|\x1b\[(?:38;5;24[46]|39|0)m[^\n]*)\n)*\x1b\[38;5;244m─{32,}\s*\n(?:\x1b\[(?:38;5;246|39)m)*❯(?:\x{a0}| )*(?:\x1b\[(?:38;5;246|39)m)*\s*\n\x1b\[38;5;244m─{32,}\s*\n[^\n]*\z']
 evidence = "MEASURED live capture on Claude Code 2.1.236 (2026-08-20): styled active frames"
 
 [[rule]]
@@ -142,6 +184,9 @@ id = "composer_has_staged_input"
 state = "idle_with_input"
 composer_semantic = "human_input"
 priority = 1050
+# The typed-input row is the same mid-turn prompt row: a composer semantic,
+# never lifecycle evidence of idle.
+lifecycle_evidence = false
 region = "bottom_non_empty_lines(6)"
 line_regex = ['^\s*❯\s+\S']
 line_regex_esc = ['\x1b\[39m❯\x{a0}[^\x1b]']
@@ -168,6 +213,9 @@ evidence = "MEASURED F55 ghost probe 2026-08-13, Claude Code 2.1.222: empty 'ESC
 id = "composer_ghost_suggestion"
 state = "idle"
 priority = 1040
+# Ghost text is painted on the same mid-turn prompt row; an ambiguous frame
+# holds an active turn rather than ending it.
+lifecycle_evidence = false
 region = "bottom_non_empty_lines(6)"
 line_regex = ['^\s*❯\s+\S']
 line_regex_esc = ['❯\x{a0}\x1b\[2m\S']
@@ -188,6 +236,9 @@ id = "composer_styled_input"
 state = "idle_with_input"
 composer_semantic = "human_input"
 priority = 1035
+# The typed-input row is the same mid-turn prompt row: a composer semantic,
+# never lifecycle evidence of idle.
+lifecycle_evidence = false
 region = "bottom_non_empty_lines(6)"
 line_regex = ['^\s*❯\s+\S']
 line_regex_esc = ['\x1b\[39m❯\x{a0}\x1b\[']
@@ -207,6 +258,9 @@ id = "composer_unstyled_input"
 state = "idle_with_input"
 composer_semantic = "human_input"
 priority = 1030
+# The typed-input row is the same mid-turn prompt row: a composer semantic,
+# never lifecycle evidence of idle.
+lifecycle_evidence = false
 region = "bottom_non_empty_lines(10)"
 unstyled_only = true
 regex = ['(?m)^(?:❯(?: |\x{a0})\S[^\n]*|  \S[^\n]*)(?:\n  [^\n]*)*\n─{32,}\n\s{0,4}(?:\S[^·\n]*(?: · [^·\n]+){2,} · \d+K window(?: · \d+K used)?|(?:Opus|Sonnet|Haiku) \d+(?:\.\d+)?(?: \([^·\n]*\))? · (?:xhigh|high|medium|low)(?: · [^·\n]+)* · [^·\n]*…)\s*(?:\n\s{0,4}paste again to expand\s*)?(?:\n\s{0,4}(?:⏸|⏵⏵) [^·\n]*\b(?:on|off)\b(?: · .+| \(.+\))?\s*)?\z']

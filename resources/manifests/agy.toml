@@ -85,20 +85,18 @@ composer_semantic = "human_input"
 priority = 1050
 region = "bottom_non_empty_lines(4)"
 line_regex = ['^\s*>\s+\S']
-note = """Plain-only on purpose, unlike the claude and codex composer rules
-which need an SGR discriminator to separate a human draft from ghost text.
-MEASURED 2026-08-20 (issue 18, agy 1.1.13, `capture-pane -e` on a live idle
-pane): an empty composer renders exactly 'ESC[94m>ESC[39m' and paints NO
-placeholder or suggestion text after the glyph, so there is nothing here
-for a ghost rule to discriminate against. If a future version does paint
-one, this rule reads it as a human draft and deliveries hold forever:
-benign, visible, and the direction to fail in. Re-probe before relaxing it.
+line_regex_esc = ['^\x1b\[94m>\x1b\[39m\s+\S']
+note = """The escaped discriminator separates the active composer from AGY's
+transcript. On 1.1.21 the active prompt paints only the `>` blue, resets the
+style, then draws the input. A submitted prompt echoed in the transcript
+paints the whole row bold blue. Both become `> text` after escape stripping,
+so a plain-only rule would mistake old transcript input for the composer and
+make later exact-doorbell verification ambiguous.
 
-The observation covers the idle state on one version; typed-input styling
-was not captured, because the only agy pane available was a colleague's
-live session and typing into it to take a measurement is exactly what the
-gate exists to prevent."""
-evidence = "MEASURED: injected marker rendered as '> CYCVAL-ACK-AGY-002 ...'; empty composer 'ESC[94m>ESC[39m' with no ghost text (2026-08-20, agy 1.1.13)"
+The empty composer still renders exactly 'ESC[94m>ESC[39m' with no ghost or
+suggestion text. If a future version paints one, this rule fails closed as
+input until that representation is measured."""
+evidence = "MEASURED: active staged doorbell ESC[94m>ESC[39m text and transcript echo ESC[1mESC[34m> text (2026-08-26, agy 1.1.21); empty composer has no ghost text (2026-08-20, agy 1.1.13)"
 
 [[rule]]
 id = "screen_working"
@@ -139,6 +137,20 @@ startup logo, which is U+2580 block elements, not braille."""
 evidence = "MEASURED 2026-08-08, agy 1.1.11, fixtures/agy_working_composer_plain.txt; spinner present in frames 1-7 of a polled tool turn and absent from frame 8 on"
 
 [[rule]]
+id = "file_access_permission"
+state = "blocked_permission"
+priority = 1500
+region = "bottom_non_empty_lines(16)"
+contains = ["File access", "Allow access to this file?"]
+line_regex = ['^\s*>\s*1\.\s+Yes, allow access\s*$']
+note = """AGY replaces the composer with a numbered access decision while a tool
+waits on a file outside the workspace. All three measured clauses are required
+so ordinary agent prose cannot look like permission to submit a key. This
+decision belongs to the human and Cyclops never dismisses it."""
+evidence = "MEASURED 2026-08-26, agy 1.1.21, fixtures/agy_file_access_permission_{plain,esc}.txt"
+auto_dismiss = false
+
+[[rule]]
 id = "quota_exhausted"
 state = "blocked_quota"
 priority = 1400
@@ -177,7 +189,7 @@ submit = "Enter"
 verify_before_submit = true
 verify_pattern = ["<message_id>"]
 safe_states = ["idle"]
-unsafe_states = ["blocked_modal", "idle_with_input"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]
 first_paste_caveat = """MEASURED: the first paste after TUI startup did not stage
 (staged_in_composer=false) while the second did. Composer readiness lags the
 first rendered prompt glyph. Verify-before-submit catches this; a blind
@@ -198,6 +210,13 @@ composer_trailer_regex_esc = [
 ]
 # The first 2 rows are painted every time; the rest are optional.
 composer_trailer_required_prefix = 2
+# MEASURED live on agy 1.1.21. The active composer prompt is one plain `>`
+# followed by one separator space and the exact compact doorbell. Joined
+# continuation rows carry no trusted chrome here, so preserve every byte and
+# let the exact payload comparison decide. The styled trailer still proves the
+# active composer boundary before Cyclops can submit.
+composer_prompt_regex = '^\s*>\s?(?P<content>.*)$'
+composer_continuation_regex = '^(?P<content>.*)$'
 
 [context_leak]
 note = """agy auto-read ~/projects/COORDINATION.md and ~/projects/NOTES.md on the

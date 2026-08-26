@@ -43,6 +43,24 @@ pub const SERVER_GONE_OFFER: &str = "tmux server is gone. Run cyclops again to s
 
 pub const EVENT_STREAM_EMPTY: &str = "No events yet.";
 
+pub fn paste_too_large(bytes: usize) -> String {
+    format!("paste refused: {bytes} bytes exceeds the 1 MiB workspace limit")
+}
+
+pub fn stream_stale(why: &str) -> String {
+    format!("stream input dropped: {why}; rebuilding history")
+}
+
+pub fn pane_input_not_sent(pane: &str, error: &dyn std::fmt::Display) -> String {
+    format!("input was not sent to {pane}: {error}")
+}
+
+pub fn pane_input_uncertain(pane: &str, error: &dyn std::fmt::Display) -> String {
+    format!("input may have reached {pane}; it will not be replayed: {error}")
+}
+
+pub const STREAM_RECONCILED: &str = "stream rebuilt from the durable tail";
+
 // No space after the glyph: ☰ is ambiguous-width and most fonts already
 // draw it with a right shoulder, so a literal space read as a two-cell gap.
 pub const APP_MENU_BUTTON: &str = "☰menu";
@@ -117,6 +135,10 @@ pub const MENU_NEW_TAB: &str = "New tab";
 pub const MENU_NEW_WORKSPACE: &str = "New session";
 
 pub const MENU_TOGGLE_EVENTS: &str = "Event stream";
+
+pub const MENU_TOGGLE_MESSAGES: &str = "Messages";
+
+pub const BINDING_TOGGLE_MESSAGES: &str = "Toggle messages";
 
 /// Marks a menu row whose setting is on, and the active row in the theme
 /// picker. One cell in every monospace font, chosen by state and never by

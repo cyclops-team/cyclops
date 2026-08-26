@@ -77,6 +77,13 @@ each goes directly to `attention_required` with its exact cause. That state
 means the terminal outcome can be unknown, not that Cyclops proved the
 recipient did not receive the message. Inspect the pane before resending.
 
+One transport result is narrower than a generic paste failure. If the command
+pipe fails its first write before accepting any command byte, Cyclops records
+`paste_command_unwritten` and returns that exact workspace notification to
+`blocked_pre_write`. The durable correction precedes runtime hold release. A
+partial write or flush failure never takes this path and remains an ambiguous
+post-write `paste_failed`.
+
 - Enforced at: `src/cyclopsd/src/delivery.rs`, `gate` (admission),
   `occupant_unchanged` (both re-checks), `attempt_delivery` (the order),
   `inject`, `staged_representation`, and `exact_staging_proof` (verification).
@@ -445,10 +452,12 @@ empty, right now, with nothing live contradicting it. Absence of evidence
 is not clean evidence; a contested verdict is not clean evidence.
 
 An authenticated, exactly keyed turn start owns runtime `Working` before the
-first visual output frame. Idle title and composer frames can lag that edge,
-so repeated captures cannot erase it and elapsed time cannot convert it to
-`Idle`. Only the matching keyed end clears it. Process-binding retirement also
-clears the start.
+first visual output frame. Idle title and ordinary composer frames can lag that
+edge, so repeated captures cannot erase it and elapsed time cannot convert it
+to `Idle`. The matching keyed end clears it. A manifest-declared terminal
+screen rule may also clear it on one stable, current capture when that exact
+rule wins an idle-class frame; generic empty, ghost, and typed composer rules
+are never terminal evidence. Process-binding retirement also clears the start.
 
 An unkeyed confirmed vendor contract may use authenticated start and end
 events from the same process binding for runtime status. It still cannot bind

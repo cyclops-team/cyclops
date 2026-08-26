@@ -66,6 +66,7 @@ fn ping(ts: u64, pane_id: &str, subject: &str) -> Entry {
             subject: subject.into(),
             pane_id: Some(pane_id.into()),
             to: None,
+            recipient: None,
             deliveries: Vec::new(),
         },
     }
@@ -108,6 +109,7 @@ fn transcript() -> Vec<Step> {
             admin_unread: 0,
             mailbox_routes: Vec::new(),
             roster: Vec::new(),
+            mailbox: Vec::new(),
         })),
         Step::Backfill(
             vec![
@@ -173,8 +175,7 @@ fn feed_like_workspace(record: &mut Record, intake: &mut Intake, step: Step) {
 fn cyclops_watch_rows(record: &Record) -> Vec<String> {
     let plain = Theme::none();
     record
-        .entries()
-        .filter(|e| record.admits(e))
+        .admitted_entries()
         .flat_map(|e| e.lines(&plain, true))
         .collect()
 }

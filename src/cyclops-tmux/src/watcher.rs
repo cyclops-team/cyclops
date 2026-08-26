@@ -404,17 +404,20 @@ enum Action {
     None,
     /// Arm (or keep) the debounced reconcile.
     Hint,
+    /// Replace all derived state before accepting another notification.
+    ContinuityLost,
     /// The connection is over.
     Disconnect,
 }
 
 async fn watch_loop(
     mut ctx: LoopCtx,
-    mut notif_rx: mpsc::UnboundedReceiver<Notification>,
+    mut notif_rx: crate::control::NotificationReceiver,
     mut reconcile_rx: mpsc::Receiver<oneshot::Sender<Result<(), TmuxError>>>,
 ) {
     // One-shot deadline armed by hints. No hint, no timer: zero polling.
     let mut deadline: Option<tokio::time::Instant> = None;
+    let mut continuity_epoch = None;
     loop {
         tokio::select! {
             n = notif_rx.recv() => match n {
@@ -423,6 +426,31 @@ async fn watch_loop(
                     Action::Hint => {
                         if deadline.is_none() {
                             deadline = Some(tokio::time::Instant::now() + RECONCILE_DEBOUNCE);
+                        }
+                    }
+                    Action::ContinuityLost => {
+                        let epoch = notif_rx.hold_continuity();
+                        continuity_epoch = Some(epoch);
+                        match reconcile_current_session(&mut ctx).await {
+                            Ok(()) => {
+                                if notif_rx.resume_after_reconcile(epoch) {
+                                    continuity_epoch = None;
+                                    deadline = None;
+                                } else {
+                                    let _ = ctx.events.send(PaneEvent::Disconnected);
+                                    break;
+                                }
+                            }
+                            Err(TmuxError::Disconnected) => {
+                                let _ = ctx.events.send(PaneEvent::Disconnected);
+                                break;
+                            }
+                            Err(error) => {
+                                warn!(%error, "continuity reconciliation failed");
+                                deadline = Some(
+                                    tokio::time::Instant::now() + RECONCILE_DEBOUNCE
+                                );
+                            }
                         }
                     }
                     Action::Disconnect => {
@@ -440,6 +468,16 @@ async fn watch_loop(
                     let res = reconcile_current_session(&mut ctx).await;
                     let disconnected = matches!(res, Err(TmuxError::Disconnected));
                     let failed = res.is_err();
+                    if !failed {
+                        if let Some(epoch) = continuity_epoch {
+                            if notif_rx.resume_after_reconcile(epoch) {
+                                continuity_epoch = None;
+                            } else {
+                                let _ = ctx.events.send(PaneEvent::Disconnected);
+                                break;
+                            }
+                        }
+                    }
                     let _ = ack.send(res);
                     deadline = None;
                     // A non-Disconnected failure here may be the session
@@ -448,7 +486,10 @@ async fn watch_loop(
                     // the hint-deadline arm below); the probe is what tells
                     // the two apart.
                     let target = ctx.session_id.as_deref().unwrap_or(&ctx.session);
-                    if disconnected || (failed && session_gone(&ctx.client, target).await) {
+                    if disconnected
+                        || (failed && continuity_epoch.is_some())
+                        || (failed && session_gone(&ctx.client, target).await)
+                    {
                         let _ = ctx.events.send(PaneEvent::Disconnected);
                         break;
                     }
@@ -460,12 +501,26 @@ async fn watch_loop(
             ), if deadline.is_some() => {
                 deadline = None;
                 match reconcile_current_session(&mut ctx).await {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        if let Some(epoch) = continuity_epoch {
+                            if notif_rx.resume_after_reconcile(epoch) {
+                                continuity_epoch = None;
+                            } else {
+                                let _ = ctx.events.send(PaneEvent::Disconnected);
+                                break;
+                            }
+                        }
+                    }
                     Err(TmuxError::Disconnected) => {
                         let _ = ctx.events.send(PaneEvent::Disconnected);
                         break;
                     }
                     Err(e) => {
+                        if continuity_epoch.is_some() {
+                            warn!(error = %e, "continuity retry failed");
+                            let _ = ctx.events.send(PaneEvent::Disconnected);
+                            break;
+                        }
                         // Killing the watched session does not always
                         // disconnect this client: tmux can switch it to a
                         // surviving session instead of detaching it, and
@@ -487,6 +542,7 @@ async fn watch_loop(
 
 fn handle_notification(ctx: &mut LoopCtx, n: Notification) -> Action {
     match n {
+        Notification::ContinuityLost => Action::ContinuityLost,
         Notification::Output { pane, .. } | Notification::ExtendedOutput { pane, .. } => {
             output_activity(ctx, pane)
         }

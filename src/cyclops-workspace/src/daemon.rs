@@ -14,6 +14,10 @@ use cyclops_proto::{Hello, PaneStatus, Request, Response, StatusParams, StatusRe
 use serde_json::{json, Value};
 
 const IO_TIMEOUT: Duration = Duration::from_millis(250);
+/// Largest hello or response retained from the daemon. Status and action
+/// payloads share this envelope so a count-bounded app queue cannot receive
+/// one unbounded item.
+pub(crate) const DAEMON_LINE_MAX_BYTES: usize = 1 << 20;
 
 /// Deadline for a send, which is a different kind of request from every
 /// other one here.
@@ -101,21 +105,78 @@ fn exchange(
 }
 
 fn read_value(reader: &mut BufReader<UnixStream>, context: &str) -> Result<Value, String> {
-    let mut line = String::new();
-    match reader.read_line(&mut line) {
-        Ok(0) => return Err(format!("cyclopsd closed during {context}")),
-        Ok(_) => {}
-        Err(error) => return Err(format!("cannot read cyclopsd {context}: {error}")),
-    }
-    serde_json::from_str(line.trim())
+    let line = read_bounded_line(reader, context)?;
+    serde_json::from_slice(&line)
         .map_err(|error| format!("cyclopsd sent unreadable {context}: {error}"))
+}
+
+fn read_bounded_line(reader: &mut impl BufRead, context: &str) -> Result<Vec<u8>, String> {
+    let mut line = Vec::new();
+    loop {
+        let (take, complete) = {
+            let available = reader
+                .fill_buf()
+                .map_err(|error| format!("cannot read cyclopsd {context}: {error}"))?;
+            if available.is_empty() {
+                if line.is_empty() {
+                    return Err(format!("cyclopsd closed during {context}"));
+                }
+                return Ok(line);
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let take = newline.map_or(available.len(), |index| index + 1);
+            if line.len().saturating_add(take) > DAEMON_LINE_MAX_BYTES {
+                return Err(format!(
+                    "cyclopsd {context} exceeded {DAEMON_LINE_MAX_BYTES} bytes"
+                ));
+            }
+            line.extend_from_slice(&available[..take]);
+            (take, newline.is_some())
+        };
+        reader.consume(take);
+        if complete {
+            return Ok(line);
+        }
+    }
+}
+
+/// A daemon refusal with its stable machine-readable code intact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DaemonRefusal {
+    pub code: String,
+    pub message: String,
+    pub data: Option<Value>,
+}
+
+impl From<cyclops_proto::WireError> for DaemonRefusal {
+    fn from(error: cyclops_proto::WireError) -> Self {
+        Self {
+            code: error.code,
+            message: error.message,
+            data: error.data,
+        }
+    }
+}
+
+impl DaemonRefusal {
+    #[cfg(test)]
+    pub(crate) fn new(code: &str, message: &str) -> Self {
+        Self {
+            code: code.to_string(),
+            message: message.to_string(),
+            data: None,
+        }
+    }
 }
 
 /// Result of a composer send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SendOutcome {
     Accepted(String),
-    Rejected(String),
+    /// The request did not reach the daemon.
+    NotSent(String),
+    /// The daemon answered no. The code is kept for state-specific recovery.
+    Rejected(DaemonRefusal),
     /// The request write began, but no trustworthy response arrived.
     Unknown(String),
 }
@@ -139,24 +200,81 @@ pub fn send_message(
     body: &str,
     client_key: &str,
 ) -> SendOutcome {
+    send_message_request(
+        home,
+        MessageRequest {
+            to: vec![to.to_string()],
+            recipient_keys: None,
+            expected_caller: None,
+            subject,
+            body,
+            fyi: false,
+            reply_to: None,
+            client_key,
+        },
+    )
+}
+
+/// Exact sender and recipients used by the Messages composer.
+pub struct ExactMessageRequest<'a> {
+    pub recipient_keys: Option<Vec<cyclops_proto::RecipientKey>>,
+    pub expected_caller: cyclops_proto::RecipientKey,
+    pub subject: &'a str,
+    pub body: &'a str,
+    pub fyi: bool,
+    pub reply_to: Option<String>,
+    pub client_key: &'a str,
+}
+
+/// Send from the Messages surface using exact recipients or a reply reference.
+pub fn send_message_full(home: &Path, request: ExactMessageRequest<'_>) -> SendOutcome {
+    send_message_request(
+        home,
+        MessageRequest {
+            to: Vec::new(),
+            recipient_keys: request.recipient_keys,
+            expected_caller: Some(request.expected_caller),
+            subject: request.subject,
+            body: request.body,
+            fyi: request.fyi,
+            reply_to: request.reply_to,
+            client_key: request.client_key,
+        },
+    )
+}
+
+struct MessageRequest<'a> {
+    to: Vec<String>,
+    recipient_keys: Option<Vec<cyclops_proto::RecipientKey>>,
+    expected_caller: Option<cyclops_proto::RecipientKey>,
+    subject: &'a str,
+    body: &'a str,
+    fyi: bool,
+    reply_to: Option<String>,
+    client_key: &'a str,
+}
+
+fn send_message_request(home: &Path, request: MessageRequest<'_>) -> SendOutcome {
     let params = match serde_json::to_value(cyclops_proto::MsgSendParams {
-        to: vec![to.to_string()],
-        subject: subject.to_string(),
-        body: body.to_string(),
-        fyi: false,
-        client_key: Some(client_key.to_string()),
-        reply_to: None,
+        to: request.to,
+        recipient_keys: request.recipient_keys,
+        expected_caller: request.expected_caller,
+        subject: request.subject.to_string(),
+        body: request.body.to_string(),
+        fyi: request.fyi,
+        client_key: Some(request.client_key.to_string()),
+        reply_to: request.reply_to,
         supersedes: None,
         wait: None,
     }) {
         Ok(params) => params,
         Err(error) => {
-            return SendOutcome::Rejected(format!("cannot encode the message: {error}"));
+            return SendOutcome::NotSent(format!("cannot encode the message: {error}"));
         }
     };
     let mut reader = match connect_with(home, SEND_TIMEOUT) {
         Ok(reader) => reader,
-        Err(error) => return SendOutcome::Rejected(error),
+        Err(error) => return SendOutcome::NotSent(error),
     };
     if let Err(error) = write_request(reader.get_mut(), "msg.send", params) {
         return SendOutcome::Unknown(error);
@@ -179,7 +297,7 @@ pub fn send_message(
         );
     }
     if let Some(error) = response.error {
-        return SendOutcome::Rejected(error.message);
+        return SendOutcome::Rejected(error.into());
     }
     let Some(value) = response.result else {
         return SendOutcome::Unknown("cyclopsd omitted the msg.send result".to_string());
@@ -209,6 +327,20 @@ fn receipt_line(result: &cyclops_proto::MsgSendResult) -> String {
         ),
         None => format!("{} · on the record", result.msg_id),
     }
+}
+
+/// Fetch a bounded snapshot of recent messages for the Messages TUI.
+pub fn fetch_messages_snapshot(
+    home: &Path,
+    limit: usize,
+) -> Result<cyclops_proto::MessagesSnapshotResult, String> {
+    let params = serde_json::to_value(cyclops_proto::MessagesSnapshotParams {
+        recent_settled: u32::try_from(limit).unwrap_or(u32::MAX).min(100),
+    })
+    .map_err(|e| format!("cannot encode messages.snapshot params: {e}"))?;
+    let value = request(home, "messages.snapshot", params)?;
+    serde_json::from_value(value)
+        .map_err(|e| format!("cannot decode messages.snapshot result: {e}"))
 }
 
 /// Current daemon status. Callers pass the shared protocol params so the
@@ -302,6 +434,16 @@ pub fn label_pane(home: &Path, pane_id: &str, label: &str) -> Result<(), String>
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn response_lines_stop_before_allocating_past_the_envelope() {
+        let oversized = vec![b'x'; DAEMON_LINE_MAX_BYTES + 1];
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(oversized));
+        let error = read_bounded_line(&mut reader, "test response")
+            .expect_err("an oversized response must be refused");
+        assert!(error.contains("exceeded"), "{error}");
+        assert!(reader.buffer().len() <= DAEMON_LINE_MAX_BYTES);
+    }
 
     #[test]
     fn request_consumes_the_mandatory_hello_before_the_response() {
@@ -423,7 +565,7 @@ mod tests {
         let outcome = send_message(&home, "missing", "hello", "hello", "workspace-rejected-key");
         assert_eq!(
             outcome,
-            SendOutcome::Rejected("no such recipient".to_string())
+            SendOutcome::Rejected(DaemonRefusal::new("unknown_recipient", "no such recipient"))
         );
         server.join().expect("server");
         let _ = std::fs::remove_dir_all(home);

@@ -175,9 +175,17 @@ The correction has four parts:
    representations. Capture identity, ancestry, manifest, route, rule winners,
    readiness, write boundary, and hook behavior without recording terminal
    content in journals.
-2. Bound repeated identical pre-write failure by evidence changes. After the
-   bounded evaluation, retain one named visible blocked notification. Do not
-   retry on a timer and do not touch the composer.
+2. Bound repeated identical pre-write failure by an explicit route-evidence
+   identity. Synthetic post-block reconciliation reuses the recorded identity.
+   Each watcher, process, or adoption source mints one identity before recompute,
+   and every inner and outer schedule for that source reuses it. A standalone
+   readiness mutation mints only when the tuple changes. A `CurrentCommand` edge
+   counts even when exec-in-place preserves pane root and readiness. A later
+   generation may reopen the same attempt once, including when its complete
+   binding is unchanged. After that bounded evaluation, retain one named visible
+   blocked notification. Do not retry on a timer and do not touch the composer.
+   Tokenless lifecycle, status, and inspection recomputes remain observational:
+   they may publish readiness but cannot mint evidence or reconcile delivery.
 3. Permit an operator to withdraw one exact recipient notification only while
    its mailbox entry is unclaimed and the daemon proves no terminal write may
    have occurred. The append-only withdrawal retains message history and
@@ -245,7 +253,18 @@ An earlier focused pass does not substitute for the frozen run.
 - Composer barriers cannot leak if a worker exits between the write boundary and
   durable state transition.
 - Repeated identical `binding_unprovable` evidence settles into one visible
-  pre-write blocked notification and performs no timer retry.
+  pre-write blocked notification and performs no timer retry. Synthetic
+  reconciliation cannot advance its evidence identity. One causal source mints
+  one token shared by recompute readiness and its follow-on schedule, so a block
+  landing between those schedules cannot turn one event into two. One later
+  same-binding observation may reopen the exact attempt once. A `CurrentCommand`
+  exec-in-place edge and a real binding change remain independently admissible
+  under the same bound. Non-width readiness recovery requires a clean verdict
+  under a strictly later token. A readiness block with no binding or width
+  observation records its current route token only as that comparison baseline.
+  Width recovery requires an actual width change. Replay at reopen count zero
+  preserves the same and stale-token refusal before a later token consumes the
+  one-reopen allowance.
 - A matched idle rule without composer ownership semantics settles into one
   visible `composer_semantic_missing` pre-write block with zero pane writes.
 - Recipient-scoped withdrawal accepts only an exact, unclaimed, provably

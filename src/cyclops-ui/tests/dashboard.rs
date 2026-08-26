@@ -37,6 +37,7 @@ fn seeded_app() -> App {
                 state_ms: None,
             },
         ],
+        mailbox: Vec::new(),
     });
     app
 }
@@ -244,6 +245,7 @@ fn a_late_source_removal_keeps_the_transferred_pane_focusable() {
         blocked_notifications_total: 0,
         manifests: None,
         pid: None,
+        mailbox_attention: Vec::new(),
     };
     let mut app = App::new(Theme::none(), View::Firehose, Filter::default());
     app.seed_status(StatusSeed::from_status(&status));

@@ -9,7 +9,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
-use crate::{MessageId, ProcessInstanceId, RecipientKey};
+use crate::{ComposerState, MessageId, ProcessInstanceId, RecipientKey};
 
 /// Errors returned by validated notification identifiers.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -127,7 +127,9 @@ impl<'de> Deserialize<'de> for NotificationManifestId {
 
 /// State of one recipient's one-shot wake notification.
 ///
-/// `Writing` is the durable boundary before the external composer write.
+/// `Writing` is the durable boundary before the external composer write. A
+/// later `paste_command_unwritten` fact may correct it to `BlockedPreWrite`
+/// only when the command pipe proves that it accepted zero command bytes.
 /// Recovery may resume `Queued` or `Gating`. A claimed `Staged` doorbell may
 /// resume only to re-prove and clear that exact attempt. A claimed `Submitted`
 /// doorbell may settle as `Notified`. Other unresolved states from `Writing`
@@ -183,6 +185,8 @@ impl NotificationState {
             BlockedPreWrite => matches!(next, Gating | Withdrawn | WithdrawnByOperator),
             QuotaHeld => next == QuotaResetObserved,
             QuotaResetObserved => false,
+            // The zero-byte Writing correction is cause-gated by the
+            // notification projection and cannot be expressed by states alone.
             Writing => matches!(next, Staged | AttentionRequired),
             Staged => matches!(next, Submitting | AttentionRequired),
             Submitting => matches!(next, Submitted | AttentionRequired),
@@ -247,12 +251,19 @@ pub enum NotificationPreWriteCause {
     WriteReadinessChanged,
     /// The terminal paste buffer could not be prepared before the write.
     SpoolFailed,
+    /// The terminal command pipe refused the paste command before accepting
+    /// any command byte.
+    PasteCommandUnwritten,
     /// The manifest selected at the gate could not be proven against the
     /// live process ancestry immediately before the write.
     BindingUnprovable,
     /// The matched screen rule does not classify its composer ownership.
     /// No terminal write can be authorized until the manifest is repaired.
     ComposerSemanticMissing,
+    /// The terminal grid cannot prove the complete application composer.
+    /// No terminal write or submit key is authorized until an application
+    /// source proves the exact composer bytes.
+    ComposerOwnershipUnproven,
     /// The delivery worker exited twice before any terminal write.
     WorkerFailed,
 }
@@ -266,8 +277,10 @@ impl NotificationPreWriteCause {
             Self::PayloadUnavailable => "payload_unavailable",
             Self::WriteReadinessChanged => "write_readiness_changed",
             Self::SpoolFailed => "spool_failed",
+            Self::PasteCommandUnwritten => "paste_command_unwritten",
             Self::BindingUnprovable => "binding_unprovable",
             Self::ComposerSemanticMissing => "composer_semantic_missing",
+            Self::ComposerOwnershipUnproven => "composer_ownership_unproven",
             Self::WorkerFailed => "worker_failed",
         }
     }
@@ -280,8 +293,10 @@ impl NotificationPreWriteCause {
             Self::PayloadUnavailable => "payload unavailable",
             Self::WriteReadinessChanged => "write readiness changed",
             Self::SpoolFailed => "paste buffer preparation failed",
+            Self::PasteCommandUnwritten => "paste command was not written",
             Self::BindingUnprovable => "binding unprovable",
             Self::ComposerSemanticMissing => "composer ownership rule missing",
+            Self::ComposerOwnershipUnproven => "complete composer ownership unproven",
             Self::WorkerFailed => "worker failed",
         }
     }
@@ -292,7 +307,20 @@ impl NotificationPreWriteCause {
 /// A later scheduler compares this stamp with a fresh observation. The same
 /// stamp cannot reopen the attempt and produce another identical retry chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationRouteEvidenceId {
+    /// Daemon run that observed this route evidence.
+    pub boot_id: String,
+    /// Pane-local causal observation generation within the daemon run.
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotificationPreWriteObservation {
+    /// The named write block the pane carried when the wake was held before
+    /// any write, for example `hook_admission_unproven`. Content-free: a
+    /// block name, never pane text. Absent on rows written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_block: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_root: Option<ProcessInstanceId>,
     /// Manifest selected by the gate for this attempt.
@@ -302,12 +330,31 @@ pub struct NotificationPreWriteObservation {
     /// even when the pane process generation does not change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_manifest: Option<NotificationManifestId>,
-    /// The complete binding observed at the write boundary.
+    /// The last complete binding observed during the attempt's pre-write proof.
     ///
-    /// None is a failed proof. A binding is kept whole so the journal cannot
-    /// represent a partially proven leader, agent, or manifest as authority.
+    /// A failed terminal lookup retains an earlier admitted binding when one
+    /// exists. That baseline lets a later scheduler distinguish the unchanged
+    /// occupant from a real process edge. None means no complete binding was
+    /// observed. A binding is kept whole so the journal cannot represent a
+    /// partially proven leader, agent, or manifest as authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<NotificationBinding>,
+    /// Identity of the causal route observation behind this proof.
+    ///
+    /// Synthetic reconciliation reuses the current identity. A watcher,
+    /// process, adoption, or readiness edge advances it, including when the
+    /// resulting complete process binding is identical to the prior proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_evidence: Option<NotificationRouteEvidenceId>,
+    /// Pane width observed without storing any terminal content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_width: Option<u32>,
+    /// Minimum pane width required by the selected notification format.
+    ///
+    /// Stored beside the observed width so replay does not reinterpret an
+    /// older block after a future format changes its threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_pane_width: Option<u32>,
 }
 
 /// Closed causes for an ambiguous outcome after the write boundary.
@@ -322,6 +369,40 @@ pub enum NotificationAttentionCause {
     AckTimeout,
     DaemonRestart,
     TransportOutcomeUnknown,
+}
+
+/// Closed reason an exact post-write composer verification failed.
+///
+/// The journal records classification only. Captured terminal bytes remain
+/// local to the verifier and never enter durable state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationVerifyFailureKind {
+    /// The composer exposed content that did not equal the staged doorbell.
+    Mismatch,
+    /// No usable capture arrived during the bounded verification window.
+    Timeout,
+    /// The expected Cyclops-owned content was no longer present.
+    OwnerMissing,
+    /// Available evidence could not assign one exact failure class.
+    Ambiguous,
+}
+
+/// Content-free observation attached to a `verify_failed` transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationVerifyOutcome {
+    pub kind: NotificationVerifyFailureKind,
+    pub observed_composer: ComposerState,
+}
+
+impl NotificationVerifyOutcome {
+    /// Conservative fallback for callers that know only that verification failed.
+    pub const fn ambiguous() -> Self {
+        Self {
+            kind: NotificationVerifyFailureKind::Ambiguous,
+            observed_composer: ComposerState::ComposerAmbiguous,
+        }
+    }
 }
 
 /// Operator decision for one staged notification attempt.
@@ -339,7 +420,7 @@ pub enum NotificationResolution {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationResolutionConsumptionEvidence {
-    /// An authenticated hook carried an attempt-bound v2 payload whose
+    /// An authenticated hook carried an exact-attempt payload whose
     /// lossless token parsed to this exact attempt under the same binding.
     ExactHookPrompt,
     /// The exact durable recipient claimed this message after the terminal
@@ -446,6 +527,12 @@ pub enum NotificationTransport {
 pub const DOORBELL_FORMAT_COMPACT_CLAIM: u32 = 1;
 /// Claim-command doorbell carrying an injective token for the exact attempt.
 pub const DOORBELL_FORMAT_ATTEMPT_CLAIM: u32 = 2;
+/// Single-row claim command carrying only the exact attempt token.
+pub const DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM: u32 = 3;
+/// Minimum pane width that can carry doorbell format 3 as one exact row.
+pub const DOORBELL_V3_MIN_PANE_WIDTH: u32 = 60;
+/// Message-shaped namespace reserved for exact notification-attempt claims.
+pub const NOTIFICATION_ATTEMPT_CLAIM_LOCATOR_PREFIX: &str = "m-att_";
 /// Current proof contract for a terminal-action resolution fact.
 ///
 /// Missing values identify legacy facts written before action acceptance and
@@ -495,8 +582,20 @@ pub struct NotificationRecord {
     pub doorbell_format: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cause: Option<NotificationAttentionCause>,
+    /// Closed, content-free detail for a `verify_failed` transition.
+    ///
+    /// Older journal rows omit this field and replay with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_outcome: Option<NotificationVerifyOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_write_cause: Option<NotificationPreWriteCause>,
+    /// Exact scheduler outcome that left this attempt without a live owner.
+    ///
+    /// This is separate from `pre_write_cause`: the latter describes the
+    /// terminal boundary, while this field preserves the recoverable wake
+    /// diagnosis across daemon restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_block: Option<crate::wire::MessageWakeBlock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_write_observation: Option<NotificationPreWriteObservation>,
     /// Automatic evidence-driven reopens already used by this attempt.
@@ -521,7 +620,7 @@ impl NotificationRecord {
         self.state == NotificationState::AttentionRequired
             && self.cause == Some(NotificationAttentionCause::VerifyFailed)
             && self.transport == NotificationTransport::Doorbell
-            && self.doorbell_format == Some(DOORBELL_FORMAT_ATTEMPT_CLAIM)
+            && doorbell_format_names_exact_attempt(self.doorbell_format)
             && self.binding.as_ref().is_some_and(|binding| {
                 binding.recipient == self.recipient
                     && binding.pane_root.is_some()
@@ -538,7 +637,7 @@ impl NotificationRecord {
         self.state == NotificationState::AttentionRequired
             && self.cause == Some(NotificationAttentionCause::AckTimeout)
             && self.transport == NotificationTransport::Doorbell
-            && self.doorbell_format == Some(DOORBELL_FORMAT_ATTEMPT_CLAIM)
+            && doorbell_format_names_exact_attempt(self.doorbell_format)
             && self.binding.as_ref().is_some_and(|binding| {
                 binding.recipient == self.recipient
                     && binding.pane_root.is_some()
@@ -578,10 +677,16 @@ pub enum NotificationFact {
         doorbell_format: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         cause: Option<NotificationAttentionCause>,
+        /// Present only when `cause` is `verify_failed`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verify_outcome: Option<NotificationVerifyOutcome>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pre_write_cause: Option<NotificationPreWriteCause>,
+        /// Exact scheduler outcome for a pre-write block.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pre_write_observation: Option<NotificationPreWriteObservation>,
+        wake_block: Option<crate::wire::MessageWakeBlock>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pre_write_observation: Option<Box<NotificationPreWriteObservation>>,
     },
     NotificationRequeued {
         record_version: u32,
@@ -709,7 +814,7 @@ pub enum NotificationFact {
         message_id: MessageId,
         recipient: RecipientKey,
     },
-    /// A late exact recipient claim reconciled one v2 doorbell ACK timeout.
+    /// A late exact recipient claim reconciled one doorbell ACK timeout.
     ///
     /// The daemon appends this only after the exact bound composer was cleared,
     /// or after crash recovery proved that same composer visibly clean. The
@@ -754,7 +859,15 @@ pub fn render_doorbell_v1(oldest_msg_id: &MessageId) -> String {
 pub fn render_doorbell_v2(oldest_msg_id: &MessageId, attempt_id: NotificationAttemptId) -> String {
     format!(
         "cyclops inbox claim {oldest_msg_id} #c:{}",
-        compact_attempt_token(attempt_id)
+        notification_attempt_token(attempt_id)
+    )
+}
+
+/// Rebuild single-row attempt-locator doorbell format 3.
+pub fn render_doorbell_v3(attempt_id: NotificationAttemptId) -> String {
+    format!(
+        "cyclops inbox claim {}",
+        notification_attempt_claim_locator(attempt_id)
     )
 }
 
@@ -772,11 +885,12 @@ pub fn parse_doorbell_v2(payload: &str) -> Option<(MessageId, NotificationAttemp
     }
     Some((
         MessageId::new(message_id).ok()?,
-        decode_attempt_token(token)?,
+        parse_notification_attempt_token(token)?,
     ))
 }
 
-fn compact_attempt_token(attempt_id: NotificationAttemptId) -> String {
+/// Encode every bit of one attempt identity as 22 URL-safe characters.
+fn notification_attempt_token(attempt_id: NotificationAttemptId) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let bytes = attempt_id.0.as_bytes();
     let mut encoded = String::with_capacity(22);
@@ -792,7 +906,8 @@ fn compact_attempt_token(attempt_id: NotificationAttemptId) -> String {
     encoded
 }
 
-fn decode_attempt_token(encoded: &str) -> Option<NotificationAttemptId> {
+/// Decode only the canonical, lossless 22-character attempt token.
+fn parse_notification_attempt_token(encoded: &str) -> Option<NotificationAttemptId> {
     if encoded.len() != 22 || !encoded.is_ascii() {
         return None;
     }
@@ -816,7 +931,49 @@ fn decode_attempt_token(encoded: &str) -> Option<NotificationAttemptId> {
     }
     bytes[15] = (values[20] << 2) | (values[21] >> 4);
     let uuid = Uuid::from_bytes(bytes);
-    (!uuid.is_nil()).then_some(NotificationAttemptId(uuid))
+    let attempt_id = (!uuid.is_nil()).then_some(NotificationAttemptId(uuid))?;
+    (notification_attempt_token(attempt_id) == encoded).then_some(attempt_id)
+}
+
+/// Build the canonical message-shaped locator understood by `inbox.claim`.
+///
+/// Production message ids are `m-` plus 32 lowercase hex characters. The
+/// reserved `m-att_` prefix is therefore disjoint from every minted id while
+/// remaining valid input for older positional claim clients.
+pub fn notification_attempt_claim_locator(attempt_id: NotificationAttemptId) -> MessageId {
+    MessageId::new(format!(
+        "{NOTIFICATION_ATTEMPT_CLAIM_LOCATOR_PREFIX}{}",
+        notification_attempt_token(attempt_id)
+    ))
+    .expect("the reserved attempt locator is a valid message-shaped id")
+}
+
+/// Decode only the canonical reserved locator for one exact attempt.
+pub fn parse_notification_attempt_claim_locator(
+    message_id: &MessageId,
+) -> Option<NotificationAttemptId> {
+    let token = message_id
+        .as_str()
+        .strip_prefix(NOTIFICATION_ATTEMPT_CLAIM_LOCATOR_PREFIX)?;
+    let attempt_id = parse_notification_attempt_token(token)?;
+    (notification_attempt_claim_locator(attempt_id).as_str() == message_id.as_str())
+        .then_some(attempt_id)
+}
+
+/// Parse the exact attempt identity carried by doorbell format 3.
+pub fn parse_doorbell_v3(payload: &str) -> Option<NotificationAttemptId> {
+    let payload = payload.strip_suffix('\n').unwrap_or(payload);
+    let locator = payload.strip_prefix("cyclops inbox claim ")?;
+    let message_id = MessageId::new(locator).ok()?;
+    parse_notification_attempt_claim_locator(&message_id)
+}
+
+/// Whether a doorbell format names one exact notification attempt.
+pub const fn doorbell_format_names_exact_attempt(format: Option<u32>) -> bool {
+    matches!(
+        format,
+        Some(DOORBELL_FORMAT_ATTEMPT_CLAIM | DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM)
+    )
 }
 
 fn decode_attempt_character(character: u8) -> Option<u8> {
@@ -914,6 +1071,10 @@ mod tests {
             ),
             (NotificationPreWriteCause::SpoolFailed, "spool_failed"),
             (
+                NotificationPreWriteCause::PasteCommandUnwritten,
+                "paste_command_unwritten",
+            ),
+            (
                 NotificationPreWriteCause::BindingUnprovable,
                 "binding_unprovable",
             ),
@@ -929,6 +1090,51 @@ mod tests {
             assert_eq!(serde_json::to_value(cause).unwrap(), wire_name);
             assert!(!cause.label().is_empty());
         }
+    }
+
+    #[test]
+    fn width_block_keeps_the_closed_prewrite_cause_rollback_decodable() {
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        #[serde(rename_all = "snake_case")]
+        enum LegacyPreWriteCause {
+            WriteReadinessChanged,
+        }
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        struct LegacyObservation {
+            selected_manifest: Option<String>,
+        }
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        struct LegacyBlock {
+            pre_write_cause: LegacyPreWriteCause,
+            pre_write_observation: LegacyObservation,
+        }
+
+        let current = serde_json::json!({
+            "pre_write_cause": NotificationPreWriteCause::WriteReadinessChanged,
+            "pre_write_observation": {
+                "selected_manifest": "codex",
+                "pane_width": 59,
+                "required_pane_width": 60
+            }
+        });
+        let legacy: LegacyBlock = serde_json::from_value(current).unwrap();
+        assert_eq!(
+            legacy.pre_write_cause,
+            LegacyPreWriteCause::WriteReadinessChanged
+        );
+        assert_eq!(
+            legacy.pre_write_observation.selected_manifest.as_deref(),
+            Some("codex")
+        );
+
+        let prior: NotificationPreWriteObservation = serde_json::from_value(serde_json::json!({
+            "selected_manifest": "codex",
+            "pane_width": 59
+        }))
+        .unwrap();
+        assert_eq!(prior.pane_width, Some(59));
+        assert_eq!(prior.required_pane_width, None);
+        assert_eq!(prior.route_evidence, None);
     }
 
     #[test]
@@ -951,7 +1157,9 @@ mod tests {
             transport: NotificationTransport::DirectPayload,
             doorbell_format: None,
             cause: None,
+            verify_outcome: None,
             pre_write_cause: None,
+            wake_block: None,
             pre_write_observation: None,
             pre_write_reopen_count: 0,
             started_seq: 1,
@@ -1092,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_v2_ack_timeout_requires_composer_reconciliation_after_claim() {
+    fn exact_attempt_ack_timeout_requires_composer_reconciliation_after_claim() {
         let workspace = "00000000-0000-0000-0000-000000000001".parse().unwrap();
         let session = "00000000-0000-0000-0000-000000000002".parse().unwrap();
         let recipient = RecipientKey::agent(workspace, session, "%3".parse().unwrap());
@@ -1112,7 +1320,9 @@ mod tests {
             transport: NotificationTransport::Doorbell,
             doorbell_format: Some(DOORBELL_FORMAT_ATTEMPT_CLAIM),
             cause: Some(NotificationAttentionCause::AckTimeout),
+            verify_outcome: None,
             pre_write_cause: None,
+            wake_block: None,
             pre_write_observation: None,
             pre_write_reopen_count: 0,
             started_seq: 1,
@@ -1121,6 +1331,12 @@ mod tests {
         };
 
         assert!(record.needs_claimed_ack_timeout_reconciliation());
+
+        let mut current = record.clone();
+        current.doorbell_format = Some(DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM);
+        assert!(current.needs_claimed_ack_timeout_reconciliation());
+        current.cause = Some(NotificationAttentionCause::VerifyFailed);
+        assert!(current.needs_exact_owned_reconciliation());
 
         let mut invalid = record.clone();
         invalid.cause = Some(NotificationAttentionCause::VerifyFailed);
@@ -1181,6 +1397,69 @@ mod tests {
             parse_doorbell_v2(&render_doorbell_v1(&MessageId::new("m-3f9c2a").unwrap())),
             None
         );
+    }
+
+    #[test]
+    fn doorbell_v3_is_exact_single_line_and_rejects_noncanonical_locators() {
+        let first =
+            NotificationAttemptId::parse("att-00000000-0000-4000-8000-000000000001").unwrap();
+        let second =
+            NotificationAttemptId::parse("att-00000000-0000-4000-8000-000000000002").unwrap();
+        let hyphen =
+            NotificationAttemptId::parse("att-f8000000-0000-4000-8000-000000000001").unwrap();
+        let double_hyphen =
+            NotificationAttemptId::parse("att-fbe00000-0000-4000-8000-000000000001").unwrap();
+        let first_token = notification_attempt_token(first);
+        let first_locator = notification_attempt_claim_locator(first);
+        let first_payload = render_doorbell_v3(first);
+
+        assert_eq!(first_token.len(), 22);
+        assert_eq!(first_locator.as_str(), format!("m-att_{first_token}"));
+        assert_eq!(
+            parse_notification_attempt_claim_locator(&first_locator),
+            Some(first)
+        );
+        assert_ne!(first_payload, render_doorbell_v3(second));
+        assert_eq!(parse_doorbell_v3(&first_payload), Some(first));
+        assert_eq!(
+            parse_doorbell_v3(&format!("{first_payload}\n")),
+            Some(first)
+        );
+        assert_eq!(parse_notification_attempt_token(&first_token), Some(first));
+        assert_eq!(parse_doorbell_v3(&format!("{first_payload} extra")), None);
+        assert_eq!(parse_doorbell_v3(&format!(" {first_payload}")), None);
+        assert_eq!(
+            parse_notification_attempt_token("AAAAAAAAQACAAAAAAAAAAR"),
+            None
+        );
+        assert_eq!(
+            parse_notification_attempt_claim_locator(
+                &MessageId::new("m-att_AAAAAAAAQACAAAAAAAAAAR").unwrap()
+            ),
+            None
+        );
+        assert_eq!(
+            parse_notification_attempt_claim_locator(
+                &MessageId::new("m-00000000000040008000000000000001").unwrap()
+            ),
+            None
+        );
+        assert_eq!(parse_doorbell_v2(&first_payload), None);
+        assert_eq!(notification_attempt_token(hyphen), "-AAAAAAAQACAAAAAAAAAAQ");
+        assert_eq!(
+            notification_attempt_token(double_hyphen),
+            "--AAAAAAQACAAAAAAAAAAQ"
+        );
+        assert_eq!(
+            parse_notification_attempt_token("--AAAAAAQACAAAAAAAAAAQ"),
+            Some(double_hyphen)
+        );
+        assert_eq!(
+            parse_doorbell_v3("cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ"),
+            Some(double_hyphen)
+        );
+        assert_eq!(2 + first_payload.chars().count(), 50);
+        assert!(2 + first_payload.chars().count() <= DOORBELL_V3_MIN_PANE_WIDTH as usize);
     }
 
     #[test]
@@ -1248,6 +1527,7 @@ mod tests {
             decoded,
             NotificationFact::NotificationTransition {
                 doorbell_format: None,
+                verify_outcome: None,
                 ..
             }
         ));
@@ -1262,7 +1542,9 @@ mod tests {
             transport: Some(NotificationTransport::Doorbell),
             doorbell_format: Some(DOORBELL_FORMAT_ATTEMPT_CLAIM),
             cause: None,
+            verify_outcome: None,
             pre_write_cause: None,
+            wake_block: None,
             pre_write_observation: None,
         };
         let encoded = serde_json::to_value(current).unwrap();
@@ -1277,6 +1559,50 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn pre_write_observation_indirection_is_transparent_on_the_wire() {
+        let workspace = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let session = "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let fact = NotificationFact::NotificationTransition {
+            record_version: 1,
+            attempt_id: NotificationAttemptId::generate(),
+            message_id: MessageId::new("m-prewrite-wire").unwrap(),
+            recipient: RecipientKey::agent(workspace, session, "%3".parse().unwrap()),
+            state: NotificationState::BlockedPreWrite,
+            binding: None,
+            transport: None,
+            doorbell_format: None,
+            cause: None,
+            verify_outcome: None,
+            pre_write_cause: Some(NotificationPreWriteCause::WriteReadinessChanged),
+            wake_block: None,
+            pre_write_observation: Some(Box::new(NotificationPreWriteObservation {
+                pane_root: None,
+                selected_manifest: None,
+                binding: None,
+                route_evidence: Some(NotificationRouteEvidenceId {
+                    boot_id: "boot-route".into(),
+                    generation: 9,
+                }),
+                pane_width: Some(59),
+                required_pane_width: Some(60),
+                write_block: None,
+            })),
+        };
+
+        let encoded = serde_json::to_value(&fact).unwrap();
+        assert_eq!(
+            encoded["pre_write_observation"],
+            serde_json::json!({
+                "route_evidence": {"boot_id": "boot-route", "generation": 9},
+                "pane_width": 59,
+                "required_pane_width": 60
+            })
+        );
+        let decoded: NotificationFact = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, fact);
     }
 
     #[test]

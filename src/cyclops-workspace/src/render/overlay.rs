@@ -1095,6 +1095,8 @@ pub struct MenuChecks {
     /// session tree. The item toggles between the two, so a check here
     /// means "the stream is what you are looking at".
     pub stream: bool,
+    /// Whether the right messages drawer is open.
+    pub messages: bool,
     /// Whether the sidebar's file panel is open. Stored as a row count, so
     /// this is "more than zero rows" rather than a flag of its own.
     pub files: bool,
@@ -1119,6 +1121,11 @@ pub fn menu_items(menu: &MenuState, checks: MenuChecks) -> Vec<MenuRow> {
                 copy::MENU_TOGGLE_EVENTS,
                 BindingAction::ToggleEventPanel,
                 Some(checks.stream),
+            ),
+            (
+                copy::MENU_TOGGLE_MESSAGES,
+                BindingAction::ToggleMessages,
+                Some(checks.messages),
             ),
             // The tab strip's only visible switch. It sits beside the
             // stream toggle because both answer the same question: which
@@ -1375,6 +1382,7 @@ mod tests {
             tab_bar: true,
             motion: true,
             stream: false,
+            messages: true,
         };
         let rows = menu_items(&MenuState::AppMenu, on);
         let checked = |rows: &[MenuRow], label: &str| {
@@ -1440,6 +1448,7 @@ mod tests {
                 tab_bar: true,
                 motion: false,
                 stream: false,
+                messages: false,
             },
         );
         let tab_bar = app_on
@@ -1521,6 +1530,7 @@ mod tests {
                 BindingAction::NewTab,
                 BindingAction::NewWorkspace,
                 BindingAction::ToggleEventPanel,
+                BindingAction::ToggleMessages,
                 BindingAction::ToggleTabBar,
                 // The file panel's only switch: its seam can close it, and
                 // a closed panel leaves no seam to reopen with.

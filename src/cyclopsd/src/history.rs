@@ -1,6 +1,7 @@
 //! Read-side queries over the authoritative workspace message journal.
 //!
-//! Pre-upgrade session ledgers remain readable as compatibility sources.
+//! Pre-upgrade session ledgers remain readable as compatibility sources,
+//! including runtime-named journals linked by a later session rename.
 //! Workspace records are read first and duplicate message identifiers are
 //! returned once. New messages are never copied into a session ledger.
 //!
@@ -15,16 +16,18 @@
 //! machine, so no indexed reader was added to that crate; the additive
 //! index stays a measured-need option, not a speculative one.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use cyclops_proto::{
-    HistoryParams, HistoryResult, Kind, LedgerLine, MessageMetadata, OpenDelivery, RecipientKey,
-    ThreadResult, WireError,
+    Delivery, HistoryParams, HistoryResult, Kind, LedgerLine, MessageMetadata, OpenDelivery,
+    RecipientKey, ThreadResult, WireError,
 };
+use cyclops_state::StateRoot;
 use serde_json::Value;
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::identity;
 use crate::mailbox::MailboxIdentity;
@@ -314,7 +317,6 @@ fn history_sources(inner: &Inner) -> (Vec<Vec<LedgerLine>>, Vec<String>, Option<
     let mut files = Vec::new();
     let mut names = Vec::new();
     let mut workspace_file = None;
-    let mut seen = HashSet::new();
     if let Some(service) = &inner.mailbox {
         match service.journal_lines() {
             Ok(lines) if !lines.is_empty() => {
@@ -328,24 +330,214 @@ fn history_sources(inner: &Inner) -> (Vec<Vec<LedgerLine>>, Vec<String>, Option<
             }
         }
     }
-    for slot in inner.session_slots() {
-        let source = legacy_journal_source(&slot);
-        if seen.insert(source.clone()) {
-            names.push(source);
-            files.push(read_session(&slot));
-        }
+    let roots = inner
+        .session_slots()
+        .into_iter()
+        .enumerate()
+        .map(|(idx, slot)| {
+            (
+                idx,
+                slot.journal_file_name().unwrap_or_default(),
+                read_session(&slot),
+            )
+        })
+        .collect();
+    for (journal, lines) in session_journal_replay(&inner.state_root, roots).files {
+        names.push(legacy_journal_source_for_file(&journal));
+        files.push(lines);
     }
     (files, names, workspace_file)
 }
 
-fn legacy_journal_source(slot: &crate::SessionSlot) -> String {
-    let file = slot
-        .ledger
-        .path()
-        .file_name()
-        .map(|name| name.to_string_lossy())
-        .unwrap_or_default();
+fn legacy_journal_source_for_file(file: &str) -> String {
     format!("session-journal:{file}")
+}
+
+pub(crate) struct SessionJournalReplay {
+    /// Globally unique files for id preload and the history read model.
+    pub(crate) files: Vec<(String, Vec<LedgerLine>)>,
+    /// One causally ordered stream per unambiguous configured root.
+    pub(crate) recovery: Vec<(usize, Vec<LedgerLine>)>,
+}
+
+struct SessionJournalNode {
+    journal: String,
+    lines: Vec<LedgerLine>,
+    links: Vec<String>,
+    owners: BTreeSet<usize>,
+}
+
+/// Root session journals plus every rename-linked journal they reach.
+///
+/// History and boot recovery share this traversal so a linked compatibility
+/// chain cannot be visible to readers while remaining invisible to id preload
+/// or restart settlement. History sees each file once. Recovery sees each
+/// unambiguous family descendants-first and its configured root last, so a
+/// terminal fact appended to the root on an earlier boot follows the linked
+/// message that fact closes.
+pub(crate) fn session_journal_replay(
+    state_root: &StateRoot,
+    roots: Vec<(usize, String, Vec<LedgerLine>)>,
+) -> SessionJournalReplay {
+    let mut nodes = Vec::<SessionJournalNode>::new();
+    let mut by_journal = HashMap::<String, usize>::new();
+    let mut root_nodes = Vec::new();
+    let mut pending = VecDeque::<(usize, usize)>::new();
+    for (idx, journal, lines) in roots {
+        let node_idx = match by_journal.get(&journal).copied() {
+            Some(node_idx) => node_idx,
+            None => {
+                let node_idx = nodes.len();
+                by_journal.insert(journal.clone(), node_idx);
+                nodes.push(SessionJournalNode {
+                    links: linked_session_journals(&lines),
+                    journal,
+                    lines,
+                    owners: BTreeSet::new(),
+                });
+                node_idx
+            }
+        };
+        root_nodes.push((idx, node_idx));
+        if nodes[node_idx].owners.insert(idx) {
+            pending.push_back((node_idx, idx));
+        }
+    }
+
+    // The queue is one (journal, configured owner) pair. A cycle can revisit
+    // a file, but it cannot add the same owner twice, so traversal is bounded
+    // by files times configured roots.
+    while let Some((node_idx, owner)) = pending.pop_front() {
+        let links = nodes[node_idx].links.clone();
+        for linked in links {
+            let linked_idx = match by_journal.get(&linked).copied() {
+                Some(linked_idx) => linked_idx,
+                None => {
+                    let descendant = PathBuf::from("ledger").join(&linked);
+                    let lines = match cyclops_ledger::read_after(state_root, &descendant, 0) {
+                        Ok(lines) => lines,
+                        Err(read_error) => {
+                            warn!(journal = linked, error = %read_error, "linked session journal is unreadable");
+                            Vec::new()
+                        }
+                    };
+                    let linked_idx = nodes.len();
+                    by_journal.insert(linked.clone(), linked_idx);
+                    nodes.push(SessionJournalNode {
+                        links: linked_session_journals(&lines),
+                        journal: linked,
+                        lines,
+                        owners: BTreeSet::new(),
+                    });
+                    linked_idx
+                }
+            };
+            if nodes[linked_idx].owners.insert(owner) {
+                pending.push_back((linked_idx, owner));
+            }
+        }
+    }
+
+    for node in &nodes {
+        if node.owners.len() > 1 {
+            error!(
+                journal = node.journal,
+                owners = ?node.owners,
+                "linked session journal has more than one configured owner; restart recovery will leave it untouched"
+            );
+        }
+    }
+
+    fn collect_descendants_first(
+        node_idx: usize,
+        owner: usize,
+        nodes: &[SessionJournalNode],
+        by_journal: &HashMap<String, usize>,
+        visited: &mut HashSet<usize>,
+        order: &mut Vec<usize>,
+    ) {
+        if !visited.insert(node_idx)
+            || nodes[node_idx].owners.len() != 1
+            || !nodes[node_idx].owners.contains(&owner)
+        {
+            return;
+        }
+        for linked in &nodes[node_idx].links {
+            if let Some(linked_idx) = by_journal.get(linked).copied() {
+                collect_descendants_first(linked_idx, owner, nodes, by_journal, visited, order);
+            }
+        }
+        order.push(node_idx);
+    }
+
+    let mut recovery = Vec::new();
+    let mut history_order = Vec::new();
+    let mut history_seen = HashSet::new();
+    for (owner, root_idx) in root_nodes {
+        let mut visited = HashSet::new();
+        let mut family = Vec::new();
+        collect_descendants_first(
+            root_idx,
+            owner,
+            &nodes,
+            &by_journal,
+            &mut visited,
+            &mut family,
+        );
+        let lines = family
+            .iter()
+            .flat_map(|node_idx| nodes[*node_idx].lines.iter().cloned())
+            .collect();
+        for node_idx in family {
+            if history_seen.insert(node_idx) {
+                history_order.push(node_idx);
+            }
+        }
+        recovery.push((owner, lines));
+    }
+    // Ambiguously owned or otherwise unreachable nodes stay visible to
+    // history and id preload, but follow the unambiguous causal families.
+    for node_idx in 0..nodes.len() {
+        if history_seen.insert(node_idx) {
+            history_order.push(node_idx);
+        }
+    }
+    let mut nodes = nodes.into_iter().map(Some).collect::<Vec<_>>();
+    let files = history_order
+        .into_iter()
+        .map(|node_idx| {
+            let node = nodes[node_idx].take().expect("journal emitted once");
+            (node.journal, node.lines)
+        })
+        .collect();
+    SessionJournalReplay { files, recovery }
+}
+
+fn linked_session_journals(lines: &[LedgerLine]) -> Vec<String> {
+    lines
+        .iter()
+        .filter_map(|line| line.data.as_ref())
+        .filter(|data| data["event"] == "session_slot_aliased")
+        .filter_map(|data| data["canonical_journal"].as_str())
+        .filter_map(|file| {
+            if valid_session_journal_file(file) {
+                Some(file.to_owned())
+            } else {
+                warn!(journal = file, "invalid linked session journal was ignored");
+                None
+            }
+        })
+        .collect()
+}
+
+fn valid_session_journal_file(file: &str) -> bool {
+    let path = Path::new(file);
+    matches!(
+        path.components().collect::<Vec<_>>().as_slice(),
+        [Component::Normal(_)]
+    ) && path
+        .extension()
+        .is_some_and(|extension| extension == "ndjson")
 }
 
 fn read_session(slot: &crate::SessionSlot) -> Vec<LedgerLine> {
@@ -402,6 +594,9 @@ pub(crate) fn fold_messages(lines: &[LedgerLine]) -> Vec<LedgerLine> {
     msgs
 }
 
+type DeliveryKey = (String, String);
+type DeliveryRank = (usize, u64);
+
 /// Merge per-file folded messages into one stream. Compatibility copies
 /// merge only when no workspace record owns their id. Other copies dedupe
 /// by id, and each recipient keeps its newest delivery record. Output is
@@ -413,6 +608,7 @@ pub(crate) fn merge_files(
     let workspace_ids = workspace_record_ids(files, workspace_file);
     let mut merged: Vec<LedgerLine> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
+    let mut delivery_sources: HashMap<DeliveryKey, usize> = HashMap::new();
     for (file_index, file) in files.iter().enumerate() {
         for msg in fold_messages(file) {
             if workspace_ids.contains(msg.id.as_str()) && Some(file_index) != workspace_file {
@@ -420,12 +616,16 @@ pub(crate) fn merge_files(
             }
             match index.get(&msg.id) {
                 None => {
+                    for delivery in &msg.deliveries {
+                        delivery_sources.insert((msg.id.clone(), delivery.to.clone()), file_index);
+                    }
                     index.insert(msg.id.clone(), merged.len());
                     merged.push(msg);
                 }
                 Some(&i) => {
                     let kept = &mut merged[i];
                     for d in msg.deliveries {
+                        let key = (msg.id.clone(), d.to.clone());
                         match kept.deliveries.iter_mut().find(|k| k.to == d.to) {
                             Some(k) => {
                                 // Newest transition wins; on a ts tie the
@@ -437,13 +637,68 @@ pub(crate) fn merge_files(
                                         && d.state != cyclops_proto::DeliveryState::Queued);
                                 if advanced {
                                     *k = d;
+                                    delivery_sources.insert(key, file_index);
                                 }
                             }
-                            None => kept.deliveries.push(d),
+                            None => {
+                                kept.deliveries.push(d);
+                                delivery_sources.insert(key, file_index);
+                            }
                         }
                     }
                 }
             }
+        }
+    }
+    // A rename-linked compatibility family can carry the Msg fact in the
+    // old runtime-named journal and its later recovery State fact in the
+    // configured root. `fold_messages` deliberately folds one file, so apply
+    // the newest explicit transition across files after the message copies
+    // have merged. Workspace-owned ids still accept facts only from the
+    // workspace journal.
+    let mut states: HashMap<DeliveryKey, (DeliveryRank, Delivery)> = HashMap::new();
+    let mut scan_order = 0_u64;
+    for (file_index, file) in files.iter().enumerate() {
+        for line in file {
+            scan_order = scan_order.saturating_add(1);
+            if line.kind != Kind::State
+                || (workspace_ids.contains(line.id.as_str()) && Some(file_index) != workspace_file)
+                || !line
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| data.get("to_state").is_some())
+            {
+                continue;
+            }
+            let Some(record) = line.deliveries.first() else {
+                continue;
+            };
+            let key = (line.id.clone(), record.to.clone());
+            let rank = (file_index, scan_order);
+            if states.get(&key).is_none_or(|(current, _)| rank > *current) {
+                states.insert(key, (rank, record.clone()));
+            }
+        }
+    }
+    for ((id, to), (rank, record)) in states {
+        let Some(&message_index) = index.get(&id) else {
+            continue;
+        };
+        let message = &mut merged[message_index];
+        match message
+            .deliveries
+            .iter_mut()
+            .find(|delivery| delivery.to == to)
+        {
+            Some(current)
+                if delivery_sources
+                    .get(&(id.clone(), to.clone()))
+                    .is_none_or(|source| rank.0 >= *source) =>
+            {
+                *current = record
+            }
+            Some(_) => {}
+            None => message.deliveries.push(record),
         }
     }
     sort_lines(&mut merged);
@@ -497,6 +752,7 @@ pub(crate) fn open_from(
                     state: d.state,
                     ts: d.ts,
                     cause: d.cause.clone(),
+                    attempt_id: None,
                 });
             }
         }
@@ -1612,6 +1868,7 @@ mod tests {
                 sender.clone(),
                 MailboxSend {
                     addresses: vec![recipient.label.clone()],
+                    recipient_keys: None,
                     subject: "canonical subject".into(),
                     body: "canonical body".into(),
                     fyi: false,

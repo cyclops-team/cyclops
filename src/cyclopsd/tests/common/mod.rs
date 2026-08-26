@@ -23,6 +23,18 @@ use tokio::net::UnixStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const MAX_CONCURRENT_RIGS: usize = 8;
+// RECONNECT_MIN reaches RECONNECT_MAX after 6.2 seconds. Allow two complete
+// five-second retries after that ladder, then round up for runner scheduling.
+const SESSION_ATTACH_TIMEOUT: Duration = Duration::from_secs(20);
+// Integration requests can wait behind a reconnect or screen recompute on a
+// loaded runner. Keep the bound finite while allowing that work to finish.
+const CLIENT_LINE_TIMEOUT: Duration = Duration::from_secs(30);
+// The first post-handshake request can include the daemon's initial session
+// adoption and screen recompute. On a macOS runner executing the whole suite
+// twice, that bounded work has twice exceeded the ordinary request budget
+// while the same test passed in the adjacent run. Keep later requests tight;
+// give only request 1 one additional ordinary window.
+const FIRST_REQUEST_LINE_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn rig_slots() -> &'static Arc<Semaphore> {
     static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -122,8 +134,11 @@ process_names = ["python3", "python", "Python", "cat", "sh", "dash"]
 [[rule]]
 id = "always_idle"
 state = "idle"
-priority = 100
-region = "pane_title"
+priority = 70
+region = "bottom_non_empty_lines(4)"
+# The fixture screen is the idle authority: a blank or plain pane is idle,
+# and this rule is the lifecycle evidence that confirms it.
+lifecycle_evidence = true
 regex = ['^']
 
 # The screen sensor must be able to answer for these panes, because a
@@ -153,6 +168,9 @@ id = "composer_holds_paste"
 state = "idle_with_input"
 composer_semantic = "human_input"
 priority = 80
+# A staged row is a composer semantic, never lifecycle evidence of idle:
+# the pane fuses to unknown, and only the exact owner acts on it.
+lifecycle_evidence = false
 # The active composer only. The escaped matcher rejects the dim transcript
 # prompt that the fixture paints after consuming a turn.
 region = "bottom_non_empty_lines(3)"
@@ -208,8 +226,11 @@ ack_payload_field = "prompt"
 [[rule]]
 id = "always_idle"
 state = "idle"
-priority = 100
-region = "pane_title"
+priority = 70
+region = "bottom_non_empty_lines(4)"
+# The fixture screen is the idle authority: a blank or plain pane is idle,
+# and this rule is the lifecycle evidence that confirms it.
+lifecycle_evidence = true
 regex = ['^']
 
 # The screen sensor must be able to answer for these panes, because a
@@ -239,6 +260,9 @@ id = "composer_holds_paste"
 state = "idle_with_input"
 composer_semantic = "human_input"
 priority = 80
+# A staged row is a composer semantic, never lifecycle evidence of idle:
+# the pane fuses to unknown, and only the exact owner acts on it.
+lifecycle_evidence = false
 # The active composer only. The escaped matcher rejects the dim transcript
 # prompt that the fixture paints after consuming a turn.
 region = "bottom_non_empty_lines(3)"
@@ -265,6 +289,68 @@ verify_pattern = ["<message_id>"]
 # What the fake TUI paints below the composer, in order and in both
 # forms. Two rows, both required, both painted: this is the authentic
 # sentinel lane rather than a chip declared over raw text.
+composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
+composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
+composer_trailer_required_prefix = 2
+composer_prompt_regex = '^❯ (?P<content>.*)$'
+composer_continuation_regex = '^(?P<content>.*)$'
+"#;
+
+/// Hook liveness fixture: the same composer as [`HOOK_MANIFEST`] with no
+/// lifecycle-evidence idle rule at all. A clean composer proves only that
+/// the composer is clean; runtime idle needs an admitting hook edge from
+/// the current daemon boot. Panes under this manifest start as `unknown`
+/// with the `hook_admission_unproven` write block until a `SessionStart`
+/// (or a configured `UserPromptSubmit` start) is reported for the current
+/// occupant, which is exactly the recovery path the hook admission tests
+/// exercise.
+pub const LIVENESS_MANIFEST: &str = r#"
+[agent]
+id = "fix"
+display_name = "Hook liveness fixture"
+process_names = ["python3", "python", "Python", "cat", "sh", "dash"]
+
+[hooks]
+available = ["SessionStart", "UserPromptSubmit", "Stop"]
+turn_start = "UserPromptSubmit"
+turn_start_evidence = "confirmed"
+turn_end = "Stop"
+turn_end_evidence = "confirmed"
+ack = "UserPromptSubmit"
+ack_payload_field = "prompt"
+
+# A clean composer is a composer claim only, never lifecycle evidence of
+# idle: the fused verdict stays unknown until an admitting edge exists.
+[[rule]]
+id = "composer_empty"
+state = "idle"
+composer_semantic = "clean"
+lifecycle_evidence = false
+priority = 90
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^❯\s*$']
+
+[[rule]]
+id = "composer_holds_paste"
+state = "idle_with_input"
+composer_semantic = "human_input"
+priority = 80
+lifecycle_evidence = false
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^\s*❯\s+\S']
+line_regex_esc = ['^❯']
+
+[[rule]]
+id = "composer_working"
+state = "working"
+priority = 300
+region = "bottom_non_empty_lines(5)"
+line_regex = ['^FAKETUI-WORKING$']
+
+[injection]
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
 composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
 composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
 composer_trailer_required_prefix = 2
@@ -300,8 +386,11 @@ auto_dismiss = false
 [[rule]]
 id = "always_idle"
 state = "idle"
-priority = 100
-region = "pane_title"
+priority = 70
+region = "bottom_non_empty_lines(4)"
+# The fixture screen is the idle authority: a blank or plain pane is idle,
+# and this rule is the lifecycle evidence that confirms it.
+lifecycle_evidence = true
 regex = ['^']
 
 # The screen sensor must be able to answer for these panes, because a
@@ -331,6 +420,9 @@ id = "composer_holds_paste"
 state = "idle_with_input"
 composer_semantic = "human_input"
 priority = 80
+# A staged row is a composer semantic, never lifecycle evidence of idle:
+# the pane fuses to unknown, and only the exact owner acts on it.
+lifecycle_evidence = false
 # The active composer only. The escaped matcher rejects the dim transcript
 # prompt that the fixture paints after consuming a turn.
 region = "bottom_non_empty_lines(3)"
@@ -381,8 +473,11 @@ contains = ["Individual quota reached"]
 [[rule]]
 id = "always_idle"
 state = "idle"
-priority = 100
-region = "pane_title"
+priority = 70
+region = "bottom_non_empty_lines(4)"
+# The fixture screen is the idle authority: a blank or plain pane is idle,
+# and this rule is the lifecycle evidence that confirms it.
+lifecycle_evidence = true
 regex = ['^']
 
 # The screen sensor must be able to answer for these panes, because a
@@ -412,6 +507,9 @@ id = "composer_holds_paste"
 state = "idle_with_input"
 composer_semantic = "human_input"
 priority = 80
+# A staged row is a composer semantic, never lifecycle evidence of idle:
+# the pane fuses to unknown, and only the exact owner acts on it.
+lifecycle_evidence = false
 # The active composer only. The escaped matcher rejects the dim transcript
 # prompt that the fixture paints after consuming a turn.
 region = "bottom_non_empty_lines(3)"
@@ -462,8 +560,11 @@ contains = ["BUSY-MARKER"]
 [[rule]]
 id = "always_idle"
 state = "idle"
-priority = 100
-region = "pane_title"
+priority = 70
+region = "bottom_non_empty_lines(4)"
+# The fixture screen is the idle authority: a blank or plain pane is idle,
+# and this rule is the lifecycle evidence that confirms it.
+lifecycle_evidence = true
 regex = ['^']
 
 # The screen sensor must be able to answer for these panes, because a
@@ -493,6 +594,9 @@ id = "composer_holds_paste"
 state = "idle_with_input"
 composer_semantic = "human_input"
 priority = 80
+# A staged row is a composer semantic, never lifecycle evidence of idle:
+# the pane fuses to unknown, and only the exact owner acts on it.
+lifecycle_evidence = false
 # The active composer only. The escaped matcher rejects the dim transcript
 # prompt that the fixture paints after consuming a turn.
 region = "bottom_non_empty_lines(3)"
@@ -537,8 +641,11 @@ process_names = ["python3", "python", "Python", "cat", "sh", "bash", "dash"]
 [[rule]]
 id = "always_idle"
 state = "idle"
-priority = 100
-region = "pane_title"
+priority = 70
+region = "bottom_non_empty_lines(4)"
+# The fixture screen is the idle authority: a blank or plain pane is idle,
+# and this rule is the lifecycle evidence that confirms it.
+lifecycle_evidence = true
 regex = ['^']
 
 # Screen-idle evidence only: this fixture exists to make verification
@@ -610,11 +717,24 @@ impl TestClient {
     }
 
     pub async fn next_line(&mut self) -> Value {
-        let line = tokio::time::timeout(Duration::from_secs(10), self.lines.next_line())
-            .await
-            .expect("line within 10s")
-            .expect("read line")
-            .expect("connection open");
+        self.next_line_for(None).await
+    }
+
+    async fn next_line_for(&mut self, request: Option<(u64, &str)>) -> Value {
+        let timeout = if request.is_some_and(|(id, _)| id == 1) {
+            FIRST_REQUEST_LINE_TIMEOUT
+        } else {
+            CLIENT_LINE_TIMEOUT
+        };
+        let line = match tokio::time::timeout(timeout, self.lines.next_line()).await {
+            Ok(line) => line.expect("read line").expect("connection open"),
+            Err(_) => match request {
+                Some((id, method)) => {
+                    panic!("no line within {timeout:?} while waiting for request {id} ({method})")
+                }
+                None => panic!("no line within {timeout:?} while waiting for an event"),
+            },
+        };
         serde_json::from_str(&line).expect("line parses")
     }
 
@@ -627,7 +747,7 @@ impl TestClient {
             .await
             .expect("write to daemon");
         loop {
-            let v = self.next_line().await;
+            let v = self.next_line_for(Some((id, method))).await;
             if v.get("event").is_some() {
                 self.pending_events.push_back(v);
                 continue;
@@ -662,7 +782,10 @@ impl TestClient {
                 Instant::now() < deadline,
                 "no matching event within {within:?}"
             );
-            let v = self.next_line().await;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let v = tokio::time::timeout(remaining, self.next_line())
+                .await
+                .unwrap_or_else(|_| panic!("no matching event within {within:?}"));
             if v.get("event").is_some() {
                 if pred(&v) {
                     return v;
@@ -845,7 +968,7 @@ impl Rig {
     }
 
     pub async fn wait_attached_session(&mut self, idx: usize, panes: usize) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + SESSION_ATTACH_TIMEOUT;
         loop {
             let resp = self.ctl.request("status", json!({})).await;
             let session = &resp["result"]["sessions"][idx];
@@ -921,11 +1044,41 @@ impl Rig {
     }
 
     pub fn ledger_lines_for(&self, session: &str) -> Vec<Value> {
-        let text = std::fs::read_to_string(self.ledger_path_for(session)).expect("ledger readable");
-        text.lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| serde_json::from_str(l).expect("ledger line is valid JSON"))
-            .collect()
+        const READ_ATTEMPTS: usize = 50;
+        const READ_RETRY: Duration = Duration::from_millis(20);
+
+        // A concurrent append can expose its final JSON before the newline.
+        // Retry only that unfinished tail. Completed malformed lines fail now.
+        for attempt in 0..READ_ATTEMPTS {
+            let text =
+                std::fs::read_to_string(self.ledger_path_for(session)).expect("ledger readable");
+            let lines: Vec<_> = text
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .collect();
+            let mut parsed = Vec::with_capacity(lines.len());
+
+            for (index, line) in lines.iter().enumerate() {
+                match serde_json::from_str(line) {
+                    Ok(value) => parsed.push(value),
+                    Err(error) => {
+                        let final_line_is_in_flight =
+                            index + 1 == lines.len() && !text.ends_with('\n');
+                        if final_line_is_in_flight && attempt + 1 < READ_ATTEMPTS {
+                            std::thread::sleep(READ_RETRY);
+                            break;
+                        }
+                        panic!("ledger line is valid JSON: {error}");
+                    }
+                }
+            }
+
+            if parsed.len() == lines.len() {
+                return parsed;
+            }
+        }
+
+        unreachable!("the final bounded ledger read either returns or reports its parse error")
     }
 
     /// The whole-run ledger contract: every line is jq-parseable and

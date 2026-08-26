@@ -19,9 +19,9 @@ use std::path::Path;
 use serde_json::Value;
 
 use cyclops_proto::{
-    AgentState, Attention, AttentionItem, ComposerMessageState, ComposerNextAction, ComposerProof,
-    ComposerState, Delivery, DeliveryReceipt, DeliveryState, Detection, Event, Kind, LedgerLine,
-    NotificationState, PaneStatus, Sensor, StatusResult,
+    delivery_needs_human, AgentState, Attention, ComposerMessageState, ComposerNextAction,
+    ComposerProof, ComposerState, Delivery, DeliveryReceipt, DeliveryState, Detection, Event, Kind,
+    LedgerLine, NotificationState, PaneStatus, Sensor, StatusResult,
 };
 use cyclops_ui::grid;
 
@@ -294,10 +294,13 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
     } else {
         names.join(", ")
     };
-    // Normal status reports the live pane fleet. Durable delivery alarms
-    // remain in the mailbox, alarm, and stream surfaces that can act on
-    // them. The named constructor makes that scope an explicit decision.
-    let attention = Attention::from_live_status(res);
+    // The eye counts everything on the record that waits on a human: blocked
+    // panes, legacy direct-delivery alarms, and the durable mailbox attention
+    // and held queue heads the daemon folds into `open_deliveries`. A closed
+    // eye with a dead mailbox queue behind it was the two-day failure this
+    // replaces. A caller that did not ask for open deliveries gets the pane
+    // fleet alone, which is what the constructor sees in that case.
+    let attention = Attention::from_status(res);
     let eye = attention.header();
     let mut header = format!(
         "{} {} {sep} watching {watching} {sep} tmux {} {sep} up {}",
@@ -327,7 +330,7 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
         ];
         out.extend(blocked_notification_rows(res, style));
         out.extend(diagnostic_rows(res, style));
-        out.extend(waiting_rows(&attention, res, style));
+        out.extend(waiting_rows(res, style));
         return out.join("\n");
     }
 
@@ -392,8 +395,19 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
     out.extend(unknown_rows(res, style));
     out.extend(blocked_notification_rows(res, style));
     out.extend(diagnostic_rows(res, style));
-    out.extend(waiting_rows(&attention, res, style));
+    out.extend(waiting_rows(res, style));
     out.join("\n")
+}
+
+/// Whether the detailed `blocked_notifications` row for `attempt` is already
+/// on screen as a mailbox waiting row. One attempt is one row with one reason
+/// and one next action: the waiting row carries both, so the detailed row
+/// yields to it.
+fn blocked_row_hidden_by_mailbox(
+    attempt: &cyclops_proto::NotificationAttemptId,
+    mailbox: &[cyclops_proto::OpenDelivery],
+) -> bool {
+    mailbox.iter().any(|row| row.attempt_id == Some(*attempt))
 }
 
 fn blocked_notification_rows(res: &StatusResult, style: &Style) -> Vec<String> {
@@ -404,11 +418,37 @@ fn blocked_notification_rows(res: &StatusResult, style: &Style) -> Vec<String> {
         String::new(),
         format!("  {}", style.dim("wake blocked before write")),
     ];
-    for item in &res.blocked_notifications {
-        let reason = match item.recipient.notification.pre_write_cause {
-            Some(cause) => cause.label(),
-            None => "reason unavailable",
-        };
+    for item in res.blocked_notifications.iter().filter(|item| {
+        !blocked_row_hidden_by_mailbox(&item.notification_attempt, &res.mailbox_attention)
+    }) {
+        let reason = item
+            .recipient
+            .notification
+            .pane_width_block()
+            .map(|(observed, required)| copy::pane_too_narrow(observed, required))
+            .or_else(|| {
+                item.recipient
+                    .notification
+                    .wake_block
+                    .map(|block| block.label().to_string())
+            })
+            .or_else(|| {
+                // A named block on the observation is the exact reason
+                // (for example hook admission unproven); the enum cause is
+                // the coarser fallback for rows written before it existed.
+                item.recipient
+                    .notification
+                    .pre_write_block
+                    .as_deref()
+                    .map(grid::cause_words)
+            })
+            .or_else(|| {
+                item.recipient
+                    .notification
+                    .pre_write_cause
+                    .map(|cause| cause.label().to_string())
+            })
+            .unwrap_or_else(|| "reason unavailable".to_string());
         let position = item
             .recipient
             .fifo_position
@@ -829,21 +869,33 @@ pub fn render_named(result: &Value, style: &Style) -> String {
 /// work remains.
 const STATUS_DELIVERY_ROW_LIMIT: usize = 8;
 
-fn waiting_rows(attention: &Attention, res: &StatusResult, style: &Style) -> Vec<String> {
-    let mut open: Vec<(String, String, DeliveryState, Option<String>, u64)> = attention
-        .items()
-        .into_iter()
-        .filter_map(|i| match i {
-            AttentionItem::Delivery { to, id, state } => {
-                let (cause, ts) = res
-                    .open_deliveries
-                    .iter()
-                    .find(|d| d.to == to && d.id == id)
-                    .map(|d| (d.cause.clone(), d.ts))
-                    .unwrap_or((None, 0));
-                Some((to, id, state, cause, ts))
+fn waiting_rows(res: &StatusResult, style: &Style) -> Vec<String> {
+    // Rows come straight from the record's two halves: the durable mailbox
+    // rows and the legacy session-ledger fold. The attention register
+    // decides the eye and keys items the same way; nothing here looks a row
+    // up by display label. Identity for deduplication is the typed
+    // recipient identity (exact key, or the label only for a legacy row
+    // that never carried one) plus the message id, and the attempt id
+    // where one exists.
+    // Every raw row resolves through the register itself, so a legacy-label
+    // row and its unique exact twin collapse to one key exactly as the eye
+    // counts them. Mailbox rows come first and override.
+    let attention = Attention::from_status(res);
+    let mut seen: std::collections::HashSet<cyclops_proto::AttentionKey> = Default::default();
+    let mut seen_attempts: std::collections::HashSet<cyclops_proto::NotificationAttemptId> =
+        Default::default();
+    let mut open: Vec<&cyclops_proto::OpenDelivery> = res
+        .mailbox_attention
+        .iter()
+        .chain(res.open_deliveries.iter())
+        .filter(|d| delivery_needs_human(d.state))
+        .filter(|d| {
+            if let Some(attempt) = d.attempt_id {
+                if !seen_attempts.insert(attempt) {
+                    return false;
+                }
             }
-            AttentionItem::Agent { .. } => None,
+            seen.insert(attention.key_for(d.recipient, &d.to, &d.id))
         })
         .collect();
     if open.is_empty() {
@@ -852,27 +904,29 @@ fn waiting_rows(attention: &Attention, res: &StatusResult, style: &Style) -> Vec
 
     open.sort_by(|left, right| {
         right
-            .4
-            .cmp(&left.4)
-            .then_with(|| left.0.cmp(&right.0))
-            .then_with(|| left.1.cmp(&right.1))
+            .ts
+            .cmp(&left.ts)
+            .then_with(|| left.to.cmp(&right.to))
+            .then_with(|| left.id.cmp(&right.id))
     });
     let hidden = open.len().saturating_sub(STATUS_DELIVERY_ROW_LIMIT);
     let shown = &open[..open.len().min(STATUS_DELIVERY_ROW_LIMIT)];
     let to_w = shown
         .iter()
-        .map(|(to, _, _, _, _)| display_width(to))
+        .map(|d| display_width(&d.to))
         .max()
         .unwrap_or(0);
     let mut out = vec![String::new(), format!("  {}", style.dim("waiting on you"))];
-    out.extend(shown.iter().map(|(to, id, state, cause, ts)| {
+    out.extend(shown.iter().map(|d| {
         let badge = receipt_badge(
             &DeliveryReceipt {
-                to: to.clone(),
-                state: *state,
+                to: d.to.clone(),
+                state: d.state,
                 notification_state: None,
                 quota_state: None,
                 notification_settlement: None,
+                pre_write_cause: None,
+                wake_block: None,
                 position: None,
                 note: None,
                 // The eye counts items from the record, which names the
@@ -882,17 +936,43 @@ fn waiting_rows(attention: &Attention, res: &StatusResult, style: &Style) -> Vec
             },
             style,
         );
-        let cause = cause
-            .as_deref()
-            .map(grid::cause_words)
-            .unwrap_or_else(|| "cause unknown".into());
-        let when = if *ts == 0 {
+        let cause_raw = d.cause.as_deref().unwrap_or("");
+        let cause = if cause_raw.is_empty() {
+            "cause unknown".to_string()
+        } else {
+            grid::cause_words(cause_raw)
+        };
+        let when = if d.ts == 0 {
             "time unknown".into()
         } else {
-            age(now_ms().saturating_sub(*ts))
+            age(now_ms().saturating_sub(d.ts))
         };
-        let detail = style.dim(&format!("{cause} · {id} · {when}"));
-        format!("  {}  {badge} · {detail}", style.role(to, &pad(to, to_w)))
+        let id = &d.id;
+        let next = match d.attempt_id.as_ref() {
+            None => String::new(),
+            Some(attempt) => match cyclops_proto::delivery_pre_write_reason(cause_raw) {
+                Some("hook_admission_unproven") => format!(
+                    " · next: the recipient may claim {id} now; or relaunch the agent after repairing its hooks (its SessionStart reopens this wake once); or an administrator may withdraw the exact unwritten attempt {attempt}"
+                ),
+                Some(reason) => format!(
+                    " · next: fix {}; the daemon reopens the wake on the next route or composer evidence, no requeue; or the recipient claims {id} now",
+                    grid::cause_words(reason)
+                ),
+                None => match (d.state, cause_raw) {
+                    (DeliveryState::ParkedBlockedQuota, "quota_reset_observed") => {
+                        format!(" · next: cyclops requeue {id}")
+                    }
+                    (DeliveryState::ParkedBlockedQuota, _) => {
+                        format!(" · next: wait for the quota reset, then cyclops requeue {id}")
+                    }
+                    (_, _) => format!(
+                        " · next: cyclops attention show {attempt} --diff, then complete or discard; or the recipient claims {id}"
+                    ),
+                },
+            },
+        };
+        let detail = style.dim(&format!("{cause} · {id} · {when}{next}"));
+        format!("  {}  {badge} · {detail}", style.role(&d.to, &pad(&d.to, to_w)))
     }));
     if hidden > 0 {
         out.push(format!(
@@ -1395,7 +1475,111 @@ mod tests {
                 }
                 .into(),
             ),
+            attempt_id: None,
         }
+    }
+
+    /// Item 5, twins: a legacy-label row and its unique exact mailbox twin
+    /// render as one waiting row, the exact one.
+    #[test]
+    fn a_legacy_row_and_its_exact_twin_render_once() {
+        let workspace: cyclops_proto::WorkspaceId =
+            "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let session: cyclops_proto::SessionInstanceId =
+            "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let key = cyclops_proto::RecipientKey::agent(workspace, session, "%1".parse().unwrap());
+        let mut res = fixture();
+        res.open_deliveries = vec![open_delivery(
+            "m-1",
+            "reviewer",
+            DeliveryState::AttentionRequired,
+        )];
+        let mut exact = open_delivery("m-1", "reviewer", DeliveryState::AttentionRequired);
+        exact.recipient = Some(key);
+        exact.attempt_id = Some(
+            cyclops_proto::NotificationAttemptId::parse("att-00000000-0000-4000-8000-000000000001")
+                .unwrap(),
+        );
+        res.mailbox_attention = vec![exact];
+
+        assert_eq!(cyclops_proto::Attention::from_status(&res).count(), 1);
+        let out = render_status(&res, &Style::none(), Path::new("/x"));
+        let rows = out.lines().filter(|line| line.contains("m-1")).count();
+        assert_eq!(rows, 1, "one delivery, one row: {out}");
+        assert!(
+            out.contains("attention show att-"),
+            "the exact row is the one rendered: {out}"
+        );
+    }
+
+    /// Item 5, dedup: a pre-write-blocked head is a mailbox waiting row and
+    /// is also detailed under blocked_notifications; the detailed row yields
+    /// to the waiting row by attempt id, so one attempt prints once.
+    #[test]
+    fn a_detailed_blocked_row_yields_to_its_mailbox_waiting_row() {
+        let attempt =
+            cyclops_proto::NotificationAttemptId::parse("att-00000000-0000-4000-8000-000000000001")
+                .unwrap();
+        let other =
+            cyclops_proto::NotificationAttemptId::parse("att-00000000-0000-4000-8000-000000000002")
+                .unwrap();
+        let mut row = open_delivery("m-held", "reviewer", DeliveryState::AttentionRequired);
+        row.attempt_id = Some(attempt);
+        row.cause = Some("blocked_pre_write:route_unavailable".into());
+        let mailbox = vec![row];
+        assert!(blocked_row_hidden_by_mailbox(&attempt, &mailbox));
+        assert!(!blocked_row_hidden_by_mailbox(&other, &mailbox));
+        assert!(!blocked_row_hidden_by_mailbox(&attempt, &[]));
+
+        let mut res = fixture();
+        res.mailbox_attention = mailbox;
+        let out = render_status(&res, &Style::none(), Path::new("/x"));
+        assert!(
+            out.contains("fix route unavailable") && out.contains("no requeue"),
+            "the waiting row names the real state and the right action: {out}"
+        );
+    }
+
+    /// Item 5: a durable mailbox attention row opens the status eye and the
+    /// waiting rows name the exact next action from the attempt id.
+    #[test]
+    fn status_eye_counts_mailbox_attention_and_names_the_next_action() {
+        let mut res = fixture();
+        let mut row = open_delivery("m-held", "reviewer", DeliveryState::AttentionRequired);
+        row.attempt_id = Some(
+            cyclops_proto::NotificationAttemptId::parse("att-00000000-0000-4000-8000-000000000001")
+                .unwrap(),
+        );
+        res.mailbox_attention = vec![row];
+
+        let out = render_status(&res, &Style::none(), Path::new("/x"));
+        let head = out.lines().next().expect("header");
+        let eye = cyclops_proto::Attention::from_status(&res).header();
+        assert!(
+            head.contains(&eye.cell),
+            "header must carry the open eye cell {:?}: {head}",
+            eye.cell
+        );
+        assert!(out.contains("waiting on you"), "{out}");
+        assert!(
+            out.contains("cyclops attention show att-00000000-0000-4000-8000-000000000001 --diff"),
+            "next action must name the attempt: {out}"
+        );
+        assert!(out.contains("or the recipient claims m-held"), "{out}");
+
+        // Isolate the legacy half: a row without an attempt id keeps its old
+        // detail line without inheriting the mailbox row's action.
+        res.mailbox_attention.clear();
+        res.open_deliveries = vec![open_delivery(
+            "m-old",
+            "reviewer",
+            DeliveryState::AttentionRequired,
+        )];
+        let out = render_status(&res, &Style::none(), Path::new("/x"));
+        assert!(
+            out.contains("waiting on you") && !out.contains("attention show"),
+            "{out}"
+        );
     }
 
     fn fixture() -> StatusResult {
@@ -1448,6 +1632,7 @@ mod tests {
                 dir: Some("/x/manifests".into()),
             }),
             pid: Some(4242),
+            mailbox_attention: Vec::new(),
         }
     }
 
@@ -1602,14 +1787,19 @@ mod tests {
                     fifo_position: Some(2),
                     notification: cyclops_proto::MessageNotificationSummary {
                         state: cyclops_proto::MessageNotificationState::Gating,
+                        wake_block: None,
                         quota_state: None,
                         settlement: None,
                         operator_withdrawn: None,
                         attempt_id: Some(attempt),
                         cause: None,
+                        verify_outcome: None,
                         pre_write_cause: Some(
                             cyclops_proto::NotificationPreWriteCause::BindingUnprovable,
                         ),
+                        pre_write_pane_width: None,
+                        pre_write_required_pane_width: None,
+                        pre_write_block: None,
                         attention_cleared: None,
                         resolution: None,
                         resolution_intent: None,
@@ -1644,11 +1834,70 @@ mod tests {
         status.blocked_notifications[0]
             .recipient
             .notification
+            .pre_write_cause =
+            Some(cyclops_proto::NotificationPreWriteCause::WriteReadinessChanged);
+        status.blocked_notifications[0]
+            .recipient
+            .notification
+            .pre_write_pane_width = Some(59);
+        status.blocked_notifications[0]
+            .recipient
+            .notification
+            .pre_write_required_pane_width = Some(60);
+        let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
+        assert!(
+            rendered.contains("pane too narrow (59, requires 60)"),
+            "{rendered}"
+        );
+
+        // A named block outranks the enum cause it was recorded under.
+        status.blocked_notifications[0]
+            .recipient
+            .notification
+            .pre_write_pane_width = None;
+        status.blocked_notifications[0]
+            .recipient
+            .notification
+            .pre_write_required_pane_width = None;
+        status.blocked_notifications[0]
+            .recipient
+            .notification
+            .pre_write_block = Some("hook_admission_unproven".into());
+        let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
+        assert!(rendered.contains("hook admission unproven"), "{rendered}");
+        assert!(!rendered.contains("write readiness changed"), "{rendered}");
+        status.blocked_notifications[0]
+            .recipient
+            .notification
+            .pre_write_block = None;
+
+        status.blocked_notifications[0]
+            .recipient
+            .notification
             .pre_write_cause = Some(cyclops_proto::NotificationPreWriteCause::WorkerFailed);
+        status.blocked_notifications[0]
+            .recipient
+            .notification
+            .pre_write_pane_width = None;
+        status.blocked_notifications[0]
+            .recipient
+            .notification
+            .pre_write_required_pane_width = None;
         let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
         assert!(rendered.contains("worker failed"), "{rendered}");
         assert!(rendered.contains("waited 1m"), "{rendered}");
         assert!(rendered.contains("reviewer-now (%1)"), "{rendered}");
+
+        status.blocked_notifications[0]
+            .recipient
+            .notification
+            .wake_block = Some(cyclops_proto::MessageWakeBlock::WorkerSupervisorExited);
+        let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
+        assert!(rendered.contains("worker supervisor exited"), "{rendered}");
+        assert!(
+            !rendered.contains("scheduler state unavailable"),
+            "{rendered}"
+        );
         assert!(
             rendered.contains(&format!(
                 "workspace admin: cyclops notification withdraw {attempt} --recipient {recipient}"
@@ -2113,13 +2362,24 @@ mod tests {
     #[test]
     fn live_status_uses_the_shared_eye_vocabulary() {
         let cases = [
-            (AgentState::Working, Vec::new()),
-            (AgentState::BlockedPermission, Vec::new()),
+            (AgentState::Working, Vec::new(), Vec::new()),
+            (AgentState::BlockedPermission, Vec::new(), Vec::new()),
+            // A durable mailbox attention row must open both eyes alike.
+            (
+                AgentState::Working,
+                Vec::new(),
+                vec![open_delivery(
+                    "m-held",
+                    "reviewer",
+                    DeliveryState::AttentionRequired,
+                )],
+            ),
         ];
-        for (state, open) in cases {
+        for (state, open, mailbox) in cases {
             let mut res = fixture();
             res.sessions[0].panes[1].state = state;
             res.open_deliveries = open;
+            res.mailbox_attention = mailbox;
 
             // What the register says the header must carry.
             let attention = cyclops_proto::Attention::from_status(&res);
@@ -2166,10 +2426,6 @@ mod tests {
     #[test]
     fn status_reports_live_panes_without_durable_delivery_alarms() {
         let mut res = fixture();
-        res.open_deliveries = vec![
-            open_delivery("m-1", "implementer", DeliveryState::ParkedBlockedQuota),
-            open_delivery("m-2", "reviewer", DeliveryState::AttentionRequired),
-        ];
         let got = render_status(&res, &Style::none(), Path::new("/x/config.toml"));
         let expected = format!(
             "‿ cyclops · watching main · tmux 3.6a · up 2m\n\
@@ -2196,14 +2452,14 @@ mod tests {
     }
 
     #[test]
-    fn status_never_renders_historical_delivery_rows() {
+    fn status_never_renders_settled_delivery_rows() {
         let mut res = fixture();
         res.open_deliveries = (0..10)
             .map(|index| {
                 let mut delivery = open_delivery(
                     &format!("m-{index:02}"),
                     "reviewer",
-                    DeliveryState::AttentionRequired,
+                    DeliveryState::DeliveredVerified,
                 );
                 delivery.ts = index + 1;
                 delivery
@@ -2265,6 +2521,8 @@ mod tests {
             notification_state: None,
             quota_state: None,
             notification_settlement: None,
+            pre_write_cause: None,
+            wake_block: None,
             position,
             note: note.map(String::from),
             pane: None,

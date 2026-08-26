@@ -479,7 +479,7 @@ struct SendArgs {
     #[arg(long)]
     client_key: Option<String>,
     /// Message id this replies to. Recipient and subject come from the referenced message.
-    #[arg(long, conflicts_with = "supersedes")]
+    #[arg(long, conflicts_with_all = ["target", "to", "all", "supersedes"])]
     reply_to: Option<String>,
     /// Replace one unclaimed message before its notification starts writing.
     #[arg(long, conflicts_with = "reply_to")]
@@ -1233,10 +1233,13 @@ fn ask<T>(
 }
 
 fn cmd_status(c: &mut Client, cli: &Cli, style: &Style) -> i32 {
+    // The eye counts the record, not only the live pane fleet: open
+    // deliveries carry legacy direct-delivery alarms and, folded by the
+    // daemon, durable mailbox attention and held queue heads.
     let status: StatusResult = match ask(
         c,
         "status",
-        json!({}),
+        json!({"open_deliveries": true}),
         cli.json,
         None,
         serde_json::from_value,
@@ -1637,7 +1640,7 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
             to.push(t.clone());
         }
     }
-    if to.is_empty() {
+    if to.is_empty() && args.reply_to.is_none() {
         eprintln!("{}", copy::NO_RECIPIENT);
         return EXIT_USAGE;
     }
@@ -1668,6 +1671,8 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
     };
     let params = serde_json::to_value(MsgSendParams {
         to: to.clone(),
+        recipient_keys: None,
+        expected_caller: None,
         subject: args.subject.clone(),
         body,
         fyi: args.fyi,
@@ -1786,6 +1791,7 @@ fn cmd_inbox(c: &mut Client, cli: &Cli, style: &Style, args: &InboxArgs) -> i32 
                 Err(code) => return code,
             };
             print_claim_payload(&result.message);
+            print_skipped_oldest(result.skipped_oldest.as_ref());
             0
         }
         InboxCmd::Next { .. } => unreachable!("inbox next owns its bounded connection"),
@@ -2082,16 +2088,196 @@ fn cmd_messages(c: &mut Client, cli: &Cli, style: &Style, args: &MessagesArgs) -
         snapshot.counts.returned_messages,
         snapshot.counts.visible_messages
     );
+    let heads = held_heads(&snapshot.rows);
+    for line in held_queue_lines(&heads) {
+        println!("{line}");
+    }
     for row in &snapshot.rows {
         println!(
             "{}",
-            message_snapshot_line(style.accent(row.message_id.as_str()), row)
+            message_snapshot_line(style.accent(row.message_id.as_str()), row, &heads)
         );
     }
     0
 }
 
-fn message_snapshot_line(styled_id: String, row: &cyclops_proto::MessageSnapshotRow) -> String {
+/// The head of one recipient's pending queue while it is not moving.
+///
+/// FIFO delivery means every later message to that recipient waits behind
+/// this one. The projection already knows the id and the cause; this is the
+/// index that lets every row and one summary line say so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeldHead {
+    message_id: cyclops_proto::MessageId,
+    label: String,
+    cause: String,
+    kind: HeldCauseKind,
+    recipient: cyclops_proto::RecipientKey,
+    attempt_id: Option<cyclops_proto::NotificationAttemptId>,
+    /// Pending messages to the same recipient behind the head.
+    waiting: usize,
+}
+
+type HeldHeads = std::collections::BTreeMap<cyclops_proto::RecipientKey, HeldHead>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldCauseKind {
+    QuotaHeld,
+    QuotaResetObserved,
+    BlockedPreWrite,
+    Attention,
+    AttentionResolutionPending,
+}
+
+/// Why a head is not moving, in the wire spelling the rest of this listing
+/// uses, or `None` when the head is progressing normally.
+fn held_cause(
+    notification: &cyclops_proto::MessageNotificationSummary,
+) -> Option<(String, HeldCauseKind)> {
+    if notification.resolution.is_some() {
+        return None;
+    }
+    match notification.quota_state {
+        Some(cyclops_proto::MessageQuotaState::Held) => {
+            return Some(("quota_held".to_string(), HeldCauseKind::QuotaHeld));
+        }
+        Some(cyclops_proto::MessageQuotaState::ResetObserved) => {
+            return Some((
+                "quota_reset_observed".to_string(),
+                HeldCauseKind::QuotaResetObserved,
+            ));
+        }
+        None => {}
+    }
+    if notification.state == cyclops_proto::MessageNotificationState::AttentionRequired {
+        if notification.resolution_intent.is_some() {
+            return Some((
+                "attention_resolution_pending".to_string(),
+                HeldCauseKind::AttentionResolutionPending,
+            ));
+        }
+        return Some((
+            notification
+                .cause
+                .map(|cause| wire_word(serde_json::to_value(cause).unwrap_or(Value::Null)))
+                .unwrap_or_else(|| "attention_required".to_string()),
+            HeldCauseKind::Attention,
+        ));
+    }
+    if let Some(cause) = message_wake_block_reason(notification) {
+        return Some((cause, HeldCauseKind::BlockedPreWrite));
+    }
+    None
+}
+
+fn held_heads(rows: &[cyclops_proto::MessageSnapshotRow]) -> HeldHeads {
+    let mut heads = HeldHeads::new();
+    for row in rows {
+        for recipient in &row.recipients {
+            if recipient.mailbox != cyclops_proto::MailboxEntryState::Pending
+                || recipient.fifo_position != Some(1)
+            {
+                continue;
+            }
+            if let Some((cause, kind)) = held_cause(&recipient.notification) {
+                heads.insert(
+                    recipient.recipient,
+                    HeldHead {
+                        message_id: row.message_id.clone(),
+                        label: recipient.label.clone(),
+                        cause,
+                        kind,
+                        recipient: recipient.recipient,
+                        attempt_id: recipient.notification.attempt_id,
+                        waiting: 0,
+                    },
+                );
+            }
+        }
+    }
+    for row in rows {
+        for recipient in &row.recipients {
+            if recipient.mailbox != cyclops_proto::MailboxEntryState::Pending
+                || recipient.fifo_position == Some(1)
+            {
+                continue;
+            }
+            if let Some(head) = heads.get_mut(&recipient.recipient) {
+                head.waiting += 1;
+            }
+        }
+    }
+    heads
+}
+
+/// One line per held recipient queue, printed before the rows so the
+/// reason a queue is not moving is the first thing on screen.
+fn held_queue_lines(heads: &HeldHeads) -> Vec<String> {
+    heads
+        .values()
+        .map(|head| {
+            format!(
+                "held queue · {} · head {} · {} · {} waiting · {}",
+                head.label,
+                head.message_id,
+                head.cause,
+                head.waiting,
+                held_release_action(head)
+            )
+        })
+        .collect()
+}
+
+fn held_release_action(head: &HeldHead) -> String {
+    match head.kind {
+        HeldCauseKind::QuotaHeld => format!(
+            "next: wait for quota reset, then admin: cyclops requeue {}",
+            head.message_id
+        ),
+        HeldCauseKind::QuotaResetObserved => {
+            format!("next: admin: cyclops requeue {}", head.message_id)
+        }
+        HeldCauseKind::BlockedPreWrite => {
+            let mut action = format!(
+                "next: fix {}; or recipient retrieves the durable payload with cyclops inbox claim {}",
+                head.cause, head.message_id
+            );
+            if let Some(attempt_id) = head.attempt_id {
+                action.push_str(&format!(
+                    "; or admin: cyclops notification withdraw {attempt_id} --recipient {}",
+                    head.recipient
+                ));
+            }
+            action
+        }
+        HeldCauseKind::Attention => match head.attempt_id {
+            Some(attempt_id) => format!(
+                "next: recipient retrieves the durable payload with cyclops inbox claim {}; or admin: cyclops attention show {attempt_id} --diff, then complete or discard when its checks authorize the action",
+                head.message_id
+            ),
+            None => format!(
+                "next: recipient retrieves the durable payload with cyclops inbox claim {}",
+                head.message_id
+            ),
+        },
+        HeldCauseKind::AttentionResolutionPending => match head.attempt_id {
+            Some(attempt_id) => format!(
+                "next: recipient retrieves the durable payload with cyclops inbox claim {}; or admin inspects cyclops attention show {attempt_id} --diff; do not repeat a terminal action",
+                head.message_id
+            ),
+            None => format!(
+                "next: recipient retrieves the durable payload with cyclops inbox claim {}; do not repeat a terminal action",
+                head.message_id
+            ),
+        },
+    }
+}
+
+fn message_snapshot_line(
+    styled_id: String,
+    row: &cyclops_proto::MessageSnapshotRow,
+    heads: &HeldHeads,
+) -> String {
     let direction = match row.direction {
         cyclops_proto::MessageDirection::Inbound => "inbound",
         cyclops_proto::MessageDirection::Outbound => "outbound",
@@ -2102,7 +2288,9 @@ fn message_snapshot_line(styled_id: String, row: &cyclops_proto::MessageSnapshot
     let recipients = row
         .recipients
         .iter()
-        .map(|recipient| message_recipient_cell(&row.message_id, recipient))
+        .map(|recipient| {
+            message_recipient_cell(&row.message_id, recipient, heads.get(&recipient.recipient))
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let subject = row.subject.as_deref().unwrap_or("(no subject)");
@@ -2115,11 +2303,18 @@ fn message_snapshot_line(styled_id: String, row: &cyclops_proto::MessageSnapshot
 fn message_recipient_cell(
     message_id: &cyclops_proto::MessageId,
     recipient: &cyclops_proto::MessageRecipientSummary,
+    held: Option<&HeldHead>,
 ) -> String {
     let mailbox = match &recipient.mailbox {
         cyclops_proto::MailboxEntryState::Pending => match recipient.fifo_position {
             Some(1) => "pending · oldest".to_string(),
-            Some(position) => format!("pending · {} ahead", position.saturating_sub(1)),
+            Some(position) => {
+                let mut cell = format!("pending · {} ahead", position.saturating_sub(1));
+                if let Some(head) = held {
+                    cell.push_str(&format!(" · behind {} ({})", head.message_id, head.cause));
+                }
+                cell
+            }
             None => "pending".to_string(),
         },
         cyclops_proto::MailboxEntryState::Claimed { .. } => "claimed".to_string(),
@@ -2146,10 +2341,9 @@ fn message_recipient_cell(
                 Some(cyclops_proto::MessageQuotaState::ResetObserved) => format!(
                 "quota reset observed · admin next: cyclops requeue {message_id} · message wide"
             ),
-                None => match recipient.notification.pre_write_cause {
-                    Some(cause) => {
-                        let mut blocked =
-                            format!("wake blocked before write: {}", cause.wire_name());
+                None => match message_wake_block_reason(&recipient.notification) {
+                    Some(reason) => {
+                        let mut blocked = format!("wake blocked before write: {reason}");
                         if let Some(updated_at) = recipient.notification.updated_at {
                             blocked.push_str(&format!(
                                 " · waited {}",
@@ -2259,6 +2453,16 @@ fn message_recipient_cell(
                 serde_json::to_value(cause).unwrap_or(Value::Null),
             ));
         }
+        if let Some(outcome) = recipient.notification.verify_outcome {
+            notification.push_str(":verify=");
+            notification.push_str(&wire_word(
+                serde_json::to_value(outcome.kind).unwrap_or(Value::Null),
+            ));
+            notification.push('/');
+            notification.push_str(&wire_word(
+                serde_json::to_value(outcome.observed_composer).unwrap_or(Value::Null),
+            ));
+        }
         if let Some(cleared) = recipient.notification.attention_cleared {
             notification.push(':');
             notification.push_str(if cleared { "cleared" } else { "open" });
@@ -2279,6 +2483,35 @@ fn message_recipient_cell(
         "{} [{mailbox}; {notification}{availability}]",
         recipient.label
     )
+}
+
+fn message_wake_block_reason(
+    notification: &cyclops_proto::MessageNotificationSummary,
+) -> Option<String> {
+    notification
+        .pane_width_block()
+        .map(|(observed, required)| copy::pane_too_narrow(observed, required))
+        .or_else(|| {
+            notification
+                .wake_block
+                .map(|block| block.wire_name().to_string())
+        })
+        // The named block (for example hook_admission_unproven) is more
+        // exact than the enum cause it was recorded under.
+        .or_else(|| notification.pre_write_block.clone())
+        .or_else(|| {
+            notification
+                .pre_write_cause
+                .map(|cause| cause.wire_name().to_string())
+        })
+}
+
+/// F5: a claim by id that jumped the queue says what it left at the head,
+/// so a recipient cannot keep skipping a stuck oldest message unknowingly.
+fn print_skipped_oldest(skipped: Option<&cyclops_proto::MessageId>) {
+    if let Some(oldest) = skipped {
+        println!("{}", copy::claim_skipped_oldest(oldest.as_str()));
+    }
 }
 
 fn print_claim_payload(message: &cyclops_proto::InboxMessage) {
@@ -2489,6 +2722,18 @@ fn confirm_age_clear<R: BufRead, W: Write>(
     Ok(answer.trim() == "clear")
 }
 
+/// The line printed under `cleared <id>`: an acknowledgement changes no
+/// state, so say what the daemon observed under the clearance lock.
+fn alarm_cleared_consequence(alarm: &cyclops_proto::AlarmSummary) -> String {
+    copy::alarm_cleared_consequence(
+        &alarm.id,
+        &alarm.message_id,
+        &alarm.recipient,
+        &wire_word(serde_json::to_value(alarm.state).unwrap_or(Value::Null)),
+        &wire_word(serde_json::to_value(alarm.cause).unwrap_or(Value::Null)),
+    )
+}
+
 fn clear_alarm_ids(
     c: &mut Client,
     cli: &Cli,
@@ -2510,8 +2755,18 @@ fn clear_alarm_ids(
         Ok(None) => return 0,
         Err(code) => return code,
     };
+    let summaries: std::collections::BTreeMap<_, _> = result
+        .summaries
+        .into_iter()
+        .map(|summary| (summary.id.clone(), summary))
+        .collect();
     for id in result.cleared_ids {
         println!("cleared {}", style.accent(&id));
+        if let Some(summary) = summaries.get(&id) {
+            println!("{}", alarm_cleared_consequence(summary));
+        } else {
+            println!("{}", copy::alarm_cleared_without_summary(&id));
+        }
     }
     0
 }
@@ -2636,6 +2891,20 @@ fn print_attention_checks(style: &Style, result: &cyclops_proto::AttentionShowRe
     for (name, passed) in copy::attention_check_rows(&result.checks) {
         println!("  {name}: {}", copy::attention_check_value(passed));
     }
+    if let Some(line) = attention_verify_failure_line(result.verify_outcome) {
+        println!("  {line}");
+    }
+}
+
+fn attention_verify_failure_line(
+    outcome: Option<cyclops_proto::NotificationVerifyOutcome>,
+) -> Option<String> {
+    outcome.map(|outcome| {
+        let kind = wire_word(serde_json::to_value(outcome.kind).unwrap_or(Value::Null));
+        let composer =
+            wire_word(serde_json::to_value(outcome.observed_composer).unwrap_or(Value::Null));
+        format!("verification failure: {kind} · composer {composer}")
+    })
 }
 
 /// Compact line diff computed by the client. The daemon never receives it.
@@ -2829,7 +3098,9 @@ fn read_body_file(path: &str) -> Result<String, String> {
 /// eye counts by and the daemon folds `status` by, so an exit code and an
 /// eye can never disagree about one delivery.
 fn receipts_exit(ds: &[DeliveryReceipt]) -> i32 {
-    i32::from(ds.iter().any(|d| delivery_needs_human(d.state)))
+    i32::from(ds.iter().any(|d| {
+        d.pre_write_cause.is_some() || d.wake_block.is_some() || delivery_needs_human(d.state)
+    }))
 }
 
 /// The same rule read tolerantly off the raw result for --json
@@ -2841,8 +3112,11 @@ fn receipts_exit_json(v: &Value) -> i32 {
         .and_then(Value::as_array)
         .is_some_and(|a| {
             a.iter().any(|d| {
-                serde_json::from_value::<DeliveryState>(d["state"].clone())
-                    .is_ok_and(delivery_needs_human)
+                d.get("pre_write_cause")
+                    .is_some_and(|cause| !cause.is_null())
+                    || d.get("wake_block").is_some_and(|block| !block.is_null())
+                    || serde_json::from_value::<DeliveryState>(d["state"].clone())
+                        .is_ok_and(delivery_needs_human)
             })
         });
     i32::from(bad)
@@ -2972,11 +3246,20 @@ mod tests {
     }
 
     #[test]
+    fn inbox_claim_requires_one_message_shaped_target() {
+        assert!(Cli::try_parse_from(["cyclops", "inbox", "claim"]).is_err());
+        assert!(Cli::try_parse_from(["cyclops", "inbox", "claim", "m-1"]).is_ok());
+        assert!(Cli::try_parse_from(
+            ["cyclops", "inbox", "claim", "m-att_--AAAAAAQACAAAAAAAAAAQ",]
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn send_keeps_reply_and_supersession_flags() {
         let reply = Cli::try_parse_from([
             "cyclops",
             "send",
-            "reviewer",
             "--subject",
             "ignored for validated reply",
             "--reply-to",
@@ -2990,6 +3273,17 @@ mod tests {
         };
         assert_eq!(args.reply_to.as_deref(), Some("m-parent"));
         assert_eq!(args.client_key.as_deref(), Some("retry-1"));
+        assert!(args.target.is_none());
+        assert!(Cli::try_parse_from([
+            "cyclops",
+            "send",
+            "reviewer",
+            "--subject",
+            "ignored",
+            "--reply-to",
+            "m-parent",
+        ])
+        .is_err());
 
         let supersession = Cli::try_parse_from([
             "cyclops",
@@ -3117,6 +3411,297 @@ mod tests {
         assert_eq!(args.recent_settled, 7);
     }
 
+    fn pending_row_to(
+        recipient: cyclops_proto::RecipientKey,
+        message_id: &str,
+        fifo_position: u64,
+        state: cyclops_proto::MessageNotificationState,
+        cause: Option<cyclops_proto::NotificationAttentionCause>,
+    ) -> cyclops_proto::MessageSnapshotRow {
+        let workspace: cyclops_proto::WorkspaceId =
+            "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        cyclops_proto::MessageSnapshotRow {
+            message_id: cyclops_proto::MessageId::new(message_id).unwrap(),
+            seq: fifo_position,
+            ts: fifo_position,
+            kind: cyclops_proto::Kind::Msg,
+            direction: cyclops_proto::MessageDirection::Outbound,
+            sender: cyclops_proto::RecipientKey::admin(workspace),
+            sender_label: "admin".into(),
+            recipients: vec![cyclops_proto::MessageRecipientSummary {
+                recipient,
+                label: "reviewer".into(),
+                direction: cyclops_proto::MessageDirection::Outbound,
+                needs_action: false,
+                can_manage_attention: false,
+                can_withdraw_notification: false,
+                current_route: None,
+                available: true,
+                mailbox: cyclops_proto::MailboxEntryState::Pending,
+                fifo_position: Some(fifo_position),
+                notification: cyclops_proto::MessageNotificationSummary {
+                    state,
+                    wake_block: None,
+                    quota_state: None,
+                    settlement: None,
+                    operator_withdrawn: None,
+                    attempt_id: None,
+                    cause,
+                    verify_outcome: None,
+                    pre_write_cause: None,
+                    pre_write_pane_width: None,
+                    pre_write_required_pane_width: None,
+                    pre_write_block: None,
+                    attention_cleared: None,
+                    resolution: None,
+                    resolution_intent: None,
+                    resolution_action_accepted: None,
+                    resolution_consumption_observed: None,
+                    updated_at: None,
+                },
+            }],
+            subject: Some("Work".into()),
+            reply_to: None,
+            thread_root: cyclops_proto::MessageId::new(message_id).unwrap(),
+            thread_message_count: 1,
+            active: true,
+            needs_action: false,
+        }
+    }
+
+    fn notification_attempt(number: u64) -> cyclops_proto::NotificationAttemptId {
+        cyclops_proto::NotificationAttemptId::parse(&format!(
+            "att-00000000-0000-4000-8000-{number:012x}"
+        ))
+        .unwrap()
+    }
+
+    /// A queue that is not moving is named by its head and cause on every
+    /// follower row and once in a summary line.
+    #[test]
+    fn followers_name_the_head_that_holds_them() {
+        let workspace: cyclops_proto::WorkspaceId =
+            "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let session: cyclops_proto::SessionInstanceId =
+            "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let recipient =
+            cyclops_proto::RecipientKey::agent(workspace, session, "%1".parse().unwrap());
+        let mut rows = vec![
+            pending_row_to(
+                recipient,
+                "m-head",
+                1,
+                cyclops_proto::MessageNotificationState::AttentionRequired,
+                Some(cyclops_proto::NotificationAttentionCause::VerifyFailed),
+            ),
+            pending_row_to(
+                recipient,
+                "m-second",
+                2,
+                cyclops_proto::MessageNotificationState::NotStarted,
+                None,
+            ),
+            pending_row_to(
+                recipient,
+                "m-third",
+                3,
+                cyclops_proto::MessageNotificationState::NotStarted,
+                None,
+            ),
+        ];
+        rows[0].recipients[0].notification.attempt_id = Some(notification_attempt(1));
+
+        let heads = held_heads(&rows);
+        let head = heads.get(&recipient).expect("held head indexed");
+        assert_eq!(head.message_id.as_str(), "m-head");
+        assert_eq!(head.cause, "verify_failed");
+        assert_eq!(head.waiting, 2);
+
+        assert_eq!(
+            held_queue_lines(&heads),
+            vec![
+                "held queue · reviewer · head m-head · verify_failed · 2 waiting · next: recipient retrieves the durable payload with cyclops inbox claim m-head; or admin: cyclops attention show att-00000000-0000-4000-8000-000000000001 --diff, then complete or discard when its checks authorize the action".to_string()
+            ]
+        );
+
+        let follower = message_snapshot_line("m-third".into(), &rows[2], &heads);
+        assert!(
+            follower.contains("pending · 2 ahead · behind m-head (verify_failed)"),
+            "follower must name the head and its cause: {follower}"
+        );
+        let head_line = message_snapshot_line("m-head".into(), &rows[0], &heads);
+        assert!(
+            head_line.contains("pending · oldest") && !head_line.contains("behind"),
+            "the head is not behind itself: {head_line}"
+        );
+
+        // A moving queue has no held head and rows read as before.
+        let moving = vec![pending_row_to(
+            recipient,
+            "m-only",
+            1,
+            cyclops_proto::MessageNotificationState::Queued,
+            None,
+        )];
+        assert!(held_heads(&moving).is_empty());
+        assert!(held_queue_lines(&held_heads(&moving)).is_empty());
+    }
+
+    #[test]
+    fn held_queue_actions_match_the_exact_cause() {
+        let workspace: cyclops_proto::WorkspaceId =
+            "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let session: cyclops_proto::SessionInstanceId =
+            "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let recipient =
+            cyclops_proto::RecipientKey::agent(workspace, session, "%1".parse().unwrap());
+
+        let mut quota_held = pending_row_to(
+            recipient,
+            "m-quota-held",
+            1,
+            cyclops_proto::MessageNotificationState::AttentionRequired,
+            None,
+        );
+        quota_held.recipients[0].notification.quota_state =
+            Some(cyclops_proto::MessageQuotaState::Held);
+        let line = held_queue_lines(&held_heads(&[quota_held]))
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(line.contains("quota_held"), "{line}");
+        assert!(line.contains("wait for quota reset"), "{line}");
+        assert!(line.contains("cyclops requeue m-quota-held"), "{line}");
+        assert!(!line.contains("attention show"), "{line}");
+
+        let mut quota_reset = pending_row_to(
+            recipient,
+            "m-quota-reset",
+            1,
+            cyclops_proto::MessageNotificationState::AttentionRequired,
+            None,
+        );
+        quota_reset.recipients[0].notification.quota_state =
+            Some(cyclops_proto::MessageQuotaState::ResetObserved);
+        let line = held_queue_lines(&held_heads(&[quota_reset]))
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(line.contains("quota_reset_observed"), "{line}");
+        assert!(line.contains("cyclops requeue m-quota-reset"), "{line}");
+        assert!(!line.contains("wait for quota reset"), "{line}");
+
+        let mut blocked = pending_row_to(
+            recipient,
+            "m-blocked",
+            1,
+            cyclops_proto::MessageNotificationState::Gating,
+            None,
+        );
+        blocked.recipients[0].notification.attempt_id = Some(notification_attempt(2));
+        blocked.recipients[0].notification.pre_write_cause =
+            Some(cyclops_proto::NotificationPreWriteCause::WorkerFailed);
+        let line = held_queue_lines(&held_heads(&[blocked.clone()]))
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(line.contains("fix worker_failed"), "{line}");
+
+        // The named block is preferred over the enum cause it was recorded under.
+        blocked.recipients[0].notification.pre_write_cause =
+            Some(cyclops_proto::NotificationPreWriteCause::WriteReadinessChanged);
+        blocked.recipients[0].notification.pre_write_block = Some("hook_admission_unproven".into());
+        let line = held_queue_lines(&held_heads(&[blocked]))
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(line.contains("hook_admission_unproven"), "{line}");
+        assert!(!line.contains("write_readiness_changed"), "{line}");
+        assert!(line.contains("cyclops inbox claim m-blocked"), "{line}");
+        assert!(
+            line.contains(
+                "cyclops notification withdraw att-00000000-0000-4000-8000-000000000002 --recipient"
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("requeue"), "{line}");
+
+        let mut attention = pending_row_to(
+            recipient,
+            "m-attention",
+            1,
+            cyclops_proto::MessageNotificationState::AttentionRequired,
+            Some(cyclops_proto::NotificationAttentionCause::VerifyFailed),
+        );
+        attention.recipients[0].notification.attempt_id = Some(notification_attempt(3));
+        let line = held_queue_lines(&held_heads(&[attention.clone()]))
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(line.contains("cyclops inbox claim m-attention"), "{line}");
+        assert!(
+            line.contains("cyclops attention show att-00000000-0000-4000-8000-000000000003 --diff"),
+            "{line}"
+        );
+        assert!(line.contains("complete or discard"), "{line}");
+        assert!(!line.contains("requeue"), "{line}");
+
+        let mut resolving = attention.clone();
+        resolving.recipients[0].notification.resolution_intent =
+            Some(cyclops_proto::NotificationResolution::Complete);
+        let line = held_queue_lines(&held_heads(&[resolving]))
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(line.contains("attention_resolution_pending"), "{line}");
+        assert!(line.contains("do not repeat a terminal action"), "{line}");
+        assert!(!line.contains("then complete or discard"), "{line}");
+
+        attention.recipients[0].notification.resolution =
+            Some(cyclops_proto::NotificationResolution::Complete);
+        assert!(
+            held_heads(&[attention]).is_empty(),
+            "a resolved compatibility attention state is not a held head"
+        );
+    }
+
+    /// Clearing an alarm acknowledges it and retires nothing. The command
+    /// names the body-free facts returned atomically by the daemon.
+    #[test]
+    fn alarm_clear_prints_consequence_and_next_action() {
+        let alarm = cyclops_proto::AlarmSummary {
+            id: "att-1".into(),
+            message_id: "m-head".into(),
+            recipient: "codey".into(),
+            state: cyclops_proto::DeliveryState::AttentionRequired,
+            cause: cyclops_proto::NotificationAttentionCause::VerifyFailed,
+            ts: 7,
+        };
+        let line = alarm_cleared_consequence(&alarm);
+        for needle in [
+            "acknowledged only",
+            "at clearance, attempt att-1 was attention_required (verify_failed)",
+            "clearance did not change message m-head to codey",
+            "while pending, it can hold that recipient's queue",
+            "recipient retrieves the durable payload with cyclops inbox claim m-head",
+            "cyclops attention show att-1 --diff",
+            "neither clearance nor payload retrieval alone proves",
+        ] {
+            assert!(line.contains(needle), "missing {needle:?} in {line}");
+        }
+        assert!(
+            !line.contains("requeue"),
+            "a cleared attempt is not eligible for requeue: {line}"
+        );
+
+        let fallback = copy::alarm_cleared_without_summary("att-old");
+        assert!(fallback.contains("acknowledged only"), "{fallback}");
+        assert!(
+            fallback.contains("attention show att-old --diff"),
+            "{fallback}"
+        );
+    }
+
     #[test]
     fn messages_plain_line_and_json_name_the_same_body_free_state() {
         let workspace: cyclops_proto::WorkspaceId =
@@ -3151,12 +3736,20 @@ mod tests {
                 fifo_position: Some(2),
                 notification: cyclops_proto::MessageNotificationSummary {
                     state: cyclops_proto::MessageNotificationState::AttentionRequired,
+                    wake_block: None,
                     quota_state: None,
                     settlement: None,
                     operator_withdrawn: None,
                     attempt_id: Some(attempt),
                     cause: Some(cyclops_proto::NotificationAttentionCause::VerifyFailed),
+                    verify_outcome: Some(cyclops_proto::NotificationVerifyOutcome {
+                        kind: cyclops_proto::NotificationVerifyFailureKind::Mismatch,
+                        observed_composer: cyclops_proto::ComposerState::HumanDraft,
+                    }),
                     pre_write_cause: None,
+                    pre_write_pane_width: None,
+                    pre_write_required_pane_width: None,
+                    pre_write_block: None,
                     attention_cleared: Some(false),
                     resolution: None,
                     resolution_intent: None,
@@ -3173,10 +3766,10 @@ mod tests {
             needs_action: true,
         };
 
-        let line = message_snapshot_line("m-1".into(), &row);
+        let line = message_snapshot_line("m-1".into(), &row, &HeldHeads::new());
         assert_eq!(
             line,
-            "m-1 outbound · work · admin -> reviewer [pending · 1 ahead; needs attention:verify_failed:open att-00000000-0000-4000-8000-000000000001] · Review · thread 3"
+            "m-1 outbound · work · admin -> reviewer [pending · 1 ahead; needs attention:verify_failed:verify=mismatch/human_draft:open att-00000000-0000-4000-8000-000000000001] · Review · thread 3"
         );
         let json = serde_json::to_value(&row).unwrap();
         assert_eq!(json["direction"], "outbound");
@@ -3189,18 +3782,31 @@ mod tests {
             json["recipients"][0]["notification"]["cause"],
             "verify_failed"
         );
+        assert_eq!(
+            json["recipients"][0]["notification"]["verify_outcome"]["kind"],
+            "mismatch"
+        );
         assert!(json.get("body").is_none());
+        assert_eq!(
+            attention_verify_failure_line(row.recipients[0].notification.verify_outcome).as_deref(),
+            Some("verification failure: mismatch · composer human_draft")
+        );
 
         let mut not_started = row.recipients[0].clone();
         not_started.fifo_position = Some(1);
         not_started.notification = cyclops_proto::MessageNotificationSummary {
             state: cyclops_proto::MessageNotificationState::NotStarted,
+            wake_block: None,
             quota_state: None,
             settlement: None,
             operator_withdrawn: None,
             attempt_id: None,
             cause: None,
+            verify_outcome: None,
             pre_write_cause: None,
+            pre_write_pane_width: None,
+            pre_write_required_pane_width: None,
+            pre_write_block: None,
             attention_cleared: None,
             resolution: None,
             resolution_intent: None,
@@ -3209,7 +3815,7 @@ mod tests {
             updated_at: None,
         };
         assert_eq!(
-            message_recipient_cell(&row.message_id, &not_started),
+            message_recipient_cell(&row.message_id, &not_started, None),
             "reviewer [pending · oldest; not started]"
         );
 
@@ -3217,12 +3823,17 @@ mod tests {
         gating.available = false;
         gating.notification = cyclops_proto::MessageNotificationSummary {
             state: cyclops_proto::MessageNotificationState::Gating,
+            wake_block: None,
             quota_state: None,
             settlement: None,
             operator_withdrawn: None,
             attempt_id: Some(attempt),
             cause: None,
+            verify_outcome: None,
             pre_write_cause: None,
+            pre_write_pane_width: None,
+            pre_write_required_pane_width: None,
+            pre_write_block: None,
             attention_cleared: None,
             resolution: None,
             resolution_intent: None,
@@ -3231,7 +3842,7 @@ mod tests {
             updated_at: Some(3),
         };
         assert_eq!(
-            message_recipient_cell(&row.message_id, &gating),
+            message_recipient_cell(&row.message_id, &gating, None),
             "reviewer [pending · 1 ahead; checking readiness att-00000000-0000-4000-8000-000000000001; unavailable]"
         );
 
@@ -3239,13 +3850,13 @@ mod tests {
         held.available = true;
         held.notification.state = cyclops_proto::MessageNotificationState::AttentionRequired;
         held.notification.quota_state = Some(cyclops_proto::MessageQuotaState::Held);
-        let held_cell = message_recipient_cell(&row.message_id, &held);
+        let held_cell = message_recipient_cell(&row.message_id, &held, None);
         assert!(held_cell.contains("wait for quota reset"), "{held_cell}");
         assert!(held_cell.contains("no automatic resume"), "{held_cell}");
 
         let mut reset = held.clone();
         reset.notification.quota_state = Some(cyclops_proto::MessageQuotaState::ResetObserved);
-        let reset_cell = message_recipient_cell(&row.message_id, &reset);
+        let reset_cell = message_recipient_cell(&row.message_id, &reset, None);
         assert!(reset_cell.contains("cyclops requeue m-1"), "{reset_cell}");
         assert!(reset_cell.contains("message wide"), "{reset_cell}");
 
@@ -3253,14 +3864,14 @@ mod tests {
         withdrawn.notification.state = cyclops_proto::MessageNotificationState::NotStarted;
         withdrawn.notification.settlement =
             Some(cyclops_proto::MessageNotificationSettlement::WithdrawnByClaim);
-        let withdrawn_cell = message_recipient_cell(&row.message_id, &withdrawn);
+        let withdrawn_cell = message_recipient_cell(&row.message_id, &withdrawn, None);
         assert!(withdrawn_cell.contains("withdrawn"), "{withdrawn_cell}");
         assert!(!withdrawn_cell.contains("notified"), "{withdrawn_cell}");
 
         let mut resolved = row.recipients[0].clone();
         resolved.notification.resolution = Some(cyclops_proto::NotificationResolution::Complete);
         assert_eq!(
-            message_recipient_cell(&row.message_id, &resolved),
+            message_recipient_cell(&row.message_id, &resolved, None),
             "reviewer [pending · 1 ahead; wake submitted att-00000000-0000-4000-8000-000000000001]"
         );
         assert_eq!(
@@ -3271,13 +3882,13 @@ mod tests {
         let mut uncertain = row.recipients[0].clone();
         uncertain.notification.resolution_intent =
             Some(cyclops_proto::NotificationResolution::Complete);
-        let cell = message_recipient_cell(&row.message_id, &uncertain);
+        let cell = message_recipient_cell(&row.message_id, &uncertain, None);
         assert!(cell.contains("terminal acceptance unproven"), "{cell}");
         assert!(!cell.contains("cyclops attention complete"), "{cell}");
 
         uncertain.notification.resolution_action_accepted =
             Some(cyclops_proto::NotificationResolution::Complete);
-        let cell = message_recipient_cell(&row.message_id, &uncertain);
+        let cell = message_recipient_cell(&row.message_id, &uncertain, None);
         assert!(
             cell.contains("terminal accepted, task start unproven"),
             "{cell}"
@@ -3290,7 +3901,7 @@ mod tests {
                 observed_at_ms: 4,
             },
         );
-        let cell = message_recipient_cell(&row.message_id, &uncertain);
+        let cell = message_recipient_cell(&row.message_id, &uncertain, None);
         assert!(cell.contains("terminal accepted the action key"), "{cell}");
         assert!(cell.contains("cyclops attention complete"), "{cell}");
         assert!(
@@ -3303,7 +3914,7 @@ mod tests {
         uncertain.notification.resolution_action_accepted =
             Some(cyclops_proto::NotificationResolution::Discard);
         uncertain.notification.resolution_consumption_observed = None;
-        let cell = message_recipient_cell(&row.message_id, &uncertain);
+        let cell = message_recipient_cell(&row.message_id, &uncertain, None);
         assert!(cell.contains("terminal accepted the action key"), "{cell}");
         assert!(cell.contains("cyclops attention discard"), "{cell}");
 
@@ -3315,7 +3926,7 @@ mod tests {
         });
         worker_failed.notification.pre_write_cause =
             Some(cyclops_proto::NotificationPreWriteCause::WorkerFailed);
-        let cell = message_recipient_cell(&row.message_id, &worker_failed);
+        let cell = message_recipient_cell(&row.message_id, &worker_failed, None);
         assert!(cell.contains("worker_failed"), "{cell}");
         assert!(cell.contains("waited "), "{cell}");
         assert!(cell.contains("current route reviewer-now (%1)"), "{cell}");
@@ -3325,6 +3936,12 @@ mod tests {
             ),
             "{cell}"
         );
+
+        worker_failed.notification.wake_block =
+            Some(cyclops_proto::MessageWakeBlock::WorkerSupervisorExited);
+        let cell = message_recipient_cell(&row.message_id, &worker_failed, None);
+        assert!(cell.contains("worker_supervisor_exited"), "{cell}");
+        assert!(!cell.contains("scheduler_state_unavailable"), "{cell}");
     }
 
     /// The preview line shows the cause in the protocol's own spelling.
@@ -3376,6 +3993,8 @@ mod tests {
             notification_state: None,
             quota_state: None,
             notification_settlement: None,
+            pre_write_cause: None,
+            wake_block: None,
             position: None,
             note: None,
             pane: None,
@@ -3414,6 +4033,28 @@ mod tests {
         // One bad recipient in a broadcast is enough.
         assert_eq!(
             receipts_exit(&[receipt(DeliveredVerified), receipt(ParkedBlockedQuota)]),
+            1
+        );
+        let mut wake_blocked = receipt(Queued);
+        wake_blocked.wake_block = Some(cyclops_proto::MessageWakeBlock::EnqueueRefused);
+        assert_eq!(receipts_exit(&[wake_blocked]), 1);
+        assert_eq!(
+            receipts_exit_json(&json!({
+                "deliveries": [{"state": "queued", "wake_block": "enqueue_refused"}]
+            })),
+            1
+        );
+        let mut pre_write_blocked = receipt(Queued);
+        pre_write_blocked.pre_write_cause =
+            Some(cyclops_proto::NotificationPreWriteCause::BindingUnprovable);
+        assert_eq!(receipts_exit(&[pre_write_blocked]), 1);
+        assert_eq!(
+            receipts_exit_json(&json!({
+                "deliveries": [{
+                    "state": "queued",
+                    "pre_write_cause": "binding_unprovable"
+                }]
+            })),
             1
         );
         // A state this build does not know is not an error to report on:

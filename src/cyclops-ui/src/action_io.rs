@@ -17,10 +17,11 @@ use std::time::Duration;
 
 use cyclops_proto::{MessageId, NotificationAttemptId};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
 use crate::detail::{Check, Loaded, ThreadEntry};
+use crate::wire::{encode_json, FrameReader};
 
 /// What a request is doing, which decides how its silence is read.
 ///
@@ -307,7 +308,23 @@ async fn open_message(sock: &Path, message_id: &MessageId, claim: bool) -> Actio
     match call(sock, "msg.thread", json!({ "id": message_id.to_string() })).await {
         Ok(value) => {
             let want = message_id.to_string();
-            for line in value["lines"].as_array().unwrap_or(&Vec::new()) {
+            let thread_problem = match value["lines"].as_array() {
+                None => Some("msg.thread returned no lines".to_string()),
+                Some(lines) if lines.len() > crate::stream::RING_CAP => Some(format!(
+                    "msg.thread exceeds the {}-item UI limit",
+                    crate::stream::RING_CAP
+                )),
+                Some(_) => None,
+            };
+            if let Some(problem) = thread_problem {
+                if loaded.body.is_some() || loaded.claim_note.is_some() {
+                    loaded.thread_note = Some(format!("thread unavailable: {problem}"));
+                    return ActionOutcome::Opened(Box::new(loaded));
+                }
+                return ActionOutcome::Uncertain(problem);
+            }
+            let lines = value["lines"].as_array().expect("validated above");
+            for line in lines {
                 let kind = line["kind"].as_str().unwrap_or("");
                 if kind != "msg" && kind != "fyi" {
                     continue; // state and gate lines are not the thread
@@ -462,27 +479,24 @@ async fn call(sock: &Path, method: &str, params: Value) -> Result<Value, Failure
 
 /// Connect and read the hello. Nothing here writes a request, so every
 /// failure in this function is known-not-sent.
-async fn open(sock: &Path) -> Result<UnixStream, Failure> {
+type Connection = (
+    FrameReader<tokio::net::unix::OwnedReadHalf>,
+    tokio::net::unix::OwnedWriteHalf,
+);
+
+async fn open(sock: &Path) -> Result<Connection, Failure> {
     let stream = UnixStream::connect(sock)
         .await
         .map_err(|e| Failure::NotSent(format!("connect: {e}")))?;
-    let mut hello = BufReader::new(stream);
-    let mut line = String::new();
-    let read = hello
-        .read_line(&mut line)
+    let (read, write) = stream.into_split();
+    let mut frames = FrameReader::new(read);
+    let frame = frames
+        .next_frame()
         .await
-        .map_err(|e| Failure::NotSent(format!("hello: {e}")))?;
-    // The greeting has to BE a greeting. read_line into a discarded
-    // String returned Ok on end-of-file and on any bytes at all, so a
-    // socket that closed before greeting looked like a healthy open. The
-    // request then went out, failed after the write, and was reported as
-    // Uncertain: a non-idempotent verb withheld and an operator told to
-    // go and look, over a connection the daemon never accepted.
-    if read == 0 {
-        return Err(Failure::NotSent("closed before the hello".into()));
-    }
-    match serde_json::from_str::<cyclops_proto::Hello>(line.trim()) {
-        Ok(_) => Ok(hello.into_inner()),
+        .map_err(|e| Failure::NotSent(format!("hello: {e}")))?
+        .ok_or_else(|| Failure::NotSent("closed before the hello".into()))?;
+    match serde_json::from_slice::<cyclops_proto::Hello>(&frame) {
+        Ok(_) => Ok((frames, write)),
         Err(_) => Err(Failure::NotSent("not a cyclops daemon".into())),
     }
 }
@@ -495,42 +509,44 @@ async fn open(sock: &Path) -> Result<UnixStream, Failure> {
 /// an unterminated fragment the daemon cannot act on. Neither case is a
 /// half-executed request, which is why a write error is reported as
 /// not-sent. Everything after the write is uncertain.
-async fn ask(stream: UnixStream, method: &str, params: Value) -> Result<Value, Failure> {
-    let (r, mut w) = stream.into_split();
-    let mut lines = BufReader::new(r).lines();
+async fn ask(connection: Connection, method: &str, params: Value) -> Result<Value, Failure> {
+    let (mut frames, mut w) = connection;
     let request = json!({ "id": 1, "method": method, "params": params });
-    w.write_all(format!("{request}\n").as_bytes())
+    let mut request =
+        encode_json(&request).map_err(|e| Failure::NotSent(format!("encode request: {e}")))?;
+    request.push(b'\n');
+    w.write_all(&request)
         .await
         .map_err(|e| Failure::NotSent(format!("send: {e}")))?;
 
-    while let Some(line) = lines
-        .next_line()
+    let frame = frames
+        .next_frame()
         .await
         .map_err(|e| Failure::Uncertain(format!("read: {e}")))?
-    {
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if value.get("event").is_some() {
-            continue; // events share the stream
-        }
-        if let Some(error) = value.get("error") {
-            return Err(Failure::Refused {
-                code: error["code"].as_str().unwrap_or("error").to_string(),
-                message: error["message"].as_str().unwrap_or("").to_string(),
-            });
-        }
-        return Ok(value["result"].clone());
+        .ok_or_else(|| Failure::Uncertain("connection closed before an answer".into()))?;
+    let response: cyclops_proto::Response = serde_json::from_slice(&frame)
+        .map_err(|e| Failure::Uncertain(format!("malformed {method} answer: {e}")))?;
+    if response.id != 1 {
+        return Err(Failure::Uncertain(format!(
+            "{method} returned the wrong response id"
+        )));
     }
-    Err(Failure::Uncertain(
-        "connection closed before an answer".into(),
-    ))
+    if let Some(error) = response.error {
+        return Err(Failure::Refused {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    response
+        .result
+        .ok_or_else(|| Failure::Uncertain(format!("{method} returned no result")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::str::FromStr;
+    use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::UnixListener;
 
     /// A real greeting. The client rejects anything else, so a fixture

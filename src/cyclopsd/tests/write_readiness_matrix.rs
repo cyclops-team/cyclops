@@ -329,7 +329,10 @@ fn agy_deterministic_safety_matrix_9_states() {
     // 2. IdleWithInput (human typed draft) -> write_ready == false
     let typed_screen =
         "mac\n────────────────\n> my draft text\n────────────────\nGemini 3.6 Flash (High)";
-    let eval = manifest.evaluate("mac", typed_screen).unwrap();
+    let typed_esc = "mac\n\u{1b}[90m────────────────\n\u{1b}[94m>\u{1b}[39m my draft text\n\u{1b}[90m────────────────\n\u{1b}[38;5;152mGemini 3.6 Flash (High)";
+    let eval = manifest
+        .evaluate_esc("mac", typed_screen, Some(typed_esc))
+        .unwrap();
     assert_eq!(eval.state, AgentState::IdleWithInput);
     let det = fuse_detection(
         "agy",

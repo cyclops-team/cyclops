@@ -71,21 +71,31 @@ impl Client {
     /// The explicit-budget form exists for the hook receiver, which runs
     /// inside vendor hook time limits and cannot afford the defaults.
     pub fn connect_with_timeouts(connect: Duration, read: Duration) -> Result<Self, ClientError> {
+        Self::from_stream(Self::connect_stream(connect)?, read)
+    }
+
+    /// Phase one of the handshake: the socket, within `connect`, and no
+    /// Hello read. Split from [`Client::from_stream`] so a caller on a hard
+    /// deadline can budget the Hello read from what is left AFTER the
+    /// connect returned, instead of granting both phases up front.
+    pub fn connect_stream(connect: Duration) -> Result<UnixStream, ClientError> {
         let path = cyclops_proto::socket_path();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let _ = tx.send(UnixStream::connect(path));
         });
-        let stream = match rx.recv_timeout(connect) {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                return Err(match e.kind() {
-                    ErrorKind::NotFound | ErrorKind::ConnectionRefused => ClientError::NotRunning,
-                    _ => ClientError::Broken(e.to_string()),
-                })
-            }
-            Err(_) => return Err(ClientError::ConnectTimeout(connect)),
-        };
+        match rx.recv_timeout(connect) {
+            Ok(Ok(s)) => Ok(s),
+            Ok(Err(e)) => Err(match e.kind() {
+                ErrorKind::NotFound | ErrorKind::ConnectionRefused => ClientError::NotRunning,
+                _ => ClientError::Broken(e.to_string()),
+            }),
+            Err(_) => Err(ClientError::ConnectTimeout(connect)),
+        }
+    }
+
+    /// Phase two: read the Hello line within `read` on a connected stream.
+    pub fn from_stream(stream: UnixStream, read: Duration) -> Result<Self, ClientError> {
         stream
             .set_read_timeout(Some(read))
             .map_err(|e| ClientError::Broken(e.to_string()))?;

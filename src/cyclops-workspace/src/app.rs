@@ -23,16 +23,20 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 
 use crossterm::event::{
     self, Event, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use cyclops_tmux::{ControlClient, ControlConfig, Notification};
-use ratatui::backend::CrosstermBackend;
+use cyclops_tmux::{
+    ControlClient, ControlConfig, InputCapacity, Notification, NotificationReceiver, TmuxError,
+};
+use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::Rect;
 use ratatui::Terminal;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep_until, Duration, Instant};
 
 use crate::action;
@@ -52,8 +56,8 @@ use crate::naming;
 use crate::notice::NoticeState;
 use crate::persist::{self, load_prefs, set_last_active, SidebarTab, WorkspacePrefs};
 use crate::render::{
-    paint_dialog, paint_menu, paint_sidebar, paint_sidebar_rail, paint_sidebar_resize_feedback,
-    paint_tab_bar, paint_window,
+    paint_dialog, paint_menu, paint_messages, paint_messages_rail, paint_messages_resize_feedback,
+    paint_sidebar, paint_sidebar_rail, paint_sidebar_resize_feedback, paint_tab_bar, paint_window,
 };
 use crate::resilience::{self, LinkState};
 use crate::selection::{self, SelectionState};
@@ -88,6 +92,32 @@ const FOLDER_PROBE_DELAY: Duration = Duration::from_millis(600);
 /// own blocking status round trip even though only the last result before
 /// the next paint was ever shown.
 const DECORATION_DEBOUNCE: Duration = Duration::from_millis(30);
+/// One frame's worth of ready work. Producers backpressure after this
+/// instead of growing memory while rendering or tmux reconciliation waits.
+const INGRESS_CAPACITY: usize = cyclops_ui::INGRESS_BATCH;
+/// Payload-bearing lanes are both item-bounded and byte-bounded. Every item
+/// is capped at 1 MiB before enqueue, so eight retained items hold at most
+/// 8 MiB of payload per lane.
+const PAYLOAD_INGRESS_CAPACITY: usize = 8;
+/// Input and action answers keep priority for an interactive burst, then one
+/// ready background lane must run before priority can resume.
+const PRIORITY_BURST: usize = 8;
+/// A send worker is serial per composer, so one answer is the full action
+/// backlog the application can use.
+const ACTION_CAPACITY: usize = 1;
+/// One pending focus or resize edge is sufficient. Interactive keys, paste,
+/// and mouse actions use the priority lanes instead.
+const TERMINAL_CAPACITY: usize = 1;
+/// Match the stream UI's shipped paste quarantine. Larger clipboard data is
+/// refused before it enters the application queue.
+const PASTE_MAX_BYTES: usize = 1 << 20;
+/// Pane output uses the same byte envelope as a terminal paste. Larger
+/// control-mode notifications are split without changing pane byte order.
+const OUTPUT_BATCH_MAX_BYTES: usize = 1 << 20;
+/// Daemon event lines are body-free in normal operation. A line larger
+/// than the paste envelope is treated as a stream gap and reconciled from
+/// the bounded journal tail instead of entering the app queue.
+const STREAM_EVENT_MAX_BYTES: usize = 1 << 20;
 
 enum AppMsg {
     /// A send started from the composer has an answer. Carries the
@@ -97,9 +127,22 @@ enum AppMsg {
         attempt: dialog::ComposeAttempt,
         outcome: crate::daemon::SendOutcome,
     },
-    Input(KeyEvent),
-    Paste(String),
-    Mouse(MouseEvent),
+    Input {
+        epoch: u64,
+        key: KeyEvent,
+    },
+    Paste {
+        epoch: u64,
+        text: String,
+    },
+    PasteTooLarge {
+        epoch: u64,
+        bytes: usize,
+    },
+    Mouse {
+        epoch: u64,
+        mouse: MouseEvent,
+    },
     /// The terminal's focus moved onto (`true`) or off (`false`) the
     /// workspace's tab. Drives the window background only: the theme's
     /// ground is painted onto the terminal while the workspace is looked
@@ -147,11 +190,199 @@ enum AppMsg {
     /// own coalesced refresh is a separate message (`DecorationChanged`)
     /// on the same connection, so this must never gate or delay it.
     StreamEntry(Box<cyclops_ui::Entry>),
+    StreamGap {
+        why: String,
+    },
+    StreamReconciled(Box<crate::event_record::Bootstrap>),
     /// The daemon switched themes (`cyclops theme <name>`), forwarded by
     /// [`spawn_decoration_forwarder`]'s reader thread. Wake-only, like
     /// cyclops-ui's `UiMsg::ThemeChanged`: the handler arms the render
     /// debounce and the reload itself runs on that deadline, before draw.
     ThemeChanged,
+    /// A messages snapshot response has landed from cyclopsd.
+    MessagesSnapshotLoaded {
+        request: cyclops_ui::RefreshRequest,
+        result: cyclops_proto::MessagesSnapshotResult,
+    },
+    /// A messages snapshot request failed or timed out.
+    MessagesSnapshotFailed {
+        request: cyclops_ui::RefreshRequest,
+        error: String,
+    },
+    /// Message detail or claim response for one frozen target.
+    MessageDetailFinished {
+        target: cyclops_ui::FrozenTarget,
+        outcome: cyclops_ui::ActionOutcome,
+    },
+    /// Messages group-chat composer send outcome from background worker.
+    MessagesSendFinished {
+        attempt: MessagesSendAttempt,
+        outcome: crate::daemon::SendOutcome,
+    },
+    /// Messages projection changed invalidation signal from cyclopsd.
+    MessagesChanged(Option<cyclops_proto::MessagesChangedData>),
+}
+
+/// Exact composer bytes and routing held until the daemon answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MessagesSendAttempt {
+    pub composer_revision: u64,
+    pub mode: cyclops_ui::ComposerMode,
+    pub caller: cyclops_proto::RecipientKey,
+    pub recipient_keys: Option<Vec<cyclops_proto::RecipientKey>>,
+    pub subject: String,
+    pub body: String,
+    pub fyi: bool,
+    pub reply_to: Option<String>,
+    pub client_key: String,
+}
+
+impl MessagesSendAttempt {
+    fn matches(
+        &self,
+        composer: &cyclops_ui::ComposerState,
+        composer_revision: u64,
+        caller: Option<cyclops_proto::RecipientKey>,
+    ) -> bool {
+        composer_revision == self.composer_revision
+            && caller == Some(self.caller)
+            && composer.sender == Some(self.caller)
+            && composer.mode.as_ref() == Some(&self.mode)
+            && composer.text() == self.body
+            && composer.draft.key() == Some(self.client_key.as_str())
+    }
+}
+
+/// Composer identity whose uncertain result an operator chose to reconcile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MessagesDraftIdentity {
+    composer_revision: u64,
+    mode: cyclops_ui::ComposerMode,
+    caller: cyclops_proto::RecipientKey,
+    body: String,
+    client_key: String,
+}
+
+impl MessagesDraftIdentity {
+    fn current(
+        composer: &cyclops_ui::ComposerState,
+        composer_revision: u64,
+        caller: Option<cyclops_proto::RecipientKey>,
+    ) -> Option<Self> {
+        Some(Self {
+            composer_revision,
+            mode: composer.mode.clone()?,
+            caller: caller?,
+            body: composer.text().to_string(),
+            client_key: composer.draft.key()?.to_string(),
+        })
+    }
+
+    fn matches(
+        &self,
+        composer: &cyclops_ui::ComposerState,
+        composer_revision: u64,
+        caller: Option<cyclops_proto::RecipientKey>,
+    ) -> bool {
+        composer_revision == self.composer_revision
+            && caller == Some(self.caller)
+            && composer.sender == Some(self.caller)
+            && composer.mode.as_ref() == Some(&self.mode)
+            && composer.text() == self.body
+            && composer.draft.key() == Some(self.client_key.as_str())
+    }
+}
+
+/// Work item for sending a message asynchronously from the group-chat composer.
+pub(crate) struct MessagesSendTask {
+    pub attempt: MessagesSendAttempt,
+}
+
+/// One detail read against the exact row the operator opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MessageDetailTask {
+    row: cyclops_ui::QueueRow,
+    target: cyclops_ui::FrozenTarget,
+}
+
+impl MessageDetailTask {
+    fn request(&self) -> cyclops_ui::ActionRequest {
+        debug_assert_eq!(&self.row.target, &self.target.target);
+        match self.target.attempt {
+            Some(attempt_id) => cyclops_ui::ActionRequest::OpenAttention { attempt_id },
+            None => cyclops_ui::ActionRequest::OpenMessage {
+                message_id: self.row.message_id.clone(),
+                claim: self.row.direction == cyclops_ui::Direction::Inbound
+                    && self.row.mailbox == cyclops_ui::MailboxWord::Pending,
+            },
+        }
+    }
+}
+
+impl AppMsg {
+    fn pane_input_epoch(&self) -> Option<u64> {
+        match self {
+            Self::Input { epoch, .. }
+            | Self::Paste { epoch, .. }
+            | Self::PasteTooLarge { epoch, .. }
+            | Self::Mouse { epoch, .. } => Some(*epoch),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PaneInputGate(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl PaneInputGate {
+    fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)))
+    }
+
+    fn stamp(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn close(&self) {
+        let _ = self.0.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |current| (current % 2 == 0).then_some(current.wrapping_add(1)),
+        );
+    }
+
+    fn open(&self) {
+        let _ = self.0.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |current| (current % 2 == 1).then_some(current.wrapping_add(1)),
+        );
+    }
+
+    fn accepts(&self, epoch: u64) -> bool {
+        let current = self.stamp();
+        current.is_multiple_of(2) && epoch == current
+    }
+
+    fn is_closed(&self) -> bool {
+        self.stamp() % 2 == 1
+    }
+}
+
+/// Independent bounded lanes for work that enters the application from
+/// background tasks. Keeping the senders typed as one message vocabulary
+/// lets the handler stay the single owner of state transitions while the
+/// receivers enforce priority.
+#[derive(Clone)]
+struct AppSinks {
+    tmux: mpsc::Sender<AppMsg>,
+    stream: mpsc::Sender<AppMsg>,
+    continuity: mpsc::Sender<ControlContinuityBarrier>,
+}
+
+struct ControlContinuityBarrier {
+    repair: oneshot::Sender<bool>,
+    cutover: oneshot::Receiver<bool>,
 }
 
 struct App {
@@ -263,12 +494,26 @@ struct App {
     /// so the Stream tab and the CLI show one history rather than two that
     /// agree only on formatting.
     record: cyclops_ui::Record,
+    /// The shared Cyclops watch Messages model (HumanQueue).
+    messages_queue: cyclops_ui::HumanQueue,
+    /// Authenticated mailbox identity that produced the current snapshot.
+    /// Absent means the Messages surface is read-only.
+    messages_caller: Option<cyclops_proto::RecipientKey>,
+    /// Open message detail view when an operator opens a message.
+    messages_detail: Option<cyclops_ui::Detail>,
+    /// Bounded group-chat composer state.
+    messages_composer: cyclops_ui::ComposerState,
+    /// Data-driven avatar registry for resolving agent/sender initials and icons.
+    avatar_registry: cyclops_ui::AvatarRegistry,
     /// Startup ordering and seq dedup for `record`
     /// ([`cyclops_ui::Intake`]): live entries reaching the app before
     /// [`crate::event_record::boot`] lands its backfill buffer here, and
     /// ledger-backed duplicates arriving live during startup are dropped
     /// by seq instead of shown twice.
     intake: cyclops_ui::Intake,
+    /// An oversized event invalidates the stream once. A replacement is
+    /// loaded off-loop and later gaps coalesce until that result lands.
+    stream_reconciling: bool,
     /// The (shape, blink) last emitted to the host terminal
     /// ([`crate::term_guard::apply_cursor_style`]), so a frame whose
     /// focused-pane cursor did not change costs no terminal write. `None`
@@ -294,14 +539,34 @@ struct App {
     /// When the next folder probe is due. `None` means none is armed; see
     /// [`arm_folder_probe`].
     folder_probe_at: Option<Instant>,
-    /// The app's own channel, for work that cannot finish on this thread.
-    ///
-    /// Nearly every action is a tmux call that returns in microseconds and
-    /// needs nothing here. A send is the exception: the daemon holds its
-    /// answer for the acknowledgement window, so it runs on a thread of its
-    /// own and posts an [`AppMsg`] back when it knows. None in tests that
-    /// build an App with no loop around it.
-    tx: Option<mpsc::UnboundedSender<AppMsg>>,
+    /// One fixed send worker. A composer can abandon an in-flight attempt,
+    /// but reopening it never creates another thread.
+    send_requests: Option<std::sync::mpsc::SyncSender<dialog::ComposeAttempt>>,
+    /// One fixed stream replacement worker. Gap edges coalesce in its
+    /// single slot while the current replacement is loading.
+    stream_reconcile_requests: Option<std::sync::mpsc::SyncSender<()>>,
+    /// Whether the Messages drawer has active keyboard focus.
+    messages_focused: bool,
+    /// Refresh gate and connection lifecycle for the Messages drawer.
+    messages_gate: cyclops_ui::RefreshGate,
+    /// Exact failure from the last whole-snapshot RPC. Kept until another
+    /// request starts or a current snapshot lands so the drawer never hides
+    /// an authentication, routing, or transport failure behind `refresh failed`.
+    messages_refresh_error: Option<String>,
+    /// Async worker for Messages composer sends.
+    messages_send_tx: Option<std::sync::mpsc::SyncSender<MessagesSendTask>>,
+    /// Local edit generation used to reject completions for abandoned drafts.
+    messages_composer_revision: u64,
+    /// The only Messages composer request whose answer may change the composer.
+    messages_send_in_flight: Option<MessagesSendAttempt>,
+    /// Async worker for bounded messages snapshot requests.
+    messages_snapshot_tx: Option<std::sync::mpsc::SyncSender<(cyclops_ui::RefreshRequest, usize)>>,
+    /// Async worker for claiming/loading message detail.
+    message_detail_tx: Option<mpsc::Sender<MessageDetailTask>>,
+    /// The only frozen detail target whose answer is still outstanding.
+    message_detail_in_flight: Option<cyclops_ui::FrozenTarget>,
+    /// Exact uncertain draft whose reconciliation waits for a current snapshot.
+    messages_reconcile_owed: Option<MessagesDraftIdentity>,
 }
 
 fn toggle_workspace_expanded(expanded: &mut HashSet<String>, session_id: String) -> bool {
@@ -322,23 +587,296 @@ fn arm(debounce: &mut Option<Instant>) {
 }
 
 enum Wake {
-    Message(Option<AppMsg>),
+    Message(Option<Box<AppMsg>>),
+    InputCapacity(Result<InputCapacity, TmuxError>),
+    ControlContinuityLost(ControlContinuityBarrier),
     Deadline,
+}
+
+impl Wake {
+    fn message(message: Option<AppMsg>) -> Self {
+        Self::Message(message.map(Box::new))
+    }
+}
+
+type InputCapacityFuture =
+    Pin<Box<dyn Future<Output = Result<InputCapacity, TmuxError>> + Send + 'static>>;
+
+#[derive(Debug, PartialEq, Eq)]
+struct PendingPaneInput {
+    pane: String,
+    keys: Vec<String>,
+}
+
+/// Retire the pane-input prefix accepted before a continuity barrier. The
+/// action lane is separate and survives because it resolves against the new
+/// model after reconciliation.
+fn retire_pane_input_segment(
+    active_pane: &str,
+    pending: &mut Option<PendingPaneInput>,
+    input_rx: &mut mpsc::Receiver<AppMsg>,
+    paste_rx: &mut mpsc::Receiver<AppMsg>,
+) -> Option<String> {
+    let pending_pane = pending.take().map(|input| input.pane);
+    let mut dropped_suffix = false;
+    while input_rx.try_recv().is_ok() {
+        dropped_suffix = true;
+    }
+    while paste_rx.try_recv().is_ok() {
+        dropped_suffix = true;
+    }
+    pending_pane.or_else(|| dropped_suffix.then(|| active_pane.to_string()))
 }
 
 /// Wait for a message or the next armed deadline. The explicit due check is
 /// what makes the render guarantee real: a permanently ready message queue
 /// cannot keep winning a biased select after the deadline has passed.
-async fn next_wake(rx: &mut mpsc::UnboundedReceiver<AppMsg>, deadline: Option<Instant>) -> Wake {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngressSource {
+    Priority,
+    Background,
+}
+
+#[derive(Default)]
+struct IngressFairness {
+    priority_run: usize,
+    priority_cursor: usize,
+    background_cursor: usize,
+}
+
+impl IngressFairness {
+    fn record(&mut self, source: IngressSource) {
+        match source {
+            IngressSource::Priority => {
+                self.priority_run = self.priority_run.saturating_add(1);
+            }
+            IngressSource::Background => self.priority_run = 0,
+        }
+    }
+}
+
+fn try_priority_ready(
+    input_rx: &mut mpsc::Receiver<AppMsg>,
+    paste_rx: &mut mpsc::Receiver<AppMsg>,
+    action_rx: &mut mpsc::Receiver<AppMsg>,
+    cursor: &mut usize,
+) -> Option<AppMsg> {
+    for offset in 0..3 {
+        let lane = (*cursor + offset) % 3;
+        let message = match lane {
+            0 => input_rx.try_recv().ok(),
+            1 => paste_rx.try_recv().ok(),
+            2 => action_rx.try_recv().ok(),
+            _ => unreachable!(),
+        };
+        if message.is_some() {
+            *cursor = (lane + 1) % 3;
+            return message;
+        }
+    }
+    None
+}
+
+fn try_background_ready(
+    terminal_rx: &mut mpsc::Receiver<AppMsg>,
+    tmux_rx: &mut mpsc::Receiver<AppMsg>,
+    stream_rx: &mut mpsc::Receiver<AppMsg>,
+    allow_stream: bool,
+    cursor: &mut usize,
+) -> Option<AppMsg> {
+    for offset in 0..3 {
+        let lane = (*cursor + offset) % 3;
+        let message = match lane {
+            0 => terminal_rx.try_recv().ok(),
+            1 => tmux_rx.try_recv().ok(),
+            2 if allow_stream => stream_rx.try_recv().ok(),
+            2 => None,
+            _ => unreachable!(),
+        };
+        if message.is_some() {
+            *cursor = (lane + 1) % 3;
+            return message;
+        }
+    }
+    None
+}
+
+async fn next_message(
+    input_rx: &mut mpsc::Receiver<AppMsg>,
+    paste_rx: &mut mpsc::Receiver<AppMsg>,
+    action_rx: &mut mpsc::Receiver<AppMsg>,
+    terminal_rx: &mut mpsc::Receiver<AppMsg>,
+    tmux_rx: &mut mpsc::Receiver<AppMsg>,
+    stream_rx: &mut mpsc::Receiver<AppMsg>,
+    allow_stream: bool,
+    fairness: &mut IngressFairness,
+) -> Option<AppMsg> {
+    if fairness.priority_run >= PRIORITY_BURST {
+        if let Some(message) = try_background_ready(
+            terminal_rx,
+            tmux_rx,
+            stream_rx,
+            allow_stream,
+            &mut fairness.background_cursor,
+        ) {
+            fairness.record(IngressSource::Background);
+            return Some(message);
+        }
+    } else if let Some(message) =
+        try_priority_ready(input_rx, paste_rx, action_rx, &mut fairness.priority_cursor)
+    {
+        fairness.record(IngressSource::Priority);
+        return Some(message);
+    }
+
+    if let Some(message) = try_background_ready(
+        terminal_rx,
+        tmux_rx,
+        stream_rx,
+        allow_stream,
+        &mut fairness.background_cursor,
+    ) {
+        fairness.record(IngressSource::Background);
+        return Some(message);
+    }
+
+    let (source, message) = tokio::select! {
+        message = input_rx.recv() => (IngressSource::Priority, message),
+        message = paste_rx.recv() => (IngressSource::Priority, message),
+        message = action_rx.recv() => (IngressSource::Priority, message),
+        message = terminal_rx.recv() => (IngressSource::Background, message),
+        message = tmux_rx.recv() => (IngressSource::Background, message),
+        message = stream_rx.recv(), if allow_stream => (IngressSource::Background, message),
+    };
+    fairness.record(source);
+    message
+}
+
+async fn next_background_message(
+    terminal_rx: &mut mpsc::Receiver<AppMsg>,
+    tmux_rx: &mut mpsc::Receiver<AppMsg>,
+    stream_rx: &mut mpsc::Receiver<AppMsg>,
+    allow_stream: bool,
+    cursor: &mut usize,
+) -> Option<AppMsg> {
+    if let Some(message) =
+        try_background_ready(terminal_rx, tmux_rx, stream_rx, allow_stream, cursor)
+    {
+        return Some(message);
+    }
+    let (lane, message) = tokio::select! {
+        message = terminal_rx.recv() => (0, message),
+        message = tmux_rx.recv() => (1, message),
+        message = stream_rx.recv(), if allow_stream => (2, message),
+    };
+    *cursor = (lane + 1) % 3;
+    message
+}
+
+async fn next_wake(
+    continuity_rx: &mut mpsc::Receiver<ControlContinuityBarrier>,
+    input_rx: &mut mpsc::Receiver<AppMsg>,
+    paste_rx: &mut mpsc::Receiver<AppMsg>,
+    action_rx: &mut mpsc::Receiver<AppMsg>,
+    terminal_rx: &mut mpsc::Receiver<AppMsg>,
+    tmux_rx: &mut mpsc::Receiver<AppMsg>,
+    stream_rx: &mut mpsc::Receiver<AppMsg>,
+    allow_stream: bool,
+    fairness: &mut IngressFairness,
+    deadline: Option<Instant>,
+) -> Wake {
+    if let Ok(ack) = continuity_rx.try_recv() {
+        return Wake::ControlContinuityLost(ack);
+    }
     if deadline.is_some_and(|at| at <= Instant::now()) {
         return Wake::Deadline;
     }
     let Some(deadline) = deadline else {
-        return Wake::Message(rx.recv().await);
+        return tokio::select! {
+            biased;
+            ack = continuity_rx.recv() => match ack {
+                Some(ack) => Wake::ControlContinuityLost(ack),
+                None => Wake::Message(None),
+            },
+            message = next_message(
+                input_rx,
+                paste_rx,
+                action_rx,
+                terminal_rx,
+                tmux_rx,
+                stream_rx,
+                allow_stream,
+                fairness,
+            ) => Wake::message(message),
+        };
     };
     tokio::select! {
         biased;
-        msg = rx.recv() => Wake::Message(msg),
+        ack = continuity_rx.recv() => match ack {
+            Some(ack) => Wake::ControlContinuityLost(ack),
+            None => Wake::Message(None),
+        },
+        msg = next_message(
+            input_rx,
+            paste_rx,
+            action_rx,
+            terminal_rx,
+            tmux_rx,
+            stream_rx,
+            allow_stream,
+            fairness,
+        ) => Wake::message(msg),
+        _ = sleep_until(deadline) => Wake::Deadline,
+    }
+}
+
+/// Wait for one held pane-input batch to gain reply capacity while the app
+/// keeps consuming background state. Priority lanes are intentionally absent:
+/// a later key, paste, or action cannot pass the batch already accepted from
+/// the terminal. The same capacity future survives background wakes, so an
+/// output flood cannot repeatedly move it to the back of the semaphore queue.
+async fn next_pending_input_wake(
+    continuity_rx: &mut mpsc::Receiver<ControlContinuityBarrier>,
+    capacity: &mut InputCapacityFuture,
+    terminal_rx: &mut mpsc::Receiver<AppMsg>,
+    tmux_rx: &mut mpsc::Receiver<AppMsg>,
+    stream_rx: &mut mpsc::Receiver<AppMsg>,
+    allow_stream: bool,
+    background_cursor: &mut usize,
+    deadline: Option<Instant>,
+) -> Wake {
+    if let Ok(ack) = continuity_rx.try_recv() {
+        return Wake::ControlContinuityLost(ack);
+    }
+    if deadline.is_some_and(|at| at <= Instant::now()) {
+        return Wake::Deadline;
+    }
+    let background = next_background_message(
+        terminal_rx,
+        tmux_rx,
+        stream_rx,
+        allow_stream,
+        background_cursor,
+    );
+    let Some(deadline) = deadline else {
+        return tokio::select! {
+            biased;
+            ack = continuity_rx.recv() => match ack {
+                Some(ack) => Wake::ControlContinuityLost(ack),
+                None => Wake::Message(None),
+            },
+            result = capacity.as_mut() => Wake::InputCapacity(result),
+            message = background => Wake::message(message),
+        };
+    };
+    tokio::select! {
+        biased;
+        ack = continuity_rx.recv() => match ack {
+            Some(ack) => Wake::ControlContinuityLost(ack),
+            None => Wake::Message(None),
+        },
+        result = capacity.as_mut() => Wake::InputCapacity(result),
+        message = background => Wake::message(message),
         _ = sleep_until(deadline) => Wake::Deadline,
     }
 }
@@ -405,44 +943,184 @@ pub async fn run_async() -> i32 {
     };
 
     let bindings = load_bindings(&home);
-    let (tx, mut rx) = mpsc::unbounded_channel::<AppMsg>();
+    let (input_tx, mut input_rx) = mpsc::channel::<AppMsg>(INGRESS_CAPACITY);
+    let (paste_tx, mut paste_rx) = mpsc::channel::<AppMsg>(1);
+    let (terminal_tx, mut terminal_rx) = mpsc::channel::<AppMsg>(TERMINAL_CAPACITY);
+    let (action_tx, mut action_rx) = mpsc::channel::<AppMsg>(ACTION_CAPACITY);
+    let (tmux_tx, mut tmux_rx) = mpsc::channel::<AppMsg>(PAYLOAD_INGRESS_CAPACITY);
+    let (continuity_tx, mut continuity_rx) = mpsc::channel(1);
+    let (stream_tx, mut stream_rx) = mpsc::channel::<AppMsg>(PAYLOAD_INGRESS_CAPACITY);
+    let pane_input_gate = PaneInputGate::new();
+    let sinks = AppSinks {
+        tmux: tmux_tx,
+        stream: stream_tx,
+        continuity: continuity_tx,
+    };
 
-    let input_tx = tx.clone();
+    let (send_request_tx, send_request_rx) =
+        std::sync::mpsc::sync_channel::<dialog::ComposeAttempt>(1);
+    let send_home = home.clone();
+    let send_results = action_tx.clone();
+    std::thread::spawn(move || {
+        while let Ok(attempt) = send_request_rx.recv() {
+            let outcome = crate::daemon::send_message(
+                &send_home,
+                &attempt.message.to,
+                &attempt.message.subject,
+                &attempt.message.body,
+                &attempt.client_key,
+            );
+            if send_results
+                .blocking_send(AppMsg::SendFinished { attempt, outcome })
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+    let (stream_reconcile_tx, stream_reconcile_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let stream_home = home.clone();
+    let stream_results = action_tx.clone();
+    std::thread::spawn(move || {
+        while stream_reconcile_rx.recv().is_ok() {
+            let bootstrap = crate::event_record::load(&stream_home);
+            if stream_results
+                .blocking_send(AppMsg::StreamReconciled(Box::new(bootstrap)))
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+
+    let (messages_send_tx, messages_send_rx) = std::sync::mpsc::sync_channel::<MessagesSendTask>(1);
+    let msg_send_home = home.clone();
+    let msg_send_results = action_tx.clone();
+    std::thread::spawn(move || {
+        while let Ok(task) = messages_send_rx.recv() {
+            let attempt = task.attempt;
+            let outcome = crate::daemon::send_message_full(
+                &msg_send_home,
+                crate::daemon::ExactMessageRequest {
+                    recipient_keys: attempt.recipient_keys.clone(),
+                    expected_caller: attempt.caller,
+                    subject: &attempt.subject,
+                    body: &attempt.body,
+                    fyi: attempt.fyi,
+                    reply_to: attempt.reply_to.clone(),
+                    client_key: &attempt.client_key,
+                },
+            );
+            if msg_send_results
+                .blocking_send(AppMsg::MessagesSendFinished { attempt, outcome })
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+
+    let (messages_snapshot_tx, messages_snapshot_rx) =
+        std::sync::mpsc::sync_channel::<(cyclops_ui::RefreshRequest, usize)>(1);
+    let msg_snapshot_home = home.clone();
+    let msg_snapshot_results = action_tx.clone();
+    std::thread::spawn(move || {
+        while let Ok((request, limit)) = messages_snapshot_rx.recv() {
+            match crate::daemon::fetch_messages_snapshot(&msg_snapshot_home, limit) {
+                Ok(result) => {
+                    if msg_snapshot_results
+                        .blocking_send(AppMsg::MessagesSnapshotLoaded { request, result })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    if msg_snapshot_results
+                        .blocking_send(AppMsg::MessagesSnapshotFailed { request, error })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    let (message_detail_tx, mut message_detail_rx) = mpsc::channel::<MessageDetailTask>(1);
+    let msg_detail_socket = home.join(cyclops_proto::SOCK_NAME);
+    let msg_detail_results = action_tx.clone();
+    tokio::spawn(async move {
+        while let Some(task) = message_detail_rx.recv().await {
+            let target = task.target.clone();
+            let outcome = cyclops_ui::perform(&msg_detail_socket, task.request()).await;
+            if msg_detail_results
+                .send(AppMsg::MessageDetailFinished { target, outcome })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+
+    let terminal_input_gate = pane_input_gate.clone();
     std::thread::spawn(move || loop {
         match event::read() {
             Ok(Event::Key(k)) => {
                 if k.kind == KeyEventKind::Release {
                     continue;
                 }
-                if input_tx.send(AppMsg::Input(k)).is_err() {
+                let epoch = terminal_input_gate.stamp();
+                if input_tx
+                    .blocking_send(AppMsg::Input { epoch, key: k })
+                    .is_err()
+                {
                     break;
                 }
             }
             Ok(Event::Mouse(m)) => {
-                if input_tx.send(AppMsg::Mouse(m)).is_err() {
+                let epoch = terminal_input_gate.stamp();
+                let moved = matches!(m.kind, MouseEventKind::Moved);
+                let message = AppMsg::Mouse { epoch, mouse: m };
+                let sent = if moved {
+                    input_tx.try_send(message).is_ok()
+                } else {
+                    input_tx.blocking_send(message).is_ok()
+                };
+                if !sent && input_tx.is_closed() {
                     break;
                 }
             }
             Ok(Event::Paste(text)) => {
-                if input_tx.send(AppMsg::Paste(text)).is_err() {
+                let epoch = terminal_input_gate.stamp();
+                let message = if text.len() > PASTE_MAX_BYTES {
+                    AppMsg::PasteTooLarge {
+                        epoch,
+                        bytes: text.len(),
+                    }
+                } else {
+                    AppMsg::Paste { epoch, text }
+                };
+                if paste_tx.blocking_send(message).is_err() {
                     break;
                 }
             }
             Ok(Event::Resize(w, h)) => {
-                let _ = input_tx.send(AppMsg::Resized(w, h));
+                let _ = terminal_tx.blocking_send(AppMsg::Resized(w, h));
             }
             Ok(Event::FocusGained) => {
-                let _ = input_tx.send(AppMsg::Focus(true));
+                let _ = terminal_tx.blocking_send(AppMsg::Focus(true));
             }
             Ok(Event::FocusLost) => {
-                let _ = input_tx.send(AppMsg::Focus(false));
+                let _ = terminal_tx.blocking_send(AppMsg::Focus(false));
             }
             Err(_) => break,
         }
     });
 
-    spawn_notif_forwarder(notif_rx, tx.clone());
-    spawn_decoration_forwarder(home.clone(), tx.clone());
+    spawn_notif_forwarder(notif_rx, sinks.tmux.clone(), sinks.continuity.clone());
+    spawn_decoration_forwarder(home.clone(), sinks.tmux.clone(), sinks.stream.clone());
 
     // Theme detection prints warnings; do it before the alternate screen
     // swallows them.
@@ -511,6 +1189,7 @@ pub async fn run_async() -> i32 {
     // sidebar wide and painted another, and the first reconcile would
     // fight the declaration. `chrome_for` is the one geometry both read.
     model.sidebar_visible = prefs.sidebar_visible;
+    model.messages_visible = prefs.messages_visible;
     let chrome_canvas =
         chrome_for(Rect::new(0, 0, term_size.0, term_size.1), &model, &prefs).canvas;
     let boot_size = crate::render::tmux_client_size(chrome_canvas, model.active_tab());
@@ -525,7 +1204,12 @@ pub async fn run_async() -> i32 {
                     // A fresh snapshot knows nothing about UI-owned
                     // preferences; re-carry visibility the same way
                     // `install_reconciled_model` does for every later one.
-                    install_reconciled_model(&mut model, resized, prefs.sidebar_visible);
+                    install_reconciled_model(
+                        &mut model,
+                        resized,
+                        prefs.sidebar_visible,
+                        prefs.messages_visible,
+                    );
                     apply_workspace_order(&mut model, &prefs.workspace_order);
                 }
             }
@@ -574,7 +1258,10 @@ pub async fn run_async() -> i32 {
         notice: NoticeState::default(),
         // Nothing to fall back to on the first frame: no answer here is
         // genuinely "nothing known yet", which is what the default says.
-        decoration: decoration::fetch_decoration(&home).unwrap_or_default(),
+        decoration: decoration::fetch_decoration(&home).unwrap_or_else(|error| {
+            log_err(&home, &format!("decoration bootstrap failed: {error}"));
+            DecorationSnapshot::default()
+        }),
         prefs: prefs.clone(),
         expanded_workspaces,
         expanded_for: None,
@@ -592,7 +1279,13 @@ pub async fn run_async() -> i32 {
         files_probe_at: None,
         files_root_pending: true,
         record: cyclops_ui::Record::new(),
+        messages_queue: cyclops_ui::HumanQueue::default(),
+        messages_caller: None,
+        messages_detail: None,
+        messages_composer: cyclops_ui::ComposerState::default(),
+        avatar_registry: cyclops_ui::AvatarRegistry::default(),
         intake: cyclops_ui::Intake::new(),
+        stream_reconciling: false,
         cursor_style: None,
         term_size,
         declared_client_size,
@@ -602,21 +1295,46 @@ pub async fn run_async() -> i32 {
         paste_seq: 0,
         home,
         folder_probe_at: None,
-        tx: Some(tx.clone()),
+        send_requests: Some(send_request_tx),
+        stream_reconcile_requests: Some(stream_reconcile_tx),
+        messages_focused: false,
+        messages_gate: cyclops_ui::RefreshGate::new(),
+        messages_refresh_error: None,
+        messages_send_tx: Some(messages_send_tx),
+        messages_composer_revision: 0,
+        messages_send_in_flight: None,
+        messages_snapshot_tx: Some(messages_snapshot_tx),
+        message_detail_tx: Some(message_detail_tx),
+        message_detail_in_flight: None,
+        messages_reconcile_owed: None,
     };
     // Bare `cyclops` can boot a session config.toml never mentions, so the
     // very first frame is already a frame the daemon may not be watching
     // for. Ask before drawing it.
     ensure_sessions_watched(&mut app);
-    app.decoration = decoration::fetch_decoration(&app.home).unwrap_or_default();
+    app.decoration = decoration::fetch_decoration(&app.home).unwrap_or_else(|error| {
+        log_err(&app.home, &format!("decoration refresh failed: {error}"));
+        DecorationSnapshot::default()
+    });
+    if app.model.messages_visible {
+        app.messages_gate.mark_dirty();
+        pump_messages_refresh(&mut app);
+    }
     // The subscription at the top of this function is already queuing live
     // entries on the app channel; boot's backfill-then-seed lands before
     // the loop below drains them, which is exactly the order the intake
     // contract wants (crate::event_record's doc).
-    crate::event_record::boot(&mut app.record, &mut app.intake, &app.home);
+    if let Some(warning) = crate::event_record::boot(&mut app.record, &mut app.intake, &app.home) {
+        app.notice.show(warning, Instant::now());
+    }
 
     let mut debounce: Option<Instant> = None;
     let mut reconnect_deadline: Option<Instant> = None;
+    let mut ingress_fairness = IngressFairness::default();
+    let mut pending_input: Option<PendingPaneInput> = None;
+    let mut input_capacity: Option<InputCapacityFuture> = None;
+    let mut pane_input_barrier_target: Option<String> = None;
+    let mut pane_input_notice_shown = false;
     // The animation clock (`crate::animate`) sits with the loop's other
     // deadlines rather than in `App`: nothing outside this loop and `draw`
     // reads it, and its wakeups are scheduled here the same one-shot way
@@ -644,19 +1362,142 @@ pub async fn run_async() -> i32 {
         .into_iter()
         .flatten()
         .min();
-        match next_wake(&mut rx, next_deadline).await {
+        if pending_input.is_some() && input_capacity.is_none() {
+            input_capacity = Some(Box::pin(client.reserve_input_capacity()));
+        } else if pending_input.is_none() {
+            input_capacity = None;
+        }
+        let wake = if let Some(capacity) = input_capacity.as_mut() {
+            next_pending_input_wake(
+                &mut continuity_rx,
+                capacity,
+                &mut terminal_rx,
+                &mut tmux_rx,
+                &mut stream_rx,
+                !app.stream_reconciling,
+                &mut ingress_fairness.background_cursor,
+                next_deadline,
+            )
+            .await
+        } else {
+            next_wake(
+                &mut continuity_rx,
+                &mut input_rx,
+                &mut paste_rx,
+                &mut action_rx,
+                &mut terminal_rx,
+                &mut tmux_rx,
+                &mut stream_rx,
+                !app.stream_reconciling,
+                &mut ingress_fairness,
+                next_deadline,
+            )
+            .await
+        };
+        match wake {
+            Wake::ControlContinuityLost(barrier) => {
+                pane_input_gate.close();
+                pane_input_notice_shown = false;
+                input_capacity = None;
+                let active_pane = app.model.active_tab().active_pane.clone();
+                pane_input_barrier_target = Some(active_pane.clone());
+                let before_repair = retire_pane_input_segment(
+                    &active_pane,
+                    &mut pending_input,
+                    &mut input_rx,
+                    &mut paste_rx,
+                );
+                while tmux_rx.try_recv().is_ok() {}
+                app.needs_forced_hydrate = true;
+                app.hit_map.clear();
+                let repair = reconcile(&mut app, &client).await;
+                let during_repair = retire_pane_input_segment(
+                    &active_pane,
+                    &mut pending_input,
+                    &mut input_rx,
+                    &mut paste_rx,
+                );
+                let repair = finish_control_cutover(repair, barrier).await;
+                let after_cutover = retire_pane_input_segment(
+                    &active_pane,
+                    &mut pending_input,
+                    &mut input_rx,
+                    &mut paste_rx,
+                );
+                if let Some(pane) = before_repair.or(during_repair).or(after_cutover) {
+                    show_pane_input_not_sent(
+                        &mut app,
+                        &pane,
+                        &TmuxError::Protocol("control stream continuity changed".into()),
+                        &mut debounce,
+                    );
+                    pane_input_notice_shown = true;
+                }
+                if repair.is_ok() {
+                    pane_input_gate.open();
+                }
+                settle_control_continuity_repair(&mut app, repair, &mut reconnect_deadline);
+                arm(&mut debounce);
+            }
             Wake::Message(msg) => {
+                if let Some(epoch) = msg.as_deref().and_then(AppMsg::pane_input_epoch) {
+                    if !pane_input_gate.accepts(epoch) {
+                        if !pane_input_notice_shown {
+                            let pane = pane_input_barrier_target
+                                .as_deref()
+                                .unwrap_or_else(|| app.model.active_tab().active_pane.as_str())
+                                .to_string();
+                            show_pane_input_not_sent(
+                                &mut app,
+                                &pane,
+                                &TmuxError::Protocol("control stream continuity changed".into()),
+                                &mut debounce,
+                            );
+                            pane_input_notice_shown = true;
+                        }
+                        continue;
+                    }
+                }
                 if !handle_app_msg(
-                    msg,
+                    msg.map(|message| *message),
                     &mut app,
                     &mut client,
                     &mut debounce,
                     &mut reconnect_deadline,
                     &mut detached,
+                    &mut pending_input,
                 )
                 .await
                 {
                     break;
+                }
+            }
+            Wake::InputCapacity(result) => {
+                input_capacity = None;
+                let pending = pending_input
+                    .take()
+                    .expect("capacity wake belongs to one pending input");
+                match result {
+                    Ok(capacity) => {
+                        let keys: Vec<&str> = pending.keys.iter().map(String::as_str).collect();
+                        if let Err(error) = client
+                            .send_keys_unconfirmed_reserved(&pending.pane, &keys, capacity)
+                            .await
+                        {
+                            let outcome =
+                                pane_input_outcome(pending.pane, pending.keys, Err(error));
+                            apply_pane_input_outcome(
+                                outcome,
+                                &mut app,
+                                &mut pending_input,
+                                &mut detached,
+                                &mut debounce,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        show_pane_input_not_sent(&mut app, &pending.pane, &error, &mut debounce);
+                    }
                 }
             }
             Wake::Deadline => {
@@ -731,14 +1572,41 @@ pub async fn run_async() -> i32 {
                 }
                 if reconnect_deadline.is_some_and(|deadline| deadline <= now) {
                     reconnect_deadline = None;
-                    let _ = handle_reconnect(
+                    let reconnected = handle_reconnect(
                         &mut app,
                         &mut client,
                         &control_cfg,
-                        &tx,
+                        &sinks,
                         &mut reconnect_deadline,
                     )
                     .await;
+                    if reconnected.is_ok()
+                        && app.link_state == LinkState::Live
+                        && pane_input_gate.is_closed()
+                    {
+                        let target = pane_input_barrier_target
+                            .as_deref()
+                            .unwrap_or_else(|| app.model.active_tab().active_pane.as_str())
+                            .to_string();
+                        if retire_pane_input_segment(
+                            &target,
+                            &mut pending_input,
+                            &mut input_rx,
+                            &mut paste_rx,
+                        )
+                        .is_some()
+                            && !pane_input_notice_shown
+                        {
+                            show_pane_input_not_sent(
+                                &mut app,
+                                &target,
+                                &TmuxError::Protocol("control stream continuity changed".into()),
+                                &mut debounce,
+                            );
+                            pane_input_notice_shown = true;
+                        }
+                        pane_input_gate.open();
+                    }
                     // A fresh instant, not this wake's: reconnecting awaits
                     // the server, so `now` is stale by the time this frame
                     // is composed and the clock would date its fades to
@@ -785,9 +1653,66 @@ fn refresh_theme_watch(app: &mut App, watch: &mut cyclops_theme::ThemeWatch) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ForwardOutcome {
+    Sent,
+    Reconciled,
+    Closed,
+}
+
+async fn reconcile_control_ingress(
+    rx: &mut NotificationReceiver,
+    continuity_tx: &mpsc::Sender<ControlContinuityBarrier>,
+) -> bool {
+    let epoch = rx.hold_continuity();
+    let (repair_tx, repair_rx) = oneshot::channel();
+    let (cutover_tx, cutover_rx) = oneshot::channel();
+    if continuity_tx
+        .send(ControlContinuityBarrier {
+            repair: repair_tx,
+            cutover: cutover_rx,
+        })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    match repair_rx.await {
+        Ok(true) => {
+            let complete = rx.resume_after_reconcile(epoch);
+            let _ = cutover_tx.send(complete);
+            complete
+        }
+        Ok(false) | Err(_) => {
+            let _ = cutover_tx.send(false);
+            false
+        }
+    }
+}
+
+async fn forward_notification_message(
+    rx: &mut NotificationReceiver,
+    tmux_tx: &mpsc::Sender<AppMsg>,
+    continuity_tx: &mpsc::Sender<ControlContinuityBarrier>,
+    message: AppMsg,
+) -> ForwardOutcome {
+    match tmux_tx.try_send(message) {
+        Ok(()) => ForwardOutcome::Sent,
+        Err(mpsc::error::TrySendError::Closed(_)) => ForwardOutcome::Closed,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            if reconcile_control_ingress(rx, continuity_tx).await {
+                ForwardOutcome::Reconciled
+            } else {
+                ForwardOutcome::Closed
+            }
+        }
+    }
+}
+
 fn spawn_notif_forwarder(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<Notification>,
-    tx: mpsc::UnboundedSender<AppMsg>,
+    mut rx: NotificationReceiver,
+    tmux_tx: mpsc::Sender<AppMsg>,
+    continuity_tx: mpsc::Sender<ControlContinuityBarrier>,
 ) {
     tokio::spawn(async move {
         let mut pending = None;
@@ -796,18 +1721,45 @@ fn spawn_notif_forwarder(
                 Some(notification) => notification,
                 None => match rx.recv().await {
                     Some(notification) => notification,
-                    None => break,
+                    None => {
+                        let _ = tmux_tx.send(AppMsg::LinkLost).await;
+                        break;
+                    }
                 },
             };
             let notification = match notification {
                 Notification::Output { pane, data }
                 | Notification::ExtendedOutput { pane, data, .. } => {
+                    if data.len() > OUTPUT_BATCH_MAX_BYTES {
+                        for chunk in data.chunks(OUTPUT_BATCH_MAX_BYTES) {
+                            match forward_notification_message(
+                                &mut rx,
+                                &tmux_tx,
+                                &continuity_tx,
+                                AppMsg::OutputBatch(vec![(pane.clone(), chunk.to_vec())]),
+                            )
+                            .await
+                            {
+                                ForwardOutcome::Sent => {}
+                                ForwardOutcome::Reconciled => break,
+                                ForwardOutcome::Closed => return,
+                            }
+                        }
+                        continue;
+                    }
                     let mut output = Vec::new();
+                    let mut output_bytes = data.len();
                     push_output(&mut output, pane, data);
                     while let Ok(next) = rx.try_recv() {
                         match next {
                             Notification::Output { pane, data }
                             | Notification::ExtendedOutput { pane, data, .. } => {
+                                if output_bytes.saturating_add(data.len()) > OUTPUT_BATCH_MAX_BYTES
+                                {
+                                    pending = Some(Notification::Output { pane, data });
+                                    break;
+                                }
+                                output_bytes += data.len();
                                 push_output(&mut output, pane, data)
                             }
                             other => {
@@ -816,50 +1768,74 @@ fn spawn_notif_forwarder(
                             }
                         }
                     }
-                    let _ = tx.send(AppMsg::OutputBatch(output));
+                    if matches!(&pending, Some(Notification::ContinuityLost)) {
+                        pending = None;
+                        if !reconcile_control_ingress(&mut rx, &continuity_tx).await {
+                            return;
+                        }
+                        continue;
+                    }
+                    match forward_notification_message(
+                        &mut rx,
+                        &tmux_tx,
+                        &continuity_tx,
+                        AppMsg::OutputBatch(output),
+                    )
+                    .await
+                    {
+                        ForwardOutcome::Sent | ForwardOutcome::Reconciled => {}
+                        ForwardOutcome::Closed => return,
+                    }
                     continue;
                 }
                 other => other,
             };
-            match notification {
+            let message = match notification {
                 Notification::LayoutChange { window, rest } => {
                     let mut fields = rest.split_whitespace();
                     let layout = fields.next().unwrap_or("").to_string();
                     // rest is "layout visible-layout flags"; the flags field
                     // carries the zoom marker.
                     let flags = fields.nth(1).map(str::to_string);
-                    let _ = tx.send(AppMsg::LayoutChanged {
+                    Some(AppMsg::LayoutChanged {
                         window,
                         layout,
                         flags,
-                    });
+                    })
                 }
                 Notification::WindowPaneChanged { window, pane } => {
-                    let _ = tx.send(AppMsg::ActivePaneChanged { window, pane });
+                    Some(AppMsg::ActivePaneChanged { window, pane })
                 }
                 Notification::SessionChanged { session, name } => {
-                    let _ = tx.send(AppMsg::SessionSwitched { session, name });
+                    Some(AppMsg::SessionSwitched { session, name })
                 }
                 Notification::SessionRenamed { session, name } => {
-                    let _ = tx.send(AppMsg::SessionRenamed { session, name });
+                    Some(AppMsg::SessionRenamed { session, name })
                 }
                 Notification::WindowAdd { .. }
                 | Notification::WindowClose { .. }
                 | Notification::WindowRenamed { .. }
-                | Notification::SessionsChanged => {
-                    let _ = tx.send(AppMsg::Reconcile);
+                | Notification::SessionsChanged => Some(AppMsg::Reconcile),
+                Notification::ContinuityLost => {
+                    if !reconcile_control_ingress(&mut rx, &continuity_tx).await {
+                        return;
+                    }
+                    None
                 }
-                Notification::Pause { pane } => {
-                    let _ = tx.send(AppMsg::PanePaused { pane });
-                }
-                Notification::Continue { pane } => {
-                    let _ = tx.send(AppMsg::PaneContinued { pane });
-                }
+                Notification::Pause { pane } => Some(AppMsg::PanePaused { pane }),
+                Notification::Continue { pane } => Some(AppMsg::PaneContinued { pane }),
                 Notification::Exit { .. } => {
-                    let _ = tx.send(AppMsg::LinkLost);
+                    let _ = tmux_tx.send(AppMsg::LinkLost).await;
                     break;
                 }
-                _ => {}
+                _ => None,
+            };
+            if let Some(message) = message {
+                match forward_notification_message(&mut rx, &tmux_tx, &continuity_tx, message).await
+                {
+                    ForwardOutcome::Sent | ForwardOutcome::Reconciled => {}
+                    ForwardOutcome::Closed => return,
+                }
             }
         }
     });
@@ -944,7 +1920,7 @@ pub fn coalesce_decoration_signals(
 /// watch` stream feed. The subscription itself never polls. A split or a
 /// border drag pushes several state/label/delivery events through
 /// cyclopsd at once; a dedicated reader thread turns each subscription
-/// line into one [`DecorationSignal`] on a plain channel, and
+/// line into one [`DecorationSignal`] on a single-slot channel, and
 /// [`subscribe_decoration_once`] coalesces a burst of them into ONE status
 /// fetch instead of one per event — the same arm-once, never-push-back
 /// rule `arm()` and `RENDER_DEBOUNCE` use for rendering
@@ -965,9 +1941,13 @@ pub fn coalesce_decoration_signals(
 /// The subscription outlives the daemon: [`run_decoration_forwarder`]
 /// reconnects on a bounded backoff, so a daemon restart or a boot-order
 /// race costs an outage, never the thread.
-fn spawn_decoration_forwarder(home: std::path::PathBuf, tx: mpsc::UnboundedSender<AppMsg>) {
+fn spawn_decoration_forwarder(
+    home: std::path::PathBuf,
+    control_tx: mpsc::Sender<AppMsg>,
+    stream_tx: mpsc::Sender<AppMsg>,
+) {
     std::thread::spawn(move || {
-        run_decoration_forwarder(&home, &tx, resilience::reconnect_delay);
+        run_decoration_forwarder(&home, &control_tx, &stream_tx, resilience::reconnect_delay);
     });
 }
 
@@ -981,6 +1961,46 @@ enum SubscribeEnd {
     Closed,
     /// The app channel is gone: the workspace itself is shutting down.
     SinkGone,
+}
+
+enum BoundedLine {
+    Eof,
+    Complete,
+    TooLong,
+}
+
+/// Read one blocking socket line without allocating past the consumer's
+/// frame envelope. The caller closes the connection on `TooLong`, so there is
+/// no need to retain or drain the rest of that frame.
+fn read_bounded_line(
+    reader: &mut impl std::io::BufRead,
+    line: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<BoundedLine> {
+    line.clear();
+    loop {
+        let (take, complete) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok(if line.is_empty() {
+                    BoundedLine::Eof
+                } else {
+                    BoundedLine::Complete
+                });
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let take = newline.map_or(available.len(), |index| index + 1);
+            if line.len().saturating_add(take) > max_bytes {
+                return Ok(BoundedLine::TooLong);
+            }
+            line.extend_from_slice(&available[..take]);
+            (take, newline.is_some())
+        };
+        reader.consume(take);
+        if complete {
+            return Ok(BoundedLine::Complete);
+        }
+    }
 }
 
 /// The forwarder's whole life: subscribe, forward until the connection
@@ -1004,13 +2024,14 @@ enum SubscribeEnd {
 /// [`resilience::reconnect_delay`], which clamps at its last entry.
 fn run_decoration_forwarder(
     home: &std::path::Path,
-    tx: &mpsc::UnboundedSender<AppMsg>,
+    control_tx: &mpsc::Sender<AppMsg>,
+    stream_tx: &mpsc::Sender<AppMsg>,
     delay_for: impl Fn(usize) -> std::time::Duration,
 ) {
     let mut attempt = 0usize;
     let mut reported_offline = false;
     loop {
-        match subscribe_decoration_once(home, tx) {
+        match subscribe_decoration_once(home, control_tx, stream_tx) {
             SubscribeEnd::SinkGone => return,
             // A connection existed, so this outage starts its own chain.
             SubscribeEnd::Closed => {
@@ -1021,8 +2042,8 @@ fn run_decoration_forwarder(
         }
         if !resilience::may_retry(attempt) && !reported_offline {
             reported_offline = true;
-            if tx
-                .send(AppMsg::DecorationChanged(DecorationSnapshot::default()))
+            if control_tx
+                .blocking_send(AppMsg::DecorationChanged(DecorationSnapshot::default()))
                 .is_err()
             {
                 return;
@@ -1038,7 +2059,7 @@ fn run_decoration_forwarder(
         }
         // The workspace shutting down closes the channel; a retry loop
         // with nobody left to tell stops instead of probing a dead socket.
-        if tx.is_closed() {
+        if control_tx.is_closed() || stream_tx.is_closed() {
             return;
         }
         // `attempt` counts completed failures; the sleep indexes the retry
@@ -1055,21 +2076,25 @@ fn run_decoration_forwarder(
 /// each carry.
 fn subscribe_decoration_once(
     home: &std::path::Path,
-    tx: &mpsc::UnboundedSender<AppMsg>,
+    control_tx: &mpsc::Sender<AppMsg>,
+    stream_tx: &mpsc::Sender<AppMsg>,
 ) -> SubscribeEnd {
-    use std::io::{BufRead, Write};
+    use std::io::Write;
     let socket = home.join(cyclops_proto::SOCK_NAME);
     let Ok(stream) = std::os::unix::net::UnixStream::connect(socket) else {
         return SubscribeEnd::ConnectFailed;
     };
     let mut reader = std::io::BufReader::new(stream);
-    let mut hello = String::new();
-    if reader
-        .read_line(&mut hello)
-        .ok()
-        .filter(|read| *read > 0)
-        .is_none()
-    {
+    let mut hello = Vec::new();
+    if !matches!(
+        read_bounded_line(&mut reader, &mut hello, STREAM_EVENT_MAX_BYTES),
+        Ok(BoundedLine::Complete)
+    ) {
+        log_err(home, &"cyclopsd sent an incomplete or oversized hello");
+        return SubscribeEnd::ConnectFailed;
+    }
+    if let Err(error) = serde_json::from_slice::<cyclops_proto::Hello>(&hello) {
+        log_err(home, &format!("cyclopsd sent an unreadable hello: {error}"));
         return SubscribeEnd::ConnectFailed;
     }
     if reader
@@ -1079,61 +2104,133 @@ fn subscribe_decoration_once(
     {
         return SubscribeEnd::ConnectFailed;
     }
+    let mut acknowledgement = Vec::new();
+    if !matches!(
+        read_bounded_line(&mut reader, &mut acknowledgement, STREAM_EVENT_MAX_BYTES),
+        Ok(BoundedLine::Complete)
+    ) {
+        log_err(
+            home,
+            &"cyclopsd sent an incomplete or oversized subscription acknowledgement",
+        );
+        return SubscribeEnd::ConnectFailed;
+    }
+    let acknowledgement = match serde_json::from_slice::<serde_json::Value>(&acknowledgement) {
+        Ok(value) => value,
+        Err(error) => {
+            log_err(
+                home,
+                &format!("cyclopsd sent an unreadable subscription acknowledgement: {error}"),
+            );
+            return SubscribeEnd::ConnectFailed;
+        }
+    };
+    if acknowledgement
+        .get("id")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+        || acknowledgement.pointer("/result/subscribed") != Some(&serde_json::Value::Bool(true))
+    {
+        log_err(home, &"cyclopsd did not acknowledge the event subscription");
+        return SubscribeEnd::ConnectFailed;
+    }
     // Subscribed. Ask the app to resync before any event arrives on this
     // connection: everything that changed while nothing was subscribed
     // produced no event, so without this a state flip during the outage
     // stays on screen as stale.
-    if tx.send(AppMsg::DaemonReconnected).is_err() {
+    // The prior connection reports its gap on this same FIFO before it
+    // releases the reconnect loop. Keeping the new acknowledgement here
+    // prevents a delayed old gap from invalidating this connection.
+    if stream_tx.blocking_send(AppMsg::DaemonReconnected).is_err() {
         return SubscribeEnd::SinkGone;
     }
 
-    let (sig_tx, sig_rx) = std::sync::mpsc::channel::<DecorationSignal>();
-    let stream_tx = tx.clone();
+    let (sig_tx, sig_rx) = std::sync::mpsc::sync_channel::<DecorationSignal>(1);
+    let stream_tx = stream_tx.clone();
     std::thread::spawn(move || loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => {
-                let _ = sig_tx.send(DecorationSignal::Closed);
+        let mut line = Vec::new();
+        match read_bounded_line(&mut reader, &mut line, STREAM_EVENT_MAX_BYTES) {
+            Ok(BoundedLine::Eof) => {
+                report_stream_gap(&stream_tx, &sig_tx, "daemon event subscription closed");
                 return;
             }
-            Ok(_) => {}
+            Err(error) => {
+                report_stream_gap(
+                    &stream_tx,
+                    &sig_tx,
+                    format!("daemon event read failed: {error}"),
+                );
+                return;
+            }
+            Ok(BoundedLine::TooLong) => {
+                report_stream_gap(
+                    &stream_tx,
+                    &sig_tx,
+                    format!("daemon event exceeded {STREAM_EVENT_MAX_BYTES} bytes"),
+                );
+                return;
+            }
+            Ok(BoundedLine::Complete) => {}
         }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
+        let value = match serde_json::from_slice::<serde_json::Value>(&line) {
+            Ok(value) => value,
+            Err(error) => {
+                report_stream_gap(
+                    &stream_tx,
+                    &sig_tx,
+                    format!("malformed daemon event JSON: {error}"),
+                );
+                return;
+            }
         };
         if value.get("event").is_none() {
-            continue;
+            report_stream_gap(
+                &stream_tx,
+                &sig_tx,
+                "daemon event stream sent a non-event record",
+            );
+            return;
         }
         // E2: normalize this same line onto the shared stream model
         // before the decoration signal below. Cheap (no IO) and
-        // per-event on purpose — it must never wait for or extend the
-        // coalescing deadline that follows. An unreadable event still
-        // reaches the decoration signal; only the record feed skips
-        // it (`Entry::from_event` never rejects a KNOWN event, but a
-        // daemon ahead of this build can still send a shape that
-        // fails to deserialize at all).
-        if let Ok(ev) = serde_json::from_value::<cyclops_proto::Event>(value) {
-            // A theme reload is not a fact about the record; the CLI
-            // stream drops it the same way (`cyclops_ui`'s own
-            // subscribe loop). It still becomes a wake-only
-            // `ThemeChanged`: the decoration signal below only
-            // repaints when a status fetch lands, and a theme switch
-            // must repaint either way. Every other vocabulary, known
-            // or not, still becomes an entry (unknown kinds render as
-            // `Other` rather than being dropped).
-            if ev.event != "theme" {
-                let entry = cyclops_ui::Entry::from_event(&ev, now_ms());
-                if stream_tx
-                    .send(AppMsg::StreamEntry(Box::new(entry)))
-                    .is_err()
-                {
-                    return;
-                }
-            } else if stream_tx.send(AppMsg::ThemeChanged).is_err() {
+        // per-event on purpose. It must never wait for or extend the
+        // coalescing deadline that follows. An unreadable event closes
+        // this subscription so the app reconciles before reconnecting.
+        let ev = match serde_json::from_value::<cyclops_proto::Event>(value) {
+            Ok(event) => event,
+            Err(error) => {
+                report_stream_gap(
+                    &stream_tx,
+                    &sig_tx,
+                    format!("unreadable daemon event: {error}"),
+                );
                 return;
             }
+        };
+        // A theme reload is not a fact about the record; the CLI stream
+        // drops it the same way (`cyclops_ui`'s own subscribe loop). It
+        // still becomes a wake-only `ThemeChanged`. Every other vocabulary,
+        // known or not, becomes an entry.
+        if ev.event == "messages.changed" {
+            let data = serde_json::from_value::<cyclops_proto::MessagesChangedData>(ev.data).ok();
+            if stream_tx
+                .blocking_send(AppMsg::MessagesChanged(data))
+                .is_err()
+            {
+                return;
+            }
+        } else if ev.event != "theme" {
+            let entry = cyclops_ui::Entry::from_event(&ev, now_ms());
+            if stream_tx
+                .blocking_send(AppMsg::StreamEntry(Box::new(entry)))
+                .is_err()
+            {
+                return;
+            }
+        } else if stream_tx.blocking_send(AppMsg::ThemeChanged).is_err() {
+            return;
         }
-        if sig_tx.send(DecorationSignal::Event).is_err() {
+        if !signal_decoration_event(&sig_tx) {
             return;
         }
     });
@@ -1148,8 +2245,13 @@ fn subscribe_decoration_once(
         // screen is the reconnect chain's call in
         // [`run_decoration_forwarder`], the one place it is reported.
         match decoration::fetch_decoration(home) {
-            Some(snapshot) => tx.send(AppMsg::DecorationChanged(snapshot)).is_ok(),
-            None => true,
+            Ok(snapshot) => control_tx
+                .blocking_send(AppMsg::DecorationChanged(snapshot))
+                .is_ok(),
+            Err(error) => {
+                log_err(home, &format!("decoration refresh failed: {error}"));
+                true
+            }
         }
     });
     match end {
@@ -1158,10 +2260,32 @@ fn subscribe_decoration_once(
     }
 }
 
-/// Coalesce adjacent control-mode output per pane before it reaches the app
-/// queue. Pane order is independent; byte order within each pane is not.
+fn report_stream_gap(
+    stream_tx: &mpsc::Sender<AppMsg>,
+    sig_tx: &std::sync::mpsc::SyncSender<DecorationSignal>,
+    why: impl Into<String>,
+) {
+    let _ = stream_tx.blocking_send(AppMsg::StreamGap { why: why.into() });
+    let _ = sig_tx.send(DecorationSignal::Closed);
+}
+
+/// One pending edge is enough to arm the coalescer. Further edges before it
+/// drains carry no additional state and are intentionally collapsed.
+fn signal_decoration_event(tx: &std::sync::mpsc::SyncSender<DecorationSignal>) -> bool {
+    match tx.try_send(DecorationSignal::Event) {
+        Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => true,
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+    }
+}
+
+/// Coalesce only adjacent output for the same pane. Keeping separate entries
+/// across a pane switch preserves the control stream's global order.
 fn push_output(output: &mut Vec<(String, Vec<u8>)>, pane: String, bytes: Vec<u8>) {
-    if let Some((_, pending)) = output.iter_mut().find(|(id, _)| *id == pane) {
+    if let Some((id, pending)) = output
+        .last_mut()
+        .filter(|(id, _)| id.as_str() == pane.as_str())
+    {
+        debug_assert_eq!(id, &pane);
         pending.extend(bytes);
     } else {
         output.push((pane, bytes));
@@ -1180,11 +2304,56 @@ fn schedule_reconnect(app: &mut App, reconnect_deadline: &mut Option<Instant>) {
     *reconnect_deadline = Some(Instant::now() + delay);
 }
 
+fn settle_control_continuity_repair(
+    app: &mut App,
+    repair: Result<(), TmuxError>,
+    reconnect_deadline: &mut Option<Instant>,
+) -> bool {
+    match repair {
+        Ok(()) => {
+            app.needs_reconcile = false;
+            true
+        }
+        Err(error) => {
+            log_err(&app.home, &error);
+            app.needs_reconcile = true;
+            schedule_reconnect(app, reconnect_deadline);
+            false
+        }
+    }
+}
+
+async fn finish_control_cutover(
+    repair: Result<(), TmuxError>,
+    barrier: ControlContinuityBarrier,
+) -> Result<(), TmuxError> {
+    let snapshot_complete = repair.is_ok();
+    let cutover_complete = if barrier.repair.send(snapshot_complete).is_ok() {
+        barrier.cutover.await.unwrap_or(false)
+    } else {
+        false
+    };
+    match repair {
+        Err(error) => Err(error),
+        Ok(()) if cutover_complete => Ok(()),
+        Ok(()) => Err(TmuxError::Protocol(
+            "control events crossed the hydration cutover".into(),
+        )),
+    }
+}
+
+fn prepare_forced_hydration(app: &mut App) {
+    // Pause and Continue are stream edges, not snapshot fields. Once an
+    // edge was lost, no retained pause can be trusted. Forced capture
+    // rebuilds the display without that transient gate.
+    app.paused_panes.clear();
+}
+
 async fn handle_reconnect(
     app: &mut App,
     client: &mut ControlClient,
     cfg: &ControlConfig,
-    tx: &mpsc::UnboundedSender<AppMsg>,
+    sinks: &AppSinks,
     reconnect_deadline: &mut Option<Instant>,
 ) -> Result<(), cyclops_tmux::TmuxError> {
     client.shutdown().await;
@@ -1192,14 +2361,18 @@ async fn handle_reconnect(
     match ControlClient::spawn(cfg).await {
         Ok((new_client, rx)) => {
             *client = new_client;
-            spawn_notif_forwarder(rx, tx.clone());
+            spawn_notif_forwarder(rx, sinks.tmux.clone(), sinks.continuity.clone());
             app.declared_client_size = None;
             app.pinned_windows.clear();
             resize_client(app, client).await;
             // The gap this flag exists for: %output missed while the link
             // was down, with no size change to mark any pane stale.
             app.needs_forced_hydrate = true;
-            reconcile(app, client).await?;
+            if let Err(error) = reconcile(app, client).await {
+                app.reconnect_attempt += 1;
+                schedule_reconnect(app, reconnect_deadline);
+                return Err(error);
+            }
             app.link_state = LinkState::Live;
             app.reconnect_attempt = 0;
         }
@@ -1209,7 +2382,7 @@ async fn handle_reconnect(
                 schedule_reconnect(app, reconnect_deadline);
             } else {
                 app.link_state = LinkState::ServerGone;
-                let _ = tx.send(AppMsg::Redraw);
+                let _ = sinks.tmux.send(AppMsg::Redraw).await;
             }
         }
     }
@@ -1232,6 +2405,8 @@ fn chrome_for(
         model.sidebar_visible,
         prefs.sidebar_width.max(crate::render::SIDEBAR_MIN_WIDTH),
         prefs.tab_bar_visible,
+        model.messages_visible,
+        prefs.messages_width.max(crate::render::MESSAGES_MIN_WIDTH),
     )
 }
 
@@ -1433,6 +2608,69 @@ enum InputOutcome {
     Detached,
     Redraw,
     NoRedraw,
+    Pending(PendingPaneInput),
+    /// The first write failed before the event entered the pending-input
+    /// state. It carries target context for one visible notice, but no key
+    /// bytes, so reconnect cannot replay an event with an unknown outcome.
+    NotSent {
+        pane: String,
+        error: TmuxError,
+    },
+    /// The write began but did not complete. No key bytes are retained and
+    /// reconnect never replays them, but the notice does not claim that tmux
+    /// received nothing.
+    Uncertain {
+        pane: String,
+        error: TmuxError,
+    },
+}
+
+fn show_pane_input_not_sent(
+    app: &mut App,
+    pane: &str,
+    error: &TmuxError,
+    debounce: &mut Option<Instant>,
+) {
+    log_err(&app.home, error);
+    app.notice
+        .show(copy::pane_input_not_sent(pane, error), Instant::now());
+    arm(debounce);
+}
+
+fn show_pane_input_uncertain(
+    app: &mut App,
+    pane: &str,
+    error: &TmuxError,
+    debounce: &mut Option<Instant>,
+) {
+    log_err(&app.home, error);
+    app.notice
+        .show(copy::pane_input_uncertain(pane, error), Instant::now());
+    arm(debounce);
+}
+
+fn apply_pane_input_outcome(
+    outcome: InputOutcome,
+    app: &mut App,
+    pending_input: &mut Option<PendingPaneInput>,
+    detached: &mut bool,
+    debounce: &mut Option<Instant>,
+) {
+    match outcome {
+        InputOutcome::Detached => *detached = true,
+        InputOutcome::Redraw => arm(debounce),
+        InputOutcome::NoRedraw => {}
+        InputOutcome::Pending(pending) => {
+            debug_assert!(pending_input.is_none());
+            *pending_input = Some(pending);
+        }
+        InputOutcome::NotSent { pane, error } => {
+            show_pane_input_not_sent(app, &pane, &error, debounce);
+        }
+        InputOutcome::Uncertain { pane, error } => {
+            show_pane_input_uncertain(app, &pane, &error, debounce);
+        }
+    }
 }
 
 /// The smallest grid worth declaring to tmux. Below this the terminal is
@@ -1558,13 +2796,286 @@ fn finish_compose_send(
                 *buffer = format!("@{} ", completed.message.to);
             }
         }
-        crate::daemon::SendOutcome::Rejected(cause) => {
+        crate::daemon::SendOutcome::NotSent(cause) => {
             *status = Some(copy::compose_rejected(&completed.message.to, &cause));
+            *send = dialog::ComposeSendState::Ready;
+        }
+        crate::daemon::SendOutcome::Rejected(refusal) => {
+            *status = Some(copy::compose_rejected(
+                &completed.message.to,
+                &refusal.message,
+            ));
             *send = dialog::ComposeSendState::Ready;
         }
         crate::daemon::SendOutcome::Unknown(cause) => {
             *status = Some(copy::compose_unknown(&completed.message.to, &cause));
             *send = dialog::ComposeSendState::Retryable(completed);
+        }
+    }
+}
+
+fn queue_messages_send(app: &mut App, attempt: MessagesSendAttempt) {
+    if !app.messages_gate.may_mutate() {
+        app.messages_composer.record_not_sent(
+            "message state is not current; wait for the daemon connection to recover".into(),
+        );
+        return;
+    }
+    if app.messages_caller != Some(attempt.caller) {
+        app.messages_composer.record_not_sent(
+            "sender identity is not current; reopen the workspace after updating Cyclops".into(),
+        );
+        return;
+    }
+    if app.messages_send_in_flight.is_some() {
+        app.messages_composer
+            .record_not_sent("another message send is still in progress".into());
+        return;
+    }
+    let Some(tx) = &app.messages_send_tx else {
+        app.messages_composer
+            .record_not_sent("the message send worker is unavailable".into());
+        return;
+    };
+    match tx.try_send(MessagesSendTask {
+        attempt: attempt.clone(),
+    }) {
+        Ok(()) => {
+            app.messages_send_in_flight = Some(attempt);
+            app.messages_composer.stage =
+                Some(cyclops_ui::Stage::Acting(cyclops_ui::Action::Reply));
+        }
+        Err(std::sync::mpsc::TrySendError::Full(_)) => app
+            .messages_composer
+            .record_not_sent("the bounded message send lane is busy".into()),
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => app
+            .messages_composer
+            .record_not_sent("the message send worker stopped".into()),
+    }
+}
+
+fn process_generation_refusal(refusal: &crate::daemon::DaemonRefusal) -> bool {
+    refusal.code == "denied"
+}
+
+fn finish_messages_send(
+    app: &mut App,
+    attempt: MessagesSendAttempt,
+    outcome: crate::daemon::SendOutcome,
+) {
+    if app.messages_send_in_flight.as_ref() != Some(&attempt) {
+        return;
+    }
+    app.messages_send_in_flight = None;
+
+    let current_composer = attempt.matches(
+        &app.messages_composer,
+        app.messages_composer_revision,
+        app.messages_caller,
+    );
+    if !current_composer {
+        if matches!(
+            app.messages_composer.stage,
+            Some(cyclops_ui::Stage::Acting(_))
+        ) {
+            app.messages_composer.clear_stage();
+        }
+        let notice = match &outcome {
+            crate::daemon::SendOutcome::Accepted(receipt) => receipt.clone(),
+            crate::daemon::SendOutcome::NotSent(why) => {
+                format!("Earlier draft was not sent: {why}")
+            }
+            crate::daemon::SendOutcome::Rejected(refusal) => {
+                format!(
+                    "Earlier draft was refused ({}): {}",
+                    refusal.code, refusal.message
+                )
+            }
+            crate::daemon::SendOutcome::Unknown(why) => {
+                format!("Earlier draft outcome is unknown: {why}")
+            }
+        };
+        app.notice.show(notice, Instant::now());
+        app.messages_gate.mark_dirty();
+        pump_messages_refresh(app);
+        return;
+    }
+
+    match outcome {
+        crate::daemon::SendOutcome::Accepted(receipt) => {
+            app.messages_composer.draft.set("");
+            app.messages_composer.mode = None;
+            app.messages_composer.focused = false;
+            app.messages_composer.clear_stage();
+            app.notice.show(receipt, Instant::now());
+        }
+        crate::daemon::SendOutcome::NotSent(why) => {
+            app.messages_composer.record_not_sent(why);
+        }
+        crate::daemon::SendOutcome::Rejected(refusal) => {
+            let why = if process_generation_refusal(&refusal) {
+                app.messages_caller = None;
+                format!(
+                    "sender identity changed; nothing was accepted. Reopen this workspace after updating Cyclops: {}",
+                    refusal.message
+                )
+            } else {
+                format!("{}: {}", refusal.code, refusal.message)
+            };
+            app.messages_composer.record_not_sent(why);
+        }
+        crate::daemon::SendOutcome::Unknown(why) => {
+            app.messages_composer.record_uncertain(why);
+        }
+    }
+    app.messages_gate.mark_dirty();
+    pump_messages_refresh(app);
+}
+
+fn finish_messages_reconcile(app: &mut App) {
+    let Some(reconciled) = app.messages_reconcile_owed.take() else {
+        return;
+    };
+    if !reconciled.matches(
+        &app.messages_composer,
+        app.messages_composer_revision,
+        app.messages_caller,
+    ) {
+        return;
+    }
+    app.messages_composer.reconcile_stage();
+    app.notice.show(
+        "Message state refreshed; an exact-key retry is now available",
+        Instant::now(),
+    );
+}
+
+fn messages_composer_changed(app: &mut App) {
+    app.messages_composer_revision = app.messages_composer_revision.wrapping_add(1);
+    app.messages_composer.clear_stage();
+    app.messages_reconcile_owed = None;
+}
+
+fn queue_message_detail(
+    app: &mut App,
+    row: cyclops_ui::QueueRow,
+    target: cyclops_ui::FrozenTarget,
+) {
+    debug_assert_eq!(&row.target, &target.target);
+    let mut detail = cyclops_ui::Detail::open(&row, target.watermark);
+    if !app.messages_gate.may_mutate() {
+        detail.not_sent(
+            None,
+            "message state is not current; wait for the daemon connection to recover",
+        );
+        app.messages_detail = Some(detail);
+        return;
+    }
+    if app.messages_caller.is_none() {
+        detail.not_sent(
+            None,
+            "authenticated mailbox identity is unavailable; update Cyclops and reopen this workspace",
+        );
+        app.messages_detail = Some(detail);
+        return;
+    }
+    if app.message_detail_in_flight.is_some() {
+        detail.not_sent(None, "another message detail request is still in progress");
+        app.messages_detail = Some(detail);
+        return;
+    }
+    let Some(tx) = &app.message_detail_tx else {
+        detail.not_sent(None, "the message detail worker is unavailable");
+        app.messages_detail = Some(detail);
+        return;
+    };
+    match tx.try_send(MessageDetailTask {
+        row,
+        target: target.clone(),
+    }) {
+        Ok(()) => app.message_detail_in_flight = Some(target),
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            detail.not_sent(None, "the bounded message detail lane is busy")
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            detail.not_sent(None, "the message detail worker stopped")
+        }
+    }
+    app.messages_detail = Some(detail);
+}
+
+fn finish_message_detail(
+    app: &mut App,
+    target: cyclops_ui::FrozenTarget,
+    outcome: cyclops_ui::ActionOutcome,
+) {
+    if app.message_detail_in_flight.as_ref() != Some(&target) {
+        return;
+    }
+    app.message_detail_in_flight = None;
+    let Some(detail) = app
+        .messages_detail
+        .as_mut()
+        .filter(|detail| detail.target() == &target)
+    else {
+        return;
+    };
+    let notice = match outcome {
+        cyclops_ui::ActionOutcome::Opened(loaded) => {
+            detail.loaded_ok(*loaded);
+            "Message detail loaded".to_string()
+        }
+        cyclops_ui::ActionOutcome::Done(note) => {
+            let why = format!("unexpected detail mutation result: {note}");
+            detail.failed(None, why.clone());
+            why
+        }
+        cyclops_ui::ActionOutcome::Refused { code, message } => {
+            detail.refused(None, &code, message.clone());
+            format!("Detail refused ({code}): {message}")
+        }
+        cyclops_ui::ActionOutcome::NotSent(why) => {
+            detail.not_sent(None, why.clone());
+            format!("Detail not sent: {why}")
+        }
+        cyclops_ui::ActionOutcome::Uncertain(why) => {
+            detail.uncertain(None, why.clone());
+            format!("Detail outcome unknown: {why}")
+        }
+    };
+    app.notice.show(notice, Instant::now());
+    app.messages_gate.mark_dirty();
+    pump_messages_refresh(app);
+}
+
+/// Request current message state without inventing connection evidence.
+fn request_messages_snapshot(app: &mut App) {
+    match app.messages_gate.link() {
+        cyclops_ui::Link::Connected => {
+            app.messages_refresh_error = None;
+            app.messages_gate.mark_dirty();
+            pump_messages_refresh(app);
+        }
+        cyclops_ui::Link::Lost => {
+            app.messages_gate.reconnecting();
+        }
+        cyclops_ui::Link::Connecting => {}
+    }
+}
+
+/// Pump the Messages drawer refresh gate, issuing a snapshot fetch if one is owed and none in flight.
+fn pump_messages_refresh(app: &mut App) {
+    if !app.model.messages_visible {
+        return;
+    }
+    if let Some(req) = app.messages_gate.begin() {
+        let sent = if let Some(tx) = &app.messages_snapshot_tx {
+            tx.try_send((req, 128)).is_ok()
+        } else {
+            false
+        };
+        if !sent {
+            app.messages_gate.finish_failure(req);
         }
     }
 }
@@ -1577,6 +3088,7 @@ async fn handle_app_msg(
     debounce: &mut Option<Instant>,
     reconnect_deadline: &mut Option<Instant>,
     detached: &mut bool,
+    pending_input: &mut Option<PendingPaneInput>,
 ) -> bool {
     let Some(msg) = msg else {
         return false;
@@ -1719,6 +3231,12 @@ async fn handle_app_msg(
             }
         }
         AppMsg::LinkLost => {
+            if let Some(pending) = pending_input.take() {
+                app.notice.show(
+                    copy::pane_input_not_sent(&pending.pane, &TmuxError::Disconnected),
+                    Instant::now(),
+                );
+            }
             app.reconnect_attempt = 0;
             schedule_reconnect(app, reconnect_deadline);
             arm(debounce);
@@ -1739,10 +3257,15 @@ async fn handle_app_msg(
         }
         AppMsg::DecorationChanged(snapshot) => {
             apply_decoration_snapshot(app, snapshot);
+            app.messages_gate.mark_dirty();
+            pump_messages_refresh(app);
             arm(debounce);
         }
         AppMsg::DaemonReconnected => {
             resync_daemon_state(app);
+            app.messages_gate.connected();
+            app.messages_gate.mark_dirty();
+            pump_messages_refresh(app);
             arm(debounce);
         }
         // E2: per-event, not coalesced with the decoration burst above —
@@ -1758,10 +3281,95 @@ async fn handle_app_msg(
             crate::event_record::live(&mut app.record, &mut app.intake, *entry);
             arm(debounce);
         }
+        AppMsg::MessagesChanged(changed) => {
+            if app.messages_gate.link() != cyclops_ui::Link::Connected {
+                app.messages_gate.connected();
+            }
+            match changed {
+                Some(data) => {
+                    app.messages_gate.messages_changed(&data);
+                }
+                None => {
+                    app.messages_gate.mark_dirty();
+                }
+            }
+            pump_messages_refresh(app);
+        }
+        AppMsg::StreamGap { why } => {
+            app.messages_gate.disconnected();
+            app.messages_caller = None;
+            if app.stream_reconciling {
+                return true;
+            }
+            app.stream_reconciling = true;
+            app.notice.show(copy::stream_stale(&why), Instant::now());
+            let queued =
+                app.stream_reconcile_requests
+                    .as_ref()
+                    .is_some_and(|tx| match tx.try_send(()) {
+                        Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => true,
+                        Err(std::sync::mpsc::TrySendError::Disconnected(())) => false,
+                    });
+            if !queued {
+                let bootstrap = crate::event_record::load(&app.home);
+                let mut record = cyclops_ui::Record::new();
+                let mut intake = cyclops_ui::Intake::new();
+                let warning = crate::event_record::install(&mut record, &mut intake, bootstrap);
+                app.record = record;
+                app.intake = intake;
+                app.stream_reconciling = false;
+                app.notice.show(
+                    warning.unwrap_or_else(|| copy::STREAM_RECONCILED.to_string()),
+                    Instant::now(),
+                );
+            }
+            arm(debounce);
+        }
+        AppMsg::StreamReconciled(bootstrap) => {
+            let mut record = cyclops_ui::Record::new();
+            let mut intake = cyclops_ui::Intake::new();
+            let warning = crate::event_record::install(&mut record, &mut intake, *bootstrap);
+            app.record = record;
+            app.intake = intake;
+            app.stream_reconciling = false;
+            app.notice.show(
+                warning.unwrap_or_else(|| copy::STREAM_RECONCILED.to_string()),
+                Instant::now(),
+            );
+            arm(debounce);
+        }
         // Wake-only: the reload itself runs on the render deadline this
         // arms (the theme_watch refresh in `run_async`).
         AppMsg::ThemeChanged => arm(debounce),
-        AppMsg::Mouse(mouse) => {
+        AppMsg::MessagesSnapshotLoaded { request, result } => {
+            let accepted = app.messages_gate.finish_snapshot(request, &result);
+            if accepted {
+                app.messages_refresh_error = None;
+                app.messages_caller = result.caller;
+                app.messages_queue
+                    .replace(cyclops_ui::messages::rows_from_snapshot(&result));
+                finish_messages_reconcile(app);
+            }
+            pump_messages_refresh(app);
+            arm(debounce);
+        }
+        AppMsg::MessagesSnapshotFailed { request, error } => {
+            if app.messages_gate.finish_snapshot_failure(request) {
+                app.messages_refresh_error = Some(error);
+                app.messages_caller = None;
+            }
+            pump_messages_refresh(app);
+            arm(debounce);
+        }
+        AppMsg::MessageDetailFinished { target, outcome } => {
+            finish_message_detail(app, target, outcome);
+            arm(debounce);
+        }
+        AppMsg::MessagesSendFinished { attempt, outcome } => {
+            finish_messages_send(app, attempt, outcome);
+            arm(debounce);
+        }
+        AppMsg::Mouse { mouse, .. } => {
             // Bare motion only matters while a menu or dialog shows hover
             // highlights — or over the sidebar's create button, the one
             // piece of resting chrome that answers the mouse. Everywhere
@@ -1788,7 +3396,12 @@ async fn handle_app_msg(
             }
             arm(debounce);
         }
-        AppMsg::Paste(text) => {
+        AppMsg::PasteTooLarge { bytes, .. } => {
+            app.notice
+                .show(copy::paste_too_large(bytes), Instant::now());
+            arm(debounce);
+        }
+        AppMsg::Paste { text, .. } => {
             if app.link_state == LinkState::ServerGone {
                 return true;
             }
@@ -1803,11 +3416,18 @@ async fn handle_app_msg(
                 }
                 return true;
             }
+            if app.model.messages_visible && app.messages_focused && app.messages_composer.focused {
+                for ch in text.chars() {
+                    app.messages_composer.push_char(ch);
+                }
+                arm(debounce);
+                return true;
+            }
             if let Err(e) = paste_into_focused_pane(app, client, text.as_bytes()).await {
                 log_err(&app.home, &e);
             }
         }
-        AppMsg::Input(key) => {
+        AppMsg::Input { key, .. } => {
             if app.link_state == LinkState::ServerGone {
                 return true;
             }
@@ -1830,9 +3450,9 @@ async fn handle_app_msg(
                 return true;
             }
             match handle_key(app, client, key).await {
-                Ok(InputOutcome::Detached) => *detached = true,
-                Ok(InputOutcome::Redraw) => arm(debounce),
-                Ok(InputOutcome::NoRedraw) => {}
+                Ok(outcome) => {
+                    apply_pane_input_outcome(outcome, app, pending_input, detached, debounce)
+                }
                 Err(e) => log_err(&app.home, &e),
             }
         }
@@ -1944,7 +3564,10 @@ mod compose_send_tests {
         finish_compose_send(
             Some(&mut dialog),
             second,
-            crate::daemon::SendOutcome::Rejected("recipient is unavailable".to_string()),
+            crate::daemon::SendOutcome::Rejected(crate::daemon::DaemonRefusal::new(
+                "no_such_target",
+                "recipient is unavailable",
+            )),
         );
         let Dialog::Compose {
             buffer,
@@ -1973,6 +3596,11 @@ fn cancel_drag(app: &mut App) {
             // Sidebar motion is only visual until mouse-up, so Escape can
             // restore the start without a compensating tmux resize.
             app.prefs.sidebar_width = width;
+        }
+        if let Some(width) = crate::render::messages_width_on_cancel(&drag, app.term_size.0) {
+            // The Messages divider follows the same preview contract as
+            // the sidebar: Escape restores the width from mouse-down.
+            app.prefs.messages_width = width;
         }
     }
 }
@@ -2224,6 +3852,7 @@ async fn handle_mouse(
                 }
                 HitTarget::PaneBody { pane_id } => {
                     app.close_menu();
+                    app.messages_focused = false;
                     let pane_id = pane_id.clone();
                     let hit = HitTarget::PaneBody {
                         pane_id: pane_id.clone(),
@@ -2363,6 +3992,8 @@ async fn handle_mouse(
                 | HitTarget::NewWorkspaceButton
                 | HitTarget::SidebarTab { .. }
                 | HitTarget::SidebarToggle
+                | HitTarget::MessagesToggle
+                | HitTarget::MessagesAction(_)
                 | HitTarget::AttentionIndicator { .. } => {
                     app.close_menu();
                 }
@@ -2408,6 +4039,13 @@ async fn handle_mouse(
                     app.close_menu();
                     clear_selection(app);
                     app.drag = Some(DragState::on_down(DragTarget::Sidebar, col, row));
+                    return Ok(());
+                }
+                HitTarget::MessagesDivider => {
+                    app.close_menu();
+                    clear_selection(app);
+                    app.messages_focused = true;
+                    app.drag = Some(DragState::on_down(DragTarget::Messages, col, row));
                     return Ok(());
                 }
                 HitTarget::SidebarSplit => {
@@ -2527,6 +4165,12 @@ async fn handle_mouse(
                         crate::render::sidebar_width_for_column(col, app.term_size.0);
                 }
                 if app.drag.as_ref().is_some_and(|drag| {
+                    drag.is_active() && matches!(&drag.target, DragTarget::Messages)
+                }) {
+                    app.prefs.messages_width =
+                        crate::render::messages_width_for_column(col, app.term_size.0);
+                }
+                if app.drag.as_ref().is_some_and(|drag| {
                     drag.is_active() && matches!(&drag.target, DragTarget::SidebarSplit)
                 }) {
                     app.prefs.files_rows = files_rows_for_row(app, row);
@@ -2561,6 +4205,15 @@ async fn handle_mouse(
             if sidebar_drag {
                 app.prefs.sidebar_width =
                     crate::render::sidebar_width_for_column(col, app.term_size.0);
+                app.save_prefs_or_log();
+                resize_client(app, client).await;
+            }
+            let messages_drag = app.drag.as_ref().is_some_and(|drag| {
+                drag.is_active() && matches!(&drag.target, DragTarget::Messages)
+            });
+            if messages_drag {
+                app.prefs.messages_width =
+                    crate::render::messages_width_for_column(col, app.term_size.0);
                 app.save_prefs_or_log();
                 resize_client(app, client).await;
             }
@@ -2736,6 +4389,215 @@ async fn handle_files_key(
     }
 }
 
+/// Keys the messages drawer and group-chat composer take while active.
+async fn handle_messages_key(
+    app: &mut App,
+    key: KeyEvent,
+) -> Result<Option<InputOutcome>, cyclops_tmux::TmuxError> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    if !app.model.messages_visible {
+        return Ok(None);
+    }
+
+    if matches!(key.code, KeyCode::Char('r'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && (app.messages_focused || app.messages_refresh_error.is_some())
+    {
+        if matches!(
+            app.messages_composer.stage,
+            Some(cyclops_ui::Stage::Uncertain { .. })
+        ) {
+            app.messages_reconcile_owed = MessagesDraftIdentity::current(
+                &app.messages_composer,
+                app.messages_composer_revision,
+                app.messages_caller,
+            );
+        }
+        request_messages_snapshot(app);
+        app.notice.show("Refreshing messages", Instant::now());
+        return Ok(Some(InputOutcome::Redraw));
+    }
+
+    if !app.messages_focused {
+        return Ok(None);
+    }
+
+    // If the composer is focused and active, it handles typing and sending:
+    if app.messages_composer.focused && app.messages_composer.mode.is_some() {
+        match key.code {
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if app.messages_composer.push_char(c) {
+                    messages_composer_changed(app);
+                }
+                return Ok(Some(InputOutcome::Redraw));
+            }
+            KeyCode::Backspace => {
+                let before = app.messages_composer.text().len();
+                app.messages_composer.backspace();
+                if app.messages_composer.text().len() != before {
+                    messages_composer_changed(app);
+                }
+                return Ok(Some(InputOutcome::Redraw));
+            }
+            KeyCode::Esc => {
+                app.messages_composer.focused = false;
+                app.messages_composer.mode = None;
+                messages_composer_changed(app);
+                return Ok(Some(InputOutcome::Redraw));
+            }
+            KeyCode::Enter => {
+                // If the composer is in an Uncertain stage, send write may have already
+                // completed at the daemon. Require explicit reconciliation before retry.
+                if matches!(
+                    app.messages_composer.stage,
+                    Some(cyclops_ui::Stage::Uncertain { .. })
+                ) {
+                    app.notice.show(
+                        "Send outcome unconfirmed by daemon: press Ctrl+R to reconcile or verify snapshot before retry",
+                        Instant::now(),
+                    );
+                    return Ok(Some(InputOutcome::Redraw));
+                }
+
+                let text = app.messages_composer.text().to_string();
+                if text.trim().is_empty() {
+                    return Ok(Some(InputOutcome::NoRedraw));
+                }
+                let key_mint = format!("ws-msg-{}", uuid::Uuid::new_v4());
+                let client_key = app.messages_composer.key_for_send(|| key_mint);
+                let mode = app.messages_composer.mode.clone().unwrap();
+
+                // Revalidate exact RecipientKeys against current live mailbox routes; never retarget by label
+                let route = match mode.revalidate_routes(&app.decoration.mailbox_routes) {
+                    Ok(res) => res,
+                    Err(why) => {
+                        app.messages_composer.record_not_sent(why.clone());
+                        app.notice.show(format!("Refused: {why}"), Instant::now());
+                        return Ok(Some(InputOutcome::Redraw));
+                    }
+                };
+                let Some(caller) = app.messages_caller else {
+                    app.messages_composer.record_not_sent(
+                        "authenticated sender is unavailable; update Cyclops and reopen this workspace"
+                            .into(),
+                    );
+                    return Ok(Some(InputOutcome::Redraw));
+                };
+                if app.messages_composer.sender != Some(caller) {
+                    app.messages_composer.record_not_sent(
+                        "the authenticated sender changed; close and reopen this composer".into(),
+                    );
+                    return Ok(Some(InputOutcome::Redraw));
+                }
+
+                queue_messages_send(
+                    app,
+                    MessagesSendAttempt {
+                        composer_revision: app.messages_composer_revision,
+                        mode,
+                        caller,
+                        recipient_keys: route.recipient_keys,
+                        subject: route.subject,
+                        body: text,
+                        fyi: route.fyi,
+                        reply_to: route.reply_to,
+                        client_key,
+                    },
+                );
+                return Ok(Some(InputOutcome::Redraw));
+            }
+            _ => return Ok(Some(InputOutcome::Redraw)),
+        }
+    }
+
+    // When the composer is not focused, handle navigation and shortcut actions:
+    match key.code {
+        KeyCode::Enter => {
+            if app.messages_detail.is_some() {
+                return Ok(Some(InputOutcome::NoRedraw));
+            }
+            if let (Some(row), Some(target)) = (
+                app.messages_queue.selected().cloned(),
+                app.messages_queue.freeze(),
+            ) {
+                queue_message_detail(app, row, target);
+                return Ok(Some(InputOutcome::Redraw));
+            }
+        }
+        KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('q') => {
+            if app.messages_detail.is_some() {
+                app.messages_detail = None;
+                return Ok(Some(InputOutcome::Redraw));
+            }
+            // Return keyboard focus to active terminal pane
+            app.messages_focused = false;
+            return Ok(Some(InputOutcome::Redraw));
+        }
+        KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(row) = app.messages_queue.selected().cloned() {
+                messages_composer_changed(app);
+                app.messages_composer = cyclops_ui::ComposerState::new_reply(
+                    row.message_id,
+                    row.sender,
+                    row.sender_label,
+                    row.subject,
+                );
+                app.messages_composer.bind_sender(app.messages_caller);
+                return Ok(Some(InputOutcome::Redraw));
+            }
+        }
+        KeyCode::Char('a') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let routes = &app.decoration.mailbox_routes;
+            if routes.is_empty() {
+                app.messages_composer.record_not_sent(
+                    "no reachable mailbox routes available for announcement".into(),
+                );
+                app.notice
+                    .show("Refused: no reachable mailbox routes", Instant::now());
+                return Ok(Some(InputOutcome::Redraw));
+            }
+            let recipients: Vec<(cyclops_proto::RecipientKey, String)> = routes
+                .iter()
+                .map(|r| (r.recipient, r.label.clone()))
+                .collect();
+            messages_composer_changed(app);
+            app.messages_composer = cyclops_ui::ComposerState::new_announce(recipients);
+            app.messages_composer.bind_sender(app.messages_caller);
+            return Ok(Some(InputOutcome::Redraw));
+        }
+        KeyCode::Char('j') | KeyCode::Down if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(detail) = app.messages_detail.as_mut() {
+                detail.scroll_by(1);
+            } else {
+                app.messages_queue.select_next();
+            }
+            return Ok(Some(InputOutcome::Redraw));
+        }
+        KeyCode::Char('k') | KeyCode::Up if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(detail) = app.messages_detail.as_mut() {
+                detail.scroll_by(-1);
+            } else {
+                app.messages_queue.select_previous();
+            }
+            return Ok(Some(InputOutcome::Redraw));
+        }
+        KeyCode::Char('s') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let next = match app.messages_queue.scope() {
+                cyclops_ui::Scope::Work => cyclops_ui::Scope::Inbox,
+                cyclops_ui::Scope::Inbox => cyclops_ui::Scope::Outbound,
+                cyclops_ui::Scope::Outbound => cyclops_ui::Scope::All,
+                cyclops_ui::Scope::All => cyclops_ui::Scope::Work,
+            };
+            app.messages_queue.set_scope(next);
+            return Ok(Some(InputOutcome::Redraw));
+        }
+        _ => {}
+    }
+
+    Ok(None)
+}
+
 /// One axis of pointer travel as a signed cell count.
 fn travel(from: u16, to: u16) -> i16 {
     i16::try_from(i32::from(to) - i32::from(from)).unwrap_or(0)
@@ -2800,6 +4662,7 @@ async fn commit_drag_drop(
         // left to resolve against whatever is under the release.
         DragTarget::Divider { .. }
         | DragTarget::Sidebar
+        | DragTarget::Messages
         | DragTarget::SidebarSplit
         | DragTarget::Dialog => None,
     };
@@ -3300,8 +5163,9 @@ fn apply_decoration_snapshot(app: &mut App, snapshot: DecorationSnapshot) {
 fn resync_daemon_state(app: &mut App) {
     app.watched_sessions.clear();
     ensure_sessions_watched(app);
-    if let Some(snapshot) = decoration::fetch_decoration(&app.home) {
-        apply_decoration_snapshot(app, snapshot);
+    match decoration::fetch_decoration(&app.home) {
+        Ok(snapshot) => apply_decoration_snapshot(app, snapshot),
+        Err(error) => log_err(&app.home, &format!("decoration resync failed: {error}")),
     }
 }
 
@@ -3309,7 +5173,12 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
     let session = app.model.session.session.clone();
     let mut model = fetch_workspace_model(client, &session).await?;
     apply_workspace_order(&mut model, &app.prefs.workspace_order);
-    install_reconciled_model(&mut app.model, model, app.prefs.sidebar_visible);
+    install_reconciled_model(
+        &mut app.model,
+        model,
+        app.prefs.sidebar_visible,
+        app.prefs.messages_visible,
+    );
     expand_active_workspace(
         &app.model.workspaces,
         app.model.active_workspace,
@@ -3322,8 +5191,9 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
     // Keep what the last answer said when this one does not arrive: a
     // reconcile that cannot reach the daemon knows nothing new about the
     // roster, and blanking it would un-name every agent on screen.
-    if let Some(snapshot) = decoration::fetch_decoration(&app.home) {
-        app.decoration = snapshot;
+    match decoration::fetch_decoration(&app.home) {
+        Ok(snapshot) => app.decoration = snapshot,
+        Err(error) => log_err(&app.home, &format!("decoration reconcile failed: {error}")),
     }
     app.persist_active();
     // New windows arrive through this snapshot (new tab, session switch,
@@ -3347,8 +5217,9 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
     // forced hydrate there would snap scrolled viewports to the tail once
     // a second.
     if std::mem::take(&mut app.needs_forced_hydrate) {
+        prepare_forced_hydration(app);
         crate::sync::hydrate_visible_tab_forced(client, app.model.active_tab(), &mut app.runtimes)
-            .await;
+            .await?;
     } else {
         hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await;
     }
@@ -3447,9 +5318,36 @@ fn install_reconciled_model(
     current: &mut WorkspaceModel,
     mut fresh: WorkspaceModel,
     sidebar_visible: bool,
+    messages_visible: bool,
 ) {
     fresh.sidebar_visible = sidebar_visible;
+    fresh.messages_visible = messages_visible;
     *current = fresh;
+}
+
+/// Forward one already-routed input event, retaining its exact target and
+/// key batch when the bounded reply FIFO is temporarily full.
+async fn forward_pane_input(
+    client: &ControlClient,
+    pane: String,
+    keys: Vec<String>,
+) -> InputOutcome {
+    let borrowed: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let result = client.send_keys_unconfirmed(&pane, &borrowed).await;
+    pane_input_outcome(pane, keys, result)
+}
+
+fn pane_input_outcome(
+    pane: String,
+    keys: Vec<String>,
+    result: Result<(), TmuxError>,
+) -> InputOutcome {
+    match result {
+        Ok(()) => InputOutcome::NoRedraw,
+        Err(TmuxError::Busy) => InputOutcome::Pending(PendingPaneInput { pane, keys }),
+        Err(error @ TmuxError::WriteUncertain(_)) => InputOutcome::Uncertain { pane, error },
+        Err(error) => InputOutcome::NotSent { pane, error },
+    }
 }
 
 /// Route one key to an [`Action`] (via [`action::route_binding`]) and run
@@ -3475,6 +5373,11 @@ async fn handle_key(
     // rather than a mode.
     if app.files_tree().cursor().is_some() && !is_prefix_key(&key) && !app.router.prefix_armed() {
         if let Some(outcome) = handle_files_key(app, client, key).await? {
+            return Ok(outcome);
+        }
+    }
+    if app.model.messages_visible && !is_prefix_key(&key) && !app.router.prefix_armed() {
+        if let Some(outcome) = handle_messages_key(app, key).await? {
             return Ok(outcome);
         }
     }
@@ -3519,15 +5422,18 @@ async fn handle_key(
                 crate::input::SelectAllOutcome::ClearLine => {
                     // Cursor to end first, so kill-to-start takes the
                     // whole line no matter where the cursor sat.
-                    client.send_keys_unconfirmed(&pane, &["C-e", "C-u"]).await?;
-                    return Ok(InputOutcome::NoRedraw);
+                    return Ok(forward_pane_input(
+                        client,
+                        pane,
+                        vec!["C-e".to_string(), "C-u".to_string()],
+                    )
+                    .await);
                 }
                 crate::input::SelectAllOutcome::Forward => {}
             }
             let encoded = encode_send_keys(&key);
             if !encoded.is_empty() {
-                let keys: Vec<&str> = encoded.iter().map(String::as_str).collect();
-                client.send_keys_unconfirmed(&pane, &keys).await?;
+                return Ok(forward_pane_input(client, pane, encoded).await);
             }
             Ok(InputOutcome::NoRedraw)
         }
@@ -3608,12 +5514,12 @@ async fn handle_dialog_key(
 /// reading. `observe` runs first and is the only place an animation starts;
 /// see `crate::animate` for why arming is a diff rather than a call at each
 /// site.
-fn draw(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+fn draw<B: Backend>(
+    terminal: &mut Terminal<B>,
     app: &mut App,
     motion: &mut Motion,
     now: Instant,
-) -> io::Result<()> {
+) -> Result<(), B::Error> {
     // The preference is read here rather than pushed from the exec arm
     // because the clock is a local of the loop, not a field of `App`. One
     // read per frame is cheap, it cannot desynchronise from what the menu
@@ -3680,6 +5586,47 @@ fn draw(
                     app.hover,
                 );
             }
+            if let Some(messages) = areas.messages {
+                let pane_manifests: std::collections::HashMap<String, String> = app
+                    .decoration
+                    .panes
+                    .iter()
+                    .filter_map(|(id, p)| p.manifest.as_ref().map(|m| (id.clone(), m.clone())))
+                    .collect();
+                let refresh_status = app
+                    .messages_refresh_error
+                    .as_ref()
+                    .map(|error| format!("refresh failed: {error} · Ctrl+R to retry"));
+                let link_status = refresh_status.as_deref().or_else(|| {
+                    (app.messages_gate.link() == cyclops_ui::Link::Lost)
+                        .then_some("daemon reconnecting")
+                        .or_else(|| app.notice.text())
+                });
+                paint_messages(
+                    &app.messages_queue,
+                    app.messages_detail.as_ref(),
+                    Some(&app.messages_composer),
+                    &app.avatar_registry,
+                    Some(&app.decoration.mailbox_routes),
+                    Some(&pane_manifests),
+                    link_status,
+                    app.messages_refresh_error.is_some(),
+                    messages,
+                    f.buffer_mut(),
+                    &app.paint,
+                    &mut app.hit_map,
+                    app.hover,
+                );
+            }
+            if let Some(messages_rail) = areas.messages_rail {
+                paint_messages_rail(
+                    messages_rail,
+                    f.buffer_mut(),
+                    &app.paint,
+                    &mut app.hit_map,
+                    app.hover,
+                );
+            }
             paint_tab_bar(
                 &app.model.session.tabs,
                 app.model.session.active_tab,
@@ -3738,6 +5685,18 @@ fn draw(
                     app.drag.as_ref(),
                 );
             }
+            if let Some(messages) = areas.messages {
+                if areas.canvas.width > 0 && areas.canvas.height > 0 {
+                    let divider = Rect::new(messages.x, messages.y, 1, messages.height);
+                    paint_messages_resize_feedback(
+                        f.buffer_mut(),
+                        divider,
+                        &app.paint,
+                        app.hover,
+                        app.drag.as_ref(),
+                    );
+                }
+            }
             // Menus paint after panes so their hit regions shadow them.
             paint_menu(
                 &app.menu,
@@ -3750,6 +5709,7 @@ fn draw(
                     tab_bar: app.prefs.tab_bar_visible,
                     motion: app.prefs.motion,
                     stream: app.sidebar_tab == crate::persist::SidebarTab::Stream,
+                    messages: app.model.messages_visible,
                     files: app.prefs.files_rows > 0,
                 },
             );
@@ -3819,6 +5779,28 @@ pub fn print_help_and_exit() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    trait FixtureParse: Sized {
+        type Error;
+
+        fn parse(value: &str) -> Result<Self, Self::Error>;
+    }
+
+    impl FixtureParse for cyclops_proto::RecipientKey {
+        type Error = cyclops_proto::IdentityError;
+
+        fn parse(value: &str) -> Result<Self, Self::Error> {
+            value.parse()
+        }
+    }
+
+    impl FixtureParse for cyclops_proto::MessageId {
+        type Error = cyclops_proto::MailboxTypeError;
+
+        fn parse(value: &str) -> Result<Self, Self::Error> {
+            cyclops_proto::MessageId::new(value)
+        }
+    }
 
     #[test]
     fn workspace_log_refuses_a_link_without_touching_its_target() {
@@ -3933,7 +5915,13 @@ mod tests {
             files_probe_at: None,
             files_root_pending: true,
             record: cyclops_ui::Record::new(),
+            messages_queue: cyclops_ui::HumanQueue::default(),
+            messages_caller: None,
+            messages_detail: None,
+            messages_composer: cyclops_ui::ComposerState::default(),
+            avatar_registry: cyclops_ui::AvatarRegistry::default(),
             intake: cyclops_ui::Intake::new(),
+            stream_reconciling: false,
             cursor_style: None,
             term_size: (40, 12),
             declared_client_size: None,
@@ -3943,7 +5931,18 @@ mod tests {
             paste_seq: 0,
             home,
             folder_probe_at: None,
-            tx: None,
+            send_requests: None,
+            stream_reconcile_requests: None,
+            messages_focused: false,
+            messages_gate: cyclops_ui::RefreshGate::new(),
+            messages_refresh_error: None,
+            messages_send_tx: None,
+            messages_composer_revision: 0,
+            messages_send_in_flight: None,
+            messages_snapshot_tx: None,
+            message_detail_tx: None,
+            message_detail_in_flight: None,
+            messages_reconcile_owed: None,
         }
     }
 
@@ -3977,7 +5976,397 @@ mod tests {
                 active_tab: 0,
             },
             sidebar_visible: true,
+            messages_visible: false,
         }
+    }
+
+    fn current_messages_gate(app: &mut App) {
+        let workspace_id = "00000000-0000-0000-0000-000000000001"
+            .parse()
+            .expect("workspace id");
+        let snapshot = cyclops_proto::MessagesSnapshotResult {
+            workspace_id,
+            caller: Some(cyclops_proto::RecipientKey::admin(workspace_id)),
+            workspace_seq: 1,
+            counts: cyclops_proto::MessagesSnapshotCounts {
+                visible_messages: 0,
+                returned_messages: 0,
+                inbox_messages: 0,
+                outbound_messages: 0,
+                work_messages: 0,
+                active_messages: 0,
+                settled_messages: 0,
+                pending_entries: 0,
+                claimed_entries: 0,
+                open_attention_entries: 0,
+            },
+            rows: Vec::new(),
+            mailbox_attention: Vec::new(),
+        };
+        app.messages_gate.connected();
+        app.messages_gate.mark_dirty();
+        let request = app.messages_gate.begin().expect("snapshot request");
+        assert!(app.messages_gate.finish_snapshot(request, &snapshot));
+        app.messages_caller = snapshot.caller;
+        assert!(app.messages_gate.may_mutate());
+    }
+
+    fn messages_test_caller() -> cyclops_proto::RecipientKey {
+        cyclops_proto::RecipientKey::admin(
+            "00000000-0000-0000-0000-000000000001"
+                .parse()
+                .expect("workspace id"),
+        )
+    }
+
+    fn messages_attempt(
+        composer_revision: u64,
+        composer: &mut cyclops_ui::ComposerState,
+    ) -> MessagesSendAttempt {
+        composer.set_text("ship the patch");
+        let client_key = composer.key_for_send(|| "stable-client-key".to_string());
+        MessagesSendAttempt {
+            composer_revision,
+            mode: composer.mode.clone().expect("composer mode"),
+            caller: messages_test_caller(),
+            recipient_keys: Some(vec![
+                "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1"
+                    .parse()
+                    .expect("recipient"),
+            ]),
+            subject: "Direct Message".into(),
+            body: composer.text().to_string(),
+            fyi: false,
+            reply_to: None,
+            client_key,
+        }
+    }
+
+    fn direct_composer() -> cyclops_ui::ComposerState {
+        let recipient = cyclops_proto::RecipientKey::parse(
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1",
+        )
+        .expect("recipient");
+        let mut composer = cyclops_ui::ComposerState::new_direct(recipient, "claudex".into());
+        composer.bind_sender(Some(messages_test_caller()));
+        composer
+    }
+
+    #[test]
+    fn stale_send_completion_cannot_clear_a_newer_draft() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-messages-stale-send");
+        let mut app = test_app(one_pane_model(), home.clone());
+        current_messages_gate(&mut app);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        app.messages_send_tx = Some(tx);
+        app.messages_composer = direct_composer();
+        let attempt = messages_attempt(app.messages_composer_revision, &mut app.messages_composer);
+
+        queue_messages_send(&mut app, attempt.clone());
+        assert_eq!(
+            rx.try_recv().expect("queued request").attempt,
+            attempt,
+            "the worker receives the exact bytes and client key"
+        );
+        assert!(app.messages_composer.push_char('!'));
+        messages_composer_changed(&mut app);
+        app.messages_composer.backspace();
+        messages_composer_changed(&mut app);
+        finish_messages_send(
+            &mut app,
+            attempt,
+            crate::daemon::SendOutcome::Accepted("accepted m-old".into()),
+        );
+
+        assert_eq!(app.messages_composer.text(), "ship the patch");
+        assert!(app.messages_composer.mode.is_some());
+        assert!(app.messages_send_in_flight.is_none());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn stale_reconcile_cannot_unlock_a_newer_uncertain_draft() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-messages-stale-reconcile");
+        let mut app = test_app(one_pane_model(), home.clone());
+        current_messages_gate(&mut app);
+        app.messages_composer = direct_composer();
+        let _ = messages_attempt(app.messages_composer_revision, &mut app.messages_composer);
+        app.messages_composer
+            .record_uncertain("old send outcome unknown".into());
+        app.messages_reconcile_owed = MessagesDraftIdentity::current(
+            &app.messages_composer,
+            app.messages_composer_revision,
+            app.messages_caller,
+        );
+
+        let mut newer = direct_composer();
+        newer.set_text("new exact bytes");
+        let _ = newer.key_for_send(|| "new-client-key".to_string());
+        newer.record_uncertain("new send outcome unknown".into());
+        app.messages_composer = newer;
+        finish_messages_reconcile(&mut app);
+
+        assert!(matches!(
+            app.messages_composer.stage,
+            Some(cyclops_ui::Stage::Uncertain { .. })
+        ));
+        assert!(app.messages_reconcile_owed.is_none());
+
+        app.messages_reconcile_owed = MessagesDraftIdentity::current(
+            &app.messages_composer,
+            app.messages_composer_revision,
+            app.messages_caller,
+        );
+        finish_messages_reconcile(&mut app);
+        assert!(app.messages_composer.stage.is_none());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn full_or_closed_send_lane_is_explicitly_not_sent() {
+        for closed in [false, true] {
+            let home = cyclops_proto::scratch::scratch_dir(if closed {
+                "workspace-messages-send-closed"
+            } else {
+                "workspace-messages-send-full"
+            });
+            let mut app = test_app(one_pane_model(), home.clone());
+            current_messages_gate(&mut app);
+            app.messages_composer = direct_composer();
+            let attempt =
+                messages_attempt(app.messages_composer_revision, &mut app.messages_composer);
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            if closed {
+                drop(rx);
+            } else {
+                tx.try_send(MessagesSendTask {
+                    attempt: attempt.clone(),
+                })
+                .expect("fill lane");
+            }
+            app.messages_send_tx = Some(tx);
+
+            queue_messages_send(&mut app, attempt.clone());
+
+            assert!(matches!(
+                app.messages_composer.stage,
+                Some(cyclops_ui::Stage::NotSent { .. })
+            ));
+            assert_eq!(app.messages_composer.text(), attempt.body);
+            assert_eq!(
+                app.messages_composer.draft.key(),
+                Some(attempt.client_key.as_str())
+            );
+            assert!(app.messages_send_in_flight.is_none());
+            let _ = std::fs::remove_dir_all(home);
+        }
+    }
+
+    #[test]
+    fn process_generation_refusal_preserves_draft_and_invalidates_routes() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-messages-send-denied");
+        let mut app = test_app(one_pane_model(), home.clone());
+        current_messages_gate(&mut app);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        app.messages_send_tx = Some(tx);
+        app.messages_composer = direct_composer();
+        let attempt = messages_attempt(app.messages_composer_revision, &mut app.messages_composer);
+        queue_messages_send(&mut app, attempt.clone());
+        let _ = rx.try_recv().expect("queued request");
+
+        finish_messages_send(
+            &mut app,
+            attempt.clone(),
+            crate::daemon::SendOutcome::Rejected(crate::daemon::DaemonRefusal::new(
+                "denied",
+                "the process that opened this connection is no longer the one on it",
+            )),
+        );
+
+        assert_eq!(app.messages_composer.text(), attempt.body);
+        assert_eq!(
+            app.messages_composer.draft.key(),
+            Some(attempt.client_key.as_str())
+        );
+        let Some(cyclops_ui::Stage::NotSent { why, .. }) = &app.messages_composer.stage else {
+            panic!("a denied sender must be known not sent");
+        };
+        assert!(why.contains("sender identity changed"), "{why}");
+        assert!(!app.messages_gate.may_mutate());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn detail_results_are_bound_to_the_frozen_row() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-messages-detail-target");
+        let mut app = test_app(one_pane_model(), home.clone());
+        current_messages_gate(&mut app);
+        let (tx, mut rx) = mpsc::channel(1);
+        app.message_detail_tx = Some(tx);
+        let row = cyclops_ui::QueueRow::default();
+        let target = cyclops_ui::FrozenTarget {
+            target: row.target.clone(),
+            attempt: row.attention,
+            watermark: 7,
+        };
+        queue_message_detail(&mut app, row.clone(), target.clone());
+        let task = rx.try_recv().expect("detail request");
+        assert_eq!(task.row, row);
+        assert_eq!(task.target, target);
+
+        let mut newer = cyclops_ui::QueueRow::default();
+        newer.message_id = cyclops_proto::MessageId::parse("m-0000000000000002").unwrap();
+        newer.target = cyclops_ui::QueueTarget::new(newer.message_id.clone(), newer.recipient);
+        let newer_detail = cyclops_ui::Detail::open(&newer, 8);
+        let newer_target = newer_detail.target().clone();
+        app.messages_detail = Some(newer_detail);
+
+        finish_message_detail(
+            &mut app,
+            target,
+            cyclops_ui::ActionOutcome::Opened(Box::default()),
+        );
+
+        assert_eq!(
+            app.messages_detail.as_ref().unwrap().target(),
+            &newer_target,
+            "an old answer cannot replace a newly opened detail"
+        );
+        assert!(app.message_detail_in_flight.is_none());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn closed_detail_lane_leaves_an_explicit_terminal_state() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-messages-detail-closed");
+        let mut app = test_app(one_pane_model(), home.clone());
+        current_messages_gate(&mut app);
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        app.message_detail_tx = Some(tx);
+        let row = cyclops_ui::QueueRow::default();
+        let target = cyclops_ui::FrozenTarget {
+            target: row.target.clone(),
+            attempt: row.attention,
+            watermark: 4,
+        };
+
+        queue_message_detail(&mut app, row, target);
+
+        assert!(matches!(
+            app.messages_detail.as_ref().map(cyclops_ui::Detail::stage),
+            Some(cyclops_ui::Stage::NotSent { .. })
+        ));
+        assert!(app.message_detail_in_flight.is_none());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn operator_refresh_waits_for_connection_evidence() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-messages-reconnect-proof");
+        let mut app = test_app(one_pane_model(), home.clone());
+        app.messages_gate.disconnected();
+
+        request_messages_snapshot(&mut app);
+
+        assert_eq!(app.messages_gate.link(), cyclops_ui::Link::Connecting);
+        assert!(!app.messages_gate.may_mutate());
+        request_messages_snapshot(&mut app);
+        assert_eq!(app.messages_gate.link(), cyclops_ui::Link::Connecting);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn ctrl_r_retries_a_failed_snapshot_without_drawer_focus() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let home = cyclops_proto::scratch::scratch_dir("workspace-messages-retry");
+        let mut model = one_pane_model();
+        model.messages_visible = true;
+        let mut app = test_app(model, home.clone());
+        app.messages_gate.connected();
+        let failed = app.messages_gate.begin().expect("initial snapshot");
+        assert!(app.messages_gate.finish_snapshot_failure(failed));
+        app.messages_refresh_error = Some("old daemon closed the socket".into());
+        app.messages_focused = false;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        app.messages_snapshot_tx = Some(tx);
+
+        let outcome = handle_messages_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        )
+        .await
+        .expect("key handling");
+
+        assert!(matches!(outcome, Some(InputOutcome::Redraw)));
+        assert!(app.messages_refresh_error.is_none());
+        assert!(app.messages_gate.is_fetching());
+        let (_, limit) = rx.try_recv().expect("retry request");
+        assert_eq!(limit, 128);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn clicking_the_messages_chevron_collapses_the_drawer() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+        use ratatui::backend::TestBackend;
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-messages-toggle");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "/bin/sh",
+        ]);
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-messages-toggle-home");
+        let mut model = one_pane_model();
+        model.messages_visible = true;
+        let mut app = test_app(model, home.clone());
+        app.prefs.messages_visible = true;
+        app.term_size = (80, 24);
+        app.window_focused = false;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        let mut motion = Motion::new(false);
+        draw(&mut terminal, &mut app, &mut motion, Instant::now()).expect("full frame");
+        let (column, row) = (0..80u16)
+            .flat_map(|column| (0..24u16).map(move |row| (column, row)))
+            .find(|&(column, row)| {
+                matches!(
+                    app.hit_map.hit(column, row),
+                    Some(HitTarget::MessagesToggle)
+                )
+            })
+            .expect("messages chevron hit target");
+        let mut detached = false;
+
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Down(MouseButton::Left), column, row),
+            &mut detached,
+        )
+        .await
+        .expect("click");
+
+        assert!(!app.model.messages_visible);
+        assert!(!app.prefs.messages_visible);
+        assert!(!app.messages_focused);
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
@@ -4037,14 +6426,558 @@ mod tests {
 
     #[tokio::test]
     async fn due_render_deadline_beats_a_ready_message_queue() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        tx.send(AppMsg::Redraw).expect("queue stays open");
+        let (input_tx, mut input_rx) = mpsc::channel(4);
+        let (_paste_tx, mut paste_rx) = mpsc::channel(1);
+        let (_action_tx, mut action_rx) = mpsc::channel(4);
+        let (_terminal_tx, mut terminal_rx) = mpsc::channel(4);
+        let (_tmux_tx, mut tmux_rx) = mpsc::channel(4);
+        let (_stream_tx, mut stream_rx) = mpsc::channel(4);
+        let (_continuity_tx, mut continuity_rx) = mpsc::channel(1);
+        let mut fairness = IngressFairness::default();
+        input_tx
+            .send(AppMsg::Redraw)
+            .await
+            .expect("queue stays open");
         let due = Instant::now() - Duration::from_millis(1);
 
         assert!(matches!(
-            next_wake(&mut rx, Some(due)).await,
+            next_wake(
+                &mut continuity_rx,
+                &mut input_rx,
+                &mut paste_rx,
+                &mut action_rx,
+                &mut terminal_rx,
+                &mut tmux_rx,
+                &mut stream_rx,
+                true,
+                &mut fairness,
+                Some(due),
+            )
+            .await,
             Wake::Deadline
         ));
+    }
+
+    #[tokio::test]
+    async fn a_control_gap_preempts_ready_user_input() {
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let (_paste_tx, mut paste_rx) = mpsc::channel(1);
+        let (_action_tx, mut action_rx) = mpsc::channel(1);
+        let (_terminal_tx, mut terminal_rx) = mpsc::channel(1);
+        let (_tmux_tx, mut tmux_rx) = mpsc::channel(1);
+        let (_stream_tx, mut stream_rx) = mpsc::channel(1);
+        let (continuity_tx, mut continuity_rx) = mpsc::channel(1);
+        let mut fairness = IngressFairness::default();
+        input_tx.try_send(AppMsg::Redraw).expect("input is ready");
+        let (repair, _repair_done) = oneshot::channel();
+        let (_cutover_done, cutover) = oneshot::channel();
+        assert!(
+            continuity_tx
+                .try_send(ControlContinuityBarrier { repair, cutover })
+                .is_ok(),
+            "continuity barrier is ready"
+        );
+
+        assert!(matches!(
+            next_wake(
+                &mut continuity_rx,
+                &mut input_rx,
+                &mut paste_rx,
+                &mut action_rx,
+                &mut terminal_rx,
+                &mut tmux_rx,
+                &mut stream_rx,
+                true,
+                &mut fairness,
+                None,
+            )
+            .await,
+            Wake::ControlContinuityLost(_)
+        ));
+        assert!(matches!(input_rx.try_recv(), Ok(AppMsg::Redraw)));
+    }
+
+    #[test]
+    fn a_failed_forced_hydrate_keeps_the_app_barrier_closed() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-continuity-hydrate");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create scratch home");
+        let mut app = test_app(one_pane_model(), home.clone());
+        app.paused_panes.insert("%0".to_string());
+
+        // The Continue edge was in the dropped suffix. Preparing the
+        // authoritative capture must not preserve its earlier Pause.
+        prepare_forced_hydration(&mut app);
+        assert!(app.paused_panes.is_empty());
+
+        let mut reconnect_deadline = None;
+        let acknowledged = settle_control_continuity_repair(
+            &mut app,
+            Err(TmuxError::Protocol("forced pane capture failed".into())),
+            &mut reconnect_deadline,
+        );
+        assert!(
+            !acknowledged,
+            "an incomplete capture cannot open the barrier"
+        );
+        assert!(app.needs_reconcile);
+        assert!(matches!(
+            app.link_state,
+            LinkState::Reconnecting { attempt: 0 }
+        ));
+        assert!(reconnect_deadline.is_some());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn an_event_after_capture_keeps_the_app_barrier_closed() {
+        let (repair, repair_rx) = oneshot::channel::<bool>();
+        let (cutover_tx, cutover) = oneshot::channel();
+        let source = tokio::spawn(async move {
+            assert!(repair_rx.await.expect("app reports snapshot result"));
+            cutover_tx
+                .send(false)
+                .expect("event after capture rejects cutover");
+        });
+
+        let result =
+            finish_control_cutover(Ok(()), ControlContinuityBarrier { repair, cutover }).await;
+        assert!(
+            matches!(result, Err(TmuxError::Protocol(message)) if message.contains("cutover")),
+            "snapshot success alone cannot acknowledge continuity"
+        );
+        source.await.expect("source cutover task exits");
+    }
+
+    #[tokio::test]
+    async fn input_arriving_during_cutover_wait_keeps_the_closed_epoch() {
+        let gate = PaneInputGate::new();
+        gate.close();
+        let source_gate = gate.clone();
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let (repair, repair_rx) = oneshot::channel::<bool>();
+        let (cutover_tx, cutover) = oneshot::channel();
+        let source = tokio::spawn(async move {
+            assert!(repair_rx.await.expect("app reports snapshot result"));
+            input_tx
+                .send(AppMsg::Input {
+                    epoch: source_gate.stamp(),
+                    key: KeyEvent::new(crossterm::event::KeyCode::Char('x'), KeyModifiers::empty()),
+                })
+                .await
+                .expect("input arrives before source cutover");
+            cutover_tx.send(true).expect("source completes cutover");
+        });
+
+        finish_control_cutover(Ok(()), ControlContinuityBarrier { repair, cutover })
+            .await
+            .expect("snapshot and source cutover both succeed");
+        gate.open();
+        let input = input_rx.try_recv().expect("cutover input was queued");
+        assert!(
+            !gate.accepts(input.pane_input_epoch().expect("pane input epoch")),
+            "input accepted during repair cannot target the reconciled model"
+        );
+        source.await.expect("source cutover task exits");
+    }
+
+    #[tokio::test]
+    async fn pending_pane_input_drains_background_without_consuming_later_actions() {
+        let (input_tx, mut input_rx) = mpsc::channel(4);
+        let (paste_tx, mut paste_rx) = mpsc::channel(1);
+        let (action_tx, mut action_rx) = mpsc::channel(4);
+        let (terminal_tx, mut terminal_rx) = mpsc::channel(4);
+        let (tmux_tx, mut tmux_rx) = mpsc::channel(4);
+        let (stream_tx, mut stream_rx) = mpsc::channel(4);
+        let (_continuity_tx, mut continuity_rx) = mpsc::channel(1);
+        let mut background_cursor = 0;
+        let mut capacity: InputCapacityFuture = Box::pin(std::future::pending());
+
+        input_tx
+            .try_send(AppMsg::Input {
+                epoch: 0,
+                key: KeyEvent::new(crossterm::event::KeyCode::Char('b'), KeyModifiers::empty()),
+            })
+            .expect("input lane accepts a later key");
+        input_tx
+            .try_send(AppMsg::Mouse {
+                epoch: 0,
+                mouse: MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 1,
+                    row: 1,
+                    modifiers: KeyModifiers::empty(),
+                },
+            })
+            .expect("input lane accepts a later mouse action");
+        paste_tx
+            .try_send(AppMsg::Paste {
+                epoch: 0,
+                text: "later paste".to_string(),
+            })
+            .expect("paste lane accepts later text");
+        action_tx
+            .try_send(AppMsg::ThemeChanged)
+            .expect("action lane accepts a later completion");
+        tmux_tx
+            .try_send(AppMsg::Redraw)
+            .expect("tmux lane carries background state");
+        terminal_tx
+            .try_send(AppMsg::Focus(true))
+            .expect("terminal lane carries focus state");
+        stream_tx
+            .try_send(AppMsg::ThemeChanged)
+            .expect("stream lane carries daemon state");
+
+        for expected in ["focus", "tmux", "stream"] {
+            let wake = next_pending_input_wake(
+                &mut continuity_rx,
+                &mut capacity,
+                &mut terminal_rx,
+                &mut tmux_rx,
+                &mut stream_rx,
+                true,
+                &mut background_cursor,
+                None,
+            )
+            .await;
+            let Wake::Message(Some(message)) = wake else {
+                panic!("pending input returned a non-message wake");
+            };
+            match (expected, *message) {
+                ("focus", AppMsg::Focus(true))
+                | ("tmux", AppMsg::Redraw)
+                | ("stream", AppMsg::ThemeChanged) => {}
+                _ => panic!("pending input drained background lanes out of order"),
+            }
+        }
+        assert!(matches!(input_rx.try_recv(), Ok(AppMsg::Input { .. })));
+        assert!(matches!(input_rx.try_recv(), Ok(AppMsg::Mouse { .. })));
+        assert!(matches!(paste_rx.try_recv(), Ok(AppMsg::Paste { .. })));
+        assert!(matches!(action_rx.try_recv(), Ok(AppMsg::ThemeChanged)));
+    }
+
+    #[tokio::test]
+    async fn a_control_gap_retires_the_whole_pre_reconcile_input_segment() {
+        let (input_tx, mut input_rx) = mpsc::channel(4);
+        let (paste_tx, mut paste_rx) = mpsc::channel(1);
+        let mut pending = Some(PendingPaneInput {
+            pane: "%7".to_string(),
+            keys: vec!["a".to_string()],
+        });
+        for key in ['b', 'c'] {
+            input_tx
+                .try_send(AppMsg::Input {
+                    epoch: 0,
+                    key: KeyEvent::new(crossterm::event::KeyCode::Char(key), KeyModifiers::empty()),
+                })
+                .expect("later key queues behind held input");
+        }
+        paste_tx
+            .try_send(AppMsg::Paste {
+                epoch: 0,
+                text: "later paste".to_string(),
+            })
+            .expect("later paste queues behind held input");
+
+        assert_eq!(
+            retire_pane_input_segment("%9", &mut pending, &mut input_rx, &mut paste_rx),
+            Some("%7".to_string()),
+            "one notice names the target of the first held batch"
+        );
+        assert!(pending.is_none());
+        assert!(input_rx.try_recv().is_err(), "queued keys are retired");
+        assert!(paste_rx.try_recv().is_err(), "queued paste is retired");
+    }
+
+    #[tokio::test]
+    async fn input_arriving_during_repair_is_quarantined_before_cutover() {
+        let (input_tx, mut input_rx) = mpsc::channel(2);
+        let (paste_tx, mut paste_rx) = mpsc::channel(1);
+        let mut pending = None;
+        assert!(
+            retire_pane_input_segment("%3", &mut pending, &mut input_rx, &mut paste_rx).is_none(),
+            "the prefix starts empty"
+        );
+
+        input_tx
+            .try_send(AppMsg::Input {
+                epoch: 0,
+                key: KeyEvent::new(crossterm::event::KeyCode::Char('x'), KeyModifiers::empty()),
+            })
+            .expect("key arrives while capture is awaited");
+        paste_tx
+            .try_send(AppMsg::Paste {
+                epoch: 0,
+                text: "during repair".to_string(),
+            })
+            .expect("paste arrives while capture is awaited");
+
+        assert_eq!(
+            retire_pane_input_segment("%3", &mut pending, &mut input_rx, &mut paste_rx),
+            Some("%3".to_string())
+        );
+        assert!(input_rx.try_recv().is_err());
+        assert!(paste_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn disconnected_capacity_wins_without_replaying_a_later_message() {
+        let (_terminal_tx, mut terminal_rx) = mpsc::channel(4);
+        let (tmux_tx, mut tmux_rx) = mpsc::channel(4);
+        let (_stream_tx, mut stream_rx) = mpsc::channel(4);
+        let (_continuity_tx, mut continuity_rx) = mpsc::channel(1);
+        let mut background_cursor = 0;
+        let mut capacity: InputCapacityFuture = Box::pin(async { Err(TmuxError::Disconnected) });
+        tmux_tx
+            .try_send(AppMsg::Redraw)
+            .expect("tmux lane accepts a ready message");
+
+        assert!(matches!(
+            next_pending_input_wake(
+                &mut continuity_rx,
+                &mut capacity,
+                &mut terminal_rx,
+                &mut tmux_rx,
+                &mut stream_rx,
+                true,
+                &mut background_cursor,
+                None,
+            )
+            .await,
+            Wake::InputCapacity(Err(TmuxError::Disconnected))
+        ));
+        assert!(matches!(tmux_rx.try_recv(), Ok(AppMsg::Redraw)));
+    }
+
+    #[test]
+    fn held_input_keeps_the_original_pane_and_exact_keys() {
+        let held = PendingPaneInput {
+            pane: "%7".to_string(),
+            keys: vec!["C-e".to_string(), "C-u".to_string()],
+        };
+        assert_eq!(held.pane, "%7");
+        assert_eq!(held.keys, ["C-e", "C-u"]);
+    }
+
+    #[test]
+    fn a_close_before_the_first_write_is_visible_and_never_replayable() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-input-disconnected");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create scratch home");
+        let mut app = test_app(one_pane_model(), home.clone());
+        let mut pending = None;
+        let mut detached = false;
+        let mut debounce = None;
+
+        let outcome = pane_input_outcome(
+            "%7".to_string(),
+            vec!["CYCLOPS_INPUT_MUST_NOT_REPLAY".to_string()],
+            Err(TmuxError::Disconnected),
+        );
+        apply_pane_input_outcome(
+            outcome,
+            &mut app,
+            &mut pending,
+            &mut detached,
+            &mut debounce,
+        );
+
+        assert_eq!(
+            app.notice.text(),
+            Some("input was not sent to %7: tmux control connection closed")
+        );
+        assert!(debounce.is_some(), "the visible notice earns one frame");
+        assert!(pending.is_none(), "failed key bytes are not retained");
+        assert!(!detached);
+
+        // A later link-loss event only inspects PendingPaneInput. Since the
+        // initial failure stores no key bytes there, reconnect has nothing
+        // it can replay and cannot produce a second target notice.
+        assert!(pending.take().is_none());
+        assert_eq!(
+            app.notice.text(),
+            Some("input was not sent to %7: tmux control connection closed")
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_write_failure_is_uncertain_visible_and_never_replayable() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-input-uncertain");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create scratch home");
+        let mut app = test_app(one_pane_model(), home.clone());
+        let mut pending = None;
+        let mut detached = false;
+        let mut debounce = None;
+        let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "flush failed");
+
+        let outcome = pane_input_outcome(
+            "%7".to_string(),
+            vec!["CYCLOPS_INPUT_MAY_HAVE_LANDED".to_string()],
+            Err(TmuxError::WriteUncertain(error)),
+        );
+        apply_pane_input_outcome(
+            outcome,
+            &mut app,
+            &mut pending,
+            &mut detached,
+            &mut debounce,
+        );
+
+        let notice = app.notice.text().expect("uncertain write is visible");
+        assert!(notice.contains("input may have reached %7"));
+        assert!(notice.contains("will not be replayed"));
+        assert!(!notice.contains("input was not sent"));
+        assert!(pending.is_none(), "uncertain key bytes are not retained");
+        assert!(debounce.is_some());
+        assert!(!detached);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn a_ready_input_precedes_a_full_stream_lane() {
+        let (input_tx, mut input_rx) = mpsc::channel(4);
+        let (_paste_tx, mut paste_rx) = mpsc::channel(1);
+        let (_action_tx, mut action_rx) = mpsc::channel(4);
+        let (_terminal_tx, mut terminal_rx) = mpsc::channel(4);
+        let (_tmux_tx, mut tmux_rx) = mpsc::channel(4);
+        let (stream_tx, mut stream_rx) = mpsc::channel(4);
+        let mut fairness = IngressFairness::default();
+
+        for _ in 0..4 {
+            stream_tx.try_send(AppMsg::ThemeChanged).unwrap();
+        }
+        assert!(stream_tx.try_send(AppMsg::ThemeChanged).is_err());
+        input_tx.try_send(AppMsg::Redraw).unwrap();
+
+        assert!(matches!(
+            next_message(
+                &mut input_rx,
+                &mut paste_rx,
+                &mut action_rx,
+                &mut terminal_rx,
+                &mut tmux_rx,
+                &mut stream_rx,
+                true,
+                &mut fairness,
+            )
+            .await,
+            Some(AppMsg::Redraw)
+        ));
+        assert!(matches!(stream_rx.try_recv(), Ok(AppMsg::ThemeChanged)));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_blocks_stream_entries_without_blocking_actions() {
+        let (_input_tx, mut input_rx) = mpsc::channel(4);
+        let (_paste_tx, mut paste_rx) = mpsc::channel(1);
+        let (action_tx, mut action_rx) = mpsc::channel(4);
+        let (_terminal_tx, mut terminal_rx) = mpsc::channel(4);
+        let (_tmux_tx, mut tmux_rx) = mpsc::channel(4);
+        let (stream_tx, mut stream_rx) = mpsc::channel(4);
+        let mut fairness = IngressFairness::default();
+
+        stream_tx.try_send(AppMsg::ThemeChanged).unwrap();
+        action_tx.try_send(AppMsg::Redraw).unwrap();
+
+        assert!(matches!(
+            next_message(
+                &mut input_rx,
+                &mut paste_rx,
+                &mut action_rx,
+                &mut terminal_rx,
+                &mut tmux_rx,
+                &mut stream_rx,
+                false,
+                &mut fairness,
+            )
+            .await,
+            Some(AppMsg::Redraw)
+        ));
+        assert!(matches!(stream_rx.try_recv(), Ok(AppMsg::ThemeChanged)));
+    }
+
+    #[tokio::test]
+    async fn a_priority_burst_yields_to_ready_background_work() {
+        let (input_tx, mut input_rx) = mpsc::channel(PRIORITY_BURST + 1);
+        let (_paste_tx, mut paste_rx) = mpsc::channel(1);
+        let (_action_tx, mut action_rx) = mpsc::channel(1);
+        let (_terminal_tx, mut terminal_rx) = mpsc::channel(1);
+        let (_tmux_tx, mut tmux_rx) = mpsc::channel(1);
+        let (stream_tx, mut stream_rx) = mpsc::channel(1);
+        let mut fairness = IngressFairness::default();
+        for _ in 0..=PRIORITY_BURST {
+            input_tx.try_send(AppMsg::Redraw).unwrap();
+        }
+        stream_tx.try_send(AppMsg::ThemeChanged).unwrap();
+
+        for _ in 0..PRIORITY_BURST {
+            assert!(matches!(
+                next_message(
+                    &mut input_rx,
+                    &mut paste_rx,
+                    &mut action_rx,
+                    &mut terminal_rx,
+                    &mut tmux_rx,
+                    &mut stream_rx,
+                    true,
+                    &mut fairness,
+                )
+                .await,
+                Some(AppMsg::Redraw)
+            ));
+        }
+        assert!(matches!(
+            next_message(
+                &mut input_rx,
+                &mut paste_rx,
+                &mut action_rx,
+                &mut terminal_rx,
+                &mut tmux_rx,
+                &mut stream_rx,
+                true,
+                &mut fairness,
+            )
+            .await,
+            Some(AppMsg::ThemeChanged)
+        ));
+    }
+
+    #[test]
+    fn decoration_edges_coalesce_in_the_single_pending_slot() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        assert!(signal_decoration_event(&tx));
+        assert!(signal_decoration_event(&tx));
+        assert!(matches!(rx.try_recv(), Ok(DecorationSignal::Event)));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(rx);
+        assert!(!signal_decoration_event(&tx));
+    }
+
+    #[test]
+    fn decoration_frames_stop_before_allocating_past_the_limit() {
+        let mut exact = vec![b'x'; STREAM_EVENT_MAX_BYTES];
+        exact[STREAM_EVENT_MAX_BYTES - 1] = b'\n';
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(exact));
+        let mut line = Vec::new();
+        assert!(matches!(
+            read_bounded_line(&mut reader, &mut line, STREAM_EVENT_MAX_BYTES).unwrap(),
+            BoundedLine::Complete
+        ));
+        assert_eq!(line.len(), STREAM_EVENT_MAX_BYTES);
+
+        let oversized = vec![b'x'; STREAM_EVENT_MAX_BYTES + 1];
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(oversized));
+        assert!(matches!(
+            read_bounded_line(&mut reader, &mut line, STREAM_EVENT_MAX_BYTES).unwrap(),
+            BoundedLine::TooLong
+        ));
+        assert!(line.len() <= STREAM_EVENT_MAX_BYTES);
     }
 
     /// L1: a burst of daemon events must collapse to exactly one status
@@ -4080,10 +7013,14 @@ mod tests {
                 .expect("hello");
             let mut line = String::new();
             reader.read_line(&mut line).expect("subscribe request");
+            reader
+                .get_mut()
+                .write_all(b"{\"id\":1,\"result\":{\"subscribed\":true}}\n")
+                .expect("subscribe acknowledgement");
             for _ in 0..5 {
                 let _ = reader
                     .get_mut()
-                    .write_all(b"{\"event\":{\"kind\":\"state\"}}\n");
+                    .write_all(b"{\"event\":\"state\",\"data\":{}}\n");
             }
 
             // 2. Every later connection is one coalesced status fetch:
@@ -4113,8 +7050,9 @@ mod tests {
             }
         });
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        spawn_decoration_forwarder(home.clone(), tx);
+        let (control_tx, mut control_rx) = mpsc::channel(INGRESS_CAPACITY);
+        let (stream_tx, _stream_rx) = mpsc::channel(INGRESS_CAPACITY);
+        spawn_decoration_forwarder(home.clone(), control_tx, stream_tx);
 
         // 3. Wait for the coalesced refresh to land, then confirm it stays
         //    at exactly one — bounded polling in test code only (rule 9's
@@ -4131,7 +7069,7 @@ mod tests {
         );
 
         let mut changed = 0;
-        while let Ok(msg) = rx.try_recv() {
+        while let Ok(msg) = control_rx.try_recv() {
             if matches!(msg, AppMsg::DecorationChanged(_)) {
                 changed += 1;
             }
@@ -4171,6 +7109,10 @@ mod tests {
                 .expect("hello");
             let mut line = String::new();
             reader.read_line(&mut line).expect("subscribe request");
+            reader
+                .get_mut()
+                .write_all(b"{\"id\":1,\"result\":{\"subscribed\":true}}\n")
+                .expect("subscribe acknowledgement");
             let _ = reader
                 .get_mut()
                 .write_all(b"{\"event\":\"theme\",\"data\":{\"name\":\"aurora\"}}\n");
@@ -4179,8 +7121,9 @@ mod tests {
             }
         });
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        spawn_decoration_forwarder(home.clone(), tx);
+        let (control_tx, _control_rx) = mpsc::channel(INGRESS_CAPACITY);
+        let (stream_tx, mut stream_rx) = mpsc::channel(INGRESS_CAPACITY);
+        spawn_decoration_forwarder(home.clone(), control_tx, stream_tx);
 
         // Bounded polling in test code only (rule 9's documented
         // exception), never in the forwarder itself.
@@ -4188,7 +7131,7 @@ mod tests {
         let mut woke = 0;
         let mut entries = 0;
         while woke == 0 && std::time::Instant::now() < deadline {
-            while let Ok(msg) = rx.try_recv() {
+            while let Ok(msg) = stream_rx.try_recv() {
                 match msg {
                     AppMsg::ThemeChanged => woke += 1,
                     AppMsg::StreamEntry(_) => entries += 1,
@@ -4270,7 +7213,8 @@ mod tests {
                     match request["method"].as_str() {
                         Some("events.subscribe") => {
                             let mut stream = reader.into_inner();
-                            let _ = stream.write_all(b"{\"id\":1,\"result\":{}}\n");
+                            let _ =
+                                stream.write_all(b"{\"id\":1,\"result\":{\"subscribed\":true}}\n");
                             subs_bg.lock().expect("subs").push(stream);
                         }
                         Some("session.watch") => {
@@ -4350,7 +7294,7 @@ mod tests {
     /// (rule 9's documented exception); the forwarder itself stays
     /// event-armed.
     fn wait_for_msg(
-        rx: &mut mpsc::UnboundedReceiver<AppMsg>,
+        rx: &mut mpsc::Receiver<AppMsg>,
         what: &str,
         mut matching: impl FnMut(&AppMsg) -> bool,
     ) -> AppMsg {
@@ -4378,27 +7322,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).expect("scratch home");
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (control_tx, mut control_rx) = mpsc::channel(INGRESS_CAPACITY);
+        let (stream_tx, mut stream_rx) = mpsc::channel(INGRESS_CAPACITY);
         let home_bg = home.clone();
         // Millisecond backoff so the whole lifecycle runs in test time;
         // production wires resilience::reconnect_delay.
         std::thread::spawn(move || {
-            run_decoration_forwarder(&home_bg, &tx, |_| Duration::from_millis(5));
+            run_decoration_forwarder(&home_bg, &control_tx, &stream_tx, |_| {
+                Duration::from_millis(5)
+            });
         });
 
         // Boot race: nothing is listening yet. The forwarder must still
         // be trying, not dead, when the daemon finally binds.
         std::thread::sleep(Duration::from_millis(40));
         let daemon = FakeDaemon::spawn(&home);
-        wait_for_msg(&mut rx, "the resync ask after the boot race", |msg| {
-            matches!(msg, AppMsg::DaemonReconnected)
-        });
+        wait_for_msg(
+            &mut stream_rx,
+            "the resync ask after the boot race",
+            |msg| matches!(msg, AppMsg::DaemonReconnected),
+        );
 
         // Restart: the live connection drops; before the fix the thread
         // ended here, permanently.
         drop(daemon);
         let daemon = FakeDaemon::spawn(&home);
-        wait_for_msg(&mut rx, "the resync ask after the restart", |msg| {
+        wait_for_msg(&mut stream_rx, "the gap before the restart", |msg| {
+            matches!(msg, AppMsg::StreamGap { .. })
+        });
+        wait_for_msg(&mut stream_rx, "the resync ask after the restart", |msg| {
             matches!(msg, AppMsg::DaemonReconnected)
         });
 
@@ -4409,10 +7361,10 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut refreshed = false;
         'push: while std::time::Instant::now() < deadline {
-            daemon.push_event(b"{\"event\":{\"kind\":\"state\"}}\n");
+            daemon.push_event(b"{\"event\":\"state\",\"data\":{}}\n");
             let pause = std::time::Instant::now() + Duration::from_millis(100);
             while std::time::Instant::now() < pause {
-                match rx.try_recv() {
+                match control_rx.try_recv() {
                     Ok(AppMsg::DecorationChanged(snapshot)) if snapshot.online => {
                         refreshed = true;
                         break 'push;
@@ -4443,13 +7395,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).expect("scratch home");
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (control_tx, mut control_rx) = mpsc::channel(INGRESS_CAPACITY);
+        let (stream_tx, mut stream_rx) = mpsc::channel(INGRESS_CAPACITY);
         let home_bg = home.clone();
         std::thread::spawn(move || {
-            run_decoration_forwarder(&home_bg, &tx, |_| Duration::from_millis(2));
+            run_decoration_forwarder(&home_bg, &control_tx, &stream_tx, |_| {
+                Duration::from_millis(2)
+            });
         });
 
-        let offline = wait_for_msg(&mut rx, "the offline report", |msg| {
+        let offline = wait_for_msg(&mut control_rx, "the offline report", |msg| {
             matches!(msg, AppMsg::DecorationChanged(_))
         });
         let AppMsg::DecorationChanged(snapshot) = offline else {
@@ -4474,7 +7429,7 @@ mod tests {
 
         // Once per outage: many more failed chain turns add nothing.
         std::thread::sleep(Duration::from_millis(60));
-        while let Ok(msg) = rx.try_recv() {
+        while let Ok(msg) = control_rx.try_recv() {
             assert!(
                 !matches!(msg, AppMsg::DecorationChanged(_)),
                 "offline must be reported once, not once per retry"
@@ -4483,7 +7438,7 @@ mod tests {
 
         // The chain never gave up: a daemon that appears now is found.
         let daemon = FakeDaemon::spawn(&home);
-        wait_for_msg(&mut rx, "the resync ask after recovery", |msg| {
+        wait_for_msg(&mut stream_rx, "the resync ask after recovery", |msg| {
             matches!(msg, AppMsg::DaemonReconnected)
         });
 
@@ -4605,11 +7560,17 @@ mod tests {
             let width = crate::render::clamp_sidebar_width(want, full.width);
             app.prefs.sidebar_width = width;
             let (grid, _) = declared_for(&app);
+            let messages_rail = app
+                .chrome(full)
+                .messages_rail
+                .expect("closed Messages rail")
+                .width;
             assert_eq!(
                 i32::from(width)
                     + i32::from(grid)
                     + 2 * i32::from(crate::render::PANE_MARGIN)
-                    + i32::from(gap_w),
+                    + i32::from(gap_w)
+                    + i32::from(messages_rail),
                 i32::from(full.width),
                 "width {width} loses a column somewhere"
             );
@@ -4864,7 +7825,7 @@ mod tests {
     }
 
     #[test]
-    fn adjacent_output_batches_preserve_each_panes_byte_order() {
+    fn output_coalescing_preserves_global_pane_order() {
         let mut output = Vec::new();
         push_output(&mut output, "%0".into(), b"ab".to_vec());
         push_output(&mut output, "%1".into(), b"x".to_vec());
@@ -4873,10 +7834,172 @@ mod tests {
         assert_eq!(
             output,
             vec![
-                ("%0".to_string(), b"abcd".to_vec()),
-                ("%1".to_string(), b"x".to_vec())
+                ("%0".to_string(), b"ab".to_vec()),
+                ("%1".to_string(), b"x".to_vec()),
+                ("%0".to_string(), b"cd".to_vec())
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_output_is_split_without_changing_its_bytes() {
+        let (notification_tx, notification_rx) = mpsc::channel(1);
+        let (tmux_tx, mut tmux_rx) = mpsc::channel(3);
+        let (continuity_tx, _continuity_rx) = mpsc::channel(1);
+        spawn_notif_forwarder(
+            NotificationReceiver::from_bounded(notification_rx),
+            tmux_tx,
+            continuity_tx,
+        );
+
+        let bytes = vec![b'x'; OUTPUT_BATCH_MAX_BYTES + 17];
+        notification_tx
+            .send(Notification::Output {
+                pane: "%1".into(),
+                data: bytes.clone(),
+            })
+            .await
+            .unwrap();
+        drop(notification_tx);
+
+        let mut landed = Vec::new();
+        for expected_len in [OUTPUT_BATCH_MAX_BYTES, 17] {
+            let Some(AppMsg::OutputBatch(batch)) = tmux_rx.recv().await else {
+                panic!("output forwarder ended before both chunks landed");
+            };
+            assert_eq!(batch.len(), 1);
+            assert_eq!(batch[0].0, "%1");
+            assert_eq!(batch[0].1.len(), expected_len);
+            landed.extend_from_slice(&batch[0].1);
+        }
+        assert_eq!(landed, bytes);
+    }
+
+    #[tokio::test]
+    async fn a_closed_notification_stream_requests_reconnect() {
+        let (notification_tx, notification_rx) = mpsc::channel(1);
+        let (tmux_tx, mut tmux_rx) = mpsc::channel(1);
+        let (continuity_tx, _continuity_rx) = mpsc::channel(1);
+        spawn_notif_forwarder(
+            NotificationReceiver::from_bounded(notification_rx),
+            tmux_tx,
+            continuity_tx,
+        );
+
+        drop(notification_tx);
+        assert!(matches!(tmux_rx.recv().await, Some(AppMsg::LinkLost)));
+    }
+
+    #[tokio::test]
+    async fn a_control_gap_blocks_the_suffix_until_authoritative_resync() {
+        let (notification_tx, notification_rx) = mpsc::channel(2);
+        let (tmux_tx, mut tmux_rx) = mpsc::channel(1);
+        let (continuity_tx, mut continuity_rx) = mpsc::channel(1);
+        spawn_notif_forwarder(
+            NotificationReceiver::from_bounded(notification_rx),
+            tmux_tx,
+            continuity_tx,
+        );
+
+        notification_tx
+            .send(Notification::ContinuityLost)
+            .await
+            .expect("notification channel stays open");
+        notification_tx
+            .send(Notification::Output {
+                pane: "%0".into(),
+                data: b"stale suffix".to_vec(),
+            })
+            .await
+            .expect("suffix queues behind the marker");
+
+        let barrier = continuity_rx.recv().await.expect("barrier reaches app");
+        assert!(
+            tmux_rx.try_recv().is_err(),
+            "barrier bypasses ordinary lane"
+        );
+        barrier
+            .repair
+            .send(true)
+            .expect("app confirms authoritative snapshot");
+        assert!(
+            barrier.cutover.await.expect("source answers cutover"),
+            "no event crossed the snapshot boundary"
+        );
+        tokio::task::yield_now().await;
+        assert!(tmux_rx.try_recv().is_err(), "stale suffix is discarded");
+    }
+
+    #[tokio::test]
+    async fn a_full_app_hop_raises_the_same_priority_barrier() {
+        let (notification_tx, notification_rx) = mpsc::channel(1);
+        let (tmux_tx, mut tmux_rx) = mpsc::channel(1);
+        tmux_tx
+            .try_send(AppMsg::Redraw)
+            .expect("fill the ordinary app hop");
+        let (continuity_tx, mut continuity_rx) = mpsc::channel(1);
+        spawn_notif_forwarder(
+            NotificationReceiver::from_bounded(notification_rx),
+            tmux_tx,
+            continuity_tx,
+        );
+        notification_tx
+            .send(Notification::SessionsChanged)
+            .await
+            .expect("control notification enters its own hop");
+
+        let barrier = continuity_rx
+            .recv()
+            .await
+            .expect("second-hop loss bypasses the saturated lane");
+        assert!(matches!(tmux_rx.try_recv(), Ok(AppMsg::Redraw)));
+        assert!(tmux_rx.try_recv().is_err());
+        barrier
+            .repair
+            .send(true)
+            .expect("app confirms authoritative snapshot");
+        assert!(barrier.cutover.await.expect("source answers cutover"));
+    }
+
+    #[tokio::test]
+    async fn structural_notifications_do_not_overtake_pane_output() {
+        let (notification_tx, notification_rx) = mpsc::channel(3);
+        let (tmux_tx, mut tmux_rx) = mpsc::channel(4);
+        let (continuity_tx, _continuity_rx) = mpsc::channel(1);
+        spawn_notif_forwarder(
+            NotificationReceiver::from_bounded(notification_rx),
+            tmux_tx,
+            continuity_tx,
+        );
+        notification_tx
+            .send(Notification::Output {
+                pane: "%0".into(),
+                data: b"before".to_vec(),
+            })
+            .await
+            .unwrap();
+        notification_tx
+            .send(Notification::LayoutChange {
+                window: "@0".into(),
+                rest: "layout".into(),
+            })
+            .await
+            .unwrap();
+        notification_tx
+            .send(Notification::Output {
+                pane: "%0".into(),
+                data: b"after".to_vec(),
+            })
+            .await
+            .unwrap();
+        drop(notification_tx);
+
+        assert!(matches!(tmux_rx.recv().await, Some(AppMsg::OutputBatch(_))));
+        assert!(matches!(
+            tmux_rx.recv().await,
+            Some(AppMsg::LayoutChanged { .. })
+        ));
+        assert!(matches!(tmux_rx.recv().await, Some(AppMsg::OutputBatch(_))));
     }
 
     #[test]
@@ -5087,6 +8210,7 @@ mod tests {
                 active_tab: 0,
             },
             sidebar_visible: true,
+            messages_visible: false,
         };
         let mut app = test_app(
             model,
@@ -5153,6 +8277,7 @@ mod tests {
                 active_tab: 0,
             },
             sidebar_visible: true,
+            messages_visible: false,
         };
         let fresh = WorkspaceModel {
             workspaces: vec![],
@@ -5163,12 +8288,14 @@ mod tests {
                 active_tab: 1,
             },
             sidebar_visible: true,
+            messages_visible: false,
         };
 
-        install_reconciled_model(&mut current, fresh, false);
+        install_reconciled_model(&mut current, fresh, false, false);
 
         assert_eq!(current.active_tab().window_id, "@2");
         assert!(!current.sidebar_visible);
+        assert!(!current.messages_visible);
     }
 
     #[test]
@@ -5201,6 +8328,7 @@ mod tests {
                 active_tab: 0,
             },
             sidebar_visible: true,
+            messages_visible: false,
         };
 
         apply_workspace_order(&mut model, &["beta".into(), "alpha".into()]);
@@ -5364,6 +8492,7 @@ mod tests {
                 active_tab: 0,
             },
             sidebar_visible: true,
+            messages_visible: false,
         };
         let mut app = test_app(model, home.clone());
 
@@ -5496,6 +8625,7 @@ mod tests {
                 active_tab: 0,
             },
             sidebar_visible: true,
+            messages_visible: false,
         };
         let mut app = test_app(
             model,
@@ -5594,6 +8724,7 @@ mod tests {
                 active_tab: 0,
             },
             sidebar_visible: true,
+            messages_visible: false,
         };
         let mut app = test_app(model, home);
         app.decoration = DecorationSnapshot {

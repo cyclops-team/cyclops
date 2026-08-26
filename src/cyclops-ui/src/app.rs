@@ -274,6 +274,34 @@ fn next_client_key() -> String {
     format!("ui-{}", uuid::Uuid::new_v4())
 }
 
+/// Route and recipient maps a seed carries, in the shapes the record's seed
+/// path takes: pane id to session index, and label or pane id to exact key.
+fn seed_maps(
+    seed: &StatusSeed,
+) -> (
+    HashMap<String, usize>,
+    HashMap<String, cyclops_proto::RecipientKey>,
+) {
+    let routes = seed
+        .roster
+        .iter()
+        .map(|pane| (pane.pane_id.clone(), pane.session_idx))
+        .collect();
+    let recipients = seed
+        .mailbox_routes
+        .iter()
+        .flat_map(|route| {
+            let recipient = route.recipient();
+            let mut keys = vec![(route.label().to_string(), recipient)];
+            if let Some(pane_id) = recipient.pane_id() {
+                keys.push((pane_id.to_string(), recipient));
+            }
+            keys
+        })
+        .collect();
+    (routes, recipients)
+}
+
 impl App {
     pub fn new(theme: Theme, view: View, filter: Filter) -> App {
         App {
@@ -595,16 +623,54 @@ impl App {
 
     /// Apply a response only if it belongs to the current connection and
     /// covers every durable change already observed on the stream.
+    /// Apply a `messages.snapshot` the refresh gate accepts. The Messages
+    /// view takes the rows; the register takes the snapshot's mailbox
+    /// attention as its mailbox half, stamped by the same `workspace_seq`,
+    /// so the eye moves on the edge that invalidated the view and never on
+    /// a second, uncorrelated read. Returns the lines that changed, or
+    /// `None` when the gate rejected the snapshot.
     pub fn apply_messages_response(
         &mut self,
         request: crate::messages::RefreshRequest,
         snapshot: &cyclops_proto::MessagesSnapshotResult,
-    ) -> bool {
+    ) -> Option<Vec<Entry>> {
         if !self.refresh.finish_snapshot(request, snapshot) {
-            return false;
+            return None;
         }
         self.apply_messages(snapshot);
-        true
+        let (routes, recipients) = self.current_maps();
+        Some(
+            self.record
+                .seed_mailbox(&snapshot.mailbox_attention, &routes, &recipients),
+        )
+    }
+
+    /// The route and recipient maps the record's seed path takes, from the
+    /// roster and mailbox routes the app already holds.
+    fn current_maps(
+        &self,
+    ) -> (
+        HashMap<String, usize>,
+        HashMap<String, cyclops_proto::RecipientKey>,
+    ) {
+        let routes = self
+            .roster
+            .values()
+            .map(|row| (row.pane_id.clone(), row.session_idx))
+            .collect();
+        let recipients = self
+            .filter_routes
+            .iter()
+            .flat_map(|route| {
+                let recipient = route.recipient();
+                let mut keys = vec![(route.label().to_string(), recipient)];
+                if let Some(pane_id) = recipient.pane_id() {
+                    keys.push((pane_id.to_string(), recipient));
+                }
+                keys
+            })
+            .collect();
+        (routes, recipients)
     }
 
     /// Return the next snapshot request, if one is owed. Asked once per
@@ -823,25 +889,9 @@ impl App {
                 .insert(p.name.clone(), PaneRoute::new(p.session_idx, &p.pane_id));
         }
         // 3. The register and the backlog's lines are the model's job.
-        let routes = seed
-            .roster
-            .iter()
-            .map(|pane| (pane.pane_id.clone(), pane.session_idx))
-            .collect();
-        let recipients: HashMap<String, _> = seed
-            .mailbox_routes
-            .iter()
-            .flat_map(|route| {
-                let recipient = route.recipient();
-                let mut keys = vec![(route.label().to_string(), recipient)];
-                if let Some(pane_id) = recipient.pane_id() {
-                    keys.push((pane_id.to_string(), recipient));
-                }
-                keys
-            })
-            .collect();
+        let (routes, recipients) = seed_maps(&seed);
         self.record
-            .seed_routed(&seed.panes, &seed.open, &routes, &recipients)
+            .seed_routed(&seed.panes, &seed.open, &seed.mailbox, &routes, &recipients)
     }
 
     /// Every attention item as one phrase, in the stream's own voice
@@ -883,9 +933,19 @@ impl App {
 
     /// Entries the current view and filter admit, oldest first.
     pub fn visible(&self) -> Vec<&Entry> {
+        // Freeze the register lookup once for this frame. Admin pings must
+        // still answer to the current attention set, but rebuilding that set
+        // once per entry makes a large ring cost entries times open items.
+        let admission = (self.view != View::Firehose).then(|| self.record.admin_admission());
         self.record
             .entries()
-            .filter(|e| self.admits_in_view(e))
+            .filter(|e| {
+                self.view == View::Firehose
+                    || (!self.filter.is_empty() && matches!(&e.kind, EntryKind::Msg { .. }))
+                    || self
+                        .record
+                        .admits_with(e, admission.as_ref().expect("non-firehose admission"))
+            })
             .filter(|e| self.filter.matches(e))
             .collect()
     }
@@ -942,6 +1002,7 @@ impl App {
                 return None;
             }
             let mut send_reply = false;
+            let mut draft_full = false;
             let detail = self.detail.as_mut()?;
             match key {
                 Key::CtrlC => return Some(Command::Quit),
@@ -951,7 +1012,7 @@ impl App {
                 // typed one are the same byte by the time they arrive, so
                 // a composer that sent on Enter would send whatever came
                 // before the first line break of a paste.
-                Key::Enter => detail.draft_mut().push('\n'),
+                Key::Enter => draft_full = !detail.draft_mut().push('\n'),
                 Key::CtrlD => {
                     // request() again, at the moment of sending. It is the
                     // staleness gate, and the row can go stale while the
@@ -970,8 +1031,14 @@ impl App {
                         }
                     }
                 }
-                Key::Char(c) => detail.draft_mut().push(c),
+                Key::Char(c) => draft_full = !detail.draft_mut().push(c),
                 _ => {}
+            }
+            if draft_full {
+                self.notice = Some(format!(
+                    "reply is limited to {} KiB",
+                    crate::detail::DRAFT_MAX_BYTES / 1024
+                ));
             }
             if send_reply {
                 self.confirm_action(crate::detail::Action::Reply);
@@ -1087,11 +1154,21 @@ impl App {
             return;
         }
         if let (Some(detail), Some(ch)) = (self.detail.as_mut(), ch) {
-            detail.draft_mut().push(ch);
+            if !detail.draft_mut().push(ch) {
+                self.notice = Some(format!(
+                    "reply is limited to {} KiB",
+                    crate::detail::DRAFT_MAX_BYTES / 1024
+                ));
+            }
         }
     }
 
     pub fn handle_key(&mut self, key: Key) -> Option<Command> {
+        if key == Key::PasteRejected {
+            self.pasting = false;
+            self.notice = Some("paste refused: exceeds the UI ingress bound".into());
+            return None;
+        }
         // Bracketed paste is settled HERE, above every route, because
         // every route below reads keys as commands. A guard further down
         // only protected the detail: a paste landing on the queue, on a
@@ -1432,6 +1509,18 @@ mod tests {
     use crate::stream::{EntryKind, RosterSeed, RING_CAP};
     use cyclops_proto::{AgentState, DeliveryState, OpenDelivery, PaneSnapshot};
 
+    #[test]
+    fn a_rejected_paste_is_visible_and_leaves_command_mode() {
+        let mut app = App::new(Theme::none(), View::Admin, Filter::default());
+        app.pasting = true;
+        assert_eq!(app.handle_key(Key::PasteRejected), None);
+        assert!(!app.pasting);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("paste refused: exceeds the UI ingress bound")
+        );
+    }
+
     fn endpoint(label: &str) -> EndpointFilter {
         EndpointFilter::new(
             "admin:00000000-0000-0000-0000-000000000001"
@@ -1553,6 +1642,7 @@ mod tests {
                     state_ms: Some(5_000),
                 })
                 .collect(),
+            mailbox: Vec::new(),
         }
     }
 
@@ -1564,6 +1654,7 @@ mod tests {
             state,
             ts: 1000,
             cause: None,
+            attempt_id: None,
         }
     }
 

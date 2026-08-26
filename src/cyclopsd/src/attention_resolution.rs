@@ -387,7 +387,7 @@ async fn resolve_clear_composer_discard(
         return Err(AttentionActionError::Uncertain);
     }
     delivery::inject_pause(inner, "attention_after_no_key_resolution").await;
-    resolve_staged_hold(inner, target, &route);
+    resolve_staged_hold(inner, target, &route).await;
     Ok(AttentionResolveResult {
         attempt_id,
         resolution: NotificationResolution::Discard,
@@ -450,7 +450,7 @@ async fn settle_resolution(
         return Err(AttentionActionError::Uncertain);
     }
     delivery::inject_pause(inner, "attention_after_resolution").await;
-    resolve_staged_hold(inner, target, &route);
+    resolve_staged_hold(inner, target, &route).await;
     if let Err(error) = messaging::schedule_recipient(inner, service, target.record.recipient) {
         tracing::error!(
             recipient = %target.record.recipient,
@@ -464,7 +464,7 @@ async fn settle_resolution(
     })
 }
 
-fn resolve_staged_hold(inner: &Arc<Inner>, target: &AttentionTarget, route: &ActionRoute) {
+async fn resolve_staged_hold(inner: &Arc<Inner>, target: &AttentionTarget, route: &ActionRoute) {
     if let Some(binding) = target.record.binding.as_ref() {
         fusion::resolve_staged_hold(
             inner,
@@ -473,7 +473,8 @@ fn resolve_staged_hold(inner: &Arc<Inner>, target: &AttentionTarget, route: &Act
             &target.record.attempt_id.to_string(),
             binding.agent,
             binding.manifest.as_str(),
-        );
+        )
+        .await;
     }
 }
 
@@ -878,6 +879,7 @@ fn assessment_result(
             message_id: target.record.message_id.clone(),
             recipient: target.record.recipient,
             checks,
+            verify_outcome: target.record.verify_outcome,
             expected: include_diff.then_some(expected).flatten(),
             observed: include_diff.then_some(observed).flatten(),
         },
@@ -1358,7 +1360,9 @@ composer_continuation_regex = '^  (?P<content>.*)$'
                 transport: cyclops_proto::NotificationTransport::Doorbell,
                 doorbell_format: None,
                 cause: None,
+                verify_outcome: None,
                 pre_write_cause: None,
+                wake_block: None,
                 pre_write_observation: None,
                 pre_write_reopen_count: 0,
                 started_seq: 1,
@@ -1383,6 +1387,11 @@ composer_continuation_regex = '^  (?P<content>.*)$'
                 target.record.attempt_id
             ))
         );
+        target.record.doorbell_format = Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM);
+        assert_eq!(
+            expected_notification_from_message(&target, &message),
+            Some(cyclops_proto::render_doorbell_v3(target.record.attempt_id))
+        );
         target.record.doorbell_format = Some(999);
         assert_eq!(expected_notification_from_message(&target, &message), None);
         let checks = AttentionChecks {
@@ -1393,5 +1402,15 @@ composer_continuation_regex = '^  (?P<content>.*)$'
             terminal_action_safe: true,
         };
         assert!(!checks.all_pass());
+
+        target.record.verify_outcome = Some(cyclops_proto::NotificationVerifyOutcome {
+            kind: cyclops_proto::NotificationVerifyFailureKind::Mismatch,
+            observed_composer: cyclops_proto::ComposerState::ComposerAmbiguous,
+        });
+        let assessment = assessment_result(&target, checks, None, None, false, None);
+        assert_eq!(
+            assessment.result.verify_outcome,
+            target.record.verify_outcome
+        );
     }
 }

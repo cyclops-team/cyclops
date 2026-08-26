@@ -74,6 +74,7 @@ than a measurement.
 | F65 | Whole-composer clearing is measured for Claude and Codex; Antigravity and Cursor refuse unsupported actions | binds |
 | F66 | The isolated soak detected staged representations and cleared them in 100 trials each for Codex, Claude, and Antigravity; Cursor was unavailable | evidence |
 | F67 | A one-line doorbell must fit the narrow lane because application wrapping is not exact composer evidence | binds |
+| F68 | Codex 0.149.1 colors the prompt glyph separately and may leave its status trailer unstyled under `NO_COLOR` | binds, partial evidence |
 
 ## F13. refresh-client -B subscriptions work in control mode on tmux 3.6a (MEASURED)
 
@@ -1686,3 +1687,226 @@ captured the complete ten-frame Braille cycle while active; the same-version
 idle title had no prefix. A separate title rule now recognizes only that exact
 cycle. The screen window remains narrow, and old static titles retain the
 existing screen path.
+
+## F68. Codex 0.149.1 changed prompt styling and honors `NO_COLOR` in its trailer
+
+MEASURED 2026-08-25 on macOS with tmux 3.6a and Codex CLI 0.149.1. Two
+fresh isolated tmux servers used 187x62 panes, private `CYCLOPS_HOME` roots,
+and Cyclops build `642b7d3`. One launch inherited `NO_COLOR=1`; the other
+explicitly removed it. Neither probe touched the live Cyclops daemon or a
+user pane.
+
+In the colored launch, Codex painted the occupied prompt as:
+
+```text
+ESC[1m ESC[38;2;255;178;66m › ESC[0m <input>
+```
+
+The shipped rule expected the prompt glyph immediately after the bold SGR.
+Cyclops therefore classified its exact staged doorbell through the plain
+fallback, could not extract exact composer ownership, withheld Enter, and
+raised one `verify_failed` attention attempt. Process binding, manifest
+binding, and terminal-action safety all remained true. In the `NO_COLOR`
+launch the prompt retained its bold SGR while the model status row carried no
+SGR. The same exact doorbell again stayed staged because the trailer had no
+declared unstyled proof.
+
+The minimized captures contain compact doorbells but no message body:
+
+| Fixture | SHA-256 |
+| --- | --- |
+| `src/cyclops-manifest/tests/fixtures/codex_staged_0_149_1_esc.txt` | `3892872fff4f39bafc0a79fa74d6da8d8a832e6234e9ddfce612bd5740265b50` |
+| `src/cyclops-manifest/tests/fixtures/codex_staged_no_color_0_149_1.txt` | `2b3ebc0ee755ae627c4cdf41b6f2a3ab57c9101042d5ce54a58de314e23a262e` |
+
+This evidence is narrow. It measures an occupied prompt and the two trailer
+representations. The 0.149.1 ghost, slash command, working, tool, modal,
+collapsed-chip, hook, restart, resumed-session, claim, and reply cases remain
+unproven. It does not promote the manifest's full-ruleset version claim.
+
+## F69. An unlinked macOS executable is still a live process
+
+OBSERVED 2026-08-26 on macOS during a managed Cyclops update. A workspace
+process kept its daemon socket open after the updater pruned the immutable pair
+directory that had launched it. `LOCAL_PEERTOKEN` and
+`proc_pidinfo(PROC_PIDTBSDINFO)` still identified the same execution and process
+birth, but `proc_pidpath_audittoken` could no longer return an executable path.
+The daemon therefore rejected the live workspace peer as if its process had
+changed.
+
+The regression launches a compiled helper from a scratch executable, captures
+its socket identity, unlinks the executable while the helper remains live, and
+requires the identity to remain current. Separate checks require process exit,
+pid reuse, descriptor inheritance, and an in-place exec to revoke authority.
+Executable path lookup is not an identity or liveness proof.
+
+## F70. AGY 1.1.21 needs escaped prompt identity before exact doorbell submission
+
+MEASURED 2026-08-26 on macOS with tmux 3.6a and Antigravity CLI 1.1.21.
+The release-proof pane was 120 columns wide and ran the shipped AGY manifest.
+The probe used `tmux capture-pane -e -p -J` against the fresh pane after
+Cyclops staged one compact doorbell. A second capture from an existing AGY
+conversation supplied submitted prompt echoes. The captures were read-only;
+no human draft was typed or submitted for the measurement.
+
+The active occupied composer rendered as:
+
+```text
+ESC[94m>ESC[39m cyclops inbox claim <opaque-message-key>
+ESC[90m<box rule>
+ESC[38;5;152mGemini 3.7 Flash<styled status fields>
+```
+
+Submitted prompts in the transcript rendered as:
+
+```text
+ESC[1mESC[34m> <submitted prompt>ESC[0m
+```
+
+Both rows reduce to `> text` after escape stripping. The old plain-only
+`composer_has_input` rule could therefore treat a transcript echo as another
+composer prompt. The shipped manifest now requires the active prompt's exact
+escaped glyph transition and declares byte-preserving composer extraction.
+Exact staging still requires the same expected doorbell bytes and the measured
+styled trailer immediately below them. Unexpected text becomes extracted
+content and fails equality rather than being ignored.
+
+The initial live delivery exposed a separate missing-capability failure: the
+manifest declared trailer anchors but no composer extraction patterns, so the
+production submit gate returned `Unsupported` after the doorbell was visibly
+staged and withheld Enter. The regression includes an earlier transcript echo,
+the active 1.1.21 doorbell row, and both trailer rows, then calls the production
+exact-staging proof.
+
+This evidence is narrow. It measures the occupied and empty composer prompt,
+transcript echo styling, and the two-row trailer on 1.1.21. It does not reprove
+the working, modal, quota, hook, lifecycle, restart, or multiline direct-payload
+rules. F71 adds current permission-modal evidence, but the full-ruleset
+`version_tested` claim remains bound to 1.1.11.
+
+## F71. AGY 1.1.21 replaces every prior state signal with a file-access modal
+
+MEASURED 2026-08-26 on macOS with tmux 3.6a and Antigravity CLI 1.1.21.
+Frozen release candidate `74ea6cc` sent one compact doorbell to pane `%40`.
+The exact notification moved through queued, gating, writing, staged,
+submitting, submitted, and notified with one process binding. The screen then
+moved from `composer_empty` to `screen_working` and finally to `no_rule`.
+Both the outcome and final detector reads returned `unknown`, no sensor
+readings, and `stale: false`. The final status had held that answer for 5.8
+seconds, so this was not a capture failure or a repaint between frames.
+
+A later read-only capture of the same pane process still showed the submitted
+doorbell echo and this unresolved screen:
+
+```text
+File access
+Read: <external-file>
+Reason: outside workspace
+Allow access to this file?
+> 1. Yes, allow access
+  2. Yes, and always allow non-workspace access
+  3. No, deny access
+```
+
+AGY removes the composer and working spinner while this decision is open. Its
+pane title remains the hostname, and no hook reports the permission state. The
+screen manifest is therefore the only source that can classify it. The shipped
+manifest had no matching permission rule, so fusion correctly failed closed to
+`unknown` but could not tell the operator what needed attention.
+
+The fixtures `agy_file_access_permission_plain.txt` and
+`agy_file_access_permission_esc.txt` preserve the measured modal structure with
+the account, path, message locator, and unrelated transcript removed. The rule
+requires the `File access` header, the exact question, and the selected first
+choice together. It outranks a stale working spinner and never dismisses the
+decision automatically. This capture proves only the 1.1.21 file-access modal;
+`version_tested` remains 1.1.11 until the complete ruleset is remeasured.
+
+## F72. A title never asserts idle; lifecycle needs screen evidence; liveness admits the first wake
+
+MEASURED 2026-08-26 on a live Claude Code 2.1.24x pane inside tmux 3.6a. The
+idle sparkle title stays in place for the whole turn and the bare prompt row
+stays on screen, so a capture that lacked a matching spinner row published
+idle from the title alone: 1203 title-idle flaps in six hours on one pane, and
+25 doorbell writes admitted into that working pane behind them (ledger and
+journal audit, GEMINI-IDLE-WHILE-WORKING.md). The manifest header's claim that
+the title is authoritative and the screen a last resort is retracted.
+
+The corrected model: hooks are the authenticated lifecycle authority (a
+candidate UserPromptSubmit promoted by a visual Working frame into a
+persistent start on the exact agent generation; no end hook is declared);
+the screen is the only sensor that confirms idle, through the completed-turn
+suffix rule measured in probe a91f (F70, F71, sanitized NDJSON db34242c…),
+proven plain-ordered and escape-ordered on the same rows; composer rows carry
+composer state but are measured mid-turn and never confirm idle. A fresh pane
+has no completed suffix, so before its first turn it is admitted idle only by
+process-bound liveness: an authenticated edge (SessionStart) from the exact
+current generation in this pane lifetime, no active start, a clean composer
+on a fresh, out-of-mode, binding-stable capture. Admission is not lifecycle
+evidence and cannot end a turn. Cross-references: F5, F6, F23, F70, F71.
+
+## F73. Codex 0.149.1 fresh and resumed delivery succeeds, while a human draft stays protected
+
+MEASURED 2026-08-26 on macOS with tmux 3.6a, Codex CLI 0.149.1, and
+Cyclops build `3bb01a4`. Client and daemon ran the same immutable pair and the
+installed Codex manifest matched the source manifest.
+
+A fresh Codex pane accepted message
+`m-f7ec4814aeb341478bea718c28142154` as attempt
+`att-6b403513-a593-42d3-86d5-797b4a12971c`. The workspace journal recorded,
+in order, queued, gating, writing, staged, submitting, submitted, notified,
+and message claimed. No operator pressed Enter and no verify-failed fact was
+recorded. The composer returned to the measured ghost-suggestion state.
+
+The same Codex conversation was then exited and resumed with
+`codex resume 01a03f8d-228a-7ec3-84b3-cf2fa6cc1ff2` in a new pane and process
+generation. Message `m-6c081012997f44e4834f29ac8ce83b94`, attempt
+`att-e360eb5b-a7af-4e4f-a0dc-11142011b471`, followed the same ordered sequence
+through notified and exact claim. Its threaded response body was `RESUMED
+PASS`. The writing binding recorded the new pane root and agent process,
+manifest `codex`, and the exact durable recipient key for the resumed pane.
+This falsifies the hypothesis that the current `codex resume` ancestry is
+intrinsically unresolvable.
+
+A separate live safety cell typed `human draft sentinel 01491` into the
+resumed pane before sending message `m-cba2d382c2d041c89003cb5d4081e349`,
+attempt `att-3af46448-2aa0-440a-b549-c1d5e3c5e202`. Detection reported
+`idle_with_input`, `composer_typed_input`, and write readiness false. The
+attempt reached only queued and gating; no writing fact and no doorbell bytes
+appeared, and the draft remained byte-for-byte intact. Clearing the draft did
+not authorize a write: the durable human-input hold correctly remained until
+a completed human turn could prove the composer lifecycle. An administrator
+then withdrew that exact attempt before write. The journal appended
+`notification_withdrawn_before_write`, released the FIFO attempt, and left the
+message claimable.
+
+This closes the reported fresh-session, resumed-session, normal submission,
+claim, reply, human-draft safety, and provably-unwritten withdrawal cells on
+0.149.1. A typed `/status` matched `composer_typed_input` and remained
+write-blocked. A submitted tool request produced an authenticated
+`UserPromptSubmit` reading plus matching title and screen Working readings;
+the live pane then reported a background terminal while remaining Working.
+These observations cover typed slash-command, working-turn, and tool-execution
+classification without weakening composer safety.
+
+This does not advance the manifest's full-ruleset `version_tested` claim.
+Three further live cells ran on the same installed build. A 2,828-character
+no-submit paste rendered as Codex's colored `[Pasted Content 2828 chars]`
+chip and detection selected `composer_typed_input`, `idle_with_input`, and
+write readiness false. An exact notification then moved from submitted to
+notified in 56ms, before the configured 1500ms tier-1 window can enter screen
+fallback and 10.9 seconds before the recipient claim; this proves the exact
+`UserPromptSubmit` ACK path. Finally, an explicit command approval rendered
+the current 0.149.1 approval dialog and detection selected
+`approval_prompt`, `blocked_permission`, and write readiness false.
+
+Canceling that approval exposed one additional lifecycle edge: Codex returned
+to its dim ghost composer and printed `Conversation interrupted - tell the
+model what to do differently`, but emitted no matching Stop hook. The exact
+UserPromptSubmit latch therefore remained Working. The shipped manifest now
+marks only that measured interruption suffix paired with the dim ghost
+composer as lifecycle evidence, below the live Working rule; typed input cannot
+match it. A stable capture may end the stranded start through the same
+manifest-owned terminal seam used by other no-end-hook vendor paths.
+
+The current-version daemon-restart cell remains before the full-ruleset
+`version_tested` claim may advance.

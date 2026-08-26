@@ -181,12 +181,38 @@ daemon loaded no detection rules at all and nothing on the machine can be
 addressed, while a full list means the rules are loaded and none of them
 binds that pane.
 
-`open_deliveries: true` adds an `open_deliveries` array: every delivery
-whose latest recorded state still needs a human, folded from the whole
-record. Each entry is `{id, to, state, ts, cause}`. Stream and durable-alarm
-surfaces ask for this projection. Normal `cyclops status` deliberately leaves
-it off: its eye reports the live pane fleet, while mailbox, alarm, and stream
-surfaces own durable delivery recovery.
+`open_deliveries: true` adds two arrays, kept apart. `open_deliveries` is the
+legacy session-ledger half: every direct delivery whose latest recorded state
+still needs a human, folded from the whole record, each entry
+`{id, to, state, ts, cause}`. `mailbox_attention` is the durable mailbox half:
+one row per live attempt for every open `attention_required` attempt and for
+every held queue head whose record is `attention_required` (an operator
+clearance only acknowledges and does not remove the row), `quota_held`,
+`quota_reset_observed`, or `blocked_pre_write`, each entry the same shape
+plus `recipient` (the exact key) and `attempt_id`. The row vocabulary has two
+words a human must act on, so held states project onto them with the cause
+naming the real state: `blocked_pre_write` rows read `attention_required`
+with cause `blocked_pre_write:<pre-write cause or wake block>`; the two quota
+states read `parked_blocked_quota` with `quota_held` or
+`quota_reset_observed` as cause. A pre-write-blocked head is a
+`mailbox_attention` row even though `status` also details it under
+`blocked_notifications`: the eye counts this array and a snapshot has no
+other, and a renderer that prints both dedups the detailed row by attempt
+id, so one attempt is one row with one reason and one next action. Identity
+is typed and durable: a row is keyed by its exact recipient
+(the label only for a legacy row that never carried a key) plus message id,
+and by `attempt_id`; every surface's attention register keys its items the
+same way and resolves a label-only reference to an exact row only when
+exactly one exact recipient carries that label for that message, so an alias
+can never merge two exact recipients. The next action a surface prints
+follows the state: `attention_required` with an attempt, inspect with
+`attention show --diff` then complete or discard, or the recipient claims;
+`blocked_pre_write`, fix the named cause and let the next route or composer
+evidence reopen the wake (the daemon refuses `requeue` for that state), or
+the recipient claims now; `quota_reset_observed`, `requeue`; `quota_held`,
+wait for the reset, then `requeue`. Operator pings are events and never rows.
+`cyclops status`, the stream, and the durable-alarm surfaces all read this
+projection, so every eye counts the same record.
 
 `admin_unread` is the number of pending messages in the workspace
 administrator's durable inbox. Older daemons omit it and clients read zero.
@@ -290,11 +316,18 @@ That is the point of it (reconcile on doubt), but do not put it in a loop.
     "msg_id":"m-7fe0df","seq":7}}
 ```
 
-`to` takes several labels, or `"*"` for every named pane. Optional params:
-`fyi` (an announcement), `client_key` (sender-scoped exact-retry key),
-`reply_to` (a visible message id) and `supersedes` (one unclaimed message
-with the same sender, recipient, and thread). The deprecated `wait` field
-is retained in protocol v1 only so the daemon can reject old callers with
+`to` takes several labels, or `"*"` for every named pane. Interactive clients
+may instead send `to: []` with `recipient_keys`, an array of exact durable
+recipient identities returned by `messages.snapshot`. The two selectors cannot
+be combined. Exact keys must still be present in the current mailbox directory,
+and the daemon snapshots their current labels only for display. A rename cannot
+retarget a selected key. `reply_to` derives its recipient from the referenced
+message and therefore permits neither selector.
+
+Other optional params are `fyi` (an announcement), `client_key`
+(sender-scoped exact-retry key), and `supersedes` (one unclaimed message with
+the same sender, recipient, and thread). The deprecated `wait` field is retained
+in protocol v1 only so the daemon can reject old callers with
 `notification_unavailable` instead of silently ignoring their request.
 
 The sender is never in the request. The daemon resolves it from the calling
@@ -311,18 +344,47 @@ sender-scoped `client_key` resolves to an existing exact request. Each
 `position`, when present, is the number of older pending entries in that
 recipient's FIFO.
 
+`DeliveryReceipt.wake_block` is an optional `MessageWakeBlock`. It is present
+when the recipient FIFO head has no live notification owner and is absent for
+a worker-owned head or an ordinary item queued behind that head. It does not
+change durable acceptance or `notification_state`; the message remains
+claimable. The closed values are `daemon_stopping`, `route_unavailable`,
+`attention_resolution_pending`, `worker_faulted`, `worker_supervisor_exited`,
+`enqueue_refused`, and `scheduler_state_unavailable`.
+
+`DeliveryReceipt.pre_write_cause` is the separate optional terminal-boundary
+reason for a durable `blocked_pre_write` attempt, such as
+`binding_unprovable`. `msg.send` subscribes to `messages.changed` before
+scheduling an immediately decidable head, then reads the exact durable
+recipient, message, and attempt projection. The event is only an invalidation;
+the projection supplies the receipt. The shared observation deadline changes
+no state. A message queued behind an older head reports `not_started` and its
+position, with neither the head's `wake_block` nor its `pre_write_cause`.
+
 For a non-admin recipient, the daemon selects one transport at the terminal
 write boundary. An exact installed claim skill selects the content-free
 doorbell:
 
 ```text
-cyclops inbox claim m-7fe0df #c:<lossless-attempt-token>
+cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
 ```
 
-The shell comment is a 22-character URL-safe encoding of the complete 128-bit
-notification attempt id. It parses back to the typed id. This keeps the claim
-command runnable while preventing a delayed hook for an older attempt on the
-same message from confirming its replacement.
+The 22-character URL-safe token encodes the complete 128-bit notification
+attempt id. The `m-att_` namespace is reserved for this locator and is disjoint
+from production message ids, which are always `m-` plus 32 lowercase hex
+characters. Older clients already accept it as a positional claim argument.
+Only the daemon's `inbox.claim` handler interprets the canonical locator; other
+message-id consumers do not. It resolves only the current attempt for that
+exact authenticated recipient and appends the claim under the same store lock.
+A delayed command for a replaced attempt cannot claim its replacement.
+
+Format 3 must fit one exact composer row. A pane narrower than 60 columns is
+recorded as `blocked_pre_write` with the compatible cause
+`write_readiness_changed`, plus its observed and required widths. Current
+clients render that evidence as `pane too narrow`. No paste occurs. A later
+width observation meeting the recorded requirement may reopen that same
+attempt once. The operator may withdraw it while it remains provably
+pre-write.
 
 If that exact capability is absent, outdated, edited, unreadable, or changes
 before the write, the daemon submits the canonical full payload ending in
@@ -343,14 +405,14 @@ replacement.
 An ambiguous terminal outcome moves to `attention_required` and never triggers
 an automatic second write. A doorbell message remains pending until claim. A
 successful direct fallback settles the mailbox entry as `delivered_direct`.
-For a current format 2 doorbell with a complete binding, an exact recipient
+For an exact-attempt doorbell with a complete binding, an exact recipient
 claim can start reconciliation of `attention_required` with cause `ack_timeout`.
 The claim leaves that state and its FIFO barrier unchanged until Cyclops clears
 the exact staged doorbell or proves the same bound composer is clean. One
 dedicated fact then moves the attempt to `notified` and retires the barrier
 atomically. It does not settle other attention causes or prove task completion.
 
-A current format 2 `verify_failed` doorbell with a complete binding enters
+An exact-attempt `verify_failed` doorbell with a complete binding enters
 automatic exact-owned recovery only when the current normalized composer is an
 exact match and terminal action is safe. A pending mailbox selects `complete`
 and one submit key. An exact recipient claim ordered after `writing` selects
@@ -358,15 +420,49 @@ and one submit key. An exact recipient claim ordered after `writing` selects
 intent are one mailbox transaction, so a concurrent claim lands wholly before
 or after that boundary. Any changed binding, human or trailing text, modal, or
 unprovable content leaves one attention item and sends no key.
+
+Every current `verify_failed` transition also carries `verify_outcome`. It is
+content-free: a closed failure kind (`mismatch`, `timeout`, `owner_missing`, or
+`ambiguous`) plus the observed composer class. It never contains captured
+terminal bytes. `messages.snapshot` and `attention.show` expose the same
+durable outcome. Older journal rows and older peers omit it and decode as an
+unknown legacy outcome.
+
+A `blocked_pre_write` transition may carry `wake_block`, the exact closed
+scheduler outcome that left the attempt without a live owner. The projection
+retains it across replay and exposes it on
+`MessageNotificationSummary.wake_block`. Current values distinguish daemon
+shutdown, missing route, pending attention resolution, worker fault, worker
+supervisor exit, enqueue refusal, and unproven complete composer ownership.
+Historical `blocked_pre_write` rows without `wake_block` remain readable and
+project no scheduler outcome. The daemon never reconstructs a scheduler result
+from notification state. New scheduler ownership failures record a specific
+outcome or fail the request if that fact cannot be persisted. A durable
+resolution intent projects
+`attention_resolution_pending` into message snapshots and send receipts for
+that exact attempt until it settles. Attention and quota states alone never
+invent a scheduler outcome.
+
+The sole live correction out of `writing` is
+`blocked_pre_write` with `pre_write_cause: "paste_command_unwritten"`. It is
+valid only when the tmux command pipe reports that its first paste-command
+write accepted zero bytes. The transition clears the projected terminal
+binding and doorbell format, restores pre-write withdrawal, and is appended
+before the runtime composer hold is released. Partial command writes, flush
+failures, tmux command errors, reply timeouts, and disconnects do not qualify;
+they remain `attention_required` with the post-write `paste_failed` cause.
+
 Admin has no pane route, so an accepted admin message reports `not_started` and
 remains in the durable admin inbox without a notification attempt.
 
 The Writing transition carries `transport: "doorbell" | "direct_payload"`
-beside `binding`. A current doorbell also carries `doorbell_format: 2`, which
-fixes the attempt-bound claim command bytes for later recovery. Format 1 is the
-older message-only compact claim command. A missing format identifies the
-original verbose doorbell. Unknown numeric formats replay but cannot authorize
-an attention recovery action. Current binding records contain
+beside `binding`. A current doorbell carries `doorbell_format: 3`, which fixes
+the reserved attempt-locator command bytes for later recovery. Format 2 is the
+older message id plus a lossless attempt-token comment. Format 1 is the older
+message-only compact claim command. Formats 1 and 2 replay with their original
+bytes. A missing format identifies the original verbose doorbell. Unknown
+numeric formats replay but cannot authorize an attention recovery action.
+Current binding records contain
 the recipient, pane-root generation, foreground leader generation, admitted
 agent generation, and manifest. Older rows without pane-root or leader
 generation replay but cannot authorize a later terminal action. Transport and
@@ -438,6 +534,19 @@ mailbox entry, and returns the immutable payload:
     "subject":"Review the rate limiter","thread_root":"m-7fe0df"}}}
 ```
 
+A fresh claim of a message that is not the caller's oldest pending one also
+returns the additive optional `skipped_oldest`: the oldest pending message id
+at claim time, which still holds that recipient's FIFO head and its wake. The
+field is absent for oldest-first claims, for repeat claims, and in answers to
+clients that predate it; those clients ignore it.
+
+When the `message_id` is the canonical reserved `m-att_` locator from a format
+3 doorbell, `inbox.claim` resolves the current attempt and claims its bound
+message under one mailbox-store lock. A stale or foreign issued attempt never
+falls back to a literal message claim. If an imported legacy message uses the
+same locator bytes, Cyclops reports a conflict instead of choosing either
+target. No other method interprets the reserved locator.
+
 Reclaiming the same id returns `already_claimed` with the same payload and
 appends no second claim. An entry that is no longer claimable returns
 `message_not_pending`; a subscribed receive client should list again within its
@@ -475,9 +584,10 @@ FIFO state, current notification attempt and cause, attention clearance,
 guarded resolution, pre-key intent, accepted-action and consumption state, and
 a workspace sequence
 watermark. A notification resolution is reported separately as `complete` or
-`discard`; a resolved attempt is not open attention. Direction is relative to
-the caller: `inbound`, `outbound`, `self_addressed`, or administrator-only
-`workspace`. Both the message and each recipient row carry their own direction
+`discard`; a resolved attempt is not open attention. The additive `caller`
+field carries the exact authenticated `RecipientKey`; older daemons omit it.
+Direction is relative to the caller: `inbound`, `outbound`, `self_addressed`,
+or administrator-only `workspace`. Both the message and each recipient row carry their own direction
 and `needs_action` answer. A per-recipient surface must use the recipient fields
 so one broadcast mailbox cannot inherit another's state. Counts include
 caller-relative inbox, outbound, and Work totals even when settled rows are
@@ -498,6 +608,13 @@ matching intent-only Discard exposes only no-key reconciliation. It does not
 require a Working observation because two fresh exact-empty and binding checks
 prove its requested effect. The opposite action remains unavailable. A client
 must not infer authority from `needs_action`.
+
+The answer also carries `mailbox_attention`: the same durable mailbox rows
+`status` serves, read from the same projection and stamped by this snapshot's
+`workspace_seq`, so a stream that refreshes on `messages.changed` moves its
+eye on the edge it was invalidated by, through the snapshot its refresh gate
+accepts, with no second uncorrelated read. Older daemons omit it; clients
+treat absence as an empty half.
 
 `messages.follow` is the lossless event-driven companion to the bounded queue
 snapshot. The authenticated caller supplies `after_seq` and a bounded `limit`.
@@ -535,10 +652,11 @@ Broadcast `*` addresses adopted agent panes only.
 
 `msg.requeue` takes one `message_id`. `alarm.preview` takes `older_than_ms`.
 Before minting fresh attempts, requeue resolves the complete selected recipient
-set. A current format 2 `verify_failed` composer barrier must be resolved first.
-If any selected attempt owns such an exact barrier, or a post-write barrier
-whose binding is absent or lacks pane-root or foreground-leader generation, the
-whole request returns `conflict` and appends nothing. The existing attempt remains
+set. A current exact-attempt `verify_failed` composer barrier must be resolved
+first. If any selected attempt owns such an exact barrier, or a post-write
+barrier whose binding is absent or lacks pane-root or foreground-leader
+generation, the whole request returns `conflict` and appends nothing. The
+existing attempt remains
 visible and claimable.
 `alarm.clear` takes a non-empty list of explicit alarm ids; there is no
 clear-all or age-selected daemon mutation. The human CLI implements
@@ -546,7 +664,10 @@ clear-all or age-selected daemon mutation. The human CLI implements
 selected ids, naming the count and cutoff in its confirmation, and sending
 only that frozen id set to `alarm.clear`. Alarms created after the preview
 cannot be swept into the request. Requeues and clearances are append-only
-workspace facts.
+workspace facts. The clear response includes additive body-free summaries for
+only the requested ids. Those summaries are captured under the same mailbox
+store lock as the clearance, so the CLI does not issue an unbounded preview or
+describe state that changed between a read and the clear.
 
 `attention.show` takes `id` and optional `diff`. The id is an exact
 notification attempt id, or a message id only when that message has one
@@ -557,8 +678,11 @@ measured terminal layout, the full foreground and agent process generations,
 the manifest, and a positively classified staged composer. With `diff`, it
 also returns the expected payload and safely extracted composer content so the
 CLI can compute a local diff. A direct fallback diff contains the message body
-and is available only to the authenticated workspace administrator. Diff bytes
-are never journaled, logged, or emitted as events.
+and is available only to the authenticated workspace administrator or the
+exact durable recipient of that attempt. Other recipients receive the same
+denial for unknown, ambiguous, and unauthorized ids, so the endpoint does not
+leak attempt existence. Diff bytes are never journaled, logged, or emitted as
+events. `attention.complete` and `attention.discard` remain administrator-only.
 `attention.complete` and `attention.discard` take the same id shape. Complete
 requires all five checks again immediately before the submit key. Discard uses
 the same guarded clear sequence when the exact notification remains staged.

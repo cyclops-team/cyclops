@@ -27,10 +27,13 @@ selects again. It never downgrades after any pane write.
 
 Transport is write metadata on the notification record. It is not part of the
 mailbox state and not part of the terminal occupant identity binding. Current
-doorbell writes keep `transport: "doorbell"` and add `doorbell_format: 2`.
-Format 2 carries a lossless 128-bit token for the exact attempt in a shell
-comment. Format 1 remains readable as the older message-only compact row but
-cannot provide hook evidence for a new Complete action. Missing format metadata
+doorbell writes keep `transport: "doorbell"` and add `doorbell_format: 3`.
+Format 3 carries a lossless 128-bit attempt token under the reserved `m-att_`
+message-shaped namespace. This keeps the row runnable by older positional
+claim clients while only the new daemon interprets the locator.
+Format 2 replays its older message id plus trailing attempt-token comment byte for byte.
+Format 1 remains readable as the older message-only compact row but cannot
+provide hook evidence for a new Complete action. Missing format metadata
 selects the original verbose row. Unknown numeric formats replay but cannot
 authorize an attention recovery action. Missing
 transport metadata on an old journal transition also means the original
@@ -113,7 +116,7 @@ re-proves and clears the exact doorbell. One
 `withdrawn_after_staging` and retires its barrier together. A claim at
 `submitting` retrieves the message once but does not cancel the reserved
 terminal key. A claim at `submitted` advances the doorbell to `notified`.
-An `ack_timeout` alarm for a current format 2 doorbell with a complete binding
+An `ack_timeout` alarm for an exact-attempt doorbell with a complete binding
 can advance to `notified` after an exact recipient claim and composer
 reconciliation. The daemon must first clear the exact staged doorbell, or prove
 the same bound composer is clean. The claim alone leaves the alarm and FIFO
@@ -161,7 +164,11 @@ timer. In order:
    admitted pid is the agent's, resolved fresh; a process table that
    cannot be read is `occupant_unprovable`, not a fallback to the pane's
    shell.
-
+5. Format 3 requires a pane width of at least 60 columns on that final row and
+   at the immediate pre-write bookend. A narrower pane becomes
+   `blocked_pre_write` with its content-free observed width and no paste. A
+   later qualifying width observation from route or size evidence may reopen
+   that attempt once.
 A delivery held in gating longer than `gate_hold_notify_ms` (config,
 default 120000) pings the admin once (action_required) so a wedged hold is
 visible; the hold itself keeps waiting on events, never on a timer.
@@ -216,12 +223,21 @@ visible; the hold itself keeps waiting on events, never on a timer.
    staged barrier with no live lifecycle or blocked-state conflict. A refusal
    withholds Enter and settles once as `verify_failed`. It is never retried.
 
+An exact start normally ends on its matching hook end. When a measured vendor
+path emits no end hook, a manifest may mark one exact screen rule as lifecycle
+evidence. That rule must win an idle-class frame on a fresh, stable capture;
+ordinary empty, ghost, and typed composer rules do not qualify. Codex 0.149.1
+uses this only for the exact interruption suffix left after a human cancels a
+command approval, paired with its dim ghost composer and ordered below the
+live Working rule.
+
 ### Receipt tiers
 
 - Tier 1 (claude, codex, cursor): the manifest `hooks.ack` event arrives via
   `agent.state.report` within the ACK window (default 1500ms; measured p95
-  is under 40ms) and its `ack_payload_field` contains the message id:
-  a hook receipt. Codex duplicate hook events are
+  is under 40ms) and its `ack_payload_field` contains the exact format 3
+  attempt locator. Legacy formats correlate through their recorded message
+  and attempt markers. Codex duplicate hook events are
   deduped on (session_id, turn_id, event) before matching (amendment d).
 - Tier 2 (agy, or tier 1 timeout): screen evidence shows the marker left the
   composer and turn-start evidence appeared (working state or output
@@ -232,8 +248,8 @@ visible; the hold itself keeps waiting on events, never on a timer.
   doorbell leaves the entry pending until an authenticated claim.
 - Neither within 5s: `attention_required` with cause `ack_timeout`. Enter may
   already have been accepted, so the payload is never re-pasted. A later exact
-  recipient claim starts composer reconciliation for a current format 2
-  attempt. Only exact clear or same-binding clean evidence moves it to
+  recipient claim starts composer reconciliation for a current exact-attempt
+  doorbell. Only exact clear or same-binding clean evidence moves it to
   `notified`.
 
 ### Retry (bounded, pre-write only)
@@ -249,21 +265,66 @@ the attempt boundary and never invites a duplicate paste. `attention_required`
 can mean the terminal outcome is unknown, not that the recipient definitely
 did not receive the message.
 
+A paste command pipe that accepted zero command bytes is also proven pre-write.
+A legacy direct delivery may use its bounded retry because it has no durable
+workspace notification boundary to correct.
+
+A workspace notification writes its durable `writing` barrier immediately
+before the paste command is attempted. If the transport then proves that the
+first command write accepted zero bytes, Cyclops appends the narrowly scoped
+`writing` to `blocked_pre_write` correction with cause
+`paste_command_unwritten`. Only after that append succeeds does it release the
+runtime composer hold. This exact attempt is claimable and withdrawable, but is
+not replayed automatically. A partial command write or flush failure remains
+`paste_failed` after the write boundary because tmux may have received it.
+
+The `pane_too_narrow` width detail is also pre-write, but it does not consume
+the retry budget. Its durable cause remains `write_readiness_changed` for old
+reader compatibility, with observed and required widths recorded separately.
+It stays withdrawable until a qualifying width edge or operator action.
+
 ### Static pre-write blocks
 
 A mailbox notification stops as `blocked_pre_write` after a known pre-write
 failure exhausts its bounded retry budget, a worker exhausts its restart budget,
 or a write-boundary proof cannot safely continue. Binding and capability races
-receive one immediate re-proof without consuming transport retry budget. A held
-composer barrier blocks immediately. The closed causes name an unavailable
-session, manifest, payload, changed write readiness, paste-buffer spool failure,
-unprovable binding, missing composer semantics, or exhausted worker restart
-budget. None writes pane bytes or retries on a timer. The message stays
-claimable, and a workspace administrator may withdraw that exact unwritten
+may receive one re-proof after new causal evidence without consuming transport
+retry budget. A held composer barrier blocks immediately. The closed causes name
+an unavailable session, manifest, payload, changed write readiness, paste-buffer
+spool failure, an exact paste command that accepted zero bytes, unprovable
+binding, missing composer semantics, or exhausted worker restart budget. None
+writes pane bytes or retries on a timer. The message stays claimable, and a
+workspace administrator may withdraw that exact unwritten
 notification to release the recipient FIFO.
+The transition also records the exact closed scheduler outcome when no live
+worker owns the wake. Replay, send receipts, status, and message detail read
+that same `wake_block`; they do not reconstruct a reason from notification
+state. A historical `blocked_pre_write` row without the additive field remains
+readable and reports no scheduler outcome. New scheduler ownership failures
+record a specific outcome or fail the request if that fact cannot be persisted.
+A durable resolution intent projects `attention_resolution_pending` into the
+same receipt field until that exact attempt settles; it is not inferred from the
+notification state.
 An exact positive route and composer-readiness observation may reopen the same
-attempt once. The cached verdict must carry the same pane-root, foreground
-leader, agent process generation, and manifest as the fresh route proof.
+attempt once. Each durable pre-write observation carries the daemon boot and a
+pane-local causal evidence generation. Watcher, process, and adoption sources
+advance that identity exactly once before recompute. Standalone readiness
+mutations advance it only when the tuple changes. Readiness scheduling inside a
+source recompute and every follow-on schedule reuse the same identity. This
+includes a `CurrentCommand` edge when an exec-in-place changes the foreground
+command or selected manifest without changing the pane root or readiness tuple.
+Tokenless lifecycle, status, and inspection recomputes may publish a readiness
+change, but they neither advance route evidence nor reconcile delivery.
+The immediate post-append reconciliation also reuses the current identity, so
+unchanged evidence is a no-op while an edge that raced ahead of the append is not
+lost. A later generation may reopen even when its complete process binding is
+identical. The cached verdict must still carry the same pane-root,
+foreground leader, agent process generation, and manifest as the fresh route
+proof. A non-width readiness block additionally requires a positive write-ready
+verdict under a strictly later token. When that block has no binding or width
+observation, it still records the current route token as a comparison baseline
+without treating the token as binding proof. Width recovery requires an actual
+width change across the recorded minimum.
 
 A workspace administrator may also withdraw the exact current attempt while it
 is `queued` or `gating`. Those states and `blocked_pre_write` are all durably
@@ -413,11 +474,12 @@ The boot requeue above carries them across.
 require the exact unresolved attempt, the original process and manifest
 binding, exact expected composer bytes, anchored trailer layout, and a current
 safe terminal state. Diff inputs can contain a direct fallback payload. They
-are returned only to the authenticated workspace administrator and never enter
-the journal or daemon log. Requeue and alarm clearance remain explicit
-operator actions and never create an automatic retry loop.
+are returned only to the authenticated workspace administrator or the exact
+durable recipient of that attempt and never enter the journal or daemon log.
+Complete and discard remain administrator-only. Requeue and alarm clearance
+remain explicit operator actions and never create an automatic retry loop.
 
-A current format 2 `verify_failed` doorbell uses the same proof and settlement
+An exact-attempt `verify_failed` doorbell uses the same proof and settlement
 path automatically. Pending work selects one submit. An exact recipient claim
 ordered after the write selects one measured clear. The mailbox choice and
 durable intent share one lock. Human, trailing, changed, or unprovable content
@@ -426,7 +488,7 @@ never reaches a terminal key.
 Before a terminal-key action, the daemon records one content-free resolution
 intent. If the terminal accepts the key, it records a separate content-free
 action-accepted fact. Neither fact is settlement. A fresh Complete also needs a
-matching authenticated attempt-bound v2 hook receipt or an exact recipient
+matching authenticated exact-attempt hook receipt or an exact recipient
 claim ordered after this action, recorded as a content-free consumption fact.
 Legacy and v1 doorbell hooks remain replay-compatible but cannot authorize new
 Complete settlement. A
@@ -447,7 +509,7 @@ different requested resolution remain unresolved.
 The legacy session-delivery path has no operator requeue verb. Standard mailbox
 notifications use the guarded `cyclops requeue <message-id>` recovery command.
 Requeue resolves every selected pending recipient before writing. A current
-format 2 `verify_failed` composer barrier must be resolved before requeue. Any
+exact-attempt `verify_failed` composer barrier must be resolved before requeue. Any
 post-write barrier with an absent binding or missing pane-root or
 foreground-leader generation also makes the whole requeue conflict before any
 append.

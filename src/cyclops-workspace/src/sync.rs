@@ -1,6 +1,6 @@
 //! Reconcile workspace model from tmux.
 
-use cyclops_tmux::{ControlClient, SnapshotWindow, TmuxError, WorkspaceSnapshot};
+use cyclops_tmux::{ControlClient, HydrationBundle, SnapshotWindow, TmuxError, WorkspaceSnapshot};
 
 use crate::layout::{parse_layout, resolve_layout};
 use crate::model::{
@@ -47,6 +47,7 @@ pub async fn fetch_workspace_model(
         active_workspace,
         session,
         sidebar_visible: true,
+        messages_visible: false,
     })
 }
 
@@ -146,7 +147,7 @@ pub async fn hydrate_visible_tab(
     tab: &TabModel,
     registry: &mut RuntimeRegistry,
 ) {
-    hydrate_tab(client, tab, registry, false).await;
+    let _ = hydrate_tab(client, tab, registry, false).await;
 }
 
 /// [`hydrate_visible_tab`] with the size check overridden: every visible
@@ -155,13 +156,15 @@ pub async fn hydrate_visible_tab(
 /// while the layout stands still, and the size-gated hydrate would leave
 /// those panes stale (content and VT modes both) until something happened
 /// to resize them. Not for the resize path, which is a hot loop and where
-/// the size check is exactly right.
+/// the size check is exactly right. A failed forced capture removes that
+/// pane's existing runtime and returns the first error, so a continuity
+/// barrier cannot acknowledge stale screen bytes as a complete repair.
 pub async fn hydrate_visible_tab_forced(
     client: &ControlClient,
     tab: &TabModel,
     registry: &mut RuntimeRegistry,
-) {
-    hydrate_tab(client, tab, registry, true).await;
+) -> Result<(), TmuxError> {
+    hydrate_tab(client, tab, registry, true).await
 }
 
 /// How much scrollback a runtime meeting its pane for the first time asks
@@ -175,7 +178,7 @@ async fn hydrate_tab(
     tab: &TabModel,
     registry: &mut RuntimeRegistry,
     force: bool,
-) {
+) -> Result<(), TmuxError> {
     let dims = visible_pane_dims(tab);
     let pane_ids: Vec<String> = dims.iter().map(|(id, _, _)| id.clone()).collect();
     registry.retain_visible(&pane_ids);
@@ -190,7 +193,7 @@ async fn hydrate_tab(
         })
         .collect();
     if stale.is_empty() {
-        return;
+        return Ok(());
     }
 
     // A pane without a runtime yet gets the deeper bundle: its runtime has
@@ -206,25 +209,60 @@ async fn hydrate_tab(
     let results = client
         .hydrate_panes_seeding(&stale_ids, &fresh, FIRST_SIGHT_HISTORY_LINES)
         .await;
-    for ((pane_id, _, _), result) in stale.into_iter().zip(results) {
-        if let Ok(bundle) = result {
-            let snapshot = snapshot_from_bundle(&bundle);
-            // In place when the pane already has a runtime: hydrate resets
-            // modes and the grid itself but carries scrollback across, so a
-            // resize does not eat the history the wheel scrolls through.
-            match registry.get_mut(&pane_id) {
-                Some(runtime) => runtime.hydrate(&snapshot),
-                None => {
-                    let mut runtime = PaneRuntime::new(bundle.cols, bundle.rows);
-                    runtime.hydrate(&snapshot);
-                    registry.insert(pane_id, runtime);
+    apply_hydration_results(stale, results, registry, force)
+}
+
+fn apply_hydration_results(
+    stale: Vec<(String, u16, u16)>,
+    results: Vec<Result<HydrationBundle, TmuxError>>,
+    registry: &mut RuntimeRegistry,
+    force: bool,
+) -> Result<(), TmuxError> {
+    let mut results = results.into_iter();
+    let mut first_error = None;
+    for (pane_id, _, _) in stale {
+        match results.next() {
+            Some(Ok(bundle)) => {
+                let snapshot = snapshot_from_bundle(&bundle);
+                // In place when the pane already has a runtime: hydrate
+                // resets modes and the grid itself but carries scrollback
+                // across, so a resize does not eat the history the wheel
+                // scrolls through.
+                match registry.get_mut(&pane_id) {
+                    Some(runtime) => runtime.hydrate(&snapshot),
+                    None => {
+                        let mut runtime = PaneRuntime::new(bundle.cols, bundle.rows);
+                        runtime.hydrate(&snapshot);
+                        registry.insert(pane_id, runtime);
+                    }
+                }
+            }
+            Some(Err(error)) => {
+                if force {
+                    registry.remove(&pane_id);
+                }
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+            None => {
+                if force {
+                    registry.remove(&pane_id);
+                }
+                if first_error.is_none() {
+                    first_error = Some(TmuxError::Protocol(format!(
+                        "hydrate returned no result for pane {pane_id}"
+                    )));
                 }
             }
         }
-        // Err: this pane's slot fails alone (see the doc comment above) —
-        // no runtime is inserted, and it paints blank until a later
-        // hydrate succeeds.
     }
+    if results.next().is_some() && first_error.is_none() {
+        first_error = Some(TmuxError::Protocol(
+            "hydrate returned more pane results than requested".into(),
+        ));
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
@@ -387,6 +425,24 @@ mod tests {
         );
 
         client.shutdown().await;
+    }
+
+    #[test]
+    fn a_failed_forced_hydrate_removes_the_stale_runtime_and_reports_incomplete() {
+        let mut registry = RuntimeRegistry::default();
+        registry.insert("%7".to_string(), PaneRuntime::new(80, 24));
+        let result = apply_hydration_results(
+            vec![("%7".to_string(), 80, 24)],
+            vec![Err(TmuxError::Protocol("capture failed".into()))],
+            &mut registry,
+            true,
+        );
+
+        assert!(result.is_err(), "forced hydration reports incompleteness");
+        assert!(
+            registry.get("%7").is_none(),
+            "failed forced capture cannot leave stale pane bytes visible"
+        );
     }
 
     /// L1: a dead pane's hydrate failure must not stop the rest of the

@@ -15,6 +15,8 @@ fn main() {
     }
 
     let fifo = args.get(1).expect("command FIFO");
+    print!("❯ ");
+    std::io::stdout().flush().expect("paint clean composer");
     let mut children: Vec<Child> = Vec::new();
     for line in BufReader::new(File::open(fifo).expect("open command FIFO")).lines() {
         let line = line.expect("read fixture command");

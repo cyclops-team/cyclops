@@ -164,7 +164,7 @@ fn messages_status(app: &App) -> Option<String> {
     }
 }
 
-fn messages_help(width: usize, height: usize, status: Option<&str>) -> Vec<String> {
+pub fn messages_help(width: usize, height: usize, status: Option<&str>) -> Vec<String> {
     let lines = [
         "Messages keys",
         "",

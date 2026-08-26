@@ -26,7 +26,7 @@
 //! ping, and the two deadlines a caller asked for (`receipt_block_ms`,
 //! and `timeout_ms` on a wait). Nothing runs on an interval.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -36,14 +36,15 @@ use cyclops_manifest::{
     mailbox_capability, strip_csi, AckEvidence, Manifest, UnstyledComposerProof,
 };
 use cyclops_proto::{
-    AgentState, ComposerSemantic, Delivery, DeliveryReceipt, DeliveryState, Detection, Event, Kind,
-    LedgerLine, MessageId, MsgSendParams, MsgSendResult, NotificationAttemptId,
-    NotificationAttentionCause, NotificationBinding, NotificationManifestId,
+    AgentState, ComposerSemantic, ComposerState, Delivery, DeliveryReceipt, DeliveryState,
+    Detection, Event, Kind, LedgerLine, MessageId, MsgSendParams, MsgSendResult,
+    NotificationAttemptId, NotificationAttentionCause, NotificationBinding, NotificationManifestId,
     NotificationPreWriteCause, NotificationPreWriteObservation, NotificationRecord,
-    NotificationState, NotificationTransport, NotifyLevel, ProcessInstanceId, QuiesceResult,
-    RecipientKey, Sensor, StatusDiagnostic, VerifiedBy, WaitUntil, WireError,
+    NotificationRouteEvidenceId, NotificationState, NotificationTransport,
+    NotificationVerifyFailureKind, NotificationVerifyOutcome, NotifyLevel, ProcessInstanceId,
+    QuiesceResult, RecipientKey, Sensor, StatusDiagnostic, VerifiedBy, WaitUntil, WireError,
 };
-use cyclops_tmux::{ControlClient, PaneEvent, PaneRow, SessionWatcher};
+use cyclops_tmux::{ControlClient, PaneEvent, PaneRow, SessionWatcher, TmuxError};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, watch, Notify};
 use tokio::task::JoinHandle;
@@ -125,6 +126,35 @@ impl MailboxCapabilityProof {
     }
 }
 
+/// Recheck format-specific authority before considering terminal geometry.
+///
+/// Capability loss is an identity failure and must not be hidden by a narrow
+/// pane. Both pre-write bookends use this exact ordering.
+fn notification_prewrite_bookend(
+    selected: &AttemptPayload,
+    recipient: Option<RecipientKey>,
+    binding: &fusion::Binding,
+    pane_width: u32,
+) -> Option<String> {
+    if matches!(selected.transport, Some(NotificationTransport::Doorbell)) {
+        let current =
+            recipient
+                .zip(selected.capability.as_ref())
+                .is_some_and(|(recipient, proof)| {
+                    proof.recheck(recipient, binding.agent, &binding.manifest)
+                });
+        if !current {
+            return Some("capability_changed".to_string());
+        }
+    }
+    if selected.doorbell_format == Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM)
+        && pane_width < cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH
+    {
+        return Some(format!("pane_too_narrow:{pane_width}"));
+    }
+    None
+}
+
 fn select_mailbox_capability(
     manifest: &Manifest,
     recipient: RecipientKey,
@@ -173,12 +203,9 @@ fn select_attempt_payload(
     });
     if capability.is_some() {
         return Ok(AttemptPayload {
-            bytes: cyclops_proto::render_doorbell_v2(
-                notification.message_id(),
-                notification.attempt_id(),
-            ),
+            bytes: cyclops_proto::render_doorbell_v3(notification.attempt_id()),
             transport: Some(NotificationTransport::Doorbell),
-            doorbell_format: Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_CLAIM),
+            doorbell_format: Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
             capability,
         });
     }
@@ -212,6 +239,9 @@ pub(crate) fn expected_notification_payload(
             Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_CLAIM) => Some(
                 cyclops_proto::render_doorbell_v2(&record.message_id, record.attempt_id),
             ),
+            Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM) => {
+                Some(cyclops_proto::render_doorbell_v3(record.attempt_id))
+            }
             Some(_) => None,
         },
         (NotificationTransport::DirectPayload, None) => {
@@ -492,7 +522,7 @@ impl Engine {
         recipient: RecipientKey,
         handle: Arc<DeliveryHandle>,
         spawn: F,
-    ) -> Option<Arc<Worker>>
+    ) -> Result<Arc<Worker>, NotificationEnqueueRefusal>
     where
         F: FnOnce(Arc<Worker>) -> JoinHandle<()>,
     {
@@ -501,22 +531,27 @@ impl Engine {
             .lock()
             .expect("notification workers lock");
         if self.stopping.load(Ordering::SeqCst) {
-            return None;
+            return Err(NotificationEnqueueRefusal::DaemonStopping);
         }
         if let Some(entry) = entries.get_mut(&recipient) {
             let worker = Arc::clone(&entry.worker);
-            worker.enqueue_back(handle);
-            if entry.task.is_finished() && !worker.is_faulted() {
+            if entry.task.is_finished() {
                 worker.set_fault("notification worker supervisor exited");
+                return Err(NotificationEnqueueRefusal::WorkerSupervisorExited);
             }
+            if worker.is_faulted() {
+                return Err(NotificationEnqueueRefusal::WorkerFaulted);
+            }
+            worker.enqueue_back(handle);
             drop(entries);
             worker.notify.notify_one();
-            return Some(worker);
+            return Ok(worker);
         }
 
         let worker = Arc::new(Worker::new());
         worker.enqueue_back(handle);
         let task = spawn(Arc::clone(&worker));
+        let task_finished = task.is_finished();
         entries.insert(
             recipient,
             NotificationWorker {
@@ -524,9 +559,13 @@ impl Engine {
                 task,
             },
         );
+        if task_finished {
+            worker.set_fault("notification worker supervisor exited");
+            return Err(NotificationEnqueueRefusal::WorkerSupervisorExited);
+        }
         drop(entries);
         worker.notify.notify_one();
-        Some(worker)
+        Ok(worker)
     }
 
     /// Remove this exact worker only while its queue is still empty.
@@ -600,8 +639,8 @@ impl Engine {
 
     /// Whether the exact recipient worker currently owns this attempt.
     ///
-    /// The weak attempt index, queued handles, and a faulted current handle do
-    /// not prove active work.
+    /// The exact handle must be current or queued under a live, nonfaulted
+    /// supervisor. A weak attempt-index entry alone never proves active work.
     /// Status uses this only to describe the next step; mutation paths recheck
     /// their own authority immediately before acting.
     pub(crate) fn notification_worker_owns(
@@ -609,22 +648,49 @@ impl Engine {
         recipient: RecipientKey,
         attempt_id: NotificationAttemptId,
     ) -> bool {
+        self.notification_worker_refusal(recipient, attempt_id)
+            .is_none()
+    }
+
+    fn notification_worker_refusal(
+        &self,
+        recipient: RecipientKey,
+        attempt_id: NotificationAttemptId,
+    ) -> Option<NotificationEnqueueRefusal> {
+        if self.is_stopping() {
+            return Some(NotificationEnqueueRefusal::DaemonStopping);
+        }
         let workers = self
             .notification_workers
             .lock()
             .expect("notification workers lock");
         let Some(entry) = workers.get(&recipient) else {
-            return false;
+            return Some(NotificationEnqueueRefusal::AttemptUnowned);
         };
+        if entry.task.is_finished() {
+            return Some(NotificationEnqueueRefusal::WorkerSupervisorExited);
+        }
         let state = entry.worker.state.lock().expect("worker state lock");
         if state.fault.is_some() {
-            return false;
+            return Some(NotificationEnqueueRefusal::WorkerFaulted);
         }
-        state
+        let current = state
             .current
             .as_ref()
             .and_then(|handle| handle.notification.as_ref())
-            .is_some_and(|notification| notification.attempt_id() == attempt_id)
+            .is_some_and(|notification| notification.attempt_id() == attempt_id);
+        if current
+            || state.queue.iter().any(|handle| {
+                handle
+                    .notification
+                    .as_ref()
+                    .is_some_and(|notification| notification.attempt_id() == attempt_id)
+            })
+        {
+            None
+        } else {
+            Some(NotificationEnqueueRefusal::AttemptUnowned)
+        }
     }
 
     /// Seed the issued-id set from a ledger so new ids stay unique per
@@ -640,13 +706,28 @@ impl Engine {
 
     /// Mint a short unique message id, e.g. "m-3f9c2a".
     fn mint_msg_id(&self) -> String {
+        self.mint_msg_id_with(|| format!("m-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]))
+    }
+
+    fn mint_msg_id_with(&self, mut candidate: impl FnMut() -> String) -> String {
         let mut issued = self.issued.lock().expect("issued lock");
         loop {
-            let id = format!("m-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
+            let id = candidate();
             if issued.insert(id.clone()) {
                 return id;
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mint_msg_id_from(&self, candidates: &[&str]) -> String {
+        let mut candidates = candidates.iter();
+        self.mint_msg_id_with(|| {
+            candidates
+                .next()
+                .expect("test candidate sequence exhausted")
+                .to_string()
+        })
     }
 }
 
@@ -1486,8 +1567,8 @@ impl About {
 
 /// Write a kind=system admin notification line and broadcast the event.
 /// `session_idx` scopes internal (delivery-driven) notifications to the
-/// recipient's ledger; None (external admin.notify) writes to every
-/// session ledger so any single-session reader sees it.
+/// recipient's ledger; None (external admin.notify) writes to every active
+/// canonical session ledger so any live single-session reader sees it.
 pub(crate) fn admin_notify(
     inner: &Arc<Inner>,
     level: NotifyLevel,
@@ -1546,7 +1627,11 @@ pub(crate) fn admin_notify(
     };
     let sessions: Vec<usize> = match session_idx {
         Some(i) => vec![i],
-        None => (0..inner.session_count()).collect(),
+        None => inner
+            .active_session_slots()
+            .into_iter()
+            .map(|(idx, _)| idx)
+            .collect(),
     };
     let mut first_seq = None;
     for idx in sessions {
@@ -1675,6 +1760,51 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
         body: String,
         fyi: bool,
     }
+    struct Chain {
+        state: DeliveryState,
+        attempts: u32,
+        owner: usize,
+        owners: BTreeSet<usize>,
+        rank: u64,
+    }
+    fn consider(
+        chains: &mut HashMap<(String, String), Chain>,
+        key: (String, String),
+        state: DeliveryState,
+        attempts: u32,
+        owner: usize,
+        rank: u64,
+    ) {
+        match chains.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Chain {
+                    state,
+                    attempts,
+                    owner,
+                    owners: BTreeSet::from([owner]),
+                    rank,
+                });
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let current = entry.get_mut();
+                current.owners.insert(owner);
+                // A terminal fact in the configured root closes unresolved
+                // history in a linked journal. Otherwise the family's
+                // descendant-first/root-last scan is its causal order; wall
+                // clocks from separate journal files are not comparable.
+                let terminal_wins = receipt_resolved(state) && !receipt_resolved(current.state);
+                let same_class_is_newer = receipt_resolved(state)
+                    == receipt_resolved(current.state)
+                    && rank > current.rank;
+                if terminal_wins || same_class_is_newer {
+                    current.state = state;
+                    current.attempts = attempts;
+                    current.owner = owner;
+                    current.rank = rank;
+                }
+            }
+        }
+    }
     let workspace_ids = match &inner.mailbox {
         Some(service) => match service.workspace_message_ids() {
             Ok(ids) => ids,
@@ -1693,22 +1823,28 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
     // The same closures as identities, so the one ping can name them and
     // a reader can hold it to the register (cyclops-ui `App::admits`).
     let mut named: Vec<DeliveryRef> = Vec::new();
+    // Families are descendants-first and configured-root-last. Fold all of
+    // them before acting so one (message, recipient) can mint at most one
+    // recovery handle during this boot.
+    let mut chains: HashMap<(String, String), Chain> = HashMap::new();
+    let mut envelopes: HashMap<(String, usize), Envelope> = HashMap::new();
+    let mut scan_order = 0_u64;
     for (idx, lines) in replayed {
-        // (msg id, recipient) -> (latest state, attempts).
-        let mut chains: HashMap<(String, String), (DeliveryState, u32)> = HashMap::new();
-        let mut envelopes: HashMap<String, Envelope> = HashMap::new();
         for line in lines {
+            scan_order = scan_order.saturating_add(1);
             if !legacy_recovery_owns(&line.id, &workspace_ids) {
                 continue;
             }
             match line.kind {
                 Kind::Msg | Kind::Fyi => {
-                    envelopes.entry(line.id.clone()).or_insert(Envelope {
-                        from: line.from.clone(),
-                        subject: line.subject.clone().unwrap_or_default(),
-                        body: line.body.clone().unwrap_or_default(),
-                        fyi: matches!(line.kind, Kind::Fyi),
-                    });
+                    envelopes
+                        .entry((line.id.clone(), *idx))
+                        .or_insert(Envelope {
+                            from: line.from.clone(),
+                            subject: line.subject.clone().unwrap_or_default(),
+                            body: line.body.clone().unwrap_or_default(),
+                            fyi: matches!(line.kind, Kind::Fyi),
+                        });
                     // `hosted` names the recipients whose chains live in
                     // this file. Ledgers from before the field existed were
                     // single-file: a msg line with no hosted list hosts
@@ -1723,9 +1859,14 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
                     for d in &line.deliveries {
                         let is_hosted = hosted.as_ref().is_none_or(|h| h.contains(d.to.as_str()));
                         if is_hosted {
-                            chains
-                                .entry((line.id.clone(), d.to.clone()))
-                                .or_insert((d.state, d.attempts));
+                            consider(
+                                &mut chains,
+                                (line.id.clone(), d.to.clone()),
+                                d.state,
+                                d.attempts,
+                                *idx,
+                                scan_order,
+                            );
                         }
                     }
                 }
@@ -1737,105 +1878,129 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
                     ) else {
                         continue; // fused-state line, not a delivery line
                     };
-                    let attempts = line.deliveries.first().map(|d| d.attempts).unwrap_or(0);
-                    chains.insert((line.id.clone(), to.to_string()), (state, attempts));
+                    let record = line.deliveries.first();
+                    consider(
+                        &mut chains,
+                        (line.id.clone(), to.to_string()),
+                        state,
+                        record.map(|delivery| delivery.attempts).unwrap_or(0),
+                        *idx,
+                        scan_order,
+                    );
                 }
                 _ => {}
             }
         }
-        let mut dangling: Vec<((String, String), (DeliveryState, u32))> = chains
-            .into_iter()
-            .filter(|(_, (state, _))| !receipt_resolved(*state))
-            .collect();
-        dangling.sort_by(|a, b| a.0.cmp(&b.0));
-        for ((id, to), (state, attempts)) in dangling {
-            if receipt_is_queued(state) {
-                let target = envelopes.get(&id).zip(requeue_target(inner, &to, *idx));
-                if let Some((env, (sess_idx, pane_id))) = target {
-                    let payload = render_payload(&id, &env.from, &env.subject, &env.body, env.fyi);
-                    // Gating cannot survive the run that was doing the
-                    // gating; the recorded step back is retry_queued, the
-                    // pre-paste retry state. Queued and retry_queued are
-                    // already accurate and re-enter silently.
-                    let requeue_state = if state == DeliveryState::Gating {
-                        let record = Delivery {
-                            to: to.clone(),
-                            state: DeliveryState::RetryQueued,
-                            verified_by: None,
-                            attempts,
-                            ts: unix_ms(),
-                            cause: Some("daemon_restart".to_string()),
-                        };
-                        emit_delivery_state(
-                            inner,
-                            &[*idx],
-                            &id,
-                            &to,
-                            inner.recipient_key(sess_idx, &pane_id),
-                            state,
-                            DeliveryState::RetryQueued,
-                            Some("daemon_restart"),
-                            None,
-                            &record,
-                        );
-                        DeliveryState::RetryQueued
-                    } else {
-                        state
+    }
+    let mut dangling: Vec<_> = chains
+        .into_iter()
+        .filter(|(_, chain)| !receipt_resolved(chain.state))
+        .collect();
+    dangling.sort_by(|a, b| a.0.cmp(&b.0));
+    for ((id, to), chain) in dangling {
+        if chain.owners.len() != 1 {
+            error!(
+                message_id = id,
+                recipient = to,
+                owners = ?chain.owners,
+                "legacy restart chain has more than one configured owner; leaving it untouched"
+            );
+            continue;
+        }
+        let Chain {
+            state,
+            attempts,
+            owner: idx,
+            ..
+        } = chain;
+        if receipt_is_queued(state) {
+            let target = envelopes
+                .get(&(id.clone(), idx))
+                .zip(requeue_target(inner, &to, idx));
+            if let Some((env, (sess_idx, pane_id))) = target {
+                let payload = render_payload(&id, &env.from, &env.subject, &env.body, env.fyi);
+                // Gating cannot survive the run that was doing the
+                // gating; the recorded step back is retry_queued, the
+                // pre-paste retry state. Queued and retry_queued are
+                // already accurate and re-enter silently.
+                let requeue_state = if state == DeliveryState::Gating {
+                    let record = Delivery {
+                        to: to.clone(),
+                        state: DeliveryState::RetryQueued,
+                        verified_by: None,
+                        attempts,
+                        ts: unix_ms(),
+                        cause: Some("daemon_restart".to_string()),
                     };
-                    let handle = DeliveryHandle::with_ledger_sessions(
+                    emit_delivery_state(
+                        inner,
+                        &[idx],
                         &id,
                         &to,
-                        &pane_id,
-                        sess_idx,
-                        vec![*idx],
-                        payload,
+                        inner.recipient_key(sess_idx, &pane_id),
+                        state,
+                        DeliveryState::RetryQueued,
+                        Some("daemon_restart"),
+                        None,
+                        &record,
                     );
-                    {
-                        let mut st = handle.state.lock().expect("handle state lock");
-                        st.state = requeue_state;
-                        st.attempts = attempts;
-                    }
-                    inner.engine.track(&handle);
-                    let Some(worker) = worker_for(inner, sess_idx, &pane_id) else {
-                        continue;
-                    };
-                    worker.enqueue_back(handle);
-                    worker.notify.notify_one();
-                    requeued.push(format!("{id} -> {to}"));
-                    continue;
+                    DeliveryState::RetryQueued
+                } else {
+                    state
+                };
+                let handle = DeliveryHandle::with_ledger_sessions(
+                    &id,
+                    &to,
+                    &pane_id,
+                    sess_idx,
+                    vec![idx],
+                    payload,
+                );
+                {
+                    let mut st = handle.state.lock().expect("handle state lock");
+                    st.state = requeue_state;
+                    st.attempts = attempts;
                 }
-                // No pane to requeue into: close below, like any other
-                // chain the restart cannot carry forward.
+                inner.engine.track(&handle);
+                let Some(worker) = worker_for(inner, sess_idx, &pane_id) else {
+                    continue;
+                };
+                worker.enqueue_back(handle);
+                worker.notify.notify_one();
+                requeued.push(format!("{id} -> {to}"));
+                continue;
             }
-            // A post-write delivery cannot be requeued after restart. Its
-            // mutable recipient label does not prove which pane may still
-            // hold the payload, so the ambiguous outcome closes below.
-            let record = Delivery {
-                to: to.clone(),
-                state: DeliveryState::AttentionRequired,
-                verified_by: None,
-                attempts,
-                ts: unix_ms(),
-                cause: Some("daemon_restart".to_string()),
-            };
-            emit_delivery_state(
-                inner,
-                &[*idx],
-                &id,
-                &to,
-                None,
-                state,
-                DeliveryState::AttentionRequired,
-                Some("daemon_restart"),
-                None,
-                &record,
-            );
-            closed.push(format!("{id} -> {to}"));
-            named.push(DeliveryRef {
-                to: to.clone(),
-                msg_id: id.clone(),
-            });
+            // No pane to requeue into: close below, like any other
+            // chain the restart cannot carry forward.
         }
+        // A post-write delivery cannot be requeued after restart. Its
+        // mutable recipient label does not prove which pane may still
+        // hold the payload, so the ambiguous outcome closes below.
+        let record = Delivery {
+            to: to.clone(),
+            state: DeliveryState::AttentionRequired,
+            verified_by: None,
+            attempts,
+            ts: unix_ms(),
+            cause: Some("daemon_restart".to_string()),
+        };
+        emit_delivery_state(
+            inner,
+            &[idx],
+            &id,
+            &to,
+            None,
+            state,
+            DeliveryState::AttentionRequired,
+            Some("daemon_restart"),
+            None,
+            &record,
+        );
+        closed.push(format!("{id} -> {to}"));
+        named.push(DeliveryRef {
+            to: to.clone(),
+            msg_id: id.clone(),
+        });
     }
     if !requeued.is_empty() {
         requeued.sort();
@@ -2414,6 +2579,8 @@ fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryRecei
             notification_state: None,
             quota_state: None,
             notification_settlement: None,
+            pre_write_cause: None,
+            wake_block: None,
             position: None,
             // The gate's machine cause travels as-is when the daemon had
             // no detail to add; wording it belongs to the surface showing
@@ -2430,6 +2597,8 @@ fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryRecei
             notification_state: None,
             quota_state: None,
             notification_settlement: None,
+            pre_write_cause: None,
+            wake_block: None,
             position: None,
             note: None,
             pane,
@@ -2456,6 +2625,8 @@ fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryRecei
         notification_state: None,
         quota_state: None,
         notification_settlement: None,
+        pre_write_cause: None,
+        wake_block: None,
         position,
         note: None,
         pane,
@@ -2525,6 +2696,16 @@ fn worker_for(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) -> Option<A
 /// Attach an already-queued mailbox notification to the pane's existing FIFO worker.
 ///
 /// Recipient selection and oldest-pending policy belong to the coordinator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotificationEnqueueRefusal {
+    DaemonStopping,
+    WorkerFaulted,
+    WorkerSupervisorExited,
+    AttemptUnowned,
+    ClassificationUnavailable,
+    PayloadUnavailable,
+}
+
 #[allow(dead_code)]
 pub(crate) fn enqueue_notification_attempt(
     inner: &Arc<Inner>,
@@ -2533,7 +2714,7 @@ pub(crate) fn enqueue_notification_attempt(
     display_recipient: &str,
     notification: NotificationContext,
     replace_existing: bool,
-) -> Option<Arc<DeliveryHandle>> {
+) -> Result<Arc<DeliveryHandle>, NotificationEnqueueRefusal> {
     let attempt_id = notification.attempt_id();
     let recipient = notification.recipient();
     let claimed_barrier = notification.claimed_notification_barrier();
@@ -2545,19 +2726,27 @@ pub(crate) fn enqueue_notification_attempt(
     active.retain(|_, handle| handle.strong_count() > 0);
     if !replace_existing {
         if let Some(handle) = active.get(&attempt_id).and_then(std::sync::Weak::upgrade) {
+            drop(active);
+            let refusal = inner
+                .engine
+                .notification_worker_refusal(recipient, attempt_id);
             if claimed_barrier.as_ref().is_ok_and(Option::is_some) {
                 handle
                     .claimed_notification_rerun_requested
                     .store(true, Ordering::SeqCst);
             }
-            return Some(handle);
+            return if let Some(refusal) = refusal {
+                Err(refusal)
+            } else {
+                Ok(handle)
+            };
         }
     }
     let claimed_barrier = match claimed_barrier {
         Ok(barrier) => barrier,
         Err(error) => {
             error!(message_id = %notification.message_id(), %error, "cannot classify notification enqueue");
-            return None;
+            return Err(NotificationEnqueueRefusal::ClassificationUnavailable);
         }
     };
     let doorbell = if claimed_barrier.is_some() {
@@ -2565,7 +2754,7 @@ pub(crate) fn enqueue_notification_attempt(
             Ok(record) => record,
             Err(error) => {
                 error!(message_id = %notification.message_id(), %error, "cannot rebuild claimed staged notification");
-                return None;
+                return Err(NotificationEnqueueRefusal::PayloadUnavailable);
             }
         };
         // Recovery owns the durable error result. An empty handle payload is
@@ -2577,7 +2766,7 @@ pub(crate) fn enqueue_notification_attempt(
             .and_then(|message| expected_notification_payload(&record, &message))
             .unwrap_or_default()
     } else {
-        cyclops_proto::render_doorbell_v2(notification.message_id(), notification.attempt_id())
+        cyclops_proto::render_doorbell_v3(notification.attempt_id())
     };
     let handle = DeliveryHandle::for_notification(
         display_recipient,
@@ -2601,11 +2790,11 @@ pub(crate) fn enqueue_notification_attempt(
                     task_inner, recipient, worker,
                 ))
             });
-    if worker.is_none() {
+    if let Err(refusal) = worker {
         inner.engine.retire_notification_run(&handle);
-        return None;
+        return Err(refusal);
     }
-    Some(handle)
+    Ok(handle)
 }
 
 // ---------------------------------------------------------------------------
@@ -2844,10 +3033,7 @@ fn recover_failed_job(
                     &handle.to,
                     &handle.pane_id,
                     handle.session_idx,
-                    cyclops_proto::render_doorbell_v2(
-                        notification.message_id(),
-                        notification.attempt_id(),
-                    ),
+                    cyclops_proto::render_doorbell_v3(notification.attempt_id()),
                     notification.clone(),
                 );
                 fresh.worker_recoveries.store(1, Ordering::SeqCst);
@@ -3029,30 +3215,41 @@ async fn persist_notification_prewrite_block(
     let Some(notification) = &handle.notification else {
         return;
     };
+    let route_evidence = inner.route_evidence_id(handle.session_idx, &handle.pane_id);
+    // Test seam: an admitting edge can land between the gate's verdict and
+    // this append. The reconcile below must catch it, never strand it.
+    inject_pause(inner, "pre_prewrite_block").await;
     if let Some(record) = record_notification_prewrite_block(
         notification,
         worker,
         &inner.mailbox_publication,
         cause,
         observation,
+        &route_evidence,
     ) {
         notify_notification_prewrite_blocked(inner, handle, &record);
         // A positive route edge can race just ahead of this append and see
         // only Gating. Reconcile once after the durable block exists so that
         // edge is not lost. The mailbox projection enforces the one-reopen
         // limit and exact binding checks.
-        crate::messaging::schedule_route_changed(inner, handle.session_idx, &handle.pane_id);
+        crate::messaging::schedule_route_reconciliation(inner, handle.session_idx, &handle.pane_id);
         if let Some(watcher) = inner.watcher_of(handle.session_idx) {
-            fusion::recompute_pane(
+            let route_evidence = inner.route_evidence_id(handle.session_idx, &handle.pane_id);
+            fusion::recompute_pane_for_route_evidence(
                 inner,
                 handle.session_idx,
                 &watcher,
                 &handle.pane_id,
                 true,
                 "prewrite_block_reconcile",
+                &route_evidence,
             )
             .await;
-            crate::messaging::schedule_route_changed(inner, handle.session_idx, &handle.pane_id);
+            crate::messaging::schedule_route_reconciliation(
+                inner,
+                handle.session_idx,
+                &handle.pane_id,
+            );
         }
     }
 }
@@ -3063,10 +3260,29 @@ fn record_notification_prewrite_block(
     publication: &StdMutex<()>,
     cause: NotificationPreWriteCause,
     observation: Option<NotificationPreWriteObservation>,
+    route_evidence: &NotificationRouteEvidenceId,
 ) -> Option<NotificationRecord> {
+    let observation =
+        if cause == NotificationPreWriteCause::WriteReadinessChanged && observation.is_none() {
+            // A readiness race can lack binding or width evidence, but it still
+            // needs the route generation under which the write was refused.
+            Some(NotificationPreWriteObservation {
+                write_block: None,
+                pane_root: None,
+                selected_manifest: None,
+                binding: None,
+                route_evidence: Some(route_evidence.clone()),
+                pane_width: None,
+                required_pane_width: None,
+            })
+        } else {
+            observation
+        };
     let recorded = {
         let _publication = publication.lock().expect("mailbox publication lock");
-        notification.record_pre_write_block(cause, observation)
+        let wake_block = (cause == NotificationPreWriteCause::ComposerOwnershipUnproven)
+            .then_some(cyclops_proto::MessageWakeBlock::ComposerOwnershipUnproven);
+        notification.record_pre_write_block_with_wake_block(cause, observation, wake_block)
     };
     match recorded {
         Ok(record) => Some(record),
@@ -3226,9 +3442,11 @@ fn exact_prewrite_watcher(
     match handle_route(inner, handle) {
         HandleRoute::Exact(watcher) => Ok(watcher),
         HandleRoute::BindingChanged => Err(AttemptFailure::pane_rebound_before_paste()),
-        HandleRoute::BindingUnprovable { pane_pid } => Err(AttemptFailure::binding_unprovable(
-            Some(binding_unprovable_observation(pane_pid, manifest_id)),
-        )),
+        HandleRoute::BindingUnprovable { pane_pid } => {
+            Err(AttemptFailure::binding_unprovable(Some(
+                binding_unprovable_observation(inner, handle, pane_pid, manifest_id),
+            )))
+        }
         HandleRoute::Unavailable => Err(AttemptFailure::session_detached()),
     }
 }
@@ -3305,7 +3523,7 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
                     worker,
                     handle,
                     cause,
-                    Some(observation),
+                    Some(*observation),
                 )
                 .await;
                 return;
@@ -3467,6 +3685,7 @@ struct AttemptFailure {
     cause: String,
     boundary: WriteBoundary,
     pre_write_block: Option<Box<PreWriteBlock>>,
+    verify_outcome: Option<NotificationVerifyOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3484,6 +3703,7 @@ impl AttemptFailure {
                 cause: block,
                 observation: None,
             })),
+            verify_outcome: None,
         }
     }
 
@@ -3515,6 +3735,21 @@ impl AttemptFailure {
         )
     }
 
+    /// The pane's manifest requires hook liveness and no admitting edge has
+    /// been published for its current binding. Carries the observation so
+    /// the durable block names the exact binding and the block itself.
+    fn hook_admission_unproven(observation: Option<NotificationPreWriteObservation>) -> Self {
+        Self {
+            cause: HOOK_ADMISSION_UNPROVEN.into(),
+            boundary: WriteBoundary::BeforeWrite,
+            pre_write_block: Some(Box::new(PreWriteBlock {
+                cause: NotificationPreWriteCause::WriteReadinessChanged,
+                observation,
+            })),
+            verify_outcome: None,
+        }
+    }
+
     fn binding_unprovable(observation: Option<NotificationPreWriteObservation>) -> Self {
         Self {
             cause: "binding_unprovable".into(),
@@ -3523,7 +3758,28 @@ impl AttemptFailure {
                 cause: NotificationPreWriteCause::BindingUnprovable,
                 observation,
             })),
+            verify_outcome: None,
         }
+    }
+
+    fn pane_too_narrow(mut observation: NotificationPreWriteObservation) -> Self {
+        observation.required_pane_width = Some(cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH);
+        Self {
+            cause: "pane_too_narrow".into(),
+            boundary: WriteBoundary::BeforeWrite,
+            pre_write_block: Some(Box::new(PreWriteBlock {
+                cause: NotificationPreWriteCause::WriteReadinessChanged,
+                observation: Some(observation),
+            })),
+            verify_outcome: None,
+        }
+    }
+
+    fn composer_ownership_unproven() -> Self {
+        Self::blocked_before_write(
+            "composer_ownership_unproven",
+            NotificationPreWriteCause::ComposerOwnershipUnproven,
+        )
     }
 
     /// Does this failure belong back at the gate rather than in the
@@ -3546,6 +3802,7 @@ impl AttemptFailure {
             cause: "barrier_held".into(),
             boundary: WriteBoundary::BeforeWrite,
             pre_write_block: None,
+            verify_outcome: None,
         }
     }
 
@@ -3553,20 +3810,54 @@ impl AttemptFailure {
         Self::blocked_before_write("spool_failed", NotificationPreWriteCause::SpoolFailed)
     }
 
+    fn paste_command_unwritten() -> Self {
+        Self::blocked_before_write(
+            "paste_command_unwritten",
+            NotificationPreWriteCause::PasteCommandUnwritten,
+        )
+    }
+
     fn paste_failed() -> Self {
         Self {
             cause: "paste_failed".into(),
             boundary: WriteBoundary::AfterWrite,
             pre_write_block: None,
+            verify_outcome: None,
         }
     }
 
     fn verify_failed() -> Self {
+        Self::verify_failed_with(NotificationVerifyOutcome::ambiguous())
+    }
+
+    fn verify_failed_with(verify_outcome: NotificationVerifyOutcome) -> Self {
         Self {
             cause: "verify_failed".into(),
             boundary: WriteBoundary::AfterWrite,
             pre_write_block: None,
+            verify_outcome: Some(verify_outcome),
         }
+    }
+
+    fn verify_timeout() -> Self {
+        Self::verify_failed_with(NotificationVerifyOutcome {
+            kind: NotificationVerifyFailureKind::Timeout,
+            observed_composer: ComposerState::ComposerAmbiguous,
+        })
+    }
+
+    fn verify_mismatch(observed_composer: ComposerState) -> Self {
+        Self::verify_failed_with(NotificationVerifyOutcome {
+            kind: NotificationVerifyFailureKind::Mismatch,
+            observed_composer,
+        })
+    }
+
+    fn verify_owner_missing(observed_composer: ComposerState) -> Self {
+        Self::verify_failed_with(NotificationVerifyOutcome {
+            kind: NotificationVerifyFailureKind::OwnerMissing,
+            observed_composer,
+        })
     }
 
     fn pane_rebound_after_paste() -> Self {
@@ -3574,6 +3865,7 @@ impl AttemptFailure {
             cause: "pane_rebound_after_paste".into(),
             boundary: WriteBoundary::AfterWrite,
             pre_write_block: None,
+            verify_outcome: None,
         }
     }
 
@@ -3582,6 +3874,7 @@ impl AttemptFailure {
             cause: "submit_failed".into(),
             boundary: WriteBoundary::AfterWrite,
             pre_write_block: None,
+            verify_outcome: None,
         }
     }
 
@@ -3593,6 +3886,7 @@ impl AttemptFailure {
             cause: "receipt_occupant_changed".into(),
             boundary: WriteBoundary::AfterWrite,
             pre_write_block: None,
+            verify_outcome: None,
         }
     }
 
@@ -3601,6 +3895,7 @@ impl AttemptFailure {
             cause: "ack_timeout".into(),
             boundary: WriteBoundary::AfterWrite,
             pre_write_block: None,
+            verify_outcome: None,
         }
     }
 
@@ -3611,6 +3906,7 @@ impl AttemptFailure {
             cause: NOTIFICATION_RECORD_FAILED.into(),
             boundary: WriteBoundary::AfterWrite,
             pre_write_block: None,
+            verify_outcome: None,
         }
     }
 
@@ -3619,6 +3915,7 @@ impl AttemptFailure {
             cause: CLAIMED_STAGED_SETTLEMENT_FAILED.into(),
             boundary: WriteBoundary::AfterWrite,
             pre_write_block: None,
+            verify_outcome: None,
         }
     }
 
@@ -3639,12 +3936,14 @@ impl AttemptFailure {
             "barrier_held" => Self::barrier_held(),
             "prewrite_session_detached" => Self::session_detached(),
             "prewrite_binding_unprovable" => Self::binding_unprovable(None),
+            "composer_ownership_unproven" => Self::composer_ownership_unproven(),
             // The pane's binding moved between the proof and the write.
             // Nothing was written, and re-proving it is the gate's job.
             "binding_changed" | "capability_changed" => Self {
                 cause,
                 boundary: WriteBoundary::BeforeWrite,
                 pre_write_block: None,
+                verify_outcome: None,
             },
             "paste_failed" => Self::paste_failed(),
             "verify_failed" => Self::verify_failed(),
@@ -3653,6 +3952,7 @@ impl AttemptFailure {
                 cause,
                 boundary: WriteBoundary::AfterWrite,
                 pre_write_block: None,
+                verify_outcome: None,
             },
         }
     }
@@ -3772,6 +4072,20 @@ async fn attempt_delivery(
                     Some(&format!("not_write_ready:{reason}")),
                 );
                 injector.discard().await;
+                if reason == HOOK_ADMISSION_UNPROVEN {
+                    // Not a readiness flicker: nothing on the pane will
+                    // clear it. Park the wake as a named durable block
+                    // that carries the exact binding it was refused for.
+                    let observation = watcher.pane(&handle.pane_id).and_then(|row| {
+                        let mut observation =
+                            composer_semantic_observation(inner, handle, &row, manifest_id)?;
+                        observation.write_block = Some(HOOK_ADMISSION_UNPROVEN.to_string());
+                        Some(observation)
+                    });
+                    return AttemptOutcome::Failed(AttemptFailure::hook_admission_unproven(
+                        observation,
+                    ));
+                }
                 return AttemptOutcome::Failed(AttemptFailure::pane_rebound_before_paste());
             }
         }
@@ -3808,22 +4122,36 @@ async fn attempt_delivery(
         injector.discard().await;
         return AttemptOutcome::Failed(AttemptFailure::session_detached());
     };
-    let observed_binding = fusion::admitted_binding(inner, handle.session_idx, &final_row);
+    let observed_binding = if inner
+        .fail_next_final_binding_observation
+        .swap(false, Ordering::SeqCst)
+    {
+        None
+    } else {
+        fusion::admitted_binding(inner, handle.session_idx, &final_row)
+    };
+    // Retain the last complete binding that this attempt genuinely observed.
+    // If the terminal lookup itself is unavailable, this prior proof is the
+    // durable baseline that prevents the unchanged occupant from looking like
+    // a new route edge and reopening the same blocked attempt.
+    let evidence_binding = observed_binding.as_ref().or(observed.as_ref());
     let observation =
         handle
             .notification
             .as_ref()
             .map(|notification| NotificationPreWriteObservation {
-                pane_root: observed_binding
-                    .as_ref()
+                pane_root: evidence_binding
                     .and_then(|binding| process_instance_id(binding.pane_root)),
                 selected_manifest: Some(
                     NotificationManifestId::new(manifest_id)
                         .expect("loaded manifest ids are validated before delivery"),
                 ),
-                binding: observed_binding
-                    .as_ref()
+                binding: evidence_binding
                     .and_then(|binding| notification_binding(notification.recipient(), binding)),
+                route_evidence: Some(inner.route_evidence_id(handle.session_idx, &handle.pane_id)),
+                pane_width: Some(final_row.width),
+                required_pane_width: None,
+                write_block: None,
             });
     let proven = match observed_binding {
         // The gate admitted under a manifest, and the live read has to
@@ -3831,11 +4159,37 @@ async fn attempt_delivery(
         // identity while becoming another program.
         Some(binding) if binding.manifest == manifest_id => binding,
         _ => {
+            // Width is a separate paired observation used only by the
+            // pane-too-narrow bookend below. Carrying an observed width
+            // without its required width makes a binding failure invalid
+            // durable data and would strand the attempt in Gating.
+            let observation = observation.map(|mut observation| {
+                observation.pane_width = None;
+                observation
+            });
             gate_line(inner, handle, "rebound", None, Some("binding_unprovable"));
             injector.discard().await;
             return AttemptOutcome::Failed(AttemptFailure::binding_unprovable(observation));
         }
     };
+    if let Some(cause) = notification_prewrite_bookend(
+        &selected,
+        handle
+            .notification
+            .as_ref()
+            .map(NotificationContext::recipient),
+        &proven,
+        final_row.width,
+    ) {
+        injector.discard().await;
+        if cause.starts_with("pane_too_narrow:") {
+            return AttemptOutcome::Failed(AttemptFailure::pane_too_narrow(
+                observation.expect("format 3 belongs to a notification"),
+            ));
+        }
+        return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
+    }
+    inject_pause(inner, "post_final_prewrite").await;
     // The composer hold is installed AT the write boundary, by the injector,
     // not before the attempt and not after it resolves. Installing it before
     // the attempt would catch `spool_failed` and block its bounded transport
@@ -3867,14 +4221,15 @@ async fn attempt_delivery(
             // payload: the same binding, read again, and equal. Nothing
             // has been written yet, so a change here is the world moving
             // rather than a transport failure.
-            let now = match handle_route(inner, handle) {
-                HandleRoute::Exact(watcher) => watcher
-                    .pane(&handle.pane_id)
-                    .ok_or_else(|| "prewrite_session_detached".to_string())
-                    .and_then(|row| {
-                        fusion::admitted_binding(inner, handle.session_idx, &row)
-                            .ok_or_else(|| "prewrite_binding_unprovable".to_string())
-                    })?,
+            let (now, pane_width) = match handle_route(inner, handle) {
+                HandleRoute::Exact(watcher) => {
+                    let row = watcher
+                        .pane(&handle.pane_id)
+                        .ok_or_else(|| "prewrite_session_detached".to_string())?;
+                    let binding = fusion::admitted_binding(inner, handle.session_idx, &row)
+                        .ok_or_else(|| "prewrite_binding_unprovable".to_string())?;
+                    (binding, row.width)
+                }
                 HandleRoute::BindingChanged => return Err("binding_changed".to_string()),
                 HandleRoute::BindingUnprovable { .. } => {
                     return Err("prewrite_binding_unprovable".to_string())
@@ -3884,21 +4239,16 @@ async fn attempt_delivery(
             if now != proven {
                 return Err("binding_changed".to_string());
             }
-            if matches!(selected.transport, Some(NotificationTransport::Doorbell)) {
-                let current = selected.capability.as_ref().is_some_and(|proof| {
-                    proof.recheck(
-                        handle
-                            .notification
-                            .as_ref()
-                            .expect("doorbell transport belongs to a notification")
-                            .recipient(),
-                        proven.agent,
-                        &proven.manifest,
-                    )
-                });
-                if !current {
-                    return Err("capability_changed".to_string());
-                }
+            if let Some(cause) = notification_prewrite_bookend(
+                &selected,
+                handle
+                    .notification
+                    .as_ref()
+                    .map(NotificationContext::recipient),
+                &now,
+                pane_width,
+            ) {
+                return Err(cause);
             }
             let notification_binding = if handle.notification.is_some() {
                 Some((
@@ -3939,11 +4289,14 @@ async fn attempt_delivery(
     .await
     {
         Ok(v) => v,
-        Err(cause) => {
-            if cause == NO_LONGER_CURRENT_BEFORE_WRITE {
-                return AttemptOutcome::NoLongerCurrentBeforeWrite;
-            }
-            return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
+        Err(failure) => {
+            return finish_attempt_delivery_inject_failure(
+                inner,
+                handle,
+                &proven,
+                observation,
+                failure,
+            );
         }
     };
     if let Some(notification) = &handle.notification {
@@ -3985,7 +4338,7 @@ async fn attempt_delivery(
             // Nobody looked, so nobody may press Enter.
             unregister_ack(inner, handle);
             gate_line(inner, handle, "rebound", None, Some("recheck_unobservable"));
-            return AttemptOutcome::Failed(AttemptFailure::verify_failed());
+            return AttemptOutcome::Failed(AttemptFailure::verify_timeout());
         }
     };
     // Not just "something valid is staged": the SAME thing must be staged.
@@ -4001,7 +4354,9 @@ async fn attempt_delivery(
     ) {
         unregister_ack(inner, handle);
         gate_line(inner, handle, "rebound", None, Some("staging_changed"));
-        return AttemptOutcome::Failed(AttemptFailure::verify_failed());
+        return AttemptOutcome::Failed(AttemptFailure::verify_mismatch(
+            ComposerState::ComposerAmbiguous,
+        ));
     }
     // The capture above took time, so the occupant is checked once more
     // after it. Otherwise the last thing proven about who owns the pane is
@@ -4067,7 +4422,9 @@ async fn attempt_delivery(
                         None,
                         Some("staging_changed_after_submit_reservation"),
                     );
-                    return AttemptOutcome::Failed(AttemptFailure::verify_failed());
+                    return AttemptOutcome::Failed(AttemptFailure::verify_mismatch(
+                        ComposerState::ComposerAmbiguous,
+                    ));
                 }
                 if let Err(detail) =
                     notification_staged_action_safe(inner, handle, manifest, &now, &proven)
@@ -4090,7 +4447,7 @@ async fn attempt_delivery(
                     None,
                     Some("reserved_staging_unobservable"),
                 );
-                return AttemptOutcome::Failed(AttemptFailure::verify_failed());
+                return AttemptOutcome::Failed(AttemptFailure::verify_timeout());
             }
         }
     }
@@ -4248,6 +4605,43 @@ async fn attempt_delivery(
         AckOutcome::Rebound => {
             unregister_ack(inner, handle);
             AttemptOutcome::Failed(AttemptFailure::receipt_occupant_changed())
+        }
+    }
+}
+
+/// Resolve the exact injector failure arm of [`attempt_delivery`].
+///
+/// Keeping the durable correction, runtime boundary, and composer hold in one
+/// arm makes their order directly testable without a live tmux process.
+fn finish_attempt_delivery_inject_failure(
+    inner: &Arc<Inner>,
+    handle: &Arc<DeliveryHandle>,
+    proven: &fusion::Binding,
+    observation: Option<NotificationPreWriteObservation>,
+    failure: InjectFailure,
+) -> AttemptOutcome {
+    match failure {
+        InjectFailure::PasteCommandUnwritten => {
+            if let Err(error) = correct_proven_unwritten_paste(handle) {
+                error!(id = %handle.msg_id, error = %error, "notification unwritten correction failed");
+                return AttemptOutcome::Failed(AttemptFailure::notification_record_failed());
+            }
+            rollback_unwritten_hold(inner, handle, proven);
+            AttemptOutcome::Failed(AttemptFailure::paste_command_unwritten())
+        }
+        InjectFailure::Other(cause) => {
+            if cause == NO_LONGER_CURRENT_BEFORE_WRITE {
+                return AttemptOutcome::NoLongerCurrentBeforeWrite;
+            }
+            if let Some(width) = cause
+                .strip_prefix("pane_too_narrow:")
+                .and_then(|width| width.parse::<u32>().ok())
+            {
+                let mut observation = observation.expect("format 3 belongs to a notification");
+                observation.pane_width = Some(width);
+                return AttemptOutcome::Failed(AttemptFailure::pane_too_narrow(observation));
+            }
+            AttemptOutcome::Failed(AttemptFailure::from_inject(cause))
         }
     }
 }
@@ -4520,7 +4914,7 @@ async fn reconcile_claimed_notification_barrier<I: Injector>(
     };
     let staged = match injector.capture_joined_escaped(&handle.pane_id).await {
         Ok(screen) => screen,
-        Err(_) => return AttemptOutcome::Failed(AttemptFailure::verify_failed()),
+        Err(_) => return AttemptOutcome::Failed(AttemptFailure::verify_timeout()),
     };
     if proven_binding_unchanged(inner, handle, proven).is_err() {
         return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
@@ -4565,7 +4959,16 @@ async fn reconcile_claimed_notification_barrier<I: Injector>(
             // input is sent again.
         }
         ClaimedStagedAction::Refuse => {
-            return AttemptOutcome::Failed(AttemptFailure::verify_failed());
+            let failure = match composer {
+                ClaimedStagedComposer::Clean => {
+                    AttemptFailure::verify_owner_missing(ComposerState::ComposerClean)
+                }
+                ClaimedStagedComposer::Ambiguous => AttemptFailure::verify_failed(),
+                ClaimedStagedComposer::ExactDoorbell => {
+                    unreachable!("an exact claimed doorbell cannot select the refusal action")
+                }
+            };
+            return AttemptOutcome::Failed(failure);
         }
     }
 
@@ -4595,7 +4998,8 @@ async fn reconcile_claimed_notification_barrier<I: Injector>(
             &record.attempt_id.to_string(),
             binding.agent,
             binding.manifest.as_str(),
-        );
+        )
+        .await;
     }
     inner
         .composer_recovery
@@ -4825,6 +5229,8 @@ fn process_instance_id(process: crate::identity::ProcId) -> Option<ProcessInstan
 }
 
 fn binding_unprovable_observation(
+    inner: &Inner,
+    handle: &DeliveryHandle,
     pane_pid: i32,
     manifest_id: &str,
 ) -> NotificationPreWriteObservation {
@@ -4832,6 +5238,10 @@ fn binding_unprovable_observation(
         pane_root: process_instance(pane_pid),
         selected_manifest: NotificationManifestId::new(manifest_id).ok(),
         binding: None,
+        route_evidence: Some(inner.route_evidence_id(handle.session_idx, &handle.pane_id)),
+        pane_width: None,
+        required_pane_width: None,
+        write_block: None,
     }
 }
 
@@ -4860,6 +5270,10 @@ fn composer_semantic_observation(
         pane_root: Some(process_instance_id(binding.pane_root)?),
         selected_manifest: Some(NotificationManifestId::new(&binding.manifest).ok()?),
         binding: Some(notification_binding(notification.recipient(), &binding)?),
+        route_evidence: Some(inner.route_evidence_id(handle.session_idx, &handle.pane_id)),
+        pane_width: None,
+        required_pane_width: None,
+        write_block: None,
     })
 }
 
@@ -4893,6 +5307,12 @@ pub(crate) async fn inject_pause(inner: &Arc<Inner>, phase: &'static str) {
 /// could not read who is in the pane.
 const OBSERVATION_HOLD: &str = "occupant_unprovable";
 const WRITE_READINESS_OBSERVATION_HOLD: &str = "not_write_ready:occupant_unprovable";
+/// The write block a hook-liveness manifest stamps when no admitting hook
+/// edge has been published for the pane's current binding. Durable, never
+/// retried: the wake parks as a named pre-write block until the recipient
+/// claims, its next admitting edge reopens the oldest attempt once, or an
+/// administrator withdraws the exact attempt.
+pub(crate) const HOOK_ADMISSION_UNPROVEN: &str = "hook_admission_unproven";
 
 /// How long that one cause waits before looking again. Short enough that
 /// a transient `ps` failure costs a person nothing, long enough that a
@@ -4943,7 +5363,7 @@ async fn fail_attempt(
         DeliveryState::Submitted,
         DeliveryState::RetryQueued,
     ];
-    if should_retry(failure, spent, inner.cfg.delivery_retry_max) {
+    if should_retry_attempt(handle, failure, spent, inner.cfg.delivery_retry_max) {
         advance(
             inner,
             handle,
@@ -4975,7 +5395,13 @@ async fn fail_attempt(
         }
         if matches!(failure.boundary, WriteBoundary::AfterWrite) {
             if let Some(notification) = &handle.notification {
-                match notification.record_attention(notification_attention_cause(&failure.cause)) {
+                let result = match failure.verify_outcome {
+                    Some(outcome) => notification.record_verify_attention(outcome),
+                    None => {
+                        notification.record_attention(notification_attention_cause(&failure.cause))
+                    }
+                };
+                match result {
                     Ok(record) => {
                         if record.needs_exact_owned_reconciliation() {
                             crate::attention_resolution::schedule_exact_owned_reconciliation(
@@ -5044,7 +5470,31 @@ fn notification_attention_cause(cause: &str) -> NotificationAttentionCause {
 }
 
 fn should_retry(failure: &AttemptFailure, spent: u32, retry_max: u32) -> bool {
-    matches!(failure.boundary, WriteBoundary::BeforeWrite) && spent <= retry_max
+    // Unproven hook admission is a durable block, never a retry budget
+    // question: only an admitting edge, a claim, or a withdrawal moves it.
+    if failure.cause == HOOK_ADMISSION_UNPROVEN {
+        return false;
+    }
+    matches!(failure.boundary, WriteBoundary::BeforeWrite)
+        && !matches!(
+            failure.cause.as_str(),
+            "pane_too_narrow" | "composer_ownership_unproven" | "binding_unprovable"
+        )
+        && spent <= retry_max
+}
+
+fn should_retry_attempt(
+    handle: &DeliveryHandle,
+    failure: &AttemptFailure,
+    spent: u32,
+    retry_max: u32,
+) -> bool {
+    // A workspace notification already has a durable Writing fact. Its exact
+    // zero-byte correction must remain withdrawable instead of being replayed
+    // automatically. Legacy direct delivery has no such durable attempt and
+    // may use the existing bounded pre-write retry.
+    !(handle.notification.is_some() && failure.cause == "paste_command_unwritten")
+        && should_retry(failure, spent, retry_max)
 }
 
 fn notify_attention(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>, cause: &str) {
@@ -5250,7 +5700,7 @@ enum GateOutcome {
     /// operator-withdrawable without touching the pane.
     BlockedPreWrite {
         cause: NotificationPreWriteCause,
-        observation: NotificationPreWriteObservation,
+        observation: Box<NotificationPreWriteObservation>,
     },
     /// A mailbox notification remains durably queued or gating. The
     /// in-memory worker stops, and the next route or restart reconciliation
@@ -5341,6 +5791,36 @@ async fn gate(
                             };
                         };
                         let manifest_id = manifest.agent.id.clone();
+                        // Screen evidence cannot repair a manifest that has no
+                        // composer ownership vocabulary. Settle that static
+                        // configuration failure before waiting on pane events.
+                        if handle.notification.is_some()
+                            && !manifest
+                                .rules
+                                .iter()
+                                .any(|rule| rule.composer_semantic.is_some())
+                        {
+                            let Some(observation) =
+                                composer_semantic_observation(inner, handle, &row, &manifest_id)
+                            else {
+                                if last_hold.as_deref() == Some(OBSERVATION_HOLD) {
+                                    return GateOutcome::BlockedPreWrite {
+                                        cause: NotificationPreWriteCause::BindingUnprovable,
+                                        observation: Box::new(binding_unprovable_observation(
+                                            inner,
+                                            handle,
+                                            row.pane_pid,
+                                            &manifest_id,
+                                        )),
+                                    };
+                                }
+                                break 'pane Some(OBSERVATION_HOLD.to_string());
+                            };
+                            return GateOutcome::BlockedPreWrite {
+                                cause: NotificationPreWriteCause::ComposerSemanticMissing,
+                                observation: Box::new(observation),
+                            };
+                        }
                         let Some(det) = fusion::recompute_pane(
                             inner,
                             handle.session_idx,
@@ -5358,6 +5838,64 @@ async fn gate(
                                 cause: "no_such_pane".to_string(),
                             };
                         };
+                        let screen_reports_idle = det.readings.iter().any(|reading| {
+                            reading.sensor == Sensor::Screen && reading.state == AgentState::Idle
+                        });
+                        if handle.notification.is_some() && screen_reports_idle {
+                            if composer_semantic_missing(manifest, &det) {
+                                if let Some(observation) =
+                                    composer_semantic_observation(inner, handle, &row, &manifest_id)
+                                {
+                                    return GateOutcome::BlockedPreWrite {
+                                        cause: NotificationPreWriteCause::ComposerSemanticMissing,
+                                        observation: Box::new(observation),
+                                    };
+                                }
+                            }
+                            if fusion::admitted_binding(inner, handle.session_idx, &row).is_none() {
+                                if last_hold.as_deref() == Some(OBSERVATION_HOLD) {
+                                    return GateOutcome::BlockedPreWrite {
+                                        cause: NotificationPreWriteCause::BindingUnprovable,
+                                        observation: Box::new(binding_unprovable_observation(
+                                            inner,
+                                            handle,
+                                            row.pane_pid,
+                                            &manifest_id,
+                                        )),
+                                    };
+                                }
+                                break 'pane Some(OBSERVATION_HOLD.to_string());
+                            }
+                        }
+                        // Unproven hook admission is a durable block, not a
+                        // hold: no pane event clears it, only an admitting
+                        // edge from this boot, a claim, or a withdrawal. The
+                        // pane fuses to unknown under it, so this is decided
+                        // before the state match parks it on an event.
+                        if handle.notification.is_some()
+                            && det.write_block.as_deref() == Some(HOOK_ADMISSION_UNPROVEN)
+                        {
+                            let Some(mut observation) =
+                                composer_semantic_observation(inner, handle, &row, &manifest_id)
+                            else {
+                                return GateOutcome::BlockedPreWrite {
+                                    cause: NotificationPreWriteCause::BindingUnprovable,
+                                    observation: Box::new(binding_unprovable_observation(
+                                        inner,
+                                        handle,
+                                        row.pane_pid,
+                                        &manifest_id,
+                                    )),
+                                };
+                            };
+                            // No width fields: a width pair is a different
+                            // block, and a lone width is refused as partial.
+                            observation.write_block = Some(HOOK_ADMISSION_UNPROVEN.to_string());
+                            return GateOutcome::BlockedPreWrite {
+                                cause: NotificationPreWriteCause::WriteReadinessChanged,
+                                observation: Box::new(observation),
+                            };
+                        }
                         match det.state {
                             AgentState::Idle => {
                                 // Runtime idle is not permission to write. A
@@ -5393,9 +5931,13 @@ async fn gate(
                                                 return GateOutcome::BlockedPreWrite {
                                                     cause:
                                                         NotificationPreWriteCause::BindingUnprovable,
-                                                    observation: binding_unprovable_observation(
-                                                        row.pane_pid,
-                                                        &manifest_id,
+                                                    observation: Box::new(
+                                                        binding_unprovable_observation(
+                                                            inner,
+                                                            handle,
+                                                            row.pane_pid,
+                                                            &manifest_id,
+                                                        ),
                                                     ),
                                                 };
                                             }
@@ -5430,10 +5972,12 @@ async fn gate(
                                     {
                                         return GateOutcome::BlockedPreWrite {
                                             cause: NotificationPreWriteCause::BindingUnprovable,
-                                            observation: binding_unprovable_observation(
+                                            observation: Box::new(binding_unprovable_observation(
+                                                inner,
+                                                handle,
                                                 row.pane_pid,
                                                 &manifest_id,
-                                            ),
+                                            )),
                                         };
                                     }
                                     (false, Some("no_write_safe_composer_evidence"))
@@ -5448,16 +5992,20 @@ async fn gate(
                                         ) else {
                                             return GateOutcome::BlockedPreWrite {
                                                 cause: NotificationPreWriteCause::BindingUnprovable,
-                                                observation: binding_unprovable_observation(
-                                                    row.pane_pid,
-                                                    &manifest_id,
+                                                observation: Box::new(
+                                                    binding_unprovable_observation(
+                                                        inner,
+                                                        handle,
+                                                        row.pane_pid,
+                                                        &manifest_id,
+                                                    ),
                                                 ),
                                             };
                                         };
                                         return GateOutcome::BlockedPreWrite {
                                             cause:
                                                 NotificationPreWriteCause::ComposerSemanticMissing,
-                                            observation,
+                                            observation: Box::new(observation),
                                         };
                                     }
                                     (false, reason) => Some(format!(
@@ -5785,6 +6333,19 @@ fn rollback_unwritten_hold(
     }
 }
 
+/// Correct the provisional boundary after tmux proves that its command pipe
+/// accepted no byte of the paste command.
+///
+/// The durable correction must succeed before the runtime boundary is cleared.
+/// Otherwise restart recovery must continue treating the attempt as post-write.
+fn correct_proven_unwritten_paste(handle: &DeliveryHandle) -> Result<(), NotificationAdapterError> {
+    if let Some(notification) = &handle.notification {
+        notification.record_paste_command_unwritten()?;
+    }
+    handle.write_boundary_crossed.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
 /// Releases a claimed composer barrier if the synchronous boundary hook unwinds.
 struct UnwrittenHold<'a> {
     inner: &'a Arc<Inner>,
@@ -6106,9 +6667,10 @@ pub(crate) trait Injector {
     /// submitting.
     ///
     /// `on_write` runs immediately before the pane is asked to take it,
-    /// which is the write boundary: everything before it is provably
-    /// retryable, and everything from it onward may have left text in
-    /// somebody's composer.
+    /// which arms the conservative write boundary: everything before it is
+    /// provably retryable, and everything from it onward may have left text
+    /// in somebody's composer. Only a transport result proving that the
+    /// command pipe accepted zero bytes can correct that boundary.
     ///
     /// It can FAIL, and then nothing is written. The barrier it installs
     /// is what stops the next delivery pasting over this one, so a paste
@@ -6119,7 +6681,7 @@ pub(crate) trait Injector {
         &self,
         pane_id: &str,
         on_write: &(dyn Fn() -> Result<(), String> + Sync),
-    ) -> Result<(), String>;
+    ) -> Result<(), InjectFailure>;
 
     /// Drop a spooled payload the attempt is not going to write.
     async fn discard(&self);
@@ -6136,6 +6698,27 @@ pub(crate) trait Injector {
     /// composer extraction compares these logical rows with the bytes that
     /// were spooled.
     async fn capture_joined_escaped(&self, pane_id: &str) -> Result<String, String>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InjectFailure {
+    /// The tmux command pipe accepted no byte of the paste command.
+    PasteCommandUnwritten,
+    /// Every other refusal or ambiguous outcome keeps its existing cause.
+    Other(String),
+}
+
+impl From<String> for InjectFailure {
+    fn from(cause: String) -> Self {
+        Self::Other(cause)
+    }
+}
+
+fn classify_paste_buffer_failure(error: TmuxError) -> InjectFailure {
+    match error {
+        TmuxError::Io(_) => InjectFailure::PasteCommandUnwritten,
+        _ => InjectFailure::Other("paste_failed".to_string()),
+    }
 }
 
 /// The tmux paste path: load-buffer through the adapter's private spool
@@ -6160,7 +6743,8 @@ impl Injector for TmuxInjector {
             // Loading the private spool buffer happens before tmux is asked
             // to write to the pane, regardless of how the load command
             // failed. It is therefore safe to retry under the bounded
-            // pre-write budget; only paste-buffer failures are ambiguous.
+            // pre-write budget. A paste-buffer failure stays ambiguous unless
+            // the command pipe proves that it accepted zero command bytes.
             return Err("spool_failed".to_string());
         }
         Ok(())
@@ -6174,11 +6758,12 @@ impl Injector for TmuxInjector {
         &self,
         pane_id: &str,
         on_write: &(dyn Fn() -> Result<(), String> + Sync),
-    ) -> Result<(), String> {
+    ) -> Result<(), InjectFailure> {
         // The write boundary. Spooling is behind us and provably touched
-        // no pane; the next call may put text in somebody's composer, and
-        // its failure is ambiguous about whether it did. Whatever this
-        // hook installs has to be installed BEFORE the await, not after
+        // no pane; the next call may put text in somebody's composer. Every
+        // outcome except an exact zero-byte command failure is ambiguous
+        // about whether it did. Whatever this hook installs has to be
+        // installed BEFORE the await, not after
         // it returns, or an outcome that leaves a payload behind can be
         // acted on by another delivery first.
         //
@@ -6188,7 +6773,7 @@ impl Injector for TmuxInjector {
         // budget.
         if let Err(cause) = on_write() {
             let _ = self.client.delete_buffer(&self.buffer).await;
-            return Err(cause);
+            return Err(InjectFailure::Other(cause));
         }
         if let Err(e) = self
             .client
@@ -6200,7 +6785,7 @@ impl Injector for TmuxInjector {
             // server-global with the payload in it. Best effort: the buffer
             // dies with the server either way.
             let _ = self.client.delete_buffer(&self.buffer).await;
-            return Err("paste_failed".to_string());
+            return Err(classify_paste_buffer_failure(e));
         }
         Ok(())
     }
@@ -6265,7 +6850,7 @@ async fn inject<I: Injector>(
     target: StagingTarget<'_>,
     expected_payload: &str,
     on_write: &(dyn Fn() -> Result<(), String> + Sync),
-) -> Result<(String, bool, String), String> {
+) -> Result<(String, bool, String), InjectFailure> {
     injector.commit(&handle.pane_id, on_write).await?;
     // The capture flavor follows the manifest's composer discriminators:
     // esc rules need the SGR-escaped grid or they fail closed, and a
@@ -6297,7 +6882,7 @@ async fn inject<I: Injector>(
             Err(e) => debug!(error = %e, "verify capture failed"),
         }
     }
-    Err("verify_failed".to_string())
+    Err(InjectFailure::Other("verify_failed".to_string()))
 }
 
 /// What representation is visible in the active composer.
@@ -8661,12 +9246,14 @@ mod tests {
     use std::sync::Barrier;
 
     use cyclops_proto::{
-        MessageId, MessagePresentation, NotificationAttemptId, NotificationState, RecipientKey,
-        RecipientPresentation, SessionInstanceId, TmuxPaneId, WorkspaceId,
+        ComposerHold, MessageId, MessagePresentation, NotificationAttemptId, NotificationState,
+        RecipientKey, RecipientPresentation, SessionInstanceId, TmuxPaneId, WorkspaceId,
     };
     use cyclops_state::StateRoot;
 
-    use crate::mailbox::{MessageDraft, MessageStore};
+    use crate::mailbox::{
+        MailboxDirectory, MailboxIdentity, MailboxSend, MailboxService, MessageDraft, MessageStore,
+    };
 
     struct NotificationScratch(PathBuf);
 
@@ -8768,6 +9355,12 @@ mod tests {
             ))
         );
 
+        record.doorbell_format = Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM);
+        assert_eq!(
+            expected_notification_payload(&record, &message),
+            Some(cyclops_proto::render_doorbell_v3(record.attempt_id))
+        );
+
         record.transport = NotificationTransport::DirectPayload;
         assert_eq!(expected_notification_payload(&record, &message), None);
 
@@ -8838,7 +9431,7 @@ mod tests {
     }
 
     fn test_worker_task() -> JoinHandle<()> {
-        tokio::spawn(async {})
+        tokio::spawn(std::future::pending())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8956,14 +9549,17 @@ mod tests {
             }
         });
 
-        assert!(result.is_none());
+        assert_eq!(
+            result.err(),
+            Some(NotificationEnqueueRefusal::DaemonStopping)
+        );
         assert!(!spawned.load(Ordering::SeqCst));
         assert!(engine.take_notification_worker_tasks().is_empty());
         assert!(engine.take_legacy_worker_tasks().is_empty());
     }
 
     #[tokio::test]
-    async fn status_worker_ownership_excludes_queued_and_different_attempts() {
+    async fn status_worker_ownership_requires_a_live_current_or_queued_attempt() {
         let engine = Engine::new();
         let (_scratch, _store, context, handle, recipient) =
             notification_fixture("status-worker-owner");
@@ -8972,10 +9568,7 @@ mod tests {
             .enqueue_notification_worker(recipient, Arc::clone(&handle), |_| test_worker_task())
             .expect("engine is running");
 
-        assert!(
-            !engine.notification_worker_owns(recipient, attempt),
-            "a queued handle was reported as active work"
-        );
+        assert!(engine.notification_worker_owns(recipient, attempt));
         let current = worker
             .current_or_next()
             .expect("queued handle becomes current");
@@ -8985,6 +9578,10 @@ mod tests {
         assert!(
             !engine.notification_worker_owns(recipient, attempt),
             "a faulted worker cannot advertise automatic reconciliation"
+        );
+        assert_eq!(
+            engine.notification_worker_refusal(recipient, attempt),
+            Some(NotificationEnqueueRefusal::WorkerFaulted)
         );
         assert!(worker.finish(&current));
         assert!(!engine.notification_worker_owns(recipient, attempt));
@@ -9034,13 +9631,19 @@ mod tests {
         let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
         let recipient = churn_recipient(workspace, 700);
         let first = DeliveryHandle::new("m-worker-first", "worker", "%1", 0, "first".into());
+        let fail = Arc::new(Notify::new());
         let worker = engine
-            .enqueue_notification_worker(recipient, Arc::clone(&first), |_| {
-                tokio::spawn(async move {
-                    panic!("simulated notification worker failure");
-                })
+            .enqueue_notification_worker(recipient, Arc::clone(&first), {
+                let fail = Arc::clone(&fail);
+                move |_| {
+                    tokio::spawn(async move {
+                        fail.notified().await;
+                        panic!("simulated notification worker failure");
+                    })
+                }
             })
             .expect("engine is running");
+        fail.notify_one();
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let finished = engine
@@ -9061,12 +9664,19 @@ mod tests {
         .expect("failed worker task finishes");
 
         let second = DeliveryHandle::new("m-worker-second", "worker", "%1", 0, "second".into());
-        let reused = engine
+        let refusal = engine
             .enqueue_notification_worker(recipient, Arc::clone(&second), |_| {
                 panic!("a failed supervisor must not restart on later traffic")
             })
-            .expect("engine is running");
-        assert!(Arc::ptr_eq(&worker, &reused));
+            .err();
+        assert_eq!(
+            refusal,
+            Some(NotificationEnqueueRefusal::WorkerSupervisorExited)
+        );
+        assert_eq!(
+            engine.notification_worker_refusal(recipient, NotificationAttemptId::generate()),
+            Some(NotificationEnqueueRefusal::WorkerSupervisorExited)
+        );
         assert!(worker.current().is_none());
         assert!(
             engine
@@ -9097,7 +9707,7 @@ mod tests {
                 .iter()
                 .map(|handle| handle.msg_id.as_str())
                 .collect::<Vec<_>>(),
-            ["m-worker-first", "m-worker-second"]
+            ["m-worker-first"]
         );
 
         let tasks = engine.take_notification_worker_tasks();
@@ -9144,7 +9754,7 @@ mod tests {
                     start.wait();
                     engine
                         .enqueue_notification_worker(recipient, next, move |_| {
-                            runtime.spawn(async {})
+                            runtime.spawn(std::future::pending::<()>())
                         })
                         .expect("engine is running")
                 }
@@ -9425,6 +10035,21 @@ mod tests {
                 true,
             ),
             (AttemptFailure::spool_failed(), "spool_failed", true),
+            (
+                AttemptFailure::paste_command_unwritten(),
+                "paste_command_unwritten",
+                true,
+            ),
+            (
+                AttemptFailure::composer_ownership_unproven(),
+                "composer_ownership_unproven",
+                false,
+            ),
+            (
+                AttemptFailure::binding_unprovable(None),
+                "binding_unprovable",
+                false,
+            ),
             (AttemptFailure::paste_failed(), "paste_failed", false),
             (AttemptFailure::verify_failed(), "verify_failed", false),
             (
@@ -9451,10 +10076,114 @@ mod tests {
         let exhausted = AttemptFailure::spool_failed();
         assert!(!should_retry(&exhausted, 2, 1));
 
+        assert_eq!(
+            AttemptFailure::verify_failed().verify_outcome,
+            Some(NotificationVerifyOutcome::ambiguous())
+        );
+        assert_eq!(
+            AttemptFailure::verify_timeout().verify_outcome,
+            Some(NotificationVerifyOutcome {
+                kind: NotificationVerifyFailureKind::Timeout,
+                observed_composer: ComposerState::ComposerAmbiguous,
+            })
+        );
+        assert_eq!(
+            AttemptFailure::verify_mismatch(ComposerState::HumanDraft).verify_outcome,
+            Some(NotificationVerifyOutcome {
+                kind: NotificationVerifyFailureKind::Mismatch,
+                observed_composer: ComposerState::HumanDraft,
+            })
+        );
+        assert_eq!(
+            AttemptFailure::verify_owner_missing(ComposerState::ComposerClean).verify_outcome,
+            Some(NotificationVerifyOutcome {
+                kind: NotificationVerifyFailureKind::OwnerMissing,
+                observed_composer: ComposerState::ComposerClean,
+            })
+        );
+
+        let pane_too_narrow = AttemptFailure::pane_too_narrow(NotificationPreWriteObservation {
+            pane_root: Some(ProcessInstanceId::new(1, 1).unwrap()),
+            selected_manifest: Some(NotificationManifestId::new("codex").unwrap()),
+            binding: None,
+            route_evidence: None,
+            pane_width: Some(cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH - 1),
+            required_pane_width: None,
+            write_block: None,
+        });
+        assert!(!should_retry(&pane_too_narrow, 0, 3));
+        assert_eq!(
+            pane_too_narrow.pre_write_block.as_deref().unwrap().cause,
+            NotificationPreWriteCause::WriteReadinessChanged
+        );
+        assert_eq!(
+            pane_too_narrow
+                .pre_write_block
+                .as_deref()
+                .and_then(|block| block.observation.as_ref())
+                .and_then(|observation| observation.required_pane_width),
+            Some(cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH)
+        );
+
         // The production mapping keeps unknown injector errors conservative
         // too: they can never opt into the pre-write retry budget.
         let unknown = AttemptFailure::from_inject("future_failure".into());
         assert!(!should_retry(&unknown, 1, 1));
+    }
+
+    #[test]
+    fn capability_loss_outranks_a_narrow_format_3_pane() {
+        let scratch = NotificationScratch(cyclops_proto::scratch::scratch_dir(&format!(
+            "capability-bookend-{}",
+            uuid::Uuid::new_v4()
+        )));
+        std::fs::create_dir_all(&scratch.0).unwrap();
+        let file = scratch.0.join("SKILL.md");
+        std::fs::write(&file, mailbox_capability::SHIPPED_SKILL).unwrap();
+        let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let session = SessionInstanceId::from_str("00000000-0000-4000-8000-000000000002").unwrap();
+        let recipient =
+            RecipientKey::agent(workspace, session, TmuxPaneId::from_str("%1").unwrap());
+        let agent = crate::identity::ProcId { pid: 42, birth: 7 };
+        let selected = AttemptPayload {
+            bytes: "doorbell".to_string(),
+            transport: Some(NotificationTransport::Doorbell),
+            doorbell_format: Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
+            capability: Some(MailboxCapabilityProof {
+                recipient,
+                agent,
+                manifest: "codex".to_string(),
+                file: file.clone(),
+                expected_digest: mailbox_capability::file_digest(&file).unwrap(),
+            }),
+        };
+        let binding = fusion::Binding {
+            pane_root: crate::identity::ProcId { pid: 40, birth: 5 },
+            leader: crate::identity::ProcId { pid: 41, birth: 6 },
+            agent,
+            manifest: "codex".to_string(),
+        };
+        let narrow = cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH - 1;
+
+        assert_eq!(
+            notification_prewrite_bookend(&selected, Some(recipient), &binding, narrow),
+            Some(format!("pane_too_narrow:{narrow}"))
+        );
+        assert_eq!(
+            notification_prewrite_bookend(
+                &selected,
+                Some(recipient),
+                &binding,
+                cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH,
+            ),
+            None,
+            "an exact current capability and safe width pass the prewrite bookend"
+        );
+        std::fs::write(&file, "operator edit").unwrap();
+        assert_eq!(
+            notification_prewrite_bookend(&selected, Some(recipient), &binding, narrow),
+            Some("capability_changed".to_string())
+        );
     }
 
     #[test]
@@ -9479,6 +10208,14 @@ mod tests {
             (
                 AttemptFailure::spool_failed(),
                 NotificationPreWriteCause::SpoolFailed,
+            ),
+            (
+                AttemptFailure::paste_command_unwritten(),
+                NotificationPreWriteCause::PasteCommandUnwritten,
+            ),
+            (
+                AttemptFailure::composer_ownership_unproven(),
+                NotificationPreWriteCause::ComposerOwnershipUnproven,
             ),
         ];
 
@@ -10215,6 +10952,169 @@ composer_trailer_required_prefix = 1
         spooled: StdMutex<Option<String>>,
     }
 
+    struct UnwrittenCommitInjector;
+
+    impl Injector for UnwrittenCommitInjector {
+        async fn spool(&self, _payload: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn commit(
+            &self,
+            _pane_id: &str,
+            on_write: &(dyn Fn() -> Result<(), String> + Sync),
+        ) -> Result<(), InjectFailure> {
+            on_write().map_err(InjectFailure::Other)?;
+            Err(InjectFailure::PasteCommandUnwritten)
+        }
+
+        async fn discard(&self) {}
+
+        async fn submit(&self, _pane_id: &str, _key: &str) -> Result<(), String> {
+            panic!("an unwritten paste must not submit")
+        }
+
+        async fn capture_joined_escaped(&self, _pane_id: &str) -> Result<String, String> {
+            panic!("an unwritten paste must not verify")
+        }
+    }
+
+    fn unwritten_test_inner(path: &Path) -> Arc<Inner> {
+        let state_root = Arc::new(StateRoot::open_or_create(path).unwrap());
+        let (registry, _) = crate::registry::Registry::load(Arc::clone(&state_root));
+        let workspace_id = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let session_identities = crate::sessionstore::SessionIdentities::open(&state_root).unwrap();
+        Arc::new(Inner {
+            cfg: crate::Config::defaults(path),
+            state_root,
+            state_repair: cyclops_state::RepairSummary::default(),
+            workspace_id,
+            session_identities: StdMutex::new(session_identities),
+            mailbox: None,
+            composer_recovery: StdMutex::new(
+                crate::composer_recovery::RecoveryCoordinator::default(),
+            ),
+            mailbox_publication: StdMutex::new(()),
+            mailbox_publish_pause: StdMutex::new(None),
+            boot_id: "b-unwritten-test".into(),
+            started: std::time::Instant::now(),
+            tmux_version: "test".into(),
+            manifests: std::collections::BTreeMap::new(),
+            manifest_dir: None,
+            sessions: StdMutex::new(Vec::new()),
+            session_registration: StdMutex::new(()),
+            events: broadcast::channel(16).0,
+            detections: StdMutex::new(HashMap::new()),
+            pane_recomputes: StdMutex::new(HashMap::new()),
+            route_evidence_generations: StdMutex::new(HashMap::new()),
+            lifecycle_rechecks: StdMutex::new(HashMap::new()),
+            registry: StdMutex::new(registry),
+            theme: StdMutex::new(cyclops_theme::ThemeWatch::new(path)),
+            hook_readings: StdMutex::new(HashMap::new()),
+            hook_lifecycle: StdMutex::new(crate::hook_lifecycle::Store::new()),
+            turn_ends: StdMutex::new(crate::turnkey::Ends::new()),
+            argv_cache: StdMutex::new(HashMap::new()),
+            engine: Engine::new(),
+            ack_state: crate::ack::AckState::new(),
+            hook_liveness: crate::selftest::HookLiveness::new(),
+            inject_pause: StdMutex::new(None),
+            fail_chrome_restore: AtomicBool::new(false),
+            fail_next_final_binding_observation: AtomicBool::new(false),
+            workspace_ui: StdMutex::new(crate::workspace_ui::WorkspaceUiState::default()),
+            shutdown_request: watch::channel(false).0,
+            stop: watch::channel(false).1,
+            extra_tasks: StdMutex::new(Vec::new()),
+        })
+    }
+
+    fn unwritten_test_binding() -> fusion::Binding {
+        fusion::Binding {
+            pane_root: crate::identity::ProcId {
+                pid: 3999,
+                birth: 817_999,
+            },
+            leader: crate::identity::ProcId {
+                pid: 4000,
+                birth: 818_000,
+            },
+            agent: crate::identity::ProcId {
+                pid: 4242,
+                birth: 818_221,
+            },
+            manifest: "codex".into(),
+        }
+    }
+
+    fn seed_unwritten_test_composer(inner: &Arc<Inner>, binding: &fusion::Binding) {
+        inner.detections.lock().unwrap().insert(
+            PaneKey::new(0, "%1"),
+            crate::DetEntry {
+                detection: Detection {
+                    state: AgentState::Idle,
+                    readings: Vec::new(),
+                    disagreement: false,
+                    decided_by: "test".into(),
+                    stale: false,
+                    write_ready: true,
+                    write_block: None,
+                    composer_semantic: Some(ComposerSemantic::Clean),
+                },
+                binding: Some(binding.clone()),
+                manifest: Some(binding.manifest.clone()),
+                occupant: Some(binding.leader.pid),
+                agent: Some(binding.agent),
+                in_mode: false,
+                quota_screen_clear: false,
+                hold: ComposerHold::Clear,
+                turn: None,
+                hold_owner: None,
+                composer: crate::ComposerProjection::default(),
+                working_confirmed: false,
+                since: std::time::Instant::now(),
+            },
+        );
+    }
+
+    async fn run_unwritten_attempt_arm(
+        inner: &Arc<Inner>,
+        handle: &Arc<DeliveryHandle>,
+        binding: &fusion::Binding,
+    ) -> AttemptOutcome {
+        let payload = handle.payload();
+        let manifest = sentinel_manifest();
+        let failure = inject(
+            &UnwrittenCommitInjector,
+            handle,
+            &manifest,
+            StagingTarget::ExactRow(&payload),
+            &payload,
+            &|| {
+                latch_hold(inner, handle, binding)?;
+                let mut unwritten_hold = UnwrittenHold::new(inner, handle, binding);
+                if let Some(notification) = &handle.notification {
+                    notification
+                        .record_writing(
+                            ProcessInstanceId::new(binding.pane_root.pid, binding.pane_root.birth)
+                                .unwrap(),
+                            ProcessInstanceId::new(binding.leader.pid, binding.leader.birth)
+                                .unwrap(),
+                            ProcessInstanceId::new(binding.agent.pid, binding.agent.birth).unwrap(),
+                            &binding.manifest,
+                            NotificationTransport::Doorbell,
+                            None,
+                        )
+                        .map_err(notification_write_cause)?;
+                }
+                handle.write_boundary_crossed.store(true, Ordering::SeqCst);
+                unwritten_hold.commit();
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("test injector proves the paste command was unwritten");
+        finish_attempt_delivery_inject_failure(inner, handle, binding, None, failure)
+    }
+
     impl MockInjector {
         pub(super) fn new(screens: Vec<&str>) -> MockInjector {
             MockInjector {
@@ -10251,8 +11151,8 @@ composer_trailer_required_prefix = 1
             &self,
             _pane_id: &str,
             on_write: &(dyn Fn() -> Result<(), String> + Sync),
-        ) -> Result<(), String> {
-            on_write()?;
+        ) -> Result<(), InjectFailure> {
+            on_write().map_err(InjectFailure::Other)?;
             let payload = self
                 .spooled
                 .lock()
@@ -10330,6 +11230,303 @@ composer_trailer_required_prefix = 1
         assert_eq!(notified.binding.unwrap().manifest.as_str(), "codex");
     }
 
+    #[test]
+    fn a_proven_unwritten_paste_restores_a_withdrawable_notification_state() {
+        let (scratch, store, context, handle, recipient) =
+            notification_fixture("paste-command-unwritten");
+        context.record_gating().unwrap();
+        context
+            .record_writing(
+                ProcessInstanceId::new(3999, 817_999).unwrap(),
+                ProcessInstanceId::new(4000, 818_000).unwrap(),
+                ProcessInstanceId::new(4242, 818_221).unwrap(),
+                "codex",
+                NotificationTransport::Doorbell,
+                Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .projection()
+                .active_notification_barriers()
+                .len(),
+            1
+        );
+
+        let blocked = context.record_paste_command_unwritten().unwrap();
+
+        assert_eq!(blocked.state, NotificationState::BlockedPreWrite);
+        assert_eq!(
+            blocked.pre_write_cause,
+            Some(NotificationPreWriteCause::PasteCommandUnwritten)
+        );
+        assert!(blocked.state.can_withdraw_before_write());
+        assert_eq!(blocked.binding, None);
+        assert_eq!(blocked.doorbell_format, None);
+        assert!(store
+            .lock()
+            .unwrap()
+            .projection()
+            .active_notification_barriers()
+            .is_empty());
+        assert_eq!(
+            notification_state(&store, recipient, context.message_id()),
+            blocked
+        );
+        let failure = AttemptFailure::paste_command_unwritten();
+        assert_eq!(failure.boundary, WriteBoundary::BeforeWrite);
+        assert!(!should_retry_attempt(&handle, &failure, 0, 3));
+        let direct = DeliveryHandle::new(
+            "m-direct-unwritten",
+            "reviewer",
+            "%1",
+            0,
+            "payload".to_string(),
+        );
+        assert!(should_retry_attempt(&direct, &failure, 0, 3));
+
+        let message_id = context.message_id().clone();
+        drop(handle);
+        drop(context);
+        drop(store);
+        let root = StateRoot::open_or_create(&scratch.0).unwrap();
+        let mut replayed = MessageStore::open(
+            &root,
+            Path::new("workspaces/current/messages.ndjson"),
+            recipient.workspace_id(),
+            "replay",
+        )
+        .unwrap();
+        let replayed_record = replayed
+            .projection()
+            .notification(recipient, &message_id)
+            .unwrap();
+        assert_eq!(replayed_record.state, NotificationState::BlockedPreWrite);
+        assert_eq!(
+            replayed_record.pre_write_cause,
+            Some(NotificationPreWriteCause::PasteCommandUnwritten)
+        );
+        assert!(replayed
+            .projection()
+            .active_notification_barriers()
+            .is_empty());
+        let withdrawn = replayed
+            .withdraw_notification_before_write(
+                RecipientKey::admin(recipient.workspace_id()),
+                recipient,
+                blocked.attempt_id,
+            )
+            .unwrap();
+        assert_eq!(withdrawn.state, NotificationState::WithdrawnByOperator);
+    }
+
+    #[tokio::test]
+    async fn proven_unwritten_runs_through_attempt_and_retry_disposition() {
+        let (scratch, store, context, handle, recipient) =
+            notification_fixture("unwritten-production-arm");
+        let inner = unwritten_test_inner(&scratch.0);
+        let binding = unwritten_test_binding();
+        seed_unwritten_test_composer(&inner, &binding);
+        assert!(advance(
+            &inner,
+            &handle,
+            &[DeliveryState::Queued],
+            Step::to(DeliveryState::Gating),
+        ));
+        context.record_gating().unwrap();
+        handle.state.lock().unwrap().attempts = 1;
+        assert!(advance(
+            &inner,
+            &handle,
+            &[DeliveryState::Gating],
+            Step::to(DeliveryState::Pasting),
+        ));
+
+        let failure = match run_unwritten_attempt_arm(&inner, &handle, &binding).await {
+            AttemptOutcome::Failed(failure) => failure,
+            _ => panic!("proven unwritten paste must be an attempt failure"),
+        };
+        assert_eq!(failure.cause, "paste_command_unwritten");
+        assert_eq!(failure.boundary, WriteBoundary::BeforeWrite);
+        assert!(!handle.write_boundary_crossed.load(Ordering::SeqCst));
+        assert!(handle.state.lock().unwrap().barrier.is_none());
+        {
+            let detection = inner.detections.lock().unwrap();
+            let entry = detection.get(&PaneKey::new(0, "%1")).unwrap();
+            assert_eq!(entry.hold, ComposerHold::Clear);
+            assert_eq!(entry.hold_owner, None);
+        }
+        let corrected = notification_state(&store, recipient, context.message_id());
+        assert_eq!(corrected.state, NotificationState::BlockedPreWrite);
+        assert_eq!(
+            corrected.pre_write_cause,
+            Some(NotificationPreWriteCause::PasteCommandUnwritten)
+        );
+        assert!(corrected.binding.is_none());
+        assert!(store
+            .lock()
+            .unwrap()
+            .projection()
+            .active_notification_barriers()
+            .is_empty());
+        let corrected_seq = corrected.updated_seq;
+        let worker = Arc::new(Worker::new());
+        assert!(!fail_attempt(&inner, &worker, &handle, &failure).await);
+        assert_eq!(handle.state(), DeliveryState::Pasting);
+        assert_eq!(
+            notification_state(&store, recipient, context.message_id()).updated_seq,
+            corrected_seq,
+            "retry disposition must not append or reopen the corrected attempt"
+        );
+
+        let (failed_scratch, failed_store, failed_context, failed_handle, failed_recipient) =
+            notification_fixture("unwritten-production-arm-append-failure");
+        let failed_inner = unwritten_test_inner(&failed_scratch.0);
+        seed_unwritten_test_composer(&failed_inner, &binding);
+        assert!(advance(
+            &failed_inner,
+            &failed_handle,
+            &[DeliveryState::Queued],
+            Step::to(DeliveryState::Gating),
+        ));
+        failed_context.record_gating().unwrap();
+        failed_handle.state.lock().unwrap().attempts = 1;
+        assert!(advance(
+            &failed_inner,
+            &failed_handle,
+            &[DeliveryState::Gating],
+            Step::to(DeliveryState::Pasting),
+        ));
+        failed_store
+            .lock()
+            .unwrap()
+            .inject_next_pre_write_block_append_failure();
+
+        let append_failure =
+            match run_unwritten_attempt_arm(&failed_inner, &failed_handle, &binding).await {
+                AttemptOutcome::Failed(failure) => failure,
+                _ => panic!("failed correction append must remain a failed attempt"),
+            };
+        assert_eq!(append_failure.cause, NOTIFICATION_RECORD_FAILED);
+        assert_eq!(append_failure.boundary, WriteBoundary::AfterWrite);
+        assert!(failed_handle.write_boundary_crossed.load(Ordering::SeqCst));
+        assert!(failed_handle.state.lock().unwrap().barrier.is_some());
+        {
+            let failed_detection = failed_inner.detections.lock().unwrap();
+            let failed_entry = failed_detection.get(&PaneKey::new(0, "%1")).unwrap();
+            assert_eq!(failed_entry.hold, ComposerHold::Staged);
+            assert_eq!(
+                failed_entry.hold_owner.as_deref(),
+                Some(failed_handle.barrier_owner().as_str())
+            );
+        }
+        let writing =
+            notification_state(&failed_store, failed_recipient, failed_context.message_id());
+        assert_eq!(writing.state, NotificationState::Writing);
+        assert!(writing.binding.is_some());
+        assert_eq!(
+            failed_store
+                .lock()
+                .unwrap()
+                .projection()
+                .active_notification_barriers(),
+            vec![writing]
+        );
+
+        let direct = DeliveryHandle::new(
+            "m-direct-unwritten-production-arm",
+            "reviewer",
+            "%1",
+            0,
+            "payload".into(),
+        );
+        direct.state.lock().unwrap().attempts = 1;
+        assert!(advance(
+            &inner,
+            &direct,
+            &[DeliveryState::Queued],
+            Step::to(DeliveryState::Gating),
+        ));
+        assert!(advance(
+            &inner,
+            &direct,
+            &[DeliveryState::Gating],
+            Step::to(DeliveryState::Pasting),
+        ));
+        let direct_failure = match run_unwritten_attempt_arm(&inner, &direct, &binding).await {
+            AttemptOutcome::Failed(failure) => failure,
+            _ => panic!("direct unwritten paste must be an attempt failure"),
+        };
+        let direct_worker = Worker::new();
+        assert!(fail_attempt(&inner, &direct_worker, &direct, &direct_failure).await);
+        assert_eq!(direct.state(), DeliveryState::RetryQueued);
+    }
+
+    #[test]
+    fn only_a_zero_byte_command_write_is_a_proven_unwritten_paste() {
+        assert_eq!(
+            classify_paste_buffer_failure(TmuxError::Io(std::io::Error::other("first write"))),
+            InjectFailure::PasteCommandUnwritten
+        );
+        assert_eq!(
+            classify_paste_buffer_failure(TmuxError::WriteUncertain(std::io::Error::other(
+                "partial write or flush"
+            ))),
+            InjectFailure::Other("paste_failed".to_string())
+        );
+        assert_eq!(
+            classify_paste_buffer_failure(TmuxError::Command("tmux refused".to_string())),
+            InjectFailure::Other("paste_failed".to_string())
+        );
+    }
+
+    #[test]
+    fn a_claim_after_proven_unwritten_is_not_postwrite_evidence() {
+        let (_scratch, store, context, _handle, recipient) =
+            notification_fixture("unwritten-claim-order");
+        context.record_gating().unwrap();
+        context
+            .record_writing(
+                ProcessInstanceId::new(3999, 817_999).unwrap(),
+                ProcessInstanceId::new(4000, 818_000).unwrap(),
+                ProcessInstanceId::new(4242, 818_221).unwrap(),
+                "codex",
+                NotificationTransport::Doorbell,
+                None,
+            )
+            .unwrap();
+        let blocked = context.record_paste_command_unwritten().unwrap();
+        store
+            .lock()
+            .unwrap()
+            .claim(recipient, context.message_id().clone())
+            .unwrap();
+
+        assert!(!store
+            .lock()
+            .unwrap()
+            .projection()
+            .exact_recipient_claimed_after_write(&blocked));
+    }
+
+    #[test]
+    fn the_unwritten_cause_requires_a_prior_writing_fact() {
+        let (_scratch, store, context, _handle, recipient) =
+            notification_fixture("unwritten-requires-writing");
+        context.record_gating().unwrap();
+
+        assert!(context
+            .record_pre_write_block(NotificationPreWriteCause::PasteCommandUnwritten, None)
+            .is_err());
+        assert_eq!(
+            notification_state(&store, recipient, context.message_id()).state,
+            NotificationState::Gating
+        );
+    }
+
     #[tokio::test]
     async fn superseded_notification_aborts_inside_on_write_without_pasting() {
         let (_scratch, store, context, handle, recipient) = notification_fixture("superseded");
@@ -10361,7 +11558,10 @@ composer_trailer_required_prefix = 1
         .await
         .unwrap_err();
 
-        assert_eq!(error, NO_LONGER_CURRENT_BEFORE_WRITE);
+        assert_eq!(
+            error,
+            InjectFailure::Other(NO_LONGER_CURRENT_BEFORE_WRITE.to_string())
+        );
         assert!(injector.pasted.lock().unwrap().is_empty());
         assert_eq!(
             notification_state(&store, recipient, context.message_id()).state,
@@ -10416,7 +11616,10 @@ composer_trailer_required_prefix = 1
         )
         .await
         .unwrap_err();
-        assert_eq!(error, NO_LONGER_CURRENT_BEFORE_WRITE);
+        assert_eq!(
+            error,
+            InjectFailure::Other(NO_LONGER_CURRENT_BEFORE_WRITE.to_string())
+        );
         assert!(injector.pasted.lock().unwrap().is_empty());
         assert_eq!(
             notification_state(&store, recipient, context.message_id()).state,
@@ -10752,6 +11955,10 @@ composer_trailer_required_prefix = 1
             &StdMutex::new(()),
             NotificationPreWriteCause::WriteReadinessChanged,
             None,
+            &NotificationRouteEvidenceId {
+                boot_id: "boot".into(),
+                generation: 1,
+            },
         );
         assert!(record.is_none());
         assert!(worker.is_faulted());
@@ -10782,6 +11989,179 @@ composer_trailer_required_prefix = 1
     }
 
     #[test]
+    fn readiness_block_persistence_records_route_baseline_and_reopens_once() {
+        let path = cyclops_proto::scratch::scratch_dir(&format!(
+            "readiness-route-baseline-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _scratch = NotificationScratch(path.clone());
+        let root = StateRoot::open_or_create(&path).unwrap();
+        let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let session = SessionInstanceId::from_str("00000000-0000-4000-8000-000000000002").unwrap();
+        let recipient =
+            RecipientKey::agent(workspace, session, TmuxPaneId::from_str("%1").unwrap());
+        let directory = || {
+            MailboxDirectory::new(
+                workspace,
+                [MailboxIdentity {
+                    key: recipient,
+                    label: "reviewer".into(),
+                }],
+            )
+            .unwrap()
+        };
+        let store = MessageStore::open(
+            &root,
+            Path::new("workspaces/current/messages.ndjson"),
+            workspace,
+            "boot",
+        )
+        .unwrap();
+        let service = MailboxService::new(directory(), store);
+        let message = service
+            .send(
+                service.admin(),
+                MailboxSend {
+                    addresses: vec!["reviewer".into()],
+                    recipient_keys: None,
+                    subject: "Wake".into(),
+                    body: "Review the mailbox".into(),
+                    fyi: false,
+                    client_key: None,
+                    supersedes: None,
+                },
+            )
+            .unwrap();
+        let queued = service
+            .prepare_oldest_notification(recipient)
+            .unwrap()
+            .unwrap();
+        let context = NotificationContext::new(
+            service.store_handle(),
+            message.message_id,
+            recipient,
+            queued.attempt_id,
+        );
+        context.record_gating().unwrap();
+        let worker = Worker::new();
+        let route_evidence = |generation| NotificationRouteEvidenceId {
+            boot_id: "boot".into(),
+            generation,
+        };
+        let baseline = route_evidence(7);
+        let blocked = record_notification_prewrite_block(
+            &context,
+            &worker,
+            &StdMutex::new(()),
+            NotificationPreWriteCause::WriteReadinessChanged,
+            None,
+            &baseline,
+        )
+        .expect("readiness block");
+        let stored = blocked
+            .pre_write_observation
+            .as_ref()
+            .expect("route baseline");
+        assert_eq!(stored.route_evidence.as_ref(), Some(&baseline));
+        assert!(stored.pane_root.is_none());
+        assert!(stored.selected_manifest.is_none());
+        assert!(stored.binding.is_none());
+        assert!(stored.pane_width.is_none());
+        assert!(stored.required_pane_width.is_none());
+
+        let message_id = context.message_id().clone();
+        drop(context);
+        drop(service);
+        let store = MessageStore::open(
+            &root,
+            Path::new("workspaces/current/messages.ndjson"),
+            workspace,
+            "boot",
+        )
+        .unwrap();
+        let service = MailboxService::new(directory(), store);
+        let replay_store = service.store_handle();
+        let replayed = replay_store
+            .lock()
+            .unwrap()
+            .projection()
+            .notification(recipient, &message_id)
+            .cloned()
+            .expect("replayed readiness block");
+        assert_eq!(
+            replayed
+                .pre_write_observation
+                .as_ref()
+                .and_then(|observation| observation.route_evidence.as_ref()),
+            Some(&baseline)
+        );
+
+        let pane_root = ProcessInstanceId::new(3999, 817_999).unwrap();
+        let manifest = NotificationManifestId::new("codex").unwrap();
+        let binding = NotificationBinding {
+            recipient,
+            pane_root: Some(pane_root),
+            leader: Some(ProcessInstanceId::new(4000, 818_000).unwrap()),
+            agent: ProcessInstanceId::new(4242, 818_221).unwrap(),
+            manifest: manifest.clone(),
+        };
+        let observation = |generation| NotificationPreWriteObservation {
+            write_block: None,
+            pane_root: Some(pane_root),
+            selected_manifest: Some(manifest.clone()),
+            binding: Some(binding.clone()),
+            route_evidence: Some(route_evidence(generation)),
+            pane_width: None,
+            required_pane_width: None,
+        };
+        let lines_before = service.journal_lines().unwrap().len();
+        assert!(service
+            .reopen_oldest_notification_after_route_evidence(recipient, observation(7), true)
+            .unwrap()
+            .is_none());
+        assert!(service
+            .reopen_oldest_notification_after_route_evidence(recipient, observation(6), true)
+            .unwrap()
+            .is_none());
+        assert_eq!(service.journal_lines().unwrap().len(), lines_before);
+        assert!(service
+            .reopen_oldest_notification_after_route_evidence(recipient, observation(8), false)
+            .unwrap()
+            .is_none());
+
+        let reopened = service
+            .reopen_oldest_notification_after_route_evidence(recipient, observation(8), true)
+            .unwrap()
+            .expect("later ready route reopens");
+        assert_eq!(reopened.attempt_id, queued.attempt_id);
+        assert_eq!(reopened.state, NotificationState::Gating);
+        assert_eq!(reopened.pre_write_reopen_count, 1);
+
+        let reopened_context = NotificationContext::new(
+            service.store_handle(),
+            message_id,
+            recipient,
+            queued.attempt_id,
+        );
+        let blocked_again = record_notification_prewrite_block(
+            &reopened_context,
+            &worker,
+            &StdMutex::new(()),
+            NotificationPreWriteCause::WriteReadinessChanged,
+            None,
+            &route_evidence(8),
+        )
+        .expect("second readiness block");
+        assert_eq!(blocked_again.pre_write_reopen_count, 1);
+        let lines_before_repeat = service.journal_lines().unwrap().len();
+        assert!(service
+            .reopen_oldest_notification_after_route_evidence(recipient, observation(9), true)
+            .unwrap()
+            .is_none());
+        assert_eq!(service.journal_lines().unwrap().len(), lines_before_repeat);
+    }
+
+    #[test]
     fn a_claim_that_wins_the_prewrite_block_releases_fifo_without_faulting() {
         let (_scratch, store, context, handle, recipient) =
             notification_fixture("claim-wins-prewrite-block");
@@ -10807,6 +12187,10 @@ composer_trailer_required_prefix = 1
             &StdMutex::new(()),
             NotificationPreWriteCause::WriteReadinessChanged,
             None,
+            &NotificationRouteEvidenceId {
+                boot_id: "boot".into(),
+                generation: 1,
+            },
         );
         assert!(record.is_none());
         assert!(!worker.is_faulted());
@@ -11275,7 +12659,10 @@ line_regex_esc = ['^❯$']
             },
         )
         .await;
-        assert_eq!(result, Err("verify_failed".into()));
+        assert_eq!(
+            result,
+            Err(InjectFailure::Other("verify_failed".to_string()))
+        );
         assert_eq!(injector.pasted.lock().unwrap().len(), 1);
 
         context
@@ -11321,7 +12708,7 @@ line_regex_esc = ['^❯$']
                     &|| Err(cause.to_string())
                 )
                 .await,
-                Err(cause.to_string())
+                Err(InjectFailure::Other(cause.to_string()))
             );
             assert!(
                 mock.pasted.lock().unwrap().is_empty(),
@@ -11360,7 +12747,7 @@ line_regex_esc = ['^❯$']
                 &|| Ok(())
             )
             .await,
-            Err("verify_failed".to_string())
+            Err(InjectFailure::Other("verify_failed".to_string()))
         );
         assert_eq!(mock.pasted.lock().unwrap().len(), 1, "payload was pasted");
 
@@ -11377,7 +12764,7 @@ line_regex_esc = ['^❯$']
                 &|| Ok(()),
             )
             .await,
-            Err("verify_failed".to_string())
+            Err(InjectFailure::Other("verify_failed".to_string()))
         );
         assert_eq!(mock.pasted.lock().unwrap().len(), 1, "payload was pasted");
         assert!(mock.submitted_is_empty());
@@ -11485,7 +12872,7 @@ line_regex_esc = ['^❯$']
                 &|| Ok(()),
             )
             .await,
-            Err("verify_failed".to_string())
+            Err(InjectFailure::Other("verify_failed".to_string()))
         );
         assert_eq!(mock.pasted.lock().unwrap().len(), 1);
         assert!(mock.submitted_is_empty());
@@ -11993,7 +13380,7 @@ contains = ["OTHER-DIALOG"]
         // %9999 does not exist: load-buffer succeeds, paste-buffer fails.
         injector.spool("secret payload").await.expect("spool");
         let err = injector.commit("%9999", &|| Ok(())).await.unwrap_err();
-        assert_eq!(err, "paste_failed");
+        assert_eq!(err, InjectFailure::Other("paste_failed".to_string()));
         let buffers = client.command("list-buffers").await.unwrap_or_default();
         assert!(
             buffers.iter().all(|l| !l.contains(&injector.buffer)),
@@ -12442,7 +13829,10 @@ composer_trailer_required_prefix = 1
         )
         .await;
 
-        assert_eq!(result.unwrap_err(), "verify_failed");
+        assert_eq!(
+            result.unwrap_err(),
+            InjectFailure::Other("verify_failed".to_string())
+        );
         assert_eq!(injector.pasted.lock().unwrap().as_slice(), &[doorbell]);
         assert!(
             injector.submitted_is_empty(),
@@ -12702,6 +14092,10 @@ mod composer_content_proof {
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../resources/manifests/agy.toml"
             )),
+            "cursor" => include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../resources/manifests/cursor.toml"
+            )),
             _ => panic!("unknown shipped manifest {id}"),
         };
         Manifest::parse(source, std::path::Path::new(id)).expect("shipped manifest parses")
@@ -12746,6 +14140,36 @@ mod composer_content_proof {
                 "{vendor} did not reconstruct the rendered payload"
             );
         }
+    }
+
+    /// AGY 1.1.21 keeps a compact doorbell visible as one prompt row. The
+    /// styled rule and status rows bind that row to the active composer.
+    #[test]
+    fn agy_1_1_21_exact_doorbell_reaches_the_submit_gate() {
+        let manifest = shipped("agy");
+        let message_id = MessageId::new("m-0123456789abcdef0123456789abcdef")
+            .expect("valid generated message id");
+        let doorbell = cyclops_proto::render_doorbell_v1(&message_id);
+        let capture = format!(
+            "\u{1b}[1m\u{1b}[34m> an earlier submitted prompt\u{1b}[0m\n\
+             \u{1b}[94m>\u{1b}[39m {doorbell}\n\
+             \u{1b}[90m────────────────────────────────────────────────────────────────────────────────\n\
+             \u{1b}[38;5;152mGemini 3.7 Flash\u{1b}[38;5;251m · \u{1b}[38;5;217mHigh\u{1b}[38;5;251m · \u{1b}[38;5;151m~\u{1b}[38;5;251m · \u{1b}[38;5;182mFull\u{1b}[38;5;251m · \u{1b}[38;5;151mCtx: 100%\u{1b}[38;5;251m · 44% 5h, 74% wk · \u{1b}[38;5;215m(0K / 1048K)"
+        );
+
+        assert_eq!(
+            exact_composer_content_from_joined_capture(&manifest, &capture),
+            ComposerContentProof::Visible(doorbell.clone())
+        );
+        assert_eq!(
+            exact_staging_proof(
+                &manifest,
+                &capture,
+                StagingTarget::ExactRow(&doorbell),
+                &doorbell,
+            ),
+            Some((true, doorbell))
+        );
     }
 
     #[test]
@@ -12869,6 +14293,162 @@ mod composer_content_proof {
             ),
         ] {
             assert!(!sentinel_verified(&manifest, &invalid, "m-no-color"));
+        }
+    }
+
+    #[test]
+    fn codex_0_149_1_doorbell_has_exact_visible_ownership() {
+        let capture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cyclops-manifest/tests/fixtures/codex_staged_0_149_1_esc.txt"
+        ));
+        let manifest = shipped("codex");
+        let doorbell =
+            "cyclops inbox claim m-4c0cdcbf9cb04cf983ef2c6aa206eac9 #c:xvXB2rLoTC2SpbRj5fnDFA";
+
+        assert_eq!(
+            staged_representation(&manifest, capture, StagingTarget::ExactRow(doorbell)),
+            Some(StagedRepresentation::VisibleTarget)
+        );
+        assert_eq!(
+            exact_composer_content_from_joined_capture(&manifest, capture),
+            ComposerContentProof::Visible(doorbell.to_string())
+        );
+
+        for ambiguous in [
+            capture.replace(doorbell, &format!("human draft {doorbell}")),
+            capture.replace(doorbell, &format!("{doorbell} unexpected")),
+        ] {
+            let ComposerContentProof::Visible(content) =
+                exact_composer_content_from_joined_capture(&manifest, &ambiguous)
+            else {
+                panic!("the occupied composer must remain visible as human input")
+            };
+            assert_ne!(content, doorbell);
+            assert!(exact_staging_proof(
+                &manifest,
+                &ambiguous,
+                StagingTarget::ExactRow(doorbell),
+                doorbell
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn codex_0_149_1_fast_status_keeps_exact_visible_ownership() {
+        let doorbell = "cyclops inbox claim m-att_LMRvMkzHQzixuOJNYwT8Qw";
+        let capture = concat!(
+            "\x1b[48;2;30;30;30m\n",
+            "\x1b[1m›\x1b[0m\x1b[48;2;30;30;30m ",
+            "cyclops inbox claim m-att_LMRvMkzHQzixuOJNYwT8Qw\n",
+            "\n",
+            "\x1b[49m  \x1b[38;2;246;226;183mgpt-5.6-sol high fast",
+            "\x1b[2m\x1b[39m · \x1b[0m",
+            "\x1b[38;2;171;223;167m/private/tmp/cyclops-release-final",
+            "\x1b[2m\x1b[39m · \x1b[0m",
+            "\x1b[38;2;200;169;238mWorkspace\x1b[39m\n",
+        );
+        let manifest = shipped("codex");
+
+        assert_eq!(
+            exact_staging_proof(
+                &manifest,
+                capture,
+                StagingTarget::ExactRow(doorbell),
+                doorbell,
+            ),
+            Some((true, doorbell.to_string()))
+        );
+    }
+
+    /// Derived from the measured 0.149.1 prompt and trailer rows. The live
+    /// 187-column capture remains release evidence; this minimized fixture
+    /// proves format 3 stays exact at the supported 80-column layout.
+    #[test]
+    fn codex_0_149_1_format_3_is_exact_in_a_derived_80_column_capture() {
+        let capture = decoded_fixture(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cyclops-manifest/tests/fixtures/codex_doorbell_v3_derived_80_esc.hex"
+        )));
+        let manifest = shipped("codex");
+        let attempt_id =
+            NotificationAttemptId::parse("att-c6f5c1da-b2e8-4c2d-92a5-b463e5f9c314").unwrap();
+        let doorbell = cyclops_proto::render_doorbell_v3(attempt_id);
+
+        for row in cyclops_manifest::strip_csi(&capture).lines() {
+            assert!(row.chars().count() <= 80, "derived row exceeds 80 columns");
+        }
+        assert_eq!(
+            exact_staging_proof(
+                &manifest,
+                &capture,
+                StagingTarget::ExactRow(&doorbell),
+                &doorbell,
+            ),
+            Some((true, doorbell))
+        );
+    }
+
+    #[test]
+    fn codex_0_149_1_no_color_doorbell_uses_structural_trailer() {
+        let capture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cyclops-manifest/tests/fixtures/codex_staged_no_color_0_149_1.txt"
+        ));
+        let manifest = shipped("codex");
+        let doorbell =
+            "cyclops inbox claim m-cfb2ad82c11a484cb617733220308231 #c:RN31a7Y4SsKK6gxgZ0xUKg";
+
+        assert_eq!(
+            exact_composer_content_from_joined_capture(&manifest, capture),
+            ComposerContentProof::Visible(doorbell.to_string())
+        );
+        assert_eq!(
+            exact_staging_proof(
+                &manifest,
+                capture,
+                StagingTarget::ExactRow(doorbell),
+                doorbell
+            ),
+            Some((true, doorbell.to_string()))
+        );
+
+        let followed = format!("{capture}\nunexpected text");
+        assert_eq!(
+            exact_composer_content_from_joined_capture(&manifest, &followed),
+            ComposerContentProof::Unprovable
+        );
+        assert!(exact_staging_proof(
+            &manifest,
+            &followed,
+            StagingTarget::ExactRow(doorbell),
+            doorbell
+        )
+        .is_none());
+
+        let prompt_row = capture.lines().next().unwrap();
+        let status_row = capture.lines().last().unwrap();
+        let empty_prompt = "\u{1b}[1m›\u{1b}[0m ";
+        let invalid = [
+            capture.replace(doorbell, &format!("human draft {doorbell}")),
+            capture.replace(doorbell, &format!("{doorbell} unexpected")),
+            capture.replacen("\n\n", "\n  unexpected continuation\n\n", 1),
+            format!("{prompt_row}\n{capture}"),
+            format!("{prompt_row}\nprior answer\n{empty_prompt}\n\n{status_row}"),
+            capture.replace(status_row, "Allow command? [y/N]"),
+        ];
+        for screen in invalid {
+            assert!(
+                exact_staging_proof(
+                    &manifest,
+                    &screen,
+                    StagingTarget::ExactRow(doorbell),
+                    doorbell
+                )
+                .is_none(),
+                "ambiguous no-color composer content must fail closed"
+            );
         }
     }
 
@@ -13115,7 +14695,7 @@ mod composer_content_proof {
             );
         }
         assert_eq!(
-            composer_content_from_joined_capture(&shipped("agy"), "anything", "m-unsupported"),
+            composer_content_from_joined_capture(&shipped("cursor"), "anything", "m-unsupported"),
             ComposerContentProof::Unsupported
         );
     }

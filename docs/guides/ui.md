@@ -55,6 +55,18 @@ connection or failed snapshot read, the last authenticated snapshot stays
 visible as stale data and `R` starts one explicit reconnect. Cyclops never
 starts parallel reconnects or retries on a timer.
 
+### Overload behavior
+
+Keyboard input has its own bounded lane and starts a fair rotation across
+input, action, snapshot, and event work. Every continuously ready lane is
+served within four items. Ordered events apply backpressure when one frame
+batch is already waiting, so a slow terminal cannot grow the queue without
+bound. Every daemon frame and ledger line is limited to 1 MiB. Malformed or
+oversized live input becomes a visible connection gap, keeps the last good
+snapshot stale, and requires an explicit reconnect plus a fresh whole snapshot
+before actions are enabled. Snapshot reads, durable follow pages, and action
+answers use separate bounded lanes.
+
 `cyclops status` remains the compact live-pane view. A pane can be runtime
 idle while a notification is staged, so status prints a factual subrow when
 that distinction matters: composer ownership, write readiness, notification
@@ -178,12 +190,16 @@ agent of a state line. While pinned it takes the newest entry.
 The header carries cyclops's mark: `‿` closed when calm, `◑` opening
 with one attention item, `◉` open with the count beside it.
 
-The stream counts two things: an agent whose state is blocked, and a
-delivery that parked on a quota or ran out of redelivery. Normal
-`cyclops status` uses the same eye vocabulary for the live pane fleet but
-does not fold durable delivery history into that grid. Mailbox, alarm, and
-stream surfaces show those delivery records and provide the actions that
-resolve them. Both scopes are owned by
+The stream counts two things: an agent whose state is blocked, and a delivery
+whose normalized state needs a human. Normal `cyclops status` uses the same eye
+vocabulary and the same folded record: its eye counts blocked panes, legacy
+delivery alarms, durable mailbox attention, and held queue heads exactly as the
+stream does, and its `waiting on you` rows name the next action for each. The
+stream takes the mailbox half of that record from every `messages.snapshot` its
+refresh gate accepts, stamped by the same `workspace_seq` as the Messages view,
+so a durable alarm that appears or clears while the stream is open moves its eye
+on that edge, with no second read and no reconnect. Mailbox, alarm, and stream
+surfaces provide the actions that resolve them. Both scopes are owned by
 `src/cyclops-proto/src/attention.rs`.
 
 Nothing else counts, pings included. A ping is the daemon telling you
@@ -193,12 +209,12 @@ names every delivery it closed, so it stands while any of them still
 does. The firehose keeps every ping either way, and a ping that names
 nothing (your own, through the `admin.notify` verb) is never dropped.
 
-An agent's item is tracked per pane, so the state a pane reports before
-you name it and the state it reports after are the same item: adopting a
-pane never strands an item nothing can clear. A delivery's item is
-tracked per message, so only that message's own next transition clears
-it: a later message to the same recipient, however it lands, never
-closes an unresolved one.
+An agent's item is tracked per pane, so the state a pane reports before you name
+it and the state it reports after are the same item: adopting a pane never
+strands an item nothing can clear. A delivery's item is tracked by exact
+recipient plus message id. A display label is a fallback only for legacy rows
+without durable identity. Only that recipient's transition for that message may
+clear the item, so broadcasts and shared aliases cannot clear one another.
 
 ### Where the count comes from
 
@@ -216,16 +232,18 @@ pane that was blocked in the replayed tail but is gone now counts for
 nothing: the answer lists the panes that exist, and a pane it does not
 list stops counting.
 
-That answer is read once, at startup. Nothing re-reads it, because
-re-reading it on a timer is polling. So while the UI runs, a pane that
-was blocked and then closed drops off the count on its own edge: the
-daemon reports `pane-removed` when a pane leaves the tmux table, and
-that is the pane's last transition. The firehose shows it as
-`%1 closed`.
+That answer's pane half is read once, at startup, and nothing re-reads
+it on a timer, because that would be polling; while the UI runs, a pane's
+state moves on live events alone. The mailbox half is different: it rides
+every `messages.snapshot` the refresh gate accepts, stamped by the same
+`workspace_seq` as the Messages view, so it moves on the `messages.changed`
+edge that invalidated the view, still never on a timer.
 
-`cyclops status` asks for the pane roster only. Its eye answers whether a
-live pane is blocked, and its admin-inbox suffix reports unread human mail.
-Use the mailbox, alarm, or stream surface for durable delivery alarms.
+`cyclops status` asks for the pane roster and the open deliveries. Its eye
+answers whether a live pane is blocked or anything durable waits on a human
+(a legacy delivery alarm, a mailbox attempt needing attention, a held queue
+head), and its admin-inbox suffix reports unread human mail. A closed eye
+with a held mailbox queue behind it is no longer possible.
 
 Anything the count knows about gets a line in the stream, timestamped
 when it happened, so a park from this morning reads as this morning. It
@@ -280,7 +298,10 @@ Startup runs in one order:
    sessions the daemon watches, where every pane stands, and the
    deliveries still waiting on a human.
 2. Backfill replays the tail of THOSE sessions' ledgers under
-   `~/.cyclops/ledger/` (default 200 lines, `--backfill N`). A ledger
+   `~/.cyclops/ledger/` (default 200 lines, `--backfill N`). The reader
+   retains at most 10,000 entries and 16 MiB across at most 256 files. Any
+   malformed line or bound that truncates the requested history is shown as
+   a stream gap. A ledger
    file from a session nobody watches is not replayed: the daemon counts
    the sessions it watches, so a line from anywhere else would be one no
    count owns and no event can ever clear.
@@ -297,8 +318,9 @@ With one watched session, replayed lines and the live stream dedupe
 exactly by ledger seq; with several, a line landing in the exact startup
 window can show twice on screen (the record itself never duplicates).
 
-If the daemon does not answer, the backfill falls back to every ledger
-file on disk so the screen is not empty, and nothing is counted. A
+If the daemon does not answer, the backfill falls back to up to 256 ledger
+files on disk so the screen is not empty, and nothing is counted. Any omitted
+files are reported as a stream gap. A
 daemon that predates the open-delivery field answers without it: the eye
 then counts blocked panes plus whatever the live push reports, and
 misses a delivery that parked before the UI started.

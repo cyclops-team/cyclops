@@ -4,7 +4,8 @@
 //! the human plus states that need one), the firehose (everything), and
 //! Messages (the durable mailbox and notification queue). Data comes from
 //! daemon pushes plus whole snapshots; IO runs on separate tasks feeding
-//! one channel, so the event loop never blocks on the daemon.
+//! bounded priority lanes, so the event loop never blocks on the daemon or
+//! leaves a keypress behind history.
 //!
 //! The terminal layer is hand-rolled (termios raw mode plus ANSI frames,
 //! see term.rs): the build environment is offline and carries no TUI
@@ -43,6 +44,8 @@
 
 pub mod action_io;
 mod app;
+pub mod avatar;
+pub mod chat;
 mod data;
 pub mod detail;
 mod entry;
@@ -56,13 +59,19 @@ pub mod queue;
 mod stream;
 mod term;
 mod theme;
+mod wire;
 
 pub use action_io::{perform, ActionOutcome, ActionRequest, RequestKind, RequestToken};
 pub use app::{App, Command, Density, RosterRow, RowTarget, View};
+pub use avatar::{Avatar, AvatarRegistry};
+pub use chat::{
+    chat_action_strip, chat_actions, render_chat, ChatAction, ChatRenderContext, ComposerMode,
+    ComposerState, TimelineItem,
+};
 pub use cyclops_proto::{Attention, AttentionItem, Eye, PaneSnapshot};
-pub use data::{read_backfill, UiMsg};
+pub use data::{read_backfill, read_backfill_report, BackfillReport, UiMsg};
 pub use detail::{Action, Back, Check, Detail, Draft, Loaded, Request, Stage, ThreadEntry};
-pub use frame::build;
+pub use frame::{build, messages_help};
 pub use health::BuildHealth;
 pub use input::Key;
 pub use messages::{
@@ -81,7 +90,7 @@ pub use theme::Theme;
 use std::io::IsTerminal;
 use std::path::Path;
 
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc;
 
 /// The terminal's size in cells, or the classic 80x24 when there is none
 /// to ask.
@@ -155,8 +164,49 @@ pub fn run(opts: UiOptions) -> i32 {
 const EYE_TICK_MS: u64 = 120;
 
 /// Largest number of queued messages folded into one frame. Keeps a flood
-/// fluid (one render per batch) without starving key handling.
-const BATCH: usize = 256;
+/// fluid (one render per batch) without starving key handling. The workspace
+/// UI uses the same budget so one number defines interactive ingress.
+pub const INGRESS_BATCH: usize = 256;
+const BATCH: usize = INGRESS_BATCH;
+/// One complete render batch. Producers backpressure after this instead of
+/// growing memory while the terminal is slow.
+pub(crate) const EVENT_CAPACITY: usize = BATCH;
+/// One result from each snapshot producer can be outstanding: startup,
+/// queue refresh, and durable follow.
+pub(crate) const SNAPSHOT_CAPACITY: usize = 3;
+/// The action worker is serial, so a second result cannot exist before the
+/// first is consumed.
+pub(crate) const ACTION_CAPACITY: usize = 1;
+/// Keys have their own lane and one render batch of headroom. The blocking
+/// reader waits when it fills, preserving every key without letting data
+/// traffic delay it.
+const INPUT_CAPACITY: usize = BATCH;
+const MESSAGE_GAP_NOTICE: &str = "message sequence gap detected; rebuilding from a whole snapshot";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    Input,
+    Action,
+    Snapshot,
+    Event,
+}
+
+impl Lane {
+    fn next(self) -> Self {
+        match self {
+            Lane::Input => Lane::Action,
+            Lane::Action => Lane::Snapshot,
+            Lane::Snapshot => Lane::Event,
+            Lane::Event => Lane::Input,
+        }
+    }
+}
+
+enum IngressWake {
+    Message(Lane, UiMsg),
+    Resize,
+    Closed,
+}
 
 async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
     let view = if opts.firehose {
@@ -166,21 +216,17 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
     };
     let mut app = App::new(Theme::detect(), view, opts.filter());
 
-    let (tx, mut rx) = unbounded_channel();
-    let io = data::spawn_io(&tx, home, opts.backfill);
-    // Keys ride the same channel as data, decoded off-thread.
-    let (key_tx, mut key_rx) = unbounded_channel();
+    let (event_tx, mut event_rx) = mpsc::channel(EVENT_CAPACITY);
+    let (snapshot_tx, mut snapshot_rx) = mpsc::channel(SNAPSHOT_CAPACITY);
+    let (action_tx, mut action_rx) = mpsc::channel(ACTION_CAPACITY);
+    let sinks = data::UiSinks {
+        events: event_tx,
+        snapshots: snapshot_tx,
+        actions: action_tx,
+    };
+    let io = data::spawn_io(&sinks, home, opts.backfill);
+    let (key_tx, mut key_rx) = mpsc::channel(INPUT_CAPACITY);
     input::spawn_reader(key_tx);
-    {
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            while let Some(k) = key_rx.recv().await {
-                if tx.send(UiMsg::Key(k)).is_err() {
-                    return;
-                }
-            }
-        });
-    }
 
     let mut term = match term::Term::enter() {
         Ok(t) => t,
@@ -203,20 +249,29 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
     let mut intake = Intake::new();
     let mut message_follower = MessageFollower::default();
     let mut tick_armed = false;
+    let mut key_open = true;
     draw(&mut term, &mut app);
 
     loop {
         // Wait for one message or a resize; then fold in whatever else is
         // already queued so a burst costs one frame.
-        let first = tokio::select! {
-            m = rx.recv() => match m {
-                Some(m) => Some(m),
-                None => break,
-            },
-            _ = recv_winch(&mut sigwinch) => None,
+        let first = match wait_next_ingress(
+            &mut key_open,
+            &mut key_rx,
+            &mut action_rx,
+            &mut snapshot_rx,
+            &mut event_rx,
+            &mut sigwinch,
+        )
+        .await
+        {
+            IngressWake::Message(lane, msg) => Some((lane, msg)),
+            IngressWake::Resize => None,
+            IngressWake::Closed => break,
         };
         let mut quit = false;
-        if let Some(first) = first {
+        if let Some((lane, first)) = first {
+            let mut next_lane = lane.next();
             let mut queued = Some(first);
             let mut n = 0;
             while let Some(msg) = queued.take() {
@@ -225,20 +280,37 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
                     &mut intake,
                     &mut message_follower,
                     &mut tick_armed,
-                    &tx,
+                    &io.focus,
                     msg,
                 ) {
                     quit = true;
                     break;
                 }
                 if std::mem::take(&mut app.reconnect_owed) {
-                    data::spawn_subscribe(&tx, home);
+                    match io.reconnect.try_send(()) {
+                        Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
+                        Err(mpsc::error::TrySendError::Closed(())) => {
+                            app.refresh.disconnected();
+                            app.notice =
+                                Some("can't reconnect: subscription worker stopped".into());
+                        }
+                    }
                 }
                 n += 1;
                 if n >= BATCH {
                     break;
                 }
-                queued = rx.try_recv().ok();
+                queued = try_next_ready(
+                    &mut next_lane,
+                    &mut key_rx,
+                    &mut action_rx,
+                    &mut snapshot_rx,
+                    &mut event_rx,
+                )
+                .map(|(lane, msg)| {
+                    next_lane = lane.next();
+                    msg
+                });
             }
         }
         if quit {
@@ -248,12 +320,12 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
         // state moved. The gate refuses while a fetch is in flight, so a
         // burst of edges costs one follow-up rather than one read each.
         if let Some(request) = app.wants_messages() {
-            if io.refresh.send(request).is_err() {
+            if io.refresh.send(request).await.is_err() {
                 break;
             }
         }
         if let Some(request) = message_follower.begin() {
-            if io.follow.send(request).is_err() {
+            if io.follow.send(request).await.is_err() {
                 break;
             }
         }
@@ -263,8 +335,18 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
         // its answer must carry.
         let next = app.take_pending().or_else(|| app.take_detail_read());
         if let Some(sent) = next {
-            if io.action.send(sent).is_err() {
-                break;
+            match io.action.try_send(sent) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full((token, _))) => app.apply_action(
+                    token,
+                    crate::action_io::ActionOutcome::NotSent(
+                        "another detail action is still queued".into(),
+                    ),
+                ),
+                Err(mpsc::error::TrySendError::Closed((token, _))) => app.apply_action(
+                    token,
+                    crate::action_io::ActionOutcome::NotSent("action worker stopped".into()),
+                ),
             }
         }
         // A theme edit, or a `cyclops theme <name>`, applies on this
@@ -284,10 +366,10 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
         // second step arms exactly one delayed redraw.
         if app.tick_eye() && !tick_armed {
             tick_armed = true;
-            let tx = tx.clone();
+            let tx = sinks.actions.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(EYE_TICK_MS)).await;
-                let _ = tx.send(UiMsg::EyeTick);
+                let _ = tx.send(UiMsg::EyeTick).await;
             });
         }
         draw(&mut term, &mut app);
@@ -302,7 +384,7 @@ fn handle(
     intake: &mut Intake,
     message_follower: &mut MessageFollower,
     tick_armed: &mut bool,
-    tx: &tokio::sync::mpsc::UnboundedSender<UiMsg>,
+    focus: &tokio::sync::mpsc::Sender<String>,
     msg: UiMsg,
 ) -> bool {
     match msg {
@@ -312,14 +394,17 @@ fn handle(
             // out to where a task can be started.
             Some(Command::Reconnect) => {}
             Some(Command::Focus(pane)) => {
-                // The jump runs off-loop; a slow tmux answer can never
-                // hold a frame or a keypress.
-                let tx = tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    if let Err(e) = cyclops_tmux::focus_pane(None, None, &pane) {
-                        let _ = tx.send(UiMsg::Notice(format!("can't jump to {pane}: {e}")));
+                // One serial worker owns tmux focus. Repeated clicks cannot
+                // create an unbounded set of blocking tasks.
+                match focus.try_send(pane) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        app.notice = Some("jump already in progress".into());
                     }
-                });
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        app.notice = Some("can't jump: focus worker stopped".into());
+                    }
+                }
             }
             None => {}
         },
@@ -365,12 +450,20 @@ fn handle(
         UiMsg::BuildHealth(health) => app.build_health = Some(health),
         UiMsg::MessagesChanged(changed) => {
             message_follower.changed(&changed);
-            app.refresh.messages_changed(&changed);
+            if app.refresh.messages_changed(&changed) {
+                app.notice = Some(MESSAGE_GAP_NOTICE.into());
+            }
         }
         UiMsg::MessagesRouteChanged => app.refresh.mark_dirty(),
         UiMsg::Messages { request, snapshot } => {
-            if app.apply_messages_response(request, &snapshot) {
+            if let Some(lines) = app.apply_messages_response(request, &snapshot) {
+                for e in lines {
+                    app.live(e);
+                }
                 message_follower.baseline(&snapshot);
+                if app.notice.as_deref() == Some(MESSAGE_GAP_NOTICE) {
+                    app.notice = None;
+                }
             }
         }
         // The last good snapshot stays on screen. Replacing it with
@@ -417,18 +510,173 @@ fn draw(term: &mut term::Term, app: &mut App) {
     term.draw(&rows);
 }
 
-async fn recv_winch(sig: &mut Option<tokio::signal::unix::Signal>) {
+async fn recv_winch(sig: &mut Option<tokio::signal::unix::Signal>) -> bool {
     match sig {
-        Some(s) => {
-            s.recv().await;
-        }
+        Some(s) => s.recv().await.is_some(),
         None => std::future::pending().await,
     }
+}
+
+/// Wait fairly across lanes. A closed stdin lane is disabled permanently,
+/// so EOF cannot become an eventless redraw loop that starves daemon work.
+async fn wait_next_ingress(
+    key_open: &mut bool,
+    key_rx: &mut mpsc::Receiver<Key>,
+    action_rx: &mut mpsc::Receiver<UiMsg>,
+    snapshot_rx: &mut mpsc::Receiver<UiMsg>,
+    event_rx: &mut mpsc::Receiver<UiMsg>,
+    sigwinch: &mut Option<tokio::signal::unix::Signal>,
+) -> IngressWake {
+    loop {
+        let wake = tokio::select! {
+            key = key_rx.recv(), if *key_open => match key {
+                Some(key) => IngressWake::Message(Lane::Input, UiMsg::Key(key)),
+                None => {
+                    *key_open = false;
+                    continue;
+                }
+            },
+            action = action_rx.recv() => match action {
+                Some(msg) => IngressWake::Message(Lane::Action, msg),
+                None => IngressWake::Closed,
+            },
+            snapshot = snapshot_rx.recv() => match snapshot {
+                Some(msg) => IngressWake::Message(Lane::Snapshot, msg),
+                None => IngressWake::Closed,
+            },
+            event = event_rx.recv() => match event {
+                Some(msg) => IngressWake::Message(Lane::Event, msg),
+                None => IngressWake::Closed,
+            },
+            resized = recv_winch(sigwinch) => if resized {
+                IngressWake::Resize
+            } else {
+                IngressWake::Closed
+            },
+        };
+        return wake;
+    }
+}
+
+/// Drain ready work by rotating the first eligible lane after every item.
+/// Input starts each run first, while every continuously ready lane is served
+/// within four items.
+fn try_next_ready(
+    start: &mut Lane,
+    key_rx: &mut mpsc::Receiver<Key>,
+    action_rx: &mut mpsc::Receiver<UiMsg>,
+    snapshot_rx: &mut mpsc::Receiver<UiMsg>,
+    event_rx: &mut mpsc::Receiver<UiMsg>,
+) -> Option<(Lane, UiMsg)> {
+    let mut lane = *start;
+    for _ in 0..4 {
+        let msg = match lane {
+            Lane::Input => key_rx.try_recv().ok().map(UiMsg::Key),
+            Lane::Action => action_rx.try_recv().ok(),
+            Lane::Snapshot => snapshot_rx.try_recv().ok(),
+            Lane::Event => event_rx.try_recv().ok(),
+        };
+        if let Some(msg) = msg {
+            return Some((lane, msg));
+        }
+        lane = lane.next();
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_ready_key_precedes_a_full_event_lane() {
+        let (key_tx, mut key_rx) = mpsc::channel(INPUT_CAPACITY);
+        let (_action_tx, mut action_rx) = mpsc::channel(ACTION_CAPACITY);
+        let (_snapshot_tx, mut snapshot_rx) = mpsc::channel(SNAPSHOT_CAPACITY);
+        let (event_tx, mut event_rx) = mpsc::channel(EVENT_CAPACITY);
+
+        for _ in 0..EVENT_CAPACITY {
+            event_tx.try_send(UiMsg::ThemeChanged).unwrap();
+        }
+        assert!(event_tx.try_send(UiMsg::ThemeChanged).is_err());
+        key_tx.try_send(Key::Char('q')).unwrap();
+        let mut start = Lane::Input;
+
+        assert!(matches!(
+            try_next_ready(
+                &mut start,
+                &mut key_rx,
+                &mut action_rx,
+                &mut snapshot_rx,
+                &mut event_rx,
+            ),
+            Some((Lane::Input, UiMsg::Key(Key::Char('q'))))
+        ));
+        assert!(matches!(event_rx.try_recv(), Ok(UiMsg::ThemeChanged)));
+    }
+
+    #[test]
+    fn ready_lanes_are_drained_in_a_bounded_rotation() {
+        let (key_tx, mut key_rx) = mpsc::channel(1);
+        let (action_tx, mut action_rx) = mpsc::channel(1);
+        let (snapshot_tx, mut snapshot_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        key_tx.try_send(Key::Char('x')).unwrap();
+        action_tx.try_send(UiMsg::EyeTick).unwrap();
+        snapshot_tx.try_send(UiMsg::ThemeChanged).unwrap();
+        event_tx.try_send(UiMsg::MessagesRouteChanged).unwrap();
+
+        let mut start = Lane::Input;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let (lane, _) = try_next_ready(
+                &mut start,
+                &mut key_rx,
+                &mut action_rx,
+                &mut snapshot_rx,
+                &mut event_rx,
+            )
+            .unwrap();
+            seen.push(lane);
+            start = lane.next();
+        }
+        assert_eq!(
+            seen,
+            vec![Lane::Input, Lane::Action, Lane::Snapshot, Lane::Event]
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_key_input_is_disabled_before_daemon_work_continues() {
+        let (key_tx, mut key_rx) = mpsc::channel(1);
+        drop(key_tx);
+        let (_action_tx, mut action_rx) = mpsc::channel(1);
+        let (_snapshot_tx, mut snapshot_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let producer = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            event_tx.send(UiMsg::ThemeChanged).await.unwrap();
+        });
+        let mut key_open = true;
+        let mut no_signal = None;
+
+        let wake = wait_next_ingress(
+            &mut key_open,
+            &mut key_rx,
+            &mut action_rx,
+            &mut snapshot_rx,
+            &mut event_rx,
+            &mut no_signal,
+        )
+        .await;
+
+        producer.await.unwrap();
+        assert!(!key_open);
+        assert!(matches!(
+            wake,
+            IngressWake::Message(Lane::Event, UiMsg::ThemeChanged)
+        ));
+    }
 
     /// GOALS lists the plain screen-reader mode and honoring NO_COLOR as
     /// two separate obligations. Treating them as one cost a user who
@@ -491,7 +739,7 @@ mod tests {
         let mut intake = Intake::new();
         let mut message_follower = MessageFollower::default();
         let mut tick_armed = false;
-        let (tx, _rx) = unbounded_channel();
+        let (tx, _rx) = mpsc::channel(4);
 
         assert!(!handle(
             &mut app,
@@ -529,7 +777,7 @@ mod tests {
         let mut intake = Intake::new();
         let mut message_follower = MessageFollower::default();
         let mut tick_armed = false;
-        let (tx, _rx) = unbounded_channel();
+        let (tx, _rx) = mpsc::channel(4);
 
         assert!(!handle(
             &mut app,
@@ -546,5 +794,83 @@ mod tests {
         assert!(frame.contains("R reconnect"), "{frame}");
         assert!(frame.contains("daemon socket unavailable"), "{frame}");
         assert_eq!(app.handle_key(Key::Char('R')), Some(Command::Reconnect));
+    }
+
+    #[test]
+    fn a_visible_stream_gap_requires_and_accepts_a_whole_snapshot_rebuild() {
+        let mut app = App::new(Theme::none(), View::Messages, Filter::default());
+        app.queue.replace(Snapshot {
+            watermark: 17,
+            rows: Vec::new(),
+        });
+        let mut intake = Intake::new();
+        let mut message_follower = MessageFollower::default();
+        let mut tick_armed = false;
+        let (focus, _focus_rx) = mpsc::channel(1);
+
+        assert!(!handle(
+            &mut app,
+            &mut intake,
+            &mut message_follower,
+            &mut tick_armed,
+            &focus,
+            UiMsg::ConnLost("malformed event; live stream may have a gap".into()),
+        ));
+        assert_eq!(app.queue.watermark(), 17, "the last good model vanished");
+        assert!(
+            !app.refresh.may_mutate(),
+            "stale state still allowed actions"
+        );
+        assert_eq!(app.handle_key(Key::Char('R')), Some(Command::Reconnect));
+
+        assert!(!handle(
+            &mut app,
+            &mut intake,
+            &mut message_follower,
+            &mut tick_armed,
+            &focus,
+            UiMsg::Subscribed,
+        ));
+        assert!(
+            !app.refresh.may_mutate(),
+            "an ack was mistaken for rebuilt state"
+        );
+        let request = app.wants_messages().expect("reconnect owes one rebuild");
+        let snapshot: cyclops_proto::MessagesSnapshotResult =
+            serde_json::from_value(serde_json::json!({
+                "workspace_id": "00000000-0000-0000-0000-000000000001",
+                "workspace_seq": 23,
+                "counts": {
+                    "visible_messages": 0,
+                    "returned_messages": 0,
+                    "inbox_messages": 0,
+                    "outbound_messages": 0,
+                    "work_messages": 0,
+                    "active_messages": 0,
+                    "settled_messages": 0,
+                    "pending_entries": 0,
+                    "claimed_entries": 0,
+                    "open_attention_entries": 0
+                },
+                "rows": []
+            }))
+            .unwrap();
+        assert!(!handle(
+            &mut app,
+            &mut intake,
+            &mut message_follower,
+            &mut tick_armed,
+            &focus,
+            UiMsg::Messages {
+                request,
+                snapshot: Box::new(snapshot),
+            },
+        ));
+
+        assert_eq!(app.queue.watermark(), 23);
+        assert!(
+            app.refresh.may_mutate(),
+            "rebuilt state did not restore actions"
+        );
     }
 }

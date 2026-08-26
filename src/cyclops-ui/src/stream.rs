@@ -32,8 +32,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use cyclops_proto::{
-    AgentState, Attention, AttentionItem, Clearance, DeliveryState, Event, Half, Kind, LedgerLine,
-    NotifyLevel, OpenDelivery, PaneSnapshot, RecipientKey, Resolved,
+    AgentState, Attention, AttentionItem, AttentionKey, Clearance, DeliveryRecipientIdentity,
+    DeliveryState, Event, Kind, LedgerLine, NotifyLevel, OpenDelivery, PaneSnapshot, RecipientKey,
+    Resolved,
 };
 use serde_json::Value;
 
@@ -57,6 +58,9 @@ pub struct StatusSeed {
     /// transposition of label and pane id cannot compile.
     pub panes: Vec<PaneSnapshot>,
     pub open: Vec<OpenDelivery>,
+    /// Durable mailbox attention rows, the register's mailbox half, kept
+    /// apart from `open` (the legacy session-ledger half).
+    pub mailbox: Vec<OpenDelivery>,
     pub admin_unread: u64,
     /// Current display labels bound to immutable mailbox endpoints.
     pub mailbox_routes: Vec<EndpointFilter>,
@@ -98,6 +102,7 @@ impl StatusSeed {
                 })
                 .collect(),
             open: res.open_deliveries.clone(),
+            mailbox: res.mailbox_attention.clone(),
             admin_unread: res.admin_unread,
             mailbox_routes: res
                 .mailbox_routes
@@ -180,6 +185,9 @@ pub enum EntryKind {
         subject: String,
         pane_id: Option<String>,
         to: Option<String>,
+        /// Exact recipient for a single-delivery ping. Older events carry
+        /// only `to` and remain label-scoped.
+        recipient: Option<RecipientKey>,
         deliveries: Vec<PingDelivery>,
     },
     State {
@@ -318,6 +326,7 @@ fn notify_kind(d: &Value, subject: String) -> EntryKind {
         subject,
         pane_id: opt_str(d, "pane_id"),
         to: opt_str(d, "to"),
+        recipient: recipient_of(d),
         deliveries: ping_deliveries(d),
     }
 }
@@ -939,6 +948,18 @@ impl Record {
         self.entries.iter()
     }
 
+    /// Calm-view entries, oldest first, with one attention lookup per scan.
+    ///
+    /// Renderers outside this crate must not rebuild the delivery union for
+    /// every entry. This iterator freezes the admission index once and keeps
+    /// exact-recipient and legacy-label resolution inside the stream model.
+    pub fn admitted_entries(&self) -> impl Iterator<Item = &Entry> {
+        let admission = AdminAdmission::from_attention(&self.attention);
+        self.entries
+            .iter()
+            .filter(move |entry| self.admits_with(entry, &admission))
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -1009,9 +1030,14 @@ impl Record {
             } => self
                 .attention
                 .observe_agent(target, pane_id.as_deref(), *state),
-            EntryKind::Delivery { to, state, .. } => {
-                self.attention.observe_delivery(to, e.id.as_deref(), *state)
-            }
+            EntryKind::Delivery {
+                to,
+                recipient,
+                state,
+                ..
+            } => self
+                .attention
+                .observe_delivery(to, *recipient, e.id.as_deref(), *state),
             // Only physical loss drops attention. A route transfer keeps
             // the same pane and may already have published its destination
             // state before this source removal arrives.
@@ -1101,7 +1127,7 @@ impl Record {
     /// After that the register moves on live events alone, and a pane
     /// leaving the table is one of them ([`Record::live`]).
     pub fn seed(&mut self, panes: &[PaneSnapshot], open: &[OpenDelivery]) -> Vec<Entry> {
-        self.seed_routed(panes, open, &HashMap::new(), &HashMap::new())
+        self.seed_routed(panes, open, &[], &HashMap::new(), &HashMap::new())
     }
 
     /// Seed with the daemon session slot for each pane.
@@ -1113,12 +1139,46 @@ impl Record {
         &mut self,
         panes: &[PaneSnapshot],
         open: &[OpenDelivery],
+        mailbox: &[OpenDelivery],
         routes: &HashMap<String, usize>,
         recipients: &HashMap<String, RecipientKey>,
     ) -> Vec<Entry> {
-        // 1. Replace both halves of the register with the answer.
+        // 1. Replace the pane and legacy halves of the register with the
+        //    answer; the mailbox half moves only by an accepted snapshot.
         self.attention.snapshot_agents(panes.iter().cloned());
         self.attention.snapshot_deliveries(open);
+        self.attention.snapshot_mailbox(mailbox);
+        let rows: Vec<OpenDelivery> = open.iter().chain(mailbox.iter()).cloned().collect();
+        self.lines_after_seed(panes, &rows, routes, recipients)
+    }
+
+    /// Replace only the mailbox half of the register from an accepted
+    /// `messages.snapshot`, and hand back the lines that changed. The pane
+    /// and legacy halves are untouched, so a mailbox edge cannot refold the
+    /// session record or reset a roster clock.
+    pub(crate) fn seed_mailbox(
+        &mut self,
+        rows: &[OpenDelivery],
+        routes: &HashMap<String, usize>,
+        recipients: &HashMap<String, RecipientKey>,
+    ) -> Vec<Entry> {
+        self.attention.snapshot_mailbox(rows);
+        // No pane reconciliation on a mailbox edge: the pane half did not
+        // move, so its dedup map must not either.
+        self.lines_after_seed(&[], rows, routes, recipients)
+    }
+
+    /// Steps 2 to 4 of a seed, against whatever the register now holds:
+    /// a line for every counted item the record does not already carry, a
+    /// clearance for every alarm the register no longer counts, and the
+    /// dedup map moved with the register.
+    fn lines_after_seed(
+        &mut self,
+        panes: &[PaneSnapshot],
+        open: &[OpenDelivery],
+        routes: &HashMap<String, usize>,
+        recipients: &HashMap<String, RecipientKey>,
+    ) -> Vec<Entry> {
         // 2. Write a line for every counted item the loaded record does
         //    not already carry. The register says WHICH items those are,
         //    so a header and the record cannot disagree about the list;
@@ -1129,9 +1189,9 @@ impl Record {
         //    of parked deliveries, so a scan per item costs items squared.
         let items = self.attention.items();
         let newest = self.newest_line_per_item(&items);
-        let open_by_key: HashMap<(&str, &str), &OpenDelivery> = open
+        let open_by_key: HashMap<(DeliveryRecipientIdentity, &str), &OpenDelivery> = open
             .iter()
-            .map(|d| ((d.to.as_str(), d.id.as_str()), d))
+            .map(|d| ((DeliveryRecipientIdentity::of(d), d.id.as_str()), d))
             .collect();
         let mut out = Vec::new();
         for item in &items {
@@ -1163,8 +1223,13 @@ impl Record {
                         state: *state,
                     },
                 },
-                AttentionItem::Delivery { to, id, state } => {
-                    let record = open_by_key.get(&(to.as_str(), id.as_str())).copied();
+                AttentionItem::Delivery {
+                    recipient,
+                    to,
+                    id,
+                    state,
+                } => {
+                    let record = open_by_key.get(&(recipient.clone(), id.as_str())).copied();
                     Entry {
                         uid: 0,
                         // The record's own transition time: this line can
@@ -1175,9 +1240,12 @@ impl Record {
                         id: Some(id.clone()),
                         kind: EntryKind::Delivery {
                             to: to.clone(),
-                            recipient: record
-                                .and_then(|delivery| delivery.recipient)
-                                .or_else(|| recipients.get(to).copied()),
+                            recipient: match recipient {
+                                DeliveryRecipientIdentity::Exact(key) => Some(*key),
+                                DeliveryRecipientIdentity::LegacyLabel(_) => record
+                                    .and_then(|delivery| delivery.recipient)
+                                    .or_else(|| recipients.get(to).copied()),
+                            },
                             state: *state,
                             cause: record.and_then(|d| d.cause.clone()),
                         },
@@ -1239,19 +1307,14 @@ impl Record {
     fn alarms_the_answer_cleared(&self) -> Vec<(AttentionItem, Option<RecipientKey>, Clearance)> {
         // Owned keys: the map outlives each entry's borrow, and the
         // identity is two strings either way.
-        let key = |item: &AttentionItem| {
-            let (half, name, id) = item.identity();
-            (half, name.to_string(), id.to_string())
-        };
-        let mut open: HashMap<(Half, String, String), (AttentionItem, Option<RecipientKey>)> =
-            HashMap::new();
+        let mut open: HashMap<AttentionKey, (AttentionItem, Option<RecipientKey>)> = HashMap::new();
         for e in &self.entries {
             match (alarm_item(e), &e.kind) {
                 (Some(item), _) => {
-                    open.insert(key(&item), (item, entry_recipient(e)));
+                    open.insert(item.identity(), (item, entry_recipient(e)));
                 }
                 (None, EntryKind::Cleared { was, .. }) => {
-                    open.remove(&key(was));
+                    open.remove(&was.identity());
                 }
                 _ => {}
             }
@@ -1259,7 +1322,7 @@ impl Record {
         let mut out: Vec<(AttentionItem, Option<RecipientKey>, Clearance)> = open
             .into_values()
             .filter_map(|(item, recipient)| {
-                let how = self.attention.clearance(item.identity())?;
+                let how = self.attention.clearance(&item.identity())?;
                 Some((item, recipient, how))
             })
             .collect();
@@ -1276,8 +1339,8 @@ impl Record {
     fn newest_line_per_item<'a>(
         &'a self,
         items: &'a [AttentionItem],
-    ) -> HashMap<(Half, &'a str, &'a str), &'a Entry> {
-        let wanted: HashSet<(Half, &str, &str)> = items.iter().map(|i| i.identity()).collect();
+    ) -> HashMap<AttentionKey, &'a Entry> {
+        let wanted: HashSet<AttentionKey> = items.iter().map(|i| i.identity()).collect();
         let mut newest = HashMap::with_capacity(items.len());
         for e in self.entries.iter().rev() {
             if newest.len() == wanted.len() {
@@ -1322,7 +1385,30 @@ impl Record {
         if items.peek().is_none() {
             return true; // names nothing the register could answer for
         }
-        items.any(|item| self.attention.holds(item))
+        let admission = AdminAdmission::from_attention(&self.attention);
+        items.any(|item| admission.holds(item))
+    }
+
+    /// Freeze the attention lookup once for one admin-view scan.
+    ///
+    /// A frame may inspect ten thousand entries. Rebuilding the delivery
+    /// union for every notification turns that scan into entries times open
+    /// items. The index keeps the same exact-recipient and legacy-label
+    /// resolution rule while paying for the current register once.
+    pub(crate) fn admin_admission(&self) -> AdminAdmission {
+        AdminAdmission::from_attention(&self.attention)
+    }
+
+    /// Apply the calm-view rule against one frame's frozen attention index.
+    pub(crate) fn admits_with(&self, e: &Entry, admission: &AdminAdmission) -> bool {
+        if !e.admin_visible() {
+            return false;
+        }
+        let mut items = ping_items(e).peekable();
+        if items.peek().is_none() {
+            return true;
+        }
+        items.any(|item| admission.holds(item))
     }
 
     /// Counted items with no line in `visible`.
@@ -1346,7 +1432,7 @@ impl Record {
         {
             // The register keys are unique, so identity indexes the
             // backlog exactly and the window is walked once against it.
-            let by_id: HashMap<(Half, &str, &str), usize> = items
+            let by_id: HashMap<AttentionKey, usize> = items
                 .iter()
                 .enumerate()
                 .map(|(i, item)| (item.identity(), i))
@@ -1369,6 +1455,107 @@ impl Record {
     }
 }
 
+/// Attention keys frozen for one admin-view scan.
+///
+/// A label-only delivery reference resolves to one exact recipient only
+/// when exactly one standing row carries that label and message id. Missing
+/// and ambiguous exact rows retain the legacy-label key, matching
+/// `Attention::key_for` without rebuilding its delivery union per entry.
+pub(crate) struct AdminAdmission {
+    agents: HashSet<String>,
+    exact_deliveries: HashMap<RecipientKey, HashSet<String>>,
+    legacy_deliveries: HashMap<String, HashSet<String>>,
+    exact_by_label: HashMap<String, HashMap<String, Option<RecipientKey>>>,
+}
+
+impl AdminAdmission {
+    fn from_attention(attention: &Attention) -> Self {
+        let items = attention.items();
+        let mut agents = HashSet::new();
+        let mut exact_deliveries: HashMap<RecipientKey, HashSet<String>> = HashMap::new();
+        let mut legacy_deliveries: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut exact_by_label = HashMap::new();
+        for item in &items {
+            match item {
+                AttentionItem::Agent { pane_id, .. } => {
+                    agents.insert(pane_id.clone());
+                }
+                AttentionItem::Delivery {
+                    recipient: DeliveryRecipientIdentity::Exact(recipient),
+                    to,
+                    id,
+                    ..
+                } => {
+                    exact_deliveries
+                        .entry(*recipient)
+                        .or_default()
+                        .insert(id.clone());
+                    exact_by_label
+                        .entry(to.clone())
+                        .or_insert_with(HashMap::new)
+                        .entry(id.clone())
+                        .and_modify(|found: &mut Option<RecipientKey>| {
+                            if *found != Some(*recipient) {
+                                *found = None;
+                            }
+                        })
+                        .or_insert(Some(*recipient));
+                }
+                AttentionItem::Delivery {
+                    recipient: DeliveryRecipientIdentity::LegacyLabel(label),
+                    id,
+                    ..
+                } => {
+                    legacy_deliveries
+                        .entry(label.clone())
+                        .or_default()
+                        .insert(id.clone());
+                }
+            }
+        }
+        Self {
+            agents,
+            exact_deliveries,
+            legacy_deliveries,
+            exact_by_label,
+        }
+    }
+
+    fn holds(&self, item: PingRef<'_>) -> bool {
+        match item {
+            PingRef::Agent(pane_id) => self.agents.contains(pane_id),
+            PingRef::Delivery {
+                recipient: Some(recipient),
+                id,
+                ..
+            } => self
+                .exact_deliveries
+                .get(&recipient)
+                .is_some_and(|ids| ids.contains(id)),
+            PingRef::Delivery {
+                recipient: None,
+                to,
+                id,
+            } => match self
+                .exact_by_label
+                .get(to)
+                .and_then(|ids| ids.get(id))
+                .copied()
+                .flatten()
+            {
+                Some(recipient) => self
+                    .exact_deliveries
+                    .get(&recipient)
+                    .is_some_and(|ids| ids.contains(id)),
+                None => self
+                    .legacy_deliveries
+                    .get(to)
+                    .is_some_and(|ids| ids.contains(id)),
+            },
+        }
+    }
+}
+
 /// The item a line could be about, by name alone. Lines that name nothing
 /// the register tracks (messages, gates, session churn) answer None.
 ///
@@ -1376,20 +1563,17 @@ impl Record {
 /// pane key across adoption, or (recipient, message id). Keeping it a
 /// value rather than a comparison is what lets a surface index its lines
 /// once instead of rescanning them per item.
-fn entry_identity(e: &Entry) -> Option<(Half, &str, &str)> {
+fn entry_identity(e: &Entry) -> Option<AttentionKey> {
     match &e.kind {
         EntryKind::State {
             target, pane_id, ..
-        } => Some((
-            Half::Agent,
-            cyclops_proto::agent_key(target, pane_id.as_deref()),
-            "",
-        )),
-        EntryKind::Delivery { to, .. } => {
-            Some((Half::Delivery, to, e.id.as_deref().unwrap_or_default()))
-        }
-        // A clearance is about its item, and carries the identity itself
-        // rather than deriving it from a name and a record id.
+        } => Some(AttentionKey::Agent {
+            pane_id: cyclops_proto::agent_key(target, pane_id.as_deref()).to_string(),
+        }),
+        EntryKind::Delivery { to, recipient, .. } => Some(AttentionKey::Delivery {
+            recipient: DeliveryRecipientIdentity::from_parts(*recipient, to),
+            id: e.id.clone().unwrap_or_default(),
+        }),
         EntryKind::Cleared { was, .. } => Some(was.identity()),
         _ => None,
     }
@@ -1426,13 +1610,17 @@ fn alarm_item(e: &Entry) -> Option<AttentionItem> {
             name: target.clone(),
             state: *state,
         }),
-        EntryKind::Delivery { to, state, .. } if cyclops_proto::delivery_needs_human(*state) => {
-            Some(AttentionItem::Delivery {
-                to: to.clone(),
-                id: e.id.clone().unwrap_or_default(),
-                state: *state,
-            })
-        }
+        EntryKind::Delivery {
+            to,
+            recipient,
+            state,
+            ..
+        } if cyclops_proto::delivery_needs_human(*state) => Some(AttentionItem::Delivery {
+            recipient: DeliveryRecipientIdentity::from_parts(*recipient, to),
+            to: to.clone(),
+            id: e.id.clone().unwrap_or_default(),
+            state: *state,
+        }),
         _ => None,
     }
 }
@@ -1449,35 +1637,46 @@ fn alarm_item(e: &Entry) -> Option<AttentionItem> {
 /// An iterator rather than a Vec: this runs for every ping on every frame
 /// (`Record::admits`), and a firehose over a full ring is where the frame
 /// budget goes.
-fn ping_items(e: &Entry) -> impl Iterator<Item = (Half, &str, &str)> {
-    // The single-item form every ping about one thing uses, and the batch
-    // list the restart closure adds. A ping carries one or the other.
-    let (one, batch): (Option<(Half, &str, &str)>, &[PingDelivery]) = match &e.kind {
+/// What one operator ping names: a pane, or a delivery by the exact
+/// recipient the ping carries (label only for older pings).
+enum PingRef<'a> {
+    Agent(&'a str),
+    Delivery {
+        recipient: Option<RecipientKey>,
+        to: &'a str,
+        id: &'a str,
+    },
+}
+
+fn ping_items(e: &Entry) -> impl Iterator<Item = PingRef<'_>> {
+    let (one, batch): (Option<PingRef<'_>>, &[PingDelivery]) = match &e.kind {
         EntryKind::Notify {
             level,
             pane_id,
             to,
+            recipient,
             deliveries,
             ..
         } if !matches!(level, NotifyLevel::Fyi) => {
             let one = match (pane_id, to) {
-                (Some(pane_id), _) => Some((Half::Agent, pane_id.as_str(), "")),
-                (None, Some(to)) => Some((
-                    Half::Delivery,
-                    to.as_str(),
-                    e.id.as_deref().unwrap_or_default(),
-                )),
+                (Some(pane_id), _) => Some(PingRef::Agent(pane_id.as_str())),
+                (None, Some(to)) => Some(PingRef::Delivery {
+                    recipient: *recipient,
+                    to: to.as_str(),
+                    id: e.id.as_deref().unwrap_or_default(),
+                }),
                 (None, None) => None,
             };
             (one, deliveries.as_slice())
         }
         _ => (None, &[]),
     };
-    one.into_iter().chain(
-        batch
-            .iter()
-            .map(|d| (Half::Delivery, d.to.as_str(), d.id.as_str())),
-    )
+    one.into_iter()
+        .chain(batch.iter().map(|d| PingRef::Delivery {
+            recipient: None,
+            to: d.to.as_str(),
+            id: d.id.as_str(),
+        }))
 }
 
 /// Does this line say what the register currently claims about that item?
@@ -1760,6 +1959,7 @@ mod tests {
             Some(recipient),
             Resolved {
                 was: AttentionItem::Delivery {
+                    recipient: DeliveryRecipientIdentity::Exact(recipient),
                     to: "after-rename".into(),
                     id: "m-1".into(),
                     state: DeliveryState::AttentionRequired,
@@ -1828,10 +2028,12 @@ mod tests {
             }
         ));
 
+        let ping_recipient = endpoint("implementer").recipient();
         let line: LedgerLine = serde_json::from_value(json!({
             "seq": 10, "boot_id": "b", "id": "e-2", "ts": 1000, "kind": "system",
             "from": "cyclopsd", "to": ["admin"], "subject": "quota parked",
-            "data": {"event": "admin_notify", "level": "urgent", "to": "implementer"}
+            "data": {"event": "admin_notify", "level": "urgent", "to": "implementer",
+                     "recipient": ping_recipient}
         }))
         .unwrap();
         let e = Entry::from_ledger(&line).unwrap();
@@ -1846,8 +2048,9 @@ mod tests {
                 level: NotifyLevel::Urgent,
                 pane_id: None,
                 to: Some(to),
+                recipient: Some(got),
                 ..
-            } if to == "implementer"
+            } if to == "implementer" && *got == ping_recipient
         ));
     }
 
@@ -2001,6 +2204,7 @@ mod tests {
             admin_unread: 0,
             mailbox_routes: Vec::new(),
             roster: Vec::new(),
+            mailbox: Vec::new(),
         };
         assert!(intake.status(Box::new(status)).is_none());
 
@@ -2282,6 +2486,7 @@ mod tests {
                 subject: "a prompt is waiting".into(),
                 pane_id: Some(pane_id.into()),
                 to: None,
+                recipient: None,
                 deliveries: Vec::new(),
             },
         }

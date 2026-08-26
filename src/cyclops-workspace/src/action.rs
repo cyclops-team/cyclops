@@ -287,6 +287,11 @@ pub enum Action {
     /// Collapse or reopen the sidebar. Visibility persists, so a
     /// workspace quit while collapsed reopens collapsed.
     ToggleSidebar,
+    /// Collapse or reopen the right-edge messages drawer.
+    ToggleMessages,
+    /// One verb clicked in the drawer's action strip, dispatched through
+    /// the same handler its key press reaches.
+    MessagesVerb(cyclops_ui::ChatAction),
     /// Show or hide the tab strip. Visible is the default and hiding is an
     /// explicit choice, so the `+` that makes tabs is on screen from a
     /// fresh install; the choice persists like the sidebar's.
@@ -463,6 +468,7 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
             session: ctx.session.to_string(),
         }),
         BindingAction::ToggleSidebar => Some(Action::ToggleSidebar),
+        BindingAction::ToggleMessages => Some(Action::ToggleMessages),
         BindingAction::ToggleTabBar => Some(Action::ToggleTabBar),
         BindingAction::ToggleMotion => Some(Action::ToggleMotion),
         BindingAction::ToggleEventPanel => Some(Action::ToggleEventPanel),
@@ -724,6 +730,13 @@ pub fn route_mouse_click(target: &HitTarget, button: MouseButton) -> Option<Acti
         // The chevron is the mouse's half of Ctrl+B b, on the panel edge
         // and on the collapsed rail alike.
         (HitTarget::SidebarToggle, MouseButton::Left) => Some(Action::ToggleSidebar),
+        (HitTarget::MessagesToggle, MouseButton::Left) => Some(Action::ToggleMessages),
+        // The strip's words are the mouse's half of the drawer's keys. The
+        // action they raise is dispatched through the same key handler, so
+        // there is one implementation of each verb rather than two.
+        (HitTarget::MessagesAction(action), MouseButton::Left) => {
+            Some(Action::MessagesVerb(*action))
+        }
         (HitTarget::AttentionIndicator { pane_id }, MouseButton::Left) => Some(Action::FocusPane {
             pane_id: pane_id.clone(),
         }),
@@ -788,7 +801,10 @@ pub fn route_drag_click(target: &DragTarget) -> Option<Action> {
         DragTarget::Divider { focus_on_click, .. } => focus_on_click
             .clone()
             .map(|pane_id| Action::FocusPane { pane_id }),
-        DragTarget::Sidebar | DragTarget::SidebarSplit | DragTarget::Dialog => None,
+        DragTarget::Sidebar
+        | DragTarget::Messages
+        | DragTarget::SidebarSplit
+        | DragTarget::Dialog => None,
     }
 }
 

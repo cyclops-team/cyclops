@@ -9,6 +9,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use common::*;
+use cyclops_proto::NotificationState;
 use serde_json::{json, Value};
 
 const IDENTITY_MANIFEST: &str = r#"
@@ -56,6 +57,14 @@ fn agent_command_loop(client_dir: &Path) -> String {
     format!(
         "{}/cycagent -u -c 'import shlex,subprocess,sys; [subprocess.run(shlex.split(line)) for line in sys.stdin]'",
         client_dir.display()
+    )
+}
+
+fn codex_ghost_agent_command_loop(client_dir: &Path) -> String {
+    format!(
+        "{}/cycagent -u {}/tests/common/socket_agent.py",
+        client_dir.display(),
+        env!("CARGO_MANIFEST_DIR")
     )
 }
 
@@ -160,6 +169,69 @@ fn notification_attempts(rig: &Rig, message_id: &str) -> BTreeSet<String> {
                 .then(|| line["data"]["attempt_id"].as_str().unwrap().to_string())
         })
         .collect()
+}
+
+fn notification_state_count(rig: &Rig, message_id: &str, state: &str) -> usize {
+    workspace_lines(rig)
+        .into_iter()
+        .filter(|line| {
+            line["id"] == message_id
+                && line["data"]["type"] == "notification_transition"
+                && line["data"]["state"] == state
+        })
+        .count()
+}
+
+async fn wait_for_notification_state(rig: &Rig, message_id: &str, state: &str) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if notification_state_count(rig, message_id, state) > 0 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "notification {message_id} did not reach {state}: {:#?}",
+            workspace_lines(rig)
+                .into_iter()
+                .filter(|line| line["id"] == message_id)
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_notification_attempt(rig: &Rig, message_id: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if let Some(attempt) = notification_attempts(rig, message_id).into_iter().next() {
+            return attempt;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "notification {message_id} never started: {:#?}",
+            workspace_lines(rig)
+                .into_iter()
+                .filter(|line| line["id"] == message_id)
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn compact_doorbell(attempt_id: &str) -> String {
+    cyclops_proto::render_doorbell_v3(
+        cyclops_proto::NotificationAttemptId::parse(attempt_id).unwrap(),
+    )
+}
+
+fn pane_history(rig: &Rig, pane: &str) -> String {
+    let output = rig.tmux.run(&["capture-pane", "-p", "-S", "-", "-t", pane]);
+    assert!(
+        output.status.success(),
+        "capture pane history failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -495,6 +567,149 @@ async fn claiming_the_oldest_withdraws_only_its_attempt_and_schedules_the_next()
         notification_attempts(&rig, &first_id),
         notification_attempts(&rig, &second_id)
     );
+
+    rig.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authenticated_claim_withdraws_exact_blocked_attempt_and_releases_fifo() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+
+    let manifest = include_str!("../../../resources/manifests/codex.toml")
+        .replace(
+            "process_names = [\"codex\"]",
+            "process_names = [\"Python\", \"python3\"]\nargv_basenames = [\"cycagent\"]",
+        )
+        .replace(
+            "[messaging]\nmailbox_capability_file = \"~/.agents/skills/cyclops/SKILL.md\"\n",
+            "",
+        );
+    let client_dir = named_clients("blocked-claim-releases-fifo");
+    let pane_command = codex_ghost_agent_command_loop(&client_dir);
+    let mut rig = Rig::new("blocked-claim-releases-fifo", &manifest, &pane_command, "").await;
+    wait_pane_state(&mut rig, "idle").await;
+    let recipient = rig.pane_ids().await[0].clone();
+    rig.label(&recipient, "recipient").await;
+
+    rig.daemon.fail_next_final_binding_observation();
+    let first = rig
+        .daemon
+        .msg_send(
+            "admin",
+            serde_json::from_value(json!({
+                "to": ["recipient"],
+                "subject": "First",
+                "body": "first private body",
+                "client_key": "blocked-claim-first"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let first_id = first["msg_id"].as_str().unwrap().to_string();
+    wait_for_notification_state(&rig, &first_id, "blocked_pre_write").await;
+    let first_attempt = notification_attempts(&rig, &first_id)
+        .into_iter()
+        .next()
+        .expect("blocked notification keeps its attempt identity");
+    let blocked_state = serde_json::to_value(NotificationState::BlockedPreWrite).unwrap();
+    let blocked = workspace_lines(&rig)
+        .into_iter()
+        .find(|line| {
+            line["id"] == first_id
+                && line["data"]["type"] == "notification_transition"
+                && line["data"]["state"] == blocked_state
+        })
+        .expect("blocked transition is durable");
+    assert_eq!(blocked["data"]["pre_write_cause"], "binding_unprovable");
+    assert_eq!(notification_state_count(&rig, &first_id, "writing"), 0);
+    assert!(!pane_history(&rig, &recipient).contains(&compact_doorbell(&first_attempt)));
+
+    let second = rig
+        .daemon
+        .msg_send(
+            "admin",
+            serde_json::from_value(json!({
+                "to": ["recipient"],
+                "subject": "Second",
+                "body": "second private body",
+                "client_key": "blocked-claim-second"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let second_id = second["msg_id"].as_str().unwrap().to_string();
+    assert!(notification_attempts(&rig, &second_id).is_empty());
+
+    // The command runs as a descendant of the exact watched cycagent pane.
+    // The fixture paints Codex Working before opening the socket, so releasing
+    // the FIFO cannot let the second attempt write while this claim runs.
+    let claimed = pane_request(
+        &mut rig,
+        &client_dir,
+        &recipient,
+        "claim-blocked-first",
+        "inbox.claim",
+        json!({"message_id": first_id}),
+    )
+    .await;
+    assert!(claimed["error"].is_null(), "claim failed: {claimed}");
+    assert_eq!(claimed["result"]["disposition"], "claimed");
+    assert_eq!(claimed["result"]["message"]["body"], "first private body");
+    assert!(workspace_lines(&rig)
+        .into_iter()
+        .any(|line| { line["id"] == first_id && line["data"]["type"] == "message_claimed" }));
+
+    let second_attempt = wait_for_notification_attempt(&rig, &second_id).await;
+    let snapshot = pane_request(
+        &mut rig,
+        &client_dir,
+        &recipient,
+        "snapshot-after-blocked-claim",
+        "messages.snapshot",
+        json!({}),
+    )
+    .await;
+    assert!(snapshot["error"].is_null(), "snapshot failed: {snapshot}");
+    let rows = snapshot["result"]["rows"].as_array().unwrap();
+    let first_row = rows
+        .iter()
+        .find(|row| row["message_id"] == first_id)
+        .expect("claimed first message remains visible");
+    let second_row = rows
+        .iter()
+        .find(|row| row["message_id"] == second_id)
+        .expect("second message remains visible");
+    assert_eq!(first_row["recipients"][0]["mailbox"]["status"], "claimed");
+    // The durable message_claimed fact projects the attempt to Withdrawn.
+    // The compatibility wire view exposes that closed state as this pair.
+    assert_eq!(
+        first_row["recipients"][0]["notification"]["state"],
+        "not_started"
+    );
+    assert_eq!(
+        first_row["recipients"][0]["notification"]["settlement"],
+        "withdrawn_by_claim"
+    );
+    assert_eq!(second_row["recipients"][0]["mailbox"]["status"], "pending");
+    assert!(matches!(
+        second_row["recipients"][0]["notification"]["state"].as_str(),
+        Some("queued" | "gating")
+    ));
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(notification_attempts(&rig, &first_id).len(), 1);
+    assert_eq!(notification_attempts(&rig, &second_id).len(), 1);
+    assert_ne!(first_attempt, second_attempt);
+    assert_eq!(notification_state_count(&rig, &first_id, "writing"), 0);
+    assert_eq!(notification_state_count(&rig, &second_id, "writing"), 0);
+    let history = pane_history(&rig, &recipient);
+    assert!(!history.contains(&compact_doorbell(&first_attempt)));
+    assert!(!history.contains(&compact_doorbell(&second_attempt)));
 
     rig.shutdown().await;
 }

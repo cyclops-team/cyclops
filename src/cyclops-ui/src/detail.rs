@@ -115,6 +115,9 @@ pub struct Draft {
     keyed_for: Option<String>,
 }
 
+/// Leaves room for JSON escaping and request metadata inside one daemon frame.
+pub const DRAFT_MAX_BYTES: usize = crate::wire::MAX_FRAME_BYTES / 4;
+
 impl Draft {
     pub fn text(&self) -> &str {
         &self.text
@@ -128,8 +131,12 @@ impl Draft {
         self.text = text.into();
     }
 
-    pub fn push(&mut self, ch: char) {
+    pub fn push(&mut self, ch: char) -> bool {
+        if self.text.len().saturating_add(ch.len_utf8()) > DRAFT_MAX_BYTES {
+            return false;
+        }
         self.text.push(ch);
+        true
     }
 
     pub fn backspace(&mut self) {
@@ -260,7 +267,13 @@ pub struct Detail {
     can_manage_attention: bool,
     /// The daemon's answer for this exact unwritten wake and authenticated caller.
     can_withdraw_notification: bool,
+    wake_block: Option<cyclops_proto::MessageWakeBlock>,
     pre_write_cause: Option<NotificationPreWriteCause>,
+    /// The daemon's named write block, preferred over the enum cause.
+    pre_write_block: Option<String>,
+    /// Decided once by `MessageNotificationSummary::pane_width_block` at
+    /// the wire boundary; the detail never re-derives it.
+    pane_width_block: Option<(u32, u32)>,
     current_route: Option<MessageRecipientRoute>,
     fifo_position: Option<u64>,
 }
@@ -299,7 +312,10 @@ impl Detail {
             },
             can_manage_attention: row.can_manage_attention,
             can_withdraw_notification: row.can_withdraw_notification,
+            wake_block: row.wake_block,
             pre_write_cause: row.pre_write_cause,
+            pre_write_block: row.pre_write_block.clone(),
+            pane_width_block: row.pane_width_block,
             current_route: row.current_route.clone(),
             fifo_position: row.fifo_position,
             message_id: row.message_id.to_string(),
@@ -482,7 +498,10 @@ impl Detail {
                     || row.resolution_intent != self.resolution_intent
                     || row.resolution_action_accepted != self.resolution_action_accepted
                     || row.resolution_consumption_observed != self.resolution_consumption_observed
+                    || row.wake_block != self.wake_block
                     || row.pre_write_cause != self.pre_write_cause
+                    || row.pre_write_block != self.pre_write_block
+                    || row.pane_width_block != self.pane_width_block
                     || row.current_route != self.current_route
                     || row.fifo_position != self.fifo_position
                 {
@@ -491,7 +510,10 @@ impl Detail {
                     self.resolution_intent = row.resolution_intent;
                     self.resolution_action_accepted = row.resolution_action_accepted;
                     self.resolution_consumption_observed = row.resolution_consumption_observed;
+                    self.wake_block = row.wake_block;
                     self.pre_write_cause = row.pre_write_cause;
+                    self.pre_write_block = row.pre_write_block.clone();
+                    self.pane_width_block = row.pane_width_block;
                     self.current_route = row.current_route.clone();
                     self.fifo_position = row.fifo_position;
                     self.needs_reload = true;
@@ -727,7 +749,10 @@ impl Detail {
         if action == Action::WithdrawNotification {
             self.can_withdraw_notification = false;
             self.wake = WakeWord::WithdrawnByOperator;
+            self.wake_block = None;
             self.pre_write_cause = None;
+            self.pre_write_block = None;
+            self.pane_width_block = None;
         }
         self.loaded.claim_note = Some(note.into());
         self.stage = Stage::Open;
@@ -764,13 +789,17 @@ impl Detail {
 
     /// The sentence an operator says yes to. Names the exact target.
     pub fn confirmation(&self, action: Action) -> String {
+        let recipient = format!(
+            "{} ({})",
+            self.target.target.recipient, self.recipient_label
+        );
         if self.reconciliation_action() == Some(action) {
             let attempt = self
                 .target
                 .attempt
                 .expect("a reconciliation action requires one exact attempt");
             return format!(
-                "{} for {} at seq {}; no second key will be sent. y to confirm, esc to cancel",
+                "{} for {recipient} using {} at seq {}; no second key will be sent. y to confirm, esc to cancel",
                 self.action_word(action),
                 attempt,
                 self.target.watermark
@@ -785,10 +814,9 @@ impl Detail {
         let what = match (self.target.attempt, action) {
             (Some(attempt), Action::WithdrawNotification) => {
                 return format!(
-                    "{} {} for {} at seq {}? y to confirm, esc to cancel",
+                    "{} {} for {recipient} at seq {}? y to confirm, esc to cancel",
                     action.word(),
                     attempt,
-                    self.target.target.recipient,
                     self.target.watermark
                 );
             }
@@ -798,7 +826,7 @@ impl Detail {
             _ => self.target.target.id(),
         };
         format!(
-            "{} {} at seq {}? y to confirm, esc to cancel",
+            "{} {} for {recipient} at seq {}? y to confirm, esc to cancel",
             self.action_word(action),
             what,
             self.target.watermark
@@ -923,7 +951,7 @@ pub fn render(detail: &Detail, width: usize, height: usize) -> Vec<String> {
     render_with_status(detail, width, height, None)
 }
 
-pub(crate) fn render_with_status(
+pub fn render_with_status(
     detail: &Detail,
     width: usize,
     height: usize,
@@ -987,11 +1015,30 @@ pub(crate) fn render_with_status(
 
     match detail.wake() {
         WakeWord::BlockedBeforeWrite => {
-            let reason = match detail.pre_write_cause {
-                Some(cause) => cause.label(),
-                None => "reason unavailable",
-            };
-            body.push(format!("wake blocked before write: {reason}"));
+            if let Some((observed, required)) = detail.pane_width_block {
+                body.push(format!(
+                    "wake blocked before write: pane too narrow ({observed}, requires {required})"
+                ));
+            } else {
+                // The named block (for example hook admission unproven) is
+                // more exact than the enum cause it was recorded under.
+                let reason = detail
+                    .wake_block
+                    .map(|block| block.label().to_string())
+                    .or_else(|| {
+                        detail
+                            .pre_write_block
+                            .as_deref()
+                            .map(crate::grid::cause_words)
+                    })
+                    .or_else(|| {
+                        detail
+                            .pre_write_cause
+                            .map(|cause| cause.label().to_string())
+                    })
+                    .unwrap_or_else(|| "reason unavailable".to_string());
+                body.push(format!("wake blocked before write: {reason}"));
+            }
             body.push(format!(
                 "mailbox position: {}",
                 detail

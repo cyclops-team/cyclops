@@ -17,10 +17,12 @@ while `wake <state>` reports the current notification attempt.
 A socket claim may complete without any body appearing in the composer. The
 Messages view records the mailbox and wake outcomes separately.
 
-In doorbell mode, the recipient retrieves the body only by claiming the exact
-id named by the wake:
+In doorbell mode, the wake carries an exact attempt token. Running that command
+atomically claims the message currently bound to the attempt. A recipient may
+also list and claim by message id:
 
 ```bash
+cyclops inbox claim m-att_<22-character-attempt-token>
 cyclops inbox list
 cyclops inbox claim <message-id>
 cyclops reply <message-id> --body "Reviewed. One issue."

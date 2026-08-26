@@ -38,6 +38,8 @@ pub enum BindingAction {
     CloseWorkspace,
     /// Collapse or reopen the sidebar; the state persists across restarts.
     ToggleSidebar,
+    /// Show or hide the right-edge messages drawer.
+    ToggleMessages,
     /// Show or hide the tab strip; the state persists across restarts.
     ///
     /// No default chord. The strip ships visible and the app menu's "Tab
@@ -208,6 +210,10 @@ pub fn default_bindings() -> HashMap<BindingAction, BindingChord> {
             BindingChord::Prefix(KeyCode::Char('b')),
         ),
         (
+            BindingAction::ToggleMessages,
+            BindingChord::Prefix(KeyCode::Char('m')),
+        ),
+        (
             BindingAction::ToggleEventPanel,
             BindingChord::Prefix(KeyCode::Char('e')),
         ),
@@ -295,6 +301,7 @@ fn action_from_key(key: &str) -> Option<BindingAction> {
         "rename_workspace" => Some(BindingAction::RenameWorkspace),
         "close_workspace" => Some(BindingAction::CloseWorkspace),
         "toggle_sidebar" => Some(BindingAction::ToggleSidebar),
+        "toggle_messages" => Some(BindingAction::ToggleMessages),
         "toggle_tab_bar" => Some(BindingAction::ToggleTabBar),
         "toggle_files" => Some(BindingAction::ToggleFiles),
         "focus_files" => Some(BindingAction::FocusFiles),
@@ -434,6 +441,7 @@ fn action_words(action: BindingAction) -> String {
         BindingAction::RenameWorkspace => "Rename session".into(),
         BindingAction::CloseWorkspace => "Close session".into(),
         BindingAction::ToggleSidebar => "Toggle sidebar".into(),
+        BindingAction::ToggleMessages => crate::copy::BINDING_TOGGLE_MESSAGES.into(),
         BindingAction::ToggleTabBar => "Toggle tab bar".into(),
         BindingAction::ToggleFiles => "Toggle file panel".into(),
         BindingAction::FocusFiles => "Keyboard into the file panel".into(),
@@ -472,10 +480,11 @@ fn help_rank(action: BindingAction) -> (u8, usize) {
         BindingAction::RenameWorkspace => (43, 0),
         BindingAction::CloseWorkspace => (44, 0),
         BindingAction::ToggleSidebar => (49, 0),
-        BindingAction::ToggleTabBar => (49, 1),
-        BindingAction::ToggleFiles => (49, 2),
+        BindingAction::ToggleMessages => (49, 1),
+        BindingAction::ToggleTabBar => (49, 2),
+        BindingAction::ToggleFiles => (49, 3),
         BindingAction::FocusFiles => (50, 2),
-        BindingAction::ToggleMotion => (49, 2),
+        BindingAction::ToggleMotion => (49, 4),
         BindingAction::ToggleEventPanel => (50, 0),
         BindingAction::Compose => (50, 1),
         BindingAction::ShowKeybinds => (51, 0),

@@ -238,6 +238,7 @@ mod tests {
                 subject: "delivery to reviewer needs attention".into(),
                 pane_id: None,
                 to: Some("reviewer".into()),
+                recipient: None,
                 deliveries: Vec::new(),
             },
         };
@@ -336,6 +337,9 @@ mod tests {
             id: Some("m-1".into()),
             kind: EntryKind::Cleared {
                 was: AttentionItem::Delivery {
+                    recipient: cyclops_proto::DeliveryRecipientIdentity::LegacyLabel(
+                        "implementer".into(),
+                    ),
                     to: "implementer".into(),
                     id: "m-1".into(),
                     state: DeliveryState::ParkedBlockedQuota,

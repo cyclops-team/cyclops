@@ -77,7 +77,8 @@ printf '%s\n' "$TERM"
 An agent pane inside tmux normally reports `tmux-256color`; a regular terminal
 outside tmux commonly reports `xterm-256color`. Cyclops does not set
 `TERM=dumb`. Remove that value from the shell profile, launcher, or automation
-that created the shell, then start a fresh terminal. Do not claim richer
+that created the shell, then create a new tmux pane or restart the pane shell
+and agent. Existing processes keep the old environment. Do not claim richer
 terminal capabilities in a non-interactive pipe merely to suppress the warning.
 
 Headless tmux control clients may report `dumb` without changing an agent

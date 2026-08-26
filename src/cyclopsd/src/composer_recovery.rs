@@ -88,9 +88,9 @@ impl RecoveryCoordinator {
 
     /// Track a same-run barrier whose delivery worker already retired.
     ///
-    /// A late exact claim can reconcile an ACK timeout after the in-memory
-    /// delivery handle is gone. The durable barrier then follows the same
-    /// clean-screen retirement path as a barrier restored at daemon boot.
+    /// An exact claim can outlive its in-memory delivery handle. The durable
+    /// barrier then follows the same bound clean-screen retirement path as a
+    /// barrier restored at daemon boot.
     pub(crate) fn track(&mut self, attempt_id: NotificationAttemptId) {
         self.tracked_attempts.insert(attempt_id);
     }
@@ -459,7 +459,7 @@ pub(crate) fn retire_exact_lifecycle(
     if canonical.iter().any(|record| {
         record.attempt_id == candidate && record.needs_claimed_ack_timeout_reconciliation()
     }) {
-        // Exact v2 ACK-timeout recovery owns its own clear-or-clean settlement
+        // Exact attempt ACK-timeout recovery owns its own clear-or-clean settlement
         // fact. A turn end cannot remove that barrier or hide its alarm.
         return LifecycleRetirement::Blocked("claimed_notification_reconciliation_pending");
     }
@@ -796,7 +796,9 @@ mod tests {
             transport: NotificationTransport::Doorbell,
             doorbell_format: None,
             cause: None,
+            verify_outcome: None,
             pre_write_cause: None,
+            wake_block: None,
             pre_write_observation: None,
             pre_write_reopen_count: 0,
             started_seq: 4,

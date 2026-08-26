@@ -34,8 +34,43 @@ pub const ALARM_CLEARANCE_CANCELLED: &str = "alarm clearance cancelled";
 
 pub const SETUP_HOME_UNAVAILABLE: &str = "HOME is not set, so setup paths cannot be inspected";
 
+/// Explain why a notification cannot fit without changing its recorded cause.
+pub fn pane_too_narrow(observed: u32, required: u32) -> String {
+    format!("pane too narrow ({observed}, requires {required})")
+}
+
 pub fn alarm_clear_confirmation(count: usize, older_than: &str) -> String {
     format!("Clear {count} alarms selected by --older-than {older_than}? Type clear to confirm: ")
+}
+
+/// What `alarm clear` did and did not do. Clearance acknowledges an alarm;
+/// it retires nothing. The attempt keeps its state, the message keeps its
+/// place, and a pending head keeps holding its recipient's queue.
+pub fn alarm_cleared_consequence(
+    id: &str,
+    message_id: &str,
+    recipient: &str,
+    state: &str,
+    cause: &str,
+) -> String {
+    format!(
+        "  acknowledged only · at clearance, attempt {id} was {state} ({cause}) · clearance did not change message {message_id} to {recipient}; while pending, it can hold that recipient's queue · next: recipient retrieves the durable payload with cyclops inbox claim {message_id} · admin may inspect current state with cyclops attention show {id} --diff, then complete or discard when its checks authorize the action · neither clearance nor payload retrieval alone proves a post-write composer barrier retired"
+    )
+}
+
+/// Mixed-version fallback when an older daemon returns cleared ids without
+/// the additive locked summaries. The command must still state that alarm
+/// clearance does not resolve the notification or message.
+pub fn alarm_cleared_without_summary(id: &str) -> String {
+    format!(
+        "  acknowledged only · the daemon did not return the locked summary for attempt {id} · inspect current state with cyclops attention show {id} --diff, or update and restart the matched Cyclops pair"
+    )
+}
+
+/// A claim by id took a later message; the oldest pending one still holds
+/// this recipient's queue head and its wake.
+pub fn claim_skipped_oldest(oldest: &str) -> String {
+    format!("skipped oldest pending {oldest} · it still holds your queue head · claim it, or use inbox next for oldest-first")
 }
 
 pub fn no_unresolved_alarms(older_than: &str) -> String {

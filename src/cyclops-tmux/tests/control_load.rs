@@ -281,7 +281,10 @@ async fn timeout_is_command_failure_not_teardown() {
 
     // The notification stream never closed.
     assert!(
-        notif.try_recv().is_ok() || !notif.is_closed(),
+        !matches!(
+            notif.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ),
         "notification stream still open"
     );
 

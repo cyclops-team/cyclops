@@ -163,6 +163,40 @@ fn dedupe_ids(payload: &Value) -> Option<(String, String)> {
 /// visible through a control-connection outage (the m1 soak lost a
 /// delivery to exactly this blindness). Fusion recompute is skipped on
 /// that path; the reading is stored and reconciles at reattach.
+/// May this report publish an admission-eligible liveness edge?
+///
+/// `SessionStart` qualifies when the exact manifest declares it available:
+/// it says the agent process is up with its hooks wired and no turn has
+/// been asked of it. `UserPromptSubmit` qualifies only when this exact
+/// manifest configures it as a lifecycle start AND the report path installed
+/// or retained an active start for the exact binding, so the edge can never
+/// be seen without its start. A manifest that merely lists
+/// `UserPromptSubmit` as available never publishes it: with no start
+/// installed, a later clean screen would otherwise read idle during the
+/// submitted turn. Every other event is refused here and again by the store.
+pub(crate) fn admitting_edge_qualifies(
+    m: &cyclops_manifest::Manifest,
+    event: &str,
+    active_start_installed: bool,
+) -> bool {
+    let available = m
+        .hooks
+        .available
+        .iter()
+        .any(|name| normalize_event(name) == event);
+    if event == normalize_event("SessionStart") {
+        return available;
+    }
+    if event == normalize_event("UserPromptSubmit") {
+        let configured_start = matches!(
+            m.hooks.lifecycle_event(event),
+            Some((LifecycleRole::Start, _))
+        );
+        return available && configured_start && active_start_installed;
+    }
+    false
+}
+
 pub(crate) async fn handle_report(
     inner: &Arc<Inner>,
     params: StateReportParams,
@@ -245,11 +279,30 @@ pub(crate) async fn handle_report(
     // turn still proves that much, and it is the ONLY thing such a
     // payload is allowed to change.
     let edge_ms = unix_ms();
-    if let Some(manifest_id) = origin.manifest.as_deref() {
-        inner
-            .hook_liveness
-            .record(&pane, &params.event, edge_ms, origin.agent, manifest_id);
-    }
+    // Bound diagnostic edge, captured BEFORE sequence dedupe or any lifecycle
+    // mutation. A route that is not open yet cannot record or publish
+    // anything; the report is answered retryable with no state changed, and
+    // because dedupe has not run the retry can still publish. Reports never
+    // open routes.
+    let bound = match origin.manifest.as_deref() {
+        Some(manifest_id) => match inner.hook_liveness.bind_diagnostic(
+            &pane,
+            &params.event,
+            edge_ms,
+            origin.agent,
+            manifest_id,
+        ) {
+            Ok(binding) => Some(binding),
+            Err(crate::selftest::RouteNotOpen) => {
+                return Ok(json!({
+                    "applied": false,
+                    "reason": "hook_route_not_ready",
+                    "retryable": true
+                }));
+            }
+        },
+        None => None,
+    };
 
     // Only the events that make up a turn have to name one. Turn fields
     // describe the turn lifecycle, not every hook a vendor emits: a
@@ -452,11 +505,20 @@ pub(crate) async fn handle_report(
         let matching_end = readings
             .get(&pane)
             .is_some_and(|current| match &correlation {
-                Some(turnkey::TurnCorrelation::Exact(turn)) => current.active_start_matches(
-                    origin.agent,
-                    origin.manifest.as_deref(),
-                    Some(turn),
-                ),
+                // A confirmed exact end on this binding also ends a persistent
+                // unkeyed start: the start had no key to match, and the end is
+                // separately proven on the same agent generation.
+                Some(turnkey::TurnCorrelation::Exact(turn)) => {
+                    current.active_start_matches(
+                        origin.agent,
+                        origin.manifest.as_deref(),
+                        Some(turn),
+                    ) || current.unkeyed_latch_ended_by(
+                        origin.agent,
+                        origin.manifest.as_deref(),
+                        edge_ms,
+                    )
+                }
                 Some(turnkey::TurnCorrelation::Unconfigured) => {
                     current.confirmed_unkeyed_start_for(origin.agent, origin.manifest.as_deref())
                 }
@@ -535,8 +597,41 @@ pub(crate) async fn handle_report(
             "hook_dispatch_superseded",
         );
     }
+    // Admission-eligible publication comes after the manifest declared this
+    // event and after any start it carries has been installed above, and
+    // before the recompute below is scheduled: one causal order, so a
+    // recompute can never see an eligible edge without its active start.
+    if let (Some(m), Some(manifest_id)) = (manifest_of(inner, &origin), origin.manifest.as_deref())
+    {
+        let active_start_installed = inner
+            .hook_readings
+            .lock()
+            .expect("hook readings lock")
+            .get(&pane)
+            .is_some_and(|current| current.active_start_for(origin.agent, Some(manifest_id)));
+        if admitting_edge_qualifies(m, &event, active_start_installed) {
+            if let Some(binding) = &bound {
+                // The captured lifetime must still be live: a route closed and
+                // reopened since the diagnostic edge belongs to a replacement
+                // occupant, which inherits nothing and is not retried against.
+                if inner
+                    .hook_liveness
+                    .publish_admission(binding, &params.event)
+                    .is_err()
+                {
+                    return Ok(json!({"applied": false, "reason": "occupant_changed"}));
+                }
+            }
+        }
+    }
     if unkeyed_dispatch_start && applied_state.is_some() {
         fusion::schedule_unkeyed_dispatch_recheck(inner, &pane);
+    }
+    // A candidate end (Claude's Stop can continue through additionalContext)
+    // may trigger a fresh look at the screen but never clears a persistent
+    // start on its own; the screen's lifecycle evidence does that.
+    if is_turn_end && !lifecycle_confirmed {
+        fusion::schedule_lifecycle_recheck(inner, &pane);
     }
     if is_turn_end && lifecycle_confirmed {
         if let (Some(turn), Some(manifest)) = (exact_turn.as_ref(), origin.manifest.as_deref()) {
@@ -668,20 +763,25 @@ pub(crate) async fn handle_report(
         }
     }
 
-    // Reconcile on the edge; the recompute emits the state event and the
-    // ledger line if the fused verdict moved. Detached sessions have no
-    // sensors to reconcile; the stored reading waits for reattach.
+    // Reconcile on the authenticated edge. It is causal route evidence even
+    // when the fused verdict stays put: a pre-write block can be appended
+    // after this recompute, and the later generation is what reopens that
+    // exact attempt. Detached sessions have no sensors to reconcile; their
+    // stored reading waits for reattach.
     let live = watcher.is_some();
     if let Some(w) = watcher {
-        fusion::recompute_pane(
+        let route_evidence = inner.advance_route_evidence(session_idx, &pane_id);
+        fusion::recompute_pane_for_route_evidence(
             inner,
             session_idx,
             &w,
             &pane_id,
             is_turn_end && lifecycle_confirmed,
             "hook_report",
+            &route_evidence,
         )
         .await;
+        crate::messaging::schedule_route_evidence(inner, session_idx, &pane_id, &route_evidence);
     }
     if is_turn_end && lifecycle_confirmed {
         if let (Some(turn), Some(manifest)) = (exact_turn.as_ref(), origin.manifest.as_deref()) {
@@ -715,6 +815,86 @@ pub(crate) async fn handle_report(
 
 #[cfg(test)]
 mod tests {
+    /// An available-only UserPromptSubmit never qualifies: the manifest must
+    /// configure it as a lifecycle start and the report path must have
+    /// installed the active start. SessionStart qualifies by declaration.
+    #[test]
+    fn available_only_user_prompt_submit_never_enters_the_admission_store() {
+        let with_start = cyclops_manifest::Manifest::parse(
+            r#"
+[agent]
+id = "hooked"
+display_name = "Hooked fixture"
+process_names = ["hooked"]
+
+[hooks]
+config_mechanism = "test"
+available = ["SessionStart", "UserPromptSubmit", "Stop"]
+turn_start = "UserPromptSubmit"
+turn_start_evidence = "candidate"
+ack = "UserPromptSubmit"
+ack_evidence = "dispatch"
+ack_payload_field = "prompt"
+"#,
+            std::path::Path::new("hooked.toml"),
+        )
+        .unwrap();
+        let available_only = cyclops_manifest::Manifest::parse(
+            r#"
+[agent]
+id = "listed"
+display_name = "Listed fixture"
+process_names = ["listed"]
+
+[hooks]
+config_mechanism = "test"
+available = ["SessionStart", "UserPromptSubmit", "Stop"]
+"#,
+            std::path::Path::new("listed.toml"),
+        )
+        .unwrap();
+        let prompt = super::normalize_event("UserPromptSubmit");
+        let session = super::normalize_event("SessionStart");
+        let stop = super::normalize_event("Stop");
+        assert!(super::admitting_edge_qualifies(&with_start, &prompt, true));
+        assert!(
+            !super::admitting_edge_qualifies(&with_start, &prompt, false),
+            "start not installed"
+        );
+        assert!(
+            !super::admitting_edge_qualifies(&available_only, &prompt, true),
+            "available-only"
+        );
+        assert!(!super::admitting_edge_qualifies(
+            &available_only,
+            &prompt,
+            false
+        ));
+        assert!(super::admitting_edge_qualifies(
+            &with_start,
+            &session,
+            false
+        ));
+        assert!(super::admitting_edge_qualifies(
+            &available_only,
+            &session,
+            false
+        ));
+        assert!(!super::admitting_edge_qualifies(&with_start, &stop, true));
+        let liveness = crate::selftest::HookLiveness::new();
+        let pane = crate::PaneKey::new(0, "%1");
+        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
+        liveness.open(&pane);
+        let binding = liveness
+            .bind_diagnostic(&pane, "UserPromptSubmit", 1, agent, "listed")
+            .expect("route open");
+        if super::admitting_edge_qualifies(&available_only, &prompt, false) {
+            liveness
+                .publish_admission(&binding, "UserPromptSubmit")
+                .expect("lifetime live");
+        }
+        assert!(!liveness.seen_admitting_edge(&pane, agent, "listed"));
+    }
     use super::*;
 
     #[test]

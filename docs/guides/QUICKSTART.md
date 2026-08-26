@@ -206,10 +206,12 @@ pane rather than anything the request claimed. The body is durable, but the
 reviewer's pane receives only a one-line wake:
 
 ```text
-cyclops inbox claim m-be0129
+cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
 ```
 
-The reviewer lists metadata, claims that exact id, and then replies:
+The reserved locator claims its exact current message through the positional
+claim command. The reviewer may also list metadata, claim by message id, and
+then reply:
 
 ```console
 $ cyclops inbox list

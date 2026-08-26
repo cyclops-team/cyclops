@@ -245,6 +245,14 @@ fn row_for(
         target,
         message_id: row.message_id.clone(),
         recipient,
+        sender: row.sender,
+        sender_label: crate::grid::safe_text(&row.sender_label),
+        reply_to: row.reply_to.clone(),
+        thread_root: row.thread_root.clone(),
+        thread_message_count: row.thread_message_count,
+        ts: row.ts,
+        kind: row.kind,
+        recipient_count: row.recipients.len(),
         // The exact attempt an attention action names, kept apart from
         // the identity precisely because it changes.
         attention: to.notification.attempt_id,
@@ -268,6 +276,9 @@ fn row_for(
         wake,
         cause: to.notification.cause,
         pre_write_cause: to.notification.pre_write_cause,
+        pre_write_block: to.notification.pre_write_block.clone(),
+        wake_block: to.notification.wake_block,
+        pane_width_block: to.notification.pane_width_block(),
         current_route: to.current_route.clone(),
         fifo_position: to.fifo_position,
         needs_action: to.needs_action,
@@ -311,7 +322,7 @@ fn wake_word(n: &cyclops_proto::MessageNotificationSummary) -> WakeWord {
     if n.settlement == Some(MessageNotificationSettlement::WithdrawnByClaim) {
         return WakeWord::Withdrawn;
     }
-    if n.pre_write_cause.is_some() {
+    if n.wake_block.is_some() || n.pre_write_cause.is_some() {
         return WakeWord::BlockedBeforeWrite;
     }
     match n.quota_state {
@@ -452,28 +463,33 @@ impl RefreshGate {
     /// Duplicate or older edges are ignored. A gap invalidates the
     /// current request even if its answer later looks plausible: only a
     /// request started after the gap may replace the queue.
-    pub fn messages_changed(&mut self, changed: &MessagesChangedData) {
+    /// Returns true when the caller must expose that gap while rebuilding.
+    pub fn messages_changed(&mut self, changed: &MessagesChangedData) -> bool {
+        let mut gap = false;
         let newer = match (self.workspace_id, self.workspace_seq) {
             (Some(workspace_id), _) if workspace_id != changed.workspace_id => {
                 self.invalidate_generation();
+                gap = true;
                 true
             }
             (_, Some(workspace_seq)) if changed.workspace_seq <= workspace_seq => false,
             (_, Some(workspace_seq)) => {
                 if changed.workspace_seq > workspace_seq.saturating_add(1) {
                     self.invalidate_generation();
+                    gap = true;
                 }
                 true
             }
             _ => true,
         };
         if !newer {
-            return;
+            return false;
         }
         self.workspace_id = Some(changed.workspace_id);
         self.workspace_seq = Some(changed.workspace_seq);
         self.dirty = true;
         self.snapshot_current = false;
+        gap
     }
 
     /// The connection came back. Everything on screen predates the gap,
@@ -568,9 +584,23 @@ impl RefreshGate {
             return false;
         }
         // The last snapshot remains useful but is no longer current.
-        // Move to Lost so the operator gets one explicit R recovery path
-        // instead of an automatic retry loop or a permanently disabled UI.
+        // Move to Lost so clients whose snapshot shares the subscription
+        // reconnect explicitly instead of retrying forever.
         self.link = Link::Lost;
+        self.snapshot_current = false;
+        true
+    }
+
+    /// Finish a failed one-shot snapshot while the caller's independent
+    /// event subscription remains acknowledged.
+    pub fn finish_snapshot_failure(&mut self, request: RefreshRequest) -> bool {
+        if self.in_flight != Some(request) {
+            return false;
+        }
+        self.in_flight = None;
+        if request.generation != self.generation {
+            return false;
+        }
         self.snapshot_current = false;
         true
     }

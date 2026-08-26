@@ -75,6 +75,9 @@ fn row(i: u64) -> QueueRow {
         },
         cause: attention.then_some(NotificationAttentionCause::VerifyFailed),
         pre_write_cause: None,
+        pre_write_block: None,
+        wake_block: None,
+        pane_width_block: None,
         current_route: None,
         fifo_position: Some(i + 1),
         needs_action: attention || !i.is_multiple_of(3),
@@ -85,6 +88,7 @@ fn row(i: u64) -> QueueRow {
         } else {
             Direction::Inbound
         },
+        ..Default::default()
     }
 }
 

@@ -1,5 +1,8 @@
 {
   "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook SessionStart" } ] }
+    ],
     "UserPromptSubmit": [
       { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook UserPromptSubmit" } ] }
     ],

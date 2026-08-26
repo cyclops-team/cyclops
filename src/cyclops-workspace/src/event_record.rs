@@ -30,6 +30,17 @@ use cyclops_ui::{Entry, Intake, Record, StatusSeed};
 /// panel and opening the CLI start from the same history.
 pub const BACKFILL: usize = 200;
 
+/// One bounded replacement for the shared stream model. Loading may touch
+/// the daemon socket and journal, so the application builds this off-loop
+/// after an ingress gap and installs it as one result.
+pub struct Bootstrap {
+    seed: Option<Box<StatusSeed>>,
+    entries: Vec<Entry>,
+    max_seq: Option<u64>,
+    /// Visible loss reported while reading the bounded durable tail.
+    warning: Option<String>,
+}
+
 /// One live subscription entry, through the intake's startup buffering
 /// and seq dedup. Before the backfill lands this buffers; after it, a
 /// ledger-backed entry the replayed tail already carries is dropped
@@ -83,7 +94,11 @@ fn apply_seed(record: &mut Record, seed: &StatusSeed) {
 /// THOSE sessions' ledgers and no others; a daemon that does not answer
 /// costs the scope, not the tail. Neither fetch repeats: after boot the
 /// record moves on the live subscription alone.
-pub fn boot(record: &mut Record, intake: &mut Intake, home: &Path) {
+pub fn boot(record: &mut Record, intake: &mut Intake, home: &Path) -> Option<String> {
+    install(record, intake, load(home))
+}
+
+pub fn load(home: &Path) -> Bootstrap {
     let params = cyclops_proto::StatusParams {
         open_deliveries: true,
     };
@@ -91,12 +106,28 @@ pub fn boot(record: &mut Record, intake: &mut Intake, home: &Path) {
         .ok()
         .map(|s| Box::new(StatusSeed::from_status(&s)));
     let watched = seed.as_ref().map(|s| s.watched.clone());
+    let report =
+        cyclops_ui::read_backfill_report(&home.join("ledger"), BACKFILL, watched.as_deref());
+    Bootstrap {
+        seed,
+        entries: report.entries,
+        max_seq: report.max_seq,
+        warning: report.warning,
+    }
+}
+
+pub fn install(record: &mut Record, intake: &mut Intake, bootstrap: Bootstrap) -> Option<String> {
+    let Bootstrap {
+        seed,
+        entries,
+        max_seq,
+        warning,
+    } = bootstrap;
     if let Some(seed) = seed {
         status(record, intake, seed);
     }
-    let (entries, max_seq) =
-        cyclops_ui::read_backfill(&home.join("ledger"), BACKFILL, watched.as_deref());
     backfill(record, intake, entries, max_seq);
+    warning
 }
 
 #[cfg(test)]
@@ -134,14 +165,14 @@ mod tests {
             admin_unread: 0,
             mailbox_routes: Vec::new(),
             roster: Vec::new(),
+            mailbox: Vec::new(),
         })
     }
 
     fn admitted_lines(record: &Record) -> Vec<String> {
         let plain = cyclops_ui::Theme::none();
         record
-            .entries()
-            .filter(|e| record.admits(e))
+            .admitted_entries()
             .flat_map(|e| e.lines(&plain, true))
             .collect()
     }
@@ -199,5 +230,34 @@ mod tests {
 
         let lines = admitted_lines(&record);
         assert_eq!(lines.len(), 1, "one fact, one row: {lines:#?}");
+    }
+
+    #[test]
+    fn a_rebuild_returns_its_gap_warning_and_preserves_max_seq() {
+        let mut record = Record::new();
+        let mut intake = Intake::new();
+        let warning = "backfill incomplete; stream history has a gap".to_string();
+
+        let returned = install(
+            &mut record,
+            &mut intake,
+            Bootstrap {
+                seed: None,
+                entries: Vec::new(),
+                max_seq: Some(7),
+                warning: Some(warning.clone()),
+            },
+        );
+        assert_eq!(returned, Some(warning));
+
+        let mut duplicate = state(1_000, "reviewer", "%1", AgentState::BlockedPermission);
+        duplicate.seq = Some(7);
+        live(&mut record, &mut intake, duplicate);
+        assert!(admitted_lines(&record).is_empty());
+
+        let mut newer = state(2_000, "reviewer", "%1", AgentState::BlockedPermission);
+        newer.seq = Some(8);
+        live(&mut record, &mut intake, newer);
+        assert_eq!(admitted_lines(&record).len(), 1);
     }
 }

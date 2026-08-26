@@ -70,11 +70,10 @@ pub enum PeerOrigin {
 /// so a peer identified by pid alone can be a different program by the
 /// time a later request on the same connection is answered.
 ///
-/// What this carries beyond the number is a generation: something that
-/// changes when the process behind the pid does. On macOS the kernel
-/// attests it directly, and it is an EXECUTION rather than a process, so a
-/// peer that execs across a live connection stops matching. That is
-/// stronger than a start time, which an exec does not move.
+/// What this carries beyond the number is both a process birth and, where
+/// the kernel provides it, an execution generation. Birth changes on exit
+/// and pid reuse. On macOS the audit token also changes across an exec,
+/// which birth alone cannot detect.
 ///
 /// Deliberately NOT a claim about who wrote any particular byte. A
 /// descriptor can be inherited or passed, so socket credentials identify
@@ -84,24 +83,11 @@ pub enum PeerOrigin {
 pub struct PeerIdentity {
     pub uid: u32,
     pub pid: i32,
-    exec: PeerExec,
-}
-
-/// What tells one execution from another behind the same pid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PeerExec {
-    /// The kernel's own audit token. MEASURED on macOS 26.5: reading
-    /// `LOCAL_PEERTOKEN` returns 32 bytes whose pid, pidversion and euid
-    /// match the connector, the pidversion INCREMENTS across an exec, a
-    /// re-read on the same descriptor reflects the new execution, and
-    /// `proc_pidpath_audittoken` answers ESRCH for a token whose execution
-    /// is gone.
+    birth: u64,
+    /// The audit token's pidversion identifies one execution. Re-reading
+    /// the socket token detects exec without consulting an executable path.
     #[cfg(target_os = "macos")]
-    Token([u32; 8]),
-    /// No attested generation available. The start time is the closest
-    /// stand-in, and it is weaker: an exec keeps it.
-    #[cfg(not(target_os = "macos"))]
-    Birth(u64),
+    exec: [u32; 8],
 }
 
 /// A connection and the peer that opened it.
@@ -137,41 +123,31 @@ impl PeerIdentity {
     /// behind it need not be.
     pub fn still_current(&self, fd: std::os::fd::RawFd) -> bool {
         match peer_identity_fd(fd) {
-            Ok(now) => now == *self && self.alive(),
+            Ok(now) => {
+                self.matches_socket_identity(&now) && self.matches_process(ProcId::of(self.pid))
+            }
             Err(_) => false,
         }
     }
 
-    #[cfg(target_os = "macos")]
-    fn alive(&self) -> bool {
-        let PeerExec::Token(token) = self.exec;
-        // Proves the EXECUTION is still there, which a re-read of the
-        // socket option cannot: the option answers for whatever holds the
-        // pid now, and this answers for the one that connected.
-        let mut path = [0i8; 4096];
-        let rc = unsafe {
-            proc_pidpath_audittoken(
-                std::ptr::addr_of!(token).cast(),
-                path.as_mut_ptr().cast(),
-                path.len() as u32,
-            )
-        };
-        rc > 0
+    fn matches_socket_identity(&self, current: &PeerIdentity) -> bool {
+        if self.uid != current.uid || self.pid != current.pid || self.birth != current.birth {
+            return false;
+        }
+        #[cfg(target_os = "macos")]
+        if self.exec != current.exec {
+            return false;
+        }
+        true
     }
 
-    #[cfg(not(target_os = "macos"))]
-    fn alive(&self) -> bool {
-        matches!(self.exec, PeerExec::Birth(b) if birth_of(self.pid) == Some(b))
+    fn matches_process(&self, current: Option<ProcId>) -> bool {
+        current
+            == Some(ProcId {
+                pid: self.pid,
+                birth: self.birth,
+            })
     }
-}
-
-#[cfg(target_os = "macos")]
-extern "C" {
-    fn proc_pidpath_audittoken(
-        token: *const libc::c_void,
-        buffer: *mut libc::c_void,
-        buffersize: u32,
-    ) -> libc::c_int;
 }
 
 /// The peer of a connected Unix socket, identified rather than numbered.
@@ -184,6 +160,29 @@ pub fn peer_identity(stream: &UnixStream) -> std::io::Result<PeerIdentity> {
 /// split into halves can still be asked who is on the other end.
 #[cfg(target_os = "macos")]
 pub fn peer_identity_fd(fd: std::os::fd::RawFd) -> std::io::Result<PeerIdentity> {
+    let token = macos_peer_token(fd)?;
+    let uid = token[1];
+    let pid = token[5] as i32;
+    let (process, process_uid) =
+        proc_facts(pid).ok_or_else(|| std::io::Error::other("peer process unreadable"))?;
+    if process_uid != uid {
+        return Err(std::io::Error::other("peer uid changed during observation"));
+    }
+    if macos_peer_token(fd)? != token || !process.still_live() {
+        return Err(std::io::Error::other(
+            "peer execution changed during observation",
+        ));
+    }
+    Ok(PeerIdentity {
+        uid,
+        pid,
+        birth: process.birth,
+        exec: token,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_peer_token(fd: std::os::fd::RawFd) -> std::io::Result<[u32; 8]> {
     // Spelled locally: libc's coverage of these has historically drifted.
     const SOL_LOCAL: libc::c_int = 0;
     const LOCAL_PEERTOKEN: libc::c_int = 0x006;
@@ -208,11 +207,7 @@ pub fn peer_identity_fd(fd: std::os::fd::RawFd) -> std::io::Result<PeerIdentity>
     // Field positions are libbsm's accessors, MEASURED against
     // audit_token_to_euid, audit_token_to_pid and
     // audit_token_to_pidversion on macOS 26.5.
-    Ok(PeerIdentity {
-        uid: token[1],
-        pid: token[5] as i32,
-        exec: PeerExec::Token(token),
-    })
+    Ok(token)
 }
 
 /// Same, where no attested peer identity is available.
@@ -223,11 +218,7 @@ pub fn peer_identity_fd(fd: std::os::fd::RawFd) -> std::io::Result<PeerIdentity>
 pub fn peer_identity_fd(fd: std::os::fd::RawFd) -> std::io::Result<PeerIdentity> {
     let (uid, pid) = linux_peer_of_fd(fd)?;
     let birth = birth_of(pid).ok_or_else(|| std::io::Error::other("peer process unreadable"))?;
-    Ok(PeerIdentity {
-        uid,
-        pid,
-        exec: PeerExec::Birth(birth),
-    })
+    Ok(PeerIdentity { uid, pid, birth })
 }
 
 /// Unsupported platform: no peer credentials, so a connection cannot become
@@ -597,9 +588,23 @@ fn origin_parent_ident(child: ProcId) -> Option<OriginParent> {
         return None;
     }
     if ppid <= 1 {
-        Some(OriginParent::Top)
-    } else {
-        ProcId::of(ppid).map(OriginParent::Process)
+        return Some(OriginParent::Top);
+    }
+    if let Some(parent) = ProcId::of(ppid) {
+        return Some(OriginParent::Process(parent));
+    }
+    // A parent this daemon cannot identify is the end of what it can
+    // prove, and how the walk must treat that depends on WHY. A process
+    // owned by another user is structurally not one of this daemon's
+    // vendors (they all run as the daemon's own user), and nothing above
+    // it can be reached through it either, so it is the top of the
+    // provable chain: the walk stops here and the caller decides on the
+    // vendor evidence it already gathered BELOW this point, which is
+    // where a vendor would have to be to matter. A parent whose owner is
+    // equally unreadable proves nothing at all and still refuses.
+    match foreign_owner(ppid) {
+        Some(uid) if uid != unsafe { libc::getuid() } => Some(OriginParent::Top),
+        _ => None,
     }
 }
 
@@ -831,6 +836,56 @@ fn birth_of(pid: i32) -> Option<u64> {
     bsd_info(pid).map(|(_, birth, _)| birth)
 }
 
+/// The owner and parent of a process the full record refuses to describe.
+///
+/// MEASURED on macOS 26.5: `proc_pidinfo(PROC_PIDTBSDINFO)` is refused to a
+/// normal user for a process owned by anybody else, so every ancestry walk
+/// that crosses one, and a Terminal.app login shell crosses a root-owned
+/// `login` on the way to launchd, loses the chain there. The short record
+/// is readable for those same processes and carries the two facts the walk
+/// needs to decide what to do about them: who owns it and what is above it.
+/// It carries no start time, which is why a process read this way is a
+/// boundary rather than a link (see `origin_parent_ident`): an identity
+/// that cannot be re-proven must never be compared as if it could.
+///
+/// Not the sysctl `KERN_PROC_PID` route: libc still defines no `kinfo_proc`
+/// for apple targets, and hand-spelling `extern_proc` plus `eproc` is the
+/// fragile unsafe this crate avoids. This struct libc does define.
+#[cfg(target_os = "macos")]
+fn bsd_short_info(pid: i32) -> Option<(i32, u32)> {
+    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            size,
+        )
+    };
+    if rc != size {
+        return None;
+    }
+    Some((info.pbsi_ppid as i32, info.pbsi_uid))
+}
+
+/// The owner of a process this daemon cannot fully read, when the kernel
+/// will still say who it belongs to. None when even that is refused.
+#[cfg(target_os = "macos")]
+pub fn foreign_owner(pid: i32) -> Option<u32> {
+    (pid > 0).then_some(())?;
+    if bsd_info(pid).is_some() {
+        return None;
+    }
+    bsd_short_info(pid).map(|(_, uid)| uid)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn foreign_owner(_pid: i32) -> Option<u32> {
+    None
+}
+
 /// One kernel read, both facts. The parent and the start time come out of
 /// the same `proc_bsdinfo` record, so asking for identity costs nothing
 /// beyond what the ancestry walk was already paying.
@@ -990,6 +1045,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn peer_process_birth_rejects_exit_and_pid_reuse() {
+        let peer = PeerIdentity {
+            uid: 501,
+            pid: 42,
+            birth: 700,
+            #[cfg(target_os = "macos")]
+            exec: [0; 8],
+        };
+
+        assert!(peer.matches_process(Some(ProcId {
+            pid: 42,
+            birth: 700,
+        })));
+        assert!(!peer.matches_process(None), "an exited opener is not live");
+        assert!(
+            !peer.matches_process(Some(ProcId {
+                pid: 42,
+                birth: 701,
+            })),
+            "a reused pid belongs to a different process"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn peer_audit_token_rejects_an_exec_at_the_same_pid_and_birth() {
+        let peer = PeerIdentity {
+            uid: 501,
+            pid: 42,
+            birth: 700,
+            exec: [0; 8],
+        };
+        let mut execed = peer;
+        execed.exec[7] = 1;
+
+        assert!(peer.matches_socket_identity(&peer));
+        assert!(
+            !peer.matches_socket_identity(&execed),
+            "pidversion must separate executions with one pid and birth"
+        );
+    }
+
     /// The same synthetic tree, walked as identities. Every process keeps
     /// the birth `id` gives it, which is the stable case; the reuse tests
     /// below supply their own parent function.
@@ -1009,6 +1107,72 @@ mod tests {
             None if process.pid == 1 => Some(OriginParent::Top),
             None => None,
         }
+    }
+
+    /// A Terminal.app login shell puts a root-owned `login` between the
+    /// operator's command and launchd, and this daemon cannot read that
+    /// process at all. Before the boundary rule, the walk lost the chain
+    /// there and every workspace UI started from a plain terminal was
+    /// refused a mailbox identity on macOS. An ancestor that is provably
+    /// somebody else's is the top of what can be proven, and with no
+    /// vendor below it the peer is the local operator.
+    #[test]
+    fn an_unreadable_foreign_ancestor_is_the_top_of_the_provable_chain() {
+        let pane_rows = vec![("%1".to_string(), Some("codex".to_string()), id(200))];
+        // 900 is the caller, 800 its shell; 700 stands for the root-owned
+        // login whose identity cannot be read, so the tree offers no
+        // parent for it at all.
+        let unreadable_parent = |process: ProcId| match process.pid {
+            900 => Some(OriginParent::Process(id(800))),
+            800 => None,
+            _ => None,
+        };
+        assert_eq!(
+            resolve_peer_origin_with(
+                id(900),
+                &pane_rows,
+                |_| Vendorship::NotVendor,
+                unreadable_parent,
+                |_| true,
+            ),
+            PeerOrigin::Unprovable,
+            "without the boundary the chain simply ends and nothing is proven"
+        );
+        let foreign_boundary = |process: ProcId| match process.pid {
+            900 => Some(OriginParent::Process(id(800))),
+            800 => Some(OriginParent::Top),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_peer_origin_with(
+                id(900),
+                &pane_rows,
+                |_| Vendorship::NotVendor,
+                foreign_boundary,
+                |_| true,
+            ),
+            PeerOrigin::Admin,
+            "a foreign-owned ancestor tops out the walk for the local operator"
+        );
+        // The boundary is not a laundering route: a vendor between the
+        // caller and that boundary still refuses, because vendor evidence
+        // is gathered below it, which is where a vendor has to be to
+        // matter.
+        assert_eq!(
+            resolve_peer_origin_with(
+                id(900),
+                &pane_rows,
+                |process| if process.pid == 800 {
+                    Vendorship::Vendor
+                } else {
+                    Vendorship::NotVendor
+                },
+                foreign_boundary,
+                |_| true,
+            ),
+            PeerOrigin::Unprovable,
+            "a vendor below the boundary still denies admin authority"
+        );
     }
 
     #[test]

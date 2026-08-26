@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex as StdMutex};
 
 use cyclops_proto::{
-    LedgerLine, MailboxEntry, MailboxEntryState, MessageId, MessagesChangedArea,
+    LedgerLine, MailboxEntry, MailboxEntryState, MessageId, MessageWakeBlock, MessagesChangedArea,
     NotificationAttemptId, NotificationAttentionCause, NotificationBinding, NotificationManifestId,
     NotificationPreWriteCause, NotificationPreWriteObservation, NotificationRecord,
     NotificationState, NotificationTransport, ProcessInstanceId, RecipientKey,
@@ -367,7 +367,7 @@ impl NotificationContext {
         Ok(record)
     }
 
-    /// Settle an exact claimed v2 ACK timeout after composer reconciliation.
+    /// Settle an exact claimed attempt ACK timeout after composer reconciliation.
     pub(crate) fn settle_claimed_ack_timeout_reconciliation(
         &self,
     ) -> Result<NotificationRecord, NotificationAdapterError> {
@@ -434,11 +434,55 @@ impl NotificationContext {
         self.record_terminal(NotificationState::AttentionRequired, Some(cause))
     }
 
+    /// Record a verification alarm with the exact content-free evidence class.
+    pub(crate) fn record_verify_attention(
+        &self,
+        outcome: cyclops_proto::NotificationVerifyOutcome,
+    ) -> Result<NotificationRecord, NotificationAdapterError> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| NotificationAdapterError::StoreLockPoisoned)?;
+        if let Some(current) = store
+            .projection()
+            .notification(self.recipient, &self.message_id)
+            .cloned()
+        {
+            if !self.owns(&current) {
+                return Err(NotificationAdapterError::TerminalConflict(current.state));
+            }
+            if current.state == NotificationState::AttentionRequired {
+                return Ok(current);
+            }
+            if current.state.is_terminal() {
+                return Err(NotificationAdapterError::TerminalConflict(current.state));
+            }
+        }
+        let record = store.advance_notification_with_verify_outcome(
+            self.message_id.clone(),
+            self.recipient,
+            self.attempt_id,
+            outcome,
+        )?;
+        self.publish_transition(&record);
+        Ok(record)
+    }
+
     /// Stop this exact attempt after proving that no terminal write occurred.
     pub(crate) fn record_pre_write_block(
         &self,
         cause: NotificationPreWriteCause,
         observation: Option<NotificationPreWriteObservation>,
+    ) -> Result<NotificationRecord, NotificationAdapterError> {
+        self.record_pre_write_block_with_wake_block(cause, observation, None)
+    }
+
+    /// Stop this attempt and retain why no scheduler worker owns its wake.
+    pub(crate) fn record_pre_write_block_with_wake_block(
+        &self,
+        cause: NotificationPreWriteCause,
+        observation: Option<NotificationPreWriteObservation>,
+        wake_block: Option<MessageWakeBlock>,
     ) -> Result<NotificationRecord, NotificationAdapterError> {
         let mut store = self
             .store
@@ -458,12 +502,49 @@ impl NotificationContext {
         if current.state != NotificationState::Gating {
             return Err(NotificationAdapterError::TerminalConflict(current.state));
         }
-        let record = store.block_notification_before_write(
+        let record = store.block_notification_before_write_with_wake_block(
             self.message_id.clone(),
             self.recipient,
             self.attempt_id,
             cause,
             observation,
+            wake_block,
+        )?;
+        self.publish_transition(&record);
+        Ok(record)
+    }
+
+    /// Correct the durable write boundary after the transport proves that
+    /// the paste command pipe accepted zero command bytes.
+    pub(crate) fn record_paste_command_unwritten(
+        &self,
+    ) -> Result<NotificationRecord, NotificationAdapterError> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| NotificationAdapterError::StoreLockPoisoned)?;
+        let current = store
+            .projection()
+            .notification(self.recipient, &self.message_id)
+            .cloned()
+            .ok_or(NotificationAdapterError::NoLongerCurrentBeforeWrite)?;
+        if !self.owns(&current) {
+            return Err(NotificationAdapterError::NoLongerCurrentBeforeWrite);
+        }
+        if current.state == NotificationState::BlockedPreWrite
+            && current.pre_write_cause == Some(NotificationPreWriteCause::PasteCommandUnwritten)
+        {
+            return Ok(current);
+        }
+        if current.state != NotificationState::Writing {
+            return Err(NotificationAdapterError::TerminalConflict(current.state));
+        }
+        let record = store.block_notification_before_write(
+            self.message_id.clone(),
+            self.recipient,
+            self.attempt_id,
+            NotificationPreWriteCause::PasteCommandUnwritten,
+            None,
         )?;
         self.publish_transition(&record);
         Ok(record)

@@ -38,6 +38,10 @@ Check the exact shell that will launch the agent:
 printf '%s\n' "$TERM"
 ```
 
+That value is the authoritative terminal type for the process launched from
+that pane. `tmux show-environment -g TERM` reports the tmux server's saved
+client environment, not the value already assigned to an existing pane.
+
 Inside tmux, Cyclops panes normally report `tmux-256color`. A regular terminal
 outside tmux commonly reports `xterm-256color`. Cyclops does not set
 `TERM=dumb`; it leaves pane terminal selection to tmux. Check that selection
@@ -48,11 +52,21 @@ tmux show-options -gv default-terminal
 tmux show-environment -g TERM
 ```
 
+Use the first command to inspect the terminal type assigned to new panes. The
+second is contrast-only evidence about the tmux server's saved client
+environment; it does not predict a pane's `TERM` value.
+
 Remove an explicit `export TERM=dumb` from the shell profile, launcher, or
 automation that created the shell. If the shell is attached to a real terminal
-emulator but inherited the wrong value, start a fresh terminal after correcting
-that configuration. Do not set `xterm-256color` merely to silence the warning in
-a non-interactive pipe or log runner; the claimed capabilities must be real.
+emulator but inherited the wrong value, create a new tmux pane or restart the
+pane shell and agent after correcting that configuration. Existing processes
+keep the old environment. Do not set `xterm-256color` merely to silence the
+warning in a non-interactive pipe or log runner; the claimed capabilities must
+be real.
+
+Codex 0.149.1 also refuses startup when its input or error stream is not attached
+to a TTY. That is a separate launch error. Run the interactive TUI in a real
+terminal pane; use a noninteractive Codex interface for pipes and automation.
 
 Headless tmux control clients can themselves report `dumb`. That is expected and
 does not change the terminal type inside an agent pane. Diagnose the value in

@@ -84,7 +84,7 @@ pub mod watcher;
 mod cmd;
 
 pub use cmd::session_target;
-pub use control::{ControlClient, ControlConfig, ControlMode};
+pub use control::{ControlClient, ControlConfig, ControlMode, InputCapacity, NotificationReceiver};
 pub use error::TmuxError;
 pub use focus::focus_pane;
 pub use hydration::HydrationBundle;

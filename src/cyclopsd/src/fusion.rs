@@ -9,15 +9,14 @@
 //! still goes to the higher-priority rule but the disagreement is exposed
 //! on the Detection (GOALS: observable, not an error).
 //!
-//! Screen capture is consulted last (amendment h): when a pane_title rule
-//! alone decides the STATE, capture-pane is skipped entirely.
+//! Every recompute evaluates the screen tier when the selected manifest has
+//! screen rules. A title is current state evidence, but it cannot prove that a
+//! permission dialog, quota screen, human draft, or active status row is
+//! absent. Output events remain coalesced by the watcher, so this policy adds
+//! one bounded capture per recompute rather than a polling loop.
 //!
-//! That skip is a cost decision about state, and it is never allowed to
-//! decide a write. Only the screen sensor can see a composer, so
-//! write-readiness needs a positive clean-composer reading from it (rule
-//! 12), and a verdict reached without one refuses. Every caller who is
-//! about to write, and `pane.read source=detection`, passes
-//! `force_screen` for exactly that reason.
+//! Only the screen sensor can prove composer readiness. A verdict without a
+//! positive clean-composer reading still refuses writes under rule 12.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -28,8 +27,8 @@ use cyclops_manifest::{
 };
 use cyclops_proto::{
     AgentState, ComposerHold, ComposerProof, ComposerSemantic, ComposerState, Detection,
-    NotificationAttemptId, NotificationAttentionCause, NotificationState, ProcessInstanceId,
-    RecipientKey, Sensor, SensorReading,
+    NotificationAttemptId, NotificationAttentionCause, NotificationRouteEvidenceId,
+    NotificationState, ProcessInstanceId, RecipientKey, Sensor, SensorReading,
 };
 #[cfg(test)]
 use cyclops_proto::{NotificationTransport, DOORBELL_FORMAT_COMPACT_CLAIM};
@@ -47,6 +46,9 @@ const HOOK_READING_TTL_MS: u64 = 300_000;
 /// A clean frame is neutral at every age. Positive Working accepts the edge;
 /// staged input, a blocking screen, or pane mode rejects it.
 const UNKEYED_DISPATCH_SETTLE_MS: u64 = 500;
+/// One bounded follow-up for contradictory, stale, or held current evidence.
+/// New pane events may schedule another pass; the worker itself never polls.
+const CONTINUOUS_EVIDENCE_RECHECK_MS: u64 = 100;
 /// Consecutive rules-tier verdicts contradicting the hook reading before
 /// the reading is invalidated.
 const HOOK_DISAGREE_LIMIT: u32 = 3;
@@ -69,8 +71,9 @@ pub(crate) struct HookEntry {
     /// immediately, but a later visual Working observation must confirm it
     /// before delivery or `wait done` may rely on it.
     confirmed_start: bool,
-    /// This reading is a conclusive end for one exact turn. It overrides a
-    /// stale visual Working frame, but never a blocking state or staged input.
+    /// This reading is a conclusive end for one exact turn. It remains an
+    /// edge, not a persistent Idle level: a later current visual Working
+    /// observation supersedes it.
     authoritative_end: bool,
     /// The exact turn when the manifest can name it. `None` can describe a
     /// binding-scoped confirmed lifecycle or provisional dispatch evidence,
@@ -80,6 +83,11 @@ pub(crate) struct HookEntry {
     /// The hook edge itself remains `reading.ts`; the deadline never stands in
     /// for a second event.
     provisional_ready_at_ms: Option<u64>,
+    /// This start was a provisional candidate that a visual Working frame
+    /// promoted. Such a latch has no exact hook key, so ordinary lifecycle
+    /// evidence may end it. Authenticated starts require either their hook
+    /// end or a rule explicitly marked `active_start_terminal`.
+    promoted: bool,
 }
 
 impl HookEntry {
@@ -104,6 +112,23 @@ impl HookEntry {
             authoritative_end: false,
             active_turn: None,
             provisional_ready_at_ms: None,
+            promoted: false,
+        }
+    }
+    /// Promote a visually accepted provisional dispatch start into a
+    /// persistent unkeyed start on the same binding, keeping its original
+    /// edge. The latch then ends only on an exact keyed end for this
+    /// binding, a binding replacement, or one observation of a conclusive
+    /// lifecycle-evidence idle screen winner on an idle-class fused frame
+    /// with the binding proven stable across that capture; never on a
+    /// candidate end, a generic clean composer, a priority, or a timer.
+    pub(crate) fn promote(self) -> HookEntry {
+        debug_assert!(self.active_start && !self.confirmed_start);
+        HookEntry {
+            confirmed_start: true,
+            provisional_ready_at_ms: None,
+            promoted: true,
+            ..self
         }
     }
 
@@ -237,6 +262,19 @@ impl HookEntry {
     ) -> bool {
         self.confirmed_start_for(agent, manifest) && self.active_turn.is_none()
     }
+    /// Does a confirmed exact end at `end_edge_ms` on this binding end a
+    /// persistent unkeyed start? The start had no key to match, so the end
+    /// must be separately proven on the same agent generation and manifest
+    /// and must come strictly after the stored start edge: a stale,
+    /// reordered, or same-instant end is not evidence that this turn ended.
+    pub(crate) fn unkeyed_latch_ended_by(
+        &self,
+        agent: crate::identity::ProcId,
+        manifest: Option<&str>,
+        end_edge_ms: u64,
+    ) -> bool {
+        self.confirmed_unkeyed_start_for(agent, manifest) && end_edge_ms > self.reading.ts
+    }
 
     /// Does an end name the active turn under this exact process binding?
     pub(crate) fn active_start_matches(
@@ -273,6 +311,7 @@ enum LifecycleRecheckWork {
         crate::hook_lifecycle::Candidate,
     ),
     Provisional(ProvisionalStartRecheck),
+    Observation(u64),
 }
 
 impl LifecycleRecheckWork {
@@ -280,6 +319,7 @@ impl LifecycleRecheckWork {
         match self {
             Self::Terminal(_, candidate) => candidate.ready_at_ms,
             Self::Provisional(candidate) => candidate.ready_at_ms,
+            Self::Observation(ready_at_ms) => *ready_at_ms,
         }
     }
 
@@ -290,6 +330,7 @@ impl LifecycleRecheckWork {
                 "candidate_visual_end_settled"
             }
             Self::Provisional(_) => "unkeyed_dispatch_settled",
+            Self::Observation(_) => "continuous_evidence_recheck",
         }
     }
 }
@@ -316,7 +357,8 @@ impl LifecycleObservation {
             | "receipt_checkpoint"
             | "candidate_end_settled"
             | "candidate_visual_end_settled"
-            | "unkeyed_dispatch_settled" => Self::Stable,
+            | "unkeyed_dispatch_settled"
+            | "continuous_evidence_recheck" => Self::Stable,
             "pane_added" | "pane_changed" => Self::Visual,
             _ => Self::None,
         }
@@ -344,7 +386,7 @@ pub(crate) struct LifecycleRecheckTask {
     task: tokio::task::JoinHandle<()>,
 }
 
-fn schedule_lifecycle_recheck(inner: &Arc<Inner>, pane: &PaneKey) {
+pub(crate) fn schedule_lifecycle_recheck(inner: &Arc<Inner>, pane: &PaneKey) {
     if *inner.stop.borrow() {
         return;
     }
@@ -367,7 +409,8 @@ fn schedule_lifecycle_recheck(inner: &Arc<Inner>, pane: &PaneKey) {
         .expect("hook lifecycle lock")
         .has_terminal_candidates(pane);
     let has_provisional = provisional_recheck(inner, pane).is_some();
-    if !has_terminal && !has_provisional {
+    let needs_observation = targeted_reobservation_needed(inner, pane);
+    if !has_terminal && !has_provisional && !needs_observation {
         return;
     }
     let mut rechecks = inner
@@ -415,6 +458,7 @@ async fn lifecycle_recheck_worker(
     let mut stop = inner.stop.clone();
     let mut attempted_terminal = HashSet::new();
     let mut attempted_provisional = HashSet::new();
+    let mut attempted_observation = false;
     loop {
         if *stop.borrow() || !lifecycle_recheck_is_current(&inner, &pane, &notify) {
             remove_lifecycle_recheck(&inner, &pane, &notify);
@@ -431,16 +475,16 @@ async fn lifecycle_recheck_worker(
                 !attempted_provisional.contains(&(candidate.agent, candidate.edge_ms))
             })
             .map(LifecycleRecheckWork::Provisional);
-        let next = match (terminal, provisional) {
-            (Some(terminal), Some(provisional)) => {
-                if terminal.ready_at_ms() <= provisional.ready_at_ms() {
-                    Some(terminal)
-                } else {
-                    Some(provisional)
-                }
-            }
-            (terminal, provisional) => terminal.or(provisional),
-        };
+        let observation = (!attempted_observation && targeted_reobservation_needed(&inner, &pane))
+            .then(|| {
+                LifecycleRecheckWork::Observation(
+                    unix_ms().saturating_add(CONTINUOUS_EVIDENCE_RECHECK_MS),
+                )
+            });
+        let next = [terminal, provisional, observation]
+            .into_iter()
+            .flatten()
+            .min_by_key(LifecycleRecheckWork::ready_at_ms);
         let Some(work) = next else {
             if retire_lifecycle_recheck_if_empty(&inner, &pane, &notify) {
                 return;
@@ -453,6 +497,7 @@ async fn lifecycle_recheck_worker(
                 _ = notify.notified() => {
                     attempted_terminal.clear();
                     attempted_provisional.clear();
+                    attempted_observation = false;
                 }
                 _ = stop.changed() => {}
             }
@@ -465,6 +510,7 @@ async fn lifecycle_recheck_worker(
                 _ = notify.notified() => {
                     attempted_terminal.clear();
                     attempted_provisional.clear();
+                    attempted_observation = false;
                     continue;
                 },
                 _ = stop.changed() => continue,
@@ -514,8 +560,24 @@ async fn lifecycle_recheck_worker(
                     attempted_provisional.insert((candidate.agent, candidate.edge_ms));
                 }
             }
+            LifecycleRecheckWork::Observation(_) => {
+                attempted_observation = true;
+            }
         }
     }
+}
+
+fn targeted_reobservation_needed(inner: &Inner, pane: &PaneKey) -> bool {
+    inner
+        .detections
+        .lock()
+        .expect("detections lock")
+        .get(pane)
+        .is_some_and(|entry| needs_targeted_reobservation(&entry.detection, entry.hold))
+}
+
+fn needs_targeted_reobservation(detection: &Detection, hold: ComposerHold) -> bool {
+    detection.stale || detection.disagreement || hold.refuses()
 }
 
 fn provisional_recheck(inner: &Inner, pane: &PaneKey) -> Option<ProvisionalStartRecheck> {
@@ -753,7 +815,13 @@ fn reconcile_unkeyed_dispatch_start_with_evidence(
         return false;
     }
 
-    let removed = readings.remove(pane).is_some();
+    let entry = readings.remove(pane);
+    let removed = entry.is_some();
+    if accepted && !rejected {
+        if let Some(entry) = entry {
+            readings.insert(pane.clone(), entry.promote());
+        }
+    }
     drop(readings);
     if removed {
         if rejected {
@@ -1713,7 +1781,7 @@ pub(crate) fn set_hold_owned(
     owner: &str,
     change: impl FnOnce(ComposerHold) -> Option<ComposerHold>,
 ) -> bool {
-    let (prior_ready, det) = {
+    let (prior_ready, now_key, det) = {
         let mut map = inner.detections.lock().expect("detections lock");
         let Some(entry) = map.get_mut(&PaneKey::new(session_idx, pane_id)) else {
             return false;
@@ -1729,15 +1797,12 @@ pub(crate) fn set_hold_owned(
         if hold == entry.hold {
             return true;
         }
-        let prior_ready = (
-            entry.detection.write_ready,
-            entry.detection.write_block.clone(),
-        );
+        let prior_ready = readiness_key(entry);
         entry.hold = hold;
         entry.detection = entry.detection.clone().stamped(entry.in_mode, hold);
-        (prior_ready, entry.detection.clone())
+        (prior_ready, readiness_key(entry), entry.detection.clone())
     };
-    wake_readiness(inner, session_idx, pane_id, Some(prior_ready), &det);
+    wake_readiness_after_mutation(inner, session_idx, pane_id, prior_ready, now_key, &det);
     true
 }
 
@@ -1774,7 +1839,7 @@ pub(crate) fn bind_turn(
     turn: turnkey::TurnKey,
     since_ms: u64,
 ) -> Option<BoundTurn> {
-    let (prior_ready, det, end_already_present) = {
+    let (prior_ready, now_key, det, end_already_present) = {
         let mut map = inner.detections.lock().expect("detections lock");
         let pane = PaneKey::new(session_idx, pane_id);
         let entry = map.get_mut(&pane)?;
@@ -1795,6 +1860,7 @@ pub(crate) fn bind_turn(
         }
         let end_already_present =
             turnkey::PaneEnds::holds(&turn_ends, &pane, agent, &manifest, &turn);
+        let prior_ready = readiness_key(entry);
         entry.turn = Some(turn);
         // Only a hold that is still WAITING takes the mark. One that
         // already carries a witnessed edge has stronger evidence than an
@@ -1802,14 +1868,15 @@ pub(crate) fn bind_turn(
         if entry.hold.is_waiting() {
             entry.hold = ComposerHold::TurnStarted { since_ms };
         }
-        let prior_ready = (
-            entry.detection.write_ready,
-            entry.detection.write_block.clone(),
-        );
         entry.detection = entry.detection.clone().stamped(entry.in_mode, entry.hold);
-        (prior_ready, entry.detection.clone(), end_already_present)
+        (
+            prior_ready,
+            readiness_key(entry),
+            entry.detection.clone(),
+            end_already_present,
+        )
     };
-    wake_readiness(inner, session_idx, pane_id, Some(prior_ready), &det);
+    wake_readiness_after_mutation(inner, session_idx, pane_id, prior_ready, now_key, &det);
     Some(BoundTurn {
         end_already_present,
     })
@@ -1834,7 +1901,7 @@ pub(crate) fn claim_hold(
     agent: Option<crate::identity::ProcId>,
     manifest: Option<&str>,
 ) -> bool {
-    let (prior_ready, det) = {
+    let (prior_ready, now_key, det) = {
         let mut map = inner.detections.lock().expect("detections lock");
         let Some(entry) = map.get_mut(&PaneKey::new(session_idx, pane_id)) else {
             return false;
@@ -1864,22 +1931,20 @@ pub(crate) fn claim_hold(
             (_, Some(held)) if held == owner => {}
             _ => return false,
         }
-        let prior_ready = (
-            entry.detection.write_ready,
-            entry.detection.write_block.clone(),
-        );
+        let prior_ready = readiness_key(entry);
         entry.hold_owner = Some(owner.to_string());
         entry.hold = ComposerHold::Staged;
         entry.detection = entry.detection.clone().stamped(entry.in_mode, entry.hold);
-        (prior_ready, entry.detection.clone())
+        (prior_ready, readiness_key(entry), entry.detection.clone())
     };
-    wake_readiness(inner, session_idx, pane_id, Some(prior_ready), &det);
+    wake_readiness_after_mutation(inner, session_idx, pane_id, prior_ready, now_key, &det);
     true
 }
 
-/// Release this attempt's barrier when its durable write fact could not be recorded.
+/// Release this attempt's barrier after proving that no terminal command byte was written.
 ///
-/// The caller has not asked tmux to paste yet. Exact owner and binding checks
+/// This covers a refused durable write fact and a paste command whose first
+/// pipe write failed before accepting bytes. Exact owner and binding checks
 /// prevent a failed attempt from clearing a person's draft or another delivery.
 pub(crate) fn release_unwritten_hold(
     inner: &Arc<Inner>,
@@ -1889,7 +1954,7 @@ pub(crate) fn release_unwritten_hold(
     agent: crate::identity::ProcId,
     manifest: &str,
 ) -> bool {
-    let (prior_ready, det) = {
+    let (prior_ready, now_key, det) = {
         let mut map = inner.detections.lock().expect("detections lock");
         let Some(entry) = map.get_mut(&PaneKey::new(session_idx, pane_id)) else {
             return false;
@@ -1901,16 +1966,13 @@ pub(crate) fn release_unwritten_hold(
         {
             return false;
         }
-        let prior_ready = (
-            entry.detection.write_ready,
-            entry.detection.write_block.clone(),
-        );
+        let prior_ready = readiness_key(entry);
         entry.hold = ComposerHold::Clear;
         entry.hold_owner = None;
         entry.detection = entry.detection.clone().stamped(entry.in_mode, entry.hold);
-        (prior_ready, entry.detection.clone())
+        (prior_ready, readiness_key(entry), entry.detection.clone())
     };
-    wake_readiness(inner, session_idx, pane_id, Some(prior_ready), &det);
+    wake_readiness_after_mutation(inner, session_idx, pane_id, prior_ready, now_key, &det);
     true
 }
 
@@ -1945,25 +2007,18 @@ fn staged_entry_ready(
         && entry.hold_owner.as_deref() == Some(owner)
         && entry.agent == Some(agent)
         && entry.manifest.as_deref() == Some(manifest)
-        && !entry.in_mode
-        && !entry.detection.stale
-        && matches!(
-            entry.detection.state,
-            AgentState::Idle | AgentState::IdleWithInput
-        )
-        && entry
-            .detection
-            .readings
-            .iter()
-            .all(|reading| matches!(reading.state, AgentState::Idle | AgentState::IdleWithInput))
+        && staged_frame_is_quiet(entry)
 }
 
-/// Release the staged composer barrier after a guarded resolution.
+/// Release this attempt's composer barrier after a guarded resolution.
 ///
 /// The caller has already proved the exact composer bytes. This final
 /// check keeps the release bound to the process generation and manifest
 /// recorded before the paste, so it cannot clear another occupant's hold.
-pub(crate) fn resolve_staged_hold(
+/// The exact settlement may race a lifecycle recompute that promotes the
+/// owned hold after the composer was cleared. That promotion must not leave
+/// an already-settled notification blocking the pane.
+pub(crate) async fn resolve_staged_hold(
     inner: &Arc<Inner>,
     session_idx: usize,
     pane_id: &str,
@@ -1971,33 +2026,42 @@ pub(crate) fn resolve_staged_hold(
     agent: cyclops_proto::ProcessInstanceId,
     manifest: &str,
 ) -> bool {
+    let pane = PaneKey::new(session_idx, pane_id);
+    let recompute_gate = pane_recompute_gate(inner, &pane);
+    let _recompute_guard = recompute_gate.lock().await;
     let expected = crate::identity::ProcId {
         pid: agent.pid(),
         birth: agent.birth(),
     };
-    let (prior_ready, det) = {
+    let (prior_ready, now_key, det) = {
         let mut map = inner.detections.lock().expect("detections lock");
-        let Some(entry) = map.get_mut(&PaneKey::new(session_idx, pane_id)) else {
+        let Some(entry) = map.get_mut(&pane) else {
             return false;
         };
-        if entry.hold != ComposerHold::Staged
+        if entry.hold == ComposerHold::Clear
             || entry.hold_owner.as_deref() != Some(owner)
             || entry.agent != Some(expected)
             || entry.manifest.as_deref() != Some(manifest)
         {
             return false;
         }
-        let prior_ready = (
-            entry.detection.write_ready,
-            entry.detection.write_block.clone(),
-        );
+        if let Some(turn) = entry.turn.as_ref() {
+            turnkey::PaneEnds::retire(
+                &mut inner.turn_ends.lock().expect("turn ends lock"),
+                &pane,
+                expected,
+                manifest,
+                turn,
+            );
+        }
+        let prior_ready = readiness_key(entry);
         entry.hold = ComposerHold::Clear;
         entry.hold_owner = None;
         entry.turn = None;
         entry.detection = entry.detection.clone().stamped(entry.in_mode, entry.hold);
-        (prior_ready, entry.detection.clone())
+        (prior_ready, readiness_key(entry), entry.detection.clone())
     };
-    wake_readiness(inner, session_idx, pane_id, Some(prior_ready), &det);
+    wake_readiness_after_mutation(inner, session_idx, pane_id, prior_ready, now_key, &det);
     true
 }
 
@@ -2010,18 +2074,187 @@ pub(crate) fn resolve_staged_hold(
 /// would be a transition that never happened, so this is its own event
 /// and it names no ledger line.
 ///
-/// First sight is not a public readiness change. It still reconciles the
-/// route because process replacement can retire the prior detection before a
-/// delivery records its durable pre-write block. The first clean detection is
-/// then the only positive edge available to reopen that exact attempt.
+/// First sight is not a public readiness change. A caller carrying a causal
+/// token may still reconcile it. Tokenless status, lifecycle, and synthetic
+/// captures are observational only and never create route evidence.
+///
+/// What a readiness wake compares: the public write verdict and, third,
+/// whether the pane's own staged notification is action-ready for its
+/// owner. The third component never makes the pane write-ready for a
+/// follower; it exists because an owned staged doorbell keeps the honest
+/// state at `idle_with_input`, which leaves the public pair unchanged
+/// across the very transition (working to idle-class) that must wake the
+/// exact-owned reconciliation. Without it that reconciliation is never
+/// requested and a claimed doorbell is never cleared.
+type ReadinessKey = (bool, Option<String>, bool);
+
+/// Is this pane's own staged hold ready for its owner's action? The same
+/// evidence `staged_entry_ready` demands, minus the owner and binding
+/// identity, which the reconciliation seam re-proves itself.
+fn staged_hold_ready(entry: &DetEntry) -> bool {
+    entry.hold == ComposerHold::Staged && entry.hold_owner.is_some() && staged_frame_is_quiet(entry)
+}
+
+/// Is this frame quiet enough for the owner's own action on its staged
+/// notification? Idle-class fused states qualify. `Unknown` qualifies only
+/// when it is the honest reading of a staged row: the screen read the row as
+/// human input (never a ghost or a bare prompt), every retained reading is
+/// idle-class (an active start's Working reading refuses), a current Screen
+/// reading exists (hook-only readings, a failed or an empty capture refuse),
+/// the capture is fresh and out of mode. Blocked states never qualify. The exact bytes are
+/// proven again by the caller before any key is sent.
+fn staged_frame_is_quiet(entry: &DetEntry) -> bool {
+    let idle_class =
+        |state: AgentState| matches!(state, AgentState::Idle | AgentState::IdleWithInput);
+    let readings_quiet = entry
+        .detection
+        .readings
+        .iter()
+        .any(|reading| reading.sensor == Sensor::Screen)
+        && entry
+            .detection
+            .readings
+            .iter()
+            .all(|reading| idle_class(reading.state));
+    let unknown_staged = entry.detection.state == AgentState::Unknown
+        && entry.detection.composer_semantic == Some(ComposerSemantic::HumanInput);
+    !entry.in_mode
+        && !entry.detection.stale
+        && (idle_class(entry.detection.state) || unknown_staged)
+        && readings_quiet
+}
+
+/// Runtime-idle admission by process-bound liveness. A separate verdict from
+/// lifecycle termination: it answers "may a wake start now?" for a pane whose
+/// lifecycle evidence is absent (a fresh pane before its first completed
+/// turn, or a pane whose completed suffix scrolled away), never "did the
+/// turn end?". It admits `Idle` only when the fused state is `unknown`
+/// because the clean composer is not lifecycle evidence, the exact current
+/// agent generation has produced an authenticated `SessionStart` or
+/// `UserPromptSubmit` edge in this pane lifetime (telemetry and attention
+/// edges never qualify), no start is active for that
+/// generation, and the current capture is a nonstale, out-of-mode,
+/// binding-stable frame whose screen winner is a clean idle-class composer
+/// row. It never touches a hook entry and cannot end a latch.
+#[allow(clippy::too_many_arguments)]
+fn liveness_admits_idle(
+    state: AgentState,
+    decided_by: &str,
+    screen: Option<&CompiledRule>,
+    has_screen_reading: bool,
+    liveness_verified: bool,
+    active_start: bool,
+    stale: bool,
+    in_mode: bool,
+    binding_stable: bool,
+) -> bool {
+    state == AgentState::Unknown
+        && decided_by == "idle_unconfirmed"
+        && screen.is_some_and(|rule| {
+            matches!(rule.state, AgentState::Idle | AgentState::IdleWithInput)
+                && rule.composer_semantic == Some(ComposerSemantic::Clean)
+        })
+        && has_screen_reading
+        && liveness_verified
+        && !active_start
+        && !stale
+        && !in_mode
+        && binding_stable
+}
+
+/// What runtime-idle admission decided for this recompute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmissionOutcome {
+    /// Admission did not apply: not an unknown clean frame, or refused by
+    /// one of the distinct outcomes (draft, ghost, ambiguous, stale, mode,
+    /// binding change, active start).
+    NotApplicable,
+    /// Every predicate held and a qualifying edge from this daemon boot
+    /// exists: the pane is idle.
+    Admitted,
+    /// Every predicate held except a qualifying edge from this daemon boot.
+    /// The pane stays unknown and its write block is named
+    /// `hook_admission_unproven`: a durable, recoverable pre-write block,
+    /// never a replay of an older boot's edge.
+    Unproven,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn liveness_idle_admission(
+    inner: &Inner,
+    route: &PaneKey,
+    admitted: Option<crate::identity::ProcId>,
+    manifest_id: Option<&str>,
+    screen: Option<&CompiledRule>,
+    binding_stable: bool,
+    in_mode: bool,
+    detection: &mut Detection,
+) -> AdmissionOutcome {
+    let (Some(agent), Some(manifest_id)) = (admitted, manifest_id) else {
+        return AdmissionOutcome::NotApplicable;
+    };
+    let liveness_verified = inner
+        .manifests
+        .get(manifest_id)
+        .is_some_and(crate::selftest::declares_hooks)
+        && inner
+            .hook_liveness
+            .seen_admitting_edge(route, agent, manifest_id);
+    let active_start = inner
+        .hook_readings
+        .lock()
+        .expect("hook readings lock")
+        .get(route)
+        .is_some_and(|entry| entry.active_start_for(agent, Some(manifest_id)));
+    let has_screen_reading = detection
+        .readings
+        .iter()
+        .any(|reading| reading.sensor == Sensor::Screen);
+    let frame_admissible = liveness_admits_idle(
+        detection.state,
+        &detection.decided_by,
+        screen,
+        has_screen_reading,
+        true,
+        active_start,
+        detection.stale,
+        in_mode,
+        binding_stable,
+    );
+    if !frame_admissible {
+        return AdmissionOutcome::NotApplicable;
+    }
+    if !liveness_verified {
+        return AdmissionOutcome::Unproven;
+    }
+    detection.state = AgentState::Idle;
+    detection.decided_by = format!(
+        "liveness:{}",
+        screen.map(|rule| rule.id.as_str()).unwrap_or("screen")
+    );
+    AdmissionOutcome::Admitted
+}
+
+fn readiness_key(entry: &DetEntry) -> ReadinessKey {
+    (
+        entry.detection.write_ready,
+        entry.detection.write_block.clone(),
+        staged_hold_ready(entry),
+    )
+}
+
+/// Callers compute `now` from the freshly stamped entry under their own
+/// `detections` guard; this function never takes that lock, because several
+/// callers still hold it here.
 fn wake_readiness(
     inner: &Arc<Inner>,
     session_idx: usize,
     pane_id: &str,
-    prior: Option<(bool, Option<String>)>,
+    prior: Option<ReadinessKey>,
+    now: ReadinessKey,
     det: &Detection,
+    route_evidence: Option<&NotificationRouteEvidenceId>,
 ) {
-    let now = (det.write_ready, det.write_block.clone());
     let decision = readiness_wake_decision(prior.as_ref(), &now);
     if decision.emit_public {
         inner.emit(
@@ -2036,8 +2269,34 @@ fn wake_readiness(
         );
     }
     if decision.reconcile_route {
-        crate::messaging::schedule_route_changed(inner, session_idx, pane_id);
+        if let Some(route_evidence) = route_evidence {
+            crate::messaging::schedule_route_evidence(inner, session_idx, pane_id, route_evidence);
+        }
     }
+}
+
+/// Publish a readiness mutation, minting one token only when it creates a
+/// route-reconciliation edge.
+fn wake_readiness_after_mutation(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    pane_id: &str,
+    prior: ReadinessKey,
+    now: ReadinessKey,
+    det: &Detection,
+) {
+    let route_evidence = readiness_wake_decision(Some(&prior), &now)
+        .reconcile_route
+        .then(|| inner.advance_route_evidence(session_idx, pane_id));
+    wake_readiness(
+        inner,
+        session_idx,
+        pane_id,
+        Some(prior),
+        now,
+        det,
+        route_evidence.as_ref(),
+    );
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2047,13 +2306,14 @@ struct ReadinessWakeDecision {
 }
 
 fn readiness_wake_decision(
-    prior: Option<&(bool, Option<String>)>,
-    now: &(bool, Option<String>),
+    prior: Option<&ReadinessKey>,
+    now: &ReadinessKey,
 ) -> ReadinessWakeDecision {
-    let changed = prior.is_some_and(|prior| prior != now);
+    let public_changed = prior.is_some_and(|prior| (&prior.0, &prior.1) != (&now.0, &now.1));
+    let staged_changed = prior.is_some_and(|prior| prior.2 != now.2);
     ReadinessWakeDecision {
-        emit_public: changed,
-        reconcile_route: prior.is_none() || changed,
+        emit_public: public_changed,
+        reconcile_route: prior.is_none() || public_changed || staged_changed,
     }
 }
 
@@ -2252,16 +2512,57 @@ enum HookAction {
 /// Age one hook entry against the rules-tier verdict of this recompute.
 /// Disagreement only counts when the rules actually decided something;
 /// agreement resets the streak.
-fn hook_action(entry: &mut HookEntry, rules_state: AgentState, now_ms: u64) -> HookAction {
+/// `idle_confirmed` says the selected screen winner certified idle this
+/// recompute ([`winner_confirms_idle`]); `in_mode` says the pane is in a
+/// tmux mode, where the capture does not show the composer; `binding_stable`
+/// says the pane's binding was the same before and after the capture, the
+/// bookends that tie the frame to this agent generation.
+fn hook_action_observed_with_terminal(
+    entry: &mut HookEntry,
+    detection: &Detection,
+    idle_confirmed: bool,
+    active_start_terminal: bool,
+    in_mode: bool,
+    binding_stable: bool,
+    now_ms: u64,
+) -> HookAction {
     // An authenticated start is a lifecycle fact, not a sample. The idle
     // composer often remains on screen until Claude paints its first output,
     // and repeated captures of that frame do not end the turn. A missing end
     // must remain visible as Working instead of silently ageing to Idle.
     if entry.active_start {
+        // A promoted candidate has no exact hook key and may end on ordinary
+        // lifecycle evidence. An authenticated start is stronger: it ends on
+        // the hook tier unless the winning rule explicitly declares itself
+        // an active-start terminal. Codex 0.149.1's measured approval-cancel
+        // suffix is one such rule; generic empty/ghost/typed composer rules
+        // are not.
+        let fused_idle = matches!(
+            detection.state,
+            AgentState::Idle | AgentState::IdleWithInput
+        );
+        if idle_confirmed
+            && (entry.promoted || active_start_terminal)
+            && fused_idle
+            && !in_mode
+            && !detection.stale
+            && binding_stable
+        {
+            return HookAction::Drop;
+        }
         return HookAction::Use;
     }
     if entry.authoritative_end {
-        return if matches!(rules_state, AgentState::Idle | AgentState::IdleWithInput) {
+        let newer_visual_working = detection.readings.iter().any(|reading| {
+            reading.sensor != Sensor::Hook
+                && reading.state == AgentState::Working
+                && reading.ts >= entry.reading.ts
+        });
+        return if matches!(
+            detection.state,
+            AgentState::Idle | AgentState::IdleWithInput
+        ) || newer_visual_working
+        {
             HookAction::Drop
         } else {
             HookAction::Use
@@ -2270,10 +2571,10 @@ fn hook_action(entry: &mut HookEntry, rules_state: AgentState, now_ms: u64) -> H
     if now_ms.saturating_sub(entry.reading.ts) > HOOK_READING_TTL_MS {
         return HookAction::Drop;
     }
-    if rules_state == AgentState::Unknown {
+    if detection.state == AgentState::Unknown {
         return HookAction::Use;
     }
-    if rules_state == entry.reading.state {
+    if detection.state == entry.reading.state {
         entry.disagreements = 0;
         return HookAction::Use;
     }
@@ -2283,6 +2584,26 @@ fn hook_action(entry: &mut HookEntry, rules_state: AgentState, now_ms: u64) -> H
     } else {
         HookAction::Use
     }
+}
+
+#[cfg(test)]
+fn hook_action_observed(
+    entry: &mut HookEntry,
+    detection: &Detection,
+    idle_confirmed: bool,
+    in_mode: bool,
+    binding_stable: bool,
+    now_ms: u64,
+) -> HookAction {
+    hook_action_observed_with_terminal(
+        entry,
+        detection,
+        idle_confirmed,
+        false,
+        in_mode,
+        binding_stable,
+        now_ms,
+    )
 }
 
 /// Apply one bound hook reading to the visual verdict.
@@ -2299,17 +2620,21 @@ fn apply_hook_reading(
 ) {
     let hook_state = reading.state;
     let hook_rule = reading.rule.clone();
+    let hook_ts = reading.ts;
     let visual_state = detection.state;
+    let newer_visual_working = detection.readings.iter().any(|visual| {
+        visual.sensor != Sensor::Hook && visual.state == AgentState::Working && visual.ts >= hook_ts
+    });
     detection.readings.push(reading);
 
-    if authoritative_end
+    if authoritative_end && newer_visual_working {
+        // Stop ended its bound turn. A later current-level Working reading
+        // describes what is on the pane now and cannot be overwritten by
+        // retaining that historical edge as an Idle level.
+    } else if authoritative_end
         && hook_state == AgentState::Idle
-        && !visual_state.is_blocked()
-        && visual_state != AgentState::IdleWithInput
+        && matches!(visual_state, AgentState::Unknown | AgentState::Idle)
     {
-        if visual_state != AgentState::Unknown && visual_state != AgentState::Idle {
-            detection.disagreement = true;
-        }
         detection.state = AgentState::Idle;
         detection.decided_by = format!("hook:{hook_rule}");
     } else if active_start && hook_state == AgentState::Working && !visual_state.is_blocked() {
@@ -2333,6 +2658,10 @@ pub(crate) fn title_winner<'m>(m: &'m Manifest, title: &str) -> Option<&'m Compi
         .find(|r| r.region == Region::PaneTitle && r.matches(title, &[title]))
 }
 
+fn manifest_uses_screen_tier(m: &Manifest) -> bool {
+    m.rules.iter().any(|rule| rule.region != Region::PaneTitle)
+}
+
 /// Highest-priority screen-region rule matching the capture. Region
 /// slicing matches `Manifest::evaluate`: bottom N non-empty lines,
 /// restored to top-down order. Production goes through
@@ -2352,6 +2681,18 @@ pub(crate) fn screen_winner_esc<'m>(
     screen: &str,
     screen_esc: Option<&str>,
 ) -> Option<&'m CompiledRule> {
+    let (non_empty, non_empty_esc) = screen_regions(screen, screen_esc);
+    m.rules
+        .iter()
+        .find(|r| screen_rule_matches(r, &non_empty, non_empty_esc.as_deref()))
+}
+
+/// Bottom-up non-empty rows of a capture and, when an escaped capture
+/// exists, the same rows with their SGR bytes.
+fn screen_regions<'s>(
+    screen: &'s str,
+    screen_esc: Option<&'s str>,
+) -> (Vec<&'s str>, Option<Vec<&'s str>>) {
     let non_empty: Vec<&str> = screen
         .lines()
         .rev()
@@ -2363,18 +2704,40 @@ pub(crate) fn screen_winner_esc<'m>(
             .filter(|l| !strip_csi(l).trim().is_empty())
             .collect()
     });
-    m.rules.iter().find(|r| match r.region {
+    (non_empty, non_empty_esc)
+}
+
+fn screen_rule_matches(
+    r: &CompiledRule,
+    non_empty: &[&str],
+    non_empty_esc: Option<&[&str]>,
+) -> bool {
+    match r.region {
         Region::PaneTitle => false,
         Region::BottomNonEmptyLines(n) => {
             let mut sel: Vec<&str> = non_empty.iter().take(n).copied().collect();
             sel.reverse();
-            let esc = non_empty_esc.as_ref().map(|ne| {
+            let esc = non_empty_esc.map(|ne| {
                 let mut sel: Vec<&str> = ne.iter().take(n).copied().collect();
                 sel.reverse();
                 sel
             });
             r.matches_esc(&sel.join("\n"), &sel, esc.as_deref())
         }
+    }
+}
+
+/// Does the selected screen winner certify an idle-class state? Only the
+/// rule the screen tier actually selected may do so, and only when the
+/// manifest marks it `lifecycle_evidence`: a composer row measured mid-turn
+/// (`lifecycle_evidence = false`) may carry a composer semantic but cannot
+/// license an idle verdict, and a low-priority catch-all idle rule that
+/// merely also matches underneath a working or blocked winner certifies
+/// nothing.
+pub(crate) fn winner_confirms_idle(winner: Option<&CompiledRule>) -> bool {
+    winner.is_some_and(|rule| {
+        rule.lifecycle_evidence
+            && matches!(rule.state, AgentState::Idle | AgentState::IdleWithInput)
     })
 }
 
@@ -2400,10 +2763,23 @@ async fn capture_screens(
 
 /// Fuse the tier winners into a Detection. Both readings are kept whenever
 /// both tiers fired, whatever the verdict.
+/// `screen_required` says the manifest relies on the screen tier, so the
+/// screen was consulted (or should have been and could not be).
+/// `idle_confirmed` says the selected screen winner is an idle-class rule the
+/// manifest marks `lifecycle_evidence` ([`winner_confirms_idle`]). When the
+/// screen tier is required and nothing confirmed idle, no idle-class verdict
+/// is published: a non-idle screen rule decides, otherwise the pane is
+/// `unknown`, which is never write-ready. A title is a lagging sensor and an
+/// idle title over a mid-turn screen is exactly the frame that admits a write
+/// into a working pane; a bare or ghosted composer row is measured mid-turn
+/// too, so it may carry its composer semantic but not the idle verdict. A
+/// manifest without a screen tier keeps deciding by title.
 pub(crate) fn fuse(
     m: &Manifest,
     title: Option<&CompiledRule>,
     screen: Option<&CompiledRule>,
+    screen_required: bool,
+    idle_confirmed: bool,
     ts: u64,
 ) -> Detection {
     let mut readings = Vec::new();
@@ -2429,6 +2805,32 @@ pub(crate) fn fuse(
         let rp: *const CompiledRule = *r;
         title.is_some_and(|t| std::ptr::eq(rp, t)) || screen.is_some_and(|s| std::ptr::eq(rp, s))
     });
+    let idle_class =
+        |state: AgentState| matches!(state, AgentState::Idle | AgentState::IdleWithInput);
+    if screen_required && !idle_confirmed && winner.is_some_and(|w| idle_class(w.state)) {
+        return match screen.filter(|s| !idle_class(s.state)) {
+            Some(s) => Detection {
+                state: s.state,
+                disagreement: true,
+                decided_by: s.id.clone(),
+                stale: false,
+                write_ready: false,
+                write_block: None,
+                composer_semantic: s.composer_semantic,
+                readings,
+            },
+            None => Detection {
+                state: AgentState::Unknown,
+                disagreement: false,
+                decided_by: "idle_unconfirmed".into(),
+                stale: false,
+                write_ready: false,
+                write_block: None,
+                composer_semantic: screen.and_then(|rule| rule.composer_semantic),
+                readings,
+            },
+        };
+    }
     match winner {
         Some(w) => Detection {
             state: w.state,
@@ -2943,8 +3345,9 @@ fn pane_recompute_gate(inner: &Arc<Inner>, pane: &PaneKey) -> Arc<tokio::sync::M
 }
 
 /// Recompute one pane's Detection, update the cache, and emit a "state"
-/// event when the fused state changed. `force_screen` runs the full sensor
-/// set even when a title rule alone would decide (pane.read detection).
+/// event when the fused state changed. Manifests with screen rules always run
+/// the full sensor set. `force_screen` additionally captures for title-only
+/// manifests used by explicit inspection paths.
 /// Returns None when the pane is gone from the table.
 ///
 /// `session_idx` is the caller's stable session-slot index, not re-derived
@@ -2967,7 +3370,35 @@ pub(crate) async fn recompute_pane(
         pane_id,
         force_screen,
         cause,
-        None,
+        RecomputeEvidence::default(),
+    )
+    .await
+}
+
+/// Recompute while reusing one supplied route-evidence token.
+///
+/// Causal event sources mint the token before entering. Synthetic
+/// reconciliation supplies the current token so it cannot create an edge.
+pub(crate) async fn recompute_pane_for_route_evidence(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    watcher: &SessionWatcher,
+    pane_id: &str,
+    force_screen: bool,
+    cause: &str,
+    route_evidence: &NotificationRouteEvidenceId,
+) -> Option<Detection> {
+    recompute_pane_with_evidence(
+        inner,
+        session_idx,
+        watcher,
+        pane_id,
+        force_screen,
+        cause,
+        RecomputeEvidence {
+            source_ms: None,
+            route: Some(route_evidence),
+        },
     )
     .await
 }
@@ -2980,20 +3411,28 @@ pub(crate) async fn recompute_pane_from_output(
     session_idx: usize,
     watcher: &SessionWatcher,
     pane_id: &str,
-    force_screen: bool,
-    cause: &str,
     evidence_ms: u64,
+    route_evidence: &NotificationRouteEvidenceId,
 ) -> Option<Detection> {
     recompute_pane_with_evidence(
         inner,
         session_idx,
         watcher,
         pane_id,
-        force_screen,
-        cause,
-        Some(evidence_ms),
+        false,
+        "output_settled",
+        RecomputeEvidence {
+            source_ms: Some(evidence_ms),
+            route: Some(route_evidence),
+        },
     )
     .await
+}
+
+#[derive(Default)]
+struct RecomputeEvidence<'a> {
+    source_ms: Option<u64>,
+    route: Option<&'a NotificationRouteEvidenceId>,
 }
 
 async fn recompute_pane_with_evidence(
@@ -3003,7 +3442,7 @@ async fn recompute_pane_with_evidence(
     pane_id: &str,
     force_screen: bool,
     cause: &str,
-    source_evidence_ms: Option<u64>,
+    evidence: RecomputeEvidence<'_>,
 ) -> Option<Detection> {
     let route = PaneKey::new(session_idx, pane_id);
     let prior_working_confirmed = cached_working_confirmed(inner, session_idx, pane_id);
@@ -3127,13 +3566,6 @@ async fn recompute_pane_with_evidence(
     // was disproved by a lookup that failed to answer, so the binding,
     // the hold, its owner and the turn it waits on are frozen below
     // rather than recomputed, and the verdict refuses.
-    let quota_screen_clear = inner
-        .detections
-        .lock()
-        .expect("detections lock")
-        .get(&route)
-        .filter(|entry| entry.agent == admitted && entry.manifest == manifest_id)
-        .is_some_and(|entry| entry.quota_screen_clear);
     let prior_hold_owner = inner
         .detections
         .lock()
@@ -3149,7 +3581,7 @@ async fn recompute_pane_with_evidence(
     // State and ledger timestamps name this capture. Lifecycle eligibility
     // names the event that caused it. Capping protects the same ordering if
     // the system clock moves while an output burst is settling.
-    let evidence_ms = source_evidence_ms.unwrap_or(ts).min(ts);
+    let evidence_ms = evidence.source_ms.unwrap_or(ts).min(ts);
     let candidate_lane = manifest.is_some_and(|m| {
         m.hooks.turn_start_evidence == LifecycleCertainty::Candidate
             || m.hooks.turn_end_evidence == LifecycleCertainty::Candidate
@@ -3163,9 +3595,7 @@ async fn recompute_pane_with_evidence(
         // in the daemon should wait on the detection cache while a `ps`
         // runs.
         let mut map = inner.detections.lock().expect("detections lock");
-        let prior_ready = map
-            .get(&route)
-            .map(|e| (e.detection.write_ready, e.detection.write_block.clone()));
+        let prior_ready = map.get(&route).map(readiness_key);
         // Stamped INTO the cache, not just onto the returned copy. The
         // cache is what status and pane.read read, so stamping only the
         // return value would leave every surface reporting the readiness
@@ -3251,6 +3681,10 @@ async fn recompute_pane_with_evidence(
                 det
             }
         };
+        let now_key = map
+            .get(&route)
+            .map(readiness_key)
+            .unwrap_or_else(|| (det.write_ready, det.write_block.clone(), false));
         drop(map);
         if candidate_lane {
             if let (Some(agent), Some(manifest)) = (admitted, manifest_id.as_deref()) {
@@ -3270,7 +3704,15 @@ async fn recompute_pane_with_evidence(
         }
         // Entering a mode refuses a write without touching the runtime
         // state, so this is the wake that has no state edge behind it.
-        wake_readiness(inner, session_idx, pane_id, prior_ready, &det);
+        wake_readiness(
+            inner,
+            session_idx,
+            pane_id,
+            prior_ready,
+            now_key,
+            &det,
+            evidence.route,
+        );
         if !is_candidate_recheck_cause(cause) {
             schedule_lifecycle_recheck(inner, &route);
         }
@@ -3278,6 +3720,10 @@ async fn recompute_pane_with_evidence(
     }
 
     let mut capture_binding_changed = false;
+    let mut idle_confirmed = false;
+    let mut active_start_terminal = false;
+    let mut screen_winner_id: Option<String> = None;
+    let mut admission = AdmissionOutcome::NotApplicable;
     let mut detection = if row.dead {
         Detection {
             state: AgentState::Dead,
@@ -3291,42 +3737,11 @@ async fn recompute_pane_with_evidence(
         }
     } else if let Some(m) = manifest {
         let t_rule = title_winner(m, &row.title);
-        let candidate_end_active = m.hooks.turn_end_evidence == LifecycleCertainty::Candidate
-            && admitted.is_some_and(|agent| {
-                inner
-                    .hook_readings
-                    .lock()
-                    .expect("hook readings lock")
-                    .get(&route)
-                    .is_some_and(|entry| entry.active_start_for(agent, Some(m.agent.id.as_str())))
-            });
-        let candidate_pending = admitted.is_some_and(|agent| {
-            inner
-                .hook_lifecycle
-                .lock()
-                .expect("hook lifecycle lock")
-                .has_pending_for(&route, agent, &m.agent.id)
-        });
-        let composer_held = inner
-            .detections
-            .lock()
-            .expect("detections lock")
-            .get(&route)
-            .filter(|entry| {
-                entry.agent == admitted && entry.manifest.as_deref() == Some(m.agent.id.as_str())
-            })
-            .is_some_and(|entry| entry.hold.refuses());
-        // One agreeing screen baseline is required per exact occupant so
-        // durable quota holds can recover after restart even when a title
-        // rule would otherwise skip capture forever. A held quota keeps
-        // this false and therefore keeps consulting screen until reset.
-        let need_screen = force_screen
-            || recovering
-            || !quota_screen_clear
-            || t_rule.is_none()
-            || candidate_end_active
-            || candidate_pending
-            || composer_held;
+        // A title cannot establish that the screen contains no stronger or
+        // safer current evidence. When a manifest declares a screen tier, the
+        // same recompute always evaluates it. `force_screen` retains its
+        // meaning for title-only manifests used by explicit inspection paths.
+        let need_screen = force_screen || manifest_uses_screen_tier(m);
         let mut capture_failed = false;
         let (screen, screen_esc) = if need_screen {
             match capture_screens(watcher, m, pane_id).await {
@@ -3337,24 +3752,34 @@ async fn recompute_pane_with_evidence(
                     debug!(pane = pane_id, error = %e, "capture failed; keeping prior state");
                     let retained = {
                         let mut map = inner.detections.lock().expect("detections lock");
-                        let prior_ready = map
-                            .get(&route)
-                            .map(|e| (e.detection.write_ready, e.detection.write_block.clone()));
-                        retain_stale(
+                        let prior_ready = map.get(&route).map(readiness_key);
+                        let retained = retain_stale(
                             &mut map,
                             &route,
                             row.in_mode,
                             foreground_pid_checked(row.pane_pid),
                             manifest_id.as_deref(),
-                        )
-                        .map(|det| (prior_ready, det))
+                        );
+                        let now_key = map
+                            .get(&route)
+                            .map(readiness_key)
+                            .unwrap_or((false, None, false));
+                        retained.map(|det| (prior_ready, now_key, det))
                     };
-                    if let Some((prior_ready, p)) = retained {
+                    if let Some((prior_ready, now_key, p)) = retained {
                         // The refusal is news like any other: a pane that
                         // was write-ready and is now refused on stale
                         // evidence has to wake whoever was gating on the
                         // old answer.
-                        wake_readiness(inner, session_idx, pane_id, prior_ready, &p);
+                        wake_readiness(
+                            inner,
+                            session_idx,
+                            pane_id,
+                            prior_ready,
+                            now_key,
+                            &p,
+                            evidence.route,
+                        );
                         if !is_candidate_recheck_cause(cause) {
                             schedule_lifecycle_recheck(inner, &route);
                         }
@@ -3412,13 +3837,23 @@ async fn recompute_pane_with_evidence(
         let s_rule = screen
             .as_deref()
             .and_then(|s| screen_winner_esc(m, s, screen_esc.as_deref()));
-        let mut det = fuse(m, t_rule, s_rule, ts);
+        idle_confirmed = winner_confirms_idle(s_rule);
+        active_start_terminal = s_rule.is_some_and(|rule| rule.active_start_terminal);
+        screen_winner_id = s_rule.map(|rule| rule.id.clone());
+        let mut det = fuse(
+            m,
+            t_rule,
+            s_rule,
+            manifest_uses_screen_tier(m),
+            idle_confirmed,
+            ts,
+        );
         // No prior to fall back on and the screen sensor errored: the rule
         // set was never fully consulted, and the record must not claim it
         // was (GOALS: the record never lies).
         if capture_failed {
             det.stale = true;
-            if det.decided_by == "no_rule" {
+            if det.decided_by == "no_rule" || det.decided_by == "idle_unconfirmed" {
                 det.decided_by = "sensor_error".into();
             }
         }
@@ -3532,22 +3967,47 @@ async fn recompute_pane_with_evidence(
                     map.remove(&route);
                     None
                 }
-                Some(entry) => match hook_action(entry, detection.state, ts) {
-                    HookAction::Use => Some((
-                        entry.reading.clone(),
-                        entry.active_start,
-                        entry.authoritative_end,
-                    )),
-                    HookAction::Drop => {
-                        map.remove(&route);
-                        None
+                Some(entry) => {
+                    match hook_action_observed_with_terminal(
+                        entry,
+                        &detection,
+                        idle_confirmed,
+                        active_start_terminal,
+                        row.in_mode,
+                        !capture_binding_changed,
+                        ts,
+                    ) {
+                        HookAction::Use => Some((
+                            entry.reading.clone(),
+                            entry.active_start,
+                            entry.authoritative_end,
+                        )),
+                        HookAction::Drop => {
+                            map.remove(&route);
+                            None
+                        }
                     }
-                },
+                }
             }
         };
         if let Some((reading, active_start, authoritative_end)) = hook {
             apply_hook_reading(&mut detection, reading, active_start, authoritative_end);
         }
+    }
+    if let Some(m) = manifest {
+        let screen_rule = screen_winner_id
+            .as_deref()
+            .and_then(|id| m.rules.iter().find(|rule| rule.id == id));
+        admission = liveness_idle_admission(
+            inner,
+            &route,
+            admitted,
+            manifest_id.as_deref(),
+            screen_rule,
+            !capture_binding_changed,
+            row.in_mode,
+            &mut detection,
+        );
     }
 
     let recovery_live = recovery_recipient.and_then(|recipient| match &binding_observation {
@@ -3639,7 +4099,7 @@ async fn recompute_pane_with_evidence(
     let working_confirmed =
         working_is_confirmed(inner, &route, &detection, admitted, manifest_id.as_deref());
 
-    let (prior, prior_ready, detection, probe_quota_reset, composer_changed) = {
+    let (prior, prior_ready, now_key, detection, probe_quota_reset, composer_changed) = {
         let mut map = inner.detections.lock().expect("detections lock");
         if matches!(
             recovery_action.as_ref(),
@@ -3661,8 +4121,7 @@ async fn recompute_pane_with_evidence(
         }
         let prior_entry = map.get(&route);
         let prior = prior_entry.map(|e| e.detection.state);
-        let prior_ready =
-            prior_entry.map(|e| (e.detection.write_ready, e.detection.write_block.clone()));
+        let prior_ready = prior_entry.map(readiness_key);
         // The hold describes one AGENT's composer, so it is carried on
         // the vendor identity and its rules, never on the foreground
         // group. A vendor that hands the terminal to a tool it spawned
@@ -3762,6 +4221,15 @@ async fn recompute_pane_with_evidence(
         if let Some(reason) = recovery_refusal {
             detection = detection.refused(reason);
         }
+        // Restart truth: a clean, current, exact-bound frame with no active
+        // start and no qualifying edge from THIS daemon boot stays unknown
+        // and names its block, so the notification path records a durable,
+        // recoverable pre-write block instead of guessing. Applied after the
+        // stamp so the name survives readiness computation, like the other
+        // named refusals above.
+        if admission == AdmissionOutcome::Unproven {
+            detection = detection.refused("hook_admission_unproven");
+        }
         let composer = project_composer(
             detection.composer_semantic,
             final_owner.as_deref(),
@@ -3806,7 +4274,7 @@ async fn recompute_pane_with_evidence(
             _ => std::time::Instant::now(),
         };
         map.insert(
-            route,
+            route.clone(),
             DetEntry {
                 detection: detection.clone(),
                 binding: match &frozen {
@@ -3843,13 +4311,20 @@ async fn recompute_pane_with_evidence(
                 since,
             },
         );
-        (
-            prior,
-            prior_ready,
-            detection,
-            probe_quota_reset,
-            composer_changed,
-        )
+        {
+            let now_key = map
+                .get(&route)
+                .map(readiness_key)
+                .unwrap_or((false, None, false));
+            (
+                prior,
+                prior_ready,
+                now_key,
+                detection,
+                probe_quota_reset,
+                composer_changed,
+            )
+        }
     };
     // A readiness change under an UNCHANGED runtime state is still news
     // for anyone gating on it. The hold lifting is the case that matters:
@@ -3857,7 +4332,15 @@ async fn recompute_pane_with_evidence(
     // a delivery sleeping on `not_write_ready:composer_hold` would sleep
     // through its own release. This wake is broadcast only. It is not a
     // state transition and must never be written to the ledger as one.
-    wake_readiness(inner, session_idx, pane_id, prior_ready, &detection);
+    wake_readiness(
+        inner,
+        session_idx,
+        pane_id,
+        prior_ready,
+        now_key,
+        &detection,
+        evidence.route,
+    );
     if probe_quota_reset {
         crate::delivery::observe_quota_reset(inner, session_idx, pane_id);
     }
@@ -3918,6 +4401,7 @@ fn is_candidate_recheck_cause(cause: &str) -> bool {
         "candidate_end_settled"
             | "candidate_visual_end_settled"
             | "unkeyed_dispatch_settled"
+            | "continuous_evidence_recheck"
             | "receipt_checkpoint"
     )
 }
@@ -4012,8 +4496,76 @@ region = "bottom_non_empty_lines(3)"
 line_regex = ['^FIXPROMPT']
 "#;
 
+    const TITLE_AND_COMPOSER_FIXTURE: &str = r#"
+[agent]
+id = "bash-composer"
+display_name = "Bash fixture with a composer rule"
+process_names = ["bash"]
+
+[[rule]]
+id = "title_idle"
+state = "idle"
+priority = 1000
+region = "pane_title"
+regex = ['^IDLE']
+
+[[rule]]
+id = "composer_empty"
+state = "idle"
+composer_semantic = "clean"
+priority = 900
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^\$ $']
+
+[[rule]]
+id = "screen_busy"
+state = "working"
+priority = 800
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^FIXPROMPT']
+"#;
+
+    const CURRENT_TIERS_FIXTURE: &str = r#"
+[agent]
+id = "current-tiers"
+display_name = "Current tiers fixture"
+process_names = ["fixture"]
+
+[[rule]]
+id = "title_working"
+state = "working"
+priority = 1100
+region = "pane_title"
+regex = ['^WORKING']
+
+[[rule]]
+id = "title_idle"
+state = "idle"
+priority = 1000
+region = "pane_title"
+regex = ['^IDLE']
+
+[[rule]]
+id = "screen_modal"
+state = "blocked_modal"
+priority = 1200
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^PERMISSION']
+
+[[rule]]
+id = "screen_working"
+state = "working"
+priority = 1150
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^ACTIVE']
+"#;
+
     fn manifest() -> Manifest {
         Manifest::parse(FIXTURE, Path::new("bash.toml")).unwrap()
+    }
+
+    fn current_tiers_manifest() -> Manifest {
+        Manifest::parse(CURRENT_TIERS_FIXTURE, Path::new("current-tiers.toml")).unwrap()
     }
 
     fn quota_detection(sensor: Sensor, state: AgentState) -> Detection {
@@ -4036,7 +4588,7 @@ line_regex = ['^FIXPROMPT']
 
     #[test]
     fn first_readiness_sight_reconciles_without_publishing_a_transition() {
-        let ready = (true, None);
+        let ready = (true, None, false);
         assert_eq!(
             readiness_wake_decision(None, &ready),
             ReadinessWakeDecision {
@@ -4053,7 +4605,7 @@ line_regex = ['^FIXPROMPT']
             }
         );
 
-        let held = (false, Some("composer_hold".to_string()));
+        let held = (false, Some("composer_hold".to_string()), false);
         assert_eq!(
             readiness_wake_decision(Some(&held), &ready),
             ReadinessWakeDecision {
@@ -4061,6 +4613,45 @@ line_regex = ['^FIXPROMPT']
                 reconcile_route: true,
             }
         );
+    }
+    /// An owned staged doorbell keeps the public pair unchanged across the
+    /// working-to-idle-class edge; the third component is what wakes the
+    /// exact-owned reconciliation, and it is never a public readiness event.
+    #[test]
+    fn staged_hold_readiness_alone_reconciles_the_route_without_a_public_wake() {
+        let before: ReadinessKey = (false, Some("not_idle".into()), false);
+        let after: ReadinessKey = (false, Some("not_idle".into()), true);
+        let decision = readiness_wake_decision(Some(&before), &after);
+        assert!(decision.reconcile_route);
+        assert!(!decision.emit_public);
+        let same = readiness_wake_decision(Some(&after), &after);
+        assert!(!same.reconcile_route);
+        assert!(!same.emit_public);
+    }
+
+    #[test]
+    fn tokenless_readiness_is_observational_and_a_mutation_mints_once() {
+        let inner = inner_with(BTreeMap::new());
+        let pane_id = "%1";
+        let mut ready = quota_detection(Sensor::Screen, AgentState::Idle);
+        ready.write_ready = true;
+        let held: ReadinessKey = (false, Some("composer_hold".to_string()), false);
+        let ready_key: ReadinessKey = (true, None, false);
+        let initial = inner.route_evidence_id(0, pane_id);
+
+        wake_readiness(
+            &inner,
+            0,
+            pane_id,
+            Some(held.clone()),
+            ready_key.clone(),
+            &ready,
+            None,
+        );
+        assert_eq!(inner.route_evidence_id(0, pane_id), initial);
+
+        wake_readiness_after_mutation(&inner, 0, pane_id, held, ready_key, &ready);
+        assert_eq!(inner.route_evidence_id(0, pane_id).generation, 1);
     }
 
     #[test]
@@ -4084,6 +4675,24 @@ line_regex = ['^FIXPROMPT']
         let mut disagreeing = clean.clone();
         disagreeing.disagreement = true;
         assert!(!quota_reset_probe_needed(false, &disagreeing));
+    }
+
+    #[test]
+    fn only_unstable_or_held_evidence_gets_a_bounded_follow_up() {
+        let stable = lifecycle_detection(Sensor::Screen, AgentState::Idle);
+        assert!(!needs_targeted_reobservation(&stable, ComposerHold::Clear));
+
+        let mut stale = stable.clone();
+        stale.stale = true;
+        assert!(needs_targeted_reobservation(&stale, ComposerHold::Clear));
+
+        let mut disagreeing = stable.clone();
+        disagreeing.disagreement = true;
+        assert!(needs_targeted_reobservation(
+            &disagreeing,
+            ComposerHold::Clear
+        ));
+        assert!(needs_targeted_reobservation(&stable, ComposerHold::Staged));
     }
 
     fn lifecycle_detection(sensor: Sensor, state: AgentState) -> Detection {
@@ -4392,7 +5001,12 @@ contains = ["working"]
             1_000 + UNKEYED_DISPATCH_SETTLE_MS + 1,
             LifecycleObservation::Stable,
         ));
-        assert!(inner.hook_readings.lock().unwrap().get(&pane).is_none());
+        assert!(inner
+            .hook_readings
+            .lock()
+            .unwrap()
+            .get(&pane)
+            .is_some_and(|entry| entry.confirmed_unkeyed_start_for(agent, Some("claude"))));
     }
 
     #[test]
@@ -4449,7 +5063,12 @@ contains = ["working"]
             true,
             LifecycleObservation::Stable,
         ));
-        assert!(inner.hook_readings.lock().unwrap().get(&pane).is_none());
+        assert!(inner
+            .hook_readings
+            .lock()
+            .unwrap()
+            .get(&pane)
+            .is_some_and(|entry| entry.confirmed_unkeyed_start_for(agent, Some("claude"))));
     }
 
     #[test]
@@ -4621,7 +5240,12 @@ contains = ["working"]
             1_101,
             LifecycleObservation::Stable,
         ));
-        assert!(inner.hook_readings.lock().unwrap().get(&pane).is_none());
+        assert!(inner
+            .hook_readings
+            .lock()
+            .unwrap()
+            .get(&pane)
+            .is_some_and(|entry| entry.confirmed_unkeyed_start_for(agent, Some("claude"))));
     }
 
     #[test]
@@ -5914,7 +6538,10 @@ contains = ["working"]
         // The delivery holding the barrier binds its own turn, and the
         // hold leaves the screen lifecycle for it.
         start(entry(Some("m-1#1"), ComposerHold::Staged, None));
+        let route_before = inner.route_evidence_id(0, "%1");
         assert!(bind_turn(&inner, 0, "%1", "m-1#1", t1.clone(), 500).is_some());
+        let route_after = inner.route_evidence_id(0, "%1");
+        assert_eq!(route_after.generation, route_before.generation + 1);
         assert_eq!(
             bound(),
             (
@@ -5927,6 +6554,7 @@ contains = ["working"]
         // Binding the same turn again is idempotent: an acknowledgement
         // can arrive more than once, and the first witnessed edge stands.
         assert!(bind_turn(&inner, 0, "%1", "m-1#1", t1.clone(), 900).is_some());
+        assert_eq!(inner.route_evidence_id(0, "%1"), route_after);
         assert_eq!(
             bound(),
             (
@@ -6005,8 +6633,8 @@ contains = ["working"]
     /// delivery take it and paste over their text. A fresh claim needs a
     /// composer this daemon believes is empty AND unclaimed; only the
     /// same owner may re-claim what it already holds.
-    #[test]
-    fn a_fresh_claim_refuses_a_barrier_it_does_not_own() {
+    #[tokio::test]
+    async fn a_fresh_claim_refuses_a_barrier_it_does_not_own() {
         let clean = Detection {
             state: AgentState::Idle,
             readings: vec![SensorReading {
@@ -6125,19 +6753,55 @@ contains = ["working"]
         ));
 
         put(entry(ComposerHold::Staged, Some(attempt)));
-        assert!(!resolve_staged_hold(
-            &inner,
-            0,
-            "%1",
-            "att-00000000-0000-4000-8000-000000000002",
-            process,
-            "bash"
-        ));
+        assert!(
+            !resolve_staged_hold(
+                &inner,
+                0,
+                "%1",
+                "att-00000000-0000-4000-8000-000000000002",
+                process,
+                "bash"
+            )
+            .await
+        );
         assert_eq!(hold_now(), (ComposerHold::Staged, Some(attempt.into())));
-        assert!(resolve_staged_hold(
-            &inner, 0, "%1", attempt, process, "bash"
-        ));
+        assert!(resolve_staged_hold(&inner, 0, "%1", attempt, process, "bash").await);
         assert_eq!(hold_now(), (ComposerHold::Clear, None));
+
+        // A recompute that started before settlement may still promote the
+        // old hold. Resolution waits for that commit, then clears it last.
+        let turn = turnkey::TurnKey::for_test(&["settled"]);
+        let mut promoted = entry(ComposerHold::TurnStarted { since_ms: 9 }, Some(attempt));
+        promoted.turn = Some(turn.clone());
+        put(entry(ComposerHold::Staged, Some(attempt)));
+        let recompute_gate = pane_recompute_gate(&inner, &pane());
+        let recompute_guard = recompute_gate.lock().await;
+        let mut resolution = Box::pin(resolve_staged_hold(
+            &inner, 0, "%1", attempt, process, "bash",
+        ));
+        tokio::select! {
+            biased;
+            result = &mut resolution => panic!("resolution crossed an active recompute: {result}"),
+            () = tokio::task::yield_now() => {}
+        }
+        put(promoted);
+        assert!(turnkey::PaneEnds::pin(
+            &mut inner.turn_ends.lock().expect("turn ends lock"),
+            &pane(),
+            admitted,
+            "bash",
+            &turn,
+        ));
+        drop(recompute_guard);
+        assert!(resolution.await);
+        assert_eq!(hold_now(), (ComposerHold::Clear, None));
+        assert!(turnkey::PaneEnds::pin(
+            &mut inner.turn_ends.lock().expect("turn ends lock"),
+            &pane(),
+            admitted,
+            "bash",
+            &turnkey::TurnKey::for_test(&["next"]),
+        ));
 
         // The race this exists for: a person types between the proof and
         // the write, a recompute records the text, and nobody owns it.
@@ -6329,14 +6993,15 @@ contains = ["working"]
     }
 
     #[test]
-    fn disagreement_takes_higher_priority_and_keeps_both_readings() {
+    fn a_title_idle_never_outranks_a_non_idle_screen_rule() {
         let m = manifest();
         let t = title_winner(&m, "IDLE ready");
         let s = screen_winner(&m, "FIXPROMPT ");
-        let d = fuse(&m, t, s, 1);
-        assert_eq!(d.state, AgentState::Idle);
-        assert_eq!(d.decided_by, "title_idle");
+        let d = fuse(&m, t, s, true, false, 1);
+        assert_eq!(d.state, AgentState::Working);
+        assert_eq!(d.decided_by, "screen_busy");
         assert!(d.disagreement);
+        assert!(!d.write_ready);
         assert_eq!(d.readings.len(), 2);
         assert_eq!(d.readings[0].sensor, Sensor::Title);
         assert_eq!(d.readings[0].rule, "title_idle");
@@ -6345,10 +7010,34 @@ contains = ["working"]
     }
 
     #[test]
+    fn current_screen_evidence_survives_repeated_title_observations() {
+        let m = current_tiers_manifest();
+        assert!(manifest_uses_screen_tier(&m));
+
+        let idle_title = title_winner(&m, "IDLE ready");
+        let working_screen = screen_winner(&m, "ACTIVE");
+        for observed_at in [10, 11, 12] {
+            let detection = fuse(&m, idle_title, working_screen, true, false, observed_at);
+            assert_eq!(detection.state, AgentState::Working);
+            assert_eq!(detection.decided_by, "screen_working");
+            assert!(detection.disagreement);
+            assert!(!detection.write_ready);
+        }
+
+        let working_title = title_winner(&m, "WORKING now");
+        let modal_screen = screen_winner(&m, "PERMISSION required");
+        let blocked = fuse(&m, working_title, modal_screen, true, false, 13);
+        assert_eq!(blocked.state, AgentState::BlockedModal);
+        assert_eq!(blocked.decided_by, "screen_modal");
+        assert!(blocked.disagreement);
+        assert!(!blocked.write_ready);
+    }
+
+    #[test]
     fn single_tier_is_no_disagreement() {
         let m = manifest();
         let s = screen_winner(&m, "FIXPROMPT ");
-        let d = fuse(&m, None, s, 1);
+        let d = fuse(&m, None, s, true, false, 1);
         assert_eq!(d.state, AgentState::Working);
         assert_eq!(d.decided_by, "screen_busy");
         assert!(!d.disagreement);
@@ -6358,10 +7047,911 @@ contains = ["working"]
     #[test]
     fn no_rule_is_unknown() {
         let m = manifest();
-        let d = fuse(&m, None, None, 1);
+        let d = fuse(&m, None, None, true, false, 1);
         assert_eq!(d.state, AgentState::Unknown);
         assert_eq!(d.decided_by, "no_rule");
         assert!(d.readings.is_empty());
+    }
+    /// MEASURED 2026-08-26 on a live Claude Code pane: the idle sparkle title
+    /// stays in place for the whole turn, so a capture that lacks a matching
+    /// spinner row used to publish `idle` from the title alone; 1203 such
+    /// flaps in six hours, and 25 doorbell writes admitted into a working
+    /// pane behind them. An observed screen with nothing idle-shaped is not
+    /// idle evidence.
+    #[test]
+    fn a_title_idle_with_no_screen_rule_is_unknown_not_idle() {
+        let m = manifest();
+        let t = title_winner(&m, "IDLE ready");
+        assert!(t.is_some());
+        let d = fuse(&m, t, None, true, false, 1);
+        assert_eq!(d.state, AgentState::Unknown);
+        assert_eq!(d.decided_by, "idle_unconfirmed");
+        assert!(!d.write_ready);
+        assert!(!d.disagreement);
+        assert_eq!(d.readings.len(), 1);
+        assert_eq!(d.readings[0].sensor, Sensor::Title);
+    }
+    /// A screen tier that only knows working or blocked states cannot
+    /// confirm idle, so a screen-tier manifest never publishes idle from
+    /// its title alone: the pane is unknown until a lifecycle-evidence idle
+    /// screen rule matches, which is the fail-closed direction.
+    #[test]
+    fn a_screen_tier_manifest_without_a_confirmed_idle_never_reads_idle() {
+        let m = manifest();
+        assert!(manifest_uses_screen_tier(&m));
+        assert!(!winner_confirms_idle(screen_winner(&m, "nothing here")));
+        let t = title_winner(&m, "IDLE ready");
+        assert!(t.is_some());
+        let d = fuse(&m, t, None, manifest_uses_screen_tier(&m), false, 1);
+        assert_eq!(d.state, AgentState::Unknown);
+        assert_eq!(d.decided_by, "idle_unconfirmed");
+        assert!(!d.write_ready);
+    }
+    /// An idle title agreeing with a lifecycle-evidence idle screen rule
+    /// keeps deciding, with the screen rule's composer semantic riding
+    /// along; the same manifest with nothing idle-shaped on screen no
+    /// longer lets the title decide.
+    #[test]
+    fn a_title_idle_confirmed_by_an_idle_screen_rule_still_decides() {
+        let m = Manifest::parse(
+            TITLE_AND_COMPOSER_FIXTURE,
+            Path::new("title-and-composer.toml"),
+        )
+        .unwrap();
+        assert!(winner_confirms_idle(screen_winner(&m, "$ ")));
+        assert!(!winner_confirms_idle(screen_winner(&m, "FIXPROMPT ")));
+        let t = title_winner(&m, "IDLE ready");
+        let s = screen_winner(&m, "$ ");
+        assert_eq!(s.map(|r| r.id.as_str()), Some("composer_empty"));
+        let d = fuse(&m, t, s, true, true, 1);
+        assert_eq!(d.state, AgentState::Idle);
+        assert_eq!(d.decided_by, "title_idle");
+        assert!(!d.disagreement);
+        assert_eq!(d.composer_semantic, Some(ComposerSemantic::Clean));
+        let unconfirmed = fuse(&m, t, None, true, false, 1);
+        assert_eq!(unconfirmed.state, AgentState::Unknown);
+        assert_eq!(unconfirmed.decided_by, "idle_unconfirmed");
+    }
+    /// A composer row measured mid-turn keeps its semantic but cannot
+    /// confirm idle once the manifest marks it `lifecycle_evidence = false`.
+    #[test]
+    fn a_mid_turn_composer_row_carries_its_semantic_but_never_confirms_idle() {
+        let m = Manifest::parse(
+            &TITLE_AND_COMPOSER_FIXTURE.replace(
+                "composer_semantic = \"clean\"\npriority = 900",
+                "composer_semantic = \"clean\"\npriority = 900\nlifecycle_evidence = false",
+            ),
+            Path::new("mid-turn-composer.toml"),
+        )
+        .unwrap();
+        let confirmed = winner_confirms_idle(screen_winner(&m, "$ "));
+        assert!(!confirmed);
+        let t = title_winner(&m, "IDLE ready");
+        let s = screen_winner(&m, "$ ");
+        assert_eq!(s.map(|r| r.id.as_str()), Some("composer_empty"));
+        let d = fuse(&m, t, s, true, confirmed, 1);
+        assert_eq!(d.state, AgentState::Unknown);
+        assert_eq!(d.decided_by, "idle_unconfirmed");
+        assert_eq!(d.composer_semantic, Some(ComposerSemantic::Clean));
+        assert!(!d.write_ready);
+    }
+    trait WithState {
+        fn with_state(self, state: AgentState) -> Self;
+    }
+    impl WithState for SensorReading {
+        fn with_state(mut self, state: AgentState) -> Self {
+            self.state = state;
+            self
+        }
+    }
+    fn working_reading(ts: u64) -> SensorReading {
+        SensorReading {
+            sensor: Sensor::Hook,
+            state: AgentState::Working,
+            rule: "UserPromptSubmit".into(),
+            ts,
+        }
+    }
+    fn visual(state: AgentState, stale: bool) -> Detection {
+        Detection {
+            state,
+            readings: Vec::new(),
+            disagreement: false,
+            decided_by: "screen".into(),
+            stale,
+            write_ready: false,
+            write_block: None,
+            composer_semantic: None,
+        }
+    }
+    /// A visually accepted provisional dispatch start keeps its original edge
+    /// and binding when it becomes persistent, and stops being provisional.
+    #[test]
+    fn a_promoted_provisional_start_keeps_its_edge_and_binding() {
+        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
+        let provisional =
+            HookEntry::provisional_start(agent, Some("fix".into()), working_reading(1000));
+        assert!(provisional.provisional_start_for(agent, Some("fix")));
+        let promoted = provisional.promote();
+        assert!(promoted.confirmed_unkeyed_start_for(agent, Some("fix")));
+        assert!(!promoted.provisional_start_for(agent, Some("fix")));
+        assert_eq!(promoted.reading.ts, 1000);
+        assert_eq!(promoted.reading.state, AgentState::Working);
+        assert!(promoted.provisional_ready_at_ms.is_none());
+        assert!(promoted.describes(Some(agent), Some("fix")));
+        let other = crate::identity::ProcId { pid: 8, birth: 80 };
+        assert!(!promoted.describes(Some(other), Some("fix")));
+    }
+    /// MEASURED 2026-08-26: the provisional start was removed on the first
+    /// Working frame and the next idle-shaped frame won. A persistent start
+    /// holds over every unconfirmed idle frame, over stale, in-mode, and
+    /// binding-changed captures, and over working frames; one conclusive
+    /// lifecycle-evidence idle winner on an idle-class fused frame with
+    /// stable bookends ends it.
+    #[test]
+    fn a_persistent_unkeyed_start_ends_on_one_conclusive_terminal_frame() {
+        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
+        let mut entry =
+            HookEntry::provisional_start(agent, Some("fix".into()), working_reading(1000))
+                .promote();
+        let idle = visual(AgentState::Idle, false);
+        for ts in 0..20 {
+            assert_eq!(
+                hook_action_observed(&mut entry, &idle, false, false, true, 2000 + ts),
+                HookAction::Use,
+                "unconfirmed idle frame {ts} must never end the latch"
+            );
+        }
+        let working = visual(AgentState::Working, false);
+        assert_eq!(
+            hook_action_observed(&mut entry, &working, false, false, true, 2100),
+            HookAction::Use
+        );
+        let stale_idle = visual(AgentState::Idle, true);
+        assert_eq!(
+            hook_action_observed(&mut entry, &stale_idle, true, false, true, 2101),
+            HookAction::Use
+        );
+        assert_eq!(
+            hook_action_observed(&mut entry, &idle, true, true, true, 2102),
+            HookAction::Use
+        );
+        assert_eq!(
+            hook_action_observed(&mut entry, &idle, true, false, false, 2103),
+            HookAction::Use
+        );
+        assert_eq!(
+            hook_action_observed(&mut entry, &idle, true, false, true, 2104),
+            HookAction::Drop
+        );
+    }
+    /// Repeated generic `composer_empty` (lifecycle_evidence = false) or title
+    /// idle frames fuse to unknown and never end the latch, however many.
+    #[test]
+    fn repeated_generic_composer_or_title_idle_never_ends_the_latch() {
+        let m = Manifest::parse(
+            &TITLE_AND_COMPOSER_FIXTURE.replace(
+                "composer_semantic = \"clean\"\npriority = 900",
+                "composer_semantic = \"clean\"\npriority = 900\nlifecycle_evidence = false",
+            ),
+            Path::new("generic-idle.toml"),
+        )
+        .unwrap();
+        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
+        let mut entry = HookEntry::provisional_start(
+            agent,
+            Some("bash-composer".into()),
+            working_reading(1000),
+        )
+        .promote();
+        let t = title_winner(&m, "IDLE ready");
+        let s = screen_winner(&m, "$ ");
+        assert_eq!(s.map(|r| r.id.as_str()), Some("composer_empty"));
+        let confirmed = winner_confirms_idle(s);
+        assert!(!confirmed);
+        for ts in 0..20 {
+            let fused = fuse(&m, t, s, true, confirmed, 1);
+            assert_eq!(fused.state, AgentState::Unknown);
+            assert_eq!(
+                hook_action_observed(&mut entry, &fused, confirmed, false, true, 2000 + ts),
+                HookAction::Use
+            );
+        }
+        let title_only = fuse(&m, t, None, true, false, 1);
+        assert_eq!(title_only.state, AgentState::Unknown);
+        assert_eq!(
+            hook_action_observed(&mut entry, &title_only, false, false, true, 3000),
+            HookAction::Use
+        );
+    }
+    const CATCH_ALL_LIFECYCLE_FIXTURE: &str = r#"
+[agent]
+id = "catch-all"
+display_name = "Catch-all lifecycle fixture"
+process_names = ["fixture"]
+
+[[rule]]
+id = "screen_modal"
+state = "blocked_modal"
+priority = 1200
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^PERMISSION']
+
+[[rule]]
+id = "screen_working"
+state = "working"
+priority = 1100
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^ACTIVE']
+
+[[rule]]
+id = "composer_typed"
+state = "idle_with_input"
+composer_semantic = "human_input"
+priority = 1000
+lifecycle_evidence = false
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^> \S']
+
+[[rule]]
+id = "always_idle"
+state = "idle"
+priority = 70
+lifecycle_evidence = true
+region = "bottom_non_empty_lines(3)"
+regex = ['^']
+"#;
+    /// MUTATION: a low-priority catch-all lifecycle idle rule (`^`) matches
+    /// underneath every higher-priority winner. Only the selected winner may
+    /// certify idle, and the latch also needs the fused state to be
+    /// idle-class, so repeated working, typed-input, and blocked frames keep
+    /// the persistent start; only the catch-all winning twice ends it.
+    #[test]
+    fn a_catch_all_lifecycle_idle_rule_never_ends_a_latch_underneath_a_winner() {
+        let m = Manifest::parse(CATCH_ALL_LIFECYCLE_FIXTURE, Path::new("catch-all.toml")).unwrap();
+        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
+        let mut entry =
+            HookEntry::provisional_start(agent, Some("catch-all".into()), working_reading(1000))
+                .promote();
+        let frames = [
+            ("ACTIVE", "screen_working", AgentState::Working),
+            ("> draft", "composer_typed", AgentState::Unknown),
+            (
+                "PERMISSION required",
+                "screen_modal",
+                AgentState::BlockedModal,
+            ),
+        ];
+        for (capture, rule, state) in frames {
+            let winner = screen_winner(&m, capture);
+            assert_eq!(winner.map(|r| r.id.as_str()), Some(rule));
+            assert!(
+                !winner_confirms_idle(winner),
+                "{rule} must not certify idle"
+            );
+            let fused = fuse(&m, None, winner, true, winner_confirms_idle(winner), 1);
+            assert_eq!(fused.state, state);
+            for ts in 0..4 {
+                assert_eq!(
+                    hook_action_observed(
+                        &mut entry,
+                        &fused,
+                        winner_confirms_idle(winner),
+                        false,
+                        true,
+                        2000 + ts
+                    ),
+                    HookAction::Use,
+                    "{rule} frame {ts} must retain the latch"
+                );
+            }
+        }
+        let winner = screen_winner(&m, "plain shell output");
+        assert_eq!(winner.map(|r| r.id.as_str()), Some("always_idle"));
+        assert!(winner_confirms_idle(winner));
+        let fused = fuse(&m, None, winner, true, true, 1);
+        assert_eq!(fused.state, AgentState::Idle);
+        assert_eq!(
+            hook_action_observed(&mut entry, &fused, true, false, true, 3000),
+            HookAction::Drop
+        );
+    }
+    /// The latch also refuses a certified-idle flag whose fused state is not
+    /// idle-class, which is the shape a stale or hook-overridden frame takes.
+    #[test]
+    fn a_latch_needs_the_fused_state_idle_as_well_as_the_winning_evidence() {
+        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
+        let mut entry =
+            HookEntry::provisional_start(agent, Some("fix".into()), working_reading(1000))
+                .promote();
+        let working = visual(AgentState::Working, false);
+        for ts in 0..4 {
+            assert_eq!(
+                hook_action_observed(&mut entry, &working, true, false, true, 2000 + ts),
+                HookAction::Use
+            );
+        }
+    }
+    /// A confirmed exact end ends a persistent unkeyed start only on the same
+    /// binding and only when it comes strictly after the stored start edge.
+    #[test]
+    fn an_exact_end_ends_an_unkeyed_latch_only_when_later_on_the_same_binding() {
+        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
+        let entry = HookEntry::provisional_start(agent, Some("fix".into()), working_reading(1000))
+            .promote();
+        assert!(
+            !entry.unkeyed_latch_ended_by(agent, Some("fix"), 999),
+            "stale end"
+        );
+        assert!(
+            !entry.unkeyed_latch_ended_by(agent, Some("fix"), 1000),
+            "same instant"
+        );
+        assert!(
+            entry.unkeyed_latch_ended_by(agent, Some("fix"), 1001),
+            "later end"
+        );
+        let other = crate::identity::ProcId { pid: 8, birth: 80 };
+        assert!(
+            !entry.unkeyed_latch_ended_by(other, Some("fix"), 1001),
+            "other generation"
+        );
+        assert!(
+            !entry.unkeyed_latch_ended_by(agent, Some("other"), 1001),
+            "other manifest"
+        );
+        let provisional =
+            HookEntry::provisional_start(agent, Some("fix".into()), working_reading(1000));
+        assert!(
+            !provisional.unkeyed_latch_ended_by(agent, Some("fix"), 1001),
+            "not yet promoted"
+        );
+    }
+    fn staged_entry(
+        state: AgentState,
+        semantic: Option<ComposerSemantic>,
+        readings: Vec<SensorReading>,
+        stale: bool,
+        in_mode: bool,
+        owner: &str,
+    ) -> DetEntry {
+        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
+        DetEntry {
+            detection: Detection {
+                state,
+                readings,
+                disagreement: false,
+                decided_by: "test".into(),
+                stale,
+                write_ready: false,
+                write_block: None,
+                composer_semantic: semantic,
+            },
+            binding: None,
+            manifest: Some("fix".into()),
+            occupant: Some(4242),
+            agent: Some(agent),
+            turn: None,
+            in_mode,
+            quota_screen_clear: false,
+            hold: ComposerHold::Staged,
+            hold_owner: Some(owner.to_string()),
+            composer: ComposerProjection::default(),
+            working_confirmed: false,
+            since: std::time::Instant::now(),
+        }
+    }
+    fn screen_reading(state: AgentState) -> SensorReading {
+        SensorReading {
+            sensor: Sensor::Screen,
+            state,
+            rule: "screen".into(),
+            ts: 1,
+        }
+    }
+    /// A staged row is not lifecycle evidence, so a pane holding our exact
+    /// doorbell fuses to `unknown`; the owner's own action on it is admitted
+    /// only when that unknown is the honest reading of a staged human-input
+    /// row on a quiet, fresh, out-of-mode frame with the exact owner.
+    #[test]
+    fn an_unknown_staged_frame_admits_only_the_exact_owner_on_a_quiet_frame() {
+        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
+        let quiet = || vec![screen_reading(AgentState::IdleWithInput)];
+        let ok = staged_entry(
+            AgentState::Unknown,
+            Some(ComposerSemantic::HumanInput),
+            quiet(),
+            false,
+            false,
+            "att-1",
+        );
+        assert!(
+            staged_entry_ready(&ok, "att-1", agent, "fix"),
+            "exact end then unknown plus exact proof clears once"
+        );
+        assert!(staged_hold_ready(&ok));
+        // exact end then unknown: a retained idle hook reading is still quiet
+        let ended = staged_entry(
+            AgentState::Unknown,
+            Some(ComposerSemantic::HumanInput),
+            vec![
+                screen_reading(AgentState::IdleWithInput),
+                working_reading(1).with_state(AgentState::Idle),
+            ],
+            false,
+            false,
+            "att-1",
+        );
+        assert!(staged_entry_ready(&ended, "att-1", agent, "fix"));
+        // active start plus exact doorbell refuses
+        let active = staged_entry(
+            AgentState::Working,
+            Some(ComposerSemantic::HumanInput),
+            vec![
+                screen_reading(AgentState::IdleWithInput),
+                working_reading(1),
+            ],
+            false,
+            false,
+            "att-1",
+        );
+        assert!(
+            !staged_entry_ready(&active, "att-1", agent, "fix"),
+            "active start refuses"
+        );
+        // unknown with no readings refuses
+        let empty = staged_entry(
+            AgentState::Unknown,
+            Some(ComposerSemantic::HumanInput),
+            vec![],
+            false,
+            false,
+            "att-1",
+        );
+        assert!(
+            !staged_entry_ready(&empty, "att-1", agent, "fix"),
+            "no readings refuses"
+        );
+        // ghost refuses
+        let ghost = staged_entry(
+            AgentState::Unknown,
+            Some(ComposerSemantic::GhostSuggestion),
+            quiet(),
+            false,
+            false,
+            "att-1",
+        );
+        assert!(
+            !staged_entry_ready(&ghost, "att-1", agent, "fix"),
+            "ghost refuses"
+        );
+        // bare prompt (clean) is not a staged row either
+        let bare = staged_entry(
+            AgentState::Unknown,
+            Some(ComposerSemantic::Clean),
+            quiet(),
+            false,
+            false,
+            "att-1",
+        );
+        assert!(
+            !staged_entry_ready(&bare, "att-1", agent, "fix"),
+            "bare prompt refuses"
+        );
+        // blocked refuses
+        let blocked = staged_entry(
+            AgentState::BlockedModal,
+            Some(ComposerSemantic::HumanInput),
+            vec![screen_reading(AgentState::BlockedModal)],
+            false,
+            false,
+            "att-1",
+        );
+        assert!(
+            !staged_entry_ready(&blocked, "att-1", agent, "fix"),
+            "blocked refuses"
+        );
+        // stale refuses
+        let stale = staged_entry(
+            AgentState::Unknown,
+            Some(ComposerSemantic::HumanInput),
+            quiet(),
+            true,
+            false,
+            "att-1",
+        );
+        assert!(
+            !staged_entry_ready(&stale, "att-1", agent, "fix"),
+            "stale refuses"
+        );
+        // mode refuses
+        let in_mode = staged_entry(
+            AgentState::Unknown,
+            Some(ComposerSemantic::HumanInput),
+            quiet(),
+            false,
+            true,
+            "att-1",
+        );
+        assert!(
+            !staged_entry_ready(&in_mode, "att-1", agent, "fix"),
+            "mode refuses"
+        );
+        // wrong owner, generation, or manifest refuses
+        assert!(
+            !staged_entry_ready(&ok, "att-2", agent, "fix"),
+            "wrong owner refuses"
+        );
+        let other = crate::identity::ProcId { pid: 8, birth: 80 };
+        assert!(
+            !staged_entry_ready(&ok, "att-1", other, "fix"),
+            "wrong generation refuses"
+        );
+        assert!(
+            !staged_entry_ready(&ok, "att-1", agent, "other"),
+            "wrong manifest refuses"
+        );
+        // extra text is refused by the callers' exact byte proof; this seam
+        // never sees bytes, so an idle-class frame stays admitted here.
+        let idle_with_input = staged_entry(
+            AgentState::IdleWithInput,
+            Some(ComposerSemantic::HumanInput),
+            quiet(),
+            false,
+            false,
+            "att-1",
+        );
+        assert!(staged_entry_ready(&idle_with_input, "att-1", agent, "fix"));
+    }
+    /// Ordinary idle composer frames never end an authenticated confirmed
+    /// start. One manifest-declared terminal winner may do so.
+    #[test]
+    fn a_confirmed_start_ignores_generic_idle_and_accepts_one_screen_terminal() {
+        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
+        let mut entry =
+            HookEntry::unkeyed_turn_started(agent, Some("fix".into()), working_reading(1000));
+        assert!(entry.confirmed_unkeyed_start_for(agent, Some("fix")));
+        let idle = visual(AgentState::Idle, false);
+        for ts in 0..6 {
+            assert_eq!(
+                hook_action_observed(&mut entry, &idle, false, false, true, 2000 + ts),
+                HookAction::Use,
+                "generic idle frame {ts}"
+            );
+        }
+        assert!(
+            matches!(
+                hook_action_observed_with_terminal(
+                    &mut entry, &idle, true, true, false, true, 3000,
+                ),
+                HookAction::Drop
+            ),
+            "the measured screen terminal ends it"
+        );
+    }
+    const SHIPPED_CLAUDE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../resources/manifests/claude.toml"
+    ));
+    /// The named sequence for a fresh Claude pane: unknown before its first
+    /// authenticated edge (SessionStart), idle once liveness is verified and
+    /// no start is active, Working immediately after UserPromptSubmit, and
+    /// never admitted while any start is active.
+    #[test]
+    fn a_fresh_claude_pane_is_unknown_until_session_start_then_idle_and_never_while_a_start_is_active(
+    ) {
+        let m = Manifest::parse(SHIPPED_CLAUDE, Path::new("claude.toml")).unwrap();
+        let rule_120 = "─".repeat(120);
+        let plain = [
+            rule_120.as_str(),
+            "❯",
+            rule_120.as_str(),
+            "  ⏵⏵ don't ask on (shift+tab to cycle)",
+        ]
+        .join("\n");
+        let styled_rule = format!("\u{1b}[38;5;244m{rule_120}");
+        let esc = [
+            styled_rule.as_str(),
+            "\u{1b}[39m❯",
+            styled_rule.as_str(),
+            "\u{1b}[39m  \u{1b}[38;5;210m⏵⏵ don't ask on\u{1b}[38;5;246m (shift+tab to cycle)\u{1b}[39m",
+        ]
+        .join("\n");
+        let s = screen_winner_esc(&m, &plain, Some(&esc));
+        assert_eq!(s.map(|r| r.id.as_str()), Some("composer_empty"));
+        assert!(
+            !winner_confirms_idle(s),
+            "composer_empty is measured mid-turn"
+        );
+        let t = title_winner(&m, "✳ Fresh pane");
+        let fused = fuse(&m, t, s, true, false, 1);
+        assert_eq!(fused.state, AgentState::Unknown);
+        assert_eq!(fused.decided_by, "idle_unconfirmed");
+        assert_eq!(fused.composer_semantic, Some(ComposerSemantic::Clean));
+        let has_screen = fused.readings.iter().any(|r| r.sensor == Sensor::Screen);
+        assert!(has_screen);
+        let admits = |verified: bool, active: bool, stale: bool, in_mode: bool, stable: bool| {
+            liveness_admits_idle(
+                fused.state,
+                &fused.decided_by,
+                s,
+                has_screen,
+                verified,
+                active,
+                stale,
+                in_mode,
+                stable,
+            )
+        };
+        // Liveness is exact-binding and event-specific: telemetry and attention
+        // edges leave the pane unknown, SessionStart admits it, and a later
+        // generation on the same pane starts unknown again.
+        let liveness = crate::selftest::HookLiveness::new();
+        let pane = PaneKey::new(0, "%9");
+        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
+        liveness.open(&pane);
+        assert!(
+            !liveness.seen_admitting_edge(&pane, agent, "claude"),
+            "no edge yet"
+        );
+        for (ts, event) in [
+            (10, "Notification"),
+            (11, "Stop"),
+            (12, "StopFailure"),
+            (13, "PermissionRequest"),
+        ] {
+            let _ = liveness.bind_diagnostic(&pane, event, ts, agent, "claude");
+            let bound = liveness
+                .bind_diagnostic(&pane, event, ts, agent, "claude")
+                .expect("route open");
+            liveness
+                .publish_admission(&bound, event)
+                .expect("lifetime live");
+            assert!(
+                liveness.seen_any(&pane, agent, "claude"),
+                "{event} proves wiring"
+            );
+            assert!(
+                !liveness.seen_admitting_edge(&pane, agent, "claude"),
+                "{event} must leave the pane unknown"
+            );
+            assert!(!admits(
+                liveness.seen_admitting_edge(&pane, agent, "claude"),
+                false,
+                false,
+                false,
+                true
+            ));
+        }
+        // The diagnostic record alone never admits, even for SessionStart:
+        // only the separately published admitting edge does.
+        let _ = liveness.bind_diagnostic(&pane, "SessionStart", 14, agent, "claude");
+        assert!(
+            !liveness.seen_admitting_edge(&pane, agent, "claude"),
+            "diagnostic record is not admission"
+        );
+        let bound = liveness
+            .bind_diagnostic(&pane, "SessionStart", 15, agent, "claude")
+            .expect("route open");
+        liveness
+            .publish_admission(&bound, "SessionStart")
+            .expect("lifetime live");
+        assert!(
+            liveness.seen_admitting_edge(&pane, agent, "claude"),
+            "SessionStart admits"
+        );
+        assert!(admits(
+            liveness.seen_admitting_edge(&pane, agent, "claude"),
+            false,
+            false,
+            false,
+            true
+        ));
+        let other = crate::identity::ProcId { pid: 8, birth: 80 };
+        assert!(
+            !liveness.seen_admitting_edge(&pane, other, "claude"),
+            "another generation begins unknown"
+        );
+        let prompt_first = PaneKey::new(0, "%10");
+        liveness.open(&prompt_first);
+        let bound = liveness
+            .bind_diagnostic(&prompt_first, "UserPromptSubmit", 20, agent, "claude")
+            .expect("route open");
+        liveness
+            .publish_admission(&bound, "UserPromptSubmit")
+            .expect("lifetime live");
+        assert!(
+            liveness.seen_admitting_edge(&prompt_first, agent, "claude"),
+            "UserPromptSubmit qualifies"
+        );
+        // A closed pane forgets its admitting edges with its lifetime.
+        liveness.close(&prompt_first);
+        liveness.open(&prompt_first);
+        assert!(
+            !liveness.seen_admitting_edge(&prompt_first, agent, "claude"),
+            "a new lifetime begins unknown"
+        );
+        assert!(
+            !admits(false, false, false, false, true),
+            "before any admitting edge"
+        );
+        assert!(
+            admits(true, false, false, false, true),
+            "after SessionStart"
+        );
+        let mut admitted = fused.clone();
+        admitted.state = AgentState::Idle;
+        admitted.decided_by = "liveness:composer_empty".into();
+        let stamped = admitted.clone().stamped(false, ComposerHold::Clear);
+        assert!(stamped.write_ready, "{stamped:?}");
+        let mut working = admitted.clone();
+        apply_hook_reading(&mut working, working_reading(2), true, false);
+        assert_eq!(
+            working.state,
+            AgentState::Working,
+            "immediately after UserPromptSubmit"
+        );
+        assert!(
+            !admits(true, true, false, false, true),
+            "never while a start is active"
+        );
+        assert!(!admits(true, false, true, false, true), "stale");
+        assert!(!admits(true, false, false, true, true), "in mode");
+        assert!(!admits(true, false, false, false, false), "binding changed");
+        assert!(
+            !liveness_admits_idle(
+                fused.state,
+                &fused.decided_by,
+                s,
+                false,
+                true,
+                false,
+                false,
+                false,
+                true
+            ),
+            "no screen reading"
+        );
+        for id in ["composer_ghost_suggestion", "composer_has_staged_input"] {
+            let rule = m.rules.iter().find(|r| r.id == id);
+            assert!(rule.is_some(), "{id}");
+            assert!(
+                !liveness_admits_idle(
+                    fused.state,
+                    &fused.decided_by,
+                    rule,
+                    has_screen,
+                    true,
+                    false,
+                    false,
+                    false,
+                    true
+                ),
+                "{id} never admits"
+            );
+        }
+        assert!(
+            !liveness_admits_idle(
+                AgentState::Idle,
+                "composer_completed_terminal_suffix_2_1_246",
+                s,
+                has_screen,
+                true,
+                false,
+                false,
+                false,
+                true
+            ),
+            "a lifecycle terminal frame needs no admission"
+        );
+    }
+    /// Contract regressions for the bound hook handshake: a report before the
+    /// route is open records nothing and is retryable; the retry after open
+    /// publishes one diagnostic edge and one admission edge; a close and
+    /// reopen between the diagnostic binding and the publication refuses the
+    /// old lifetime, and the replacement inherits nothing.
+    #[test]
+    fn a_bound_handshake_records_nothing_before_open_and_refuses_an_expired_lifetime() {
+        use crate::selftest::{HookLiveness, LifetimeExpired, RouteNotOpen};
+        let liveness = HookLiveness::new();
+        let pane = PaneKey::new(0, "%11");
+        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
+        // before route open: retryable, nothing recorded
+        assert_eq!(
+            liveness.bind_diagnostic(&pane, "SessionStart", 1, agent, "claude"),
+            Err(RouteNotOpen)
+        );
+        assert!(!liveness.seen_any(&pane, agent, "claude"));
+        assert!(!liveness.seen_admitting_edge(&pane, agent, "claude"));
+        // retry after open with the same payload: one diagnostic, one admission
+        liveness.open(&pane);
+        let bound = liveness
+            .bind_diagnostic(&pane, "SessionStart", 1, agent, "claude")
+            .expect("route open");
+        assert!(liveness.seen_any(&pane, agent, "claude"));
+        assert!(
+            !liveness.seen_admitting_edge(&pane, agent, "claude"),
+            "not yet published"
+        );
+        assert_eq!(liveness.publish_admission(&bound, "SessionStart"), Ok(()));
+        assert!(liveness.seen_admitting_edge(&pane, agent, "claude"));
+        assert_eq!(liveness.edge_counts(&bound), (1, 1));
+        // a duplicate publication of the same edge is idempotent, and a lost
+        // response followed by the same sequence rebinds the same binding
+        // and republishes without a second edge of either kind
+        assert_eq!(liveness.publish_admission(&bound, "SessionStart"), Ok(()));
+        assert!(liveness.seen_admitting_edge(&pane, agent, "claude"));
+        let rebound = liveness
+            .bind_diagnostic(&pane, "SessionStart", 1, agent, "claude")
+            .expect("route still open");
+        assert_eq!(rebound, bound);
+        assert_eq!(liveness.publish_admission(&rebound, "SessionStart"), Ok(()));
+        assert_eq!(liveness.edge_counts(&bound), (1, 1));
+        // close and reopen between binding and publication: refused, and the
+        // replacement lifetime inherits nothing
+        let pane2 = PaneKey::new(0, "%12");
+        liveness.open(&pane2);
+        let stale = liveness
+            .bind_diagnostic(&pane2, "SessionStart", 2, agent, "claude")
+            .expect("route open");
+        liveness.close(&pane2);
+        liveness.open(&pane2);
+        assert_eq!(
+            liveness.publish_admission(&stale, "SessionStart"),
+            Err(LifetimeExpired)
+        );
+        assert!(!liveness.seen_admitting_edge(&pane2, agent, "claude"));
+        // non-admitting events are a no-op even with a live binding
+        let bound = liveness
+            .bind_diagnostic(&pane2, "Stop", 3, agent, "claude")
+            .expect("route open");
+        assert_eq!(liveness.publish_admission(&bound, "Stop"), Ok(()));
+        assert!(!liveness.seen_admitting_edge(&pane2, agent, "claude"));
+    }
+    /// Hook-only readings never make a staged frame quiet, whatever they say.
+    #[test]
+    fn a_staged_frame_needs_a_current_screen_reading() {
+        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
+        let hook_only = staged_entry(
+            AgentState::Unknown,
+            Some(ComposerSemantic::HumanInput),
+            vec![working_reading(1).with_state(AgentState::Idle)],
+            false,
+            false,
+            "att-1",
+        );
+        assert!(!staged_entry_ready(&hook_only, "att-1", agent, "fix"));
+        assert!(!staged_hold_ready(&hook_only));
+    }
+    /// Stable screen bookends are not terminal by themselves. A keyed start
+    /// still accepts an explicitly lifecycle-capable terminal winner.
+    #[test]
+    fn a_keyed_start_needs_more_than_bookends_before_a_screen_terminal() {
+        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
+        let turn = turnkey::TurnKey::for_test(&["s", "t"]);
+        let mut entry =
+            HookEntry::turn_started(agent, Some("fix".into()), working_reading(1000), turn);
+        let idle = visual(AgentState::Idle, false);
+        for _ in 0..3 {
+            assert_eq!(
+                hook_action_observed(&mut entry, &idle, false, false, true, 2000),
+                HookAction::Use
+            );
+        }
+        assert_eq!(
+            hook_action_observed_with_terminal(&mut entry, &idle, true, true, false, true, 2001,),
+            HookAction::Drop
+        );
+    }
+    /// A manifest that never captures the screen still decides by title.
+    #[test]
+    fn a_title_idle_alone_still_decides_when_no_screen_was_observed() {
+        let m = manifest();
+        let t = title_winner(&m, "IDLE ready");
+        let d = fuse(&m, t, None, false, false, 1);
+        assert_eq!(d.state, AgentState::Idle);
+        assert_eq!(d.decided_by, "title_idle");
+        assert!(!d.disagreement);
     }
 
     fn composer_candidate(
@@ -6395,7 +7985,9 @@ contains = ["working"]
             transport: NotificationTransport::Doorbell,
             doorbell_format: Some(DOORBELL_FORMAT_COMPACT_CLAIM),
             cause: None,
+            verify_outcome: None,
             pre_write_cause: None,
+            wake_block: None,
             pre_write_observation: None,
             pre_write_reopen_count: 0,
             started_seq: 2,
@@ -6984,11 +8576,25 @@ contains = ["working"]
     fn hook_reading_ages_out_on_ttl() {
         let mut e = entry(AgentState::Working, 1_000);
         assert_eq!(
-            hook_action(&mut e, AgentState::Unknown, 1_000 + HOOK_READING_TTL_MS),
+            hook_action_observed(
+                &mut e,
+                &lifecycle_detection(Sensor::Screen, AgentState::Unknown),
+                false,
+                false,
+                true,
+                1_000 + HOOK_READING_TTL_MS
+            ),
             HookAction::Use
         );
         assert_eq!(
-            hook_action(&mut e, AgentState::Unknown, 1_001 + HOOK_READING_TTL_MS),
+            hook_action_observed(
+                &mut e,
+                &lifecycle_detection(Sensor::Screen, AgentState::Unknown),
+                false,
+                false,
+                true,
+                1_001 + HOOK_READING_TTL_MS
+            ),
             HookAction::Drop
         );
     }
@@ -6999,21 +8605,49 @@ contains = ["working"]
         // Rules see nothing: no evidence against the hook.
         for _ in 0..10 {
             assert_eq!(
-                hook_action(&mut e, AgentState::Unknown, 2_000),
+                hook_action_observed(
+                    &mut e,
+                    &lifecycle_detection(Sensor::Screen, AgentState::Unknown),
+                    false,
+                    false,
+                    true,
+                    2_000
+                ),
                 HookAction::Use
             );
         }
         // Two contradictions survive, the third invalidates.
         assert_eq!(
-            hook_action(&mut e, AgentState::Idle, 2_000),
+            hook_action_observed(
+                &mut e,
+                &lifecycle_detection(Sensor::Screen, AgentState::Idle),
+                false,
+                false,
+                true,
+                2_000
+            ),
             HookAction::Use
         );
         assert_eq!(
-            hook_action(&mut e, AgentState::Idle, 2_000),
+            hook_action_observed(
+                &mut e,
+                &lifecycle_detection(Sensor::Screen, AgentState::Idle),
+                false,
+                false,
+                true,
+                2_000
+            ),
             HookAction::Use
         );
         assert_eq!(
-            hook_action(&mut e, AgentState::Idle, 2_000),
+            hook_action_observed(
+                &mut e,
+                &lifecycle_detection(Sensor::Screen, AgentState::Idle),
+                false,
+                false,
+                true,
+                2_000
+            ),
             HookAction::Drop
         );
     }
@@ -7022,20 +8656,48 @@ contains = ["working"]
     fn hook_agreement_resets_the_disagreement_streak() {
         let mut e = entry(AgentState::Working, 1_000);
         assert_eq!(
-            hook_action(&mut e, AgentState::Idle, 2_000),
+            hook_action_observed(
+                &mut e,
+                &lifecycle_detection(Sensor::Screen, AgentState::Idle),
+                false,
+                false,
+                true,
+                2_000
+            ),
             HookAction::Use
         );
         assert_eq!(
-            hook_action(&mut e, AgentState::Idle, 2_000),
+            hook_action_observed(
+                &mut e,
+                &lifecycle_detection(Sensor::Screen, AgentState::Idle),
+                false,
+                false,
+                true,
+                2_000
+            ),
             HookAction::Use
         );
         assert_eq!(
-            hook_action(&mut e, AgentState::Working, 2_000),
+            hook_action_observed(
+                &mut e,
+                &lifecycle_detection(Sensor::Screen, AgentState::Working),
+                false,
+                false,
+                true,
+                2_000
+            ),
             HookAction::Use
         );
         assert_eq!(e.disagreements, 0);
         assert_eq!(
-            hook_action(&mut e, AgentState::Idle, 2_000),
+            hook_action_observed(
+                &mut e,
+                &lifecycle_detection(Sensor::Screen, AgentState::Idle),
+                false,
+                false,
+                true,
+                2_000
+            ),
             HookAction::Use
         );
     }
@@ -7045,16 +8707,56 @@ contains = ["working"]
         let mut entry = start_entry(1_000);
         for round in 0..10 {
             assert_eq!(
-                hook_action(
+                hook_action_observed(
                     &mut entry,
-                    AgentState::Idle,
-                    1_001 + HOOK_READING_TTL_MS + round,
+                    &lifecycle_detection(Sensor::Screen, AgentState::Idle),
+                    false,
+                    false,
+                    true,
+                    1_001 + HOOK_READING_TTL_MS + round
                 ),
                 HookAction::Use,
                 "idle frame {round} discarded the active start"
             );
         }
         assert_eq!(entry.disagreements, 0);
+    }
+
+    #[test]
+    fn a_manifest_terminal_idle_may_end_an_exact_active_start() {
+        let mut entry = start_entry(1_000);
+        assert_eq!(
+            hook_action_observed_with_terminal(
+                &mut entry,
+                &lifecycle_detection(Sensor::Screen, AgentState::Idle),
+                true,
+                true,
+                false,
+                true,
+                1_001,
+            ),
+            HookAction::Drop
+        );
+
+        for (idle_confirmed, in_mode, binding_stable) in [
+            (false, false, true),
+            (true, true, true),
+            (true, false, false),
+        ] {
+            let mut entry = start_entry(1_000);
+            assert_eq!(
+                hook_action_observed_with_terminal(
+                    &mut entry,
+                    &lifecycle_detection(Sensor::Screen, AgentState::Idle),
+                    idle_confirmed,
+                    true,
+                    in_mode,
+                    binding_stable,
+                    1_001,
+                ),
+                HookAction::Use
+            );
+        }
     }
 
     #[test]
@@ -7131,6 +8833,36 @@ contains = ["working"]
     }
 
     #[test]
+    fn a_current_bound_start_and_agreeing_screen_stay_working() {
+        let agent = crate::identity::ProcId { pid: 1, birth: 1 };
+        for observed_at in [10, 11, 12] {
+            let mut detection = lifecycle_detection(Sensor::Screen, AgentState::Working);
+            detection.readings[0].ts = observed_at;
+            let start = HookEntry::unkeyed_turn_started(
+                agent,
+                Some("fixture".into()),
+                SensorReading {
+                    sensor: Sensor::Hook,
+                    state: AgentState::Working,
+                    rule: "PreInvocation".into(),
+                    ts: 3,
+                },
+            );
+            apply_hook_reading(
+                &mut detection,
+                start.reading,
+                start.active_start,
+                start.authoritative_end,
+            );
+            let detection = detection.stamped(false, ComposerHold::Clear);
+
+            assert_eq!(detection.state, AgentState::Working);
+            assert!(!detection.disagreement);
+            assert!(!detection.write_ready);
+        }
+    }
+
+    #[test]
     fn blocked_visuals_remain_authoritative_during_an_active_start() {
         let states = [
             AgentState::Unknown,
@@ -7175,9 +8907,9 @@ contains = ["working"]
     }
 
     #[test]
-    fn a_conclusive_end_overrides_stale_working_but_not_terminal_safety_state() {
+    fn a_conclusive_end_never_overwrites_current_working_or_safety_state() {
         for (visual, expected) in [
-            (AgentState::Working, AgentState::Idle),
+            (AgentState::Working, AgentState::Working),
             (AgentState::Unknown, AgentState::Idle),
             (AgentState::IdleWithInput, AgentState::IdleWithInput),
             (AgentState::BlockedModal, AgentState::BlockedModal),
@@ -7208,25 +8940,55 @@ contains = ["working"]
             );
             assert_eq!(detection.state, expected, "visual state {visual}");
             assert!(
-                visual == AgentState::IdleWithInput
+                visual == AgentState::Working
+                    || visual == AgentState::IdleWithInput
                     || visual == AgentState::Unknown
-                    || visual.is_blocked()
-                    || detection.disagreement,
-                "stale Working must remain visible as disagreement"
+                    || visual.is_blocked(),
+                "current visual safety state changed"
             );
         }
     }
 
     #[test]
-    fn a_conclusive_end_retires_only_after_visual_terminal_state() {
-        for state in [AgentState::Working, AgentState::BlockedModal] {
-            let mut end = end_entry(3);
-            assert_eq!(hook_action(&mut end, state, 4), HookAction::Use);
+    fn an_old_stop_cannot_override_repeated_current_visual_working() {
+        for observed_at in [3, 10, 11, 12] {
+            let mut detection = lifecycle_detection(Sensor::Screen, AgentState::Working);
+            detection.readings[0].ts = observed_at;
+            let end = end_entry(3);
+            apply_hook_reading(
+                &mut detection,
+                end.reading,
+                end.active_start,
+                end.authoritative_end,
+            );
+            let detection = detection.stamped(false, ComposerHold::Clear);
+
+            assert_eq!(detection.state, AgentState::Working);
+            assert_eq!(detection.decided_by, "fixture");
+            assert!(!detection.write_ready);
         }
-        for state in [AgentState::Idle, AgentState::IdleWithInput] {
+    }
+
+    #[test]
+    fn a_conclusive_end_is_an_edge_not_a_persistent_idle_level() {
+        for state in [
+            AgentState::Working,
+            AgentState::Idle,
+            AgentState::IdleWithInput,
+        ] {
             let mut end = end_entry(3);
-            assert_eq!(hook_action(&mut end, state, 4), HookAction::Drop);
+            let current = lifecycle_detection(Sensor::Screen, state);
+            assert_eq!(
+                hook_action_observed(&mut end, &current, false, false, true, 4),
+                HookAction::Drop
+            );
         }
+        let mut end = end_entry(3);
+        let blocked = lifecycle_detection(Sensor::Screen, AgentState::BlockedModal);
+        assert_eq!(
+            hook_action_observed(&mut end, &blocked, false, false, true, 4),
+            HookAction::Use
+        );
     }
 
     // The shipped codex esc rules: dim after the glyph is a ghost
@@ -7348,6 +9110,7 @@ regex = ['^IDLE']
                 service.admin(),
                 MailboxSend {
                     addresses: vec!["codex".into()],
+                    recipient_keys: None,
                     subject: "recover".into(),
                     body: "body".into(),
                     fyi: false,
@@ -7591,6 +9354,7 @@ regex = ['^IDLE']
             session_registration: StdMutex::new(()),
             events: tokio::sync::broadcast::channel(16).0,
             detections: StdMutex::new(HashMap::new()),
+            route_evidence_generations: StdMutex::new(HashMap::new()),
             pane_recomputes: StdMutex::new(HashMap::new()),
             lifecycle_rechecks: StdMutex::new(HashMap::new()),
             registry: StdMutex::new(registry),
@@ -7604,6 +9368,7 @@ regex = ['^IDLE']
             hook_liveness: crate::selftest::HookLiveness::new(),
             inject_pause: StdMutex::new(None),
             fail_chrome_restore: std::sync::atomic::AtomicBool::new(false),
+            fail_next_final_binding_observation: std::sync::atomic::AtomicBool::new(false),
             workspace_ui: StdMutex::new(crate::workspace_ui::WorkspaceUiState::default()),
             shutdown_request: tokio::sync::watch::channel(false).0,
             stop,

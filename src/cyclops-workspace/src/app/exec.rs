@@ -247,6 +247,41 @@ pub(super) async fn execute(
             app.model.sidebar_visible = !app.model.sidebar_visible;
             Ok(commit_sidebar_visibility(app, client).await)
         }
+        Action::ToggleMessages => {
+            app.model.messages_visible = !app.model.messages_visible;
+            app.prefs.messages_visible = app.model.messages_visible;
+            if app.model.messages_visible {
+                app.messages_focused = true;
+                super::request_messages_snapshot(app);
+            } else {
+                app.messages_focused = false;
+            }
+            super::resize_client(app, client).await;
+            Ok(Outcome {
+                persist: true,
+                ..Outcome::default()
+            })
+        }
+        Action::MessagesVerb(verb) => {
+            // The click is dispatched as the key press its own label names,
+            // through the one handler that implements the verb. A pointer
+            // user therefore gets exactly the keyboard behaviour, including
+            // its refusals, and there is no second copy to drift.
+            use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+            let (code, modifiers) = match verb {
+                cyclops_ui::ChatAction::Reply => (KeyCode::Char('r'), KeyModifiers::NONE),
+                cyclops_ui::ChatAction::Announce => (KeyCode::Char('a'), KeyModifiers::NONE),
+                cyclops_ui::ChatAction::Open => (KeyCode::Enter, KeyModifiers::NONE),
+                cyclops_ui::ChatAction::Scope => (KeyCode::Char('s'), KeyModifiers::NONE),
+                cyclops_ui::ChatAction::Retry => (KeyCode::Char('r'), KeyModifiers::CONTROL),
+            };
+            // Clicking a verb in the strip is also a statement about where
+            // the operator is working, so the drawer takes focus first for
+            // the verbs that read the selection.
+            app.messages_focused = true;
+            super::handle_messages_key(app, KeyEvent::new(code, modifiers)).await?;
+            Ok(Outcome::default())
+        }
         Action::ToggleTabBar => {
             // The strip's row moves between chrome and the declared grid
             // whole, so every flip re-declares the client size exactly the
@@ -738,8 +773,12 @@ fn name_pane(app: &mut App, pane_id: String, label: String) -> Result<Outcome, T
     });
     app.dialog = None;
     app.hover = None;
-    if let Some(snapshot) = decoration::fetch_decoration(&app.home) {
-        app.decoration = snapshot;
+    match decoration::fetch_decoration(&app.home) {
+        Ok(snapshot) => app.decoration = snapshot,
+        Err(error) => super::log_err(
+            &app.home,
+            &format!("decoration refresh after label failed: {error}"),
+        ),
     }
     Ok(Outcome {
         persist,
@@ -1270,7 +1309,7 @@ async fn insert_file_ref(
 }
 
 fn send_message(app: &mut App, to: String, subject: String, body: String) {
-    let Some(tx) = app.tx.clone() else {
+    let Some(requests) = app.send_requests.clone() else {
         return;
     };
     let message = Composed { to, subject, body };
@@ -1283,19 +1322,23 @@ fn send_message(app: &mut App, to: String, subject: String, body: String) {
         let to = &attempt.message.to;
         *status = Some(crate::copy::compose_sending(to));
     }
-    let home = app.home.clone();
-    std::thread::spawn(move || {
-        let outcome = daemon::send_message(
-            &home,
-            &attempt.message.to,
-            &attempt.message.subject,
-            &attempt.message.body,
-            &attempt.client_key,
-        );
-        // The workspace shutting down closes the channel. Nothing to do
-        // about it and nothing to report it to.
-        let _ = tx.send(super::AppMsg::SendFinished { attempt, outcome });
-    });
+    match requests.try_send(attempt) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::TrySendError::Full(attempt)) => {
+            super::finish_compose_send(
+                app.dialog.as_mut(),
+                attempt,
+                daemon::SendOutcome::NotSent("another send is still in progress".into()),
+            );
+        }
+        Err(std::sync::mpsc::TrySendError::Disconnected(attempt)) => {
+            super::finish_compose_send(
+                app.dialog.as_mut(),
+                attempt,
+                daemon::SendOutcome::NotSent("the send worker stopped".into()),
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1350,6 +1393,7 @@ mod tests {
                 active_tab: 0,
             },
             sidebar_visible: true,
+            messages_visible: false,
         }
     }
 
@@ -1358,7 +1402,6 @@ mod tests {
             // No loop around this App, so nothing could receive a send's
             // answer. `send_message` declines to start one rather than put
             // a message on the record nobody will be told about.
-            tx: None,
             model,
             runtimes: RuntimeRegistry::default(),
             router: Router::new(default_bindings()),
@@ -1392,7 +1435,13 @@ mod tests {
             watched_sessions: HashSet::new(),
             sidebar_tab: SidebarTab::default(),
             record: cyclops_ui::Record::new(),
+            messages_queue: cyclops_ui::HumanQueue::default(),
+            messages_caller: None,
+            messages_detail: None,
+            messages_composer: cyclops_ui::ComposerState::default(),
+            avatar_registry: cyclops_ui::AvatarRegistry::default(),
             intake: cyclops_ui::Intake::new(),
+            stream_reconciling: false,
             cursor_style: None,
             term_size: (80, 24),
             declared_client_size: None,
@@ -1402,6 +1451,18 @@ mod tests {
             paste_seq: 0,
             home,
             folder_probe_at: None,
+            send_requests: None,
+            stream_reconcile_requests: None,
+            messages_focused: false,
+            messages_gate: cyclops_ui::RefreshGate::new(),
+            messages_refresh_error: None,
+            messages_send_tx: None,
+            messages_composer_revision: 0,
+            messages_send_in_flight: None,
+            messages_snapshot_tx: None,
+            message_detail_tx: None,
+            message_detail_in_flight: None,
+            messages_reconcile_owed: None,
         }
     }
 
@@ -2255,6 +2316,55 @@ mod tests {
         assert_ne!(
             reopened, collapsed,
             "the canvas has to give the sidebar's columns back"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn toggle_messages_persists_visibility_and_redecares_client_size() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-toggle-messages");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        let pane = pane_ids(&server, "s")[0].clone();
+        let client = rig_client(&server, "s").await;
+        let home = scratch_home("exec-toggle-messages-home");
+        let mut app = test_app(one_tab_model("s", "@0", &pane, "$0"), home.clone());
+        assert!(!app.model.messages_visible, "the default is collapsed");
+
+        let outcome = execute(&mut app, &client, Action::ToggleMessages)
+            .await
+            .expect("open messages drawer");
+        assert!(outcome.persist, "the new visibility belongs on disk");
+        assert!(app.model.messages_visible);
+        assert!(app.prefs.messages_visible, "prefs mirror the model");
+        let opened = app
+            .declared_client_size
+            .expect("opening messages drawer re-declares the client size");
+
+        crate::persist::save_prefs(&home, &app.prefs).expect("save prefs");
+        assert!(
+            crate::persist::load_prefs(&home).messages_visible,
+            "a workspace quit with messages open must reopen with messages open"
+        );
+
+        let outcome = execute(&mut app, &client, Action::ToggleMessages)
+            .await
+            .expect("collapse messages drawer");
+        assert!(outcome.persist);
+        assert!(!app.model.messages_visible);
+        assert!(!app.prefs.messages_visible);
+        let collapsed = app
+            .declared_client_size
+            .expect("collapsing messages drawer re-declares the client size");
+        assert_ne!(
+            opened, collapsed,
+            "the canvas must resize when messages drawer collapses"
         );
 
         let _ = std::fs::remove_dir_all(&home);

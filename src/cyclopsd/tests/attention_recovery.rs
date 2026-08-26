@@ -9,8 +9,7 @@ use std::time::{Duration, Instant};
 
 use common::{faketui_path, tmux_available, Rig, CAT_MANIFEST};
 use cyclops_proto::{
-    Kind, LedgerLine, MessageId, MsgSendParams, NotificationResolution,
-    NOTIFICATION_RESOLUTION_PROOF_VERSION,
+    Kind, LedgerLine, MsgSendParams, NotificationResolution, NOTIFICATION_RESOLUTION_PROOF_VERSION,
 };
 use serde_json::json;
 
@@ -387,8 +386,7 @@ async fn exercise_resolution(resolution: NotificationResolution, direct_fallback
         .unwrap();
     let message_id = sent["msg_id"].as_str().expect("message id").to_string();
     let attempt_id = wait_for_alarm(&mut rig, &message_id).await;
-    let doorbell = cyclops_proto::render_doorbell_v2(
-        &MessageId::new(&message_id).unwrap(),
+    let doorbell = cyclops_proto::render_doorbell_v3(
         cyclops_proto::NotificationAttemptId::parse(&attempt_id).unwrap(),
     );
     let expected = if direct_fallback {
@@ -441,7 +439,7 @@ async fn exercise_resolution(resolution: NotificationResolution, direct_fallback
         if direct_fallback {
             serde_json::Value::Null
         } else {
-            json!(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_CLAIM)
+            json!(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM)
         }
     );
 
@@ -713,7 +711,7 @@ async fn pending_exact_owned_doorbell_submits_once_without_operator_input() {
     wait_for_inject_phase(&mut entered_rx, "automatic_attention_before_resolve").await;
     rig.tmux
         .run_ok(&["select-pane", "-t", &pane, "-T", "worker"]);
-    common::wait_pane_state(&mut rig, "idle").await;
+    common::wait_pane_state(&mut rig, "unknown").await;
 
     automatic.add_permits(32);
     wait_for_inject_phase(&mut entered_rx, "attention_after_action_accepted").await;
@@ -810,7 +808,7 @@ async fn claimed_exact_owned_doorbell_clears_without_another_submit() {
     wait_for_inject_phase(&mut entered_rx, "automatic_attention_before_resolve").await;
     rig.tmux
         .run_ok(&["select-pane", "-t", &pane, "-T", "worker"]);
-    common::wait_pane_state(&mut rig, "idle").await;
+    common::wait_pane_state(&mut rig, "unknown").await;
     rig.daemon
         .claim_message_for_test("worker", &message_id)
         .expect("claim before automatic resolution");
@@ -887,8 +885,7 @@ async fn admin_diff_exposes_only_the_content_free_doorbell() {
     assert_eq!(shown["result"]["checks"]["process_matches"], true);
     assert_eq!(shown["result"]["checks"]["manifest_matches"], true);
     assert_eq!(shown["result"]["checks"]["terminal_action_safe"], true);
-    let doorbell = cyclops_proto::render_doorbell_v2(
-        &MessageId::new(&message_id).unwrap(),
+    let doorbell = cyclops_proto::render_doorbell_v3(
         cyclops_proto::NotificationAttemptId::parse(&attempt_id).unwrap(),
     );
     assert_eq!(shown["result"]["expected"], doorbell);
@@ -949,8 +946,7 @@ async fn direct_fallback_refuses_a_doorbell_staged_for_the_same_message() {
         "private direct body",
         false,
     );
-    let doorbell = cyclops_proto::render_doorbell_v2(
-        &MessageId::new(&message_id).unwrap(),
+    let doorbell = cyclops_proto::render_doorbell_v3(
         cyclops_proto::NotificationAttemptId::parse(&attempt_id).unwrap(),
     );
 
@@ -1099,8 +1095,7 @@ async fn diff_returns_only_the_trailer_bound_composer_candidate() {
         .ctl
         .request("attention.show", json!({"id": attempt_id, "diff": true}))
         .await;
-    let doorbell = cyclops_proto::render_doorbell_v2(
-        &MessageId::new(&message_id).unwrap(),
+    let doorbell = cyclops_proto::render_doorbell_v3(
         cyclops_proto::NotificationAttemptId::parse(&attempt_id).unwrap(),
     );
     assert_eq!(shown["result"]["expected"], doorbell);
@@ -1565,8 +1560,7 @@ async fn swallowed_complete_stays_uncertain_and_reconciliation_sends_no_second_k
         .unwrap();
     let message_id = sent["msg_id"].as_str().unwrap().to_string();
     let attempt_id = wait_for_alarm(&mut rig, &message_id).await;
-    let expected = cyclops_proto::render_doorbell_v2(
-        &MessageId::new(&message_id).unwrap(),
+    let expected = cyclops_proto::render_doorbell_v3(
         cyclops_proto::NotificationAttemptId::parse(&attempt_id).unwrap(),
     );
     assert!(rig.tmux.capture(&pane).contains(&expected));
@@ -1772,8 +1766,7 @@ async fn process_replacement_after_intent_refuses_the_terminal_key() {
     assert!(!rig
         .tmux
         .capture(&pane)
-        .contains(&cyclops_proto::render_doorbell_v2(
-            &MessageId::new(&message_id).unwrap(),
+        .contains(&cyclops_proto::render_doorbell_v3(
             cyclops_proto::NotificationAttemptId::parse(&attempt_id).unwrap(),
         )));
     let lines = workspace_lines(&rig);

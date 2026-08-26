@@ -40,12 +40,17 @@ fn attempt(n: u64) -> NotificationAttemptId {
 fn wake(state: MessageNotificationState) -> MessageNotificationSummary {
     MessageNotificationSummary {
         state,
+        wake_block: None,
         quota_state: None,
         settlement: None,
         operator_withdrawn: None,
         attempt_id: None,
         cause: None,
+        verify_outcome: None,
         pre_write_cause: None,
+        pre_write_block: None,
+        pre_write_pane_width: None,
+        pre_write_required_pane_width: None,
         attention_cleared: None,
         resolution: None,
         resolution_intent: None,
@@ -58,12 +63,17 @@ fn wake(state: MessageNotificationState) -> MessageNotificationSummary {
 fn alarm(n: u64, cleared: bool) -> MessageNotificationSummary {
     MessageNotificationSummary {
         state: MessageNotificationState::AttentionRequired,
+        wake_block: None,
         quota_state: None,
         settlement: None,
         operator_withdrawn: None,
         attempt_id: Some(attempt(n)),
         cause: Some(NotificationAttentionCause::VerifyFailed),
+        verify_outcome: None,
         pre_write_cause: None,
+        pre_write_block: None,
+        pre_write_pane_width: None,
+        pre_write_required_pane_width: None,
         attention_cleared: Some(cleared),
         resolution: None,
         resolution_intent: None,
@@ -76,12 +86,17 @@ fn alarm(n: u64, cleared: bool) -> MessageNotificationSummary {
 fn quota(n: u64, state: MessageQuotaState) -> MessageNotificationSummary {
     MessageNotificationSummary {
         state: MessageNotificationState::AttentionRequired,
+        wake_block: None,
         quota_state: Some(state),
         settlement: None,
         operator_withdrawn: None,
         attempt_id: Some(attempt(n)),
         cause: None,
+        verify_outcome: None,
         pre_write_cause: None,
+        pre_write_block: None,
+        pre_write_pane_width: None,
+        pre_write_required_pane_width: None,
         attention_cleared: None,
         resolution: None,
         resolution_intent: None,
@@ -169,6 +184,7 @@ fn row(
 fn snapshot(seq: u64, rows: Vec<MessageSnapshotRow>) -> MessagesSnapshotResult {
     MessagesSnapshotResult {
         workspace_id: workspace(),
+        caller: None,
         workspace_seq: seq,
         counts: MessagesSnapshotCounts {
             visible_messages: rows.len() as u64,
@@ -183,6 +199,7 @@ fn snapshot(seq: u64, rows: Vec<MessageSnapshotRow>) -> MessagesSnapshotResult {
             open_attention_entries: 0,
         },
         rows,
+        mailbox_attention: Vec::new(),
     }
 }
 
@@ -444,6 +461,29 @@ fn wake_states_map_without_losing_delivery_progress() {
     assert_eq!(rows.rows[0].wake, WakeWord::BlockedBeforeWrite);
     assert!(rows.rows[0].needs_human());
     assert!(rows.rows[0].can_withdraw_notification);
+
+    // The named block rides from the wire into the row; the width pair is
+    // decided once by the proto rule, so a cause without widths has none.
+    let mut named = wake(MessageNotificationState::Gating);
+    named.attempt_id = Some(attempt(22));
+    named.pre_write_cause = Some(NotificationPreWriteCause::WriteReadinessChanged);
+    named.pre_write_block = Some("hook_admission_unproven".into());
+    let rows = rows_from_snapshot(&snapshot(
+        3,
+        vec![row(
+            "m-named",
+            3,
+            MessageDirection::Workspace,
+            true,
+            vec![theirs("%1", "reviewer", named)],
+        )],
+    ));
+    assert_eq!(rows.rows[0].wake, WakeWord::BlockedBeforeWrite);
+    assert_eq!(
+        rows.rows[0].pre_write_block.as_deref(),
+        Some("hook_admission_unproven")
+    );
+    assert_eq!(rows.rows[0].pane_width_block, None);
 
     let mut operator_withdrawn = wake(MessageNotificationState::NotStarted);
     operator_withdrawn.attempt_id = Some(attempt(21));
@@ -1009,7 +1049,9 @@ fn applying_a_snapshot_releases_the_gate() {
     let request = app.wants_messages().expect("a reconnect owes a snapshot");
     assert!(app.wants_messages().is_none(), "one fetch at a time");
 
-    assert!(app.apply_messages_response(request, &snapshot(1, Vec::new())));
+    assert!(app
+        .apply_messages_response(request, &snapshot(1, Vec::new()))
+        .is_some());
     assert!(app.wants_messages().is_none(), "nothing changed since");
 
     app.refresh.mark_dirty();

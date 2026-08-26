@@ -840,7 +840,7 @@ async fn claude_stopfailure_confirms_a_superseded_exact_dispatch() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn claude_stopfailure_ends_runtime_before_a_dirty_barrier_releases() {
+async fn claude_stopfailure_does_not_override_visual_working_or_release_a_dirty_barrier() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -906,7 +906,7 @@ async fn claude_stopfailure_ends_runtime_before_a_dirty_barrier_releases() {
             json!({"target": "keyed", "source": "detection"}),
         )
         .await;
-    assert_eq!(dirty["result"]["detection"]["state"], "idle", "{dirty}");
+    assert_eq!(dirty["result"]["detection"]["state"], "working", "{dirty}");
     assert_eq!(
         dirty["result"]["detection"]["write_ready"], false,
         "{dirty}"

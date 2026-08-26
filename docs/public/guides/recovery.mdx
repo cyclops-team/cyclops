@@ -20,7 +20,7 @@ cyclops attention show <attempt-id> --diff
 administrator-only, read-only recheck of one attempt. `--diff` may expose a
 direct-fallback payload.
 
-Cyclops automatically handles a current format 2 `verify_failed` doorbell only
+Cyclops automatically handles a current exact-attempt `verify_failed` doorbell only
 when the complete durable binding and exact composer bytes still match. It
 submits once while the mailbox is pending. If the exact recipient claimed after
 the write, it clears that doorbell without submitting it. Durable intent blocks

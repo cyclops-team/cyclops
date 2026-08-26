@@ -11,15 +11,10 @@ mod common;
 use std::time::Duration;
 
 use common::TestServer;
-use cyclops_tmux::{ControlClient, Notification};
-use tokio::sync::mpsc::UnboundedReceiver;
+use cyclops_tmux::{ControlClient, Notification, NotificationReceiver};
 
 /// Await a subscription-changed for `sub` whose value contains `needle`.
-async fn await_sub_value(
-    rx: &mut UnboundedReceiver<Notification>,
-    sub: &str,
-    needle: &str,
-) -> Notification {
+async fn await_sub_value(rx: &mut NotificationReceiver, sub: &str, needle: &str) -> Notification {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match rx.recv().await {

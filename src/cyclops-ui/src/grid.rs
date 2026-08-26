@@ -271,24 +271,28 @@ fn mailbox_receipt_badge(
     if let Some(ahead) = receipt.position.filter(|ahead| *ahead > 0) {
         words.push_str(&format!(" {sep} {ahead} ahead"));
     }
-    let wake = if receipt.notification_settlement
+    let wake = if let Some(cause) = receipt.pre_write_cause {
+        format!("blocked before write ({})", cause.label())
+    } else if let Some(block) = receipt.wake_block {
+        format!("blocked ({})", block.label())
+    } else if receipt.notification_settlement
         == Some(cyclops_proto::MessageNotificationSettlement::WithdrawnByClaim)
     {
-        "withdrawn"
+        "withdrawn".into()
     } else {
         match receipt.quota_state {
-            Some(MessageQuotaState::Held) => "quota held",
-            Some(MessageQuotaState::ResetObserved) => "quota reset observed",
+            Some(MessageQuotaState::Held) => "quota held".into(),
+            Some(MessageQuotaState::ResetObserved) => "quota reset observed".into(),
             None => match notification {
-                MessageNotificationState::NotStarted => "not started",
-                MessageNotificationState::Queued => "queued",
-                MessageNotificationState::Gating => "checking readiness",
-                MessageNotificationState::Writing => "writing",
-                MessageNotificationState::Staged => "staged",
-                MessageNotificationState::Submitted => "submitted",
-                MessageNotificationState::Notified => "notified",
-                MessageNotificationState::AttentionRequired => "needs attention",
-                MessageNotificationState::Superseded => "superseded",
+                MessageNotificationState::NotStarted => "not started".into(),
+                MessageNotificationState::Queued => "queued".into(),
+                MessageNotificationState::Gating => "checking readiness".into(),
+                MessageNotificationState::Writing => "writing".into(),
+                MessageNotificationState::Staged => "staged".into(),
+                MessageNotificationState::Submitted => "submitted".into(),
+                MessageNotificationState::Notified => "notified".into(),
+                MessageNotificationState::AttentionRequired => "needs attention".into(),
+                MessageNotificationState::Superseded => "superseded".into(),
             },
         }
     };
@@ -330,6 +334,8 @@ pub fn delivery_badge(
             notification_state: None,
             quota_state: None,
             notification_settlement: None,
+            pre_write_cause: None,
+            wake_block: None,
             position: None,
             note,
             held_by: None,
@@ -375,6 +381,7 @@ pub fn cleared_cell(was: &AttentionItem, how: Clearance, paint: &dyn Paint) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cyclops_proto::MessageWakeBlock;
 
     fn receipt(state: DeliveryState, position: Option<u32>, note: Option<&str>) -> DeliveryReceipt {
         DeliveryReceipt {
@@ -383,6 +390,8 @@ mod tests {
             notification_state: None,
             quota_state: None,
             notification_settlement: None,
+            pre_write_cause: None,
+            wake_block: None,
             position,
             note: note.map(String::from),
             pane: None,
@@ -497,6 +506,18 @@ mod tests {
         let mut oldest = receipt(DeliveryState::Queued, Some(0), None);
         oldest.notification_state = Some(Queued);
         assert_eq!(receipt_badge(&oldest, &Plain), "✓ accepted · wake queued");
+
+        oldest.wake_block = Some(MessageWakeBlock::WorkerSupervisorExited);
+        assert_eq!(
+            receipt_badge(&oldest, &Plain),
+            "✓ accepted · wake blocked (worker supervisor exited)"
+        );
+
+        oldest.pre_write_cause = Some(cyclops_proto::NotificationPreWriteCause::BindingUnprovable);
+        assert_eq!(
+            receipt_badge(&oldest, &Plain),
+            "✓ accepted · wake blocked before write (binding unprovable)"
+        );
     }
 
     #[test]
@@ -592,6 +613,7 @@ mod tests {
             "reviewer  ⚠ blocked_permission"
         );
         let delivery = AttentionItem::Delivery {
+            recipient: cyclops_proto::DeliveryRecipientIdentity::LegacyLabel("implementer".into()),
             to: "implementer".into(),
             id: "m-1".into(),
             state: DeliveryState::ParkedBlockedQuota,

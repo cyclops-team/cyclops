@@ -14,6 +14,12 @@ pub enum TmuxError {
     #[error("tmux io: {0}")]
     Io(#[from] std::io::Error),
 
+    /// A control command write or flush failed after the write began. Some
+    /// bytes may have reached tmux, so callers must not replay the command or
+    /// describe it as definitely unwritten.
+    #[error("tmux command write outcome is uncertain: {0}")]
+    WriteUncertain(std::io::Error),
+
     /// tmux answered a command with a %error block. Carries the error text.
     #[error("tmux command error: {0}")]
     Command(String),
@@ -27,6 +33,11 @@ pub enum TmuxError {
     /// this until the owner reconnects.
     #[error("tmux control connection closed")]
     Disconnected,
+
+    /// The fixed reply FIFO is full. Refusing before another command task
+    /// waits keeps overload bounded and leaves existing correlation intact.
+    #[error("tmux control reply queue is full")]
+    Busy,
 
     /// A layout could not be read off a session or built onto one: a
     /// window that is not a grid of rows, a zoomed pane, a session that

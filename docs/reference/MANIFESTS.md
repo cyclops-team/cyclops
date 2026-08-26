@@ -113,8 +113,10 @@ safe_states = ["idle"]
 | `argv_basenames` | Bind when `argv[0]`'s basename is one of these. The fallback for when the first list cannot work |
 | `launch` | The command that starts this CLI, for `cyclops start --agents <id>`. Optional |
 
-Each shipped `version_tested` value is parity-tested against one authoritative
-full-ruleset fixture. A newer partial capture does not promote that claim.
+Each shipped `version_tested` value is parity-tested against an authoritative
+live fixture from that version. The value identifies the newest tested vendor
+version, not proof that every state was remeasured. Each rule's `evidence` and
+the current release record state the narrower coverage boundary.
 
 `argv_basenames` exists for one measured reason. tmux reports the kernel's
 name for the resolved executable, so a native Claude install, where

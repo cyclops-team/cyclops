@@ -34,8 +34,28 @@ The receipt reports two separate facts:
   `not started`, `queued`, `checking readiness`, `writing`, `staged`,
   `submitted`, `notified`, `withdrawn`, `needs attention`, or `superseded`.
 
+When the recipient FIFO head has no live notification worker, the receipt also
+reports `wake blocked (<reason>)`. The message remains accepted and claimable.
+This field explains why the wake has no current owner; it does not prove that
+the composer was written or that the message was claimed. The protocol
+reference owns the closed [`wake_block` vocabulary](../reference/PROTOCOL.md#msgsend).
+
+A durable failure before terminal bytes reports `wake blocked before write
+(<reason>)`. Its `pre_write_cause` is separate from `wake_block`: the first
+names the failed write-boundary proof, while the second names why no scheduler
+worker owns the wake. The plain and JSON commands exit 1 when either field is
+present, but the message remains durably accepted and claimable. Inspect the
+named cause before requeueing; a retry without changed evidence cannot clear a
+terminal pre-write block.
+
 A position such as `2 ahead` is the recipient mailbox's FIFO position. The
-daemon never bypasses an older pending message.
+daemon never bypasses an older pending message. When the oldest pending
+message is not moving (`attention_required`, quota held, or blocked before
+write), `cyclops messages` prints one `held queue` line naming that recipient,
+the head message id, its cause, and how many wait behind it, and every
+follower cell reads `N ahead · behind <id> (<cause>)`. The held-queue line
+names next actions for the exact cause. It does not treat alarm clearance or
+payload retrieval alone as proof that a post-write composer barrier retired.
 
 The body and wake use different paths. Doorbell mode never pastes the message
 body. A terminal wake stages one `inbox claim` command, while a pull client may
@@ -48,13 +68,14 @@ view of mailbox and wake state.
 The preferred path is this content-free notification:
 
 ```text
-cyclops inbox claim m-3f9c2a #c:<lossless-attempt-token>
+cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
 ```
 
 The daemon selects it only when `cyclops setup check` reports `mailbox
-doorbell`. The suffix is a shell comment carrying the exact notification
-attempt, so the command remains runnable. The recipient then claims the message
-as described below.
+doorbell`. The reserved locator remains valid positional-claim input for older
+clients. Its 22-character token losslessly identifies the exact current
+notification attempt. The daemon atomically resolves that attempt to its
+message and claims it for the authenticated recipient.
 
 If setup reports `mailbox direct payload`, Cyclops writes the full message
 envelope instead. This compatibility path exists for an absent, edited,
@@ -118,7 +139,7 @@ claim races a doorbell already staged in the composer, Cyclops must either
 submit a previously reserved terminal key or re-prove and clear that exact
 doorbell. The claim alone never settles staged bytes.
 
-A current format 2 doorbell can reach `ack_timeout` after the terminal key was
+A current format 3 doorbell can reach `ack_timeout` after the terminal key was
 sent but before Claude paints output. A later exact recipient claim starts
 reconciliation. Cyclops clears the exact staged doorbell, or proves the same
 bound composer is clean, before moving the attempt to `notified` and clearing
@@ -157,7 +178,9 @@ accepted m-c82d11
 Admin mail receives no pane notification. `cyclops status` shows the pending
 admin count. A same-user shell with no agent-vendor ancestor reads it with the
 same `cyclops inbox list` and `cyclops inbox claim <id>` commands, including a
-shell inside a watched pane. A vendor process gets an agent identity only
+shell inside a watched pane. A claim by id may take a later message; when it
+does, the answer names the oldest pending message it skipped, which still
+holds that mailbox's head, and `inbox next` claims oldest-first. A vendor process gets an agent identity only
 through its current watched pane. Broadcast `*` targets agent panes only; name
 `admin` explicitly when the operator needs a durable message.
 
@@ -176,22 +199,24 @@ limited to one recipient and only succeeds while the old message is unclaimed
 and its notification has not crossed the write boundary. History remains
 append-only.
 
-Prefer `cyclops reply <id>` to `send --reply-to <id>`. Both use the same daemon
-validation, but `reply` avoids supplying routing or subject that the daemon
-will ignore.
+Prefer `cyclops reply <id>` to `cyclops send --subject "ignored" --reply-to <id>`.
+Both use the same daemon validation. Neither accepts a recipient because the
+daemon derives the exact route and subject from the referenced message.
 
 ## Attention and operator recovery
 
 `cyclops messages` is the body-free combined view of mailbox and notification
 state. `cyclops alarm preview --older-than <age>` lists unresolved notification
-alarms and their exact attempt ids. `cyclops status` reports pane and legacy
-delivery attention plus the admin unread count; it is not the mailbox alarm
-source.
+alarms and their exact attempt ids. `cyclops status` reports blocked panes,
+legacy delivery alarms, durable mailbox attention, held queue heads, and the
+admin unread count. Its eye and `waiting on you` rows summarize that combined
+projection; use `alarm preview` when an operator needs the exact unresolved
+notification attempts.
 
 An ambiguous notification is never an invitation to resend blindly. Use its
 exact notification attempt id:
 
-Cyclops automatically handles a current format 2 `verify_failed` doorbell only
+Cyclops automatically handles a current exact-attempt `verify_failed` doorbell only
 when the complete durable binding and exact composer bytes still match. It
 submits once while the mailbox is pending. If the exact recipient claimed after
 the write, it clears that doorbell without submitting it. Durable intent blocks
@@ -204,7 +229,9 @@ cyclops attention complete <attempt-id>
 cyclops attention discard <attempt-id>
 ```
 
-`show` is read-only. `complete` and `discard` recheck the exact attempt,
+`show` is read-only and available to the workspace administrator or the exact
+durable recipient of that attempt. `complete` and `discard` remain
+administrator-only and recheck the exact attempt,
 terminal layout, process generations, manifest, and current terminal safety.
 An uncertain result must be inspected and must not be repeated as a fresh
 terminal action. Reconciliation never sends a second key. `cyclops messages`
@@ -216,8 +243,13 @@ claim`. The exact transition and reconciliation rules are owned by the
 
 A wake that stops before writing reports one exact cause, including
 `session_unavailable`, `manifest_unavailable`, `payload_unavailable`,
-`write_readiness_changed`, `spool_failed`, `binding_unprovable`,
-`composer_semantic_missing`, or `worker_failed`. The message remains claimable.
+`write_readiness_changed`, `spool_failed`, `paste_command_unwritten`,
+`binding_unprovable`, `composer_semantic_missing`, or `worker_failed`. The
+message remains claimable.
+For format 3, `write_readiness_changed` with an observed width below its
+recorded required width is shown as `pane too narrow`. The width pair is
+content-free, no pane write occurred, and a later size edge may reopen that
+same attempt once.
 A workspace administrator can release the FIFO without touching the pane:
 
 ```bash
@@ -225,14 +257,26 @@ cyclops notification withdraw <attempt-id> --recipient <recipient-key>
 ```
 
 `show --diff` returns the exact selected transport bytes to the authenticated
-workspace administrator. A direct fallback diff therefore contains the message
-payload. The daemon does not write those diff inputs to its journal or log.
+workspace administrator or that attempt's exact durable recipient. A direct
+fallback diff therefore contains the message payload. Other recipients receive
+the same denial for missing and unauthorized ids. The daemon does not write
+those diff inputs to its journal or log.
 
 `cyclops requeue <message-id>` is an explicit operator action for a notification
 that is still eligible. `cyclops alarm clear <attempt-id>...` appends explicit
-clearances to the content-free notification alarm register. For an age-selected
-set, `cyclops alarm clear --older-than <age>` previews and prints the exact ids,
-then requires typing `clear` at a confirmation that names the count and cutoff.
+clearances to the content-free notification alarm register. A clearance
+acknowledges; it retires nothing. Under each cleared id the command prints the
+attempt's state and cause at clearance time, the message and recipient the
+clearance did not change, and the available next actions. The recipient
+retrieves the durable payload with `inbox claim`, or the administrator inspects
+the exact attempt with `attention show --diff` and uses `complete` or `discard`
+only when its checks authorize the action. Neither clearance nor payload
+retrieval alone proves that a post-write composer barrier retired.
+
+For an age-selected set, `cyclops alarm clear --older-than <age>` previews and
+prints the exact ids, then requires typing `clear` at a confirmation that names
+the count and cutoff.
+
 The clear request contains only those frozen ids, so a newer alarm cannot enter
 the operation. There is no clear-all form. Scripts use `alarm preview --json`
 and pass its ids explicitly rather than using the interactive age form. None of

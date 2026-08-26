@@ -23,8 +23,15 @@ use crate::theme::Theme;
 use crate::UiOptions;
 
 pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let io = data::spawn_io(&tx, home, opts.backfill);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(crate::EVENT_CAPACITY);
+    let (snapshot_tx, mut snapshot_rx) = tokio::sync::mpsc::channel(crate::SNAPSHOT_CAPACITY);
+    let (action_tx, mut action_rx) = tokio::sync::mpsc::channel(crate::ACTION_CAPACITY);
+    let sinks = data::UiSinks {
+        events: event_tx,
+        snapshots: snapshot_tx,
+        actions: action_tx,
+    };
+    let io = data::spawn_io(&sinks, home, opts.backfill);
     let view = if opts.firehose {
         View::Firehose
     } else {
@@ -40,7 +47,15 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
     let mut lost: Option<String> = None;
     let mut stdout = std::io::stdout();
 
-    while let Some(msg) = rx.recv().await {
+    loop {
+        let msg = tokio::select! {
+            action = action_rx.recv() => action,
+            snapshot = snapshot_rx.recv() => snapshot,
+            event = event_rx.recv() => event,
+        };
+        let Some(msg) = msg else {
+            return 1;
+        };
         match msg {
             UiMsg::Subscribed => {
                 app.conn_lost = false;
@@ -49,7 +64,9 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
             }
             UiMsg::MessagesChanged(changed) => {
                 message_follower.changed(&changed);
-                app.refresh.messages_changed(&changed);
+                if app.refresh.messages_changed(&changed) {
+                    eprintln!("message sequence gap detected; rebuilding from a whole snapshot");
+                }
             }
             UiMsg::MessagesRouteChanged => app.refresh.mark_dirty(),
             UiMsg::Messages { request, snapshot } => apply_messages_snapshot(
@@ -120,17 +137,18 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
                     eprintln!("{notice}");
                 }
             }
-            UiMsg::Key(_) | UiMsg::Notice(_) | UiMsg::EyeTick | UiMsg::ThemeChanged => {}
+            UiMsg::Notice(notice) => eprintln!("{notice}"),
+            UiMsg::Key(_) | UiMsg::EyeTick | UiMsg::ThemeChanged => {}
         }
         eye_line(&app, &mut eye_printed, &mut stdout);
         let _ = stdout.flush();
         if let Some(request) = app.wants_messages() {
-            if io.refresh.send(request).is_err() {
+            if io.refresh.send(request).await.is_err() {
                 return 1;
             }
         }
         if let Some(request) = message_follower.begin() {
-            if io.follow.send(request).is_err() {
+            if io.follow.send(request).await.is_err() {
                 return 1;
             }
         }
@@ -141,7 +159,6 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
             }
         }
     }
-    0
 }
 
 fn apply_messages_snapshot(
@@ -149,10 +166,13 @@ fn apply_messages_snapshot(
     follower: &mut MessageFollower,
     request: crate::messages::RefreshRequest,
     snapshot: &cyclops_proto::MessagesSnapshotResult,
-    _out: &mut impl Write,
+    out: &mut impl Write,
 ) {
-    if !app.apply_messages_response(request, snapshot) {
+    let Some(lines) = app.apply_messages_response(request, snapshot) else {
         return;
+    };
+    for e in lines {
+        live(app, e, out);
     }
     follower.baseline(snapshot);
 }
@@ -323,6 +343,7 @@ mod tests {
     fn snapshot(seq: u64, rows: Vec<MessageSnapshotRow>) -> MessagesSnapshotResult {
         MessagesSnapshotResult {
             workspace_id: workspace(),
+            caller: None,
             workspace_seq: seq,
             counts: MessagesSnapshotCounts {
                 visible_messages: rows.len() as u64,
@@ -337,6 +358,7 @@ mod tests {
                 open_attention_entries: 0,
             },
             rows,
+            mailbox_attention: Vec::new(),
         }
     }
 
@@ -363,12 +385,17 @@ mod tests {
                 fifo_position: Some(1),
                 notification: MessageNotificationSummary {
                     state: MessageNotificationState::NotStarted,
+                    wake_block: None,
                     quota_state: None,
                     settlement: None,
                     operator_withdrawn: None,
                     attempt_id: None,
                     cause: None,
+                    verify_outcome: None,
                     pre_write_cause: None,
+                    pre_write_block: None,
+                    pre_write_pane_width: None,
+                    pre_write_required_pane_width: None,
                     attention_cleared: None,
                     resolution: None,
                     resolution_intent: None,
@@ -509,7 +536,9 @@ mod tests {
                     state: cyclops_proto::DeliveryState::ParkedBlockedQuota,
                     ts: 43_471_000,
                     cause: Some("blocked_quota".into()),
+                    attempt_id: None,
                 }],
+                mailbox: Vec::new(),
             },
             &mut out,
         );
@@ -556,6 +585,7 @@ mod tests {
                 subject: "delivery to reviewer needs attention".into(),
                 pane_id: None,
                 to: to.map(String::from),
+                recipient: None,
                 deliveries: Vec::new(),
             },
         }

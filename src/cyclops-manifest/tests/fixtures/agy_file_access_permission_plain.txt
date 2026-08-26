@@ -1,0 +1,11 @@
+Antigravity CLI 1.1.21
+File access
+────────────────────────────────────────────────────────────────
+Read: <external-file>
+Reason: outside workspace
+Allow access to this file?
+> 1. Yes, allow access
+  2. Yes, and always allow non-workspace access
+  3. No, deny access
+  ↑/↓ Navigate
+Gemini 3.7 Flash · High · <workspace> · Full · Ctx: 98%

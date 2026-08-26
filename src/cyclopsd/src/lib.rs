@@ -80,7 +80,7 @@ pub use delivery::render_payload;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -88,8 +88,8 @@ use cyclops_ledger::LedgerWriter;
 use cyclops_manifest::Manifest;
 use cyclops_proto::{
     AdminNotifyParams, AgentState, Detection, Event, Kind, LedgerLine, MessageId, MsgSendParams,
-    ProcessInstanceId, RecipientKey, SessionIdentityBinding, SessionInstanceId, StateReportParams,
-    TmuxPaneId, TmuxSessionId, WireError, WorkspaceId,
+    NotificationRouteEvidenceId, ProcessInstanceId, RecipientKey, SessionIdentityBinding,
+    SessionInstanceId, StateReportParams, TmuxPaneId, TmuxSessionId, WireError, WorkspaceId,
 };
 use cyclops_state::{RepairSummary, StateRoot};
 use cyclops_tmux::{
@@ -198,6 +198,9 @@ pub(crate) struct Inner {
     pub(crate) events: broadcast::Sender<Event>,
     /// Cached fusion verdict per exact watched pane route.
     pub(crate) detections: StdMutex<HashMap<PaneKey, DetEntry>>,
+    /// Pane-local causal route observation generation for notification
+    /// reproof. Synthetic reconciliation reads this map without advancing it.
+    pub(crate) route_evidence_generations: StdMutex<HashMap<PaneKey, u64>>,
     /// One observation transaction per pane. Capture and cache commit stay in
     /// order, so an older slow capture cannot overwrite a newer verdict or
     /// mutate lifecycle candidates after the newer observation settled them.
@@ -253,6 +256,9 @@ pub(crate) struct Inner {
     /// Test-only: make the `--clear` chrome restore fail the way tmux
     /// refusing a command would. See [`Daemon::fail_chrome_restore`].
     pub(crate) fail_chrome_restore: AtomicBool,
+    /// Test-only: make the next final pre-write process observation
+    /// unavailable after the admitting capture has completed.
+    pub(crate) fail_next_final_binding_observation: AtomicBool,
     /// Last-active workspace/tab for the terminal workspace UI.
     pub(crate) workspace_ui: StdMutex<workspace_ui::WorkspaceUiState>,
     /// Self-shutdown request sent only after a successful daemon.shutdown
@@ -269,6 +275,12 @@ pub(crate) struct Inner {
     pub(crate) extra_tasks: StdMutex<Vec<JoinHandle<()>>>,
 }
 
+#[cfg(test)]
+struct SessionRenamePause {
+    entered: std::sync::mpsc::Sender<()>,
+    release: Arc<std::sync::Barrier>,
+}
+
 pub(crate) struct SessionSlot {
     /// Mutable so a followed session rename (`PaneEvent::SessionRenamed`,
     /// `handle_pane_event`) can update it in place: `session_index` then
@@ -277,6 +289,22 @@ pub(crate) struct SessionSlot {
     /// one tmux session. Go through [`SessionSlot::name`] and
     /// [`SessionSlot::rename`] rather than the field directly.
     name: StdMutex<String>,
+    /// A rename can make a live runtime slot collide with a configured slot
+    /// that was still waiting for that name. Indices are durable for the
+    /// daemon's lifetime, so the losing slot cannot be removed from
+    /// `Inner::sessions`; it becomes an alias of the live canonical slot
+    /// instead. Historical ledger reads may still address this slot by index,
+    /// while every live traversal skips it.
+    ///
+    /// `usize::MAX` means canonical. Any other value is the canonical slot's
+    /// append-only index.
+    alias_of: AtomicUsize,
+    /// Wakes an already-published session task when this slot loses a rename
+    /// collision. The atomic above is the state; this channel is only the
+    /// edge that makes a blocked task observe it immediately.
+    alias_changed: watch::Sender<Option<usize>>,
+    #[cfg(test)]
+    rename_pause: StdMutex<Option<SessionRenamePause>>,
     pub(crate) link: StdMutex<SessionLink>,
     /// Append-only session ledger at $CYCLOPS_HOME/ledger/<session>.ndjson,
     /// opened once when the slot is created (`boot`, `watch_session`) and
@@ -315,8 +343,13 @@ impl SessionSlot {
     /// and `watch_session` both build slots this way so the two paths a
     /// session can join the daemon by stay in lockstep.
     pub(crate) fn new(name: String, ledger: Arc<LedgerWriter>) -> Self {
+        let (alias_changed, _) = watch::channel(None);
         SessionSlot {
             name: StdMutex::new(name),
+            alias_of: AtomicUsize::new(usize::MAX),
+            alias_changed,
+            #[cfg(test)]
+            rename_pause: StdMutex::new(None),
             link: StdMutex::new(SessionLink::default()),
             ledger,
             last_panes: StdMutex::new(HashMap::new()),
@@ -343,6 +376,53 @@ impl SessionSlot {
             return None;
         }
         Some(std::mem::replace(&mut *name, new_name))
+    }
+
+    fn alias_of(&self) -> Option<usize> {
+        let idx = self.alias_of.load(Ordering::Acquire);
+        (idx != usize::MAX).then_some(idx)
+    }
+
+    fn is_canonical(&self) -> bool {
+        self.alias_of().is_none()
+    }
+
+    fn journal_file_name(&self) -> Option<String> {
+        self.ledger
+            .path()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    }
+
+    /// Retire this slot behind `canonical_idx` without invalidating its
+    /// historical index. Only the session-registration transaction calls
+    /// this. A live loser is woken so its task tears down its duplicate
+    /// watcher instead of waiting for another tmux event.
+    fn retire_as_alias(&self, canonical_idx: usize) -> bool {
+        let retired = self
+            .alias_of
+            .compare_exchange(
+                usize::MAX,
+                canonical_idx,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if retired {
+            self.alias_changed.send_replace(Some(canonical_idx));
+        }
+        retired
+    }
+
+    fn retarget_alias(&self, prior_idx: usize, canonical_idx: usize) -> bool {
+        self.alias_of
+            .compare_exchange(
+                prior_idx,
+                canonical_idx,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     /// Current observed rows while attached, otherwise the retained rows.
@@ -514,8 +594,9 @@ impl Inner {
             .cloned()
     }
 
-    /// How many sessions are watched right now (configured plus any added
-    /// since boot).
+    /// How many append-only session slots exist (configured plus any added
+    /// since boot). Retired aliases remain in this count because callers that
+    /// walk `0..session_count()` use the result as stable ledger indices.
     pub(crate) fn session_count(&self) -> usize {
         self.sessions.lock().expect("sessions lock").len()
     }
@@ -526,7 +607,8 @@ impl Inner {
             .lock()
             .expect("sessions lock")
             .iter()
-            .position(|s| s.name() == name)
+            .enumerate()
+            .find_map(|(idx, slot)| (slot.is_canonical() && slot.name() == name).then_some(idx))
     }
 
     /// A cloned snapshot of every session slot, for iteration. Lock the
@@ -534,6 +616,21 @@ impl Inner {
     /// span the loop body that follows.
     pub(crate) fn session_slots(&self) -> Vec<Arc<SessionSlot>> {
         self.sessions.lock().expect("sessions lock").clone()
+    }
+
+    /// Canonical live slots with their append-only indices. A retired alias
+    /// remains available through `session(idx)` and `session_slots()` for
+    /// historical ledger reads, but must never take part in routing, status,
+    /// mailbox publication, or another watcher attachment.
+    pub(crate) fn active_session_slots(&self) -> Vec<(usize, Arc<SessionSlot>)> {
+        self.sessions
+            .lock()
+            .expect("sessions lock")
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.is_canonical())
+            .map(|(idx, slot)| (idx, Arc::clone(slot)))
+            .collect()
     }
 
     /// Emit a fused-state change: one kind=state ledger line on the
@@ -654,6 +751,48 @@ impl Inner {
             .unwrap_or(AgentState::Unknown)
     }
 
+    /// Current durable identity for this pane's route evidence.
+    pub(crate) fn route_evidence_id(
+        &self,
+        session_idx: usize,
+        pane_id: &str,
+    ) -> NotificationRouteEvidenceId {
+        let generation = self
+            .route_evidence_generations
+            .lock()
+            .expect("route evidence generations lock")
+            .get(&PaneKey::new(session_idx, pane_id))
+            .copied()
+            .unwrap_or(0);
+        NotificationRouteEvidenceId {
+            boot_id: self.boot_id.clone(),
+            generation,
+        }
+    }
+
+    /// Advance one real watcher, process, adoption, or readiness observation.
+    pub(crate) fn advance_route_evidence(
+        &self,
+        session_idx: usize,
+        pane_id: &str,
+    ) -> NotificationRouteEvidenceId {
+        let generation = {
+            let mut generations = self
+                .route_evidence_generations
+                .lock()
+                .expect("route evidence generations lock");
+            let generation = generations
+                .entry(PaneKey::new(session_idx, pane_id))
+                .or_insert(0);
+            *generation = generation.saturating_add(1);
+            *generation
+        };
+        NotificationRouteEvidenceId {
+            boot_id: self.boot_id.clone(),
+            generation,
+        }
+    }
+
     /// Durable recipient for a pane inside one exact daemon session slot.
     pub(crate) fn recipient_key(&self, session_idx: usize, pane_id: &str) -> Option<RecipientKey> {
         let slot = self.session(session_idx)?;
@@ -764,6 +903,9 @@ impl Inner {
     /// Live watcher for a session slot, if attached.
     pub(crate) fn watcher_of(&self, session_idx: usize) -> Option<Arc<SessionWatcher>> {
         let slot = self.session(session_idx)?;
+        if !slot.is_canonical() {
+            return None;
+        }
         let link = slot.link.lock().expect("session link lock");
         link.watcher.as_ref().map(Arc::clone)
     }
@@ -780,7 +922,7 @@ impl Inner {
         if let Some(recipient) = exact {
             let session_instance_id = recipient.session_instance_id()?;
             let pane_id = recipient.pane_id()?.to_string();
-            for (idx, slot) in self.session_slots().into_iter().enumerate() {
+            for (idx, slot) in self.active_session_slots() {
                 let watcher = {
                     let link = slot.link.lock().expect("session link lock");
                     if link
@@ -812,7 +954,7 @@ impl Inner {
         }
         let wanted = name;
         let mut found = None;
-        for (idx, slot) in self.session_slots().into_iter().enumerate() {
+        for (idx, slot) in self.active_session_slots() {
             let watcher = {
                 let link = slot.link.lock().expect("session link lock");
                 link.watcher.as_ref().map(Arc::clone)
@@ -842,7 +984,7 @@ impl Inner {
         if let Some(recipient) = exact {
             let session_instance_id = recipient.session_instance_id()?;
             let pane_id = recipient.pane_id()?.to_string();
-            for (idx, slot) in self.session_slots().into_iter().enumerate() {
+            for (idx, slot) in self.active_session_slots() {
                 let link = slot.link.lock().expect("session link lock");
                 if link.attached
                     || link
@@ -880,7 +1022,7 @@ impl Inner {
         }
         let wanted = name;
         let mut found = None;
-        for (idx, slot) in self.session_slots().into_iter().enumerate() {
+        for (idx, slot) in self.active_session_slots() {
             if slot.link.lock().expect("session link lock").attached {
                 continue; // live table is authoritative while attached
             }
@@ -929,9 +1071,8 @@ fn mailbox_routes(
     proposed: Option<&MailboxRouteOverride<'_>>,
 ) -> Vec<MailboxSessionRoute> {
     inner
-        .session_slots()
+        .active_session_slots()
         .into_iter()
-        .enumerate()
         .filter_map(|(idx, slot)| {
             proposed
                 .filter(|route| route.session_idx == idx)
@@ -1332,6 +1473,7 @@ impl Daemon {
             .identity_for_address(from)
             .map_err(server::mailbox_service_error)?;
         let result = messaging::send(&self.inner, service, sender, params)
+            .await
             .map_err(server::mailbox_service_error)?;
         serde_json::to_value(result).map_err(|error| WireError {
             code: "internal".to_string(),
@@ -1524,6 +1666,16 @@ impl Daemon {
         self.inner.fail_chrome_restore.store(on, Ordering::SeqCst);
     }
 
+    /// Test-only seam: fail the next OS binding observation at the exact
+    /// terminal write boundary. The one-shot models a real process-table
+    /// observation failure without replacing the authenticated pane process.
+    #[doc(hidden)]
+    pub fn fail_next_final_binding_observation(&self) {
+        self.inner
+            .fail_next_final_binding_observation
+            .store(true, Ordering::SeqCst);
+    }
+
     /// Adopt a pane under a label, or un-adopt it. `target` is a pane id or
     /// an existing label; `label: None` clears.
     pub async fn label_pane(
@@ -1676,15 +1828,19 @@ pub(crate) async fn label_pane(
 fn label_taken_words(inner: &Inner, label: &str, holder: &registry::Adoption) -> String {
     let session_idx = inner.session_index(&holder.session).or_else(|| {
         let instance_id = holder.recipient?.session_instance_id()?;
-        inner.session_slots().iter().position(|slot| {
-            slot.link
-                .lock()
-                .expect("session link lock")
-                .identity
-                .as_ref()
-                .map(|identity| identity.session_instance_id())
-                == Some(instance_id)
-        })
+        inner
+            .active_session_slots()
+            .into_iter()
+            .find_map(|(idx, slot)| {
+                slot.link
+                    .lock()
+                    .expect("session link lock")
+                    .identity
+                    .as_ref()
+                    .map(|identity| identity.session_instance_id())
+                    .is_some_and(|candidate| candidate == instance_id)
+                    .then_some(idx)
+            })
     });
     let attached = session_idx
         .and_then(|idx| inner.session(idx))
@@ -1878,8 +2034,18 @@ async fn adopt_pane(
     // 3. Paint.
     paint_chrome(inner, session_idx, pane_id).await;
     // 4. Re-read.
-    fusion::recompute_pane(inner, session_idx, watcher, pane_id, false, "pane_labeled").await;
-    messaging::schedule_route_changed(inner, session_idx, pane_id);
+    let route_evidence = inner.advance_route_evidence(session_idx, pane_id);
+    fusion::recompute_pane_for_route_evidence(
+        inner,
+        session_idx,
+        watcher,
+        pane_id,
+        false,
+        "pane_labeled",
+        &route_evidence,
+    )
+    .await;
+    messaging::schedule_route_evidence(inner, session_idx, pane_id, &route_evidence);
     Ok(())
 }
 
@@ -1973,7 +2139,18 @@ async fn unadopt_pane(
     messaging::schedule_available(inner);
     // 5. Re-read.
     if let Some(w) = watcher {
-        fusion::recompute_pane(inner, session_idx, w, pane_id, false, "pane_unlabeled").await;
+        let route_evidence = inner.advance_route_evidence(session_idx, pane_id);
+        fusion::recompute_pane_for_route_evidence(
+            inner,
+            session_idx,
+            w,
+            pane_id,
+            false,
+            "pane_unlabeled",
+            &route_evidence,
+        )
+        .await;
+        messaging::schedule_route_evidence(inner, session_idx, pane_id, &route_evidence);
     }
     Ok(())
 }
@@ -2028,7 +2205,7 @@ fn chrome_not_restored(
 /// out, because there the window keeps its text while a named pane is
 /// still in it.)
 async fn restore_all_chrome(inner: &Arc<Inner>) {
-    for (idx, slot) in inner.session_slots().into_iter().enumerate() {
+    for (idx, slot) in inner.active_session_slots() {
         let Some(watcher) = inner.watcher_of(idx) else {
             continue;
         };
@@ -2306,7 +2483,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     .map_err(|error| anyhow::anyhow!("open mailbox directory: {error}"))?;
     let (manifests, manifest_dir) = load_manifests(&cfg);
     let mut sessions = Vec::with_capacity(cfg.sessions.len());
-    let mut replayed: Vec<(usize, Vec<LedgerLine>)> = Vec::new();
+    let mut replay_roots: Vec<(usize, String, Vec<LedgerLine>)> = Vec::new();
     let engine = delivery::Engine::new();
     for (idx, name) in cfg.sessions.iter().enumerate() {
         let descendant = PathBuf::from("ledger").join(format!("{name}.ndjson"));
@@ -2316,17 +2493,24 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
                 state_root.path().join(&descendant).display()
             )
         })?;
-        // Message ids stay unique per ledger across restarts; the replayed
-        // lines also feed the restart-limbo scan below.
+        // The roots and every rename-linked journal discovered from them
+        // feed both id preload and restart-limbo settlement below.
         match ledger.read_after(0) {
             Ok(lines) => {
-                engine.preload_ids(&lines);
-                replayed.push((idx, lines));
+                replay_roots.push((idx, format!("{name}.ndjson"), lines));
             }
             Err(e) => warn!(session = %name, error = %e, "ledger replay for id preload failed"),
         }
         sessions.push(Arc::new(SessionSlot::new(name.clone(), Arc::new(ledger))));
     }
+    let replay = history::session_journal_replay(&state_root, replay_roots);
+    // This is the first Engine use after construction, so every historical
+    // id is reserved before any request can mint one. Files stay separate for
+    // history; restart recovery receives one descendant-first stream per root.
+    for (_, lines) in &replay.files {
+        engine.preload_ids(lines);
+    }
+    let replayed = replay.recovery;
     // Adoptions from the previous run. Nothing is trusted onto a pane
     // yet; each session prunes its own entries against the live pane
     // table when it attaches (registry::restore_session).
@@ -2405,6 +2589,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         session_registration: StdMutex::new(()),
         events,
         detections: StdMutex::new(HashMap::new()),
+        route_evidence_generations: StdMutex::new(HashMap::new()),
         pane_recomputes: StdMutex::new(HashMap::new()),
         lifecycle_rechecks: StdMutex::new(HashMap::new()),
         registry: StdMutex::new(adoptions),
@@ -2418,6 +2603,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         hook_liveness: selftest::HookLiveness::new(),
         inject_pause: StdMutex::new(None),
         fail_chrome_restore: AtomicBool::new(false),
+        fail_next_final_binding_observation: AtomicBool::new(false),
         workspace_ui: StdMutex::new(workspace_ui::WorkspaceUiState::default()),
         shutdown_request,
         stop: stop_rx,
@@ -2535,9 +2721,8 @@ pub(crate) async fn watch_session(
     // here and dedup against it instead of opening a second ledger and
     // watcher for the same tmux session.
     if let Some(idx) = inner
-        .session_slots()
-        .iter()
-        .enumerate()
+        .active_session_slots()
+        .into_iter()
         .find_map(|(idx, slot)| {
             let watcher = slot
                 .link
@@ -2551,7 +2736,7 @@ pub(crate) async fn watch_session(
                 .then_some(idx)
         })
     {
-        rename_session_slot_locked(inner, idx, name.to_string());
+        rename_session_slot_locked(inner, idx, name.to_string(), None);
         return Ok((idx, false));
     }
     let descendant = PathBuf::from("ledger").join(format!("{name}.ndjson"));
@@ -2726,6 +2911,13 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
         if *stop.borrow() {
             return;
         }
+        if let Some(canonical_idx) = slot.alias_of() {
+            info!(
+                alias_idx = idx,
+                canonical_idx, "retired session-slot task stopped"
+            );
+            return;
+        }
         // Re-read on every attempt, not cached once outside the loop: a
         // rename followed while attached (`handle_pane_event`'s
         // `SessionRenamed` arm) updates this slot in place, and if the
@@ -2746,6 +2938,10 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
         match SessionWatcher::connect(ccfg).await {
             Ok(watcher) => {
                 let watcher = Arc::new(watcher);
+                if slot.alias_of().is_some() {
+                    watcher.shutdown().await;
+                    return;
+                }
                 let binding = match observe_session_identity(&inner, &watcher).await {
                     Ok(binding) => binding,
                     Err(error) => {
@@ -2758,8 +2954,15 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                         continue;
                     }
                 };
+                if slot.alias_of().is_some() {
+                    watcher.shutdown().await;
+                    return;
+                }
                 if !run_session(&inner, idx, &watcher, binding, stop.clone()).await {
                     watcher.shutdown().await;
+                    if slot.alias_of().is_some() {
+                        return;
+                    }
                     if reconnect_delay(&mut stop, backoff).await {
                         return;
                     }
@@ -2811,6 +3014,9 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                     }
                 }
                 watcher.shutdown().await;
+                if slot.alias_of().is_some() {
+                    return;
+                }
                 if *stop.borrow() {
                     return;
                 }
@@ -2948,7 +3154,28 @@ fn session_lifecycle(inner: &Arc<Inner>, idx: usize, attached: bool) {
 /// runtime is not durable across a restart by design, and neither is a
 /// rename of one. A restart re-reads `sessions` and watches the OLD name
 /// again, same as it always has).
-fn rename_session_slot(inner: &Arc<Inner>, idx: usize, new_name: String) {
+fn rename_session_slot(inner: &Arc<Inner>, idx: usize, new_name: String) -> bool {
+    rename_session_slot_with_identity(inner, idx, new_name, None)
+}
+
+fn rename_session_slot_with_identity(
+    inner: &Arc<Inner>,
+    idx: usize,
+    new_name: String,
+    observed_instance_id: Option<SessionInstanceId>,
+) -> bool {
+    #[cfg(test)]
+    if let Some(slot) = inner.session(idx) {
+        let pause = slot
+            .rename_pause
+            .lock()
+            .expect("session rename pause lock")
+            .take();
+        if let Some(pause) = pause {
+            pause.entered.send(()).expect("rename pause receiver");
+            pause.release.wait();
+        }
+    }
     let _registration = inner
         .session_registration
         .lock()
@@ -2957,18 +3184,132 @@ fn rename_session_slot(inner: &Arc<Inner>, idx: usize, new_name: String) {
     // lands after that barrier would split the slot name from the registry
     // name while restore is reading both, leaving Cyclops chrome behind.
     if inner.engine.is_stopping() {
-        return;
+        return true;
     }
-    rename_session_slot_locked(inner, idx, new_name);
+    rename_session_slot_locked(inner, idx, new_name, observed_instance_id)
 }
 
-fn rename_session_slot_locked(inner: &Arc<Inner>, idx: usize, new_name: String) {
+fn rename_session_slot_locked(
+    inner: &Arc<Inner>,
+    idx: usize,
+    new_name: String,
+    observed_instance_id: Option<SessionInstanceId>,
+) -> bool {
     let Some(slot) = inner.session(idx) else {
-        return;
+        return false;
     };
-    let Some(old_name) = slot.rename(new_name.clone()) else {
-        return;
+    if !slot.is_canonical() {
+        return false;
+    }
+    let old_name = slot.name();
+    if old_name == new_name {
+        return true;
+    }
+
+    // A runtime-created session can be watched under its temporary name and
+    // then renamed onto a configured name whose slot is still detached. The
+    // source slot owns the live watcher and therefore wins. The other slot
+    // cannot be removed because its index may already be held by a task or a
+    // historical cursor; retire it as an alias instead. If its task won the
+    // registration race and attached first, matching durable session identity
+    // proves both watchers follow the same tmux session and wakes the loser so
+    // it tears its duplicate connection down.
+    let source_instance_id = observed_instance_id.or_else(|| {
+        slot.link
+            .lock()
+            .expect("session link lock")
+            .identity
+            .as_ref()
+            .map(SessionIdentityBinding::session_instance_id)
+    });
+    let collision = inner
+        .active_session_slots()
+        .into_iter()
+        .find(|(other_idx, other)| *other_idx != idx && other.name() == new_name);
+    let retired = if let Some((other_idx, other)) = collision {
+        let (target_is_live, target_instance_id) = {
+            let link = other.link.lock().expect("session link lock");
+            (
+                link.attached || link.watcher.is_some(),
+                link.identity
+                    .as_ref()
+                    .map(SessionIdentityBinding::session_instance_id),
+            )
+        };
+        let same_live_identity = matches!(
+            (source_instance_id, target_instance_id),
+            (Some(source), Some(target)) if source == target
+        );
+        if target_is_live && !same_live_identity {
+            error!(
+                source_idx = idx,
+                target_idx = other_idx,
+                old_name = %old_name,
+                new_name = %new_name,
+                "refusing to merge live session slots without matching durable identity"
+            );
+            return true;
+        }
+        let Some(canonical_journal) = slot.journal_file_name() else {
+            error!(
+                source_idx = idx,
+                target_idx = other_idx,
+                "rename collision source has no journal file name"
+            );
+            return false;
+        };
+        if inner
+            .append_line(
+                other_idx,
+                daemon_line(
+                    Kind::System,
+                    inner.mint_event_id(),
+                    json!({
+                        "event": "session_slot_aliased",
+                        "session": &new_name,
+                        "canonical_session_idx": idx,
+                        "canonical_journal": canonical_journal,
+                    }),
+                ),
+            )
+            .is_none()
+        {
+            error!(
+                source_idx = idx,
+                target_idx = other_idx,
+                "rename collision history link could not be recorded"
+            );
+            return false;
+        }
+        if !other.retire_as_alias(idx) {
+            error!(
+                source_idx = idx,
+                target_idx = other_idx,
+                new_name = %new_name,
+                "rename collision target changed before it could be retired"
+            );
+            return true;
+        }
+        for alias in inner.session_slots() {
+            alias.retarget_alias(other_idx, idx);
+        }
+        debug_assert!(inner.session(idx).is_some_and(|slot| slot.is_canonical()));
+        debug_assert!(inner.session_slots().iter().all(|slot| {
+            slot.alias_of().is_none_or(|canonical_idx| {
+                inner
+                    .session(canonical_idx)
+                    .is_some_and(|canonical| canonical.is_canonical())
+            })
+        }));
+        Some((other_idx, other, target_is_live))
+    } else {
+        None
     };
+
+    let replaced = slot
+        .rename(new_name.clone())
+        .expect("the old and new session names were checked above");
+    debug_assert_eq!(replaced, old_name);
     // Adoptions and their chrome snapshots are session-scoped even though
     // their tmux pane/window ids do not change on a rename. Move those
     // durable facts with the slot or every in_session(new_name) path
@@ -2983,6 +3324,16 @@ fn rename_session_slot_locked(inner: &Arc<Inner>, idx: usize, new_name: String) 
     }
     refresh_mailbox_and_schedule(inner);
     info!(old_name = %old_name, new_name = %new_name, "session renamed; daemon slot now follows tmux");
+    if let Some((alias_idx, alias, was_live)) = retired {
+        info!(
+            canonical_idx = idx,
+            alias_idx,
+            session = %new_name,
+            was_live,
+            "retired a duplicate session slot after a rename collision"
+        );
+        debug_assert_eq!(alias.alias_of(), Some(idx));
+    }
     inner.append_line(
         idx,
         daemon_line(
@@ -2995,6 +3346,7 @@ fn rename_session_slot_locked(inner: &Arc<Inner>, idx: usize, new_name: String) 
             }),
         ),
     );
+    true
 }
 
 /// Reconcile daemon-owned pane routes after its watcher receiver lagged.
@@ -3091,6 +3443,13 @@ async fn run_session(
     binding: SessionIdentityBinding,
     mut stop: watch::Receiver<bool>,
 ) -> bool {
+    let Some(slot) = inner.session(idx) else {
+        return false;
+    };
+    let mut alias_changed = slot.alias_changed.subscribe();
+    if !slot.is_canonical() {
+        return false;
+    }
     let mut rx = watcher.subscribe();
     // A rename can land after SessionWatcher::connect returns but before
     // this receiver exists. Broadcast channels do not replay that event;
@@ -3100,7 +3459,15 @@ async fn run_session(
     // below is idempotent with this check.
     let live_name = watcher.session();
     if inner.session(idx).is_some_and(|s| s.name() != live_name) {
-        rename_session_slot(inner, idx, live_name);
+        rename_session_slot_with_identity(
+            inner,
+            idx,
+            live_name,
+            Some(binding.session_instance_id()),
+        );
+    }
+    if !slot.is_canonical() || slot.name() != watcher.session() {
+        return false;
     }
     let rows: Vec<ObservedPane> = watcher
         .snapshot()
@@ -3130,10 +3497,18 @@ async fn run_session(
             .hook_liveness
             .open(&PaneKey::new(idx, &pane.row.pane_id));
     }
+    // A detached slot may have been retired as an alias while this task was
+    // observing process generations or reconciling adoption records. Share
+    // the registration barrier with rename collision handling so the losing
+    // task can never publish a second live route after retirement.
+    let _registration = inner
+        .session_registration
+        .lock()
+        .expect("session registration lock");
+    if !slot.is_canonical() {
+        return false;
+    }
     if let Err(error) = publish_mailbox_transition(inner, &route, || {
-        let slot = inner
-            .session(idx)
-            .expect("session_idx valid: append-only, never removed");
         let mut link = slot.link.lock().expect("session link lock");
         link.identity = Some(binding);
         link.attached = true;
@@ -3147,9 +3522,7 @@ async fn run_session(
         warn!(session = %watcher.session(), error = %error, "cannot publish mailbox directory");
         return false;
     }
-    let slot = inner
-        .session(idx)
-        .expect("session_idx valid: append-only, never removed");
+    drop(_registration);
     info!(session = %slot.name(), "attached to tmux session");
     session_lifecycle(inner, idx, true);
     // Bootstrap: the watcher's table is already authoritative; evaluate
@@ -3158,13 +3531,29 @@ async fn run_session(
     // already knows which panes are named and which manifest is pinned.
     reconcile_adoptions(inner, idx, watcher, &kept).await;
     for row in watcher.snapshot() {
-        fusion::recompute_pane(inner, idx, watcher, &row.pane_id, false, "bootstrap").await;
-        messaging::schedule_route_changed(inner, idx, &row.pane_id);
+        let route_evidence = inner.advance_route_evidence(idx, &row.pane_id);
+        fusion::recompute_pane_for_route_evidence(
+            inner,
+            idx,
+            watcher,
+            &row.pane_id,
+            false,
+            "bootstrap",
+            &route_evidence,
+        )
+        .await;
+        messaging::schedule_route_evidence(inner, idx, &row.pane_id, &route_evidence);
     }
     // Per-pane debounce kickers for output activity.
     let mut debounce: HashMap<String, watch::Sender<u64>> = HashMap::new();
     loop {
         tokio::select! {
+            biased;
+            changed = alias_changed.changed() => {
+                if changed.is_err() || !slot.is_canonical() {
+                    return true;
+                }
+            }
             _ = stop.changed() => return true,
             ev = rx.recv() => match ev {
                 Ok(ev) => {
@@ -3186,8 +3575,9 @@ async fn run_session(
                     if inner
                         .session(idx)
                         .is_some_and(|s| s.name() != live_name)
+                        && !rename_session_slot(inner, idx, live_name)
                     {
-                        rename_session_slot(inner, idx, live_name);
+                        return true;
                     }
                     warn!(session = %watcher.session(), missed, "event stream lagged; reconciling");
                     if watcher.reconcile_now().await.is_err() {
@@ -3198,8 +3588,22 @@ async fn run_session(
                         return true;
                     }
                     for row in watcher.snapshot() {
-                        fusion::recompute_pane(inner, idx, watcher, &row.pane_id, false, "lag_reconcile").await;
-                        messaging::schedule_route_changed(inner, idx, &row.pane_id);
+                        let route_evidence = inner.advance_route_evidence(idx, &row.pane_id);
+                        fusion::recompute_pane_for_route_evidence(
+                            inner,
+                            idx,
+                            watcher,
+                            &row.pane_id,
+                            false,
+                            "lag_reconcile",
+                            &route_evidence,
+                        ).await;
+                        messaging::schedule_route_evidence(
+                            inner,
+                            idx,
+                            &row.pane_id,
+                            &route_evidence,
+                        );
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => return true,
@@ -3675,16 +4079,18 @@ async fn handle_pane_event(
                     .mailbox_panes
                     .insert(row.pane_id.clone(), ObservedPane::capture(row.clone()));
             });
-            fusion::recompute_pane(
+            let route_evidence = inner.advance_route_evidence(session_idx, &row.pane_id);
+            fusion::recompute_pane_for_route_evidence(
                 inner,
                 session_idx,
                 watcher,
                 &row.pane_id,
                 false,
                 "pane_added",
+                &route_evidence,
             )
             .await;
-            messaging::schedule_route_changed(inner, session_idx, &row.pane_id);
+            messaging::schedule_route_evidence(inner, session_idx, &row.pane_id, &route_evidence);
             false
         }
         PaneEvent::PaneRemoved(id) => {
@@ -3756,6 +4162,11 @@ async fn handle_pane_event(
                     .detections
                     .lock()
                     .expect("detections lock")
+                    .remove(&pane);
+                inner
+                    .route_evidence_generations
+                    .lock()
+                    .expect("route evidence generations lock")
                     .remove(&pane);
                 // Stored turn ends die only with the physical pane. A
                 // session transfer keeps the exact end and composer hold
@@ -3865,12 +4276,28 @@ async fn handle_pane_event(
                         | PaneField::PanePid
                 )
             });
-            if relevant {
-                fusion::recompute_pane(inner, session_idx, watcher, &id, false, "pane_changed")
-                    .await;
+            let size_changed = changed.iter().any(|field| matches!(field, PaneField::Size));
+            let route_changed = relevant || occupant_changed;
+            let route_evidence = if route_changed {
+                inner.advance_route_evidence(session_idx, &id)
+            } else {
+                inner.route_evidence_id(session_idx, &id)
+            };
+            if route_changed {
+                fusion::recompute_pane_for_route_evidence(
+                    inner,
+                    session_idx,
+                    watcher,
+                    &id,
+                    false,
+                    "pane_changed",
+                    &route_evidence,
+                )
+                .await;
+                messaging::schedule_route_evidence(inner, session_idx, &id, &route_evidence);
             }
-            if occupant_changed {
-                messaging::schedule_route_changed(inner, session_idx, &id);
+            if size_changed {
+                messaging::schedule_pane_size_changed(inner, session_idx, &id, &route_evidence);
             }
             // A move does not touch agent state, but it does move half the
             // chrome: the pane carries its own options and the window's
@@ -3911,10 +4338,7 @@ async fn handle_pane_event(
         // guarantees the slot is renamed before any event the watcher
         // emits after the rename gets processed. See `emit_state`'s doc
         // comment for what breaks if that ordering did not hold.
-        PaneEvent::SessionRenamed { name } => {
-            rename_session_slot(inner, session_idx, name);
-            false
-        }
+        PaneEvent::SessionRenamed { name } => !rename_session_slot(inner, session_idx, name),
         PaneEvent::Reconciled => {
             let outcome = match reconcile_missed_pane_routes(inner, session_idx, watcher) {
                 Ok(outcome) => outcome,
@@ -3927,16 +4351,18 @@ async fn handle_pane_event(
                 return false;
             }
             for pane_id in outcome.changed_panes {
-                fusion::recompute_pane(
+                let route_evidence = inner.advance_route_evidence(session_idx, &pane_id);
+                fusion::recompute_pane_for_route_evidence(
                     inner,
                     session_idx,
                     watcher,
                     &pane_id,
                     false,
                     "pane_reconciled",
+                    &route_evidence,
                 )
                 .await;
-                messaging::schedule_route_changed(inner, session_idx, &pane_id);
+                messaging::schedule_route_evidence(inner, session_idx, &pane_id, &route_evidence);
             }
             false
         }
@@ -4003,17 +4429,17 @@ async fn debounce_task(
         let Some(evidence_ms) = settled_output_evidence(&mut rx).await else {
             return;
         };
+        let route_evidence = inner.advance_route_evidence(session_idx, &pane_id);
         fusion::recompute_pane_from_output(
             &inner,
             session_idx,
             &watcher,
             &pane_id,
-            false,
-            "output_settled",
             evidence_ms,
+            &route_evidence,
         )
         .await;
-        messaging::schedule_route_changed(&inner, session_idx, &pane_id);
+        messaging::schedule_route_evidence(&inner, session_idx, &pane_id, &route_evidence);
         if rx.changed().await.is_err() {
             return;
         }
@@ -4191,6 +4617,7 @@ mod tests {
             session_registration: StdMutex::new(()),
             events: broadcast::channel(16).0,
             detections: StdMutex::new(HashMap::new()),
+            route_evidence_generations: StdMutex::new(HashMap::new()),
             pane_recomputes: StdMutex::new(HashMap::new()),
             lifecycle_rechecks: StdMutex::new(HashMap::new()),
             registry: StdMutex::new(registry),
@@ -4204,6 +4631,7 @@ mod tests {
             hook_liveness: selftest::HookLiveness::new(),
             inject_pause: StdMutex::new(None),
             fail_chrome_restore: AtomicBool::new(false),
+            fail_next_final_binding_observation: AtomicBool::new(false),
             workspace_ui: StdMutex::new(workspace_ui::WorkspaceUiState::default()),
             shutdown_request: watch::channel(false).0,
             stop: watch::channel(false).1,
@@ -4361,6 +4789,7 @@ mod tests {
             service.admin(),
             mailbox::MailboxSend {
                 addresses: vec![address],
+                recipient_keys: None,
                 subject: "Test".into(),
                 body: String::new(),
                 fyi: false,
@@ -4411,6 +4840,7 @@ mod tests {
                 service.admin(),
                 mailbox::MailboxSend {
                     addresses: vec!["admin".into()],
+                    recipient_keys: None,
                     subject: "Restart".into(),
                     body: "Persisted".into(),
                     fyi: false,
@@ -4436,6 +4866,202 @@ mod tests {
         assert_eq!(inbox[0].entry.message_id, message_id);
         second.shutdown().await;
         drop(second);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_boots_settle_a_rename_linked_legacy_journal_once() {
+        let home = cyclops_proto::scratch::scratch_dir(&format!(
+            "cyc-linked-boot-replay-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state_root = StateRoot::open_or_create(&home).unwrap();
+        let configured =
+            LedgerWriter::open(&state_root, Path::new("ledger/research.ndjson"), "old-boot")
+                .unwrap();
+        let linked =
+            LedgerWriter::open(&state_root, Path::new("ledger/runtime.ndjson"), "old-boot")
+                .unwrap();
+
+        let legacy_id = "m-abcdef";
+        let skewed_id = "m-123456";
+        let assert_terminal_history =
+            |configured_lines: Vec<LedgerLine>, linked_lines: Vec<LedgerLine>| {
+                // The replay traversal presents a family descendants-first
+                // and configured-root-last. Wall clocks in the older file
+                // may be ahead; causal family order still decides.
+                let history = history::merge_files(&[linked_lines, configured_lines], None);
+                let records = history
+                    .iter()
+                    .filter(|line| line.id == legacy_id)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    records.len(),
+                    1,
+                    "linked history must expose one message after recovery"
+                );
+                assert_eq!(
+                    records[0].deliveries[0].state,
+                    cyclops_proto::DeliveryState::AttentionRequired,
+                    "the terminal root fact must dominate the linked submitted copy"
+                );
+                let gating = history
+                    .iter()
+                    .filter(|line| line.id == skewed_id)
+                    .collect::<Vec<_>>();
+                assert_eq!(gating.len(), 1, "the skewed chain remains one message");
+                assert_eq!(
+                    gating[0].deliveries[0].state,
+                    cyclops_proto::DeliveryState::RetryQueued,
+                    "the root retry fact must follow the future-dated linked gating fact"
+                );
+            };
+        let mut message = daemon_line(Kind::Msg, legacy_id.into(), json!({"hosted": ["%0"]}));
+        message.from = "admin".into();
+        message.to = vec!["%0".into()];
+        message.subject = Some("linked before restart".into());
+        message.body = Some("body".into());
+        message.deliveries = vec![cyclops_proto::Delivery {
+            to: "%0".into(),
+            state: cyclops_proto::DeliveryState::Submitted,
+            verified_by: None,
+            attempts: 1,
+            ts: unix_ms(),
+            cause: None,
+        }];
+        linked.append(message).unwrap();
+        let future_ms = unix_ms().saturating_add(86_400_000);
+        let mut gating = daemon_line(Kind::Msg, skewed_id.into(), json!({"hosted": ["%1"]}));
+        gating.ts = future_ms;
+        gating.from = "admin".into();
+        gating.to = vec!["%1".into()];
+        gating.subject = Some("future-dated before restart".into());
+        gating.body = Some("body".into());
+        gating.deliveries = vec![cyclops_proto::Delivery {
+            to: "%1".into(),
+            state: cyclops_proto::DeliveryState::Gating,
+            verified_by: None,
+            attempts: 1,
+            ts: future_ms,
+            cause: None,
+        }];
+        linked.append(gating).unwrap();
+        configured
+            .append(daemon_line(
+                Kind::System,
+                "e-alias".into(),
+                json!({
+                    "event": "session_slot_aliased",
+                    "session": "research",
+                    "canonical_session_idx": 1,
+                    "canonical_journal": "runtime.ndjson",
+                }),
+            ))
+            .unwrap();
+        drop(linked);
+        drop(configured);
+        drop(state_root);
+
+        let mut cfg = Config::defaults(&home);
+        cfg.sessions = vec!["research".into()];
+        let daemon = boot(cfg.clone()).await.unwrap();
+        assert_eq!(
+            daemon
+                .inner
+                .engine
+                .mint_msg_id_from(&[legacy_id, skewed_id, "m-fedcba"]),
+            "m-fedcba",
+            "an id visible through linked history must be rejected by the real mint path"
+        );
+
+        let lines = daemon
+            .inner
+            .session(0)
+            .unwrap()
+            .ledger
+            .read_after(0)
+            .unwrap();
+        let settlements = lines
+            .iter()
+            .filter(|line| {
+                line.id == legacy_id
+                    && line.kind == Kind::State
+                    && line.data.as_ref().is_some_and(|data| {
+                        data["to_state"] == "attention_required"
+                            && data["cause"] == "daemon_restart"
+                    })
+            })
+            .count();
+        assert_eq!(settlements, 1, "linked in-flight chain must settle once");
+        let retries = lines
+            .iter()
+            .filter(|line| {
+                line.id == skewed_id
+                    && line.kind == Kind::State
+                    && line.data.as_ref().is_some_and(|data| {
+                        data["to_state"] == "retry_queued" && data["cause"] == "daemon_restart"
+                    })
+            })
+            .count();
+        assert_eq!(retries, 1, "linked gating chain must requeue once");
+        let linked_lines = cyclops_ledger::read_after(
+            &daemon.inner.state_root,
+            Path::new("ledger/runtime.ndjson"),
+            0,
+        )
+        .unwrap();
+        assert_terminal_history(lines, linked_lines);
+
+        daemon.shutdown().await;
+        drop(daemon);
+
+        let daemon = boot(cfg).await.unwrap();
+        let configured_lines = daemon
+            .inner
+            .session(0)
+            .unwrap()
+            .ledger
+            .read_after(0)
+            .unwrap();
+        let settlements = configured_lines
+            .iter()
+            .filter(|line| {
+                line.id == legacy_id
+                    && line.kind == Kind::State
+                    && line.data.as_ref().is_some_and(|data| {
+                        data["to_state"] == "attention_required"
+                            && data["cause"] == "daemon_restart"
+                    })
+            })
+            .count();
+        assert_eq!(
+            settlements, 1,
+            "a linked chain already settled into its root must not settle again"
+        );
+        let retries = configured_lines
+            .iter()
+            .filter(|line| {
+                line.id == skewed_id
+                    && line.kind == Kind::State
+                    && line.data.as_ref().is_some_and(|data| {
+                        data["to_state"] == "retry_queued" && data["cause"] == "daemon_restart"
+                    })
+            })
+            .count();
+        assert_eq!(
+            retries, 1,
+            "future timestamps must not make a linked gating fact requeue twice"
+        );
+        let linked_lines = cyclops_ledger::read_after(
+            &daemon.inner.state_root,
+            Path::new("ledger/runtime.ndjson"),
+            0,
+        )
+        .unwrap();
+        assert_terminal_history(configured_lines, linked_lines);
+
+        daemon.shutdown().await;
+        drop(daemon);
         std::fs::remove_dir_all(home).unwrap();
     }
 
@@ -5079,7 +5705,9 @@ process_names = ["never"]
             .unwrap()
             .insert((pane.clone(), agent), "test-agent".into());
         inner.hook_liveness.open(&pane);
-        inner.hook_liveness.record(&pane, "Stop", 1, agent, "test");
+        let _ = inner
+            .hook_liveness
+            .bind_diagnostic(&pane, "Stop", 1, agent, "test");
         let reserved = inner
             .hook_liveness
             .binding(&pane, agent, "reserved-manifest")
@@ -6023,6 +6651,402 @@ process_names = ["never"]
         assert_eq!(slot.name(), "new-name");
 
         watcher.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A terminal workspace is initially watched under its temporary tmux
+    /// name, then renamed to the configured workspace name. If that configured
+    /// slot was still detached, the rename used to leave two live watchers for
+    /// one tmux session: status rendered the session twice and raw pane-id
+    /// resolution failed as ambiguous. The live source slot must become the
+    /// sole canonical owner while the configured slot remains readable only as
+    /// a historical alias.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_runtime_session_renamed_onto_a_configured_slot_has_one_live_owner() {
+        if !cyclops_testrig::tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let server = cyclops_testrig::TmuxServer::new("rename-configured-collision");
+        server.run_ok(&["new-session", "-d", "-s", "yahirh", "/bin/sh"]);
+
+        let mut inner = bare_inner("cyc-rename-configured-collision");
+        let home = inner.cfg.home.clone();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        {
+            let mutable = Arc::get_mut(&mut inner).expect("bare inner is unique");
+            mutable.cfg.tmux_socket = Some(server.socket().to_string());
+            mutable.cfg.tmux_config = Some(PathBuf::from("/dev/null"));
+            mutable.shutdown_request = stop_tx.clone();
+            mutable.stop = stop_rx;
+        }
+
+        // The rename pause below lets this configured slot's real session task
+        // attach before the runtime watcher handles the edge.
+        let configured_ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/research.ndjson"),
+            &inner.boot_id,
+        )
+        .unwrap();
+        let configured = Arc::new(SessionSlot::new(
+            "research".into(),
+            Arc::new(configured_ledger),
+        ));
+        let configured_idx = {
+            let mut sessions = inner.sessions.lock().unwrap();
+            sessions.push(Arc::clone(&configured));
+            sessions.len() - 1
+        };
+        let (runtime_idx, added) = watch_session(&inner, "yahirh")
+            .await
+            .expect("runtime session is watched");
+        assert!(added);
+        let runtime = inner.session(runtime_idx).unwrap();
+        let runtime_binding = wait_for_session_binding(&runtime, None).await;
+        assert!(runtime.link.lock().unwrap().attached);
+
+        let (rename_entered_tx, rename_entered_rx) = std::sync::mpsc::channel();
+        let rename_release = Arc::new(std::sync::Barrier::new(2));
+        *runtime.rename_pause.lock().unwrap() = Some(SessionRenamePause {
+            entered: rename_entered_tx,
+            release: Arc::clone(&rename_release),
+        });
+        server.run_ok(&["rename-session", "-t", "=yahirh", "research"]);
+        rename_entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("runtime rename handler reaches the registration race");
+        let configured_task = tokio::spawn(session_task(
+            Arc::clone(&inner),
+            configured_idx,
+            inner.stop.clone(),
+        ));
+        let configured_binding = wait_for_session_binding(&configured, None).await;
+        assert!(configured.link.lock().unwrap().attached);
+        assert_eq!(
+            configured_binding.session_instance_id(),
+            runtime_binding.session_instance_id(),
+            "both live watchers must be proven to follow the same tmux session"
+        );
+        rename_release.wait();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if configured.alias_of() == Some(runtime_idx) && runtime.name() == "research" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("rename collision is coalesced");
+
+        tokio::time::timeout(Duration::from_secs(5), configured_task)
+            .await
+            .expect("active retired task exits")
+            .expect("retired task does not panic");
+        {
+            let link = configured.link.lock().unwrap();
+            assert!(!link.attached);
+            assert!(link.watcher.is_none());
+        }
+
+        assert_eq!(inner.session_count(), 2, "both ledger indices remain");
+        assert!(inner.session(configured_idx).is_some());
+        assert_eq!(inner.session_index("research"), Some(runtime_idx));
+        let active = inner.active_session_slots();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].0, runtime_idx);
+
+        let live_identities: Vec<_> = active
+            .iter()
+            .filter_map(|(idx, slot)| {
+                let link = slot.link.lock().unwrap();
+                (link.attached && link.watcher.is_some())
+                    .then(|| (*idx, link.identity.as_ref().unwrap().session_instance_id()))
+            })
+            .collect();
+        assert_eq!(
+            live_identities,
+            vec![(runtime_idx, runtime_binding.session_instance_id())]
+        );
+        let mailbox = mailbox_routes(&inner, None);
+        assert_eq!(mailbox.len(), 1);
+        assert_eq!(mailbox[0].session_idx, runtime_idx);
+        assert_eq!(
+            mailbox[0].instance_id,
+            runtime_binding.session_instance_id()
+        );
+
+        let status = server::status_result(&inner, false);
+        assert_eq!(status.sessions.len(), 1);
+        assert_eq!(status.sessions[0].name, "research");
+        assert_eq!(status.sessions[0].panes.len(), 1);
+        let pane_id = status.sessions[0].panes[0].pane_id.clone();
+        assert_eq!(
+            inner.resolve_recipient(&pane_id),
+            Some((runtime_idx, pane_id.clone()))
+        );
+        let labeled = label_pane(&inner, &pane_id, Some("gemini-research".into()), None)
+            .await
+            .expect("a raw pane id remains labelable");
+        assert_eq!(labeled["label"], "gemini-research");
+
+        let alias_facts = configured.ledger.read_after(0).unwrap();
+        assert!(alias_facts.iter().any(|line| {
+            line.data
+                .as_ref()
+                .is_some_and(|data| data["event"] == "session_slot_aliased")
+        }));
+        let alias_line_count = alias_facts.len();
+        delivery::admin_notify(
+            &inner,
+            cyclops_proto::NotifyLevel::Fyi,
+            "canonical-only notification",
+            "alias ledgers are historical",
+            None,
+            None,
+            delivery::About::default(),
+        );
+        assert_eq!(
+            configured.ledger.read_after(0).unwrap().len(),
+            alias_line_count,
+            "global live notifications must not extend a retired ledger"
+        );
+        assert!(runtime
+            .ledger
+            .read_after(0)
+            .unwrap()
+            .iter()
+            .any(|line| { line.subject.as_deref() == Some("canonical-only notification") }));
+
+        let _ = stop_tx.send(true);
+        let tasks = std::mem::take(&mut *inner.extra_tasks.lock().unwrap());
+        for task in tasks {
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("runtime session task stops")
+                .expect("runtime session task does not panic");
+        }
+        drop(runtime);
+        drop(configured);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// The opposite registration order is equally important: the runtime
+    /// rename can retire the configured slot before its task ever publishes.
+    /// Starting that task afterwards must observe the alias and exit without
+    /// attaching a second watcher or route.
+    #[tokio::test]
+    async fn a_rename_that_wins_registration_prevents_the_configured_slot_from_publishing() {
+        if !cyclops_testrig::tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let server = cyclops_testrig::TmuxServer::new("rename-wins-registration");
+        server.run_ok(&["new-session", "-d", "-s", "yahirh", "/bin/sh"]);
+
+        let mut inner = bare_inner("cyc-rename-wins-registration");
+        let home = inner.cfg.home.clone();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        {
+            let mutable = Arc::get_mut(&mut inner).expect("bare inner is unique");
+            mutable.cfg.tmux_socket = Some(server.socket().to_string());
+            mutable.cfg.tmux_config = Some(PathBuf::from("/dev/null"));
+            mutable.shutdown_request = stop_tx.clone();
+            mutable.stop = stop_rx;
+        }
+
+        let configured_ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/research.ndjson"),
+            &inner.boot_id,
+        )
+        .unwrap();
+        let configured = Arc::new(SessionSlot::new(
+            "research".into(),
+            Arc::new(configured_ledger),
+        ));
+        let configured_idx = {
+            let mut sessions = inner.sessions.lock().unwrap();
+            sessions.push(Arc::clone(&configured));
+            sessions.len() - 1
+        };
+
+        let (runtime_idx, added) = watch_session(&inner, "yahirh")
+            .await
+            .expect("runtime session is watched");
+        assert!(added);
+        let runtime = inner.session(runtime_idx).unwrap();
+        wait_for_session_binding(&runtime, None).await;
+
+        server.run_ok(&["rename-session", "-t", "=yahirh", "research"]);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if configured.alias_of() == Some(runtime_idx) && runtime.name() == "research" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("rename retires the unpublished configured slot");
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::spawn(session_task(
+                Arc::clone(&inner),
+                configured_idx,
+                inner.stop.clone(),
+            )),
+        )
+        .await
+        .expect("retired configured task exits")
+        .expect("retired configured task does not panic");
+        {
+            let link = configured.link.lock().unwrap();
+            assert!(!link.attached);
+            assert!(link.watcher.is_none());
+            assert!(link.identity.is_none());
+        }
+        assert_eq!(inner.session_index("research"), Some(runtime_idx));
+        assert_eq!(inner.active_session_slots().len(), 1);
+        let pane_id = runtime
+            .link
+            .lock()
+            .unwrap()
+            .mailbox_panes
+            .keys()
+            .next()
+            .expect("runtime watcher published one pane")
+            .clone();
+        assert_eq!(
+            inner.resolve_recipient(&pane_id),
+            Some((runtime_idx, pane_id))
+        );
+
+        let _ = stop_tx.send(true);
+        let tasks = std::mem::take(&mut *inner.extra_tasks.lock().unwrap());
+        for task in tasks {
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("runtime session task stops")
+                .expect("runtime session task does not panic");
+        }
+        drop(runtime);
+        drop(configured);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_configured_alias_keeps_the_runtime_journal_in_history_after_restart() {
+        let tag = "cyc-session-alias-history";
+        let inner = bare_inner(tag);
+        let home = inner.cfg.home.clone();
+        let configured_ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/research.ndjson"),
+            &inner.boot_id,
+        )
+        .unwrap();
+        let runtime_ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/yahirh.ndjson"),
+            &inner.boot_id,
+        )
+        .unwrap();
+        let configured = Arc::new(SessionSlot::new(
+            "research".into(),
+            Arc::new(configured_ledger),
+        ));
+        let runtime = Arc::new(SessionSlot::new("yahirh".into(), Arc::new(runtime_ledger)));
+        inner
+            .sessions
+            .lock()
+            .unwrap()
+            .extend([Arc::clone(&configured), Arc::clone(&runtime)]);
+
+        let mut before = daemon_line(Kind::Msg, "m-1-before-rename".into(), Value::Null);
+        before.from = "admin".into();
+        before.to = vec!["reviewer".into()];
+        runtime.ledger.append(before).unwrap();
+        rename_session_slot_locked(&inner, 1, "research".into(), None);
+        std::thread::sleep(Duration::from_millis(2));
+        let mut after = daemon_line(Kind::Msg, "m-2-after-rename".into(), Value::Null);
+        after.from = "admin".into();
+        after.to = vec!["reviewer".into()];
+        runtime.ledger.append(after).unwrap();
+
+        // A restart recreates only the configured slot. Its durable alias fact
+        // must keep the runtime-created journal in the history source set.
+        *inner.sessions.lock().unwrap() = vec![Arc::clone(&configured)];
+        let history = history::msg_history(
+            &inner,
+            cyclops_proto::HistoryParams {
+                with: None,
+                from: None,
+                to: None,
+                limit: 10,
+                cursor: None,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        let ids = history["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|line| line["id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            ["m-1-before-rename", "m-2-after-rename"],
+            "both sides of the rename must survive exactly once and in order: {history}"
+        );
+
+        drop(runtime);
+        drop(configured);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn repeated_session_collisions_keep_every_alias_one_hop_from_the_owner() {
+        let tag = "cyc-session-alias-flat";
+        let inner = bare_inner(tag);
+        let home = inner.cfg.home.clone();
+        let add_slot = |name: &str| {
+            let ledger = LedgerWriter::open(
+                &inner.state_root,
+                &PathBuf::from("ledger").join(format!("{name}.ndjson")),
+                &inner.boot_id,
+            )
+            .unwrap();
+            let slot = Arc::new(SessionSlot::new(name.into(), Arc::new(ledger)));
+            inner.sessions.lock().unwrap().push(Arc::clone(&slot));
+            slot
+        };
+
+        let configured = add_slot("research");
+        let first = add_slot("first");
+        rename_session_slot_locked(&inner, 1, "research".into(), None);
+        assert_eq!(configured.alias_of(), Some(1));
+
+        let second = add_slot("second");
+        rename_session_slot_locked(&inner, 2, "research".into(), None);
+
+        assert_eq!(first.alias_of(), Some(2));
+        assert_eq!(configured.alias_of(), Some(2));
+        assert!(second.is_canonical());
+        assert_eq!(inner.active_session_slots().len(), 1);
+
+        drop(second);
+        drop(first);
+        drop(configured);
+        drop(inner);
         let _ = std::fs::remove_dir_all(home);
     }
 

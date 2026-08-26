@@ -53,12 +53,16 @@ fn row(
         wake,
         cause: None,
         pre_write_cause: None,
+        pre_write_block: None,
+        wake_block: None,
+        pane_width_block: None,
         current_route: None,
         fifo_position: Some(1),
         needs_action: true,
         seq: 1,
         updated_at: 1000,
         direction,
+        ..Default::default()
     }
 }
 
@@ -266,6 +270,46 @@ fn a_blocked_wake_offers_one_exact_recipient_scoped_withdrawal() {
 }
 
 #[test]
+fn a_width_block_says_what_was_observed_and_required() {
+    let mut row = blocked();
+    row.pre_write_cause = Some(NotificationPreWriteCause::WriteReadinessChanged);
+    row.pane_width_block = Some((59, 60));
+
+    let frame = render(&opened(&row, Loaded::default()), 80, 24).join("\n");
+    assert!(
+        frame.contains("pane too narrow (59, requires 60)"),
+        "{frame}"
+    );
+    assert!(!frame.contains("write readiness changed"), "{frame}");
+}
+
+/// The daemon's named block is the exact reason; the enum cause it was
+/// recorded under is the fallback for rows written before the name existed.
+#[test]
+fn a_named_block_is_preferred_over_its_enum_cause() {
+    let mut row = blocked();
+    row.pre_write_cause = Some(NotificationPreWriteCause::WriteReadinessChanged);
+    row.pre_write_block = Some("hook_admission_unproven".into());
+
+    let frame = render(&opened(&row, Loaded::default()), 80, 24).join("\n");
+    assert!(
+        frame.contains("wake blocked before write: hook admission unproven"),
+        "{frame}"
+    );
+    assert!(!frame.contains("write readiness changed"), "{frame}");
+}
+
+#[test]
+fn a_blocked_detail_names_the_durable_scheduler_cause() {
+    let mut row = blocked();
+    row.wake_block = Some(cyclops_proto::MessageWakeBlock::WorkerSupervisorExited);
+
+    let frame = render(&opened(&row, Loaded::default()), 80, 24).join("\n");
+    assert!(frame.contains("worker supervisor exited"), "{frame}");
+    assert!(!frame.contains("scheduler state unavailable"), "{frame}");
+}
+
+#[test]
 fn every_daemon_authorized_unwritten_wake_offers_withdrawal() {
     for wake in [WakeWord::Queued, WakeWord::Gating] {
         let mut row = row(
@@ -345,6 +389,10 @@ fn destructive_actions_confirm_by_name_and_cancel_clean() {
         sentence.contains(&attempt(7).to_string()),
         "the confirmation does not name the attempt: {sentence}"
     );
+    assert!(
+        sentence.contains("reviewer") && sentence.contains(&agent("%1").to_string()),
+        "the confirmation does not name the frozen broadcast recipient: {sentence}"
+    );
     assert!(sentence.contains("discard"), "{sentence}");
     assert_eq!(*d.stage(), Stage::Confirming(Action::AttentionDiscard));
 
@@ -372,6 +420,28 @@ fn destructive_actions_confirm_by_name_and_cancel_clean() {
     let mut d = opened(&outbound(), Loaded::default());
     assert!(matches!(d.request(Action::Reply), Request::Refused(_)));
     assert_eq!(*d.stage(), Stage::Open);
+}
+
+#[test]
+fn a_broadcast_action_names_the_frozen_recipient() {
+    let mut selected = alarmed();
+    selected.target = QueueTarget::new(MessageId::new("m-001").unwrap(), agent("%2"));
+    selected.recipient = agent("%2");
+    selected.recipient_label = "codex-reviewer".into();
+    let mut detail = opened(
+        &selected,
+        Loaded {
+            checks: checks(true),
+            ..Loaded::default()
+        },
+    );
+
+    let Request::Confirm(sentence) = detail.request(Action::AttentionDiscard) else {
+        panic!("broadcast recipient action did not ask for confirmation");
+    };
+    assert!(sentence.contains("codex-reviewer"), "{sentence}");
+    assert!(sentence.contains(&agent("%2").to_string()), "{sentence}");
+    assert!(!sentence.contains(&agent("%1").to_string()), "{sentence}");
 }
 
 /// A row that vanished under an open detail freezes it rather than
@@ -768,6 +838,7 @@ mod through_the_app {
     pub fn snapshot(seq: u64, rows: Vec<MessageSnapshotRow>) -> MessagesSnapshotResult {
         MessagesSnapshotResult {
             workspace_id: workspace(),
+            caller: None,
             workspace_seq: seq,
             counts: MessagesSnapshotCounts {
                 visible_messages: rows.len() as u64,
@@ -782,6 +853,7 @@ mod through_the_app {
                 open_attention_entries: 0,
             },
             rows,
+            mailbox_attention: Vec::new(),
         }
     }
 
@@ -792,12 +864,17 @@ mod through_the_app {
             } else {
                 MessageNotificationState::Notified
             },
+            wake_block: None,
             quota_state: None,
             settlement: None,
             operator_withdrawn: None,
             attempt_id: alarmed.then(|| attempt(n)),
             cause: alarmed.then_some(NotificationAttentionCause::VerifyFailed),
+            verify_outcome: None,
             pre_write_cause: None,
+            pre_write_block: None,
+            pre_write_pane_width: None,
+            pre_write_required_pane_width: None,
             attention_cleared: alarmed.then_some(false),
             resolution: None,
             resolution_intent: None,
@@ -924,7 +1001,9 @@ mod through_the_app {
         // the connection itself do not.
         app.refresh.connected();
         let request = app.wants_messages().expect("connect owes a snapshot");
-        assert!(app.apply_messages_response(request, &snapshot(seq, rows)));
+        assert!(app
+            .apply_messages_response(request, &snapshot(seq, rows))
+            .is_some());
         app
     }
 
@@ -2861,10 +2940,12 @@ mod connection {
         assert_eq!(*app.detail.as_ref().unwrap().stage(), Stage::Open);
 
         let request = app.wants_messages().expect("reconnect owes a snapshot");
-        assert!(app.apply_messages_response(
-            request,
-            &snapshot(10, vec![wire_lifecycle("m-001", Some(7), false)])
-        ));
+        assert!(app
+            .apply_messages_response(
+                request,
+                &snapshot(10, vec![wire_lifecycle("m-001", Some(7), false)])
+            )
+            .is_some());
         assert!(app.refresh.may_mutate());
         assert_eq!(app.detail.as_ref().unwrap().target(), &frozen);
 
@@ -2920,10 +3001,12 @@ mod connection {
         );
         app.refresh.connected();
         let request = app.wants_messages().expect("reconnect owes a snapshot");
-        assert!(app.apply_messages_response(
-            request,
-            &snapshot(10, vec![wire_lifecycle("m-001", Some(7), false)])
-        ));
+        assert!(app
+            .apply_messages_response(
+                request,
+                &snapshot(10, vec![wire_lifecycle("m-001", Some(7), false)])
+            )
+            .is_some());
         assert_eq!(app.detail.as_ref().unwrap().target(), &frozen);
         assert!(app.refresh.may_mutate());
 
@@ -2952,7 +3035,9 @@ mod connection {
 
         app.refresh.connected();
         let request = app.wants_messages().expect("connect owes a snapshot");
-        assert!(app.apply_messages_response(request, &snapshot(1, Vec::new())));
+        assert!(app
+            .apply_messages_response(request, &snapshot(1, Vec::new()))
+            .is_some());
         app.notice = Some("snapshot refused safely".into());
         let noticed = cyclops_ui::build(&mut app, 80, 24).join("\n");
         assert!(noticed.contains("snapshot refused safely"), "{noticed}");
