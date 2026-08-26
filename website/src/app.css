@@ -181,6 +181,13 @@ body {
 	-webkit-font-smoothing: antialiased;
 }
 
+/* The signal field is a fixed layer at z-index 0; the page sits on it. */
+main,
+footer {
+	position: relative;
+	z-index: 1;
+}
+
 #install,
 #how-it-works {
 	scroll-margin-top: 96px;

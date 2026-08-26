@@ -1,14 +1,11 @@
 <script lang="ts">
 	import InstallCommand from './InstallCommand.svelte';
 	import HeroVisual from './HeroVisual.svelte';
-	import SignalField from './SignalField.svelte';
 	import GithubMark from './GithubMark.svelte';
 	import { REPO_URL } from '$lib/config';
 </script>
 
-<div class="hero-wrap">
-	<SignalField />
-	<section class="section hero">
+<section class="section hero">
 		<div class="copy">
 			<div class="eyebrow">// Open source coordination for coding agents</div>
 			<h1 class="pixel">CYCLOPS</h1>
@@ -32,18 +29,10 @@
 				Live mock · click an agent, a pane, or a tab
 			</p>
 		</div>
-	</section>
-</div>
+</section>
 
 <style>
-	.hero-wrap {
-		position: relative;
-		overflow: hidden;
-	}
-
 	.hero {
-		position: relative;
-		z-index: 1;
 		display: grid;
 		grid-template-columns: minmax(0, 0.82fr) minmax(0, 1.18fr);
 		gap: 48px;

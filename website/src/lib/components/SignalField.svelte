@@ -51,6 +51,11 @@
 				cleanups.push(() => document.removeEventListener('visibilitychange', sync));
 
 				cleanups.push(onSignal((from, to) => field?.pulse(from, to)));
+
+				const onScroll = () => field?.setScroll(window.scrollY);
+				onScroll();
+				window.addEventListener('scroll', onScroll, { passive: true });
+				cleanups.push(() => window.removeEventListener('scroll', onScroll));
 				ready = true;
 			})
 			.catch(() => {
@@ -70,22 +75,16 @@
 </div>
 
 <style>
+	/* The one layer under the whole page. Everything else is stacked above
+	   it (see app.css), and the panels' own grounds cover it where there is
+	   reading to do. */
 	.field {
-		position: absolute;
+		position: fixed;
 		inset: 0;
+		z-index: 0;
 		opacity: 0;
 		transition: opacity 1.2s ease;
 		pointer-events: none;
-		/* The field belongs to the hero: it dissolves into the paper before
-		   the first section starts, and under the navbar. */
-		mask-image: linear-gradient(to bottom, transparent 0, black 80px, black 70%, transparent 100%);
-		-webkit-mask-image: linear-gradient(
-			to bottom,
-			transparent 0,
-			black 80px,
-			black 70%,
-			transparent 100%
-		);
 	}
 
 	.field.ready {

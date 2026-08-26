@@ -8,6 +8,7 @@
 	import OpenSource from '$lib/components/OpenSource.svelte';
 	import FinalCta from '$lib/components/FinalCta.svelte';
 	import Footer from '$lib/components/Footer.svelte';
+	import SignalField from '$lib/components/SignalField.svelte';
 </script>
 
 <svelte:head>
@@ -18,6 +19,7 @@
 	/>
 </svelte:head>
 
+<SignalField />
 <Navbar />
 <main>
 	<Hero />

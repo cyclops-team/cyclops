@@ -1,6 +1,8 @@
-// The signal field behind the hero: a drifting constellation of nodes, the
+// The signal field behind the page: a drifting constellation of nodes, the
 // short wires between the ones that are near each other, and the pulses
-// that run along those wires. Three nodes stand for the three agents in
+// that run along those wires. It sits fixed under everything and drifts
+// against the scroll, so the panels and pane frames read as paper laid
+// over it. Three nodes stand for the three agents in
 // the workspace mock beside it, and when the mock delivers a message the
 // field runs the same pulse between the same two nodes.
 //
@@ -29,8 +31,10 @@ export interface Field {
 	setTheme(theme: FieldTheme): void;
 	/** Run a pulse from one agent node to another (indices into `agents`). */
 	pulse(from: number, to: number): void;
-	/** Pause or resume the frame loop, e.g. when the hero scrolls away. */
+	/** Pause or resume the frame loop, e.g. when the tab is hidden. */
 	setActive(active: boolean): void;
+	/** The page's scroll offset in px; the field drifts against it. */
+	setScroll(px: number): void;
 	dispose(): void;
 }
 
@@ -227,6 +231,13 @@ export function createField(
 	let spreadY = 1;
 	const spreadZ = 5;
 	let link = 4;
+	// World units per CSS pixel of canvas height, for the scroll parallax.
+	let worldPerPx = 0;
+	let scrollTarget = 0;
+	let scrollOffset = 0;
+	// The field moves at a fraction of the page, so it reads as a layer
+	// behind the paper rather than as paint on it.
+	const PARALLAX = 0.12;
 	function resize() {
 		const w = canvas.clientWidth || 1;
 		const h = canvas.clientHeight || 1;
@@ -236,6 +247,7 @@ export function createField(
 		const halfH = camera.position.z * Math.tan((camera.fov * Math.PI) / 360);
 		spreadY = halfH * 1.15;
 		spreadX = halfH * camera.aspect * 1.15;
+		worldPerPx = (2 * halfH) / h;
 		// Wire reach scales with the mean spacing so density reads the
 		// same on a phone and on a wide desktop.
 		const spacing = Math.sqrt((4 * spreadX * spreadY) / COUNT);
@@ -279,6 +291,7 @@ export function createField(
 			}
 			flash[i] = Math.max(0, flash[i] - dt * 1.6);
 		}
+		scrollOffset += (scrollTarget * worldPerPx * PARALLAX - scrollOffset) * 0.08;
 		project();
 
 		// Wires between near neighbours, coloured toward the ground as
@@ -373,9 +386,15 @@ export function createField(
 	}
 
 	function project() {
+		// Scrolling lifts the field; a node that leaves the top comes back
+		// in at the bottom. The spread runs past the viewport on both
+		// sides, so the jump happens out of view.
+		const span = 2 * spreadY;
 		for (let i = 0; i < COUNT; i++) {
+			let y = norm[i * 3 + 1] * spreadY + scrollOffset + spreadY;
+			y = y - Math.floor(y / span) * span - spreadY;
 			world[i * 3] = norm[i * 3] * spreadX;
-			world[i * 3 + 1] = norm[i * 3 + 1] * spreadY;
+			world[i * 3 + 1] = y;
 			world[i * 3 + 2] = norm[i * 3 + 2] * spreadZ;
 		}
 		nodeGeo.getAttribute('position').needsUpdate = true;
@@ -437,6 +456,9 @@ export function createField(
 			);
 		},
 		setActive,
+		setScroll(px) {
+			scrollTarget = px;
+		},
 		dispose() {
 			running = false;
 			cancelAnimationFrame(raf);
