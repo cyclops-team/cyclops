@@ -5,7 +5,9 @@
 
 use std::collections::HashMap;
 
-use cyclops_proto::{Kind, MessageId, RecipientKey};
+use cyclops_proto::{
+    Kind, MessageId, NotificationAttentionCause, NotificationPreWriteCause, RecipientKey,
+};
 
 use crate::avatar::{Avatar, AvatarRegistry};
 use crate::detail::{Detail, Draft, Stage, ThreadEntry, DRAFT_MAX_BYTES};
@@ -362,12 +364,9 @@ impl TimelineItem {
                 let is_broadcast = row.recipient_count > 1 || row.kind == Kind::Fyi;
 
                 let (authorized_body, thread_history) = if let Some(d) = detail {
-                    if d.row.message_id == row.message_id {
-                        if let Some(loaded) = d.loaded() {
-                            (loaded.body.clone(), loaded.thread.clone())
-                        } else {
-                            (None, Vec::new())
-                        }
+                    if d.target().target.message_id == row.message_id {
+                        let loaded = d.loaded();
+                        (loaded.body.clone(), loaded.thread.clone())
                     } else {
                         (None, Vec::new())
                     }
