@@ -2754,6 +2754,8 @@ fn clear_alarm_ids(
         println!("cleared {}", style.accent(&id));
         if let Some(summary) = summaries.get(&id) {
             println!("{}", alarm_cleared_consequence(summary));
+        } else {
+            println!("{}", copy::alarm_cleared_without_summary(&id));
         }
     }
     0
@@ -3667,6 +3669,13 @@ mod tests {
         assert!(
             !line.contains("requeue"),
             "a cleared attempt is not eligible for requeue: {line}"
+        );
+
+        let fallback = copy::alarm_cleared_without_summary("att-old");
+        assert!(fallback.contains("acknowledged only"), "{fallback}");
+        assert!(
+            fallback.contains("attention show att-old --diff"),
+            "{fallback}"
         );
     }
 

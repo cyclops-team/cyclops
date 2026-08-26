@@ -58,6 +58,15 @@ pub fn alarm_cleared_consequence(
     )
 }
 
+/// Mixed-version fallback when an older daemon returns cleared ids without
+/// the additive locked summaries. The command must still state that alarm
+/// clearance does not resolve the notification or message.
+pub fn alarm_cleared_without_summary(id: &str) -> String {
+    format!(
+        "  acknowledged only · the daemon did not return the locked summary for attempt {id} · inspect current state with cyclops attention show {id} --diff, or update and restart the matched Cyclops pair"
+    )
+}
+
 /// A claim by id took a later message; the oldest pending one still holds
 /// this recipient's queue head and its wake.
 pub fn claim_skipped_oldest(oldest: &str) -> String {
