@@ -9305,7 +9305,7 @@ mod tests {
                     start.wait();
                     engine
                         .enqueue_notification_worker(recipient, next, move |_| {
-                            runtime.spawn(async {})
+                            runtime.spawn(std::future::pending::<()>())
                         })
                         .expect("engine is running")
                 }

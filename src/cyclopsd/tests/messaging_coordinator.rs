@@ -12,6 +12,7 @@ use common::{
 };
 use cyclops_proto::{
     Kind, LedgerLine, MessageId, MsgSendParams, NotificationAttemptId, NotificationState,
+    RecipientKey,
 };
 use serde_json::{json, Value};
 
@@ -195,29 +196,40 @@ fn current_notification_attempt(
     lines: &[LedgerLine],
     message_id: &str,
 ) -> Option<NotificationAttemptId> {
-    let mut current_by_recipient = BTreeMap::<String, String>::new();
+    let mut current_by_recipient = BTreeMap::<RecipientKey, NotificationAttemptId>::new();
     for line in lines.iter().filter(|line| line.id == message_id) {
         let Some(data) = line.data.as_ref() else {
             continue;
         };
         match data["type"].as_str() {
             Some("notification_transition" | "notification_requeued") => {
-                let (Some(recipient), Some(attempt_id)) =
-                    (data["recipient"].as_str(), data["attempt_id"].as_str())
+                let Some(recipient) =
+                    serde_json::from_value::<RecipientKey>(data["recipient"].clone()).ok()
                 else {
                     continue;
                 };
-                current_by_recipient.insert(recipient.to_string(), attempt_id.to_string());
+                let Some(attempt_id) = data["attempt_id"]
+                    .as_str()
+                    .and_then(|value| NotificationAttemptId::parse(value).ok())
+                else {
+                    continue;
+                };
+                current_by_recipient.insert(recipient, attempt_id);
             }
             Some("notifications_requeued") => {
                 for requeue in data["requeues"].as_array().into_iter().flatten() {
-                    let (Some(recipient), Some(attempt_id)) = (
-                        requeue["recipient"].as_str(),
-                        requeue["attempt_id"].as_str(),
-                    ) else {
+                    let Some(recipient) =
+                        serde_json::from_value::<RecipientKey>(requeue["recipient"].clone()).ok()
+                    else {
                         continue;
                     };
-                    current_by_recipient.insert(recipient.to_string(), attempt_id.to_string());
+                    let Some(attempt_id) = requeue["attempt_id"]
+                        .as_str()
+                        .and_then(|value| NotificationAttemptId::parse(value).ok())
+                    else {
+                        continue;
+                    };
+                    current_by_recipient.insert(recipient, attempt_id);
                 }
             }
             _ => {}
@@ -231,7 +243,7 @@ fn current_notification_attempt(
     if attempts.next().is_some() {
         return None;
     }
-    NotificationAttemptId::parse(&attempt_id).ok()
+    Some(attempt_id)
 }
 
 fn compact_doorbell(rig: &Rig, message_id: &str) -> String {
@@ -265,7 +277,10 @@ fn current_doorbell_follows_the_attempt_owned_by_a_requeue_fact() {
     let message_id = "m-requeued-doorbell";
     let prior = "att-00000000-0000-4000-8000-000000000001";
     let current = "att-00000000-0000-4000-8000-000000000002";
-    let recipient = "00000000-0000-4000-8000-000000000003/00000000-0000-4000-8000-000000000004/%1";
+    let recipient: RecipientKey =
+        "agent:00000000-0000-4000-8000-000000000003/00000000-0000-4000-8000-000000000004/%1"
+            .parse()
+            .unwrap();
     let lines = vec![
         line(
             1,
@@ -325,10 +340,29 @@ async fn wait_for_pane_mode(rig: &mut Rig, pane: &str, expected: bool) {
     }
 }
 
-async fn resize_pane_and_allow_event(rig: &Rig, pane: &str, width: u32) {
-    let width = width.to_string();
-    rig.tmux.run_ok(&["resize-pane", "-t", pane, "-x", &width]);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+async fn resize_pane_and_allow_event(rig: &mut Rig, pane: &str, width: u32) {
+    let width_arg = width.to_string();
+    rig.tmux
+        .run_ok(&["resize-pane", "-t", pane, "-x", &width_arg]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = rig.ctl.request("status", json!({})).await;
+        let observed = status["result"]["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|session| session["panes"].as_array())
+            .flatten()
+            .any(|row| row["pane_id"] == pane && row["width"].as_u64() == Some(u64::from(width)));
+        if observed {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not observe pane {pane} at width {width}: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 fn pane_pid(rig: &Rig, pane: &str) -> i64 {
@@ -883,7 +917,7 @@ async fn format_3_width_block_writes_nothing_then_reopens_once_on_a_size_edge() 
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
     wait_pane_state(&mut rig, "idle").await;
-    resize_pane_and_allow_event(&rig, &pane, 59).await;
+    resize_pane_and_allow_event(&mut rig, &pane, 59).await;
 
     let sent = send_workspace_message(&rig, "format3-width", "Width", "private body").await;
     let message_id = sent["msg_id"].as_str().unwrap().to_string();
@@ -914,7 +948,7 @@ async fn format_3_width_block_writes_nothing_then_reopens_once_on_a_size_edge() 
         cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH
     );
 
-    resize_pane_and_allow_event(&rig, &pane, cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH).await;
+    resize_pane_and_allow_event(&mut rig, &pane, cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH).await;
     wait_for_notification_state(&mut rig, &message_id, NotificationState::Writing).await;
     assert_eq!(
         notification_state_count(&rig, &message_id, NotificationState::Gating),
@@ -927,7 +961,7 @@ async fn format_3_width_block_writes_nothing_then_reopens_once_on_a_size_edge() 
     );
     assert_eq!(notification_attempts(&rig, &message_id).len(), 1);
 
-    resize_pane_and_allow_event(&rig, &pane, cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH).await;
+    resize_pane_and_allow_event(&mut rig, &pane, cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH).await;
     assert_eq!(
         notification_state_count(&rig, &message_id, NotificationState::Gating),
         2,
@@ -976,7 +1010,7 @@ async fn format_3_resize_between_final_read_and_write_is_caught() {
         .await
         .expect("delivery reached the final pre-write bookend")
         .expect("pause sender stayed open");
-    resize_pane_and_allow_event(&rig, &pane, 59).await;
+    resize_pane_and_allow_event(&mut rig, &pane, 59).await;
     release.add_permits(1);
 
     wait_for_notification_state(&mut rig, &message_id, NotificationState::BlockedPreWrite).await;

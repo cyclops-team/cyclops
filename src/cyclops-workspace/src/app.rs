@@ -5050,7 +5050,7 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut refreshed = false;
         'push: while std::time::Instant::now() < deadline {
-            daemon.push_event(b"{\"event\":{\"kind\":\"state\"}}\n");
+            daemon.push_event(b"{\"event\":\"state\",\"data\":{}}\n");
             let pause = std::time::Instant::now() + Duration::from_millis(100);
             while std::time::Instant::now() < pause {
                 match control_rx.try_recv() {
