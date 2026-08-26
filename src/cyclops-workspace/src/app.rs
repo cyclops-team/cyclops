@@ -871,7 +871,9 @@ pub async fn run_async() -> i32 {
     // entries on the app channel; boot's backfill-then-seed lands before
     // the loop below drains them, which is exactly the order the intake
     // contract wants (crate::event_record's doc).
-    crate::event_record::boot(&mut app.record, &mut app.intake, &app.home);
+    if let Some(warning) = crate::event_record::boot(&mut app.record, &mut app.intake, &app.home) {
+        app.notice.show(warning, Instant::now());
+    }
 
     let mut debounce: Option<Instant> = None;
     let mut reconnect_deadline: Option<Instant> = None;
@@ -2210,22 +2212,28 @@ async fn handle_app_msg(
                 let bootstrap = crate::event_record::load(&app.home);
                 let mut record = cyclops_ui::Record::new();
                 let mut intake = cyclops_ui::Intake::new();
-                crate::event_record::install(&mut record, &mut intake, bootstrap);
+                let warning = crate::event_record::install(&mut record, &mut intake, bootstrap);
                 app.record = record;
                 app.intake = intake;
                 app.stream_reconciling = false;
-                app.notice.show(copy::STREAM_RECONCILED, Instant::now());
+                app.notice.show(
+                    warning.unwrap_or_else(|| copy::STREAM_RECONCILED.to_string()),
+                    Instant::now(),
+                );
             }
             arm(debounce);
         }
         AppMsg::StreamReconciled(bootstrap) => {
             let mut record = cyclops_ui::Record::new();
             let mut intake = cyclops_ui::Intake::new();
-            crate::event_record::install(&mut record, &mut intake, *bootstrap);
+            let warning = crate::event_record::install(&mut record, &mut intake, *bootstrap);
             app.record = record;
             app.intake = intake;
             app.stream_reconciling = false;
-            app.notice.show(copy::STREAM_RECONCILED, Instant::now());
+            app.notice.show(
+                warning.unwrap_or_else(|| copy::STREAM_RECONCILED.to_string()),
+                Instant::now(),
+            );
             arm(debounce);
         }
         // Wake-only: the reload itself runs on the render deadline this
