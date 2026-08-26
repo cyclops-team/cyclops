@@ -1847,7 +1847,7 @@ impl App {
 
 /// Append one error line to `<home>/workspace.log`. The alternate screen
 /// owns stderr while the workspace runs; printing there corrupts the frame.
-fn log_err(home: &std::path::Path, err: &dyn std::fmt::Display) {
+fn log_err(home: &std::path::Path, err: impl std::fmt::Display) {
     use std::io::Write;
     if let Ok(root) = cyclops_state::StateRoot::open_or_create(home) {
         let Ok(mut f) = root.open_append(std::path::Path::new("workspace.log")) else {

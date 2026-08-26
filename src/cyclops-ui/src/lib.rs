@@ -243,7 +243,6 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
     let mut message_follower = MessageFollower::default();
     let mut tick_armed = false;
     let mut key_open = true;
-    let mut next_lane = Lane::Input;
     draw(&mut term, &mut app);
 
     loop {
@@ -265,7 +264,7 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
         };
         let mut quit = false;
         if let Some((lane, first)) = first {
-            next_lane = lane.next();
+            let mut next_lane = lane.next();
             let mut queued = Some(first);
             let mut n = 0;
             while let Some(msg) = queued.take() {

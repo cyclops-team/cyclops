@@ -79,6 +79,7 @@ impl Store {
         *revision = revision.saturating_add(1);
     }
 
+    #[cfg(test)]
     pub(crate) fn has_pending_for(&self, pane: &PaneKey, agent: ProcId, manifest: &str) -> bool {
         self.pending.get(pane).is_some_and(|pending| {
             pending

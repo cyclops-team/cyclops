@@ -3172,13 +3172,6 @@ async fn recompute_pane_with_evidence(
     // was disproved by a lookup that failed to answer, so the binding,
     // the hold, its owner and the turn it waits on are frozen below
     // rather than recomputed, and the verdict refuses.
-    let quota_screen_clear = inner
-        .detections
-        .lock()
-        .expect("detections lock")
-        .get(&route)
-        .filter(|entry| entry.agent == admitted && entry.manifest == manifest_id)
-        .is_some_and(|entry| entry.quota_screen_clear);
     let prior_hold_owner = inner
         .detections
         .lock()
