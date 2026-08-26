@@ -315,6 +315,9 @@ pub fn motion_touches_hover_button(
                     | HitTarget::SidebarDivider
                     | HitTarget::MessagesToggle
                     | HitTarget::MessagesDivider
+                    // The drawer's footer buttons fill under the pointer
+                    // the way the tab strip's `+` does.
+                    | HitTarget::MessagesAction(_)
                     | HitTarget::FileRow { .. }
                     | HitTarget::FileDisclosure { .. }
                     | HitTarget::FileUp

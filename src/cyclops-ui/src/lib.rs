@@ -65,7 +65,8 @@ pub use action_io::{perform, ActionOutcome, ActionRequest, RequestKind, RequestT
 pub use app::{App, Command, Density, RosterRow, RowTarget, View};
 pub use avatar::{Avatar, AvatarRegistry};
 pub use chat::{
-    chat_action_strip, chat_actions, render_chat, ChatAction, ChatRenderContext, ComposerMode,
+    chat_action_line, chat_action_strip, chat_actions, render_chat, render_chat_lines, wrap_words,
+    ChatAction, ChatInk, ChatLine, ChatLineKind, ChatRenderContext, ChatSpan, ComposerMode,
     ComposerState, TimelineItem,
 };
 pub use cyclops_proto::{Attention, AttentionItem, Eye, PaneSnapshot};
@@ -79,7 +80,7 @@ pub use messages::{
 };
 pub use queue::{
     Counts, Direction, FrozenTarget, HumanQueue, MailboxWord, QueueRow, QueueTarget, Scope,
-    Snapshot, WakeWord,
+    SessionFilter, Snapshot, WakeWord,
 };
 pub use stream::{
     Backfilled, EndpointFilter, Entry, EntryKind, Filter, Intake, MessageEndpoints, PingDelivery,

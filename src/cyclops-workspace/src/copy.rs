@@ -318,6 +318,17 @@ pub fn file_sent(reference: &str, pane: &str) -> String {
     format!("{reference} → {pane}")
 }
 
+/// Why keys typed across a control-stream gap were not sent.
+///
+/// The gap is the adapter's own bounded queue overflowing under a burst of
+/// pane output (`cyclops_tmux::control::NOTIFICATION_CAPACITY`), after
+/// which the workspace rebuilds its view from a fresh snapshot and retires
+/// the keys accepted against the old one rather than replay them at a
+/// pane that may have changed underneath. "continuity changed" told the
+/// operator none of that; this names the cause and the one thing to do.
+pub const CONTROL_STREAM_GAP: &str =
+    "the tmux event stream overflowed and the view was rebuilt; keys typed meanwhile were dropped, type them again";
+
 #[cfg(test)]
 mod tests {
     use super::*;

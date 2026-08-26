@@ -15,6 +15,7 @@ use std::collections::HashMap;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
@@ -488,7 +489,7 @@ pub fn paint_messages(
         .ok()
         .map(|d| d.as_millis() as u64);
 
-    let rows = cyclops_ui::render_chat(
+    let rows = cyclops_ui::render_chat_lines(
         queue,
         cyclops_ui::ChatRenderContext {
             detail,
@@ -509,37 +510,68 @@ pub fn paint_messages(
         area.width.saturating_sub(1),
         area.height,
     );
-    let style = theme::chrome_panel(paint);
-    // The action strip is built from the same table the renderer used, at
-    // the same width, so the row it produced here is byte-identical to the
-    // one in `rows`. Matching on that text locates the strip without the
-    // renderer having to report a row index that a later edit could leave
-    // stale; a strip that did not fit produces no spans and no hits.
-    let (strip, spans) = cyclops_ui::chat_action_strip(content_w, retry_available);
-    let strip_row = rows
-        .iter()
-        .rposition(|row| row == &strip)
-        .filter(|_| !spans.is_empty());
+    let pointed = |rect: Rect| {
+        hover.is_some_and(|(col, row)| {
+            col >= rect.x
+                && col < rect.x + rect.width
+                && row >= rect.y
+                && row < rect.y + rect.height
+        })
+    };
+    // Every run is painted with the ink the renderer named for it; the
+    // strip's buttons also register their hit targets, one per button, so
+    // a click lands on exactly the verb whose fill it is over. The strip
+    // is found by kind, never by matching on the words it printed.
     for (i, row) in rows.into_iter().enumerate() {
         if i >= content_rect.height as usize {
             break;
         }
         let y = content_rect.y + i as u16;
-        super::overlay_text(buf, content_rect, content_rect.x, y, &row, style);
-        if strip_row == Some(i) {
-            for (action, start, end) in &spans {
-                let x = content_rect.x.saturating_add(*start as u16);
-                let width = (end - start) as u16;
-                if x >= content_rect.right() || width == 0 {
-                    continue;
-                }
-                let width = width.min(content_rect.right() - x);
-                hits.push(
-                    Rect::new(x, y, width, 1),
-                    HitTarget::MessagesAction(*action),
-                );
+        let mut x = content_rect.x;
+        for span in &row.spans {
+            let width = Span::raw(span.text.as_str()).width() as u16;
+            if x >= content_rect.right() {
+                break;
             }
+            let cell = Rect::new(x, y, width.min(content_rect.right() - x), 1);
+            let style = match &span.ink {
+                cyclops_ui::ChatInk::Button(action) => {
+                    if row.kind == cyclops_ui::ChatLineKind::Strip && cell.width > 0 {
+                        hits.push(cell, HitTarget::MessagesAction(*action));
+                    }
+                    if pointed(cell) {
+                        theme::add_button_hover(paint)
+                    } else {
+                        theme::sidebar_footer_button(paint)
+                    }
+                }
+                ink => chat_ink_style(paint, ink),
+            };
+            super::overlay_text(buf, content_rect, x, y, &span.text, style);
+            x = x.saturating_add(width);
         }
+    }
+}
+
+/// The workspace palette for one drawer ink. The renderer named what the
+/// run is; this is the one place that decides what that looks like, on the
+/// drawer's own panel ground.
+fn chat_ink_style(paint: &Paint, ink: &cyclops_ui::ChatInk) -> Style {
+    use cyclops_ui::ChatInk;
+    let panel = theme::chrome_panel(paint);
+    match ink {
+        ChatInk::Text => panel,
+        ChatInk::Dim => theme::sidebar_label(paint),
+        ChatInk::Accent => theme::chrome_notice(paint).add_modifier(Modifier::BOLD),
+        // The same stable color the agent's pane border and sidebar row
+        // carry, so one name is one color everywhere in the workspace.
+        ChatInk::Role(label) => panel.patch(paint.role(label)).add_modifier(Modifier::BOLD),
+        ChatInk::Avatar(label) => paint.role_ground(label),
+        ChatInk::Attention => panel
+            .patch(paint.style_token(cyclops_theme::tokens::STATE_NEEDS_YOU))
+            .add_modifier(Modifier::BOLD),
+        ChatInk::Healthy => panel.patch(paint.style_token(cyclops_theme::tokens::STATE_HEALTHY)),
+        ChatInk::Button(_) => theme::sidebar_footer_button(paint),
     }
 }
 
@@ -3452,6 +3484,140 @@ mod tests {
                 "a click on {action:?} routes to its own action"
             );
         }
+    }
+
+    /// A footer button fills under the pointer, the way every other chrome
+    /// button does (rule 1), and the fill covers the whole button, air
+    /// included, not only its letters.
+    #[test]
+    fn a_strip_button_fills_under_the_pointer() {
+        let area = Rect::new(160, 0, 60, 24);
+        let paint = Paint::for_test();
+        let queue = cyclops_ui::HumanQueue::new();
+        let registry = cyclops_ui::AvatarRegistry::default();
+        let content_w = (area.width - 1) as usize;
+        let (_, spans) = cyclops_ui::chat_action_strip(content_w, false);
+        let (action, start, end) = spans[1];
+        let x = area.x + 1 + start as u16;
+        let y = (0..area.height)
+            .find(|&y| {
+                let mut buf = Buffer::empty(area);
+                let mut hits = HitMap::default();
+                paint_messages(
+                    &queue, None, None, &registry, None, None, None, false, area, &mut buf, &paint,
+                    &mut hits, None,
+                );
+                matches!(hits.hit(x, y), Some(HitTarget::MessagesAction(found)) if *found == action)
+            })
+            .expect("the strip paints a button");
+
+        let draw = |hover: Option<(u16, u16)>| {
+            let mut buf = Buffer::empty(area);
+            let mut hits = HitMap::default();
+            paint_messages(
+                &queue, None, None, &registry, None, None, None, false, area, &mut buf, &paint,
+                &mut hits, hover,
+            );
+            buf
+        };
+        let rested = draw(None);
+        let lit = draw(Some((x, y)));
+        let hover = theme::add_button_hover(&paint);
+        for col in x..area.x + 1 + end as u16 {
+            assert_eq!(
+                lit.cell((col, y)).unwrap().bg,
+                hover.bg.unwrap(),
+                "column {col} of the pointed button carries the fill"
+            );
+            assert_ne!(
+                rested.cell((col, y)).unwrap().bg,
+                hover.bg.unwrap(),
+                "column {col} of a button at rest does not"
+            );
+        }
+        let beside = lit.cell((area.x + 1 + end as u16, y)).unwrap();
+        assert_ne!(beside.bg, hover.bg.unwrap(), "the fill stops at the button");
+    }
+
+    /// A name in the drawer is painted in the agent's role color, the one
+    /// its sidebar row and pane border already use.
+    #[test]
+    fn an_agent_name_in_the_drawer_takes_its_role_color() {
+        use cyclops_proto::{Kind, MessageId, RecipientKey};
+        use cyclops_ui::{
+            Direction, MailboxWord, QueueRow, QueueTarget, Scope, Snapshot, WakeWord,
+        };
+        let area = Rect::new(100, 0, 80, 12);
+        let paint = Paint::for_test();
+        let registry = cyclops_ui::AvatarRegistry::default();
+        let sender: RecipientKey =
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%0"
+                .parse()
+                .unwrap();
+        let recipient: RecipientKey =
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1"
+                .parse()
+                .unwrap();
+        let message = MessageId::new("m-0000000000000001").unwrap();
+        let mut queue = cyclops_ui::HumanQueue::new();
+        queue.replace(Snapshot {
+            watermark: 1,
+            rows: vec![QueueRow {
+                target: QueueTarget::new(message.clone(), recipient),
+                message_id: message.clone(),
+                recipient,
+                recipient_label: "codey".into(),
+                sender,
+                sender_label: "claudex".into(),
+                thread_root: message,
+                thread_message_count: 1,
+                ts: 1,
+                kind: Kind::Msg,
+                recipient_count: 1,
+                subject: Some("hello".into()),
+                mailbox: MailboxWord::Pending,
+                wake: WakeWord::NotStarted,
+                needs_action: true,
+                seq: 1,
+                updated_at: 1,
+                direction: Direction::Inbound,
+                ..QueueRow::default()
+            }],
+        });
+        queue.set_scope(Scope::All);
+        let mut buf = Buffer::empty(area);
+        let mut hits = HitMap::default();
+        paint_messages(
+            &queue, None, None, &registry, None, None, None, false, area, &mut buf, &paint,
+            &mut hits, None,
+        );
+        let row_text = |y: u16| -> String {
+            (area.x..area.right())
+                .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+                .collect()
+        };
+        let y = (0..area.height)
+            .find(|&y| row_text(y).contains("claudex"))
+            .expect("the heading names the sender");
+        let text = row_text(y);
+        let name_col = area.x + text.find("claudex").unwrap() as u16;
+        assert_eq!(
+            buf.cell((name_col, y)).unwrap().fg,
+            paint.role("claudex").fg.unwrap(),
+            "the sender's name carries claudex's role color"
+        );
+        let chip_col = name_col - 2;
+        assert_eq!(
+            buf.cell((chip_col, y)).unwrap().bg,
+            paint.role("claudex").fg.unwrap(),
+            "the avatar chip is grounded in the same color"
+        );
+        let codey_col = area.x + text.find("codey").unwrap() as u16;
+        assert_eq!(
+            buf.cell((codey_col, y)).unwrap().fg,
+            paint.role("codey").fg.unwrap(),
+            "the recipient's name carries codey's role color"
+        );
     }
 
     #[test]
