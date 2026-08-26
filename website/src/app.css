@@ -343,12 +343,13 @@ a:hover {
 	font-family: var(--font-pixel);
 }
 
-/* The measure is capped; the margin beside it grows with the window, so
-   a laptop gets a real margin and not just the inner padding. */
+/* The margin beside the content grows with the window, so a laptop gets
+   a real margin and not just the inner padding; the measure is capped
+   only where a window is wide enough that the proportion stops mattering. */
 .section {
 	box-sizing: content-box;
 	min-width: 0;
-	max-width: 1044px;
+	max-width: 1240px;
 	margin: 0 auto;
 	padding: 72px max(48px, 7vw);
 }
