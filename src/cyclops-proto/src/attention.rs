@@ -73,7 +73,7 @@
 //! behind them. Newest wins, which is why the snapshot may not be applied
 //! last.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use serde::de::value::{Error as ValueError, StrDeserializer};
 use serde::de::IntoDeserializer;
@@ -316,6 +316,12 @@ pub struct Attention {
     /// the same way and kept apart from the legacy half: a snapshot replaces
     /// only what the mailbox knows, a ledger event only what the ledger knows.
     mailbox: BTreeMap<(DeliveryRecipientIdentity, String), (String, DeliveryState)>,
+    /// Both delivery halves as one map by key, the mailbox half overriding
+    /// a legacy row with the same key and a legacy-label row dropped when
+    /// exactly one exact row carries its label and message. Rebuilt once per
+    /// mutation of either half, so every query (count, items, resolution,
+    /// clearance) is a lookup, not a rebuild: surfaces call those per row.
+    union: BTreeMap<(DeliveryRecipientIdentity, String), (String, DeliveryState)>,
 }
 
 impl Attention {
@@ -378,6 +384,7 @@ impl Attention {
     /// so anything it does not list has been resolved or never existed.
     pub fn snapshot_deliveries(&mut self, open: &[OpenDelivery]) {
         self.deliveries = Self::keyed(open);
+        self.rebuild_union();
     }
 
     /// Replace the mailbox half from an authenticated snapshot's rows. A key
@@ -419,6 +426,7 @@ impl Attention {
             }
         }
         self.mailbox = next;
+        self.rebuild_union();
     }
 
     fn keyed(
@@ -435,55 +443,49 @@ impl Attention {
             .collect()
     }
 
-    /// Both delivery halves as one map by key, the mailbox half overriding a
-    /// legacy row with the same key: the mailbox is the newer, authenticated
-    /// answer about that attempt. Resolution, count, items, and clearance
-    /// read this union; the halves themselves stay separately replaceable.
     fn delivery_union(
         &self,
-    ) -> BTreeMap<&(DeliveryRecipientIdentity, String), &(String, DeliveryState)> {
-        let mut union: BTreeMap<_, _> = self.deliveries.iter().collect();
+    ) -> &BTreeMap<(DeliveryRecipientIdentity, String), (String, DeliveryState)> {
+        &self.union
+    }
+
+    /// Recompute the union after either half changed. O(n log n) once per
+    /// mutation; queries then never pay for it.
+    fn rebuild_union(&mut self) {
+        let mut union: BTreeMap<(DeliveryRecipientIdentity, String), (String, DeliveryState)> =
+            self.deliveries.clone();
         for (key, value) in &self.mailbox {
-            union.insert(key, value);
+            union.insert(key.clone(), value.clone());
         }
-        // semantic_twins: a legacy-label row and one unique exact row for
-        // the same label and message are one delivery. The exact row is
-        // the durable one, so the legacy twin drops out of the union.
-        // Count exact rows once. Searching the whole union for every legacy
-        // key makes count, item, and render paths quadratic in a backlog.
-        let mut exact_counts: HashMap<String, HashMap<String, usize>> = HashMap::new();
+        // Semantic twins: a legacy-label row whose label and message exactly
+        // one exact row carries is the same delivery; the exact row stands.
+        let mut exact_by_label: BTreeMap<(String, String), usize> = BTreeMap::new();
         for ((identity, id), (label, _)) in &union {
             if matches!(identity, DeliveryRecipientIdentity::Exact(_)) {
-                *exact_counts
-                    .entry(label.to_string())
-                    .or_default()
-                    .entry(id.to_string())
+                *exact_by_label
+                    .entry((label.clone(), id.clone()))
                     .or_default() += 1;
             }
         }
         let twins: Vec<_> = union
             .keys()
-            .filter(|(identity, _)| matches!(identity, DeliveryRecipientIdentity::LegacyLabel(_)))
-            .filter(|(identity, id)| {
-                let DeliveryRecipientIdentity::LegacyLabel(label) = identity else {
-                    return false;
-                };
-                exact_counts
-                    .get(label.as_str())
-                    .and_then(|ids| ids.get(id.as_str()))
-                    == Some(&1)
+            .filter(|(identity, id)| match identity {
+                DeliveryRecipientIdentity::LegacyLabel(label) => {
+                    exact_by_label.get(&(label.clone(), id.clone())) == Some(&1)
+                }
+                DeliveryRecipientIdentity::Exact(_) => false,
             })
-            .map(|key| (*key).clone())
+            .cloned()
             .collect();
         for key in &twins {
             union.remove(key);
         }
-        union
+        self.union = union;
     }
 
     /// The one exact row carrying `label` for `id`, if exactly one does.
-    fn unique_exact_in<'a>(
-        union: &BTreeMap<&'a (DeliveryRecipientIdentity, String), &'a (String, DeliveryState)>,
+    fn unique_exact_in(
+        union: &BTreeMap<(DeliveryRecipientIdentity, String), (String, DeliveryState)>,
         label: &str,
         id: &str,
     ) -> Option<DeliveryRecipientIdentity> {
@@ -525,7 +527,7 @@ impl Attention {
         // reference names, even when a legacy twin also exists; the legacy
         // form is the answer only when no exact row, or more than one,
         // carries the label.
-        match Self::unique_exact_in(&union, to, id) {
+        match Self::unique_exact_in(union, to, id) {
             Some(identity) => (identity, id.to_string()),
             None => legacy,
         }
@@ -613,9 +615,12 @@ impl Attention {
         let key = self.resolve(recipient, to, id.unwrap_or_default());
         if delivery_needs_human(state) {
             self.deliveries.insert(key, (to.to_string(), state));
+            self.rebuild_union();
             return None;
         }
-        let (label, was) = self.deliveries.remove(&key)?;
+        let removed = self.deliveries.remove(&key);
+        self.rebuild_union();
+        let (label, was) = removed?;
         Some(Resolved {
             was: AttentionItem::Delivery {
                 recipient: key.0,
@@ -669,7 +674,7 @@ impl Attention {
             })
             .chain(
                 self.delivery_union()
-                    .into_iter()
+                    .iter()
                     .map(|((recipient, id), (to, state))| AttentionItem::Delivery {
                         recipient: recipient.clone(),
                         to: to.clone(),
@@ -991,6 +996,61 @@ mod tests {
             .observe_delivery("reviewer", None, Some("m-1"), DeliveredVerified)
             .is_some());
         assert_eq!(attention.count(), 0);
+    }
+
+    /// The cached union follows every mutation of either half: a seed of
+    /// the legacy half, a seed of the mailbox half, a live insert, and a
+    /// live clearance each leave count, items, resolution, and clearance
+    /// answering for the new state, never the previous one.
+    #[test]
+    fn the_union_follows_every_mutation() {
+        use DeliveryState::*;
+        let workspace: crate::WorkspaceId = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let session: crate::SessionInstanceId =
+            "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let key = crate::RecipientKey::agent(workspace, session, "%1".parse().unwrap());
+        let exact = AttentionKey::Delivery {
+            recipient: DeliveryRecipientIdentity::Exact(key),
+            id: "m-1".into(),
+        };
+        let mut a = Attention::default();
+        assert_eq!(a.count(), 0);
+
+        // 1. legacy seed
+        let mut legacy = open("m-1", "worker", ParkedBlockedQuota);
+        legacy.recipient = Some(key);
+        a.snapshot_deliveries(std::slice::from_ref(&legacy));
+        assert_eq!(a.count(), 1);
+        assert!(a.holds(&exact));
+        assert_eq!(a.key_for(None, "worker", "m-1"), exact);
+
+        // 2. mailbox seed overriding the same key
+        let mut mailbox = open("m-1", "worker", AttentionRequired);
+        mailbox.recipient = Some(key);
+        a.snapshot_mailbox(std::slice::from_ref(&mailbox));
+        assert_eq!(a.count(), 1);
+        assert!(matches!(
+            a.items().as_slice(),
+            [AttentionItem::Delivery { state, .. }] if *state == AttentionRequired
+        ));
+
+        // 3. mailbox absence removes the twin, immediately
+        a.snapshot_mailbox(&[]);
+        assert_eq!(a.count(), 0);
+        assert!(!a.holds(&exact));
+
+        // 4. a live insert reopens it, a live clearance ends it
+        assert!(a
+            .observe_delivery("worker", Some(key), Some("m-1"), ParkedBlockedQuota)
+            .is_none());
+        assert_eq!(a.count(), 1);
+        assert!(a.holds(&exact));
+        assert!(a
+            .observe_delivery("worker", Some(key), Some("m-1"), DeliveredVerified)
+            .is_some());
+        assert_eq!(a.count(), 0);
+        assert!(a.items().is_empty());
+        assert!(!a.holds(&exact));
     }
 
     /// Two exact recipients that share a display label are two items, a
