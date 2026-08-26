@@ -5,6 +5,13 @@ versions are unreleased until admin cuts a tag.
 
 ## [Unreleased]
 
+### Fixed
+
+- A `[workspace.bindings]` rebinding onto a chord a default already used
+  left both actions on the chord, and which one fired depended on hash
+  order: it worked in one process and did nothing in the next. The
+  rebinding now takes the chord and the default is unbound.
+
 ### Added
 
 - Durable workspace mailboxes now separate immutable messages, recipient claims,

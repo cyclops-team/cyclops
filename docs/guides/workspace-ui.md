@@ -445,5 +445,9 @@ toggle_tab_bar = "prefix t"
 show_keybinds = "prefix ?"
 ```
 
+A chord belongs to one action: a rebinding that reuses a default's chord
+takes it, and the default is left unbound (`show_settings = "prefix g"`
+would open Settings and leave the file panel's `g` unbound).
+
 More: [workspaces.md](workspaces.md) for presets and save/restore;
 [ui.md](ui.md) for the stream TUI.
