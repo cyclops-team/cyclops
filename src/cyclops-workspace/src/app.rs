@@ -28,7 +28,7 @@ use std::io;
 use crossterm::event::{
     self, Event, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use cyclops_tmux::{ControlClient, ControlConfig, Notification};
+use cyclops_tmux::{ControlClient, ControlConfig, Notification, NotificationReceiver};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
@@ -88,6 +88,32 @@ const FOLDER_PROBE_DELAY: Duration = Duration::from_millis(600);
 /// own blocking status round trip even though only the last result before
 /// the next paint was ever shown.
 const DECORATION_DEBOUNCE: Duration = Duration::from_millis(30);
+/// One frame's worth of ready work. Producers backpressure after this
+/// instead of growing memory while rendering or tmux reconciliation waits.
+const INGRESS_CAPACITY: usize = cyclops_ui::INGRESS_BATCH;
+/// Payload-bearing lanes are both item-bounded and byte-bounded. Every item
+/// is capped at 1 MiB before enqueue, so eight retained items hold at most
+/// 8 MiB of payload per lane.
+const PAYLOAD_INGRESS_CAPACITY: usize = 8;
+/// Input and action answers keep priority for an interactive burst, then one
+/// ready background lane must run before priority can resume.
+const PRIORITY_BURST: usize = 8;
+/// A send worker is serial per composer, so one answer is the full action
+/// backlog the application can use.
+const ACTION_CAPACITY: usize = 1;
+/// Pointer motion is advisory. One pending terminal change is sufficient:
+/// excess motion is discarded while clicks, focus, and resize wait for it.
+const TERMINAL_CAPACITY: usize = 1;
+/// Match the stream UI's shipped paste quarantine. Larger clipboard data is
+/// refused before it enters the application queue.
+const PASTE_MAX_BYTES: usize = 1 << 20;
+/// Pane output uses the same byte envelope as a terminal paste. Larger
+/// control-mode notifications are split without changing pane byte order.
+const OUTPUT_BATCH_MAX_BYTES: usize = 1 << 20;
+/// Daemon event lines are body-free in normal operation. A line larger
+/// than the paste envelope is treated as a stream gap and reconciled from
+/// the bounded journal tail instead of entering the app queue.
+const STREAM_EVENT_MAX_BYTES: usize = 1 << 20;
 
 enum AppMsg {
     /// A send started from the composer has an answer. Carries the
@@ -99,6 +125,7 @@ enum AppMsg {
     },
     Input(KeyEvent),
     Paste(String),
+    PasteTooLarge(usize),
     Mouse(MouseEvent),
     /// The terminal's focus moved onto (`true`) or off (`false`) the
     /// workspace's tab. Drives the window background only: the theme's
@@ -147,11 +174,26 @@ enum AppMsg {
     /// own coalesced refresh is a separate message (`DecorationChanged`)
     /// on the same connection, so this must never gate or delay it.
     StreamEntry(Box<cyclops_ui::Entry>),
+    StreamGap {
+        why: String,
+    },
+    StreamReconciled(Box<crate::event_record::Bootstrap>),
     /// The daemon switched themes (`cyclops theme <name>`), forwarded by
     /// [`spawn_decoration_forwarder`]'s reader thread. Wake-only, like
     /// cyclops-ui's `UiMsg::ThemeChanged`: the handler arms the render
     /// debounce and the reload itself runs on that deadline, before draw.
     ThemeChanged,
+}
+
+/// Independent bounded lanes for work that enters the application from
+/// background tasks. Keeping the senders typed as one message vocabulary
+/// lets the handler stay the single owner of state transitions while the
+/// receivers enforce priority.
+#[derive(Clone)]
+struct AppSinks {
+    action: mpsc::Sender<AppMsg>,
+    tmux: mpsc::Sender<AppMsg>,
+    stream: mpsc::Sender<AppMsg>,
 }
 
 struct App {
@@ -269,6 +311,9 @@ struct App {
     /// ledger-backed duplicates arriving live during startup are dropped
     /// by seq instead of shown twice.
     intake: cyclops_ui::Intake,
+    /// An oversized event invalidates the stream once. A replacement is
+    /// loaded off-loop and later gaps coalesce until that result lands.
+    stream_reconciling: bool,
     /// The (shape, blink) last emitted to the host terminal
     /// ([`crate::term_guard::apply_cursor_style`]), so a frame whose
     /// focused-pane cursor did not change costs no terminal write. `None`
@@ -294,14 +339,12 @@ struct App {
     /// When the next folder probe is due. `None` means none is armed; see
     /// [`arm_folder_probe`].
     folder_probe_at: Option<Instant>,
-    /// The app's own channel, for work that cannot finish on this thread.
-    ///
-    /// Nearly every action is a tmux call that returns in microseconds and
-    /// needs nothing here. A send is the exception: the daemon holds its
-    /// answer for the acknowledgement window, so it runs on a thread of its
-    /// own and posts an [`AppMsg`] back when it knows. None in tests that
-    /// build an App with no loop around it.
-    tx: Option<mpsc::UnboundedSender<AppMsg>>,
+    /// One fixed send worker. A composer can abandon an in-flight attempt,
+    /// but reopening it never creates another thread.
+    send_requests: Option<std::sync::mpsc::SyncSender<dialog::ComposeAttempt>>,
+    /// One fixed stream replacement worker. Gap edges coalesce in its
+    /// single slot while the current replacement is loading.
+    stream_reconcile_requests: Option<std::sync::mpsc::SyncSender<()>>,
 }
 
 fn toggle_workspace_expanded(expanded: &mut HashSet<String>, session_id: String) -> bool {
@@ -329,16 +372,168 @@ enum Wake {
 /// Wait for a message or the next armed deadline. The explicit due check is
 /// what makes the render guarantee real: a permanently ready message queue
 /// cannot keep winning a biased select after the deadline has passed.
-async fn next_wake(rx: &mut mpsc::UnboundedReceiver<AppMsg>, deadline: Option<Instant>) -> Wake {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngressSource {
+    Priority,
+    Background,
+}
+
+#[derive(Default)]
+struct IngressFairness {
+    priority_run: usize,
+    priority_cursor: usize,
+    background_cursor: usize,
+}
+
+impl IngressFairness {
+    fn record(&mut self, source: IngressSource) {
+        match source {
+            IngressSource::Priority => {
+                self.priority_run = self.priority_run.saturating_add(1);
+            }
+            IngressSource::Background => self.priority_run = 0,
+        }
+    }
+}
+
+fn try_priority_ready(
+    input_rx: &mut mpsc::Receiver<AppMsg>,
+    paste_rx: &mut mpsc::Receiver<AppMsg>,
+    action_rx: &mut mpsc::Receiver<AppMsg>,
+    cursor: &mut usize,
+) -> Option<AppMsg> {
+    for offset in 0..3 {
+        let lane = (*cursor + offset) % 3;
+        let message = match lane {
+            0 => input_rx.try_recv().ok(),
+            1 => paste_rx.try_recv().ok(),
+            2 => action_rx.try_recv().ok(),
+            _ => unreachable!(),
+        };
+        if message.is_some() {
+            *cursor = (lane + 1) % 3;
+            return message;
+        }
+    }
+    None
+}
+
+fn try_background_ready(
+    terminal_rx: &mut mpsc::Receiver<AppMsg>,
+    tmux_rx: &mut mpsc::Receiver<AppMsg>,
+    stream_rx: &mut mpsc::Receiver<AppMsg>,
+    allow_stream: bool,
+    cursor: &mut usize,
+) -> Option<AppMsg> {
+    for offset in 0..3 {
+        let lane = (*cursor + offset) % 3;
+        let message = match lane {
+            0 => terminal_rx.try_recv().ok(),
+            1 => tmux_rx.try_recv().ok(),
+            2 if allow_stream => stream_rx.try_recv().ok(),
+            2 => None,
+            _ => unreachable!(),
+        };
+        if message.is_some() {
+            *cursor = (lane + 1) % 3;
+            return message;
+        }
+    }
+    None
+}
+
+async fn next_message(
+    input_rx: &mut mpsc::Receiver<AppMsg>,
+    paste_rx: &mut mpsc::Receiver<AppMsg>,
+    action_rx: &mut mpsc::Receiver<AppMsg>,
+    terminal_rx: &mut mpsc::Receiver<AppMsg>,
+    tmux_rx: &mut mpsc::Receiver<AppMsg>,
+    stream_rx: &mut mpsc::Receiver<AppMsg>,
+    allow_stream: bool,
+    fairness: &mut IngressFairness,
+) -> Option<AppMsg> {
+    if fairness.priority_run >= PRIORITY_BURST {
+        if let Some(message) = try_background_ready(
+            terminal_rx,
+            tmux_rx,
+            stream_rx,
+            allow_stream,
+            &mut fairness.background_cursor,
+        ) {
+            fairness.record(IngressSource::Background);
+            return Some(message);
+        }
+    } else if let Some(message) =
+        try_priority_ready(input_rx, paste_rx, action_rx, &mut fairness.priority_cursor)
+    {
+        fairness.record(IngressSource::Priority);
+        return Some(message);
+    }
+
+    if let Some(message) = try_background_ready(
+        terminal_rx,
+        tmux_rx,
+        stream_rx,
+        allow_stream,
+        &mut fairness.background_cursor,
+    ) {
+        fairness.record(IngressSource::Background);
+        return Some(message);
+    }
+
+    let (source, message) = tokio::select! {
+        message = input_rx.recv() => (IngressSource::Priority, message),
+        message = paste_rx.recv() => (IngressSource::Priority, message),
+        message = action_rx.recv() => (IngressSource::Priority, message),
+        message = terminal_rx.recv() => (IngressSource::Background, message),
+        message = tmux_rx.recv() => (IngressSource::Background, message),
+        message = stream_rx.recv(), if allow_stream => (IngressSource::Background, message),
+    };
+    fairness.record(source);
+    message
+}
+
+async fn next_wake(
+    input_rx: &mut mpsc::Receiver<AppMsg>,
+    paste_rx: &mut mpsc::Receiver<AppMsg>,
+    action_rx: &mut mpsc::Receiver<AppMsg>,
+    terminal_rx: &mut mpsc::Receiver<AppMsg>,
+    tmux_rx: &mut mpsc::Receiver<AppMsg>,
+    stream_rx: &mut mpsc::Receiver<AppMsg>,
+    allow_stream: bool,
+    fairness: &mut IngressFairness,
+    deadline: Option<Instant>,
+) -> Wake {
     if deadline.is_some_and(|at| at <= Instant::now()) {
         return Wake::Deadline;
     }
     let Some(deadline) = deadline else {
-        return Wake::Message(rx.recv().await);
+        return Wake::Message(
+            next_message(
+                input_rx,
+                paste_rx,
+                action_rx,
+                terminal_rx,
+                tmux_rx,
+                stream_rx,
+                allow_stream,
+                fairness,
+            )
+            .await,
+        );
     };
     tokio::select! {
         biased;
-        msg = rx.recv() => Wake::Message(msg),
+        msg = next_message(
+            input_rx,
+            paste_rx,
+            action_rx,
+            terminal_rx,
+            tmux_rx,
+            stream_rx,
+            allow_stream,
+            fairness,
+        ) => Wake::Message(msg),
         _ = sleep_until(deadline) => Wake::Deadline,
     }
 }
@@ -405,44 +600,99 @@ pub async fn run_async() -> i32 {
     };
 
     let bindings = load_bindings(&home);
-    let (tx, mut rx) = mpsc::unbounded_channel::<AppMsg>();
+    let (input_tx, mut input_rx) = mpsc::channel::<AppMsg>(INGRESS_CAPACITY);
+    let (paste_tx, mut paste_rx) = mpsc::channel::<AppMsg>(1);
+    let (terminal_tx, mut terminal_rx) = mpsc::channel::<AppMsg>(TERMINAL_CAPACITY);
+    let (action_tx, mut action_rx) = mpsc::channel::<AppMsg>(ACTION_CAPACITY);
+    let (tmux_tx, mut tmux_rx) = mpsc::channel::<AppMsg>(PAYLOAD_INGRESS_CAPACITY);
+    let (stream_tx, mut stream_rx) = mpsc::channel::<AppMsg>(PAYLOAD_INGRESS_CAPACITY);
+    let sinks = AppSinks {
+        action: action_tx.clone(),
+        tmux: tmux_tx,
+        stream: stream_tx,
+    };
 
-    let input_tx = tx.clone();
+    let (send_request_tx, send_request_rx) =
+        std::sync::mpsc::sync_channel::<dialog::ComposeAttempt>(1);
+    let send_home = home.clone();
+    let send_results = action_tx.clone();
+    std::thread::spawn(move || {
+        while let Ok(attempt) = send_request_rx.recv() {
+            let outcome = crate::daemon::send_message(
+                &send_home,
+                &attempt.message.to,
+                &attempt.message.subject,
+                &attempt.message.body,
+                &attempt.client_key,
+            );
+            if send_results
+                .blocking_send(AppMsg::SendFinished { attempt, outcome })
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+    let (stream_reconcile_tx, stream_reconcile_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let stream_home = home.clone();
+    let stream_results = action_tx;
+    std::thread::spawn(move || {
+        while stream_reconcile_rx.recv().is_ok() {
+            let bootstrap = crate::event_record::load(&stream_home);
+            if stream_results
+                .blocking_send(AppMsg::StreamReconciled(Box::new(bootstrap)))
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+
     std::thread::spawn(move || loop {
         match event::read() {
             Ok(Event::Key(k)) => {
                 if k.kind == KeyEventKind::Release {
                     continue;
                 }
-                if input_tx.send(AppMsg::Input(k)).is_err() {
+                if input_tx.blocking_send(AppMsg::Input(k)).is_err() {
                     break;
                 }
             }
             Ok(Event::Mouse(m)) => {
-                if input_tx.send(AppMsg::Mouse(m)).is_err() {
+                let sent = if matches!(m.kind, MouseEventKind::Moved) {
+                    terminal_tx.try_send(AppMsg::Mouse(m)).is_ok()
+                } else {
+                    terminal_tx.blocking_send(AppMsg::Mouse(m)).is_ok()
+                };
+                if !sent && terminal_tx.is_closed() {
                     break;
                 }
             }
             Ok(Event::Paste(text)) => {
-                if input_tx.send(AppMsg::Paste(text)).is_err() {
+                let message = if text.len() > PASTE_MAX_BYTES {
+                    AppMsg::PasteTooLarge(text.len())
+                } else {
+                    AppMsg::Paste(text)
+                };
+                if paste_tx.blocking_send(message).is_err() {
                     break;
                 }
             }
             Ok(Event::Resize(w, h)) => {
-                let _ = input_tx.send(AppMsg::Resized(w, h));
+                let _ = terminal_tx.blocking_send(AppMsg::Resized(w, h));
             }
             Ok(Event::FocusGained) => {
-                let _ = input_tx.send(AppMsg::Focus(true));
+                let _ = terminal_tx.blocking_send(AppMsg::Focus(true));
             }
             Ok(Event::FocusLost) => {
-                let _ = input_tx.send(AppMsg::Focus(false));
+                let _ = terminal_tx.blocking_send(AppMsg::Focus(false));
             }
             Err(_) => break,
         }
     });
 
-    spawn_notif_forwarder(notif_rx, tx.clone());
-    spawn_decoration_forwarder(home.clone(), tx.clone());
+    spawn_notif_forwarder(notif_rx, sinks.tmux.clone());
+    spawn_decoration_forwarder(home.clone(), sinks.tmux.clone(), sinks.stream.clone());
 
     // Theme detection prints warnings; do it before the alternate screen
     // swallows them.
@@ -574,7 +824,10 @@ pub async fn run_async() -> i32 {
         notice: NoticeState::default(),
         // Nothing to fall back to on the first frame: no answer here is
         // genuinely "nothing known yet", which is what the default says.
-        decoration: decoration::fetch_decoration(&home).unwrap_or_default(),
+        decoration: decoration::fetch_decoration(&home).unwrap_or_else(|error| {
+            log_err(&home, &format!("decoration bootstrap failed: {error}"));
+            DecorationSnapshot::default()
+        }),
         prefs: prefs.clone(),
         expanded_workspaces,
         expanded_for: None,
@@ -593,6 +846,7 @@ pub async fn run_async() -> i32 {
         files_root_pending: true,
         record: cyclops_ui::Record::new(),
         intake: cyclops_ui::Intake::new(),
+        stream_reconciling: false,
         cursor_style: None,
         term_size,
         declared_client_size,
@@ -602,13 +856,17 @@ pub async fn run_async() -> i32 {
         paste_seq: 0,
         home,
         folder_probe_at: None,
-        tx: Some(tx.clone()),
+        send_requests: Some(send_request_tx),
+        stream_reconcile_requests: Some(stream_reconcile_tx),
     };
     // Bare `cyclops` can boot a session config.toml never mentions, so the
     // very first frame is already a frame the daemon may not be watching
     // for. Ask before drawing it.
     ensure_sessions_watched(&mut app);
-    app.decoration = decoration::fetch_decoration(&app.home).unwrap_or_default();
+    app.decoration = decoration::fetch_decoration(&app.home).unwrap_or_else(|error| {
+        log_err(&app.home, &format!("decoration refresh failed: {error}"));
+        DecorationSnapshot::default()
+    });
     // The subscription at the top of this function is already queuing live
     // entries on the app channel; boot's backfill-then-seed lands before
     // the loop below drains them, which is exactly the order the intake
@@ -617,6 +875,7 @@ pub async fn run_async() -> i32 {
 
     let mut debounce: Option<Instant> = None;
     let mut reconnect_deadline: Option<Instant> = None;
+    let mut ingress_fairness = IngressFairness::default();
     // The animation clock (`crate::animate`) sits with the loop's other
     // deadlines rather than in `App`: nothing outside this loop and `draw`
     // reads it, and its wakeups are scheduled here the same one-shot way
@@ -644,7 +903,19 @@ pub async fn run_async() -> i32 {
         .into_iter()
         .flatten()
         .min();
-        match next_wake(&mut rx, next_deadline).await {
+        match next_wake(
+            &mut input_rx,
+            &mut paste_rx,
+            &mut action_rx,
+            &mut terminal_rx,
+            &mut tmux_rx,
+            &mut stream_rx,
+            !app.stream_reconciling,
+            &mut ingress_fairness,
+            next_deadline,
+        )
+        .await
+        {
             Wake::Message(msg) => {
                 if !handle_app_msg(
                     msg,
@@ -735,7 +1006,7 @@ pub async fn run_async() -> i32 {
                         &mut app,
                         &mut client,
                         &control_cfg,
-                        &tx,
+                        &sinks,
                         &mut reconnect_deadline,
                     )
                     .await;
@@ -785,10 +1056,7 @@ fn refresh_theme_watch(app: &mut App, watch: &mut cyclops_theme::ThemeWatch) {
     }
 }
 
-fn spawn_notif_forwarder(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<Notification>,
-    tx: mpsc::UnboundedSender<AppMsg>,
-) {
+fn spawn_notif_forwarder(mut rx: NotificationReceiver, tmux_tx: mpsc::Sender<AppMsg>) {
     tokio::spawn(async move {
         let mut pending = None;
         loop {
@@ -796,18 +1064,40 @@ fn spawn_notif_forwarder(
                 Some(notification) => notification,
                 None => match rx.recv().await {
                     Some(notification) => notification,
-                    None => break,
+                    None => {
+                        let _ = tmux_tx.send(AppMsg::LinkLost).await;
+                        break;
+                    }
                 },
             };
             let notification = match notification {
                 Notification::Output { pane, data }
                 | Notification::ExtendedOutput { pane, data, .. } => {
+                    if data.len() > OUTPUT_BATCH_MAX_BYTES {
+                        for chunk in data.chunks(OUTPUT_BATCH_MAX_BYTES) {
+                            if tmux_tx
+                                .send(AppMsg::OutputBatch(vec![(pane.clone(), chunk.to_vec())]))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        continue;
+                    }
                     let mut output = Vec::new();
+                    let mut output_bytes = data.len();
                     push_output(&mut output, pane, data);
                     while let Ok(next) = rx.try_recv() {
                         match next {
                             Notification::Output { pane, data }
                             | Notification::ExtendedOutput { pane, data, .. } => {
+                                if output_bytes.saturating_add(data.len()) > OUTPUT_BATCH_MAX_BYTES
+                                {
+                                    pending = Some(Notification::Output { pane, data });
+                                    break;
+                                }
+                                output_bytes += data.len();
                                 push_output(&mut output, pane, data)
                             }
                             other => {
@@ -816,7 +1106,9 @@ fn spawn_notif_forwarder(
                             }
                         }
                     }
-                    let _ = tx.send(AppMsg::OutputBatch(output));
+                    if tmux_tx.send(AppMsg::OutputBatch(output)).await.is_err() {
+                        return;
+                    }
                     continue;
                 }
                 other => other,
@@ -828,35 +1120,41 @@ fn spawn_notif_forwarder(
                     // rest is "layout visible-layout flags"; the flags field
                     // carries the zoom marker.
                     let flags = fields.nth(1).map(str::to_string);
-                    let _ = tx.send(AppMsg::LayoutChanged {
-                        window,
-                        layout,
-                        flags,
-                    });
+                    let _ = tmux_tx
+                        .send(AppMsg::LayoutChanged {
+                            window,
+                            layout,
+                            flags,
+                        })
+                        .await;
                 }
                 Notification::WindowPaneChanged { window, pane } => {
-                    let _ = tx.send(AppMsg::ActivePaneChanged { window, pane });
+                    let _ = tmux_tx
+                        .send(AppMsg::ActivePaneChanged { window, pane })
+                        .await;
                 }
                 Notification::SessionChanged { session, name } => {
-                    let _ = tx.send(AppMsg::SessionSwitched { session, name });
+                    let _ = tmux_tx
+                        .send(AppMsg::SessionSwitched { session, name })
+                        .await;
                 }
                 Notification::SessionRenamed { session, name } => {
-                    let _ = tx.send(AppMsg::SessionRenamed { session, name });
+                    let _ = tmux_tx.send(AppMsg::SessionRenamed { session, name }).await;
                 }
                 Notification::WindowAdd { .. }
                 | Notification::WindowClose { .. }
                 | Notification::WindowRenamed { .. }
                 | Notification::SessionsChanged => {
-                    let _ = tx.send(AppMsg::Reconcile);
+                    let _ = tmux_tx.send(AppMsg::Reconcile).await;
                 }
                 Notification::Pause { pane } => {
-                    let _ = tx.send(AppMsg::PanePaused { pane });
+                    let _ = tmux_tx.send(AppMsg::PanePaused { pane }).await;
                 }
                 Notification::Continue { pane } => {
-                    let _ = tx.send(AppMsg::PaneContinued { pane });
+                    let _ = tmux_tx.send(AppMsg::PaneContinued { pane }).await;
                 }
                 Notification::Exit { .. } => {
-                    let _ = tx.send(AppMsg::LinkLost);
+                    let _ = tmux_tx.send(AppMsg::LinkLost).await;
                     break;
                 }
                 _ => {}
@@ -944,7 +1242,7 @@ pub fn coalesce_decoration_signals(
 /// watch` stream feed. The subscription itself never polls. A split or a
 /// border drag pushes several state/label/delivery events through
 /// cyclopsd at once; a dedicated reader thread turns each subscription
-/// line into one [`DecorationSignal`] on a plain channel, and
+/// line into one [`DecorationSignal`] on a single-slot channel, and
 /// [`subscribe_decoration_once`] coalesces a burst of them into ONE status
 /// fetch instead of one per event — the same arm-once, never-push-back
 /// rule `arm()` and `RENDER_DEBOUNCE` use for rendering
@@ -965,9 +1263,13 @@ pub fn coalesce_decoration_signals(
 /// The subscription outlives the daemon: [`run_decoration_forwarder`]
 /// reconnects on a bounded backoff, so a daemon restart or a boot-order
 /// race costs an outage, never the thread.
-fn spawn_decoration_forwarder(home: std::path::PathBuf, tx: mpsc::UnboundedSender<AppMsg>) {
+fn spawn_decoration_forwarder(
+    home: std::path::PathBuf,
+    control_tx: mpsc::Sender<AppMsg>,
+    stream_tx: mpsc::Sender<AppMsg>,
+) {
     std::thread::spawn(move || {
-        run_decoration_forwarder(&home, &tx, resilience::reconnect_delay);
+        run_decoration_forwarder(&home, &control_tx, &stream_tx, resilience::reconnect_delay);
     });
 }
 
@@ -981,6 +1283,46 @@ enum SubscribeEnd {
     Closed,
     /// The app channel is gone: the workspace itself is shutting down.
     SinkGone,
+}
+
+enum BoundedLine {
+    Eof,
+    Complete,
+    TooLong,
+}
+
+/// Read one blocking socket line without allocating past the consumer's
+/// frame envelope. The caller closes the connection on `TooLong`, so there is
+/// no need to retain or drain the rest of that frame.
+fn read_bounded_line(
+    reader: &mut impl std::io::BufRead,
+    line: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<BoundedLine> {
+    line.clear();
+    loop {
+        let (take, complete) = {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok(if line.is_empty() {
+                    BoundedLine::Eof
+                } else {
+                    BoundedLine::Complete
+                });
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let take = newline.map_or(available.len(), |index| index + 1);
+            if line.len().saturating_add(take) > max_bytes {
+                return Ok(BoundedLine::TooLong);
+            }
+            line.extend_from_slice(&available[..take]);
+            (take, newline.is_some())
+        };
+        reader.consume(take);
+        if complete {
+            return Ok(BoundedLine::Complete);
+        }
+    }
 }
 
 /// The forwarder's whole life: subscribe, forward until the connection
@@ -1004,13 +1346,14 @@ enum SubscribeEnd {
 /// [`resilience::reconnect_delay`], which clamps at its last entry.
 fn run_decoration_forwarder(
     home: &std::path::Path,
-    tx: &mpsc::UnboundedSender<AppMsg>,
+    control_tx: &mpsc::Sender<AppMsg>,
+    stream_tx: &mpsc::Sender<AppMsg>,
     delay_for: impl Fn(usize) -> std::time::Duration,
 ) {
     let mut attempt = 0usize;
     let mut reported_offline = false;
     loop {
-        match subscribe_decoration_once(home, tx) {
+        match subscribe_decoration_once(home, control_tx, stream_tx) {
             SubscribeEnd::SinkGone => return,
             // A connection existed, so this outage starts its own chain.
             SubscribeEnd::Closed => {
@@ -1021,8 +1364,8 @@ fn run_decoration_forwarder(
         }
         if !resilience::may_retry(attempt) && !reported_offline {
             reported_offline = true;
-            if tx
-                .send(AppMsg::DecorationChanged(DecorationSnapshot::default()))
+            if control_tx
+                .blocking_send(AppMsg::DecorationChanged(DecorationSnapshot::default()))
                 .is_err()
             {
                 return;
@@ -1038,7 +1381,7 @@ fn run_decoration_forwarder(
         }
         // The workspace shutting down closes the channel; a retry loop
         // with nobody left to tell stops instead of probing a dead socket.
-        if tx.is_closed() {
+        if control_tx.is_closed() || stream_tx.is_closed() {
             return;
         }
         // `attempt` counts completed failures; the sleep indexes the retry
@@ -1055,21 +1398,25 @@ fn run_decoration_forwarder(
 /// each carry.
 fn subscribe_decoration_once(
     home: &std::path::Path,
-    tx: &mpsc::UnboundedSender<AppMsg>,
+    control_tx: &mpsc::Sender<AppMsg>,
+    stream_tx: &mpsc::Sender<AppMsg>,
 ) -> SubscribeEnd {
-    use std::io::{BufRead, Write};
+    use std::io::Write;
     let socket = home.join(cyclops_proto::SOCK_NAME);
     let Ok(stream) = std::os::unix::net::UnixStream::connect(socket) else {
         return SubscribeEnd::ConnectFailed;
     };
     let mut reader = std::io::BufReader::new(stream);
-    let mut hello = String::new();
-    if reader
-        .read_line(&mut hello)
-        .ok()
-        .filter(|read| *read > 0)
-        .is_none()
-    {
+    let mut hello = Vec::new();
+    if !matches!(
+        read_bounded_line(&mut reader, &mut hello, STREAM_EVENT_MAX_BYTES),
+        Ok(BoundedLine::Complete)
+    ) {
+        log_err(home, "cyclopsd sent an incomplete or oversized hello");
+        return SubscribeEnd::ConnectFailed;
+    }
+    if let Err(error) = serde_json::from_slice::<cyclops_proto::Hello>(&hello) {
+        log_err(home, &format!("cyclopsd sent an unreadable hello: {error}"));
         return SubscribeEnd::ConnectFailed;
     }
     if reader
@@ -1079,61 +1426,122 @@ fn subscribe_decoration_once(
     {
         return SubscribeEnd::ConnectFailed;
     }
+    let mut acknowledgement = Vec::new();
+    if !matches!(
+        read_bounded_line(&mut reader, &mut acknowledgement, STREAM_EVENT_MAX_BYTES),
+        Ok(BoundedLine::Complete)
+    ) {
+        log_err(
+            home,
+            "cyclopsd sent an incomplete or oversized subscription acknowledgement",
+        );
+        return SubscribeEnd::ConnectFailed;
+    }
+    let acknowledgement = match serde_json::from_slice::<serde_json::Value>(&acknowledgement) {
+        Ok(value) => value,
+        Err(error) => {
+            log_err(
+                home,
+                &format!("cyclopsd sent an unreadable subscription acknowledgement: {error}"),
+            );
+            return SubscribeEnd::ConnectFailed;
+        }
+    };
+    if acknowledgement
+        .get("id")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+        || acknowledgement.pointer("/result/subscribed") != Some(&serde_json::Value::Bool(true))
+    {
+        log_err(home, "cyclopsd did not acknowledge the event subscription");
+        return SubscribeEnd::ConnectFailed;
+    }
     // Subscribed. Ask the app to resync before any event arrives on this
     // connection: everything that changed while nothing was subscribed
     // produced no event, so without this a state flip during the outage
     // stays on screen as stale.
-    if tx.send(AppMsg::DaemonReconnected).is_err() {
+    if control_tx.blocking_send(AppMsg::DaemonReconnected).is_err() {
         return SubscribeEnd::SinkGone;
     }
 
-    let (sig_tx, sig_rx) = std::sync::mpsc::channel::<DecorationSignal>();
-    let stream_tx = tx.clone();
+    let (sig_tx, sig_rx) = std::sync::mpsc::sync_channel::<DecorationSignal>(1);
+    let stream_tx = stream_tx.clone();
     std::thread::spawn(move || loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => {
-                let _ = sig_tx.send(DecorationSignal::Closed);
+        let mut line = Vec::new();
+        match read_bounded_line(&mut reader, &mut line, STREAM_EVENT_MAX_BYTES) {
+            Ok(BoundedLine::Eof) => {
+                report_stream_gap(&stream_tx, &sig_tx, "daemon event subscription closed");
                 return;
             }
-            Ok(_) => {}
+            Err(error) => {
+                report_stream_gap(
+                    &stream_tx,
+                    &sig_tx,
+                    format!("daemon event read failed: {error}"),
+                );
+                return;
+            }
+            Ok(BoundedLine::TooLong) => {
+                report_stream_gap(
+                    &stream_tx,
+                    &sig_tx,
+                    format!("daemon event exceeded {STREAM_EVENT_MAX_BYTES} bytes"),
+                );
+                return;
+            }
+            Ok(BoundedLine::Complete) => {}
         }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
+        let value = match serde_json::from_slice::<serde_json::Value>(&line) {
+            Ok(value) => value,
+            Err(error) => {
+                report_stream_gap(
+                    &stream_tx,
+                    &sig_tx,
+                    format!("malformed daemon event JSON: {error}"),
+                );
+                return;
+            }
         };
         if value.get("event").is_none() {
-            continue;
+            report_stream_gap(
+                &stream_tx,
+                &sig_tx,
+                "daemon event stream sent a non-event record",
+            );
+            return;
         }
         // E2: normalize this same line onto the shared stream model
         // before the decoration signal below. Cheap (no IO) and
-        // per-event on purpose — it must never wait for or extend the
-        // coalescing deadline that follows. An unreadable event still
-        // reaches the decoration signal; only the record feed skips
-        // it (`Entry::from_event` never rejects a KNOWN event, but a
-        // daemon ahead of this build can still send a shape that
-        // fails to deserialize at all).
-        if let Ok(ev) = serde_json::from_value::<cyclops_proto::Event>(value) {
-            // A theme reload is not a fact about the record; the CLI
-            // stream drops it the same way (`cyclops_ui`'s own
-            // subscribe loop). It still becomes a wake-only
-            // `ThemeChanged`: the decoration signal below only
-            // repaints when a status fetch lands, and a theme switch
-            // must repaint either way. Every other vocabulary, known
-            // or not, still becomes an entry (unknown kinds render as
-            // `Other` rather than being dropped).
-            if ev.event != "theme" {
-                let entry = cyclops_ui::Entry::from_event(&ev, now_ms());
-                if stream_tx
-                    .send(AppMsg::StreamEntry(Box::new(entry)))
-                    .is_err()
-                {
-                    return;
-                }
-            } else if stream_tx.send(AppMsg::ThemeChanged).is_err() {
+        // per-event on purpose. It must never wait for or extend the
+        // coalescing deadline that follows. An unreadable event closes
+        // this subscription so the app reconciles before reconnecting.
+        let ev = match serde_json::from_value::<cyclops_proto::Event>(value) {
+            Ok(event) => event,
+            Err(error) => {
+                report_stream_gap(
+                    &stream_tx,
+                    &sig_tx,
+                    format!("unreadable daemon event: {error}"),
+                );
                 return;
             }
+        };
+        // A theme reload is not a fact about the record; the CLI stream
+        // drops it the same way (`cyclops_ui`'s own subscribe loop). It
+        // still becomes a wake-only `ThemeChanged`. Every other vocabulary,
+        // known or not, becomes an entry.
+        if ev.event != "theme" {
+            let entry = cyclops_ui::Entry::from_event(&ev, now_ms());
+            if stream_tx
+                .blocking_send(AppMsg::StreamEntry(Box::new(entry)))
+                .is_err()
+            {
+                return;
+            }
+        } else if stream_tx.blocking_send(AppMsg::ThemeChanged).is_err() {
+            return;
         }
-        if sig_tx.send(DecorationSignal::Event).is_err() {
+        if !signal_decoration_event(&sig_tx) {
             return;
         }
     });
@@ -1148,8 +1556,13 @@ fn subscribe_decoration_once(
         // screen is the reconnect chain's call in
         // [`run_decoration_forwarder`], the one place it is reported.
         match decoration::fetch_decoration(home) {
-            Some(snapshot) => tx.send(AppMsg::DecorationChanged(snapshot)).is_ok(),
-            None => true,
+            Ok(snapshot) => control_tx
+                .blocking_send(AppMsg::DecorationChanged(snapshot))
+                .is_ok(),
+            Err(error) => {
+                log_err(home, &format!("decoration refresh failed: {error}"));
+                true
+            }
         }
     });
     match end {
@@ -1158,10 +1571,32 @@ fn subscribe_decoration_once(
     }
 }
 
-/// Coalesce adjacent control-mode output per pane before it reaches the app
-/// queue. Pane order is independent; byte order within each pane is not.
+fn report_stream_gap(
+    stream_tx: &mpsc::Sender<AppMsg>,
+    sig_tx: &std::sync::mpsc::SyncSender<DecorationSignal>,
+    why: impl Into<String>,
+) {
+    let _ = stream_tx.blocking_send(AppMsg::StreamGap { why: why.into() });
+    let _ = sig_tx.send(DecorationSignal::Closed);
+}
+
+/// One pending edge is enough to arm the coalescer. Further edges before it
+/// drains carry no additional state and are intentionally collapsed.
+fn signal_decoration_event(tx: &std::sync::mpsc::SyncSender<DecorationSignal>) -> bool {
+    match tx.try_send(DecorationSignal::Event) {
+        Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => true,
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+    }
+}
+
+/// Coalesce only adjacent output for the same pane. Keeping separate entries
+/// across a pane switch preserves the control stream's global order.
 fn push_output(output: &mut Vec<(String, Vec<u8>)>, pane: String, bytes: Vec<u8>) {
-    if let Some((_, pending)) = output.iter_mut().find(|(id, _)| *id == pane) {
+    if let Some((id, pending)) = output
+        .last_mut()
+        .filter(|(id, _)| id.as_str() == pane.as_str())
+    {
+        debug_assert_eq!(id, &pane);
         pending.extend(bytes);
     } else {
         output.push((pane, bytes));
@@ -1184,7 +1619,7 @@ async fn handle_reconnect(
     app: &mut App,
     client: &mut ControlClient,
     cfg: &ControlConfig,
-    tx: &mpsc::UnboundedSender<AppMsg>,
+    sinks: &AppSinks,
     reconnect_deadline: &mut Option<Instant>,
 ) -> Result<(), cyclops_tmux::TmuxError> {
     client.shutdown().await;
@@ -1192,7 +1627,7 @@ async fn handle_reconnect(
     match ControlClient::spawn(cfg).await {
         Ok((new_client, rx)) => {
             *client = new_client;
-            spawn_notif_forwarder(rx, tx.clone());
+            spawn_notif_forwarder(rx, sinks.tmux.clone());
             app.declared_client_size = None;
             app.pinned_windows.clear();
             resize_client(app, client).await;
@@ -1209,7 +1644,7 @@ async fn handle_reconnect(
                 schedule_reconnect(app, reconnect_deadline);
             } else {
                 app.link_state = LinkState::ServerGone;
-                let _ = tx.send(AppMsg::Redraw);
+                let _ = sinks.tmux.send(AppMsg::Redraw).await;
             }
         }
     }
@@ -1758,6 +2193,41 @@ async fn handle_app_msg(
             crate::event_record::live(&mut app.record, &mut app.intake, *entry);
             arm(debounce);
         }
+        AppMsg::StreamGap { why } => {
+            if app.stream_reconciling {
+                return true;
+            }
+            app.stream_reconciling = true;
+            app.notice.show(copy::stream_stale(&why), Instant::now());
+            let queued =
+                app.stream_reconcile_requests
+                    .as_ref()
+                    .is_some_and(|tx| match tx.try_send(()) {
+                        Ok(()) | Err(std::sync::mpsc::TrySendError::Full(())) => true,
+                        Err(std::sync::mpsc::TrySendError::Disconnected(())) => false,
+                    });
+            if !queued {
+                let bootstrap = crate::event_record::load(&app.home);
+                let mut record = cyclops_ui::Record::new();
+                let mut intake = cyclops_ui::Intake::new();
+                crate::event_record::install(&mut record, &mut intake, bootstrap);
+                app.record = record;
+                app.intake = intake;
+                app.stream_reconciling = false;
+                app.notice.show(copy::STREAM_RECONCILED, Instant::now());
+            }
+            arm(debounce);
+        }
+        AppMsg::StreamReconciled(bootstrap) => {
+            let mut record = cyclops_ui::Record::new();
+            let mut intake = cyclops_ui::Intake::new();
+            crate::event_record::install(&mut record, &mut intake, *bootstrap);
+            app.record = record;
+            app.intake = intake;
+            app.stream_reconciling = false;
+            app.notice.show(copy::STREAM_RECONCILED, Instant::now());
+            arm(debounce);
+        }
         // Wake-only: the reload itself runs on the render deadline this
         // arms (the theme_watch refresh in `run_async`).
         AppMsg::ThemeChanged => arm(debounce),
@@ -1786,6 +2256,11 @@ async fn handle_app_msg(
             if let Err(e) = handle_mouse(app, client, mouse, detached).await {
                 log_err(&app.home, &e);
             }
+            arm(debounce);
+        }
+        AppMsg::PasteTooLarge(bytes) => {
+            app.notice
+                .show(copy::paste_too_large(bytes), Instant::now());
             arm(debounce);
         }
         AppMsg::Paste(text) => {
@@ -3270,8 +3745,9 @@ fn apply_decoration_snapshot(app: &mut App, snapshot: DecorationSnapshot) {
 fn resync_daemon_state(app: &mut App) {
     app.watched_sessions.clear();
     ensure_sessions_watched(app);
-    if let Some(snapshot) = decoration::fetch_decoration(&app.home) {
-        apply_decoration_snapshot(app, snapshot);
+    match decoration::fetch_decoration(&app.home) {
+        Ok(snapshot) => apply_decoration_snapshot(app, snapshot),
+        Err(error) => log_err(&app.home, &format!("decoration resync failed: {error}")),
     }
 }
 
@@ -3292,8 +3768,9 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
     // Keep what the last answer said when this one does not arrive: a
     // reconcile that cannot reach the daemon knows nothing new about the
     // roster, and blanking it would un-name every agent on screen.
-    if let Some(snapshot) = decoration::fetch_decoration(&app.home) {
-        app.decoration = snapshot;
+    match decoration::fetch_decoration(&app.home) {
+        Ok(snapshot) => app.decoration = snapshot,
+        Err(error) => log_err(&app.home, &format!("decoration reconcile failed: {error}")),
     }
     app.persist_active();
     // New windows arrive through this snapshot (new tab, session switch,
@@ -3910,6 +4387,7 @@ mod tests {
             files_root_pending: true,
             record: cyclops_ui::Record::new(),
             intake: cyclops_ui::Intake::new(),
+            stream_reconciling: false,
             cursor_style: None,
             term_size: (40, 12),
             declared_client_size: None,
@@ -3919,7 +4397,8 @@ mod tests {
             paste_seq: 0,
             home,
             folder_probe_at: None,
-            tx: None,
+            send_requests: None,
+            stream_reconcile_requests: None,
         }
     }
 
@@ -4013,14 +4492,178 @@ mod tests {
 
     #[tokio::test]
     async fn due_render_deadline_beats_a_ready_message_queue() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        tx.send(AppMsg::Redraw).expect("queue stays open");
+        let (input_tx, mut input_rx) = mpsc::channel(4);
+        let (_paste_tx, mut paste_rx) = mpsc::channel(1);
+        let (_action_tx, mut action_rx) = mpsc::channel(4);
+        let (_terminal_tx, mut terminal_rx) = mpsc::channel(4);
+        let (_tmux_tx, mut tmux_rx) = mpsc::channel(4);
+        let (_stream_tx, mut stream_rx) = mpsc::channel(4);
+        let mut fairness = IngressFairness::default();
+        input_tx
+            .send(AppMsg::Redraw)
+            .await
+            .expect("queue stays open");
         let due = Instant::now() - Duration::from_millis(1);
 
         assert!(matches!(
-            next_wake(&mut rx, Some(due)).await,
+            next_wake(
+                &mut input_rx,
+                &mut paste_rx,
+                &mut action_rx,
+                &mut terminal_rx,
+                &mut tmux_rx,
+                &mut stream_rx,
+                true,
+                &mut fairness,
+                Some(due),
+            )
+            .await,
             Wake::Deadline
         ));
+    }
+
+    #[tokio::test]
+    async fn a_ready_input_precedes_a_full_stream_lane() {
+        let (input_tx, mut input_rx) = mpsc::channel(4);
+        let (_paste_tx, mut paste_rx) = mpsc::channel(1);
+        let (_action_tx, mut action_rx) = mpsc::channel(4);
+        let (_terminal_tx, mut terminal_rx) = mpsc::channel(4);
+        let (_tmux_tx, mut tmux_rx) = mpsc::channel(4);
+        let (stream_tx, mut stream_rx) = mpsc::channel(4);
+        let mut fairness = IngressFairness::default();
+
+        for _ in 0..4 {
+            stream_tx.try_send(AppMsg::ThemeChanged).unwrap();
+        }
+        assert!(stream_tx.try_send(AppMsg::ThemeChanged).is_err());
+        input_tx.try_send(AppMsg::Redraw).unwrap();
+
+        assert!(matches!(
+            next_message(
+                &mut input_rx,
+                &mut paste_rx,
+                &mut action_rx,
+                &mut terminal_rx,
+                &mut tmux_rx,
+                &mut stream_rx,
+                true,
+                &mut fairness,
+            )
+            .await,
+            Some(AppMsg::Redraw)
+        ));
+        assert!(matches!(stream_rx.try_recv(), Ok(AppMsg::ThemeChanged)));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_blocks_stream_entries_without_blocking_actions() {
+        let (_input_tx, mut input_rx) = mpsc::channel(4);
+        let (_paste_tx, mut paste_rx) = mpsc::channel(1);
+        let (action_tx, mut action_rx) = mpsc::channel(4);
+        let (_terminal_tx, mut terminal_rx) = mpsc::channel(4);
+        let (_tmux_tx, mut tmux_rx) = mpsc::channel(4);
+        let (stream_tx, mut stream_rx) = mpsc::channel(4);
+        let mut fairness = IngressFairness::default();
+
+        stream_tx.try_send(AppMsg::ThemeChanged).unwrap();
+        action_tx.try_send(AppMsg::Redraw).unwrap();
+
+        assert!(matches!(
+            next_message(
+                &mut input_rx,
+                &mut paste_rx,
+                &mut action_rx,
+                &mut terminal_rx,
+                &mut tmux_rx,
+                &mut stream_rx,
+                false,
+                &mut fairness,
+            )
+            .await,
+            Some(AppMsg::Redraw)
+        ));
+        assert!(matches!(stream_rx.try_recv(), Ok(AppMsg::ThemeChanged)));
+    }
+
+    #[tokio::test]
+    async fn a_priority_burst_yields_to_ready_background_work() {
+        let (input_tx, mut input_rx) = mpsc::channel(PRIORITY_BURST + 1);
+        let (_paste_tx, mut paste_rx) = mpsc::channel(1);
+        let (_action_tx, mut action_rx) = mpsc::channel(1);
+        let (_terminal_tx, mut terminal_rx) = mpsc::channel(1);
+        let (_tmux_tx, mut tmux_rx) = mpsc::channel(1);
+        let (stream_tx, mut stream_rx) = mpsc::channel(1);
+        let mut fairness = IngressFairness::default();
+        for _ in 0..=PRIORITY_BURST {
+            input_tx.try_send(AppMsg::Redraw).unwrap();
+        }
+        stream_tx.try_send(AppMsg::ThemeChanged).unwrap();
+
+        for _ in 0..PRIORITY_BURST {
+            assert!(matches!(
+                next_message(
+                    &mut input_rx,
+                    &mut paste_rx,
+                    &mut action_rx,
+                    &mut terminal_rx,
+                    &mut tmux_rx,
+                    &mut stream_rx,
+                    true,
+                    &mut fairness,
+                )
+                .await,
+                Some(AppMsg::Redraw)
+            ));
+        }
+        assert!(matches!(
+            next_message(
+                &mut input_rx,
+                &mut paste_rx,
+                &mut action_rx,
+                &mut terminal_rx,
+                &mut tmux_rx,
+                &mut stream_rx,
+                true,
+                &mut fairness,
+            )
+            .await,
+            Some(AppMsg::ThemeChanged)
+        ));
+    }
+
+    #[test]
+    fn decoration_edges_coalesce_in_the_single_pending_slot() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        assert!(signal_decoration_event(&tx));
+        assert!(signal_decoration_event(&tx));
+        assert!(matches!(rx.try_recv(), Ok(DecorationSignal::Event)));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(rx);
+        assert!(!signal_decoration_event(&tx));
+    }
+
+    #[test]
+    fn decoration_frames_stop_before_allocating_past_the_limit() {
+        let mut exact = vec![b'x'; STREAM_EVENT_MAX_BYTES];
+        exact[STREAM_EVENT_MAX_BYTES - 1] = b'\n';
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(exact));
+        let mut line = Vec::new();
+        assert!(matches!(
+            read_bounded_line(&mut reader, &mut line, STREAM_EVENT_MAX_BYTES).unwrap(),
+            BoundedLine::Complete
+        ));
+        assert_eq!(line.len(), STREAM_EVENT_MAX_BYTES);
+
+        let oversized = vec![b'x'; STREAM_EVENT_MAX_BYTES + 1];
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(oversized));
+        assert!(matches!(
+            read_bounded_line(&mut reader, &mut line, STREAM_EVENT_MAX_BYTES).unwrap(),
+            BoundedLine::TooLong
+        ));
+        assert!(line.len() <= STREAM_EVENT_MAX_BYTES);
     }
 
     /// L1: a burst of daemon events must collapse to exactly one status
@@ -4056,10 +4699,14 @@ mod tests {
                 .expect("hello");
             let mut line = String::new();
             reader.read_line(&mut line).expect("subscribe request");
+            reader
+                .get_mut()
+                .write_all(b"{\"id\":1,\"result\":{\"subscribed\":true}}\n")
+                .expect("subscribe acknowledgement");
             for _ in 0..5 {
                 let _ = reader
                     .get_mut()
-                    .write_all(b"{\"event\":{\"kind\":\"state\"}}\n");
+                    .write_all(b"{\"event\":\"state\",\"data\":{}}\n");
             }
 
             // 2. Every later connection is one coalesced status fetch:
@@ -4089,8 +4736,9 @@ mod tests {
             }
         });
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        spawn_decoration_forwarder(home.clone(), tx);
+        let (control_tx, mut control_rx) = mpsc::channel(INGRESS_CAPACITY);
+        let (stream_tx, _stream_rx) = mpsc::channel(INGRESS_CAPACITY);
+        spawn_decoration_forwarder(home.clone(), control_tx, stream_tx);
 
         // 3. Wait for the coalesced refresh to land, then confirm it stays
         //    at exactly one — bounded polling in test code only (rule 9's
@@ -4107,7 +4755,7 @@ mod tests {
         );
 
         let mut changed = 0;
-        while let Ok(msg) = rx.try_recv() {
+        while let Ok(msg) = control_rx.try_recv() {
             if matches!(msg, AppMsg::DecorationChanged(_)) {
                 changed += 1;
             }
@@ -4147,6 +4795,10 @@ mod tests {
                 .expect("hello");
             let mut line = String::new();
             reader.read_line(&mut line).expect("subscribe request");
+            reader
+                .get_mut()
+                .write_all(b"{\"id\":1,\"result\":{\"subscribed\":true}}\n")
+                .expect("subscribe acknowledgement");
             let _ = reader
                 .get_mut()
                 .write_all(b"{\"event\":\"theme\",\"data\":{\"name\":\"aurora\"}}\n");
@@ -4155,8 +4807,9 @@ mod tests {
             }
         });
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        spawn_decoration_forwarder(home.clone(), tx);
+        let (control_tx, _control_rx) = mpsc::channel(INGRESS_CAPACITY);
+        let (stream_tx, mut stream_rx) = mpsc::channel(INGRESS_CAPACITY);
+        spawn_decoration_forwarder(home.clone(), control_tx, stream_tx);
 
         // Bounded polling in test code only (rule 9's documented
         // exception), never in the forwarder itself.
@@ -4164,7 +4817,7 @@ mod tests {
         let mut woke = 0;
         let mut entries = 0;
         while woke == 0 && std::time::Instant::now() < deadline {
-            while let Ok(msg) = rx.try_recv() {
+            while let Ok(msg) = stream_rx.try_recv() {
                 match msg {
                     AppMsg::ThemeChanged => woke += 1,
                     AppMsg::StreamEntry(_) => entries += 1,
@@ -4246,7 +4899,8 @@ mod tests {
                     match request["method"].as_str() {
                         Some("events.subscribe") => {
                             let mut stream = reader.into_inner();
-                            let _ = stream.write_all(b"{\"id\":1,\"result\":{}}\n");
+                            let _ =
+                                stream.write_all(b"{\"id\":1,\"result\":{\"subscribed\":true}}\n");
                             subs_bg.lock().expect("subs").push(stream);
                         }
                         Some("session.watch") => {
@@ -4326,7 +4980,7 @@ mod tests {
     /// (rule 9's documented exception); the forwarder itself stays
     /// event-armed.
     fn wait_for_msg(
-        rx: &mut mpsc::UnboundedReceiver<AppMsg>,
+        rx: &mut mpsc::Receiver<AppMsg>,
         what: &str,
         mut matching: impl FnMut(&AppMsg) -> bool,
     ) -> AppMsg {
@@ -4354,27 +5008,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).expect("scratch home");
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (control_tx, mut control_rx) = mpsc::channel(INGRESS_CAPACITY);
+        let (stream_tx, _stream_rx) = mpsc::channel(INGRESS_CAPACITY);
         let home_bg = home.clone();
         // Millisecond backoff so the whole lifecycle runs in test time;
         // production wires resilience::reconnect_delay.
         std::thread::spawn(move || {
-            run_decoration_forwarder(&home_bg, &tx, |_| Duration::from_millis(5));
+            run_decoration_forwarder(&home_bg, &control_tx, &stream_tx, |_| {
+                Duration::from_millis(5)
+            });
         });
 
         // Boot race: nothing is listening yet. The forwarder must still
         // be trying, not dead, when the daemon finally binds.
         std::thread::sleep(Duration::from_millis(40));
         let daemon = FakeDaemon::spawn(&home);
-        wait_for_msg(&mut rx, "the resync ask after the boot race", |msg| {
-            matches!(msg, AppMsg::DaemonReconnected)
-        });
+        wait_for_msg(
+            &mut control_rx,
+            "the resync ask after the boot race",
+            |msg| matches!(msg, AppMsg::DaemonReconnected),
+        );
 
         // Restart: the live connection drops; before the fix the thread
         // ended here, permanently.
         drop(daemon);
         let daemon = FakeDaemon::spawn(&home);
-        wait_for_msg(&mut rx, "the resync ask after the restart", |msg| {
+        wait_for_msg(&mut control_rx, "the resync ask after the restart", |msg| {
             matches!(msg, AppMsg::DaemonReconnected)
         });
 
@@ -4388,7 +5047,7 @@ mod tests {
             daemon.push_event(b"{\"event\":{\"kind\":\"state\"}}\n");
             let pause = std::time::Instant::now() + Duration::from_millis(100);
             while std::time::Instant::now() < pause {
-                match rx.try_recv() {
+                match control_rx.try_recv() {
                     Ok(AppMsg::DecorationChanged(snapshot)) if snapshot.online => {
                         refreshed = true;
                         break 'push;
@@ -4419,13 +5078,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).expect("scratch home");
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (control_tx, mut control_rx) = mpsc::channel(INGRESS_CAPACITY);
+        let (stream_tx, _stream_rx) = mpsc::channel(INGRESS_CAPACITY);
         let home_bg = home.clone();
         std::thread::spawn(move || {
-            run_decoration_forwarder(&home_bg, &tx, |_| Duration::from_millis(2));
+            run_decoration_forwarder(&home_bg, &control_tx, &stream_tx, |_| {
+                Duration::from_millis(2)
+            });
         });
 
-        let offline = wait_for_msg(&mut rx, "the offline report", |msg| {
+        let offline = wait_for_msg(&mut control_rx, "the offline report", |msg| {
             matches!(msg, AppMsg::DecorationChanged(_))
         });
         let AppMsg::DecorationChanged(snapshot) = offline else {
@@ -4450,7 +5112,7 @@ mod tests {
 
         // Once per outage: many more failed chain turns add nothing.
         std::thread::sleep(Duration::from_millis(60));
-        while let Ok(msg) = rx.try_recv() {
+        while let Ok(msg) = control_rx.try_recv() {
             assert!(
                 !matches!(msg, AppMsg::DecorationChanged(_)),
                 "offline must be reported once, not once per retry"
@@ -4459,7 +5121,7 @@ mod tests {
 
         // The chain never gave up: a daemon that appears now is found.
         let daemon = FakeDaemon::spawn(&home);
-        wait_for_msg(&mut rx, "the resync ask after recovery", |msg| {
+        wait_for_msg(&mut control_rx, "the resync ask after recovery", |msg| {
             matches!(msg, AppMsg::DaemonReconnected)
         });
 
@@ -4830,7 +5492,7 @@ mod tests {
     }
 
     #[test]
-    fn adjacent_output_batches_preserve_each_panes_byte_order() {
+    fn output_coalescing_preserves_global_pane_order() {
         let mut output = Vec::new();
         push_output(&mut output, "%0".into(), b"ab".to_vec());
         push_output(&mut output, "%1".into(), b"x".to_vec());
@@ -4839,10 +5501,86 @@ mod tests {
         assert_eq!(
             output,
             vec![
-                ("%0".to_string(), b"abcd".to_vec()),
-                ("%1".to_string(), b"x".to_vec())
+                ("%0".to_string(), b"ab".to_vec()),
+                ("%1".to_string(), b"x".to_vec()),
+                ("%0".to_string(), b"cd".to_vec())
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn oversized_output_is_split_without_changing_its_bytes() {
+        let (notification_tx, notification_rx) = mpsc::channel(1);
+        let (tmux_tx, mut tmux_rx) = mpsc::channel(3);
+        spawn_notif_forwarder(NotificationReceiver::from_bounded(notification_rx), tmux_tx);
+
+        let bytes = vec![b'x'; OUTPUT_BATCH_MAX_BYTES + 17];
+        notification_tx
+            .send(Notification::Output {
+                pane: "%1".into(),
+                data: bytes.clone(),
+            })
+            .await
+            .unwrap();
+        drop(notification_tx);
+
+        let mut landed = Vec::new();
+        for expected_len in [OUTPUT_BATCH_MAX_BYTES, 17] {
+            let Some(AppMsg::OutputBatch(batch)) = tmux_rx.recv().await else {
+                panic!("output forwarder ended before both chunks landed");
+            };
+            assert_eq!(batch.len(), 1);
+            assert_eq!(batch[0].0, "%1");
+            assert_eq!(batch[0].1.len(), expected_len);
+            landed.extend_from_slice(&batch[0].1);
+        }
+        assert_eq!(landed, bytes);
+    }
+
+    #[tokio::test]
+    async fn a_closed_notification_stream_requests_reconnect() {
+        let (notification_tx, notification_rx) = mpsc::channel(1);
+        let (tmux_tx, mut tmux_rx) = mpsc::channel(1);
+        spawn_notif_forwarder(NotificationReceiver::from_bounded(notification_rx), tmux_tx);
+
+        drop(notification_tx);
+        assert!(matches!(tmux_rx.recv().await, Some(AppMsg::LinkLost)));
+    }
+
+    #[tokio::test]
+    async fn structural_notifications_do_not_overtake_pane_output() {
+        let (notification_tx, notification_rx) = mpsc::channel(3);
+        let (tmux_tx, mut tmux_rx) = mpsc::channel(4);
+        spawn_notif_forwarder(NotificationReceiver::from_bounded(notification_rx), tmux_tx);
+        notification_tx
+            .send(Notification::Output {
+                pane: "%0".into(),
+                data: b"before".to_vec(),
+            })
+            .await
+            .unwrap();
+        notification_tx
+            .send(Notification::LayoutChange {
+                window: "@0".into(),
+                rest: "layout".into(),
+            })
+            .await
+            .unwrap();
+        notification_tx
+            .send(Notification::Output {
+                pane: "%0".into(),
+                data: b"after".to_vec(),
+            })
+            .await
+            .unwrap();
+        drop(notification_tx);
+
+        assert!(matches!(tmux_rx.recv().await, Some(AppMsg::OutputBatch(_))));
+        assert!(matches!(
+            tmux_rx.recv().await,
+            Some(AppMsg::LayoutChanged { .. })
+        ));
+        assert!(matches!(tmux_rx.recv().await, Some(AppMsg::OutputBatch(_))));
     }
 
     #[test]

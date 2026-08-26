@@ -410,7 +410,7 @@ enum Action {
 
 async fn watch_loop(
     mut ctx: LoopCtx,
-    mut notif_rx: mpsc::UnboundedReceiver<Notification>,
+    mut notif_rx: crate::control::NotificationReceiver,
     mut reconcile_rx: mpsc::Receiver<oneshot::Sender<Result<(), TmuxError>>>,
 ) {
     // One-shot deadline armed by hints. No hint, no timer: zero polling.

@@ -27,7 +27,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cyclops_testrig::{tmux_available, TmuxServer};
-use cyclops_tmux::{ControlClient, ControlConfig, Notification};
+use cyclops_tmux::{ControlClient, ControlConfig, Notification, NotificationReceiver};
 use cyclops_workspace::app::{coalesce_decoration_signals, CoalesceEnd, DecorationSignal};
 
 /// One measurement at a time. cargo runs this binary's tests on parallel
@@ -359,9 +359,7 @@ async fn sustained_output_backlog_drains_continuously() {
 /// uninterrupted block — checking in between and continuing would let the
 /// reader drain whatever little had queued and reset the "behind" clock
 /// to zero, defeating the next attempt before it starts.
-async fn stall_until_paused(
-    notif: &mut tokio::sync::mpsc::UnboundedReceiver<Notification>,
-) -> Option<String> {
+async fn stall_until_paused(notif: &mut NotificationReceiver) -> Option<String> {
     const ATTEMPTS: [Duration; 4] = [
         Duration::from_secs(2),
         Duration::from_secs(4),

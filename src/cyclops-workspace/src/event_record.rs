@@ -30,6 +30,15 @@ use cyclops_ui::{Entry, Intake, Record, StatusSeed};
 /// panel and opening the CLI start from the same history.
 pub const BACKFILL: usize = 200;
 
+/// One bounded replacement for the shared stream model. Loading may touch
+/// the daemon socket and journal, so the application builds this off-loop
+/// after an ingress gap and installs it as one result.
+pub struct Bootstrap {
+    seed: Option<Box<StatusSeed>>,
+    entries: Vec<Entry>,
+    max_seq: Option<u64>,
+}
+
 /// One live subscription entry, through the intake's startup buffering
 /// and seq dedup. Before the backfill lands this buffers; after it, a
 /// ledger-backed entry the replayed tail already carries is dropped
@@ -84,6 +93,10 @@ fn apply_seed(record: &mut Record, seed: &StatusSeed) {
 /// costs the scope, not the tail. Neither fetch repeats: after boot the
 /// record moves on the live subscription alone.
 pub fn boot(record: &mut Record, intake: &mut Intake, home: &Path) {
+    install(record, intake, load(home));
+}
+
+pub fn load(home: &Path) -> Bootstrap {
     let params = cyclops_proto::StatusParams {
         open_deliveries: true,
     };
@@ -91,12 +104,20 @@ pub fn boot(record: &mut Record, intake: &mut Intake, home: &Path) {
         .ok()
         .map(|s| Box::new(StatusSeed::from_status(&s)));
     let watched = seed.as_ref().map(|s| s.watched.clone());
-    if let Some(seed) = seed {
-        status(record, intake, seed);
-    }
     let (entries, max_seq) =
         cyclops_ui::read_backfill(&home.join("ledger"), BACKFILL, watched.as_deref());
-    backfill(record, intake, entries, max_seq);
+    Bootstrap {
+        seed,
+        entries,
+        max_seq,
+    }
+}
+
+pub fn install(record: &mut Record, intake: &mut Intake, bootstrap: Bootstrap) {
+    if let Some(seed) = bootstrap.seed {
+        status(record, intake, seed);
+    }
+    backfill(record, intake, bootstrap.entries, bootstrap.max_seq);
 }
 
 #[cfg(test)]

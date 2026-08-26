@@ -14,6 +14,10 @@ use cyclops_proto::{Hello, PaneStatus, Request, Response, StatusParams, StatusRe
 use serde_json::{json, Value};
 
 const IO_TIMEOUT: Duration = Duration::from_millis(250);
+/// Largest hello or response retained from the daemon. Status and action
+/// payloads share this envelope so a count-bounded app queue cannot receive
+/// one unbounded item.
+pub(crate) const DAEMON_LINE_MAX_BYTES: usize = 1 << 20;
 
 /// Deadline for a send, which is a different kind of request from every
 /// other one here.
@@ -101,14 +105,39 @@ fn exchange(
 }
 
 fn read_value(reader: &mut BufReader<UnixStream>, context: &str) -> Result<Value, String> {
-    let mut line = String::new();
-    match reader.read_line(&mut line) {
-        Ok(0) => return Err(format!("cyclopsd closed during {context}")),
-        Ok(_) => {}
-        Err(error) => return Err(format!("cannot read cyclopsd {context}: {error}")),
-    }
-    serde_json::from_str(line.trim())
+    let line = read_bounded_line(reader, context)?;
+    serde_json::from_slice(&line)
         .map_err(|error| format!("cyclopsd sent unreadable {context}: {error}"))
+}
+
+fn read_bounded_line(reader: &mut impl BufRead, context: &str) -> Result<Vec<u8>, String> {
+    let mut line = Vec::new();
+    loop {
+        let (take, complete) = {
+            let available = reader
+                .fill_buf()
+                .map_err(|error| format!("cannot read cyclopsd {context}: {error}"))?;
+            if available.is_empty() {
+                if line.is_empty() {
+                    return Err(format!("cyclopsd closed during {context}"));
+                }
+                return Ok(line);
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let take = newline.map_or(available.len(), |index| index + 1);
+            if line.len().saturating_add(take) > DAEMON_LINE_MAX_BYTES {
+                return Err(format!(
+                    "cyclopsd {context} exceeded {DAEMON_LINE_MAX_BYTES} bytes"
+                ));
+            }
+            line.extend_from_slice(&available[..take]);
+            (take, newline.is_some())
+        };
+        reader.consume(take);
+        if complete {
+            return Ok(line);
+        }
+    }
 }
 
 /// Result of a composer send.
@@ -302,6 +331,16 @@ pub fn label_pane(home: &Path, pane_id: &str, label: &str) -> Result<(), String>
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn response_lines_stop_before_allocating_past_the_envelope() {
+        let oversized = vec![b'x'; DAEMON_LINE_MAX_BYTES + 1];
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(oversized));
+        let error = read_bounded_line(&mut reader, "test response")
+            .expect_err("an oversized response must be refused");
+        assert!(error.contains("exceeded"), "{error}");
+        assert!(reader.buffer().len() <= DAEMON_LINE_MAX_BYTES);
+    }
 
     #[test]
     fn request_consumes_the_mandatory_hello_before_the_response() {

@@ -52,6 +52,16 @@ pub const SERVER_GONE_OFFER: &str = "tmux server is gone. Run cyclops again to s
 
 pub const EVENT_STREAM_EMPTY: &str = "No events yet.";
 
+pub fn paste_too_large(bytes: usize) -> String {
+    format!("paste refused: {bytes} bytes exceeds the 1 MiB workspace limit")
+}
+
+pub fn stream_stale(why: &str) -> String {
+    format!("stream input dropped: {why}; rebuilding history")
+}
+
+pub const STREAM_RECONCILED: &str = "stream rebuilt from the durable tail";
+
 // No space after the glyph: ☰ is ambiguous-width and most fonts already
 // draw it with a right shoulder, so a literal space read as a two-cell gap.
 pub const APP_MENU_BUTTON: &str = "☰menu";

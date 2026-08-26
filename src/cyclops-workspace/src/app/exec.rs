@@ -716,8 +716,12 @@ fn name_pane(app: &mut App, pane_id: String, label: String) -> Result<Outcome, T
     });
     app.dialog = None;
     app.hover = None;
-    if let Some(snapshot) = decoration::fetch_decoration(&app.home) {
-        app.decoration = snapshot;
+    match decoration::fetch_decoration(&app.home) {
+        Ok(snapshot) => app.decoration = snapshot,
+        Err(error) => super::log_err(
+            &app.home,
+            &format!("decoration refresh after label failed: {error}"),
+        ),
     }
     Ok(Outcome {
         persist,
@@ -1228,7 +1232,7 @@ async fn insert_file_ref(
 }
 
 fn send_message(app: &mut App, to: String, subject: String, body: String) {
-    let Some(tx) = app.tx.clone() else {
+    let Some(requests) = app.send_requests.clone() else {
         return;
     };
     let message = Composed { to, subject, body };
@@ -1241,19 +1245,23 @@ fn send_message(app: &mut App, to: String, subject: String, body: String) {
         let to = &attempt.message.to;
         *status = Some(crate::copy::compose_sending(to));
     }
-    let home = app.home.clone();
-    std::thread::spawn(move || {
-        let outcome = daemon::send_message(
-            &home,
-            &attempt.message.to,
-            &attempt.message.subject,
-            &attempt.message.body,
-            &attempt.client_key,
-        );
-        // The workspace shutting down closes the channel. Nothing to do
-        // about it and nothing to report it to.
-        let _ = tx.send(super::AppMsg::SendFinished { attempt, outcome });
-    });
+    match requests.try_send(attempt) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::TrySendError::Full(attempt)) => {
+            super::finish_compose_send(
+                app.dialog.as_mut(),
+                attempt,
+                daemon::SendOutcome::Rejected("another send is still in progress".into()),
+            );
+        }
+        Err(std::sync::mpsc::TrySendError::Disconnected(attempt)) => {
+            super::finish_compose_send(
+                app.dialog.as_mut(),
+                attempt,
+                daemon::SendOutcome::Rejected("the send worker stopped".into()),
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1316,7 +1324,6 @@ mod tests {
             // No loop around this App, so nothing could receive a send's
             // answer. `send_message` declines to start one rather than put
             // a message on the record nobody will be told about.
-            tx: None,
             model,
             runtimes: RuntimeRegistry::default(),
             router: Router::new(default_bindings()),
@@ -1351,6 +1358,7 @@ mod tests {
             sidebar_tab: SidebarTab::default(),
             record: cyclops_ui::Record::new(),
             intake: cyclops_ui::Intake::new(),
+            stream_reconciling: false,
             cursor_style: None,
             term_size: (80, 24),
             declared_client_size: None,
@@ -1360,6 +1368,8 @@ mod tests {
             paste_seq: 0,
             home,
             folder_probe_at: None,
+            send_requests: None,
+            stream_reconcile_requests: None,
         }
     }
 

@@ -20,6 +20,11 @@
 //! multi-byte character split across two pty reads makes each of the two
 //! lines invalid UTF-8 on its own. Decoding must never decide whether the
 //! connection lives.
+//!
+//! Notifications enter a bounded ordered queue. Queue overflow or an
+//! oversized control line closes this connection so the owner can reconnect
+//! and rebuild a whole snapshot. The reader never skips one notification and
+//! pretends later notifications are contiguous.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -28,9 +33,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -39,6 +44,29 @@ use crate::notify::{parse_notification_bytes, Notification};
 use crate::quote::quote_arg;
 
 static SPOOL_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Notifications waiting outside the control reader. A full queue means the
+/// consumer no longer keeps up with an ordered tmux stream, so the reader
+/// disconnects and lets its owner reconcile from a fresh snapshot.
+pub const NOTIFICATION_CAPACITY: usize = 256;
+/// Aggregate retained notification payload. Item capacity still bounds
+/// bookkeeping, while this budget prevents a queue of large output records
+/// from retaining `capacity * line_limit` bytes.
+pub const NOTIFICATION_MAX_QUEUED_BYTES: usize = 8 << 20;
+/// Largest tmux control line accepted into memory. A larger line closes the
+/// connection rather than growing one read without bound.
+pub const CONTROL_LINE_MAX_BYTES: usize = 1 << 20;
+/// Aggregate reply data accepted between one `%begin` and its terminator.
+pub const CONTROL_BLOCK_MAX_BYTES: usize = 8 << 20;
+/// Reply rows accepted in one block. This also bounds the `Vec<String>`
+/// bookkeeping when rows themselves are empty.
+pub const CONTROL_BLOCK_MAX_LINES: usize = 65_536;
+/// Commands awaiting correlated reply blocks. A caller that cannot reserve a
+/// slot is refused before writing, so the reply FIFO and command tasks stay
+/// fixed.
+pub const PENDING_REPLY_CAPACITY: usize = 64;
+/// Pause resume asks waiting behind the single resume writer.
+const PAUSE_RESUME_CAPACITY: usize = 64;
 
 /// How the control client reaches its session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,8 +172,17 @@ impl ControlConfig {
     }
 }
 
-/// Reply slot for one in-flight command.
-type ReplySlot = oneshot::Sender<Result<Vec<String>, TmuxError>>;
+enum ReplyTarget {
+    Caller(oneshot::Sender<Result<Vec<String>, TmuxError>>),
+    Resume { pane: String },
+}
+
+/// Reply slot for one in-flight command. The permit is retained until the
+/// reader consumes the correlated block or connection shutdown drains it.
+struct ReplySlot {
+    target: ReplyTarget,
+    _permit: OwnedSemaphorePermit,
+}
 
 /// Shared write side: stdin plus the FIFO of waiting reply slots. The slot
 /// is pushed while the stdin lock is held, so queue order always matches
@@ -154,6 +191,7 @@ type ReplySlot = oneshot::Sender<Result<Vec<String>, TmuxError>>;
 struct CommandPipe {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     pending: Arc<StdMutex<VecDeque<ReplySlot>>>,
+    reply_slots: Arc<Semaphore>,
     /// Commands successfully written, across every clone of this pipe.
     /// Exists so a caller (a test, or a future cost budget) can prove a
     /// batched adapter call issues a small, fixed number of tmux commands
@@ -170,17 +208,40 @@ impl CommandPipe {
         &self,
         cmd: &str,
     ) -> Result<oneshot::Receiver<Result<Vec<String>, TmuxError>>, TmuxError> {
+        let (tx, rx) = oneshot::channel();
+        self.submit_target(cmd, ReplyTarget::Caller(tx)).await?;
+        Ok(rx)
+    }
+
+    /// Queue an adapter-owned resume. Its successful reply becomes a
+    /// `Continue` notification in the reader itself, at the exact point that
+    /// reply appears in the ordered control stream.
+    async fn submit_resume(&self, cmd: &str, pane: String) -> Result<(), TmuxError> {
+        self.submit_target(cmd, ReplyTarget::Resume { pane }).await
+    }
+
+    async fn submit_target(&self, cmd: &str, target: ReplyTarget) -> Result<(), TmuxError> {
         if cmd.contains('\n') || cmd.contains('\r') {
             return Err(TmuxError::Protocol(format!(
                 "command contains a line break: {cmd:?}"
             )));
         }
-        let (tx, rx) = oneshot::channel();
+        let permit = match Arc::clone(&self.reply_slots).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::NoPermits) => return Err(TmuxError::Busy),
+            Err(tokio::sync::TryAcquireError::Closed) => return Err(TmuxError::Disconnected),
+        };
         let mut guard = self.stdin.lock().await;
         let Some(stdin) = guard.as_mut() else {
             return Err(TmuxError::Disconnected);
         };
-        self.pending.lock().expect("pending lock").push_back(tx);
+        self.pending
+            .lock()
+            .expect("pending lock")
+            .push_back(ReplySlot {
+                target,
+                _permit: permit,
+            });
         let mut line = String::with_capacity(cmd.len() + 1);
         line.push_str(cmd);
         line.push('\n');
@@ -196,15 +257,64 @@ impl CommandPipe {
             return Err(TmuxError::Io(e));
         }
         self.issued.fetch_add(1, Ordering::Relaxed);
-        Ok(rx)
+        Ok(())
     }
 
     /// Drop stdin (tmux sees EOF) and fail everything still waiting.
     async fn close(&self) {
         *self.stdin.lock().await = None;
         let mut pending = self.pending.lock().expect("pending lock");
-        while let Some(tx) = pending.pop_front() {
-            let _ = tx.send(Err(TmuxError::Disconnected));
+        while let Some(slot) = pending.pop_front() {
+            if let ReplyTarget::Caller(tx) = slot.target {
+                let _ = tx.send(Err(TmuxError::Disconnected));
+            }
+        }
+    }
+}
+
+struct QueuedNotification {
+    notification: Notification,
+    _permit: OwnedSemaphorePermit,
+}
+
+#[derive(Clone)]
+struct NotificationSink {
+    tx: mpsc::Sender<QueuedNotification>,
+    bytes: Arc<Semaphore>,
+}
+
+/// Bounded unsolicited control notifications. `recv` releases the queue's
+/// byte permit before handing ownership of the notification to its caller.
+pub struct NotificationReceiver {
+    rx: NotificationQueue,
+}
+
+enum NotificationQueue {
+    Budgeted(mpsc::Receiver<QueuedNotification>),
+    Direct(mpsc::Receiver<Notification>),
+}
+
+impl NotificationReceiver {
+    pub async fn recv(&mut self) -> Option<Notification> {
+        match &mut self.rx {
+            NotificationQueue::Budgeted(rx) => rx.recv().await.map(|queued| queued.notification),
+            NotificationQueue::Direct(rx) => rx.recv().await,
+        }
+    }
+
+    pub fn try_recv(&mut self) -> Result<Notification, mpsc::error::TryRecvError> {
+        match &mut self.rx {
+            NotificationQueue::Budgeted(rx) => rx.try_recv().map(|queued| queued.notification),
+            NotificationQueue::Direct(rx) => rx.try_recv(),
+        }
+    }
+
+    /// Adapt an already bounded notification receiver. `ControlClient`
+    /// supplies the stronger aggregate byte budget; this adapter exists for
+    /// bounded in-process producers such as integration probes.
+    pub fn from_bounded(rx: mpsc::Receiver<Notification>) -> Self {
+        Self {
+            rx: NotificationQueue::Direct(rx),
         }
     }
 }
@@ -221,6 +331,15 @@ enum Routed {
         client: bool,
         result: Result<Vec<String>, String>,
     },
+    /// A reply block exceeded its item or byte envelope.
+    BlockOverflow,
+}
+
+struct OpenBlock {
+    client: bool,
+    command: Option<u64>,
+    lines: Vec<String>,
+    bytes: usize,
 }
 
 /// Line-level state machine for the control stream.
@@ -234,8 +353,7 @@ enum Routed {
 /// %begin, so captured pane text containing "%end ..." cannot truncate a
 /// block.
 struct LineRouter {
-    /// (client flag, command number, collected lines) of the open block.
-    block: Option<(bool, Option<u64>, Vec<String>)>,
+    block: Option<OpenBlock>,
 }
 
 impl LineRouter {
@@ -244,37 +362,47 @@ impl LineRouter {
     }
 
     fn feed(&mut self, line: &[u8]) -> Option<Routed> {
-        if let Some((_, num, lines)) = &mut self.block {
+        if let Some(block) = &mut self.block {
             if let Some(rest) = line
                 .strip_prefix(b"%end ".as_slice())
                 .or(if line == b"%end" { Some(&[][..]) } else { None })
             {
-                if block_num(rest) == *num {
-                    let (client, _, lines) = self.block.take().expect("open block");
+                if block_num(rest) == block.command {
+                    let block = self.block.take().expect("open block");
                     return Some(Routed::Reply {
-                        client,
-                        result: Ok(lines),
+                        client: block.client,
+                        result: Ok(block.lines),
                     });
                 }
             } else if let Some(rest) = line.strip_prefix(b"%error ".as_slice()) {
-                if block_num(rest) == *num {
-                    let (client, _, lines) = self.block.take().expect("open block");
+                if block_num(rest) == block.command {
+                    let block = self.block.take().expect("open block");
                     return Some(Routed::Reply {
-                        client,
-                        result: Err(lines.join("\n")),
+                        client: block.client,
+                        result: Err(block.lines.join("\n")),
                     });
                 }
+            }
+            let next_bytes = block.bytes.saturating_add(line.len()).saturating_add(1);
+            if block.lines.len() >= CONTROL_BLOCK_MAX_LINES || next_bytes > CONTROL_BLOCK_MAX_BYTES
+            {
+                self.block = None;
+                return Some(Routed::BlockOverflow);
             }
             // Reply content is textual (formats, grids); pane bytes travel
             // on notification lines. Lossy conversion keeps a stray invalid
             // byte from poisoning the whole block.
-            lines.push(String::from_utf8_lossy(line).into_owned());
+            block.bytes = next_bytes;
+            block.lines.push(String::from_utf8_lossy(line).into_owned());
             return None;
         }
         if let Some(rest) = line.strip_prefix(b"%begin ".as_slice()) {
-            let num = block_num(rest);
-            let client = block_field(rest, 2) == Some(b"1".as_slice());
-            self.block = Some((client, num, Vec::new()));
+            self.block = Some(OpenBlock {
+                command: block_num(rest),
+                client: block_field(rest, 2) == Some(b"1".as_slice()),
+                lines: Vec::new(),
+                bytes: 0,
+            });
             return None;
         }
         Some(Routed::Notify(parse_notification_bytes(line)))
@@ -321,7 +449,7 @@ impl ControlClient {
     /// [`TmuxError::Disconnected`].
     pub async fn spawn(
         cfg: ControlConfig,
-    ) -> Result<(ControlClient, mpsc::UnboundedReceiver<Notification>), TmuxError> {
+    ) -> Result<(ControlClient, NotificationReceiver), TmuxError> {
         let mut cmd = Command::new("tmux");
         // -u forces UTF-8 handling for this client. MEASURED on 3.6a:
         // without it, a client whose LC_ALL/LC_CTYPE/LANG do not name UTF-8
@@ -388,10 +516,15 @@ impl ControlClient {
         let pipe = CommandPipe {
             stdin: Arc::new(Mutex::new(Some(stdin))),
             pending: Arc::new(StdMutex::new(VecDeque::new())),
+            reply_slots: Arc::new(Semaphore::new(PENDING_REPLY_CAPACITY)),
             issued: Arc::new(AtomicU64::new(0)),
         };
-        let (notif_tx, notif_rx) = mpsc::unbounded_channel();
-        let reader = tokio::spawn(reader_task(stdout, pipe.clone(), notif_tx));
+        let (notif_tx, notif_rx) = mpsc::channel(NOTIFICATION_CAPACITY);
+        let notification_sink = NotificationSink {
+            tx: notif_tx,
+            bytes: Arc::new(Semaphore::new(NOTIFICATION_MAX_QUEUED_BYTES)),
+        };
+        let reader = tokio::spawn(reader_task(stdout, pipe.clone(), notification_sink));
 
         let client = ControlClient {
             pipe,
@@ -422,7 +555,12 @@ impl ControlClient {
             }
         }
 
-        Ok((client, notif_rx))
+        Ok((
+            client,
+            NotificationReceiver {
+                rx: NotificationQueue::Budgeted(notif_rx),
+            },
+        ))
     }
 
     /// Session this client is attached to.
@@ -815,11 +953,7 @@ fn spool_file_name(seq: u64) -> String {
 /// On EOF it closes the pipe, which fails every waiting command with
 /// Disconnected, and drops the notification sender so the consumer sees the
 /// stream end.
-async fn reader_task(
-    stdout: ChildStdout,
-    pipe: CommandPipe,
-    notif_tx: mpsc::UnboundedSender<Notification>,
-) {
+async fn reader_task(stdout: ChildStdout, pipe: CommandPipe, notif_tx: NotificationSink) {
     // Byte lines, never UTF-8 lines. tmux escapes control bytes octally but
     // passes bytes >= 0x80 through verbatim, and a multi-byte character
     // split across two pty reads produces two lines that are each invalid
@@ -829,9 +963,24 @@ async fn reader_task(
     let mut reader = BufReader::new(stdout);
     let mut line: Vec<u8> = Vec::new();
     let mut router = LineRouter::new();
+    let (resume_tx, mut resume_rx) = mpsc::channel::<String>(PAUSE_RESUME_CAPACITY);
+    let resume_pipe = pipe.clone();
+    tokio::spawn(async move {
+        while let Some(pane) = resume_rx.recv().await {
+            let cmd = format!(
+                "refresh-client -A {}",
+                quote_arg(&format!("{pane}:continue"))
+            );
+            if let Err(error) = resume_pipe.submit_resume(&cmd, pane.clone()).await {
+                warn!(%error, %pane, "failed to submit paused-pane resume");
+                resume_pipe.close().await;
+                return;
+            }
+        }
+    });
     loop {
         line.clear();
-        match reader.read_until(b'\n', &mut line).await {
+        match read_control_line(&mut reader, &mut line).await {
             Ok(0) => break, // EOF: the transport is really gone
             Ok(_) => {}
             Err(e) => {
@@ -847,48 +996,42 @@ async fn reader_task(
             Some(Routed::Notify(n)) => {
                 if let Notification::Pause { pane } = &n {
                     debug!(%pane, "flow control paused pane, resuming");
-                    let pipe = pipe.clone();
-                    let notif_tx = notif_tx.clone();
                     let pane = pane.clone();
-                    let cmd = format!(
-                        "refresh-client -A {}",
-                        quote_arg(&format!("{pane}:continue"))
-                    );
-                    // Preserve the state transition order for consumers: a
-                    // successful resume reply can arrive immediately.
-                    let _ = notif_tx.send(n);
-                    // Separate task: the reader must keep draining so it can
-                    // route this very command's reply.
-                    tokio::spawn(async move {
-                        let reply = match pipe.submit(&cmd).await {
-                            Ok(reply) => reply,
-                            Err(e) => {
-                                warn!(error = %e, %pane, "failed to submit paused-pane resume");
-                                return;
-                            }
-                        };
-                        match reply.await {
-                            Ok(Ok(_)) => {
-                                // tmux 3.7b accepts the resume command but
-                                // omits `%continue`; its successful reply is
-                                // the authoritative resume confirmation.
-                                let _ = notif_tx.send(Notification::Continue { pane });
-                            }
-                            Ok(Err(e)) => {
-                                warn!(error = %e, %pane, "tmux rejected paused-pane resume");
-                            }
-                            Err(e) => {
-                                warn!(error = %e, %pane, "paused-pane resume reply receiver cancelled");
-                            }
+                    if enqueue_notification(&notif_tx, n).is_overflow() {
+                        warn!(
+                            capacity = NOTIFICATION_CAPACITY,
+                            "tmux notification queue overflowed; reconnecting"
+                        );
+                        break;
+                    }
+                    match resume_tx.try_send(pane.clone()) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            warn!(%pane, "paused-pane resume worker stopped; reconnecting");
+                            break;
                         }
-                    });
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            warn!(
+                                capacity = PAUSE_RESUME_CAPACITY,
+                                %pane,
+                                "paused-pane resume queue overflowed; reconnecting"
+                            );
+                            break;
+                        }
+                    }
                     continue;
                 }
                 if let Notification::Other(raw) = &n {
                     debug!(line = %raw, "unrecognized control line");
                 }
                 // Consumer gone is fine; keep draining for command replies.
-                let _ = notif_tx.send(n);
+                if enqueue_notification(&notif_tx, n).is_overflow() {
+                    warn!(
+                        capacity = NOTIFICATION_CAPACITY,
+                        "tmux notification queue overflowed; reconnecting"
+                    );
+                    break;
+                }
             }
             Some(Routed::Reply { client, result }) => {
                 if !client {
@@ -899,15 +1042,175 @@ async fn reader_task(
                 }
                 let slot = pipe.pending.lock().expect("pending lock").pop_front();
                 match slot {
-                    Some(tx) => {
+                    Some(ReplySlot {
+                        target: ReplyTarget::Caller(tx),
+                        ..
+                    }) => {
                         let _ = tx.send(result.map_err(TmuxError::Command));
                     }
+                    Some(ReplySlot {
+                        target: ReplyTarget::Resume { pane },
+                        ..
+                    }) => match result {
+                        Ok(_) => {
+                            // tmux 3.7b may omit `%continue`. The successful
+                            // correlated reply is authoritative and is
+                            // emitted before the reader accepts another line.
+                            if enqueue_notification(
+                                &notif_tx,
+                                Notification::Continue { pane: pane.clone() },
+                            )
+                            .is_overflow()
+                            {
+                                warn!(
+                                    capacity = NOTIFICATION_CAPACITY,
+                                    %pane,
+                                    "tmux notification queue overflowed after resume; reconnecting"
+                                );
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            warn!(%error, %pane, "tmux rejected paused-pane resume");
+                        }
+                    },
                     None => debug!("reply block with no waiting caller"),
                 }
+            }
+            Some(Routed::BlockOverflow) => {
+                warn!(
+                    bytes = CONTROL_BLOCK_MAX_BYTES,
+                    lines = CONTROL_BLOCK_MAX_LINES,
+                    "tmux reply block exceeded its envelope; reconnecting"
+                );
+                break;
             }
         }
     }
     pipe.close().await;
+}
+
+/// Read one byte line without allowing a malformed or hostile control record
+/// to grow the allocation past the transport envelope.
+async fn read_control_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    line.clear();
+    loop {
+        let (take, complete) = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                return Ok(line.len());
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let take = newline.map_or(available.len(), |index| index + 1);
+            if line.len().saturating_add(take) > CONTROL_LINE_MAX_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("tmux control line exceeds {CONTROL_LINE_MAX_BYTES} bytes"),
+                ));
+            }
+            line.extend_from_slice(&available[..take]);
+            (take, newline.is_some())
+        };
+        reader.consume(take);
+        if complete {
+            return Ok(line.len());
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnqueueResult {
+    Sent,
+    ReceiverClosed,
+    Overflow,
+}
+
+impl EnqueueResult {
+    fn is_overflow(self) -> bool {
+        matches!(self, Self::Overflow)
+    }
+}
+
+/// Command callers may discard notifications while continuing to use the
+/// connection, so a closed receiver is harmless. A full receiver is different:
+/// ordered notification state has been lost and requires reconnect recovery.
+fn enqueue_notification(tx: &NotificationSink, notification: Notification) -> EnqueueResult {
+    let bytes = notification_retained_bytes(&notification).max(1);
+    let Ok(bytes) = u32::try_from(bytes) else {
+        return EnqueueResult::Overflow;
+    };
+    let permit = match Arc::clone(&tx.bytes).try_acquire_many_owned(bytes) {
+        Ok(permit) => permit,
+        Err(_) => return EnqueueResult::Overflow,
+    };
+    match tx.tx.try_send(QueuedNotification {
+        notification,
+        _permit: permit,
+    }) {
+        Ok(()) => EnqueueResult::Sent,
+        Err(mpsc::error::TrySendError::Closed(_)) => EnqueueResult::ReceiverClosed,
+        Err(mpsc::error::TrySendError::Full(_)) => EnqueueResult::Overflow,
+    }
+}
+
+fn notification_retained_bytes(notification: &Notification) -> usize {
+    match notification {
+        Notification::Output { pane, data } | Notification::ExtendedOutput { pane, data, .. } => {
+            pane.len().saturating_add(data.len())
+        }
+        Notification::SessionChanged { session, name }
+        | Notification::WindowRenamed {
+            window: session,
+            name,
+        }
+        | Notification::UnlinkedWindowRenamed {
+            window: session,
+            name,
+        }
+        | Notification::WindowPaneChanged {
+            window: session,
+            pane: name,
+        } => session.len().saturating_add(name.len()),
+        Notification::SessionRenamed { session, name } => session
+            .as_ref()
+            .map_or(0, String::len)
+            .saturating_add(name.len()),
+        Notification::ClientSessionChanged {
+            client,
+            session,
+            name,
+        } => client
+            .len()
+            .saturating_add(session.len())
+            .saturating_add(name.len()),
+        Notification::SubscriptionChanged {
+            name,
+            session,
+            window,
+            pane,
+            value,
+        } => name
+            .len()
+            .saturating_add(session.as_ref().map_or(0, String::len))
+            .saturating_add(window.as_ref().map_or(0, String::len))
+            .saturating_add(pane.as_ref().map_or(0, String::len))
+            .saturating_add(value.len()),
+        Notification::WindowAdd { window }
+        | Notification::WindowClose { window }
+        | Notification::UnlinkedWindowAdd { window }
+        | Notification::UnlinkedWindowClose { window } => window.len(),
+        Notification::LayoutChange { window, rest } => window.len().saturating_add(rest.len()),
+        Notification::PaneModeChanged { pane }
+        | Notification::Pause { pane }
+        | Notification::Continue { pane } => pane.len(),
+        Notification::ClientDetached { client } => client.len(),
+        Notification::Exit { reason } => reason.as_ref().map_or(0, String::len),
+        Notification::Other(raw) => raw.len(),
+        Notification::SessionsChanged => 0,
+    }
 }
 
 /// Key names the daemon sends as keys rather than literal text: the named
@@ -1006,6 +1309,29 @@ mod tests {
     }
 
     #[test]
+    fn router_refuses_reply_blocks_past_either_envelope() {
+        let mut bytes = LineRouter::new();
+        bytes.block = Some(OpenBlock {
+            client: true,
+            command: Some(7),
+            lines: Vec::new(),
+            bytes: CONTROL_BLOCK_MAX_BYTES,
+        });
+        assert_eq!(bytes.feed(b"x"), Some(Routed::BlockOverflow));
+        assert!(bytes.block.is_none());
+
+        let mut lines = LineRouter::new();
+        lines.block = Some(OpenBlock {
+            client: true,
+            command: Some(8),
+            lines: vec![String::new(); CONTROL_BLOCK_MAX_LINES],
+            bytes: 0,
+        });
+        assert_eq!(lines.feed(b""), Some(Routed::BlockOverflow));
+        assert!(lines.block.is_none());
+    }
+
+    #[test]
     fn router_survives_invalid_utf8_lines() {
         // Wire truth on 3.6a (F22): raw bytes >= 0x80 and split multi-byte
         // fragments appear on notification lines. Routing must stay
@@ -1035,6 +1361,86 @@ mod tests {
                 result: Ok(vec!["grid \u{FFFD} line".into()])
             })
         );
+    }
+
+    #[test]
+    fn notification_overflow_is_distinct_from_an_unused_receiver() {
+        let (tx, rx) = mpsc::channel(1);
+        let tx = NotificationSink {
+            tx,
+            bytes: Arc::new(Semaphore::new(NOTIFICATION_MAX_QUEUED_BYTES)),
+        };
+        let mut rx = NotificationReceiver {
+            rx: NotificationQueue::Budgeted(rx),
+        };
+        assert_eq!(
+            enqueue_notification(&tx, Notification::SessionsChanged),
+            EnqueueResult::Sent
+        );
+        assert_eq!(
+            enqueue_notification(&tx, Notification::SessionsChanged),
+            EnqueueResult::Overflow
+        );
+        assert!(matches!(rx.try_recv(), Ok(Notification::SessionsChanged)));
+        drop(rx);
+        assert_eq!(
+            enqueue_notification(&tx, Notification::SessionsChanged),
+            EnqueueResult::ReceiverClosed
+        );
+    }
+
+    #[test]
+    fn notification_payload_budget_is_independent_of_item_capacity() {
+        let (tx, rx) = mpsc::channel(2);
+        let tx = NotificationSink {
+            tx,
+            bytes: Arc::new(Semaphore::new(4)),
+        };
+        let mut rx = NotificationReceiver {
+            rx: NotificationQueue::Budgeted(rx),
+        };
+        assert_eq!(
+            enqueue_notification(
+                &tx,
+                Notification::Output {
+                    pane: "%0".into(),
+                    data: b"ab".to_vec(),
+                },
+            ),
+            EnqueueResult::Sent
+        );
+        assert_eq!(
+            enqueue_notification(&tx, Notification::SessionsChanged),
+            EnqueueResult::Overflow
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Notification::Output { data, .. }) if data == b"ab"
+        ));
+        assert_eq!(
+            enqueue_notification(&tx, Notification::SessionsChanged),
+            EnqueueResult::Sent
+        );
+    }
+
+    #[tokio::test]
+    async fn control_lines_have_a_preallocation_byte_limit() {
+        let mut exact = vec![b'x'; CONTROL_LINE_MAX_BYTES];
+        exact[CONTROL_LINE_MAX_BYTES - 1] = b'\n';
+        let mut reader = BufReader::new(exact.as_slice());
+        let mut line = Vec::new();
+        assert_eq!(
+            read_control_line(&mut reader, &mut line).await.unwrap(),
+            CONTROL_LINE_MAX_BYTES
+        );
+
+        let oversized = vec![b'x'; CONTROL_LINE_MAX_BYTES + 1];
+        let mut reader = BufReader::new(oversized.as_slice());
+        let error = read_control_line(&mut reader, &mut line)
+            .await
+            .expect_err("an oversized control line must close the connection");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(line.len() <= CONTROL_LINE_MAX_BYTES);
     }
 
     #[tokio::test]

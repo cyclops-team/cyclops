@@ -200,14 +200,14 @@ impl DecorationSnapshot {
 /// Fetch decoration from cyclopsd on reconcile. Attention is consumed, never
 /// recomputed here.
 ///
-/// `None` is a failed ASK, not an answer of "no agents", and the difference
+/// `Err` is a failed ASK, not an answer of "no agents", and the difference
 /// matters: every sidebar row and pane label is filtered on a pane carrying
 /// a label or a manifest, so rendering an empty snapshot un-names every
 /// agent on screen. `app::spawn_decoration_forwarder` coalesces a burst of
 /// daemon events (a split or a border drag pushes several) into one fetch,
 /// but that one fetch can still be refused; a caller with a previous
 /// snapshot should keep it rather than blank the roster for a frame.
-pub fn fetch_decoration(home: &Path) -> Option<DecorationSnapshot> {
+pub fn fetch_decoration(home: &Path) -> Result<DecorationSnapshot, String> {
     crate::daemon::status(
         home,
         StatusParams {
@@ -220,7 +220,6 @@ pub fn fetch_decoration(home: &Path) -> Option<DecorationSnapshot> {
         },
     )
     .map(|status| snapshot_from_status(&status))
-    .ok()
 }
 
 fn snapshot_from_status(status: &StatusResult) -> DecorationSnapshot {
@@ -493,7 +492,7 @@ mod tests {
         std::fs::create_dir_all(&home).expect("home");
         // Nothing is bound at <home>/sock, so the status call cannot answer.
         assert!(
-            fetch_decoration(&home).is_none(),
+            fetch_decoration(&home).is_err(),
             "an unreachable daemon must not read as an empty roster"
         );
         let _ = std::fs::remove_dir_all(home);

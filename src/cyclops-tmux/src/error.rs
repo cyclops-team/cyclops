@@ -28,6 +28,11 @@ pub enum TmuxError {
     #[error("tmux control connection closed")]
     Disconnected,
 
+    /// The fixed reply FIFO is full. Refusing before another command task
+    /// waits keeps overload bounded and leaves existing correlation intact.
+    #[error("tmux control reply queue is full")]
+    Busy,
+
     /// A layout could not be read off a session or built onto one: a
     /// window that is not a grid of rows, a zoomed pane, a session that
     /// already exists. Carries the whole sentence to show the human,
