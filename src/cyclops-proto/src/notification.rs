@@ -253,6 +253,10 @@ pub enum NotificationPreWriteCause {
     /// The matched screen rule does not classify its composer ownership.
     /// No terminal write can be authorized until the manifest is repaired.
     ComposerSemanticMissing,
+    /// The terminal grid cannot prove the complete application composer.
+    /// No terminal write or submit key is authorized until an application
+    /// source proves the exact composer bytes.
+    ComposerOwnershipUnproven,
     /// The delivery worker exited twice before any terminal write.
     WorkerFailed,
 }
@@ -268,6 +272,7 @@ impl NotificationPreWriteCause {
             Self::SpoolFailed => "spool_failed",
             Self::BindingUnprovable => "binding_unprovable",
             Self::ComposerSemanticMissing => "composer_semantic_missing",
+            Self::ComposerOwnershipUnproven => "composer_ownership_unproven",
             Self::WorkerFailed => "worker_failed",
         }
     }
@@ -282,6 +287,7 @@ impl NotificationPreWriteCause {
             Self::SpoolFailed => "paste buffer preparation failed",
             Self::BindingUnprovable => "binding unprovable",
             Self::ComposerSemanticMissing => "composer ownership rule missing",
+            Self::ComposerOwnershipUnproven => "complete composer ownership unproven",
             Self::WorkerFailed => "worker failed",
         }
     }

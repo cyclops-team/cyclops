@@ -151,6 +151,13 @@ fn notification_prewrite_bookend(
     {
         return Some(format!("pane_too_narrow:{pane_width}"));
     }
+    // tmux exposes the visible terminal grid, not the application's complete
+    // composer buffer. Hidden trailing spaces can produce the same grid and
+    // cursor as this exact row. Until an application-level proof is carried
+    // here, format 3 cannot authorize either a write or a submit key.
+    if selected.doorbell_format == Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM) {
+        return Some("composer_ownership_unproven".to_string());
+    }
     None
 }
 
@@ -3621,6 +3628,13 @@ impl AttemptFailure {
         }
     }
 
+    fn composer_ownership_unproven() -> Self {
+        Self::blocked_before_write(
+            "composer_ownership_unproven",
+            NotificationPreWriteCause::ComposerOwnershipUnproven,
+        )
+    }
+
     /// Does this failure belong back at the gate rather than in the
     /// retry budget? True only where the cause is readiness moving under
     /// a delivery that had not yet written anything.
@@ -3734,6 +3748,7 @@ impl AttemptFailure {
             "barrier_held" => Self::barrier_held(),
             "prewrite_session_detached" => Self::session_detached(),
             "prewrite_binding_unprovable" => Self::binding_unprovable(None),
+            "composer_ownership_unproven" => Self::composer_ownership_unproven(),
             // The pane's binding moved between the proof and the write.
             // Nothing was written, and re-proving it is the gate's job.
             "binding_changed" | "capability_changed" => Self {
@@ -5168,7 +5183,10 @@ fn notification_attention_cause(cause: &str) -> NotificationAttentionCause {
 
 fn should_retry(failure: &AttemptFailure, spent: u32, retry_max: u32) -> bool {
     matches!(failure.boundary, WriteBoundary::BeforeWrite)
-        && failure.cause != "pane_too_narrow"
+        && !matches!(
+            failure.cause.as_str(),
+            "pane_too_narrow" | "composer_ownership_unproven"
+        )
         && spent <= retry_max
 }
 
@@ -9573,6 +9591,11 @@ mod tests {
                 true,
             ),
             (AttemptFailure::spool_failed(), "spool_failed", true),
+            (
+                AttemptFailure::composer_ownership_unproven(),
+                "composer_ownership_unproven",
+                false,
+            ),
             (AttemptFailure::paste_failed(), "paste_failed", false),
             (AttemptFailure::verify_failed(), "verify_failed", false),
             (
@@ -9664,6 +9687,16 @@ mod tests {
             notification_prewrite_bookend(&selected, Some(recipient), &binding, narrow),
             Some(format!("pane_too_narrow:{narrow}"))
         );
+        assert_eq!(
+            notification_prewrite_bookend(
+                &selected,
+                Some(recipient),
+                &binding,
+                cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH,
+            ),
+            Some("composer_ownership_unproven".to_string()),
+            "a complete visible row cannot rule out hidden application input"
+        );
         std::fs::write(&file, "operator edit").unwrap();
         assert_eq!(
             notification_prewrite_bookend(&selected, Some(recipient), &binding, narrow),
@@ -9693,6 +9726,10 @@ mod tests {
             (
                 AttemptFailure::spool_failed(),
                 NotificationPreWriteCause::SpoolFailed,
+            ),
+            (
+                AttemptFailure::composer_ownership_unproven(),
+                NotificationPreWriteCause::ComposerOwnershipUnproven,
             ),
         ];
 
