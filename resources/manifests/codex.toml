@@ -7,7 +7,8 @@
 # Composer extraction and clear action were re-measured on 0.149.0
 # (2026-08-21). Active and idle pane titles were re-measured on 0.149.0
 # (2026-08-22). Occupied prompt styling and no-color trailer structure were
-# re-measured on 0.149.1 (2026-08-25).
+# re-measured on 0.149.1 (2026-08-25). The fresh, resumed, and daemon-restart
+# delivery matrix was completed on 0.149.1 (2026-08-26).
 #
 # Sensor summary for this CLI:
 #   title  WORKING-ONLY on 0.149.0. Active turns prefix the project title with
@@ -21,7 +22,7 @@
 [agent]
 id = "codex"
 display_name = "Codex CLI"
-version_tested = "0.147.0"
+version_tested = "0.149.1"
 process_names = ["codex"]
 # What `cyclops start --agents codex` runs in a pane. The bare CLI, so the
 # directory-trust gate in [hooks] below still applies to a pane started
