@@ -347,6 +347,15 @@ impl PaneRuntime {
         self.term.scroll_display(Scroll::Delta(-delta));
     }
 
+    /// Return the viewport to the live tail. True when it moved.
+    pub fn scroll_to_tail(&mut self) -> bool {
+        if self.at_tail() {
+            return false;
+        }
+        self.term.scroll_display(Scroll::Bottom);
+        true
+    }
+
     /// Whether this pane wants wheel motion delivered as an SGR mouse
     /// report instead of moving this runtime's own scroll offset: mouse
     /// reporting is on and SGR encoding is enabled, the same pair xterm and
@@ -737,6 +746,21 @@ mod tests {
         let rt = PaneRuntime::new(10, 2);
         assert!(!rt.alt_screen());
         assert!(!rt.wants_sgr_mouse_wheel());
+    }
+
+    /// A viewport left in history returns to the tail on demand, once; at
+    /// the tail there is nothing to move and the call says so.
+    #[test]
+    fn a_scrolled_back_viewport_returns_to_the_tail_once() {
+        let mut rt = PaneRuntime::new(20, 4);
+        for i in 0..40 {
+            rt.feed(format!("line{i}\r\n").as_bytes());
+        }
+        rt.scroll(-6);
+        assert!(!rt.at_tail(), "the wheel moved into history");
+        assert!(rt.scroll_to_tail(), "the viewport moved back");
+        assert!(rt.at_tail());
+        assert!(!rt.scroll_to_tail(), "already at the tail: nothing moved");
     }
 
     #[test]
