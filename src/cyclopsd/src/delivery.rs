@@ -4108,27 +4108,14 @@ async fn attempt_delivery(
     .await
     {
         Ok(v) => v,
-        Err(InjectFailure::PasteCommandUnwritten) => {
-            if let Err(error) = correct_proven_unwritten_paste(handle) {
-                error!(id = %handle.msg_id, error = %error, "notification unwritten correction failed");
-                return AttemptOutcome::Failed(AttemptFailure::notification_record_failed());
-            }
-            rollback_unwritten_hold(inner, handle, &proven);
-            return AttemptOutcome::Failed(AttemptFailure::paste_command_unwritten());
-        }
-        Err(InjectFailure::Other(cause)) => {
-            if cause == NO_LONGER_CURRENT_BEFORE_WRITE {
-                return AttemptOutcome::NoLongerCurrentBeforeWrite;
-            }
-            if let Some(width) = cause
-                .strip_prefix("pane_too_narrow:")
-                .and_then(|width| width.parse::<u32>().ok())
-            {
-                let mut observation = observation.expect("format 3 belongs to a notification");
-                observation.pane_width = Some(width);
-                return AttemptOutcome::Failed(AttemptFailure::pane_too_narrow(observation));
-            }
-            return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
+        Err(failure) => {
+            return finish_attempt_delivery_inject_failure(
+                inner,
+                handle,
+                &proven,
+                observation,
+                failure,
+            );
         }
     };
     if let Some(notification) = &handle.notification {
@@ -4437,6 +4424,43 @@ async fn attempt_delivery(
         AckOutcome::Rebound => {
             unregister_ack(inner, handle);
             AttemptOutcome::Failed(AttemptFailure::receipt_occupant_changed())
+        }
+    }
+}
+
+/// Resolve the exact injector failure arm of [`attempt_delivery`].
+///
+/// Keeping the durable correction, runtime boundary, and composer hold in one
+/// arm makes their order directly testable without a live tmux process.
+fn finish_attempt_delivery_inject_failure(
+    inner: &Arc<Inner>,
+    handle: &Arc<DeliveryHandle>,
+    proven: &fusion::Binding,
+    observation: Option<NotificationPreWriteObservation>,
+    failure: InjectFailure,
+) -> AttemptOutcome {
+    match failure {
+        InjectFailure::PasteCommandUnwritten => {
+            if let Err(error) = correct_proven_unwritten_paste(handle) {
+                error!(id = %handle.msg_id, error = %error, "notification unwritten correction failed");
+                return AttemptOutcome::Failed(AttemptFailure::notification_record_failed());
+            }
+            rollback_unwritten_hold(inner, handle, proven);
+            AttemptOutcome::Failed(AttemptFailure::paste_command_unwritten())
+        }
+        InjectFailure::Other(cause) => {
+            if cause == NO_LONGER_CURRENT_BEFORE_WRITE {
+                return AttemptOutcome::NoLongerCurrentBeforeWrite;
+            }
+            if let Some(width) = cause
+                .strip_prefix("pane_too_narrow:")
+                .and_then(|width| width.parse::<u32>().ok())
+            {
+                let mut observation = observation.expect("format 3 belongs to a notification");
+                observation.pane_width = Some(width);
+                return AttemptOutcome::Failed(AttemptFailure::pane_too_narrow(observation));
+            }
+            AttemptOutcome::Failed(AttemptFailure::from_inject(cause))
         }
     }
 }
@@ -8981,8 +9005,8 @@ mod tests {
     use std::sync::Barrier;
 
     use cyclops_proto::{
-        MessageId, MessagePresentation, NotificationAttemptId, NotificationState, RecipientKey,
-        RecipientPresentation, SessionInstanceId, TmuxPaneId, WorkspaceId,
+        ComposerHold, MessageId, MessagePresentation, NotificationAttemptId, NotificationState,
+        RecipientKey, RecipientPresentation, SessionInstanceId, TmuxPaneId, WorkspaceId,
     };
     use cyclops_state::StateRoot;
 
@@ -10710,6 +10734,140 @@ composer_trailer_required_prefix = 1
         }
     }
 
+    fn unwritten_test_inner(path: &Path) -> Arc<Inner> {
+        let state_root = Arc::new(StateRoot::open_or_create(path).unwrap());
+        let (registry, _) = crate::registry::Registry::load(Arc::clone(&state_root));
+        let workspace_id = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let session_identities = crate::sessionstore::SessionIdentities::open(&state_root).unwrap();
+        Arc::new(Inner {
+            cfg: crate::Config::defaults(path),
+            state_root,
+            state_repair: cyclops_state::RepairSummary::default(),
+            workspace_id,
+            session_identities: StdMutex::new(session_identities),
+            mailbox: None,
+            composer_recovery: StdMutex::new(
+                crate::composer_recovery::RecoveryCoordinator::default(),
+            ),
+            mailbox_publication: StdMutex::new(()),
+            mailbox_publish_pause: StdMutex::new(None),
+            boot_id: "b-unwritten-test".into(),
+            started: std::time::Instant::now(),
+            tmux_version: "test".into(),
+            manifests: std::collections::BTreeMap::new(),
+            manifest_dir: None,
+            sessions: StdMutex::new(Vec::new()),
+            session_registration: StdMutex::new(()),
+            events: broadcast::channel(16).0,
+            detections: StdMutex::new(HashMap::new()),
+            pane_recomputes: StdMutex::new(HashMap::new()),
+            lifecycle_rechecks: StdMutex::new(HashMap::new()),
+            registry: StdMutex::new(registry),
+            theme: StdMutex::new(cyclops_theme::ThemeWatch::new(path)),
+            hook_readings: StdMutex::new(HashMap::new()),
+            hook_lifecycle: StdMutex::new(crate::hook_lifecycle::Store::new()),
+            turn_ends: StdMutex::new(crate::turnkey::Ends::new()),
+            argv_cache: StdMutex::new(HashMap::new()),
+            engine: Engine::new(),
+            ack_state: crate::ack::AckState::new(),
+            hook_liveness: crate::selftest::HookLiveness::new(),
+            inject_pause: StdMutex::new(None),
+            fail_chrome_restore: AtomicBool::new(false),
+            workspace_ui: StdMutex::new(crate::workspace_ui::WorkspaceUiState::default()),
+            shutdown_request: watch::channel(false).0,
+            stop: watch::channel(false).1,
+            extra_tasks: StdMutex::new(Vec::new()),
+        })
+    }
+
+    fn unwritten_test_binding() -> fusion::Binding {
+        fusion::Binding {
+            pane_root: crate::identity::ProcId {
+                pid: 3999,
+                birth: 817_999,
+            },
+            leader: crate::identity::ProcId {
+                pid: 4000,
+                birth: 818_000,
+            },
+            agent: crate::identity::ProcId {
+                pid: 4242,
+                birth: 818_221,
+            },
+            manifest: "codex".into(),
+        }
+    }
+
+    fn seed_unwritten_test_composer(inner: &Arc<Inner>, binding: &fusion::Binding) {
+        inner.detections.lock().unwrap().insert(
+            PaneKey::new(0, "%1"),
+            crate::DetEntry {
+                detection: Detection {
+                    state: AgentState::Idle,
+                    readings: Vec::new(),
+                    disagreement: false,
+                    decided_by: "test".into(),
+                    stale: false,
+                    write_ready: true,
+                    write_block: None,
+                    composer_semantic: Some(ComposerSemantic::Clean),
+                },
+                binding: Some(binding.clone()),
+                manifest: Some(binding.manifest.clone()),
+                occupant: Some(binding.leader.pid),
+                agent: Some(binding.agent),
+                in_mode: false,
+                quota_screen_clear: false,
+                hold: ComposerHold::Clear,
+                turn: None,
+                hold_owner: None,
+                composer: crate::ComposerProjection::default(),
+                working_confirmed: false,
+                since: std::time::Instant::now(),
+            },
+        );
+    }
+
+    async fn run_unwritten_attempt_arm(
+        inner: &Arc<Inner>,
+        handle: &Arc<DeliveryHandle>,
+        binding: &fusion::Binding,
+    ) -> AttemptOutcome {
+        let payload = handle.payload();
+        let manifest = sentinel_manifest();
+        let failure = inject(
+            &UnwrittenCommitInjector,
+            handle,
+            &manifest,
+            StagingTarget::ExactRow(&payload),
+            &payload,
+            &|| {
+                latch_hold(inner, handle, binding)?;
+                let mut unwritten_hold = UnwrittenHold::new(inner, handle, binding);
+                if let Some(notification) = &handle.notification {
+                    notification
+                        .record_writing(
+                            ProcessInstanceId::new(binding.pane_root.pid, binding.pane_root.birth)
+                                .unwrap(),
+                            ProcessInstanceId::new(binding.leader.pid, binding.leader.birth)
+                                .unwrap(),
+                            ProcessInstanceId::new(binding.agent.pid, binding.agent.birth).unwrap(),
+                            &binding.manifest,
+                            NotificationTransport::Doorbell,
+                            None,
+                        )
+                        .map_err(notification_write_cause)?;
+                }
+                handle.write_boundary_crossed.store(true, Ordering::SeqCst);
+                unwritten_hold.commit();
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("test injector proves the paste command was unwritten");
+        finish_attempt_delivery_inject_failure(inner, handle, binding, None, failure)
+    }
+
     impl MockInjector {
         pub(super) fn new(screens: Vec<&str>) -> MockInjector {
             MockInjector {
@@ -10919,49 +11077,145 @@ composer_trailer_required_prefix = 1
     }
 
     #[tokio::test]
-    async fn an_unwritten_commit_is_corrected_at_the_delivery_seam() {
-        let (_scratch, store, context, handle, recipient) =
-            notification_fixture("unwritten-delivery-seam");
-        context.record_gating().unwrap();
-        let payload = handle.payload();
-        let manifest = sentinel_manifest();
-
-        let error = inject(
-            &UnwrittenCommitInjector,
+    async fn proven_unwritten_runs_through_attempt_and_retry_disposition() {
+        let (scratch, store, context, handle, recipient) =
+            notification_fixture("unwritten-production-arm");
+        let inner = unwritten_test_inner(&scratch.0);
+        let binding = unwritten_test_binding();
+        seed_unwritten_test_composer(&inner, &binding);
+        assert!(advance(
+            &inner,
             &handle,
-            &manifest,
-            StagingTarget::ExactRow(&payload),
-            &payload,
-            &|| {
-                context
-                    .record_writing(
-                        ProcessInstanceId::new(3999, 817_999).unwrap(),
-                        ProcessInstanceId::new(4000, 818_000).unwrap(),
-                        ProcessInstanceId::new(4242, 818_221).unwrap(),
-                        "codex",
-                        NotificationTransport::Doorbell,
-                        None,
-                    )
-                    .map(|_| handle.write_boundary_crossed.store(true, Ordering::SeqCst))
-                    .map_err(notification_write_cause)
-            },
-        )
-        .await
-        .unwrap_err();
+            &[DeliveryState::Queued],
+            Step::to(DeliveryState::Gating),
+        ));
+        context.record_gating().unwrap();
+        handle.state.lock().unwrap().attempts = 1;
+        assert!(advance(
+            &inner,
+            &handle,
+            &[DeliveryState::Gating],
+            Step::to(DeliveryState::Pasting),
+        ));
 
-        assert_eq!(error, InjectFailure::PasteCommandUnwritten);
-        assert_eq!(
-            notification_state(&store, recipient, context.message_id()).state,
-            NotificationState::Writing
-        );
-        correct_proven_unwritten_paste(&handle).unwrap();
+        let failure = match run_unwritten_attempt_arm(&inner, &handle, &binding).await {
+            AttemptOutcome::Failed(failure) => failure,
+            _ => panic!("proven unwritten paste must be an attempt failure"),
+        };
+        assert_eq!(failure.cause, "paste_command_unwritten");
+        assert_eq!(failure.boundary, WriteBoundary::BeforeWrite);
         assert!(!handle.write_boundary_crossed.load(Ordering::SeqCst));
+        assert!(handle.state.lock().unwrap().barrier.is_none());
+        {
+            let detection = inner.detections.lock().unwrap();
+            let entry = detection.get(&PaneKey::new(0, "%1")).unwrap();
+            assert_eq!(entry.hold, ComposerHold::Clear);
+            assert_eq!(entry.hold_owner, None);
+        }
         let corrected = notification_state(&store, recipient, context.message_id());
         assert_eq!(corrected.state, NotificationState::BlockedPreWrite);
         assert_eq!(
             corrected.pre_write_cause,
             Some(NotificationPreWriteCause::PasteCommandUnwritten)
         );
+        assert!(corrected.binding.is_none());
+        assert!(store
+            .lock()
+            .unwrap()
+            .projection()
+            .active_notification_barriers()
+            .is_empty());
+        let corrected_seq = corrected.updated_seq;
+        let worker = Arc::new(Worker::new());
+        assert!(!fail_attempt(&inner, &worker, &handle, &failure).await);
+        assert_eq!(handle.state(), DeliveryState::Pasting);
+        assert_eq!(
+            notification_state(&store, recipient, context.message_id()).updated_seq,
+            corrected_seq,
+            "retry disposition must not append or reopen the corrected attempt"
+        );
+
+        let (failed_scratch, failed_store, failed_context, failed_handle, failed_recipient) =
+            notification_fixture("unwritten-production-arm-append-failure");
+        let failed_inner = unwritten_test_inner(&failed_scratch.0);
+        seed_unwritten_test_composer(&failed_inner, &binding);
+        assert!(advance(
+            &failed_inner,
+            &failed_handle,
+            &[DeliveryState::Queued],
+            Step::to(DeliveryState::Gating),
+        ));
+        failed_context.record_gating().unwrap();
+        failed_handle.state.lock().unwrap().attempts = 1;
+        assert!(advance(
+            &failed_inner,
+            &failed_handle,
+            &[DeliveryState::Gating],
+            Step::to(DeliveryState::Pasting),
+        ));
+        failed_store
+            .lock()
+            .unwrap()
+            .inject_next_pre_write_block_append_failure();
+
+        let append_failure =
+            match run_unwritten_attempt_arm(&failed_inner, &failed_handle, &binding).await {
+                AttemptOutcome::Failed(failure) => failure,
+                _ => panic!("failed correction append must remain a failed attempt"),
+            };
+        assert_eq!(append_failure.cause, NOTIFICATION_RECORD_FAILED);
+        assert_eq!(append_failure.boundary, WriteBoundary::AfterWrite);
+        assert!(failed_handle.write_boundary_crossed.load(Ordering::SeqCst));
+        assert!(failed_handle.state.lock().unwrap().barrier.is_some());
+        {
+            let failed_detection = failed_inner.detections.lock().unwrap();
+            let failed_entry = failed_detection.get(&PaneKey::new(0, "%1")).unwrap();
+            assert_eq!(failed_entry.hold, ComposerHold::Staged);
+            assert_eq!(
+                failed_entry.hold_owner.as_deref(),
+                Some(failed_handle.barrier_owner().as_str())
+            );
+        }
+        let writing =
+            notification_state(&failed_store, failed_recipient, failed_context.message_id());
+        assert_eq!(writing.state, NotificationState::Writing);
+        assert!(writing.binding.is_some());
+        assert_eq!(
+            failed_store
+                .lock()
+                .unwrap()
+                .projection()
+                .active_notification_barriers(),
+            vec![writing]
+        );
+
+        let direct = DeliveryHandle::new(
+            "m-direct-unwritten-production-arm",
+            "reviewer",
+            "%1",
+            0,
+            "payload".into(),
+        );
+        direct.state.lock().unwrap().attempts = 1;
+        assert!(advance(
+            &inner,
+            &direct,
+            &[DeliveryState::Queued],
+            Step::to(DeliveryState::Gating),
+        ));
+        assert!(advance(
+            &inner,
+            &direct,
+            &[DeliveryState::Gating],
+            Step::to(DeliveryState::Pasting),
+        ));
+        let direct_failure = match run_unwritten_attempt_arm(&inner, &direct, &binding).await {
+            AttemptOutcome::Failed(failure) => failure,
+            _ => panic!("direct unwritten paste must be an attempt failure"),
+        };
+        let direct_worker = Worker::new();
+        assert!(fail_attempt(&inner, &direct_worker, &direct, &direct_failure).await);
+        assert_eq!(direct.state(), DeliveryState::RetryQueued);
     }
 
     #[test]
@@ -10980,34 +11234,6 @@ composer_trailer_required_prefix = 1
             classify_paste_buffer_failure(TmuxError::Command("tmux refused".to_string())),
             InjectFailure::Other("paste_failed".to_string())
         );
-    }
-
-    #[test]
-    fn an_unwritten_correction_append_failure_keeps_the_postwrite_barrier() {
-        let (_scratch, store, context, handle, recipient) =
-            notification_fixture("unwritten-correction-append-failure");
-        context.record_gating().unwrap();
-        context
-            .record_writing(
-                ProcessInstanceId::new(3999, 817_999).unwrap(),
-                ProcessInstanceId::new(4000, 818_000).unwrap(),
-                ProcessInstanceId::new(4242, 818_221).unwrap(),
-                "codex",
-                NotificationTransport::Doorbell,
-                None,
-            )
-            .unwrap();
-        handle.write_boundary_crossed.store(true, Ordering::SeqCst);
-        store
-            .lock()
-            .unwrap()
-            .inject_next_pre_write_block_append_failure();
-
-        assert!(correct_proven_unwritten_paste(&handle).is_err());
-        assert!(handle.write_boundary_crossed.load(Ordering::SeqCst));
-        let current = notification_state(&store, recipient, context.message_id());
-        assert_eq!(current.state, NotificationState::Writing);
-        assert!(current.binding.is_some());
     }
 
     #[test]
