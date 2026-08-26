@@ -9,7 +9,6 @@ use cyclops_proto::{Kind, MessageId, NotificationAttentionCause, RecipientKey};
 
 use crate::avatar::{Avatar, AvatarRegistry};
 use crate::detail::{Detail, Draft, Stage, ThreadEntry};
-#[cfg(test)]
 use crate::grid::display_width;
 use crate::queue::{fit, HumanQueue, MailboxWord, QueueRow, QueueTarget, WakeWord};
 
@@ -216,6 +215,92 @@ impl ComposerState {
             self.stage = None;
         }
     }
+}
+
+/// One verb the drawer's action strip offers.
+///
+/// The strip is the only place these verbs are named for a reader, and a
+/// pointer must reach exactly the verb whose word it lands on, so the words
+/// and their columns come from one table rather than from a literal that a
+/// hit map then guesses at. Every verb here already has a keyboard route;
+/// the strip is a second way to ask for the same action, never a second
+/// implementation of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChatAction {
+    Reply,
+    Announce,
+    Open,
+    Scope,
+    /// Only offered while a refresh has failed: the retry the status line
+    /// tells the operator to press.
+    Retry,
+}
+
+impl ChatAction {
+    /// The word the strip prints for this verb, key hint included.
+    pub fn label(self) -> &'static str {
+        match self {
+            ChatAction::Reply => "r reply",
+            ChatAction::Announce => "a announce",
+            ChatAction::Open => "enter open",
+            ChatAction::Scope => "s scope",
+            ChatAction::Retry => "^R retry",
+        }
+    }
+}
+
+const ACTION_SEPARATOR: &str = " | ";
+
+/// Does this status line mean the drawer is showing stale or no state?
+///
+/// The retry verb appears only then, so an operator is never offered a
+/// recovery for a connection that is fine.
+pub fn refresh_failed(status: &str) -> bool {
+    status.contains("refresh failed") || status.contains("reconnecting")
+}
+
+/// The verbs the strip offers right now. `refresh_failed` adds the retry.
+pub fn chat_actions(refresh_failed: bool) -> Vec<ChatAction> {
+    let mut actions = vec![
+        ChatAction::Reply,
+        ChatAction::Announce,
+        ChatAction::Open,
+        ChatAction::Scope,
+    ];
+    if refresh_failed {
+        actions.insert(0, ChatAction::Retry);
+    }
+    actions
+}
+
+/// The strip as text, and where each verb sits in it.
+///
+/// Returns the rendered row plus one column span per verb that actually
+/// fit. A verb the width could not hold is absent from the spans rather
+/// than mapped to a truncated word, so a click can never land on half a
+/// verb and dispatch the whole one.
+pub fn chat_action_strip(
+    width: usize,
+    refresh_failed: bool,
+) -> (String, Vec<(ChatAction, usize, usize)>) {
+    let mut text = String::new();
+    let mut spans = Vec::new();
+    for action in chat_actions(refresh_failed) {
+        let separator = if text.is_empty() {
+            ""
+        } else {
+            ACTION_SEPARATOR
+        };
+        let start = display_width(&text) + display_width(separator);
+        let end = start + display_width(action.label());
+        if end > width {
+            break;
+        }
+        text.push_str(separator);
+        text.push_str(action.label());
+        spans.push((action, start, end));
+    }
+    (fit(&text, width), spans)
 }
 
 /// Computes the exact proven delivery truth label from mailbox and wake states.
@@ -841,15 +926,63 @@ pub fn render_chat(
             out.push(fit(help, width));
         } else {
             out.push(fit("── Messages Group Chat ──", width));
-            out.push(fit("r reply | a announce | enter open | s scope", width));
+            out.push(chat_action_strip(width, refresh_failed(status_hint)).0);
         }
     } else {
         out.push(fit("── Messages Group Chat ──", width));
-        out.push(fit("r reply | a announce | enter open | s scope", width));
+        out.push(chat_action_strip(width, refresh_failed(status_hint)).0);
     }
 
     out.truncate(height);
     out
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use super::*;
+
+    /// Every span the strip reports must land exactly on that verb's word
+    /// in the row it rendered. This is the whole safety property of the
+    /// clickable strip: a pointer lands on the verb it can read.
+    #[test]
+    fn every_reported_span_covers_exactly_its_own_verb() {
+        let (row, spans) = chat_action_strip(80, false);
+        assert_eq!(spans.len(), 4, "{row}");
+        for (action, start, end) in spans {
+            assert_eq!(
+                &row[start..end],
+                action.label(),
+                "span for {action:?} must cover its own word in {row:?}"
+            );
+        }
+    }
+
+    /// A verb the width cannot hold is absent rather than truncated: a
+    /// half-printed word must never carry a whole action.
+    #[test]
+    fn a_verb_that_does_not_fit_has_no_span() {
+        let (row, spans) = chat_action_strip(9, false);
+        assert_eq!(
+            spans.iter().map(|(a, _, _)| *a).collect::<Vec<_>>(),
+            vec![ChatAction::Reply],
+            "only the first verb fits in nine columns: {row:?}"
+        );
+        assert!(!row.contains("announce"), "{row:?}");
+    }
+
+    /// Retry is offered only while the drawer says it is stale, so the
+    /// operator is never given a recovery for a healthy connection.
+    #[test]
+    fn retry_appears_only_while_a_refresh_has_failed() {
+        let (healthy, _) = chat_action_strip(80, false);
+        assert!(!healthy.contains("retry"), "{healthy:?}");
+        let (failed, spans) = chat_action_strip(80, true);
+        assert!(failed.starts_with(ChatAction::Retry.label()), "{failed:?}");
+        assert_eq!(spans[0].0, ChatAction::Retry);
+        assert!(refresh_failed("refresh failed: cyclopsd is unavailable"));
+        assert!(refresh_failed("daemon reconnecting"));
+        assert!(!refresh_failed("3 pending"));
+    }
 }
 
 #[cfg(test)]

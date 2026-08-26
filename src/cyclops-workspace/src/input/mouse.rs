@@ -105,6 +105,10 @@ pub enum HitTarget {
     MessagesToggle,
     /// Resize handle for the right-edge messages drawer.
     MessagesDivider,
+    /// One verb in the drawer's action strip. The strip prints the same
+    /// words a keyboard user reads, so a pointer gets the same verbs
+    /// instead of a hint it cannot act on.
+    MessagesAction(cyclops_ui::ChatAction),
     AttentionIndicator {
         pane_id: String,
     },

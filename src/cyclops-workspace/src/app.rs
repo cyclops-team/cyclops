@@ -3979,6 +3979,7 @@ async fn handle_mouse(
                 | HitTarget::SidebarTab { .. }
                 | HitTarget::SidebarToggle
                 | HitTarget::MessagesToggle
+                | HitTarget::MessagesAction(_)
                 | HitTarget::AttentionIndicator { .. } => {
                     app.close_menu();
                 }

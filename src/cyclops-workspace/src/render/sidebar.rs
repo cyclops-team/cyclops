@@ -508,12 +508,37 @@ pub fn paint_messages(
         area.height,
     );
     let style = theme::chrome_panel(paint);
+    // The action strip is built from the same table the renderer used, at
+    // the same width, so the row it produced here is byte-identical to the
+    // one in `rows`. Matching on that text locates the strip without the
+    // renderer having to report a row index that a later edit could leave
+    // stale; a strip that did not fit produces no spans and no hits.
+    let (strip, spans) =
+        cyclops_ui::chat_action_strip(content_w, cyclops_ui::refresh_failed(status.unwrap_or("")));
+    let strip_row = rows
+        .iter()
+        .rposition(|row| row == &strip)
+        .filter(|_| !spans.is_empty());
     for (i, row) in rows.into_iter().enumerate() {
         if i >= content_rect.height as usize {
             break;
         }
         let y = content_rect.y + i as u16;
         super::overlay_text(buf, content_rect, content_rect.x, y, &row, style);
+        if strip_row == Some(i) {
+            for (action, start, end) in &spans {
+                let x = content_rect.x.saturating_add(*start as u16);
+                let width = (end - start) as u16;
+                if x >= content_rect.right() || width == 0 {
+                    continue;
+                }
+                let width = width.min(content_rect.right() - x);
+                hits.push(
+                    Rect::new(x, y, width, 1),
+                    HitTarget::MessagesAction(*action),
+                );
+            }
+        }
     }
 }
 
@@ -3386,6 +3411,47 @@ mod tests {
             vec![bottom - MIN_FILES_ROWS - 1],
             "the seam stops at the file panel's own floor"
         );
+    }
+
+    /// The strip's words are controls, not decoration: a click on a verb
+    /// reaches that verb, and it reaches it through the action the key
+    /// press raises rather than through a second implementation.
+    #[test]
+    fn clicking_a_word_in_the_action_strip_raises_that_verb() {
+        let area = Rect::new(160, 0, 40, 24);
+        let mut buf = Buffer::empty(area);
+        let mut hits = HitMap::default();
+        let paint = Paint::for_test();
+        let queue = cyclops_ui::HumanQueue::new();
+        let registry = cyclops_ui::AvatarRegistry::default();
+        paint_messages(
+            &queue, None, None, &registry, None, None, None, area, &mut buf, &paint, &mut hits,
+            None,
+        );
+
+        let content_w = (area.width - 1) as usize;
+        let (_, spans) = cyclops_ui::chat_action_strip(content_w, false);
+        assert!(!spans.is_empty(), "the strip must fit at forty columns");
+        for (action, start, _) in spans {
+            let x = area.x + 1 + start as u16;
+            let hit = (0..area.height).find_map(|y| match hits.hit(x, y) {
+                Some(HitTarget::MessagesAction(found)) => Some(*found),
+                _ => None,
+            });
+            assert_eq!(
+                hit,
+                Some(action),
+                "column {x} must answer for {action:?} and nothing else"
+            );
+            assert_eq!(
+                crate::action::route_mouse_click(
+                    &HitTarget::MessagesAction(action),
+                    MouseButton::Left
+                ),
+                Some(crate::action::Action::MessagesVerb(action)),
+                "a click on {action:?} routes to its own action"
+            );
+        }
     }
 
     #[test]

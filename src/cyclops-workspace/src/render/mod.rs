@@ -101,8 +101,14 @@ pub(crate) const SIDEBAR_RAIL_WIDTH: u16 = 1;
 /// Geometry constants for the mirrored right-edge messages drawer.
 pub(crate) const MESSAGES_MIN_WIDTH: u16 = 14;
 pub(crate) const MESSAGES_DEFAULT_WIDTH: u16 = 24;
-pub(crate) const MESSAGES_MAX_WIDTH: u16 = 42;
 pub(crate) const MESSAGES_RAIL_WIDTH: u16 = 1;
+/// The drawer carries whole conversations, not a list of names, so how wide
+/// it should be is the operator's judgement and not a number chosen here: a
+/// fixed ceiling truncated headers and the action strip mid-word on a wide
+/// terminal, with no way to widen past it. The only thing this side still
+/// owes the operator is that the panes it overlays stay usable, so the
+/// bound is what the canvas needs rather than what the drawer may have.
+pub(crate) const MAIN_MIN_WIDTH: u16 = 20;
 
 /// Chrome rectangles for one frame. `sidebar` and `rail` are mutually
 /// exclusive on the left edge; `messages` and `messages_rail` are mutually
@@ -209,10 +215,14 @@ pub fn clamp_sidebar_width(requested: u16, terminal_width: u16) -> u16 {
     requested.clamp(min, max)
 }
 
-/// Bound a requested messages drawer width to what stays readable without
-/// eating more than half the terminal.
+/// Bound a requested messages drawer width to what leaves the pane canvas
+/// usable. The operator decides how wide the conversation is; this only
+/// keeps the canvas from disappearing behind it.
 pub fn clamp_messages_width(requested: u16, terminal_width: u16) -> u16 {
-    let max = MESSAGES_MAX_WIDTH.min(terminal_width / 2).max(1);
+    let max = terminal_width
+        .saturating_sub(MAIN_MIN_WIDTH)
+        .max(MESSAGES_MIN_WIDTH.min(terminal_width))
+        .max(1);
     let min = MESSAGES_MIN_WIDTH.min(max);
     requested.clamp(min, max)
 }
@@ -1003,6 +1013,25 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How wide the conversation should be is the operator's call. The
+    /// only bound left is the canvas the drawer overlays, which is why a
+    /// drag past the old forty-two column ceiling now widens the drawer
+    /// instead of stopping at a number chosen here.
+    #[test]
+    fn the_messages_drawer_is_as_wide_as_the_operator_drags_it() {
+        assert_eq!(clamp_messages_width(80, 200), 80);
+        assert_eq!(clamp_messages_width(120, 200), 120);
+        assert_eq!(
+            clamp_messages_width(400, 200),
+            200 - MAIN_MIN_WIDTH,
+            "the canvas keeps its minimum, and nothing narrower bounds the drawer"
+        );
+        assert_eq!(clamp_messages_width(1, 200), MESSAGES_MIN_WIDTH);
+        // A drag from a column near the left edge of a wide terminal is
+        // the same request expressed as a position.
+        assert_eq!(messages_width_for_column(60, 200), 140);
+    }
 
     #[test]
     fn sidebar_resize_is_bounded_by_readability_and_half_the_terminal() {

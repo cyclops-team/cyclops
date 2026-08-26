@@ -289,6 +289,9 @@ pub enum Action {
     ToggleSidebar,
     /// Collapse or reopen the right-edge messages drawer.
     ToggleMessages,
+    /// One verb clicked in the drawer's action strip, dispatched through
+    /// the same handler its key press reaches.
+    MessagesVerb(cyclops_ui::ChatAction),
     /// Show or hide the tab strip. Visible is the default and hiding is an
     /// explicit choice, so the `+` that makes tabs is on screen from a
     /// fresh install; the choice persists like the sidebar's.
@@ -695,6 +698,12 @@ pub fn route_mouse_click(target: &HitTarget, button: MouseButton) -> Option<Acti
         // and on the collapsed rail alike.
         (HitTarget::SidebarToggle, MouseButton::Left) => Some(Action::ToggleSidebar),
         (HitTarget::MessagesToggle, MouseButton::Left) => Some(Action::ToggleMessages),
+        // The strip's words are the mouse's half of the drawer's keys. The
+        // action they raise is dispatched through the same key handler, so
+        // there is one implementation of each verb rather than two.
+        (HitTarget::MessagesAction(action), MouseButton::Left) => {
+            Some(Action::MessagesVerb(*action))
+        }
         (HitTarget::AttentionIndicator { pane_id }, MouseButton::Left) => Some(Action::FocusPane {
             pane_id: pane_id.clone(),
         }),

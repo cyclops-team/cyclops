@@ -64,7 +64,10 @@ mod wire;
 pub use action_io::{perform, ActionOutcome, ActionRequest, RequestKind, RequestToken};
 pub use app::{App, Command, Density, RosterRow, RowTarget, View};
 pub use avatar::{Avatar, AvatarRegistry};
-pub use chat::{render_chat, ChatRenderContext, ComposerMode, ComposerState, TimelineItem};
+pub use chat::{
+    chat_action_strip, chat_actions, refresh_failed, render_chat, ChatAction, ChatRenderContext,
+    ComposerMode, ComposerState, TimelineItem,
+};
 pub use cyclops_proto::{Attention, AttentionItem, Eye, PaneSnapshot};
 pub use data::{read_backfill, read_backfill_report, BackfillReport, UiMsg};
 pub use detail::{Action, Back, Check, Detail, Draft, Loaded, Request, Stage, ThreadEntry};

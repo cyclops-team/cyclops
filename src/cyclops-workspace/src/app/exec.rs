@@ -260,6 +260,26 @@ pub(super) async fn execute(
                 ..Outcome::default()
             })
         }
+        Action::MessagesVerb(verb) => {
+            // The click is dispatched as the key press its own label names,
+            // through the one handler that implements the verb. A pointer
+            // user therefore gets exactly the keyboard behaviour, including
+            // its refusals, and there is no second copy to drift.
+            use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+            let (code, modifiers) = match verb {
+                cyclops_ui::ChatAction::Reply => (KeyCode::Char('r'), KeyModifiers::NONE),
+                cyclops_ui::ChatAction::Announce => (KeyCode::Char('a'), KeyModifiers::NONE),
+                cyclops_ui::ChatAction::Open => (KeyCode::Enter, KeyModifiers::NONE),
+                cyclops_ui::ChatAction::Scope => (KeyCode::Char('s'), KeyModifiers::NONE),
+                cyclops_ui::ChatAction::Retry => (KeyCode::Char('r'), KeyModifiers::CONTROL),
+            };
+            // Clicking a verb in the strip is also a statement about where
+            // the operator is working, so the drawer takes focus first for
+            // the verbs that read the selection.
+            app.messages_focused = true;
+            super::handle_messages_key(app, KeyEvent::new(code, modifiers)).await?;
+            Ok(Outcome::default())
+        }
         Action::ToggleTabBar => {
             // The strip's row moves between chrome and the declared grid
             // whole, so every flip re-declares the client size exactly the
