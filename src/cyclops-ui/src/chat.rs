@@ -315,8 +315,8 @@ impl TimelineItem {
             let cause_str = row
                 .cause
                 .as_ref()
-                .map(|c| c.to_string())
-                .or_else(|| row.pre_write_cause.as_ref().map(|c| c.to_string()));
+                .map(|c| format!("{c:?}"))
+                .or_else(|| row.pre_write_cause.as_ref().map(|c| c.label().to_string()));
 
             let recip_entry = RecipientEntry {
                 recipient: row.recipient,
@@ -505,13 +505,27 @@ pub fn render_chat(
 
             if let Some(r) = first_recip {
                 if r.is_attention || r.cause.is_some() {
+                    let is_head = r.mailbox == MailboxWord::Pending && r.fifo_position == Some(1);
                     let cause_desc = r.cause.as_deref().unwrap_or(status_short);
-                    let behind_desc = r
-                        .fifo_position
-                        .map(|pos| format!(" · {pos} behind"))
-                        .unwrap_or_default();
-                    let line3 = format!(" ! [head · held: {cause_desc}{behind_desc}]");
-                    timeline_lines.push(fit(&line3, width));
+                    if is_head {
+                        let total_pending = visible_rows
+                            .iter()
+                            .filter(|row| {
+                                row.recipient == r.recipient && row.mailbox == MailboxWord::Pending
+                            })
+                            .count();
+                        let behind_count = total_pending.saturating_sub(1);
+                        let behind_desc = if behind_count > 0 {
+                            format!(" {behind_count}b")
+                        } else {
+                            String::new()
+                        };
+                        let line3 = format!(" ! [head:held {cause_desc}{behind_desc}]");
+                        timeline_lines.push(fit(&line3, width));
+                    } else {
+                        let line3 = format!(" ! [held: {cause_desc}]");
+                        timeline_lines.push(fit(&line3, width));
+                    }
                 }
             }
         }
@@ -595,13 +609,31 @@ pub fn render_chat(
                 );
                 timeline_lines.push(fit(&states, width));
                 if r.is_attention || r.cause.is_some() {
+                    let is_head = r.mailbox == MailboxWord::Pending && r.fifo_position == Some(1);
                     let cause_desc = r.cause.as_deref().unwrap_or(status_label);
-                    let behind_desc = r
-                        .fifo_position
-                        .map(|pos| format!(" · {pos} behind"))
-                        .unwrap_or_default();
-                    let held_line = format!("   ! [head · held: {cause_desc}{behind_desc}]");
-                    timeline_lines.push(fit(&held_line, width));
+                    if is_head {
+                        let total_pending = visible_rows
+                            .iter()
+                            .filter(|row| {
+                                row.recipient == r.recipient && row.mailbox == MailboxWord::Pending
+                            })
+                            .count();
+                        let behind_count = total_pending.saturating_sub(1);
+                        let behind_desc = if behind_count > 0 {
+                            format!(" · {behind_count} behind")
+                        } else {
+                            String::new()
+                        };
+                        let held_line = format!("   ! [head · held: {cause_desc}{behind_desc}]");
+                        timeline_lines.push(fit(&held_line, width));
+                    } else {
+                        let pos_desc = r
+                            .fifo_position
+                            .map(|pos| format!(" · pos {pos}"))
+                            .unwrap_or_default();
+                        let held_line = format!("   ! [held: {cause_desc}{pos_desc}]");
+                        timeline_lines.push(fit(&held_line, width));
+                    }
                 }
             }
             timeline_lines.push(fit("", width));
@@ -701,7 +733,9 @@ pub fn render_chat(
 mod tests {
     use super::*;
     use crate::queue::{Direction, QueueTarget, Snapshot};
-    use cyclops_proto::{MessageId, RecipientKey};
+    use cyclops_proto::{
+        MessageId, NotificationAttentionCause, NotificationPreWriteCause, RecipientKey,
+    };
 
     fn make_test_queue() -> HumanQueue {
         let mut queue = HumanQueue::default();
@@ -1102,7 +1136,97 @@ mod tests {
     }
 
     #[test]
-    fn held_queue_head_renders_cause_and_behind_count() {
+    fn held_queue_head_renders_verify_failed_and_accurate_behind_count() {
+        let mut queue = make_test_queue();
+        let r1 = RecipientKey::parse(
+            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+        )
+        .unwrap();
+        let m1 = MessageId::parse("m-0000000000000001").unwrap();
+        let m2 = MessageId::parse("m-0000000000000002").unwrap();
+        let m3 = MessageId::parse("m-0000000000000003").unwrap();
+
+        let head_row = QueueRow {
+            target: QueueTarget::new(m1.clone(), r1),
+            message_id: m1,
+            recipient: r1,
+            recipient_label: "blocked-worker".into(),
+            sender: r1,
+            sender_label: "operator".into(),
+            subject: Some("Head message".into()),
+            mailbox: MailboxWord::Pending,
+            wake: WakeWord::NeedsAttention,
+            cause: Some(NotificationAttentionCause::VerifyFailed),
+            fifo_position: Some(1),
+            needs_action: true,
+            can_manage_attention: true,
+            can_withdraw_notification: true,
+            seq: 10,
+            updated_at: 1_000_000,
+            direction: Direction::Inbound,
+            ..Default::default()
+        };
+        let row2 = QueueRow {
+            target: QueueTarget::new(m2.clone(), r1),
+            message_id: m2,
+            recipient: r1,
+            recipient_label: "blocked-worker".into(),
+            sender: r1,
+            sender_label: "operator".into(),
+            subject: Some("Second message".into()),
+            mailbox: MailboxWord::Pending,
+            wake: WakeWord::Queued,
+            fifo_position: Some(2),
+            seq: 11,
+            updated_at: 1_001_000,
+            direction: Direction::Inbound,
+            ..Default::default()
+        };
+        let row3 = QueueRow {
+            target: QueueTarget::new(m3.clone(), r1),
+            message_id: m3,
+            recipient: r1,
+            recipient_label: "blocked-worker".into(),
+            sender: r1,
+            sender_label: "operator".into(),
+            subject: Some("Third message".into()),
+            mailbox: MailboxWord::Pending,
+            wake: WakeWord::Queued,
+            fifo_position: Some(3),
+            seq: 12,
+            updated_at: 1_002_000,
+            direction: Direction::Inbound,
+            ..Default::default()
+        };
+
+        queue.replace(Snapshot {
+            watermark: 12,
+            rows: vec![head_row, row2, row3],
+        });
+
+        let reg = AvatarRegistry::default();
+        let lines = render_chat(
+            &queue,
+            None,
+            None,
+            &reg,
+            None,
+            None,
+            80,
+            25,
+            None,
+            Some(1_010_000),
+        );
+
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("head · held: VerifyFailed · 2 behind"),
+            "held queue head must render exact VerifyFailed cause and behind count: {joined}"
+        );
+    }
+
+    #[test]
+    fn pre_write_held_head_renders_cause() {
         let mut queue = make_test_queue();
         let r1 = RecipientKey::parse(
             "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
@@ -1116,10 +1240,11 @@ mod tests {
             recipient_label: "blocked-worker".into(),
             sender: r1,
             sender_label: "operator".into(),
-            subject: Some("Rate limited task".into()),
+            subject: Some("Pre-write block".into()),
             mailbox: MailboxWord::Pending,
-            wake: WakeWord::NeedsAttention,
-            fifo_position: Some(3),
+            wake: WakeWord::BlockedBeforeWrite,
+            pre_write_cause: Some(NotificationPreWriteCause::SessionUnavailable),
+            fifo_position: Some(1),
             needs_action: true,
             can_manage_attention: true,
             can_withdraw_notification: true,
@@ -1149,8 +1274,64 @@ mod tests {
 
         let joined = lines.join("\n");
         assert!(
-            joined.contains("head · held: Attention · 3 behind"),
-            "held queue head must render cause and behind count: {joined}"
+            joined.contains("head · held: session unavailable"),
+            "pre-write blocked head must render pre-write cause: {joined}"
+        );
+    }
+
+    #[test]
+    fn claimed_or_non_head_attention_row_does_not_label_head() {
+        let mut queue = make_test_queue();
+        let r1 = RecipientKey::parse(
+            "00000000-0000-0000-0000-000000000001:00000000-0000-0000-0000-000000000002:%1",
+        )
+        .unwrap();
+        let m1 = MessageId::parse("m-0000000000000001").unwrap();
+        let claimed_attention_row = QueueRow {
+            target: QueueTarget::new(m1.clone(), r1),
+            message_id: m1,
+            recipient: r1,
+            recipient_label: "claimed-agent".into(),
+            sender: r1,
+            sender_label: "operator".into(),
+            subject: Some("Old claimed message with unretired alarm".into()),
+            mailbox: MailboxWord::Claimed,
+            wake: WakeWord::NeedsAttention,
+            cause: Some(NotificationAttentionCause::VerifyFailed),
+            fifo_position: None,
+            needs_action: false,
+            seq: 10,
+            updated_at: 1_000_000,
+            direction: Direction::Inbound,
+            ..Default::default()
+        };
+        queue.replace(Snapshot {
+            watermark: 10,
+            rows: vec![claimed_attention_row],
+        });
+
+        let reg = AvatarRegistry::default();
+        let lines = render_chat(
+            &queue,
+            None,
+            None,
+            &reg,
+            None,
+            None,
+            80,
+            15,
+            None,
+            Some(1_010_000),
+        );
+
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("held: VerifyFailed"),
+            "claimed row must show cause: {joined}"
+        );
+        assert!(
+            !joined.contains("head · held"),
+            "claimed row must NOT be labelled as head: {joined}"
         );
     }
 }

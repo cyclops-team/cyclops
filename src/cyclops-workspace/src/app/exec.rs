@@ -250,12 +250,8 @@ pub(super) async fn execute(
             app.prefs.messages_visible = app.model.messages_visible;
             if app.model.messages_visible {
                 app.messages_focused = true;
-                if !app.messages_snapshot_in_flight {
-                    if let Some(tx) = &app.messages_snapshot_tx {
-                        let _ = tx.try_send(128);
-                        app.messages_snapshot_in_flight = true;
-                    }
-                }
+                app.messages_gate.mark_dirty();
+                super::pump_messages_refresh(app);
             } else {
                 app.messages_focused = false;
             }
@@ -1396,8 +1392,7 @@ mod tests {
             send_requests: None,
             stream_reconcile_requests: None,
             messages_focused: false,
-            messages_snapshot_in_flight: false,
-            messages_pending_seq: 0,
+            messages_gate: cyclops_ui::RefreshGate::new(),
             messages_send_tx: None,
             messages_snapshot_tx: None,
             message_detail_tx: None,

@@ -184,15 +184,20 @@ enum AppMsg {
     /// debounce and the reload itself runs on that deadline, before draw.
     ThemeChanged,
     /// A messages snapshot response has landed from cyclopsd.
-    MessagesSnapshotLoaded(cyclops_proto::MessagesSnapshotResult),
+    MessagesSnapshotLoaded {
+        request: cyclops_ui::RefreshRequest,
+        result: cyclops_proto::MessagesSnapshotResult,
+    },
+    /// A messages snapshot request failed or timed out.
+    MessagesSnapshotFailed {
+        request: cyclops_ui::RefreshRequest,
+    },
     /// Message detail / claim response has landed from cyclopsd.
     MessageDetailLoaded(Box<cyclops_ui::Detail>),
     /// Messages group-chat composer send outcome from background worker.
     MessagesSendFinished(crate::daemon::SendOutcome),
     /// Messages projection changed invalidation signal from cyclopsd.
-    MessagesChanged {
-        workspace_seq: u64,
-    },
+    MessagesChanged(Option<cyclops_proto::MessagesChangedData>),
 }
 
 /// Work item for sending a message asynchronously from the group-chat composer.
@@ -375,14 +380,12 @@ struct App {
     stream_reconcile_requests: Option<std::sync::mpsc::SyncSender<()>>,
     /// Whether the Messages drawer has active keyboard focus.
     messages_focused: bool,
-    /// Whether a messages.snapshot request is currently in-flight.
-    messages_snapshot_in_flight: bool,
-    /// Highest workspace_seq observed from messages.changed events for follow-up refresh.
-    messages_pending_seq: u64,
+    /// Refresh gate and connection lifecycle for the Messages drawer.
+    messages_gate: cyclops_ui::RefreshGate,
     /// Async worker for Messages composer sends.
     messages_send_tx: Option<std::sync::mpsc::SyncSender<MessagesSendTask>>,
     /// Async worker for bounded messages snapshot requests.
-    messages_snapshot_tx: Option<std::sync::mpsc::SyncSender<usize>>,
+    messages_snapshot_tx: Option<std::sync::mpsc::SyncSender<(cyclops_ui::RefreshRequest, usize)>>,
     /// Async worker for claiming/loading message detail.
     message_detail_tx: Option<
         std::sync::mpsc::SyncSender<(cyclops_proto::MessageId, cyclops_proto::RecipientKey)>,
@@ -713,17 +716,28 @@ pub async fn run_async() -> i32 {
         }
     });
 
-    let (messages_snapshot_tx, messages_snapshot_rx) = std::sync::mpsc::sync_channel::<usize>(1);
+    let (messages_snapshot_tx, messages_snapshot_rx) =
+        std::sync::mpsc::sync_channel::<(cyclops_ui::RefreshRequest, usize)>(1);
     let msg_snapshot_home = home.clone();
     let msg_snapshot_results = action_tx.clone();
     std::thread::spawn(move || {
-        while let Ok(limit) = messages_snapshot_rx.recv() {
-            if let Ok(result) = crate::daemon::fetch_messages_snapshot(&msg_snapshot_home, limit) {
-                if msg_snapshot_results
-                    .blocking_send(AppMsg::MessagesSnapshotLoaded(result))
-                    .is_err()
-                {
-                    return;
+        while let Ok((request, limit)) = messages_snapshot_rx.recv() {
+            match crate::daemon::fetch_messages_snapshot(&msg_snapshot_home, limit) {
+                Ok(result) => {
+                    if msg_snapshot_results
+                        .blocking_send(AppMsg::MessagesSnapshotLoaded { request, result })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(_) => {
+                    if msg_snapshot_results
+                        .blocking_send(AppMsg::MessagesSnapshotFailed { request })
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
         }
@@ -996,8 +1010,7 @@ pub async fn run_async() -> i32 {
         send_requests: Some(send_request_tx),
         stream_reconcile_requests: Some(stream_reconcile_tx),
         messages_focused: false,
-        messages_snapshot_in_flight: false,
-        messages_pending_seq: 0,
+        messages_gate: cyclops_ui::RefreshGate::new(),
         messages_send_tx: Some(messages_send_tx),
         messages_snapshot_tx: Some(messages_snapshot_tx),
         message_detail_tx: Some(message_detail_tx),
@@ -1010,11 +1023,10 @@ pub async fn run_async() -> i32 {
         log_err(&app.home, &format!("decoration refresh failed: {error}"));
         DecorationSnapshot::default()
     });
+    app.messages_gate.connected();
     if app.model.messages_visible {
-        if let Some(tx) = &app.messages_snapshot_tx {
-            let _ = tx.try_send(128);
-            app.messages_snapshot_in_flight = true;
-        }
+        app.messages_gate.mark_dirty();
+        pump_messages_refresh(&mut app);
     }
     // The subscription at the top of this function is already queuing live
     // entries on the app channel; boot's backfill-then-seed lands before
@@ -1682,14 +1694,9 @@ fn subscribe_decoration_once(
         // still becomes a wake-only `ThemeChanged`. Every other vocabulary,
         // known or not, becomes an entry.
         if ev.event == "messages.changed" {
-            let workspace_seq = ev
-                .data
-                .get("workspace_seq")
-                .and_then(serde_json::Value::as_u64)
-                .or_else(|| ev.data.get("seq").and_then(serde_json::Value::as_u64))
-                .unwrap_or(u64::MAX);
+            let data = serde_json::from_value::<cyclops_proto::MessagesChangedData>(ev.data).ok();
             if stream_tx
-                .blocking_send(AppMsg::MessagesChanged { workspace_seq })
+                .blocking_send(AppMsg::MessagesChanged(data))
                 .is_err()
             {
                 return;
@@ -2321,6 +2328,7 @@ async fn handle_app_msg(
         }
         AppMsg::LinkLost => {
             app.reconnect_attempt = 0;
+            app.messages_gate.disconnected();
             schedule_reconnect(app, reconnect_deadline);
             arm(debounce);
         }
@@ -2340,22 +2348,15 @@ async fn handle_app_msg(
         }
         AppMsg::DecorationChanged(snapshot) => {
             apply_decoration_snapshot(app, snapshot);
-            if app.model.messages_visible && !app.messages_snapshot_in_flight {
-                if let Some(tx) = &app.messages_snapshot_tx {
-                    let _ = tx.try_send(128);
-                    app.messages_snapshot_in_flight = true;
-                }
-            }
+            app.messages_gate.mark_dirty();
+            pump_messages_refresh(app);
             arm(debounce);
         }
         AppMsg::DaemonReconnected => {
             resync_daemon_state(app);
-            if app.model.messages_visible && !app.messages_snapshot_in_flight {
-                if let Some(tx) = &app.messages_snapshot_tx {
-                    let _ = tx.try_send(128);
-                    app.messages_snapshot_in_flight = true;
-                }
-            }
+            app.messages_gate.connected();
+            app.messages_gate.mark_dirty();
+            pump_messages_refresh(app);
             arm(debounce);
         }
         // E2: per-event, not coalesced with the decoration burst above —
@@ -2371,17 +2372,16 @@ async fn handle_app_msg(
             crate::event_record::live(&mut app.record, &mut app.intake, *entry);
             arm(debounce);
         }
-        AppMsg::MessagesChanged { workspace_seq } => {
-            app.messages_pending_seq = app.messages_pending_seq.max(workspace_seq);
-            if app.model.messages_visible
-                && !app.messages_snapshot_in_flight
-                && app.messages_pending_seq > app.messages_queue.watermark()
-            {
-                if let Some(tx) = &app.messages_snapshot_tx {
-                    let _ = tx.try_send(128);
-                    app.messages_snapshot_in_flight = true;
+        AppMsg::MessagesChanged(changed) => {
+            match changed {
+                Some(data) => {
+                    app.messages_gate.messages_changed(&data);
+                }
+                None => {
+                    app.messages_gate.mark_dirty();
                 }
             }
+            pump_messages_refresh(app);
         }
         AppMsg::StreamGap { why } => {
             if app.stream_reconciling {
@@ -2427,22 +2427,21 @@ async fn handle_app_msg(
         // Wake-only: the reload itself runs on the render deadline this
         // arms (the theme_watch refresh in `run_async`).
         AppMsg::ThemeChanged => arm(debounce),
-        AppMsg::MessagesSnapshotLoaded(result) => {
-            app.messages_snapshot_in_flight = false;
-            let rows = cyclops_ui::messages::rows_from_snapshot(&result);
-            app.messages_queue.replace(cyclops_ui::Snapshot {
-                watermark: result.watermark,
-                rows,
-            });
-            // If an edge arrived while this fetch was in flight, issue exactly one follow-up:
-            if app.model.messages_visible
-                && app.messages_pending_seq > app.messages_queue.watermark()
-            {
-                if let Some(tx) = &app.messages_snapshot_tx {
-                    let _ = tx.try_send(128);
-                    app.messages_snapshot_in_flight = true;
-                }
+        AppMsg::MessagesSnapshotLoaded { request, result } => {
+            let accepted = app.messages_gate.finish_snapshot(request, &result);
+            if accepted {
+                let rows = cyclops_ui::messages::rows_from_snapshot(&result);
+                app.messages_queue.replace(cyclops_ui::Snapshot {
+                    watermark: result.watermark,
+                    rows,
+                });
             }
+            pump_messages_refresh(app);
+            arm(debounce);
+        }
+        AppMsg::MessagesSnapshotFailed { request } => {
+            app.messages_gate.finish_failure(request);
+            pump_messages_refresh(app);
             arm(debounce);
         }
         AppMsg::MessageDetailLoaded(detail) => {
@@ -3486,12 +3485,8 @@ async fn handle_messages_key(
         match key.code {
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.messages_composer.reconcile_stage();
-                if !app.messages_snapshot_in_flight {
-                    if let Some(tx) = &app.messages_snapshot_tx {
-                        let _ = tx.try_send(128);
-                        app.messages_snapshot_in_flight = true;
-                    }
-                }
+                app.messages_gate.mark_dirty();
+                pump_messages_refresh(app);
                 app.notice.show(
                     "Reconciled uncertain state: refreshed snapshot and routes",
                     Instant::now(),
@@ -4922,8 +4917,7 @@ mod tests {
             send_requests: None,
             stream_reconcile_requests: None,
             messages_focused: false,
-            messages_snapshot_in_flight: false,
-            messages_pending_seq: 0,
+            messages_gate: cyclops_ui::RefreshGate::new(),
             messages_send_tx: None,
             messages_snapshot_tx: None,
             message_detail_tx: None,
