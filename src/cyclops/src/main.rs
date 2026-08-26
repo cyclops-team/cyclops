@@ -2615,6 +2615,49 @@ fn confirm_age_clear<R: BufRead, W: Write>(
     Ok(answer.trim() == "clear")
 }
 
+/// Unresolved alarms by id, read just before a clearance so the clearance
+/// can say what each id held. `older_than_ms: 0` selects every unresolved
+/// alarm. A failed read degrades to "unknown" lines, never to silence.
+fn unresolved_alarms_by_id(
+    c: &mut Client,
+    cli: &Cli,
+) -> std::collections::BTreeMap<String, cyclops_proto::AlarmSummary> {
+    let params = serde_json::to_value(cyclops_proto::AlarmPreviewParams { older_than_ms: 0 })
+        .expect("alarm.preview params serialize");
+    let preview: Result<Option<cyclops_proto::AlarmPreviewResult>, i32> = ask(
+        c,
+        "alarm.preview",
+        params,
+        false,
+        None,
+        serde_json::from_value,
+    );
+    let _ = cli;
+    match preview {
+        Ok(Some(result)) => result
+            .entries
+            .into_iter()
+            .map(|alarm| (alarm.id.clone(), alarm))
+            .collect(),
+        Ok(None) | Err(_) => std::collections::BTreeMap::new(),
+    }
+}
+
+/// The line printed under `cleared <id>`: an acknowledgement changes no
+/// state, so say what stays true and which two actions release it.
+fn alarm_cleared_consequence(id: &str, alarm: Option<&cyclops_proto::AlarmSummary>) -> String {
+    match alarm {
+        Some(alarm) => copy::alarm_cleared_consequence(
+            id,
+            &alarm.message_id,
+            &alarm.recipient,
+            &wire_word(serde_json::to_value(alarm.state).unwrap_or(Value::Null)),
+            &wire_word(serde_json::to_value(alarm.cause).unwrap_or(Value::Null)),
+        ),
+        None => copy::alarm_cleared_unknown(id),
+    }
+}
+
 fn clear_alarm_ids(
     c: &mut Client,
     cli: &Cli,
@@ -2622,6 +2665,11 @@ fn clear_alarm_ids(
     ids: Vec<String>,
     cutoff_ms: Option<u64>,
 ) -> i32 {
+    let known = if cli.json {
+        std::collections::BTreeMap::new()
+    } else {
+        unresolved_alarms_by_id(c, cli)
+    };
     let params = serde_json::to_value(cyclops_proto::AlarmClearParams { ids, cutoff_ms })
         .expect("alarm.clear params serialize");
     let result: cyclops_proto::AlarmClearResult = match ask(
@@ -2638,6 +2686,7 @@ fn clear_alarm_ids(
     };
     for id in result.cleared_ids {
         println!("cleared {}", style.accent(&id));
+        println!("{}", alarm_cleared_consequence(&id, known.get(&id)));
     }
     0
 }
@@ -3406,6 +3455,38 @@ mod tests {
         )];
         assert!(held_heads(&moving).is_empty());
         assert!(held_queue_lines(&held_heads(&moving)).is_empty());
+    }
+
+    /// F1: clearing an alarm acknowledges it and retires nothing. The
+    /// command must say so, name what the id held, and name the actions
+    /// that release it, instead of printing only its own success.
+    #[test]
+    fn alarm_clear_prints_consequence_and_next_action() {
+        let alarm = cyclops_proto::AlarmSummary {
+            id: "att-1".into(),
+            message_id: "m-head".into(),
+            recipient: "codey".into(),
+            state: cyclops_proto::DeliveryState::AttentionRequired,
+            cause: cyclops_proto::NotificationAttentionCause::VerifyFailed,
+            ts: 7,
+        };
+        let line = alarm_cleared_consequence("att-1", Some(&alarm));
+        for needle in [
+            "acknowledged only",
+            "attempt att-1 stays attention_required (verify_failed)",
+            "message m-head to codey is unchanged",
+            "holds that recipient's queue",
+            "recipient claims m-head",
+            "cyclops attention show att-1 --diff",
+            "cyclops requeue m-head",
+        ] {
+            assert!(line.contains(needle), "missing {needle:?} in {line}");
+        }
+        let unknown = alarm_cleared_consequence("att-2", None);
+        assert!(
+            unknown.contains("acknowledged only") && unknown.contains("att-2"),
+            "{unknown}"
+        );
     }
 
     #[test]

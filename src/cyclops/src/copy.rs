@@ -43,6 +43,27 @@ pub fn alarm_clear_confirmation(count: usize, older_than: &str) -> String {
     format!("Clear {count} alarms selected by --older-than {older_than}? Type clear to confirm: ")
 }
 
+/// What `alarm clear` did and did not do. Clearance acknowledges an alarm;
+/// it retires nothing. The attempt keeps its state, the message keeps its
+/// place, and a pending head keeps holding its recipient's queue.
+pub fn alarm_cleared_consequence(
+    id: &str,
+    message_id: &str,
+    recipient: &str,
+    state: &str,
+    cause: &str,
+) -> String {
+    format!(
+        "  acknowledged only · attempt {id} stays {state} ({cause}) · message {message_id} to {recipient} is unchanged and, while pending, holds that recipient's queue · release: recipient claims {message_id} · or admin: cyclops attention show {id} --diff, then complete or discard · or cyclops requeue {message_id} after fixing the cause"
+    )
+}
+
+/// The cleared id was not in the unresolved set the daemon reported just
+/// before clearing, so nothing can be said about what it held.
+pub fn alarm_cleared_unknown(id: &str) -> String {
+    format!("  acknowledged only · no unresolved attempt was listed for {id} just before clearing")
+}
+
 pub fn no_unresolved_alarms(older_than: &str) -> String {
     format!("no unresolved alarms selected by --older-than {older_than}")
 }
