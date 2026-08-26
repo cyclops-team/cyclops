@@ -76,6 +76,28 @@ fn receipt_from_disposition(
     }
 }
 
+/// Preserve the durable acceptance result when the scheduler could not record
+/// its own disposition. The message already exists and retrying an unkeyed send
+/// would create a duplicate; the receipt therefore carries a fail-closed wake
+/// diagnosis instead of converting acceptance into an RPC error.
+fn receipt_with_schedule_truth(
+    disposition: crate::mailbox::MessageDisposition,
+    pane: Option<String>,
+    scheduler_state_unavailable: bool,
+) -> DeliveryReceipt {
+    let mut receipt = receipt_from_disposition(disposition, pane);
+    if scheduler_state_unavailable && receipt.wake_block.is_none() {
+        receipt.wake_block = Some(MessageWakeBlock::SchedulerStateUnavailable);
+    }
+    receipt
+}
+
+#[derive(Debug, Default)]
+struct AcceptanceSchedule {
+    outcomes: HashMap<RecipientKey, RecipientScheduleOutcome>,
+    unavailable: HashSet<RecipientKey>,
+}
+
 /// Resolve a durable recipient only when its exact session instance is attached.
 pub(crate) fn notification_route(
     inner: &Inner,
@@ -666,14 +688,14 @@ async fn finish_acceptance(
     // before enqueue returns; the immediate projection read below remains the
     // authority, and this receiver prevents losing a later commit.
     let events = inner.events.subscribe();
-    let schedule_outcomes = schedule_accepted_notifications(&accepted, |recipient| {
+    let schedule = schedule_accepted_notifications(&accepted, |recipient| {
         schedule_recipient(inner, service, recipient)
-    })?;
+    });
     let deadline = Instant::now() + Duration::from_millis(inner.cfg.receipt_block_ms);
     let dispositions = observe_first_durable_dispositions(
         service,
         &accepted.message_id,
-        &schedule_outcomes,
+        &schedule.outcomes,
         events,
         deadline,
     )
@@ -684,37 +706,43 @@ async fn finish_acceptance(
         deliveries: dispositions
             .into_iter()
             .map(|disposition| {
+                let recipient = disposition.recipient;
                 let pane = notification_route(inner, service, disposition.recipient)?
                     .map(|route| route.pane_id);
-                Ok(receipt_from_disposition(disposition, pane))
+                Ok(receipt_with_schedule_truth(
+                    disposition,
+                    pane,
+                    schedule.unavailable.contains(&recipient),
+                ))
             })
             .collect::<Result<Vec<_>, MailboxServiceError>>()?,
         inserted: Some(accepted.inserted),
     })
 }
 
-/// Attempt every broadcast recipient, then propagate the first failure whose
-/// durable disposition could not be recorded.
+/// Attempt every broadcast recipient without revoking durable acceptance.
+///
+/// A scheduling error occurs after the message append has been synced. Keep
+/// attempting the other recipients and return the affected recipient in the
+/// unavailable set so the accepted receipt fails closed without inviting an
+/// unkeyed retry and duplicate message.
 fn schedule_accepted_notifications(
     accepted: &AcceptResult,
     mut schedule: impl FnMut(RecipientKey) -> Result<RecipientScheduleOutcome, MailboxServiceError>,
-) -> Result<HashMap<RecipientKey, RecipientScheduleOutcome>, MailboxServiceError> {
-    let mut outcomes = HashMap::new();
-    let mut first_error = None;
+) -> AcceptanceSchedule {
+    let mut report = AcceptanceSchedule::default();
     for recipient in accepted.recipient_keys.iter().copied() {
         match schedule(recipient) {
             Ok(outcome) => {
-                outcomes.insert(recipient, outcome);
+                report.outcomes.insert(recipient, outcome);
             }
             Err(error) => {
                 error!(%recipient, %error, "cannot schedule accepted mailbox notification");
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
+                report.unavailable.insert(recipient);
             }
         }
     }
-    first_error.map_or(Ok(outcomes), Err)
+    report
 }
 
 pub(crate) async fn send(
@@ -1208,38 +1236,55 @@ mod tests {
     }
 
     #[test]
-    fn a_scheduler_persistence_failure_does_not_skip_later_broadcast_recipients() {
-        let workspace = "00000000-0000-4000-8000-000000000001".parse().unwrap();
-        let session = "00000000-0000-4000-8000-000000000002".parse().unwrap();
-        let first = RecipientKey::agent(workspace, session, "%3".parse().unwrap());
-        let middle = RecipientKey::agent(workspace, session, "%4".parse().unwrap());
-        let last = RecipientKey::agent(workspace, session, "%5".parse().unwrap());
-        let accepted = AcceptResult {
-            message_id: MessageId::new("m-accepted-schedule-failed").unwrap(),
-            inserted: true,
-            seq: 41,
-            recipients: vec!["first".into(), "middle".into(), "last".into()],
-            recipient_keys: vec![first, middle, last],
-        };
+    fn a_scheduler_failure_keeps_acceptance_and_does_not_skip_later_recipients() {
+        let (_scratch, service, _events, reviewer, observer) =
+            mailbox_service("accepted-scheduler-failure", 8);
+        let accepted = send_to(&service, &["reviewer", "observer"], "Broadcast");
 
         let mut attempted = Vec::new();
-        let error = schedule_accepted_notifications(&accepted, |recipient| {
+        let report = schedule_accepted_notifications(&accepted, |recipient| {
             attempted.push(recipient);
-            if recipient == middle {
+            if recipient == reviewer {
                 Err(MailboxServiceError::Poisoned)
             } else {
-                Ok(RecipientScheduleOutcome::WorkerOwned {
-                    head: ScheduledHead::new(
-                        accepted.message_id.clone(),
-                        NotificationAttemptId::generate(),
-                    ),
-                    observe_first_disposition: false,
-                })
+                Ok(RecipientScheduleOutcome::NoWakeNeeded)
             }
-        })
-        .unwrap_err();
-        assert_eq!(attempted, vec![first, middle, last]);
-        assert!(matches!(error, MailboxServiceError::Poisoned));
+        });
+        assert_eq!(attempted, vec![reviewer, observer]);
+        assert_eq!(report.outcomes.len(), 1);
+        assert_eq!(
+            report.outcomes[&observer],
+            RecipientScheduleOutcome::NoWakeNeeded
+        );
+        assert_eq!(report.unavailable, HashSet::from([reviewer]));
+
+        let receipts: Vec<_> = service
+            .message_dispositions(&accepted.message_id)
+            .unwrap()
+            .into_iter()
+            .map(|disposition| {
+                let unavailable = report.unavailable.contains(&disposition.recipient);
+                receipt_with_schedule_truth(disposition, None, unavailable)
+            })
+            .collect();
+        assert_eq!(
+            receipts
+                .iter()
+                .find(|receipt| receipt.to == "reviewer")
+                .unwrap()
+                .wake_block,
+            Some(MessageWakeBlock::SchedulerStateUnavailable),
+            "the accepted recipient gets a truthful nonzero-exit receipt"
+        );
+        assert_eq!(
+            receipts
+                .iter()
+                .find(|receipt| receipt.to == "observer")
+                .unwrap()
+                .wake_block,
+            None,
+            "one recipient's scheduler failure cannot contaminate another"
+        );
     }
 
     #[test]
