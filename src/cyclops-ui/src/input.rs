@@ -172,14 +172,14 @@ fn utf8_len(first: u8) -> usize {
 
 /// Spawn the reader thread. It parks in read() and dies with the process;
 /// the runtime only ever sees decoded keys on the channel.
-pub fn spawn_reader(tx: tokio::sync::mpsc::UnboundedSender<Key>) {
+pub fn spawn_reader(tx: tokio::sync::mpsc::Sender<Key>) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         let mut pending: Vec<u8> = Vec::new();
         let mut in_paste = false;
         loop {
             for key in drain(&mut pending, &mut in_paste) {
-                if tx.send(key).is_err() {
+                if tx.blocking_send(key).is_err() {
                     return;
                 }
             }
@@ -205,7 +205,7 @@ pub fn spawn_reader(tx: tokio::sync::mpsc::UnboundedSender<Key>) {
                         }
                     } else if pending == [0x1b] {
                         for key in decode(&pending) {
-                            if tx.send(key).is_err() {
+                            if tx.blocking_send(key).is_err() {
                                 return;
                             }
                         }

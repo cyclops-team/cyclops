@@ -34,6 +34,8 @@ use crate::stream::Entry;
 use crate::stream::StatusSeed;
 use crate::wire::{encode_json, FrameReader};
 
+type UiError = Box<dyn std::error::Error + Send + Sync>;
+
 /// Everything the event loop can receive.
 pub enum UiMsg {
     Key(Key),
@@ -308,9 +310,7 @@ async fn messages_task(
 /// before the write and a stall after it are equally harmless. The last
 /// good snapshot stays on screen either way. They are split so there is
 /// one timeout contract to reason about rather than two.
-async fn messages_snapshot(
-    sock: &Path,
-) -> Result<cyclops_proto::MessagesSnapshotResult, Box<dyn std::error::Error>> {
+async fn messages_snapshot(sock: &Path) -> Result<cyclops_proto::MessagesSnapshotResult, UiError> {
     let open = tokio::time::timeout(crate::action_io::OPEN_TIMEOUT, snapshot_open(sock));
     let (mut lines, mut w) = match open.await {
         Ok(opened) => opened?,
@@ -339,7 +339,7 @@ async fn messages_snapshot(
 async fn messages_follow(
     sock: &Path,
     request: crate::messages::FollowRequest,
-) -> Result<cyclops_proto::MessagesFollowResult, Box<dyn std::error::Error>> {
+) -> Result<cyclops_proto::MessagesFollowResult, UiError> {
     let open = tokio::time::timeout(crate::action_io::OPEN_TIMEOUT, snapshot_open(sock));
     let (mut lines, mut w) = match open.await {
         Ok(opened) => opened?,
@@ -370,7 +370,7 @@ type SnapshotReader = FrameReader<tokio::net::unix::OwnedReadHalf>;
 /// Connect and read the greeting. Nothing has been asked for yet.
 async fn snapshot_open(
     sock: &Path,
-) -> Result<(SnapshotReader, tokio::net::unix::OwnedWriteHalf), Box<dyn std::error::Error>> {
+) -> Result<(SnapshotReader, tokio::net::unix::OwnedWriteHalf), UiError> {
     let stream = UnixStream::connect(sock).await?;
     let (r, w) = stream.into_split();
     let mut frames = FrameReader::new(r);
@@ -392,7 +392,7 @@ async fn snapshot_open(
 async fn snapshot_ask(
     frames: &mut SnapshotReader,
     w: &mut tokio::net::unix::OwnedWriteHalf,
-) -> Result<cyclops_proto::MessagesSnapshotResult, Box<dyn std::error::Error>> {
+) -> Result<cyclops_proto::MessagesSnapshotResult, UiError> {
     w.write_all(b"{\"id\":1,\"method\":\"messages.snapshot\",\"params\":{}}\n")
         .await?;
     let frame = frames
@@ -418,7 +418,7 @@ async fn follow_ask(
     frames: &mut SnapshotReader,
     w: &mut tokio::net::unix::OwnedWriteHalf,
     request: crate::messages::FollowRequest,
-) -> Result<cyclops_proto::MessagesFollowResult, Box<dyn std::error::Error>> {
+) -> Result<cyclops_proto::MessagesFollowResult, UiError> {
     let request_line = serde_json::json!({
         "id": 1,
         "method": "messages.follow",
@@ -447,7 +447,7 @@ async fn follow_ask(
     Ok(page)
 }
 
-fn response_result(frame: &[u8], method: &str) -> Result<Value, Box<dyn std::error::Error>> {
+fn response_result(frame: &[u8], method: &str) -> Result<Value, UiError> {
     let response: cyclops_proto::Response = serde_json::from_slice(frame)
         .map_err(|error| format!("{method} returned malformed JSON: {error}"))?;
     if response.id != Value::from(1) {
@@ -673,7 +673,7 @@ async fn forward_event(tx: &mpsc::Sender<UiMsg>, ev: Event) -> Result<bool, Stri
 /// label -> pane map behind the focus jump, where every pane stands, and
 /// the deliveries still waiting on a human. A failed or malformed answer is
 /// visible because it changes the scope and freshness of the read model.
-async fn status_seed(sock: &Path) -> Result<StatusSeed, Box<dyn std::error::Error>> {
+async fn status_seed(sock: &Path) -> Result<StatusSeed, UiError> {
     let open = tokio::time::timeout(crate::action_io::OPEN_TIMEOUT, snapshot_open(sock));
     let (mut frames, mut w) = match open.await {
         Ok(opened) => opened?,
