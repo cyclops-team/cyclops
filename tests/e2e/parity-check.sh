@@ -408,6 +408,19 @@ composer_semantic = "clean"
 priority = 90
 region = "bottom_non_empty_lines(4)"
 line_regex = ['^❯\s*$']
+# The parity composer is fully controlled: it paints this row only while
+# idle, and its working row below outranks it during a turn.
+lifecycle_evidence = true
+
+[[rule]]
+id = "screen_idle"
+state = "idle"
+priority = 70
+region = "bottom_non_empty_lines(4)"
+# Before the fixture composer starts, the persistent command loop leaves a
+# blank pane. This purpose-built screen rule is that loop's idle authority.
+lifecycle_evidence = true
+regex = ['^']
 
 [[rule]]
 id = "composer_holds_paste"
