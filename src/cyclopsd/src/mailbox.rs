@@ -1500,22 +1500,20 @@ impl MailboxProjection {
                 pre_write_observation.as_ref().is_some_and(|observation| {
                     observation.pane_width.is_some() != observation.required_pane_width.is_some()
                 });
-            if matches!(
+            if (matches!(
                 pre_write_cause,
                 Some(
                     NotificationPreWriteCause::BindingUnprovable
                         | NotificationPreWriteCause::ComposerSemanticMissing
                 )
             ) || width_observation.is_some()
-                && pre_write_cause == Some(NotificationPreWriteCause::WriteReadinessChanged)
-            {
-                if pre_write_observation
+                && pre_write_cause == Some(NotificationPreWriteCause::WriteReadinessChanged))
+                && pre_write_observation
                     .as_ref()
                     .and_then(|observation| observation.selected_manifest.as_ref())
                     .is_none()
-                {
-                    return Err(MailboxError::NotificationPreWriteObservationRequired);
-                }
+            {
+                return Err(MailboxError::NotificationPreWriteObservationRequired);
             }
             if has_partial_width_observation {
                 return Err(MailboxError::NotificationPreWriteObservationRequired);

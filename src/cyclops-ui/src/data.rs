@@ -450,7 +450,7 @@ async fn follow_ask(
 fn response_result(frame: &[u8], method: &str) -> Result<Value, UiError> {
     let response: cyclops_proto::Response = serde_json::from_slice(frame)
         .map_err(|error| format!("{method} returned malformed JSON: {error}"))?;
-    if response.id != Value::from(1) {
+    if response.id != 1 {
         return Err(format!("{method} returned the wrong response id").into());
     }
     if let Some(error) = response.error {
@@ -627,7 +627,7 @@ async fn subscribe_ack(
         .ok_or_else(|| "the connection closed before the subscribe acknowledgement".to_string())?;
     let response: cyclops_proto::Response = serde_json::from_slice(&frame)
         .map_err(|error| format!("events.subscribe returned malformed JSON: {error}"))?;
-    if response.id != Value::from(1) {
+    if response.id != 1 {
         return Err("events.subscribe returned the wrong response id".into());
     }
     if let Some(error) = response.error {

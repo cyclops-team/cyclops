@@ -526,7 +526,7 @@ async fn ask(connection: Connection, method: &str, params: Value) -> Result<Valu
         .ok_or_else(|| Failure::Uncertain("connection closed before an answer".into()))?;
     let response: cyclops_proto::Response = serde_json::from_slice(&frame)
         .map_err(|e| Failure::Uncertain(format!("malformed {method} answer: {e}")))?;
-    if response.id != Value::from(1) {
+    if response.id != 1 {
         return Err(Failure::Uncertain(format!(
             "{method} returned the wrong response id"
         )));
