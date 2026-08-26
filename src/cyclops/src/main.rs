@@ -3376,6 +3376,7 @@ mod tests {
                     operator_withdrawn: None,
                     attempt_id: None,
                     cause,
+                    verify_outcome: None,
                     pre_write_cause: None,
                     pre_write_pane_width: None,
                     pre_write_required_pane_width: None,

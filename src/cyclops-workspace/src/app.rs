@@ -360,7 +360,7 @@ impl PaneInputGate {
 
     fn accepts(&self, epoch: u64) -> bool {
         let current = self.stamp();
-        current % 2 == 0 && epoch == current
+        current.is_multiple_of(2) && epoch == current
     }
 
     fn is_closed(&self) -> bool {
