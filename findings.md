@@ -1843,3 +1843,51 @@ process-bound liveness: an authenticated edge (SessionStart) from the exact
 current generation in this pane lifetime, no active start, a clean composer
 on a fresh, out-of-mode, binding-stable capture. Admission is not lifecycle
 evidence and cannot end a turn. Cross-references: F5, F6, F23, F70, F71.
+
+## F73. Codex 0.149.1 fresh and resumed delivery succeeds, while a human draft stays protected
+
+MEASURED 2026-08-26 on macOS with tmux 3.6a, Codex CLI 0.149.1, and
+Cyclops build `3bb01a4`. Client and daemon ran the same immutable pair and the
+installed Codex manifest matched the source manifest.
+
+A fresh Codex pane accepted message
+`m-f7ec4814aeb341478bea718c28142154` as attempt
+`att-6b403513-a593-42d3-86d5-797b4a12971c`. The workspace journal recorded,
+in order, queued, gating, writing, staged, submitting, submitted, notified,
+and message claimed. No operator pressed Enter and no verify-failed fact was
+recorded. The composer returned to the measured ghost-suggestion state.
+
+The same Codex conversation was then exited and resumed with
+`codex resume 01a03f8d-228a-7ec3-84b3-cf2fa6cc1ff2` in a new pane and process
+generation. Message `m-6c081012997f44e4834f29ac8ce83b94`, attempt
+`att-e360eb5b-a7af-4e4f-a0dc-11142011b471`, followed the same ordered sequence
+through notified and exact claim. Its threaded response body was `RESUMED
+PASS`. The writing binding recorded the new pane root and agent process,
+manifest `codex`, and the exact durable recipient key for the resumed pane.
+This falsifies the hypothesis that the current `codex resume` ancestry is
+intrinsically unresolvable.
+
+A separate live safety cell typed `human draft sentinel 01491` into the
+resumed pane before sending message `m-cba2d382c2d041c89003cb5d4081e349`,
+attempt `att-3af46448-2aa0-440a-b549-c1d5e3c5e202`. Detection reported
+`idle_with_input`, `composer_typed_input`, and write readiness false. The
+attempt reached only queued and gating; no writing fact and no doorbell bytes
+appeared, and the draft remained byte-for-byte intact. Clearing the draft did
+not authorize a write: the durable human-input hold correctly remained until
+a completed human turn could prove the composer lifecycle. An administrator
+then withdrew that exact attempt before write. The journal appended
+`notification_withdrawn_before_write`, released the FIFO attempt, and left the
+message claimable.
+
+This closes the reported fresh-session, resumed-session, normal submission,
+claim, reply, human-draft safety, and provably-unwritten withdrawal cells on
+0.149.1. A typed `/status` matched `composer_typed_input` and remained
+write-blocked. A submitted tool request produced an authenticated
+`UserPromptSubmit` reading plus matching title and screen Working readings;
+the live pane then reported a background terminal while remaining Working.
+These observations cover typed slash-command, working-turn, and tool-execution
+classification without weakening composer safety.
+
+This does not advance the manifest's full-ruleset `version_tested` claim.
+Current-version modal/approval, collapsed staging, exact notification ACK,
+and daemon-restart cells still need their own measured evidence.
