@@ -427,11 +427,75 @@ pub(crate) fn schedule_pane_size_changed(inner: &Arc<Inner>, session_idx: usize,
     }
 }
 
+/// Open attention attempts that no automatic path will ever retire.
+///
+/// Exact owned reconciliation and claimed ack-timeout reconciliation both
+/// require an attempt-naming doorbell format and a full binding. Anything
+/// else in `attention_required` (a format 1 doorbell from an older build,
+/// a direct payload, a binding without pane-root generation) waits for a
+/// recipient claim or an operator action, and until now waited silently.
+pub(crate) fn operator_only_attention(
+    records: &[cyclops_proto::NotificationRecord],
+) -> Vec<&cyclops_proto::NotificationRecord> {
+    records
+        .iter()
+        .filter(|record| {
+            record.state == cyclops_proto::NotificationState::AttentionRequired
+                && !record.needs_exact_owned_reconciliation()
+                && !record.needs_claimed_ack_timeout_reconciliation()
+        })
+        .collect()
+}
+
+static OPERATOR_ONLY_ATTENTION_REPORTED: std::sync::Once = std::sync::Once::new();
+
+/// Once per daemon process, name every operator-only attempt with the two
+/// actions that release it. Silence was the failure; the limitation is
+/// legitimate and stays.
+fn report_operator_only_attention(inner: &Arc<Inner>, service: &Arc<MailboxService>) {
+    OPERATOR_ONLY_ATTENTION_REPORTED.call_once(|| {
+        let records = match service.alarms_at_or_before(u64::MAX) {
+            Ok(records) => records,
+            Err(error) => {
+                error!(%error, "cannot list open attention attempts at startup");
+                return;
+            }
+        };
+        for record in operator_only_attention(&records) {
+            let cause = record
+                .cause
+                .and_then(|cause| serde_json::to_value(cause).ok())
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string());
+            let format = record
+                .doorbell_format
+                .map(|format| format.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            crate::delivery::admin_notify(
+                inner,
+                cyclops_proto::NotifyLevel::ActionRequired,
+                &format!(
+                    "attention attempt {} cannot be retired automatically",
+                    record.attempt_id
+                ),
+                &format!(
+                    "message {} to {}: {cause}, doorbell format {format}; no automatic recovery applies. Release: the recipient claims {}, or admin runs cyclops attention show {} --diff then complete or discard",
+                    record.message_id, record.recipient, record.message_id, record.attempt_id
+                ),
+                Some(record.message_id.as_str()),
+                None,
+                crate::delivery::About::delivery(&record.recipient.to_string()),
+            );
+        }
+    });
+}
+
 /// Resume queued work after a route appears or a daemon restarts.
 pub(crate) fn schedule_available(inner: &Arc<Inner>) {
     let Some(service) = inner.mailbox.as_ref() else {
         return;
     };
+    report_operator_only_attention(inner, service);
     let recipients = match service.pending_recipients() {
         Ok(recipients) => recipients,
         Err(error) => {
@@ -766,6 +830,63 @@ pub(crate) fn withdraw_notification(
 
 #[cfg(test)]
 mod tests {
+    /// F7: an attention attempt that neither automatic reconciliation
+    /// accepts is operator-only and must be listed; one that qualifies for
+    /// automatic recovery must not.
+    #[test]
+    fn operator_only_attention_lists_what_no_automatic_path_can_retire() {
+        use cyclops_proto::{
+            NotificationAttemptId, NotificationAttentionCause, NotificationBinding,
+            NotificationManifestId, NotificationRecord, NotificationState, NotificationTransport,
+            ProcessInstanceId,
+        };
+        let workspace: cyclops_proto::WorkspaceId =
+            "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let session: cyclops_proto::SessionInstanceId =
+            "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let recipient =
+            cyclops_proto::RecipientKey::agent(workspace, session, "%1".parse().unwrap());
+        let record = |id: &str, format: Option<u32>, binding: Option<NotificationBinding>| {
+            NotificationRecord {
+                attempt_id: NotificationAttemptId::parse(id).unwrap(),
+                message_id: cyclops_proto::MessageId::new("m-1").unwrap(),
+                recipient,
+                state: NotificationState::AttentionRequired,
+                binding,
+                transport: NotificationTransport::Doorbell,
+                doorbell_format: format,
+                cause: Some(NotificationAttentionCause::VerifyFailed),
+                pre_write_cause: None,
+                wake_block: None,
+                pre_write_observation: None,
+                pre_write_reopen_count: 0,
+                started_seq: 1,
+                updated_seq: 2,
+                updated_at: 3,
+            }
+        };
+        let full_binding = NotificationBinding {
+            recipient,
+            pane_root: Some(ProcessInstanceId::new(1, 1).unwrap()),
+            leader: Some(ProcessInstanceId::new(2, 2).unwrap()),
+            agent: ProcessInstanceId::new(3, 3).unwrap(),
+            manifest: NotificationManifestId::new("codex").unwrap(),
+        };
+        let format_one = record("att-00000000-0000-4000-8000-000000000001", Some(1), None);
+        let recoverable = record(
+            "att-00000000-0000-4000-8000-000000000002",
+            Some(3),
+            Some(full_binding),
+        );
+        let records = vec![format_one, recoverable];
+
+        let listed: Vec<_> = operator_only_attention(&records)
+            .into_iter()
+            .map(|record| record.attempt_id.to_string())
+            .collect();
+        assert_eq!(listed, vec!["att-00000000-0000-4000-8000-000000000001"]);
+    }
+
     use super::*;
 
     fn binding(leader_birth: u64) -> crate::fusion::Binding {
