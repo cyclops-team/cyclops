@@ -5415,7 +5415,22 @@ async fn fail_attempt(
                         // The workspace journal remains at its last
                         // post-write state. Explicit restart recovery can
                         // close it without risking another pane write.
+                        //
+                        // That is the right durable choice and it used to
+                        // be the whole response, which left the attempt
+                        // invisible: still in flight, so `open_alarms`
+                        // skips it (it filters on AttentionRequired), no
+                        // wake block, so the scheduler reports nothing to
+                        // do, and the recipient's head never advances. The
+                        // pre-write sibling already faults the worker on a
+                        // storage failure (`record_notification_prewrite_
+                        // block`), so this is the same failure reported the
+                        // same way rather than a new mechanism: the fault
+                        // reaches `notification_worker_diagnostics` and so
+                        // `cyclops status`, which is where an operator
+                        // learns that this daemon needs a restart.
                         error!(id = %handle.msg_id, error = %error, "notification attention fact failed");
+                        worker.set_fault(format!("notification attention storage failed: {error}"));
                     }
                 }
             }

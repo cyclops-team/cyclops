@@ -137,6 +137,9 @@ pub const MENU_NEW_WORKSPACE: &str = "New session";
 pub const MENU_TOGGLE_EVENTS: &str = "Event stream";
 
 pub const MENU_TOGGLE_MESSAGES: &str = "Messages";
+/// The composer, in the menu because the `@` button that opens it lives
+/// in the sidebar footer, and a collapsed sidebar has no footer to click.
+pub const MENU_COMPOSE: &str = "Send a message";
 
 pub const BINDING_TOGGLE_MESSAGES: &str = "Toggle messages";
 
