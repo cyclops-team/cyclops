@@ -1414,7 +1414,7 @@ fn subscribe_decoration_once(
         read_bounded_line(&mut reader, &mut hello, STREAM_EVENT_MAX_BYTES),
         Ok(BoundedLine::Complete)
     ) {
-        log_err(home, "cyclopsd sent an incomplete or oversized hello");
+        log_err(home, &"cyclopsd sent an incomplete or oversized hello");
         return SubscribeEnd::ConnectFailed;
     }
     if let Err(error) = serde_json::from_slice::<cyclops_proto::Hello>(&hello) {
@@ -1435,7 +1435,7 @@ fn subscribe_decoration_once(
     ) {
         log_err(
             home,
-            "cyclopsd sent an incomplete or oversized subscription acknowledgement",
+            &"cyclopsd sent an incomplete or oversized subscription acknowledgement",
         );
         return SubscribeEnd::ConnectFailed;
     }
@@ -1455,7 +1455,7 @@ fn subscribe_decoration_once(
         != Some(1)
         || acknowledgement.pointer("/result/subscribed") != Some(&serde_json::Value::Bool(true))
     {
-        log_err(home, "cyclopsd did not acknowledge the event subscription");
+        log_err(home, &"cyclopsd did not acknowledge the event subscription");
         return SubscribeEnd::ConnectFailed;
     }
     // Subscribed. Ask the app to resync before any event arrives on this
@@ -1847,7 +1847,7 @@ impl App {
 
 /// Append one error line to `<home>/workspace.log`. The alternate screen
 /// owns stderr while the workspace runs; printing there corrupts the frame.
-fn log_err(home: &std::path::Path, err: impl std::fmt::Display) {
+fn log_err(home: &std::path::Path, err: &dyn std::fmt::Display) {
     use std::io::Write;
     if let Ok(root) = cyclops_state::StateRoot::open_or_create(home) {
         let Ok(mut f) = root.open_append(std::path::Path::new("workspace.log")) else {
