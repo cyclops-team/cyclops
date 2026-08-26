@@ -200,6 +200,7 @@ id = "approval_cancelled_terminal"
 state = "idle"
 composer_semantic = "ghost_suggestion"
 lifecycle_evidence = true
+active_start_terminal = true
 priority = 1090
 region = "bottom_non_empty_lines(12)"
 contains = ["Conversation interrupted - tell the model what to do differently"]

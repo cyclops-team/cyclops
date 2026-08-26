@@ -83,6 +83,11 @@ pub(crate) struct HookEntry {
     /// The hook edge itself remains `reading.ts`; the deadline never stands in
     /// for a second event.
     provisional_ready_at_ms: Option<u64>,
+    /// This start was a provisional candidate that a visual Working frame
+    /// promoted. Such a latch has no exact hook key, so ordinary lifecycle
+    /// evidence may end it. Authenticated starts require either their hook
+    /// end or a rule explicitly marked `active_start_terminal`.
+    promoted: bool,
 }
 
 impl HookEntry {
@@ -107,6 +112,7 @@ impl HookEntry {
             authoritative_end: false,
             active_turn: None,
             provisional_ready_at_ms: None,
+            promoted: false,
         }
     }
     /// Promote a visually accepted provisional dispatch start into a
@@ -121,6 +127,7 @@ impl HookEntry {
         HookEntry {
             confirmed_start: true,
             provisional_ready_at_ms: None,
+            promoted: true,
             ..self
         }
     }
@@ -2510,10 +2517,11 @@ enum HookAction {
 /// tmux mode, where the capture does not show the composer; `binding_stable`
 /// says the pane's binding was the same before and after the capture, the
 /// bookends that tie the frame to this agent generation.
-fn hook_action_observed(
+fn hook_action_observed_with_terminal(
     entry: &mut HookEntry,
     detection: &Detection,
     idle_confirmed: bool,
+    active_start_terminal: bool,
     in_mode: bool,
     binding_stable: bool,
     now_ms: u64,
@@ -2523,20 +2531,23 @@ fn hook_action_observed(
     // and repeated captures of that frame do not end the turn. A missing end
     // must remain visible as Working instead of silently ageing to Idle.
     if entry.active_start {
-        // One observation of a manifest-declared lifecycle terminal may end
-        // a start when that rule wins an idle-class fused frame on a stable,
-        // current capture. This is deliberately narrower than generic clean
-        // composer evidence: Codex 0.149.1 emits no Stop when a human cancels
-        // an approval, while the measured interruption suffix plus dim ghost
-        // composer proves that exact turn ended. Ordinary empty, ghost, and
-        // typed composer rules are not lifecycle evidence and cannot erase a
-        // start before its first output. A promoted candidate uses the same
-        // terminal seam because it has no key an end hook could match.
+        // A promoted candidate has no exact hook key and may end on ordinary
+        // lifecycle evidence. An authenticated start is stronger: it ends on
+        // the hook tier unless the winning rule explicitly declares itself
+        // an active-start terminal. Codex 0.149.1's measured approval-cancel
+        // suffix is one such rule; generic empty/ghost/typed composer rules
+        // are not.
         let fused_idle = matches!(
             detection.state,
             AgentState::Idle | AgentState::IdleWithInput
         );
-        if idle_confirmed && fused_idle && !in_mode && !detection.stale && binding_stable {
+        if idle_confirmed
+            && (entry.promoted || active_start_terminal)
+            && fused_idle
+            && !in_mode
+            && !detection.stale
+            && binding_stable
+        {
             return HookAction::Drop;
         }
         return HookAction::Use;
@@ -2573,6 +2584,26 @@ fn hook_action_observed(
     } else {
         HookAction::Use
     }
+}
+
+#[cfg(test)]
+fn hook_action_observed(
+    entry: &mut HookEntry,
+    detection: &Detection,
+    idle_confirmed: bool,
+    in_mode: bool,
+    binding_stable: bool,
+    now_ms: u64,
+) -> HookAction {
+    hook_action_observed_with_terminal(
+        entry,
+        detection,
+        idle_confirmed,
+        false,
+        in_mode,
+        binding_stable,
+        now_ms,
+    )
 }
 
 /// Apply one bound hook reading to the visual verdict.
@@ -3690,6 +3721,7 @@ async fn recompute_pane_with_evidence(
 
     let mut capture_binding_changed = false;
     let mut idle_confirmed = false;
+    let mut active_start_terminal = false;
     let mut screen_winner_id: Option<String> = None;
     let mut admission = AdmissionOutcome::NotApplicable;
     let mut detection = if row.dead {
@@ -3806,6 +3838,7 @@ async fn recompute_pane_with_evidence(
             .as_deref()
             .and_then(|s| screen_winner_esc(m, s, screen_esc.as_deref()));
         idle_confirmed = winner_confirms_idle(s_rule);
+        active_start_terminal = s_rule.is_some_and(|rule| rule.active_start_terminal);
         screen_winner_id = s_rule.map(|rule| rule.id.clone());
         let mut det = fuse(
             m,
@@ -3935,10 +3968,11 @@ async fn recompute_pane_with_evidence(
                     None
                 }
                 Some(entry) => {
-                    match hook_action_observed(
+                    match hook_action_observed_with_terminal(
                         entry,
                         &detection,
                         idle_confirmed,
+                        active_start_terminal,
                         row.in_mode,
                         !capture_binding_changed,
                         ts,
@@ -7587,7 +7621,9 @@ regex = ['^']
         }
         assert!(
             matches!(
-                hook_action_observed(&mut entry, &idle, true, false, true, 3000),
+                hook_action_observed_with_terminal(
+                    &mut entry, &idle, true, true, false, true, 3000,
+                ),
                 HookAction::Drop
             ),
             "the measured screen terminal ends it"
@@ -7903,7 +7939,7 @@ regex = ['^']
             );
         }
         assert_eq!(
-            hook_action_observed(&mut entry, &idle, true, false, true, 2001),
+            hook_action_observed_with_terminal(&mut entry, &idle, true, true, false, true, 2001,),
             HookAction::Drop
         );
     }
@@ -8690,9 +8726,10 @@ regex = ['^']
     fn a_manifest_terminal_idle_may_end_an_exact_active_start() {
         let mut entry = start_entry(1_000);
         assert_eq!(
-            hook_action_observed(
+            hook_action_observed_with_terminal(
                 &mut entry,
                 &lifecycle_detection(Sensor::Screen, AgentState::Idle),
+                true,
                 true,
                 false,
                 true,
@@ -8708,10 +8745,11 @@ regex = ['^']
         ] {
             let mut entry = start_entry(1_000);
             assert_eq!(
-                hook_action_observed(
+                hook_action_observed_with_terminal(
                     &mut entry,
                     &lifecycle_detection(Sensor::Screen, AgentState::Idle),
                     idle_confirmed,
+                    true,
                     in_mode,
                     binding_stable,
                     1_001,

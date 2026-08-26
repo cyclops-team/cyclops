@@ -493,6 +493,7 @@ fn codex_cancelled_approval_is_terminal_only_with_a_clean_ghost_composer() {
     assert_eq!(rule.id, "approval_cancelled_terminal");
     assert_eq!(rule.state, AgentState::Idle);
     assert!(rule.lifecycle_evidence);
+    assert!(rule.active_start_terminal);
 
     let typed = interrupted.replace(
         "\x1b[2mAsk Codex to do anything\x1b[0m",

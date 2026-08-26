@@ -452,6 +452,13 @@ pub struct RawRule {
     /// Advisory rules still report runtime state and block unsafe writes.
     #[serde(default = "enabled_by_default")]
     pub lifecycle_evidence: bool,
+    /// Whether this exact idle lifecycle rule may retire an authenticated
+    /// active-start hook when it wins the current, binding-stable screen
+    /// capture. This is deliberately separate from `lifecycle_evidence`:
+    /// ordinary lifecycle-idle rules can confirm candidate dispatches but
+    /// must not erase an authenticated start before its terminal hook.
+    #[serde(default)]
+    pub active_start_terminal: bool,
     #[serde(default)]
     pub any: Vec<RawMatcher>,
     #[serde(flatten)]
@@ -604,6 +611,7 @@ pub struct CompiledRule {
     pub priority: i64,
     pub region: Region,
     pub lifecycle_evidence: bool,
+    pub active_start_terminal: bool,
     pub matcher: CompiledMatcher,
     pub any: Vec<CompiledMatcher>,
     pub decline_keys: Vec<String>,
@@ -892,6 +900,7 @@ impl Manifest {
                 priority: r.priority,
                 region,
                 lifecycle_evidence: r.lifecycle_evidence,
+                active_start_terminal: r.active_start_terminal,
                 matcher,
                 any,
                 decline_keys: r.decline_keys.clone(),
