@@ -5,13 +5,11 @@
    palette: one product, two of its themes, never a screenshot that
    inverted. */
 
-/* `.invert` paints one element in the OTHER theme: on the forest page a
-   sorbet panel, on the sorbet page a forest one. The selectors below
-   make each token block apply to its own theme and to an inverted
-   element inside the opposite one, so the swap is the whole palette,
-   pane frames included, never a second set of colors. */
-:root,
-:root[data-theme='dark'] .invert {
+/* `.invert` paints one element on the opposite ground: on the sorbet
+   page a forest panel (the forest block below also applies inside it),
+   and on the forest page a plain near-white panel in forest's own ink
+   and green (its block sits after the forest tokens). */
+:root {
 	color-scheme: light;
 
 	/* Surfaces, stepping down from the paper into apricot the way sorbet's
@@ -144,10 +142,11 @@
 	--accent-2: #dd9a72; /* role.8, fallen leaf */
 	--accent-2-hover: #e6ad8a;
 
-	/* Forest's counterpoint is its one warm leaf, and it is strong enough
-	   to be the headline's drop shadow as well. */
-	--counter: #dd9a72; /* role.8, fallen leaf */
-	--counter-shadow: #dd9a72;
+	/* Forest's counterpoint is plain light: the marks read as chalk on
+	   the green rather than a second hue. The headline's drop stays the
+	   quiet raised green; a light shadow under light ink would vanish. */
+	--counter: #eff5f0;
+	--counter-shadow: #24342a; /* chrome.raised */
 	--link: #b3d8b6;
 
 	--field-line: #22332a;
@@ -178,6 +177,47 @@
 	--sb-role-6: #a1b6de; /* bluebell */
 	--sb-role-7: #cba1bb; /* foxglove */
 	--sb-role-8: #dd9a72; /* fallen leaf */
+}
+
+/* The light panel on the forest page: near-white paper, forest ink, and
+   the green pulled down far enough to read on white. Only the tokens a
+   panel and the pane frame inside it use. */
+:root[data-theme='dark'] .invert {
+	color-scheme: light;
+	--paper: #f6f8f6;
+	--surface: #ffffff;
+	--surface-mid: #eef2ee;
+	--surface-deep: #f6f8f6;
+	--ink: #0c1310;
+	--text: #1c2620;
+	--muted: #4f6256;
+	--gray: #5f7266;
+	--faint: #7f8f84;
+	--line: #dfe5e0;
+	--line-soft: #e9eee9;
+	--hairline: #cfd8d1;
+	--hairline-btn: #b9c6bc;
+	--accent: #2f7a45;
+	--accent-hover: #256337;
+	--accent-ink: #ffffff;
+	--accent-soft: #dfe9e1;
+	--link: #256337;
+	--counter: #4f6256;
+	--counter-shadow: #dfe9e1;
+	--term-bg: #ffffff;
+	--term-line: #dfe5e0;
+	--term-frame: #cfd8d1;
+	--term-pane-line: #b9c6bc;
+	--term-shadow: rgba(12, 19, 16, 0.08);
+	--term-text: #1c2620;
+	--term-dim: #5f7266;
+	--term-faint: #7f8f84;
+	--term-control: #eef2ee;
+	--term-control-hover: #dfe9e1;
+	--sb-accent: #2f7a45;
+	--sb-panel: #eef2ee;
+	--sb-raised: #dfe9e1;
+	--sb-healthy: #2a7a4a;
 }
 
 * {
