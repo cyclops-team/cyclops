@@ -211,7 +211,7 @@ pub fn default_bindings() -> HashMap<BindingAction, BindingChord> {
         ),
         (
             BindingAction::ToggleMessages,
-            BindingChord::Prefix(KeyCode::Char('m')),
+            BindingChord::Prefix(KeyCode::Char('M')),
         ),
         (
             BindingAction::ToggleEventPanel,
@@ -578,6 +578,17 @@ fn parse_direct_chord(s: &str) -> Option<BindingChord> {
 mod tests {
     use super::*;
 
+    /// A default chord must identify exactly one action. The router walks a
+    /// hash map, so a shared chord would make the action depend on hash order.
+    #[test]
+    fn every_default_chord_is_unique() {
+        let bindings = default_bindings();
+        let mut chords: Vec<&BindingChord> = bindings.values().collect();
+        chords.sort_by_key(|chord| format!("{chord:?}"));
+        chords.dedup();
+        assert_eq!(chords.len(), bindings.len(), "no default chord is shared");
+    }
+
     #[test]
     fn direct_chord_rebinds_next_tab() {
         let chord = parse_binding_spec("ctrl+alt+]").expect("parse");
@@ -669,6 +680,11 @@ mod tests {
             .find(|row| row.action == "Toggle event stream")
             .expect("stream row");
         assert_eq!(stream.keys, "Ctrl+B e");
+        let messages = rows
+            .iter()
+            .find(|row| row.action == "Toggle messages")
+            .expect("messages row");
+        assert_eq!(messages.keys, "Ctrl+B M");
     }
 
     #[test]

@@ -453,6 +453,7 @@ folder_tracked = []
 [workspace.bindings]
 name_pane = "prefix m"
 toggle_sidebar = "prefix b"
+toggle_messages = "prefix M"
 toggle_tab_bar = "prefix t"
 show_keybinds = "prefix ?"
 ```
