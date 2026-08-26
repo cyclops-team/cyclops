@@ -55,6 +55,18 @@ connection or failed snapshot read, the last authenticated snapshot stays
 visible as stale data and `R` starts one explicit reconnect. Cyclops never
 starts parallel reconnects or retries on a timer.
 
+### Overload behavior
+
+Keyboard input has its own bounded lane and starts a fair rotation across
+input, action, snapshot, and event work. Every continuously ready lane is
+served within four items. Ordered events apply backpressure when one frame
+batch is already waiting, so a slow terminal cannot grow the queue without
+bound. Every daemon frame and ledger line is limited to 1 MiB. Malformed or
+oversized live input becomes a visible connection gap, keeps the last good
+snapshot stale, and requires an explicit reconnect plus a fresh whole snapshot
+before actions are enabled. Snapshot reads, durable follow pages, and action
+answers use separate bounded lanes.
+
 `cyclops status` remains the compact live-pane view. A pane can be runtime
 idle while a notification is staged, so status prints a factual subrow when
 that distinction matters: composer ownership, write readiness, notification
@@ -280,7 +292,10 @@ Startup runs in one order:
    sessions the daemon watches, where every pane stands, and the
    deliveries still waiting on a human.
 2. Backfill replays the tail of THOSE sessions' ledgers under
-   `~/.cyclops/ledger/` (default 200 lines, `--backfill N`). A ledger
+   `~/.cyclops/ledger/` (default 200 lines, `--backfill N`). The reader
+   retains at most 10,000 entries and 16 MiB across at most 256 files. Any
+   malformed line or bound that truncates the requested history is shown as
+   a stream gap. A ledger
    file from a session nobody watches is not replayed: the daemon counts
    the sessions it watches, so a line from anywhere else would be one no
    count owns and no event can ever clear.
@@ -297,8 +312,9 @@ With one watched session, replayed lines and the live stream dedupe
 exactly by ledger seq; with several, a line landing in the exact startup
 window can show twice on screen (the record itself never duplicates).
 
-If the daemon does not answer, the backfill falls back to every ledger
-file on disk so the screen is not empty, and nothing is counted. A
+If the daemon does not answer, the backfill falls back to up to 256 ledger
+files on disk so the screen is not empty, and nothing is counted. Any omitted
+files are reported as a stream gap. A
 daemon that predates the open-delivery field answers without it: the eye
 then counts blocked panes plus whatever the live push reports, and
 misses a delivery that parked before the UI started.
