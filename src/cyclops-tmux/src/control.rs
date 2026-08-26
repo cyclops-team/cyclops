@@ -1498,12 +1498,52 @@ mod tests {
         )
     }
 
+    /// The classification seam, deterministically: a writer that fails
+    /// before accepting a single byte yields `Unwritten`, no OS pipe timing
+    /// involved. The partial and flush cases below prove `Uncertain`.
     #[tokio::test]
-    async fn a_close_before_the_first_command_byte_is_proven_unwritten() {
-        // Keep the process alive after it closes stdin, and publish that
-        // close over stdout before the write. Waiting for a short-lived
-        // process to exit is not enough: pipe-close observation can race a
-        // write and turn a genuinely accepted byte into an uncertain result.
+    async fn a_failure_before_the_first_command_byte_is_proven_unwritten() {
+        struct FirstWriteFails;
+
+        impl AsyncWrite for FirstWriteFails {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed before the first byte",
+                )))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        let mut writer = FirstWriteFails;
+        assert!(matches!(
+            write_command_line(&mut writer, b"display-message -p not-sent\n").await,
+            Err(CommandWriteError::Unwritten(_))
+        ));
+    }
+
+    /// The pipe-level contract a closed child stdin proves without a timing
+    /// premise: the first submit fails (unwritten or uncertain, whichever the
+    /// OS observes first), and the pipe is poisoned so nothing replays.
+    #[tokio::test]
+    async fn a_closed_command_sink_fails_the_first_submit_and_poisons_the_pipe() {
         let mut child = Command::new("sh")
             .arg("-c")
             .arg("exec 0<&-; printf 'stdin-closed\\n'; exec sleep 30")
@@ -1527,7 +1567,13 @@ mod tests {
 
         let first = pipe.submit("display-message -p not-sent").await;
         child.kill().await.expect("stop closed command sink");
-        assert!(matches!(first, Err(TmuxError::Io(_))));
+        assert!(
+            matches!(
+                first,
+                Err(TmuxError::Io(_)) | Err(TmuxError::WriteUncertain(_))
+            ),
+            "a closed sink fails the first submit one way or the other: {first:?}"
+        );
         assert!(matches!(
             pipe.submit("display-message -p never-replay").await,
             Err(TmuxError::Disconnected)
