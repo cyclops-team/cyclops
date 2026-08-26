@@ -1910,3 +1910,33 @@ manifest-owned terminal seam used by other no-end-hook vendor paths.
 
 The current-version daemon-restart cell remains before the full-ruleset
 `version_tested` claim may advance.
+
+## F74. Claude 2.1.246 completed rows carry two duration units and two trailer rows
+
+MEASURED 2026-08-26 on the live pane %1 (Claude Code 2.1.246, escaped
+capture 45 s after the turn ended, ledger `cyclops-optimization.ndjson` seq
+141-146). The completed row of any turn longer than a minute reads
+`✻ Churned for 5m 11s · done 3:50 PM`: two duration units, where the
+`composer_completed_terminal_suffix_2_1_246` rule allowed exactly one
+(`\d+[smhd]`). Below the composer box the real frame carries two rows, the
+model status row (`Fable 5 · high · ~ · Ctx: 65% · ... · 350K used`) and the
+permissions row (`⏵⏵ bypass permissions on ...`), where the escaped suffix
+ended in `[^\n]*\z` and so allowed one. Either clause alone refused every
+real completion.
+
+Consequence, from the ledger: `UserPromptSubmit` opened the candidate turn
+at 20:31:52Z, the turn ended at about 20:38Z with no state line at all, and
+the pane still read `working · decided by hook:UserPromptSubmit` at
+20:45Z. Claude's manifest ends a turn on visual evidence only (F72), and
+this rule is the sole lifecycle-evidence idle rule for Claude, so no Claude
+turn over a minute ever ended, `hook_admission_unproven` blocked every
+doorbell to the pane, and a hand-posted `cyclops hook Stop` from inside the
+pane was accepted and ignored, as designed.
+
+Probe: `shipped_rules.rs::claude_2_1_246_terminal_suffix_matches_a_real_long_turn`
+holds the captured rows verbatim (`5m 11s`) plus the `1h 2m` shape. Fix:
+the duration clause accepts one or more number-plus-unit groups in both
+patterns, and the escaped suffix accepts one or two trailer rows before its
+end anchor. The daemon reads manifests once at boot, so an
+installed copy under `$CYCLOPS_HOME/manifests` needs a daemon restart to
+take effect.

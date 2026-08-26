@@ -1410,6 +1410,63 @@ fn claude_frame(plain_rows: &[&str], esc_rows: &[&str]) -> (String, String) {
     (plain_rows.join("\n"), esc_rows.join("\n"))
 }
 
+/// MEASURED 2026-08-26 (Claude Code 2.1.246, live pane %1, escaped capture
+/// 45 s after the turn ended): the real completed frame of a turn longer
+/// than a minute. Two duration units in the completed row and two trailer
+/// rows under the composer box, and it is still the terminal suffix. Before
+/// this, every real completion was refused and the pane stayed working.
+#[test]
+fn claude_2_1_246_terminal_suffix_matches_a_real_long_turn() {
+    let all = shipped();
+    let claude = &all["claude"];
+    let rule_esc = format!("\u{1b}[38;5;244m{RULE_120}");
+    let status_plain =
+        "  Fable 5 · high · ~ · Ctx: 65% · 5h: 70% · 7d: 32% · 1000K window · 350K used";
+    let status_esc = "\u{1b}[39m  \u{1b}[38;5;174mFable 5\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;216mhigh\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;230m~\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;72mCtx: 65%\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;181m5h: 70%\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;181m7d: 32%\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;180m1000K window\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;180m350K used\u{1b}[39m";
+    let trailer_plain = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 1 agent";
+    let trailer_esc = "  \u{1b}[38;5;210m⏵⏵ bypass permissions on\u{1b}[38;5;246m (shift+tab to cycle) · ← 1 agent\u{1b}[39m";
+    for (done_plain, done_esc) in [
+        (
+            "✻ Churned for 5m 11s · done 3:50 PM",
+            "\u{1b}[38;5;246m✻\u{1b}[39m \u{1b}[38;5;246mChurned for 5m 11s · done 3:50 PM\u{1b}[39m",
+        ),
+        (
+            "✻ Crunched for 1h 2m · done 11:03 AM",
+            "\u{1b}[38;5;246m✻\u{1b}[39m \u{1b}[38;5;246mCrunched for 1h 2m · done 11:03 AM\u{1b}[39m",
+        ),
+    ] {
+        let (plain, esc) = claude_frame(
+            &[
+                "  manifest change, TOML only, with the captured frame as its evidence file).",
+                done_plain,
+                RULE_120,
+                "❯\u{a0}",
+                RULE_120,
+                status_plain,
+                trailer_plain,
+            ],
+            &[
+                "  manifest change, TOML only, with the captured frame as its evidence file).",
+                done_esc,
+                &rule_esc,
+                "\u{1b}[39m❯\u{a0}",
+                &rule_esc,
+                status_esc,
+                trailer_esc,
+            ],
+        );
+        let rule = claude
+            .evaluate_esc("", &plain, Some(&esc))
+            .expect("a rule matches");
+        assert_eq!(
+            rule.id, "composer_completed_terminal_suffix_2_1_246",
+            "{done_plain}: the real completed frame is the terminal suffix"
+        );
+        assert!(rule.lifecycle_evidence);
+        assert_eq!(rule.state, AgentState::Idle);
+    }
+}
+
 /// MEASURED 2026-08-26 (Claude Code 2.1.246, probe a91f, sanitized NDJSON
 /// db34242c…). After every Stop hook round, the current completed row in
 /// uniform 38;5;246 followed by the clean composer box is the terminal
