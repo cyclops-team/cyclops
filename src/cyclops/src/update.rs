@@ -2995,6 +2995,13 @@ fn run_install_pair(source: &Path, prefix: &Path, style: &Style) -> i32 {
     let previous = match store.selection() {
         Ok(previous) => previous,
         Err(error) => {
+            if stopped.is_some() {
+                if let Err(restart_error) =
+                    restart_pre_activation_pair(&store, prefix, before_migration.as_ref())
+                {
+                    eprintln!("  previous daemon restart failed: {restart_error}");
+                }
+            }
             let _ = store.discard(&candidate);
             eprintln!("install failed: {error}");
             return 1;
@@ -4004,6 +4011,21 @@ sys.exit(43)"#,
                 "{function} copied live journals before stopping the daemon"
             );
         }
+    }
+
+    #[test]
+    fn install_restarts_the_unchanged_pair_if_post_replay_selection_fails() {
+        let source = include_str!("update.rs");
+        let selection_failure = source
+            .split_once("    let previous = match store.selection() {")
+            .expect("post-replay selection read")
+            .1
+            .split_once("    if let Err(error) = store.activate")
+            .expect("activation follows selection read")
+            .0;
+
+        assert!(selection_failure.contains("restart_pre_activation_pair("));
+        assert!(selection_failure.contains("before_migration.as_ref()"));
     }
 
     #[test]
