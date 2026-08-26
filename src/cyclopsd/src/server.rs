@@ -3287,6 +3287,7 @@ mod tests {
                     route_evidence: None,
                     pane_width: None,
                     required_pane_width: None,
+                    write_block: None,
                 }),
             )
             .unwrap();

@@ -2161,6 +2161,23 @@ fn liveness_admits_idle(
         && binding_stable
 }
 
+/// What runtime-idle admission decided for this recompute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmissionOutcome {
+    /// Admission did not apply: not an unknown clean frame, or refused by
+    /// one of the distinct outcomes (draft, ghost, ambiguous, stale, mode,
+    /// binding change, active start).
+    NotApplicable,
+    /// Every predicate held and a qualifying edge from this daemon boot
+    /// exists: the pane is idle.
+    Admitted,
+    /// Every predicate held except a qualifying edge from this daemon boot.
+    /// The pane stays unknown and its write block is named
+    /// `hook_admission_unproven`: a durable, recoverable pre-write block,
+    /// never a replay of an older boot's edge.
+    Unproven,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn liveness_idle_admission(
     inner: &Inner,
@@ -2171,9 +2188,9 @@ fn liveness_idle_admission(
     binding_stable: bool,
     in_mode: bool,
     detection: &mut Detection,
-) {
+) -> AdmissionOutcome {
     let (Some(agent), Some(manifest_id)) = (admitted, manifest_id) else {
-        return;
+        return AdmissionOutcome::NotApplicable;
     };
     let liveness_verified = inner
         .manifests
@@ -2192,23 +2209,29 @@ fn liveness_idle_admission(
         .readings
         .iter()
         .any(|reading| reading.sensor == Sensor::Screen);
-    if liveness_admits_idle(
+    let frame_admissible = liveness_admits_idle(
         detection.state,
         &detection.decided_by,
         screen,
         has_screen_reading,
-        liveness_verified,
+        true,
         active_start,
         detection.stale,
         in_mode,
         binding_stable,
-    ) {
-        detection.state = AgentState::Idle;
-        detection.decided_by = format!(
-            "liveness:{}",
-            screen.map(|rule| rule.id.as_str()).unwrap_or("screen")
-        );
+    );
+    if !frame_admissible {
+        return AdmissionOutcome::NotApplicable;
     }
+    if !liveness_verified {
+        return AdmissionOutcome::Unproven;
+    }
+    detection.state = AgentState::Idle;
+    detection.decided_by = format!(
+        "liveness:{}",
+        screen.map(|rule| rule.id.as_str()).unwrap_or("screen")
+    );
+    AdmissionOutcome::Admitted
 }
 
 fn readiness_key(entry: &DetEntry) -> ReadinessKey {
@@ -3672,6 +3695,7 @@ async fn recompute_pane_with_evidence(
     let mut capture_binding_changed = false;
     let mut idle_confirmed = false;
     let mut screen_winner_id: Option<String> = None;
+    let mut admission = AdmissionOutcome::NotApplicable;
     let mut detection = if row.dead {
         Detection {
             state: AgentState::Dead,
@@ -3944,7 +3968,7 @@ async fn recompute_pane_with_evidence(
         let screen_rule = screen_winner_id
             .as_deref()
             .and_then(|id| m.rules.iter().find(|rule| rule.id == id));
-        liveness_idle_admission(
+        admission = liveness_idle_admission(
             inner,
             &route,
             admitted,
@@ -4166,6 +4190,15 @@ async fn recompute_pane_with_evidence(
         }
         if let Some(reason) = recovery_refusal {
             detection = detection.refused(reason);
+        }
+        // Restart truth: a clean, current, exact-bound frame with no active
+        // start and no qualifying edge from THIS daemon boot stays unknown
+        // and names its block, so the notification path records a durable,
+        // recoverable pre-write block instead of guessing. Applied after the
+        // stamp so the name survives readiness computation, like the other
+        // named refusals above.
+        if admission == AdmissionOutcome::Unproven {
+            detection = detection.refused("hook_admission_unproven");
         }
         let composer = project_composer(
             detection.composer_semantic,
@@ -7629,8 +7662,13 @@ regex = ['^']
             (12, "StopFailure"),
             (13, "PermissionRequest"),
         ] {
-            liveness.record(&pane, event, ts, agent, "claude");
-            liveness.record_admitting_edge(&pane, event, agent, "claude");
+            let _ = liveness.bind_diagnostic(&pane, event, ts, agent, "claude");
+            let bound = liveness
+                .bind_diagnostic(&pane, event, ts, agent, "claude")
+                .expect("route open");
+            liveness
+                .publish_admission(&bound, event)
+                .expect("lifetime live");
             assert!(
                 liveness.seen_any(&pane, agent, "claude"),
                 "{event} proves wiring"
@@ -7649,12 +7687,17 @@ regex = ['^']
         }
         // The diagnostic record alone never admits, even for SessionStart:
         // only the separately published admitting edge does.
-        liveness.record(&pane, "SessionStart", 14, agent, "claude");
+        let _ = liveness.bind_diagnostic(&pane, "SessionStart", 14, agent, "claude");
         assert!(
             !liveness.seen_admitting_edge(&pane, agent, "claude"),
             "diagnostic record is not admission"
         );
-        liveness.record_admitting_edge(&pane, "SessionStart", agent, "claude");
+        let bound = liveness
+            .bind_diagnostic(&pane, "SessionStart", 15, agent, "claude")
+            .expect("route open");
+        liveness
+            .publish_admission(&bound, "SessionStart")
+            .expect("lifetime live");
         assert!(
             liveness.seen_admitting_edge(&pane, agent, "claude"),
             "SessionStart admits"
@@ -7673,7 +7716,12 @@ regex = ['^']
         );
         let prompt_first = PaneKey::new(0, "%10");
         liveness.open(&prompt_first);
-        liveness.record_admitting_edge(&prompt_first, "UserPromptSubmit", agent, "claude");
+        let bound = liveness
+            .bind_diagnostic(&prompt_first, "UserPromptSubmit", 20, agent, "claude")
+            .expect("route open");
+        liveness
+            .publish_admission(&bound, "UserPromptSubmit")
+            .expect("lifetime live");
         assert!(
             liveness.seen_admitting_edge(&prompt_first, agent, "claude"),
             "UserPromptSubmit qualifies"
@@ -7758,6 +7806,69 @@ regex = ['^']
             ),
             "a lifecycle terminal frame needs no admission"
         );
+    }
+    /// Contract regressions for the bound hook handshake: a report before the
+    /// route is open records nothing and is retryable; the retry after open
+    /// publishes one diagnostic edge and one admission edge; a close and
+    /// reopen between the diagnostic binding and the publication refuses the
+    /// old lifetime, and the replacement inherits nothing.
+    #[test]
+    fn a_bound_handshake_records_nothing_before_open_and_refuses_an_expired_lifetime() {
+        use crate::selftest::{HookLiveness, LifetimeExpired, RouteNotOpen};
+        let liveness = HookLiveness::new();
+        let pane = PaneKey::new(0, "%11");
+        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
+        // before route open: retryable, nothing recorded
+        assert_eq!(
+            liveness.bind_diagnostic(&pane, "SessionStart", 1, agent, "claude"),
+            Err(RouteNotOpen)
+        );
+        assert!(!liveness.seen_any(&pane, agent, "claude"));
+        assert!(!liveness.seen_admitting_edge(&pane, agent, "claude"));
+        // retry after open with the same payload: one diagnostic, one admission
+        liveness.open(&pane);
+        let bound = liveness
+            .bind_diagnostic(&pane, "SessionStart", 1, agent, "claude")
+            .expect("route open");
+        assert!(liveness.seen_any(&pane, agent, "claude"));
+        assert!(
+            !liveness.seen_admitting_edge(&pane, agent, "claude"),
+            "not yet published"
+        );
+        assert_eq!(liveness.publish_admission(&bound, "SessionStart"), Ok(()));
+        assert!(liveness.seen_admitting_edge(&pane, agent, "claude"));
+        assert_eq!(liveness.edge_counts(&bound), (1, 1));
+        // a duplicate publication of the same edge is idempotent, and a lost
+        // response followed by the same sequence rebinds the same binding
+        // and republishes without a second edge of either kind
+        assert_eq!(liveness.publish_admission(&bound, "SessionStart"), Ok(()));
+        assert!(liveness.seen_admitting_edge(&pane, agent, "claude"));
+        let rebound = liveness
+            .bind_diagnostic(&pane, "SessionStart", 1, agent, "claude")
+            .expect("route still open");
+        assert_eq!(rebound, bound);
+        assert_eq!(liveness.publish_admission(&rebound, "SessionStart"), Ok(()));
+        assert_eq!(liveness.edge_counts(&bound), (1, 1));
+        // close and reopen between binding and publication: refused, and the
+        // replacement lifetime inherits nothing
+        let pane2 = PaneKey::new(0, "%12");
+        liveness.open(&pane2);
+        let stale = liveness
+            .bind_diagnostic(&pane2, "SessionStart", 2, agent, "claude")
+            .expect("route open");
+        liveness.close(&pane2);
+        liveness.open(&pane2);
+        assert_eq!(
+            liveness.publish_admission(&stale, "SessionStart"),
+            Err(LifetimeExpired)
+        );
+        assert!(!liveness.seen_admitting_edge(&pane2, agent, "claude"));
+        // non-admitting events are a no-op even with a live binding
+        let bound = liveness
+            .bind_diagnostic(&pane2, "Stop", 3, agent, "claude")
+            .expect("route open");
+        assert_eq!(liveness.publish_admission(&bound, "Stop"), Ok(()));
+        assert!(!liveness.seen_admitting_edge(&pane2, agent, "claude"));
     }
     /// Hook-only readings never make a staged frame quiet, whatever they say.
     #[test]

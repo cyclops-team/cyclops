@@ -269,8 +269,11 @@ pub struct Detail {
     can_withdraw_notification: bool,
     wake_block: Option<cyclops_proto::MessageWakeBlock>,
     pre_write_cause: Option<NotificationPreWriteCause>,
-    pre_write_pane_width: Option<u32>,
-    pre_write_required_pane_width: Option<u32>,
+    /// The daemon's named write block, preferred over the enum cause.
+    pre_write_block: Option<String>,
+    /// Decided once by `MessageNotificationSummary::pane_width_block` at
+    /// the wire boundary; the detail never re-derives it.
+    pane_width_block: Option<(u32, u32)>,
     current_route: Option<MessageRecipientRoute>,
     fifo_position: Option<u64>,
 }
@@ -311,8 +314,8 @@ impl Detail {
             can_withdraw_notification: row.can_withdraw_notification,
             wake_block: row.wake_block,
             pre_write_cause: row.pre_write_cause,
-            pre_write_pane_width: row.pre_write_pane_width,
-            pre_write_required_pane_width: row.pre_write_required_pane_width,
+            pre_write_block: row.pre_write_block.clone(),
+            pane_width_block: row.pane_width_block,
             current_route: row.current_route.clone(),
             fifo_position: row.fifo_position,
             message_id: row.message_id.to_string(),
@@ -497,8 +500,8 @@ impl Detail {
                     || row.resolution_consumption_observed != self.resolution_consumption_observed
                     || row.wake_block != self.wake_block
                     || row.pre_write_cause != self.pre_write_cause
-                    || row.pre_write_pane_width != self.pre_write_pane_width
-                    || row.pre_write_required_pane_width != self.pre_write_required_pane_width
+                    || row.pre_write_block != self.pre_write_block
+                    || row.pane_width_block != self.pane_width_block
                     || row.current_route != self.current_route
                     || row.fifo_position != self.fifo_position
                 {
@@ -509,8 +512,8 @@ impl Detail {
                     self.resolution_consumption_observed = row.resolution_consumption_observed;
                     self.wake_block = row.wake_block;
                     self.pre_write_cause = row.pre_write_cause;
-                    self.pre_write_pane_width = row.pre_write_pane_width;
-                    self.pre_write_required_pane_width = row.pre_write_required_pane_width;
+                    self.pre_write_block = row.pre_write_block.clone();
+                    self.pane_width_block = row.pane_width_block;
                     self.current_route = row.current_route.clone();
                     self.fifo_position = row.fifo_position;
                     self.needs_reload = true;
@@ -748,8 +751,8 @@ impl Detail {
             self.wake = WakeWord::WithdrawnByOperator;
             self.wake_block = None;
             self.pre_write_cause = None;
-            self.pre_write_pane_width = None;
-            self.pre_write_required_pane_width = None;
+            self.pre_write_block = None;
+            self.pane_width_block = None;
         }
         self.loaded.claim_note = Some(note.into());
         self.stage = Stage::Open;
@@ -1012,20 +1015,28 @@ pub fn render_with_status(
 
     match detail.wake() {
         WakeWord::BlockedBeforeWrite => {
-            if let Some((observed, required)) = detail
-                .pre_write_pane_width
-                .zip(detail.pre_write_required_pane_width)
-                .filter(|(observed, required)| observed < required)
-            {
+            if let Some((observed, required)) = detail.pane_width_block {
                 body.push(format!(
                     "wake blocked before write: pane too narrow ({observed}, requires {required})"
                 ));
             } else {
+                // The named block (for example hook admission unproven) is
+                // more exact than the enum cause it was recorded under.
                 let reason = detail
                     .wake_block
-                    .map(cyclops_proto::MessageWakeBlock::label)
-                    .or_else(|| detail.pre_write_cause.map(NotificationPreWriteCause::label))
-                    .unwrap_or("reason unavailable");
+                    .map(|block| block.label().to_string())
+                    .or_else(|| {
+                        detail
+                            .pre_write_block
+                            .as_deref()
+                            .map(crate::grid::cause_words)
+                    })
+                    .or_else(|| {
+                        detail
+                            .pre_write_cause
+                            .map(|cause| cause.label().to_string())
+                    })
+                    .unwrap_or_else(|| "reason unavailable".to_string());
                 body.push(format!("wake blocked before write: {reason}"));
             }
             body.push(format!(

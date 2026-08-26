@@ -279,11 +279,30 @@ pub(crate) async fn handle_report(
     // turn still proves that much, and it is the ONLY thing such a
     // payload is allowed to change.
     let edge_ms = unix_ms();
-    if let Some(manifest_id) = origin.manifest.as_deref() {
-        inner
-            .hook_liveness
-            .record(&pane, &params.event, edge_ms, origin.agent, manifest_id);
-    }
+    // Bound diagnostic edge, captured BEFORE sequence dedupe or any lifecycle
+    // mutation. A route that is not open yet cannot record or publish
+    // anything; the report is answered retryable with no state changed, and
+    // because dedupe has not run the retry can still publish. Reports never
+    // open routes.
+    let bound = match origin.manifest.as_deref() {
+        Some(manifest_id) => match inner.hook_liveness.bind_diagnostic(
+            &pane,
+            &params.event,
+            edge_ms,
+            origin.agent,
+            manifest_id,
+        ) {
+            Ok(binding) => Some(binding),
+            Err(crate::selftest::RouteNotOpen) => {
+                return Ok(json!({
+                    "applied": false,
+                    "reason": "hook_route_not_ready",
+                    "retryable": true
+                }));
+            }
+        },
+        None => None,
+    };
 
     // Only the events that make up a turn have to name one. Turn fields
     // describe the turn lifecycle, not every hook a vendor emits: a
@@ -591,12 +610,18 @@ pub(crate) async fn handle_report(
             .get(&pane)
             .is_some_and(|current| current.active_start_for(origin.agent, Some(manifest_id)));
         if admitting_edge_qualifies(m, &event, active_start_installed) {
-            inner.hook_liveness.record_admitting_edge(
-                &pane,
-                &params.event,
-                origin.agent,
-                manifest_id,
-            );
+            if let Some(binding) = &bound {
+                // The captured lifetime must still be live: a route closed and
+                // reopened since the diagnostic edge belongs to a replacement
+                // occupant, which inherits nothing and is not retried against.
+                if inner
+                    .hook_liveness
+                    .publish_admission(binding, &params.event)
+                    .is_err()
+                {
+                    return Ok(json!({"applied": false, "reason": "occupant_changed"}));
+                }
+            }
         }
     }
     if unkeyed_dispatch_start && applied_state.is_some() {
@@ -855,8 +880,13 @@ available = ["SessionStart", "UserPromptSubmit", "Stop"]
         let pane = crate::PaneKey::new(0, "%1");
         let agent = crate::identity::ProcId { pid: 7, birth: 70 };
         liveness.open(&pane);
+        let binding = liveness
+            .bind_diagnostic(&pane, "UserPromptSubmit", 1, agent, "listed")
+            .expect("route open");
         if super::admitting_edge_qualifies(&available_only, &prompt, false) {
-            liveness.record_admitting_edge(&pane, "UserPromptSubmit", agent, "listed");
+            liveness
+                .publish_admission(&binding, "UserPromptSubmit")
+                .expect("lifetime live");
         }
         assert!(!liveness.seen_admitting_edge(&pane, agent, "listed"));
     }

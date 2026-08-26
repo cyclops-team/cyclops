@@ -5216,7 +5216,9 @@ process_names = ["never"]
             .unwrap()
             .insert((pane.clone(), agent), "test-agent".into());
         inner.hook_liveness.open(&pane);
-        inner.hook_liveness.record(&pane, "Stop", 1, agent, "test");
+        let _ = inner
+            .hook_liveness
+            .bind_diagnostic(&pane, "Stop", 1, agent, "test");
         let reserved = inner
             .hook_liveness
             .binding(&pane, agent, "reserved-manifest")

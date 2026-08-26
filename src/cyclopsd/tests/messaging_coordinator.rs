@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use common::{
     composer_pane, faketui_path, hold_script, swallowing_animated_composer_pane, tmux_available,
-    wait_pane_state, Rig, CAT_MANIFEST, HOOK_MANIFEST, MODAL_MANIFEST,
+    wait_pane_state, Rig, CAT_MANIFEST, HOOK_MANIFEST, LIVENESS_MANIFEST, MODAL_MANIFEST,
 };
 use cyclops_proto::{
     Kind, LedgerLine, MessageId, MsgSendParams, NotificationAttemptId, NotificationState,
@@ -2684,6 +2684,443 @@ async fn newly_proven_binding_reopens_the_same_blocked_attempt_once() {
         notification_state_count(&rig, &message_id, NotificationState::Writing),
         1
     );
+
+    rig.daemon.shutdown().await;
+}
+
+/// Poll the roster until the pane's fused verdict carries exactly `block`
+/// as its write block (`None` for write-allowed or an unstamped refusal).
+async fn wait_for_pane_write_block(rig: &mut Rig, pane: &str, block: Option<&str>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = rig.ctl.request("status", json!({})).await;
+        let current = status["result"]["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|session| session["panes"].as_array())
+            .flatten()
+            .find(|row| row["pane_id"] == pane)
+            .map(|row| row["write_block"].as_str().map(str::to_string));
+        if current == Some(block.map(str::to_string)) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pane {pane} never carried write block {block:?}: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// One in-process hook report for the labeled `worker` pane.
+async fn report_hook(rig: &Rig, event: &str, seq: u64, payload: Value) -> Value {
+    rig.daemon
+        .report_state(
+            serde_json::from_value(json!({
+                "agent": "worker",
+                "event": event,
+                "seq": seq,
+                "payload": payload
+            }))
+            .unwrap(),
+        )
+        .await
+        .expect("hook report accepted")
+}
+
+/// Hook admission recovery, restart truth: an old SessionStart and an
+/// unclosed prompt are never replayed after a daemon restart; the clean
+/// restarted pane is unknown under `hook_admission_unproven`; a send there
+/// records one named durable pre-write block with zero writing facts and
+/// zero pane bytes; and one SessionStart from the current boot reopens that
+/// exact attempt exactly once. A duplicate SessionStart before the restart
+/// is duplicate-safe and leaves the pane admitted once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_pane_parks_the_wake_as_hook_admission_unproven_until_a_current_boot_edge() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "workspace-hook-admission-restart",
+        LIVENESS_MANIFEST,
+        &composer_pane(),
+        "delivery_retry_max = 0\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    // A clean composer with no admitting edge from this boot is unknown
+    // under a named block, never idle.
+    wait_for_pane_write_block(&mut rig, &pane, Some("hook_admission_unproven")).await;
+    wait_pane_state(&mut rig, "unknown").await;
+
+    // One SessionStart from this boot admits the pane. The same report
+    // again is a duplicate and leaves it admitted exactly as before.
+    let first = report_hook(&rig, "SessionStart", 1, json!({"session_id": "session-1"})).await;
+    assert_eq!(first["applied"], true, "{first}");
+    wait_pane_state(&mut rig, "idle").await;
+    wait_for_pane_write_block(&mut rig, &pane, None).await;
+    let duplicate = report_hook(&rig, "SessionStart", 1, json!({"session_id": "session-1"})).await;
+    assert_eq!(duplicate["applied"], false, "{duplicate}");
+    wait_pane_state(&mut rig, "idle").await;
+    wait_for_pane_write_block(&mut rig, &pane, None).await;
+
+    // A turn opens and never closes before the daemon restarts.
+    let prompt = report_hook(
+        &rig,
+        "UserPromptSubmit",
+        2,
+        json!({
+            "prompt": "a turn that never closes",
+            "session_id": "session-1",
+            "turn_id": "turn-1"
+        }),
+    )
+    .await;
+    assert_eq!(prompt["applied"], true, "{prompt}");
+    assert_eq!(prompt["state"], "working", "{prompt}");
+
+    let mut rig = rig.reboot().await;
+    rig.wait_attached(1).await;
+    // Restart truth: neither the old SessionStart nor the unclosed prompt
+    // is replayed. The pane is unknown under the block, not idle and not
+    // working.
+    wait_for_pane_write_block(&mut rig, &pane, Some("hook_admission_unproven")).await;
+    wait_pane_state(&mut rig, "unknown").await;
+    let before = rig.tmux.capture(&pane);
+
+    let sent =
+        send_workspace_message(&rig, "hook-admission-restart", "Restart", "private body").await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::BlockedPreWrite).await;
+    let blocked = notification_transition(&rig, &message_id, NotificationState::BlockedPreWrite)
+        .expect("the hook admission block is durable");
+    let fact = blocked.data.as_ref().expect("blocked transition data");
+    assert_eq!(fact["pre_write_cause"], "write_readiness_changed");
+    assert_eq!(
+        fact["pre_write_observation"]["write_block"],
+        "hook_admission_unproven"
+    );
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::Writing),
+        0
+    );
+    assert_eq!(
+        rig.tmux.capture(&pane),
+        before,
+        "a hook admission block writes zero pane bytes"
+    );
+    let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
+    let notification = &snapshot["result"]["rows"][0]["recipients"][0]["notification"];
+    // The wire spells a blocked pre-write as gating plus its cause fields.
+    assert_eq!(notification["state"], "gating");
+    assert_eq!(notification["pre_write_block"], "hook_admission_unproven");
+    assert_eq!(notification["pre_write_cause"], "write_readiness_changed");
+
+    // A SessionStart from the current boot reopens that exact attempt once.
+    let again = report_hook(&rig, "SessionStart", 3, json!({"session_id": "session-2"})).await;
+    assert_eq!(again["applied"], true, "{again}");
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::Writing).await;
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::Gating),
+        2,
+        "one admitting edge must reopen the same attempt exactly once"
+    );
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::BlockedPreWrite),
+        1
+    );
+    assert_eq!(notification_attempts(&rig, &message_id).len(), 1);
+    wait_for_doorbell(&rig, &pane, &message_id).await;
+
+    rig.daemon.shutdown().await;
+}
+
+/// A configured UserPromptSubmit start records liveness for the pane, but
+/// an open turn over a clean composer is Working, not idle, until a valid
+/// terminal edge closes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_user_prompt_submit_records_liveness_but_stays_working_until_a_terminal_edge() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "workspace-hook-admission-prompt",
+        LIVENESS_MANIFEST,
+        &composer_pane(),
+        "delivery_retry_max = 0\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_for_pane_write_block(&mut rig, &pane, Some("hook_admission_unproven")).await;
+
+    let prompt = report_hook(
+        &rig,
+        "UserPromptSubmit",
+        1,
+        json!({
+            "prompt": "a real turn",
+            "session_id": "session-1",
+            "turn_id": "turn-1"
+        }),
+    )
+    .await;
+    assert_eq!(prompt["applied"], true, "{prompt}");
+    assert_eq!(prompt["state"], "working", "{prompt}");
+    wait_pane_state(&mut rig, "working").await;
+    // The clean composer under the open turn must not be admitted as idle
+    // by the liveness the prompt just recorded.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_pane_state(&mut rig, "working").await;
+
+    let stop = report_hook(
+        &rig,
+        "Stop",
+        2,
+        json!({"session_id": "session-1", "turn_id": "turn-1"}),
+    )
+    .await;
+    assert_eq!(stop["applied"], true, "{stop}");
+    // Idle by the confirmed end. This fixture has no lifecycle idle rule,
+    // so the hook-derived idle keeps its own named write block; write
+    // readiness after a turn is the manifest's contract, not this one.
+    wait_pane_state(&mut rig, "idle").await;
+
+    rig.daemon.shutdown().await;
+}
+
+/// A human draft is a hold, never a hook admission block, and an admitting
+/// edge arriving over the draft writes nothing and touches nothing. The
+/// human's own submit is what frees the composer; the edge already
+/// recorded then admits the clean composer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_human_draft_is_untouched_by_hook_admission_recovery() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "workspace-hook-admission-draft",
+        LIVENESS_MANIFEST,
+        &composer_pane(),
+        "delivery_retry_max = 0\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_for_pane_write_block(&mut rig, &pane, Some("hook_admission_unproven")).await;
+
+    rig.tmux
+        .run_ok(&["send-keys", "-l", "-t", &pane, "human draft stays private"]);
+    rig.tmux.wait_screen("main", "human draft stays private");
+
+    let sent = send_workspace_message(&rig, "hook-admission-draft", "Draft", "private body").await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    rig.ev
+        .wait_event(Duration::from_secs(8), |event| {
+            event["event"] == "gate"
+                && event["data"]["id"] == message_id.as_str()
+                && event["data"]["action"] == "hold"
+        })
+        .await;
+
+    let start = report_hook(&rig, "SessionStart", 1, json!({"session_id": "session-1"})).await;
+    assert_eq!(start["applied"], true, "{start}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let held = rig.tmux.capture(&pane);
+    assert!(held.contains("human draft stays private"));
+    assert!(!held.contains(&compact_doorbell(&rig, &message_id)));
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::Writing),
+        0
+    );
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::BlockedPreWrite),
+        0,
+        "a human draft is a hold, never a hook admission block"
+    );
+
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "Enter"]);
+    let released = wait_for_doorbell(&rig, &pane, &message_id).await;
+    assert!(!released.contains("private body"));
+    assert_eq!(notification_attempts(&rig, &message_id).len(), 1);
+
+    rig.daemon.shutdown().await;
+}
+
+/// An admitting edge that lands after the gate refused and before the
+/// block is durable is reconciled once the append exists: the attempt
+/// reopens once and is never stranded behind a block nothing will clear.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_admitting_edge_racing_the_block_append_does_not_strand_the_attempt() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "workspace-hook-admission-race",
+        LIVENESS_MANIFEST,
+        &composer_pane(),
+        "delivery_retry_max = 0\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_for_pane_write_block(&mut rig, &pane, Some("hook_admission_unproven")).await;
+
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let hold = Arc::new(tokio::sync::Semaphore::new(0));
+    let pause = Arc::clone(&hold);
+    rig.daemon.set_inject_pause(move |phase| {
+        let entered_tx = entered_tx.clone();
+        let pause = Arc::clone(&pause);
+        Box::pin(async move {
+            if phase != "pre_prewrite_block" {
+                return;
+            }
+            let _ = entered_tx.send(());
+            pause.acquire_owned().await.unwrap().forget();
+        })
+    });
+
+    let sent = send_workspace_message(&rig, "hook-admission-race", "Race", "private body").await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+        .await
+        .expect("the refused attempt reached the pre-append pause")
+        .expect("pause sender stayed open");
+
+    // The edge lands while the block is decided but not yet durable.
+    let start = report_hook(&rig, "SessionStart", 1, json!({"session_id": "session-1"})).await;
+    assert_eq!(start["applied"], true, "{start}");
+    wait_pane_state(&mut rig, "idle").await;
+    hold.add_permits(1);
+
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::Writing).await;
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::BlockedPreWrite),
+        1
+    );
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::Gating),
+        2,
+        "the racing edge must reopen the same attempt exactly once"
+    );
+    assert_eq!(notification_attempts(&rig, &message_id).len(), 1);
+    wait_for_doorbell(&rig, &pane, &message_id).await;
+
+    rig.daemon.shutdown().await;
+}
+
+/// A recipient claim and an exact administrator withdrawal each release
+/// the FIFO behind a hook admission block, and neither deletes the mailbox
+/// message: the claimed one stays claimed, the withdrawn one stays pending.
+#[tokio::test(flavor = "multi_thread")]
+async fn claim_and_exact_withdrawal_each_release_a_hook_admission_block_without_deleting_the_message(
+) {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "workspace-hook-admission-release",
+        LIVENESS_MANIFEST,
+        &composer_pane(),
+        "delivery_retry_max = 0\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_for_pane_write_block(&mut rig, &pane, Some("hook_admission_unproven")).await;
+
+    let pair = send_waiting_pair(&rig, "hook-admission-release").await;
+    let third =
+        send_workspace_message(&rig, "hook-admission-release-third", "Third", "third body").await;
+    let third_id = third["msg_id"].as_str().unwrap().to_string();
+    wait_for_notification_state(&mut rig, &pair.first, NotificationState::BlockedPreWrite).await;
+    assert_only_oldest_attempt_exists(&rig, &pair);
+    assert!(notification_attempts(&rig, &third_id).is_empty());
+
+    // The recipient claims the blocked head: its attempt is withdrawn by
+    // the claim, the message stays claimed, and the next message is
+    // scheduled into the same block.
+    rig.daemon
+        .claim_message_for_test("worker", &pair.first)
+        .expect("exact recipient claim");
+    wait_for_notification_state(&mut rig, &pair.second, NotificationState::BlockedPreWrite).await;
+    let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
+    let rows = snapshot["result"]["rows"].as_array().unwrap();
+    let row_of = |id: &str| {
+        rows.iter()
+            .find(|row| row["message_id"] == id)
+            .expect("message row survives")
+    };
+    let first_row = row_of(&pair.first);
+    assert_eq!(first_row["recipients"][0]["mailbox"]["status"], "claimed");
+    assert_eq!(
+        first_row["recipients"][0]["notification"]["settlement"],
+        "withdrawn_by_claim"
+    );
+    let second_row = row_of(&pair.second);
+    // The wire spells a blocked pre-write as gating plus its cause fields.
+    assert_eq!(
+        second_row["recipients"][0]["notification"]["state"],
+        "gating"
+    );
+    assert_eq!(
+        second_row["recipients"][0]["notification"]["pre_write_block"],
+        "hook_admission_unproven"
+    );
+    let recipient = second_row["recipients"][0]["recipient"].clone();
+    assert!(notification_attempts(&rig, &third_id).is_empty());
+
+    // An administrator withdraws the exact blocked attempt: the message
+    // stays pending, that attempt is withdrawn, and the FIFO moves on.
+    let blocked = notification_transition(&rig, &pair.second, NotificationState::BlockedPreWrite)
+        .expect("the second block is durable");
+    let attempt_id = blocked.data.as_ref().expect("blocked transition data")["attempt_id"].clone();
+    let withdrawn = rig
+        .ctl
+        .request(
+            "notification.withdraw",
+            json!({"attempt_id": attempt_id, "recipient": recipient}),
+        )
+        .await;
+    assert!(withdrawn["error"].is_null(), "{withdrawn}");
+    assert_eq!(
+        withdrawn["result"]["disposition"], "withdrawn",
+        "{withdrawn}"
+    );
+    wait_for_notification_state(&mut rig, &third_id, NotificationState::BlockedPreWrite).await;
+    let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
+    let rows = snapshot["result"]["rows"].as_array().unwrap();
+    let row_of = |id: &str| {
+        rows.iter()
+            .find(|row| row["message_id"] == id)
+            .expect("message row survives")
+    };
+    let second_row = row_of(&pair.second);
+    assert_eq!(second_row["recipients"][0]["mailbox"]["status"], "pending");
+    // The wire spells an operator withdrawal as not_started plus the flag.
+    assert_eq!(
+        second_row["recipients"][0]["notification"]["state"],
+        "not_started"
+    );
+    assert_eq!(
+        second_row["recipients"][0]["notification"]["operator_withdrawn"],
+        true
+    );
+    let third_row = row_of(&third_id);
+    assert_eq!(
+        third_row["recipients"][0]["notification"]["pre_write_block"],
+        "hook_admission_unproven"
+    );
+    assert_eq!(notification_attempts(&rig, &pair.second).len(), 1);
+    assert_eq!(notification_attempts(&rig, &third_id).len(), 1);
 
     rig.daemon.shutdown().await;
 }

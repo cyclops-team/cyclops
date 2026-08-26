@@ -284,6 +284,68 @@ composer_prompt_regex = '^❯ (?P<content>.*)$'
 composer_continuation_regex = '^(?P<content>.*)$'
 "#;
 
+/// Hook liveness fixture: the same composer as [`HOOK_MANIFEST`] with no
+/// lifecycle-evidence idle rule at all. A clean composer proves only that
+/// the composer is clean; runtime idle needs an admitting hook edge from
+/// the current daemon boot. Panes under this manifest start as `unknown`
+/// with the `hook_admission_unproven` write block until a `SessionStart`
+/// (or a configured `UserPromptSubmit` start) is reported for the current
+/// occupant, which is exactly the recovery path the hook admission tests
+/// exercise.
+pub const LIVENESS_MANIFEST: &str = r#"
+[agent]
+id = "fix"
+display_name = "Hook liveness fixture"
+process_names = ["python3", "python", "Python", "cat", "sh", "dash"]
+
+[hooks]
+available = ["SessionStart", "UserPromptSubmit", "Stop"]
+turn_start = "UserPromptSubmit"
+turn_start_evidence = "confirmed"
+turn_end = "Stop"
+turn_end_evidence = "confirmed"
+ack = "UserPromptSubmit"
+ack_payload_field = "prompt"
+
+# A clean composer is a composer claim only, never lifecycle evidence of
+# idle: the fused verdict stays unknown until an admitting edge exists.
+[[rule]]
+id = "composer_empty"
+state = "idle"
+composer_semantic = "clean"
+lifecycle_evidence = false
+priority = 90
+region = "bottom_non_empty_lines(4)"
+line_regex = ['^❯\s*$']
+
+[[rule]]
+id = "composer_holds_paste"
+state = "idle_with_input"
+composer_semantic = "human_input"
+priority = 80
+lifecycle_evidence = false
+region = "bottom_non_empty_lines(3)"
+line_regex = ['^\s*❯\s+\S']
+line_regex_esc = ['^❯']
+
+[[rule]]
+id = "composer_working"
+state = "working"
+priority = 300
+region = "bottom_non_empty_lines(5)"
+line_regex = ['^FAKETUI-WORKING$']
+
+[injection]
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+composer_trailer_regex = ['^─+$', '^Model \S+ · Ctx: \d+%$']
+composer_trailer_regex_esc = ['^\x1b\[38;5;244m─', '^\x1b\[38;5;152mModel\b']
+composer_trailer_required_prefix = 2
+composer_prompt_regex = '^❯ (?P<content>.*)$'
+composer_continuation_regex = '^(?P<content>.*)$'
+"#;
+
 /// Modal fixture: one auto-dismissable rule with explicit decline keys and
 /// one rule (trust-style) that must never be dismissed by the daemon.
 pub const MODAL_MANIFEST: &str = r#"

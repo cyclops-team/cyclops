@@ -3117,6 +3117,9 @@ async fn persist_notification_prewrite_block(
         return;
     };
     let route_evidence = inner.route_evidence_id(handle.session_idx, &handle.pane_id);
+    // Test seam: an admitting edge can land between the gate's verdict and
+    // this append. The reconcile below must catch it, never strand it.
+    inject_pause(inner, "pre_prewrite_block").await;
     if let Some(record) = record_notification_prewrite_block(
         notification,
         worker,
@@ -3632,6 +3635,21 @@ impl AttemptFailure {
         )
     }
 
+    /// The pane's manifest requires hook liveness and no admitting edge has
+    /// been published for its current binding. Carries the observation so
+    /// the durable block names the exact binding and the block itself.
+    fn hook_admission_unproven(observation: Option<NotificationPreWriteObservation>) -> Self {
+        Self {
+            cause: HOOK_ADMISSION_UNPROVEN.into(),
+            boundary: WriteBoundary::BeforeWrite,
+            pre_write_block: Some(Box::new(PreWriteBlock {
+                cause: NotificationPreWriteCause::WriteReadinessChanged,
+                observation,
+            })),
+            verify_outcome: None,
+        }
+    }
+
     fn binding_unprovable(observation: Option<NotificationPreWriteObservation>) -> Self {
         Self {
             cause: "binding_unprovable".into(),
@@ -3954,6 +3972,20 @@ async fn attempt_delivery(
                     Some(&format!("not_write_ready:{reason}")),
                 );
                 injector.discard().await;
+                if reason == HOOK_ADMISSION_UNPROVEN {
+                    // Not a readiness flicker: nothing on the pane will
+                    // clear it. Park the wake as a named durable block
+                    // that carries the exact binding it was refused for.
+                    let observation = watcher.pane(&handle.pane_id).and_then(|row| {
+                        let mut observation =
+                            composer_semantic_observation(inner, handle, &row, manifest_id)?;
+                        observation.write_block = Some(HOOK_ADMISSION_UNPROVEN.to_string());
+                        Some(observation)
+                    });
+                    return AttemptOutcome::Failed(AttemptFailure::hook_admission_unproven(
+                        observation,
+                    ));
+                }
                 return AttemptOutcome::Failed(AttemptFailure::pane_rebound_before_paste());
             }
         }
@@ -4019,6 +4051,7 @@ async fn attempt_delivery(
                 route_evidence: Some(inner.route_evidence_id(handle.session_idx, &handle.pane_id)),
                 pane_width: Some(final_row.width),
                 required_pane_width: None,
+                write_block: None,
             });
     let proven = match observed_binding {
         // The gate admitted under a manifest, and the live read has to
@@ -5108,6 +5141,7 @@ fn binding_unprovable_observation(
         route_evidence: Some(inner.route_evidence_id(handle.session_idx, &handle.pane_id)),
         pane_width: None,
         required_pane_width: None,
+        write_block: None,
     }
 }
 
@@ -5139,6 +5173,7 @@ fn composer_semantic_observation(
         route_evidence: Some(inner.route_evidence_id(handle.session_idx, &handle.pane_id)),
         pane_width: None,
         required_pane_width: None,
+        write_block: None,
     })
 }
 
@@ -5172,6 +5207,12 @@ pub(crate) async fn inject_pause(inner: &Arc<Inner>, phase: &'static str) {
 /// could not read who is in the pane.
 const OBSERVATION_HOLD: &str = "occupant_unprovable";
 const WRITE_READINESS_OBSERVATION_HOLD: &str = "not_write_ready:occupant_unprovable";
+/// The write block a hook-liveness manifest stamps when no admitting hook
+/// edge has been published for the pane's current binding. Durable, never
+/// retried: the wake parks as a named pre-write block until the recipient
+/// claims, its next admitting edge reopens the oldest attempt once, or an
+/// administrator withdraws the exact attempt.
+pub(crate) const HOOK_ADMISSION_UNPROVEN: &str = "hook_admission_unproven";
 
 /// How long that one cause waits before looking again. Short enough that
 /// a transient `ps` failure costs a person nothing, long enough that a
@@ -5329,6 +5370,11 @@ fn notification_attention_cause(cause: &str) -> NotificationAttentionCause {
 }
 
 fn should_retry(failure: &AttemptFailure, spent: u32, retry_max: u32) -> bool {
+    // Unproven hook admission is a durable block, never a retry budget
+    // question: only an admitting edge, a claim, or a withdrawal moves it.
+    if failure.cause == HOOK_ADMISSION_UNPROVEN {
+        return false;
+    }
     matches!(failure.boundary, WriteBoundary::BeforeWrite)
         && !matches!(
             failure.cause.as_str(),
@@ -5720,6 +5766,33 @@ async fn gate(
                                 }
                                 break 'pane Some(OBSERVATION_HOLD.to_string());
                             }
+                        }
+                        // Unproven hook admission is a durable block, not a
+                        // hold: no pane event clears it, only an admitting
+                        // edge from this boot, a claim, or a withdrawal. The
+                        // pane fuses to unknown under it, so this is decided
+                        // before the state match parks it on an event.
+                        if handle.notification.is_some()
+                            && det.write_block.as_deref() == Some(HOOK_ADMISSION_UNPROVEN)
+                        {
+                            let Some(mut observation) =
+                                composer_semantic_observation(inner, handle, &row, &manifest_id)
+                            else {
+                                return GateOutcome::BlockedPreWrite {
+                                    cause: NotificationPreWriteCause::BindingUnprovable,
+                                    observation: binding_unprovable_observation(
+                                        row.pane_pid,
+                                        &manifest_id,
+                                    ),
+                                };
+                            };
+                            // No width fields: a width pair is a different
+                            // block, and a lone width is refused as partial.
+                            observation.write_block = Some(HOOK_ADMISSION_UNPROVEN.to_string());
+                            return GateOutcome::BlockedPreWrite {
+                                cause: NotificationPreWriteCause::WriteReadinessChanged,
+                                observation,
+                            };
                         }
                         match det.state {
                             AgentState::Idle => {
@@ -9930,6 +10003,7 @@ mod tests {
             route_evidence: None,
             pane_width: Some(cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH - 1),
             required_pane_width: None,
+            write_block: None,
         });
         assert!(!should_retry(&pane_too_narrow, 0, 3));
         assert_eq!(

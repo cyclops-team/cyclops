@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::client::Client;
+use crate::client::ClientError;
 use crate::copy;
 use cyclops_proto::StateReportParams;
 use cyclops_state::StateRoot;
@@ -31,9 +32,6 @@ const BUDGET: Duration = Duration::from_secs(3);
 const STDIN_TIMEOUT: Duration = Duration::from_secs(1);
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
 const HELLO_TIMEOUT: Duration = Duration::from_millis(500);
-/// Floor for the response wait so a spent budget still reads the reply of
-/// an already-written request instead of instantly misreporting it.
-const MIN_WAIT: Duration = Duration::from_millis(50);
 
 pub fn run(event: &str, agent_flag: Option<&str>) -> i32 {
     let deadline = Instant::now() + BUDGET;
@@ -47,11 +45,53 @@ fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
 
+/// What one phase may spend: the remaining budget, capped by the phase's
+/// own limit. A spent budget is refused here, before any socket is opened
+/// or waited on, so no phase ever extends past the deadline by a floor.
+fn phase_budget(deadline: Instant, cap: Duration) -> Result<Duration, String> {
+    phase_budget_at(Instant::now(), deadline, cap)
+}
+
+/// [`phase_budget`] against an explicit clock reading, so the ordering of
+/// phases can be proven with a scripted clock and no sockets.
+fn phase_budget_at(now: Instant, deadline: Instant, cap: Duration) -> Result<Duration, String> {
+    let left = deadline.saturating_duration_since(now);
+    if left.is_zero() {
+        return Err("hook budget spent".into());
+    }
+    Ok(left.min(cap))
+}
+
+/// Connect, then Hello, then the request, each budgeted from what is left
+/// of the deadline at the moment it starts. The clock is read again after
+/// every phase returns, so whatever a phase spent is gone before the next
+/// budget is set: a later phase can only shrink, never extend the deadline,
+/// and no phase starts once the budget is spent. The outer error is the
+/// spent budget (final); the inner one is the client's, for the caller to
+/// classify. The clock and all three phases are injectable so a test proves
+/// the ordering without a daemon.
+fn connect_hello_request<S, C, R>(
+    deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+    connect: impl FnOnce(Duration) -> Result<S, ClientError>,
+    hello: impl FnOnce(S, Duration) -> Result<C, ClientError>,
+    request: impl FnOnce(C, Duration) -> Result<R, ClientError>,
+) -> Result<Result<R, ClientError>, String> {
+    let connect_budget = phase_budget_at(now(), deadline, CONNECT_TIMEOUT)?;
+    let stream = match connect(connect_budget) {
+        Ok(stream) => stream,
+        Err(e) => return Ok(Err(e)),
+    };
+    let hello_budget = phase_budget_at(now(), deadline, HELLO_TIMEOUT)?;
+    let client = match hello(stream, hello_budget) {
+        Ok(client) => client,
+        Err(e) => return Ok(Err(e)),
+    };
+    let read_budget = phase_budget_at(now(), deadline, BUDGET)?;
+    Ok(request(client, read_budget))
+}
+
 fn post(event: &str, agent_flag: Option<&str>, deadline: Instant) -> Result<(), String> {
-    // The label is optional: the daemon derives the reporting origin from
-    // the authenticated socket peer, so a hook that does not know its own
-    // name can still report. A label supplied here is an assertion about
-    // that origin, checked against it and denied on disagreement.
     let agent = agent_flag.map(String::from);
     let sequence_namespace = agent.clone().or_else(|| {
         std::env::var(AGENT_ENV)
@@ -59,29 +99,20 @@ fn post(event: &str, agent_flag: Option<&str>, deadline: Instant) -> Result<(), 
             .filter(|name| !name.is_empty())
     });
     let home = cyclops_proto::cyclops_home();
-    // Payload trouble is logged but never fatal: the event edge matters
-    // more than its audit payload.
-    let payload = match read_stdin(remaining(deadline).min(STDIN_TIMEOUT)) {
+    // stdin is read exactly once and the sequence is allocated exactly once:
+    // every retry below resends the identical parameters, so the daemon's
+    // dedupe sees one report however many times the wire carried it.
+    let payload = match read_stdin(phase_budget(deadline, STDIN_TIMEOUT)?) {
         Ok(v) => v,
         Err(cause) => {
             log_error(event, &format!("{cause}; reported with an empty payload"));
             Value::Null
         }
     };
-    // The counter is per-label, so a report without one carries none
-    // rather than sharing a namespace with every other label-free hook.
     let seq = match &sequence_namespace {
         Some(a) => Some(next_seq(&home, a)?),
         None => None,
     };
-    let mut c = Client::connect_with_timeouts(
-        remaining(deadline).min(CONNECT_TIMEOUT),
-        remaining(deadline).min(HELLO_TIMEOUT).max(MIN_WAIT),
-    )
-    .map_err(|e| copy::client_error(&e, None))?;
-    // No proto-mismatch warning here: hooks own no terminal to warn on,
-    // and the protocol is tolerant by design.
-    c.set_read_timeout(remaining(deadline).max(MIN_WAIT));
     let params = serde_json::to_value(StateReportParams {
         agent,
         event: event.to_string(),
@@ -89,9 +120,125 @@ fn post(event: &str, agent_flag: Option<&str>, deadline: Instant) -> Result<(), 
         payload,
     })
     .expect("state report params serialize");
-    c.request("agent.state.report", params)
-        .map(|_| ())
-        .map_err(|e| copy::client_error(&e, None))
+    let session_start = is_session_start(event);
+    let mut backoff = RETRY_BACKOFF_MIN;
+    loop {
+        // A spent budget fails here, before another connect, so a backoff
+        // that slept up to the deadline never buys one more attempt.
+        let outcome = send_once(&params, deadline)?;
+        match retry_decision(session_start, &outcome, remaining(deadline)) {
+            Retry::Done => return Ok(()),
+            Retry::Fail(cause) => return Err(cause),
+            Retry::Again => {
+                std::thread::sleep(backoff.min(remaining(deadline)));
+                backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
+            }
+        }
+    }
+}
+
+/// One connect, one request, one classified outcome. Every phase takes its
+/// time from the shared deadline and none of them may start once it is
+/// spent: the error names the spent budget as the final cause.
+fn send_once(params: &Value, deadline: Instant) -> Result<Outcome, String> {
+    let answer = connect_hello_request(
+        deadline,
+        Instant::now,
+        Client::connect_stream,
+        Client::from_stream,
+        |mut c, read| {
+            c.set_read_timeout(read);
+            c.request("agent.state.report", params.clone())
+        },
+    )?;
+    Ok(match answer {
+        Ok(response) => Outcome::Answered(response),
+        Err(e) => classify(e),
+    })
+}
+
+/// The daemon answered (any JSON), refused the request as a wire error, or
+/// the outcome is unknown because the connection or the reply was lost.
+enum Outcome {
+    Answered(Value),
+    Denied(String),
+    Unknown(String),
+}
+
+fn classify(e: ClientError) -> Outcome {
+    match e {
+        ClientError::Server { .. } => Outcome::Denied(copy::client_error(&e, None)),
+        other => Outcome::Unknown(copy::client_error(&other, None)),
+    }
+}
+
+enum Retry {
+    Done,
+    Again,
+    Fail(String),
+}
+
+const RETRY_BACKOFF_MIN: Duration = Duration::from_millis(50);
+const RETRY_BACKOFF_MAX: Duration = Duration::from_millis(400);
+
+fn is_session_start(event: &str) -> bool {
+    let folded: String = event
+        .chars()
+        .filter(|c| *c != '_' && *c != '-')
+        .flat_map(char::to_lowercase)
+        .collect();
+    folded == "sessionstart"
+}
+
+/// Success is only `applied: true` or `duplicate: true` (the first report
+/// landed). Only `SessionStart` is ever retried, and only for two outcomes:
+/// the daemon's exact retryable route-not-ready tuple (`applied: false`,
+/// `reason: hook_route_not_ready`, `retryable: true`; the pane's route is
+/// not open yet and nothing was recorded), or an unknown outcome where the
+/// connection or the reply was lost. Every other `applied: false` answer,
+/// a missing `applied`, manifest mismatch, occupant change, malformed
+/// input, and every denial are final and logged. The budget is the shared
+/// three-second hook budget; once it is spent nothing retries, the last
+/// failure is logged once, and the hook still exits zero.
+fn retry_decision(session_start: bool, outcome: &Outcome, remaining: Duration) -> Retry {
+    match outcome {
+        Outcome::Answered(response) => {
+            if response.get("applied") == Some(&Value::Bool(true))
+                || response.get("duplicate") == Some(&Value::Bool(true))
+            {
+                return Retry::Done;
+            }
+            let reason = response
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("no reason");
+            let route_not_ready = response.get("applied") == Some(&Value::Bool(false))
+                && reason == "hook_route_not_ready"
+                && response.get("retryable") == Some(&Value::Bool(true));
+            if !route_not_ready {
+                return Retry::Fail(format!("daemon did not apply the report: {reason}"));
+            }
+            if !session_start {
+                return Retry::Fail(
+                    "daemon route not ready; only SessionStart retries that answer".into(),
+                );
+            }
+            if remaining.is_zero() {
+                return Retry::Fail(
+                    "daemon route not ready for SessionStart within the hook budget".into(),
+                );
+            }
+            Retry::Again
+        }
+        Outcome::Denied(cause) => Retry::Fail(cause.clone()),
+        Outcome::Unknown(cause) => {
+            if session_start && !remaining.is_zero() {
+                Retry::Again
+            } else {
+                Retry::Fail(cause.clone())
+            }
+        }
+    }
 }
 
 /// Read all of stdin on a helper thread so a stalled pipe cannot eat the
@@ -357,5 +504,292 @@ mod tests {
             .unwrap()
             .contains("hook Stop: written after release"));
         let _ = fs::remove_dir_all(&home);
+    }
+
+    /// Deterministic: an already-expired deadline stays expired, so every
+    /// phase refuses before it opens or waits on anything, and a live
+    /// deadline is capped by the phase limit, never extended by a floor.
+    #[test]
+    fn a_spent_budget_refuses_every_phase_and_never_extends() {
+        let expired = Instant::now() - Duration::from_secs(1);
+        assert_eq!(
+            phase_budget(expired, CONNECT_TIMEOUT),
+            Err("hook budget spent".to_string())
+        );
+        assert_eq!(
+            phase_budget(expired, BUDGET),
+            Err("hook budget spent".to_string())
+        );
+        let live = Instant::now() + Duration::from_secs(10);
+        let capped = phase_budget(live, HELLO_TIMEOUT).unwrap();
+        assert!(capped <= HELLO_TIMEOUT && !capped.is_zero(), "{capped:?}");
+        let not_ready = Outcome::Answered(serde_json::json!({
+            "applied": false, "reason": "hook_route_not_ready", "retryable": true
+        }));
+        let lost = Outcome::Unknown("connection reset".into());
+        assert!(matches!(
+            retry_decision(true, &not_ready, Duration::ZERO),
+            Retry::Fail(_)
+        ));
+        assert!(matches!(
+            retry_decision(true, &lost, Duration::ZERO),
+            Retry::Fail(_)
+        ));
+    }
+
+    /// Deterministic, no sockets: a scripted clock stands in for time. The
+    /// connect is granted what is left at its start; the Hello is budgeted
+    /// from what is left AFTER the connect returned, so the connect's spend
+    /// shrinks it; the request is budgeted from what is left after the
+    /// Hello, so the Hello's spend shrinks it in turn.
+    #[test]
+    fn hello_is_budgeted_from_what_the_connect_left() {
+        let t0 = Instant::now();
+        let deadline = t0 + BUDGET;
+        // 2.95 s spent connecting: 50 ms remain for the Hello; the Hello
+        // spends 20 ms of it, so the request gets the last 30 ms.
+        let mut ticks = vec![
+            t0,
+            t0 + Duration::from_millis(2950),
+            t0 + Duration::from_millis(2970),
+        ]
+        .into_iter();
+        let result = connect_hello_request(
+            deadline,
+            move || ticks.next().expect("three clock reads"),
+            |connect_budget| {
+                assert_eq!(
+                    connect_budget, CONNECT_TIMEOUT,
+                    "capped, not the whole budget"
+                );
+                Ok::<(), ClientError>(())
+            },
+            |(), hello_budget| {
+                assert_eq!(
+                    hello_budget,
+                    Duration::from_millis(50),
+                    "what the connect left"
+                );
+                Ok::<(), ClientError>(())
+            },
+            |(), read_budget| {
+                assert_eq!(
+                    read_budget,
+                    Duration::from_millis(30),
+                    "what the Hello left"
+                );
+                Ok::<(), ClientError>(())
+            },
+        );
+        assert!(
+            matches!(result, Ok(Ok(()))),
+            "all three phases run, each within its budget"
+        );
+    }
+
+    /// A Hello that consumes the remaining budget leaves nothing for the
+    /// request: the request callback is never invoked and the spent budget
+    /// is the final cause.
+    #[test]
+    fn a_hello_that_spends_the_budget_leaves_no_request() {
+        let t0 = Instant::now();
+        let deadline = t0 + BUDGET;
+        let mut ticks = vec![t0, t0 + Duration::from_secs(1), deadline].into_iter();
+        let mut request_started = false;
+        let result = connect_hello_request(
+            deadline,
+            move || ticks.next().expect("three clock reads"),
+            |_| Ok::<(), ClientError>(()),
+            |(), hello_budget| {
+                assert_eq!(hello_budget, HELLO_TIMEOUT, "plenty left, so the cap");
+                Ok::<(), ClientError>(())
+            },
+            |(), _| {
+                request_started = true;
+                Ok::<(), ClientError>(())
+            },
+        );
+        assert!(
+            matches!(result, Err(ref cause) if cause == "hook budget spent"),
+            "the spent budget is the final cause"
+        );
+        assert!(
+            !request_started,
+            "the request must never start on a spent budget"
+        );
+    }
+
+    #[test]
+    fn a_connect_that_spends_the_budget_leaves_no_hello() {
+        let t0 = Instant::now();
+        let deadline = t0 + BUDGET;
+        let mut ticks = vec![t0, deadline].into_iter();
+        let mut hello_started = false;
+        let mut request_started = false;
+        let result = connect_hello_request(
+            deadline,
+            move || ticks.next().expect("two clock reads"),
+            |_| Ok::<(), ClientError>(()),
+            |(), _| {
+                hello_started = true;
+                Ok::<(), ClientError>(())
+            },
+            |(), _| {
+                request_started = true;
+                Ok::<(), ClientError>(())
+            },
+        );
+        assert!(
+            matches!(result, Err(ref cause) if cause == "hook budget spent"),
+            "the spent budget is the final cause"
+        );
+        assert!(
+            !hello_started && !request_started,
+            "neither later phase may start on a spent budget"
+        );
+    }
+
+    #[test]
+    fn a_spent_budget_never_starts_the_connect() {
+        let t0 = Instant::now();
+        let deadline = t0 + BUDGET;
+        let mut ticks = vec![deadline].into_iter();
+        let mut connect_started = false;
+        let result = connect_hello_request(
+            deadline,
+            move || ticks.next().expect("one clock read"),
+            |_| {
+                connect_started = true;
+                Ok::<(), ClientError>(())
+            },
+            |(), _| Ok::<(), ClientError>(()),
+            |(), _| Ok::<(), ClientError>(()),
+        );
+        assert!(
+            matches!(result, Err(ref cause) if cause == "hook budget spent"),
+            "the spent budget is the final cause"
+        );
+        assert!(!connect_started);
+    }
+
+    /// A connect failure is the client's to classify, never a spent budget.
+    #[test]
+    fn a_failed_connect_is_classified_not_budgeted() {
+        let t0 = Instant::now();
+        let deadline = t0 + BUDGET;
+        let mut ticks = vec![t0].into_iter();
+        let later_started = std::cell::Cell::new(false);
+        let result = connect_hello_request(
+            deadline,
+            move || ticks.next().expect("one clock read"),
+            |_| Err::<(), ClientError>(ClientError::NotRunning),
+            |(), _| {
+                later_started.set(true);
+                Ok::<(), ClientError>(())
+            },
+            |(), _| {
+                later_started.set(true);
+                Ok::<(), ClientError>(())
+            },
+        );
+        assert!(!later_started.get(), "a failed connect ends the sequence");
+        assert!(
+            matches!(result, Ok(Err(ClientError::NotRunning))),
+            "a connect failure is classified, not budgeted"
+        );
+    }
+
+    /// Success is applied or duplicate, nothing else: an answer without
+    /// `applied`, or `applied: false` for any reason but the exact
+    /// retryable route-not-ready tuple, is a logged failure.
+    #[test]
+    fn only_applied_or_duplicate_answers_succeed() {
+        let plenty = Duration::from_secs(2);
+        let bare = Outcome::Answered(serde_json::json!({"state": "idle"}));
+        let not_applied = Outcome::Answered(serde_json::json!({"applied": false}));
+        let not_retryable = Outcome::Answered(serde_json::json!({
+            "applied": false, "reason": "hook_route_not_ready", "retryable": false
+        }));
+        let applied_but_named = Outcome::Answered(serde_json::json!({
+            "applied": true, "reason": "hook_route_not_ready", "retryable": true
+        }));
+        assert!(matches!(
+            retry_decision(true, &bare, plenty),
+            Retry::Fail(_)
+        ));
+        assert!(matches!(
+            retry_decision(true, &not_applied, plenty),
+            Retry::Fail(_)
+        ));
+        assert!(matches!(
+            retry_decision(true, &not_retryable, plenty),
+            Retry::Fail(_)
+        ));
+        assert!(matches!(
+            retry_decision(true, &applied_but_named, plenty),
+            Retry::Done
+        ));
+    }
+
+    #[test]
+    fn only_session_start_retries_and_only_for_route_not_ready_or_unknown_outcome() {
+        let plenty = Duration::from_secs(2);
+        let spent = Duration::ZERO;
+        let not_ready = Outcome::Answered(serde_json::json!({
+            "applied": false, "reason": "hook_route_not_ready", "retryable": true
+        }));
+        let duplicate = Outcome::Answered(serde_json::json!({"applied": false, "duplicate": true}));
+        let applied = Outcome::Answered(serde_json::json!({"applied": true, "state": "idle"}));
+        let occupant =
+            Outcome::Answered(serde_json::json!({"applied": false, "reason": "occupant_changed"}));
+        let manifest =
+            Outcome::Answered(serde_json::json!({"applied": false, "reason": "manifest_changed"}));
+        let denied = Outcome::Denied("bad_request".into());
+        let lost = Outcome::Unknown("connection reset".into());
+        assert!(matches!(
+            retry_decision(true, &not_ready, plenty),
+            Retry::Again
+        ));
+        assert!(
+            matches!(retry_decision(true, &not_ready, spent), Retry::Fail(_)),
+            "budget spent"
+        );
+        assert!(
+            matches!(retry_decision(false, &not_ready, plenty), Retry::Fail(_)),
+            "other events never retry; route not ready is a logged failure for them"
+        );
+        assert!(
+            matches!(retry_decision(true, &duplicate, plenty), Retry::Done),
+            "duplicate is success"
+        );
+        assert!(matches!(
+            retry_decision(true, &applied, plenty),
+            Retry::Done
+        ));
+        assert!(
+            matches!(retry_decision(true, &occupant, plenty), Retry::Fail(_)),
+            "occupant change is a final, logged failure"
+        );
+        assert!(
+            matches!(retry_decision(true, &manifest, plenty), Retry::Fail(_)),
+            "manifest mismatch is a final, logged failure"
+        );
+        assert!(
+            matches!(retry_decision(true, &denied, plenty), Retry::Fail(_)),
+            "denial is final"
+        );
+        assert!(
+            matches!(retry_decision(true, &lost, plenty), Retry::Again),
+            "unknown outcome retries SessionStart"
+        );
+        assert!(
+            matches!(retry_decision(false, &lost, plenty), Retry::Fail(_)),
+            "unknown outcome is final for others"
+        );
+        assert!(matches!(retry_decision(true, &lost, spent), Retry::Fail(_)));
+        assert!(is_session_start("SessionStart"));
+        assert!(is_session_start("session_start"));
+        assert!(!is_session_start("UserPromptSubmit"));
+        assert!(!is_session_start("Stop"));
     }
 }

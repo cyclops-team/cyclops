@@ -48,6 +48,7 @@ fn wake(state: MessageNotificationState) -> MessageNotificationSummary {
         cause: None,
         verify_outcome: None,
         pre_write_cause: None,
+        pre_write_block: None,
         pre_write_pane_width: None,
         pre_write_required_pane_width: None,
         attention_cleared: None,
@@ -70,6 +71,7 @@ fn alarm(n: u64, cleared: bool) -> MessageNotificationSummary {
         cause: Some(NotificationAttentionCause::VerifyFailed),
         verify_outcome: None,
         pre_write_cause: None,
+        pre_write_block: None,
         pre_write_pane_width: None,
         pre_write_required_pane_width: None,
         attention_cleared: Some(cleared),
@@ -92,6 +94,7 @@ fn quota(n: u64, state: MessageQuotaState) -> MessageNotificationSummary {
         cause: None,
         verify_outcome: None,
         pre_write_cause: None,
+        pre_write_block: None,
         pre_write_pane_width: None,
         pre_write_required_pane_width: None,
         attention_cleared: None,
@@ -458,6 +461,29 @@ fn wake_states_map_without_losing_delivery_progress() {
     assert_eq!(rows.rows[0].wake, WakeWord::BlockedBeforeWrite);
     assert!(rows.rows[0].needs_human());
     assert!(rows.rows[0].can_withdraw_notification);
+
+    // The named block rides from the wire into the row; the width pair is
+    // decided once by the proto rule, so a cause without widths has none.
+    let mut named = wake(MessageNotificationState::Gating);
+    named.attempt_id = Some(attempt(22));
+    named.pre_write_cause = Some(NotificationPreWriteCause::WriteReadinessChanged);
+    named.pre_write_block = Some("hook_admission_unproven".into());
+    let rows = rows_from_snapshot(&snapshot(
+        3,
+        vec![row(
+            "m-named",
+            3,
+            MessageDirection::Workspace,
+            true,
+            vec![theirs("%1", "reviewer", named)],
+        )],
+    ));
+    assert_eq!(rows.rows[0].wake, WakeWord::BlockedBeforeWrite);
+    assert_eq!(
+        rows.rows[0].pre_write_block.as_deref(),
+        Some("hook_admission_unproven")
+    );
+    assert_eq!(rows.rows[0].pane_width_block, None);
 
     let mut operator_withdrawn = wake(MessageNotificationState::NotStarted);
     operator_withdrawn.attempt_id = Some(attempt(21));

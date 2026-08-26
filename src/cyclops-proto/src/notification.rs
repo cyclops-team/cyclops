@@ -316,6 +316,11 @@ pub struct NotificationRouteEvidenceId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotificationPreWriteObservation {
+    /// The named write block the pane carried when the wake was held before
+    /// any write, for example `hook_admission_unproven`. Content-free: a
+    /// block name, never pane text. Absent on rows written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_block: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_root: Option<ProcessInstanceId>,
     /// Manifest selected by the gate for this attempt.
@@ -1583,6 +1588,7 @@ mod tests {
                 }),
                 pane_width: Some(59),
                 required_pane_width: Some(60),
+                write_block: None,
             })),
         };
 

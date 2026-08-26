@@ -341,6 +341,8 @@ impl TimelineItem {
                 .cause
                 .as_ref()
                 .map(|c| attention_cause_label(*c).to_string())
+                // The named block is more exact than the enum cause.
+                .or_else(|| row.pre_write_block.as_deref().map(crate::grid::cause_words))
                 .or_else(|| row.pre_write_cause.as_ref().map(|c| c.label().to_string()));
 
             let recip_entry = RecipientEntry {

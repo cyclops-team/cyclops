@@ -240,10 +240,16 @@ pub struct QueueRow {
     pub wake: WakeWord,
     pub cause: Option<NotificationAttentionCause>,
     pub pre_write_cause: Option<NotificationPreWriteCause>,
+    /// The named write block behind a pre-write hold, when the daemon
+    /// recorded one (for example `hook_admission_unproven`). More exact
+    /// than the enum cause, so readers prefer it.
+    pub pre_write_block: Option<String>,
     /// Exact durable reason this wake has no live scheduler owner.
     pub wake_block: Option<MessageWakeBlock>,
-    pub pre_write_pane_width: Option<u32>,
-    pub pre_write_required_pane_width: Option<u32>,
+    /// Observed and required widths of a pane-too-narrow block, decided
+    /// once by `MessageNotificationSummary::pane_width_block`; no surface
+    /// re-derives it.
+    pub pane_width_block: Option<(u32, u32)>,
     /// Current live route. The immutable send-time label remains the fallback.
     pub current_route: Option<MessageRecipientRoute>,
     /// The daemon's one-based mailbox position.
@@ -322,8 +328,8 @@ impl Default for QueueRow {
             wake: WakeWord::NotStarted,
             cause: None,
             pre_write_cause: None,
-            pre_write_pane_width: None,
-            pre_write_required_pane_width: None,
+            pre_write_block: None,
+            pane_width_block: None,
             wake_block: None,
             current_route: None,
             fifo_position: None,

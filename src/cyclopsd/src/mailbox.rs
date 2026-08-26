@@ -3394,6 +3394,7 @@ impl MailboxProjection {
                 pre_write_cause: None,
                 pre_write_pane_width: None,
                 pre_write_required_pane_width: None,
+                pre_write_block: None,
                 attention_cleared: None,
                 resolution: None,
                 resolution_intent: None,
@@ -3438,6 +3439,10 @@ impl MailboxProjection {
             pre_write_cause: record.pre_write_cause,
             pre_write_pane_width: width_block.map(|(observed, _)| observed),
             pre_write_required_pane_width: width_block.map(|(_, required)| required),
+            pre_write_block: record
+                .pre_write_observation
+                .as_ref()
+                .and_then(|observation| observation.write_block.clone()),
             attention_cleared,
             resolution,
             resolution_intent,
@@ -3685,9 +3690,18 @@ impl MailboxProjection {
                     Some("quota_reset_observed".to_string()),
                 ),
                 NotificationState::BlockedPreWrite => {
+                    // A named write block on the observation is the exact
+                    // reason (for example hook_admission_unproven); the enum
+                    // cause stays for readers that only know it.
                     let why = record
-                        .pre_write_cause
-                        .map(|cause| cause.wire_name().to_string())
+                        .pre_write_observation
+                        .as_ref()
+                        .and_then(|observation| observation.write_block.clone())
+                        .or_else(|| {
+                            record
+                                .pre_write_cause
+                                .map(|cause| cause.wire_name().to_string())
+                        })
                         .or_else(|| record.wake_block.map(|block| block.wire_name().to_string()))
                         .unwrap_or_else(|| "unknown".to_string());
                     (
@@ -9024,6 +9038,7 @@ mod tests {
             route_evidence: evidence(7),
             pane_width: None,
             required_pane_width: None,
+            write_block: None,
         };
         let lines_before_inner_schedule = service.journal_lines().unwrap().len();
         assert!(
@@ -9121,6 +9136,7 @@ mod tests {
             route_evidence: evidence(8),
             pane_width: None,
             required_pane_width: None,
+            write_block: None,
         };
         assert!(service
             .reopen_oldest_notification_after_route_evidence(bob, cross_pane_observation, false,)
@@ -9136,6 +9152,7 @@ mod tests {
             route_evidence: evidence(8),
             pane_width: None,
             required_pane_width: None,
+            write_block: None,
         };
         assert!(
             service
@@ -9182,6 +9199,7 @@ mod tests {
             route_evidence: evidence(8),
             pane_width: None,
             required_pane_width: None,
+            write_block: None,
         };
         let reopened_context = crate::notification_adapter::NotificationContext::new(
             service.store_handle(),
@@ -9205,6 +9223,7 @@ mod tests {
             route_evidence: evidence(9),
             pane_width: None,
             required_pane_width: None,
+            write_block: None,
         };
         let lines_before_second_proof = service.journal_lines().unwrap().len();
         assert!(service
@@ -9323,6 +9342,7 @@ mod tests {
             route_evidence: evidence(7),
             pane_width: None,
             required_pane_width: None,
+            write_block: None,
         };
         context
             .record_pre_write_block(
@@ -9524,6 +9544,7 @@ mod tests {
                     route_evidence: None,
                     pane_width: None,
                     required_pane_width: None,
+                    write_block: None,
                 }),
             )
             .unwrap();
@@ -9628,6 +9649,7 @@ mod tests {
                     route_evidence: None,
                     pane_width: None,
                     required_pane_width: None,
+                    write_block: None,
                 },
                 true,
             )
@@ -9797,6 +9819,7 @@ mod tests {
                     route_evidence: None,
                     pane_width: None,
                     required_pane_width: None,
+                    write_block: None,
                 }),
             )
             .unwrap();
@@ -9897,6 +9920,7 @@ mod tests {
                         route_evidence: None,
                         pane_width: None,
                         required_pane_width: None,
+                        write_block: None,
                     }),
                 )
                 .unwrap();
@@ -16708,6 +16732,7 @@ mod tests {
             route_evidence: None,
             pane_width: Some(DOORBELL_V3_MIN_PANE_WIDTH - 1),
             required_pane_width: Some(DOORBELL_V3_MIN_PANE_WIDTH),
+            write_block: None,
         };
         context
             .record_pre_write_block(
@@ -16724,6 +16749,7 @@ mod tests {
         let wide = NotificationPreWriteObservation {
             pane_width: Some(DOORBELL_V3_MIN_PANE_WIDTH),
             required_pane_width: None,
+            write_block: None,
             ..narrow
         };
         let reopened = service

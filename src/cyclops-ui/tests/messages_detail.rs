@@ -53,9 +53,9 @@ fn row(
         wake,
         cause: None,
         pre_write_cause: None,
+        pre_write_block: None,
         wake_block: None,
-        pre_write_pane_width: None,
-        pre_write_required_pane_width: None,
+        pane_width_block: None,
         current_route: None,
         fifo_position: Some(1),
         needs_action: true,
@@ -273,12 +273,27 @@ fn a_blocked_wake_offers_one_exact_recipient_scoped_withdrawal() {
 fn a_width_block_says_what_was_observed_and_required() {
     let mut row = blocked();
     row.pre_write_cause = Some(NotificationPreWriteCause::WriteReadinessChanged);
-    row.pre_write_pane_width = Some(59);
-    row.pre_write_required_pane_width = Some(60);
+    row.pane_width_block = Some((59, 60));
 
     let frame = render(&opened(&row, Loaded::default()), 80, 24).join("\n");
     assert!(
         frame.contains("pane too narrow (59, requires 60)"),
+        "{frame}"
+    );
+    assert!(!frame.contains("write readiness changed"), "{frame}");
+}
+
+/// The daemon's named block is the exact reason; the enum cause it was
+/// recorded under is the fallback for rows written before the name existed.
+#[test]
+fn a_named_block_is_preferred_over_its_enum_cause() {
+    let mut row = blocked();
+    row.pre_write_cause = Some(NotificationPreWriteCause::WriteReadinessChanged);
+    row.pre_write_block = Some("hook_admission_unproven".into());
+
+    let frame = render(&opened(&row, Loaded::default()), 80, 24).join("\n");
+    assert!(
+        frame.contains("wake blocked before write: hook admission unproven"),
         "{frame}"
     );
     assert!(!frame.contains("write readiness changed"), "{frame}");
@@ -857,6 +872,7 @@ mod through_the_app {
             cause: alarmed.then_some(NotificationAttentionCause::VerifyFailed),
             verify_outcome: None,
             pre_write_cause: None,
+            pre_write_block: None,
             pre_write_pane_width: None,
             pre_write_required_pane_width: None,
             attention_cleared: alarmed.then_some(false),

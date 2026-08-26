@@ -433,6 +433,16 @@ fn blocked_notification_rows(res: &StatusResult, style: &Style) -> Vec<String> {
                     .map(|block| block.label().to_string())
             })
             .or_else(|| {
+                // A named block on the observation is the exact reason
+                // (for example hook admission unproven); the enum cause is
+                // the coarser fallback for rows written before it existed.
+                item.recipient
+                    .notification
+                    .pre_write_block
+                    .as_deref()
+                    .map(grid::cause_words)
+            })
+            .or_else(|| {
                 item.recipient
                     .notification
                     .pre_write_cause
@@ -941,6 +951,9 @@ fn waiting_rows(res: &StatusResult, style: &Style) -> Vec<String> {
         let next = match d.attempt_id.as_ref() {
             None => String::new(),
             Some(attempt) => match cyclops_proto::delivery_pre_write_reason(cause_raw) {
+                Some("hook_admission_unproven") => format!(
+                    " · next: the recipient may claim {id} now; or relaunch the agent after repairing its hooks (its SessionStart reopens this wake once); or an administrator may withdraw the exact unwritten attempt {attempt}"
+                ),
                 Some(reason) => format!(
                     " · next: fix {}; the daemon reopens the wake on the next route or composer evidence, no requeue; or the recipient claims {id} now",
                     grid::cause_words(reason)
@@ -1786,6 +1799,7 @@ mod tests {
                         ),
                         pre_write_pane_width: None,
                         pre_write_required_pane_width: None,
+                        pre_write_block: None,
                         attention_cleared: None,
                         resolution: None,
                         resolution_intent: None,
@@ -1835,6 +1849,27 @@ mod tests {
             rendered.contains("pane too narrow (59, requires 60)"),
             "{rendered}"
         );
+
+        // A named block outranks the enum cause it was recorded under.
+        status.blocked_notifications[0]
+            .recipient
+            .notification
+            .pre_write_pane_width = None;
+        status.blocked_notifications[0]
+            .recipient
+            .notification
+            .pre_write_required_pane_width = None;
+        status.blocked_notifications[0]
+            .recipient
+            .notification
+            .pre_write_block = Some("hook_admission_unproven".into());
+        let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
+        assert!(rendered.contains("hook admission unproven"), "{rendered}");
+        assert!(!rendered.contains("write readiness changed"), "{rendered}");
+        status.blocked_notifications[0]
+            .recipient
+            .notification
+            .pre_write_block = None;
 
         status.blocked_notifications[0]
             .recipient

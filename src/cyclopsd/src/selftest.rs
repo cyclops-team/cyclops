@@ -78,6 +78,14 @@ struct HookLivenessState {
 pub(crate) struct HookLiveness {
     state: StdMutex<HookLivenessState>,
 }
+/// The pane has no live lifetime: its route is not open yet (or is closed).
+/// Reports never open routes, so the caller answers retryable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RouteNotOpen;
+/// The captured pane lifetime is no longer the live one: a replacement
+/// occupant owns the pane now and inherits nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LifetimeExpired;
 
 impl HookLiveness {
     pub(crate) fn new() -> HookLiveness {
@@ -124,17 +132,24 @@ impl HookLiveness {
     /// Duplicates count: a duplicate still proves the hook config is loaded
     /// and firing. Process generations remain distinct so a delayed check
     /// for one submitted occupant cannot read another occupant's history.
-    pub(crate) fn record(
+    /// Record one diagnostic edge under the exact binding that is live right
+    /// now and hand that binding back. The binding carries the pane
+    /// lifetime, the agent process identity including birth, and the
+    /// manifest; a later publication uses it verbatim and never looks a
+    /// lifetime up again. When no lifetime is live the route is not open:
+    /// nothing is recorded and the caller must answer retryable, because
+    /// reports never open routes.
+    pub(crate) fn bind_diagnostic(
         &self,
         pane: &PaneKey,
         raw_event: &str,
         ts: u64,
         agent: crate::identity::ProcId,
         manifest: &str,
-    ) {
+    ) -> Result<HookBinding, RouteNotOpen> {
         let mut state = self.state.lock().expect("hook liveness lock");
         let Some(lifetime) = state.live.get(pane).copied() else {
-            return;
+            return Err(RouteNotOpen);
         };
         let binding = HookBinding {
             pane: pane.clone(),
@@ -144,9 +159,10 @@ impl HookLiveness {
         };
         state
             .edges
-            .entry(binding)
+            .entry(binding.clone())
             .or_default()
             .insert(ack::normalize_event(raw_event), (raw_event.to_string(), ts));
+        Ok(binding)
     }
 
     /// True once any hook edge has been seen from the CURRENT occupant of
@@ -174,37 +190,49 @@ impl HookLiveness {
             .get(&binding)
             .is_some_and(|events| !events.is_empty())
     }
-    /// Publish an admission-eligible edge for this exact binding. Only a
-    /// normalized `SessionStart` or `UserPromptSubmit` is ever stored; any
-    /// other event is a no-op here, whatever `record` keeps for diagnostics.
+    /// Publish an admission-eligible edge for a binding captured earlier by
+    /// [`HookLiveness::bind_diagnostic`]. Only a normalized `SessionStart` or
+    /// `UserPromptSubmit` is ever stored; any other event is a no-op here.
+    /// The captured pane lifetime must still be the live one: a route that
+    /// closed and reopened in between belongs to a replacement occupant,
+    /// which inherits nothing, so the publication is refused and the caller
+    /// answers `occupant_changed`. No new lifetime is ever looked up here.
     /// The report path calls this after the manifest declared the event and
     /// after any start the edge carries was installed.
-    pub(crate) fn record_admitting_edge(
+    pub(crate) fn publish_admission(
         &self,
-        pane: &PaneKey,
+        binding: &HookBinding,
         raw_event: &str,
-        agent: crate::identity::ProcId,
-        manifest: &str,
-    ) {
+    ) -> Result<(), LifetimeExpired> {
         const ADMITTING_EVENTS: [&str; 2] = ["SessionStart", "UserPromptSubmit"];
         let event = ack::normalize_event(raw_event);
+        let mut state = self.state.lock().expect("hook liveness lock");
+        if state.live.get(&binding.pane) != Some(&binding.lifetime) {
+            return Err(LifetimeExpired);
+        }
         if !ADMITTING_EVENTS
             .iter()
             .any(|admitting| ack::normalize_event(admitting) == event)
         {
-            return;
+            return Ok(());
         }
-        let mut state = self.state.lock().expect("hook liveness lock");
-        let Some(lifetime) = state.live.get(pane).copied() else {
-            return;
-        };
-        let binding = HookBinding {
-            pane: pane.clone(),
-            lifetime,
-            agent,
-            manifest: manifest.to_string(),
-        };
-        state.admitting.entry(binding).or_default().insert(event);
+        state
+            .admitting
+            .entry(binding.clone())
+            .or_default()
+            .insert(event);
+        Ok(())
+    }
+    /// Test-only: how many distinct diagnostic events and admission-eligible
+    /// events this exact binding holds, so a repeated report can be proven
+    /// to collapse to one of each rather than accumulate.
+    #[cfg(test)]
+    pub(crate) fn edge_counts(&self, binding: &HookBinding) -> (usize, usize) {
+        let state = self.state.lock().expect("hook liveness lock");
+        (
+            state.edges.get(binding).map_or(0, HashMap::len),
+            state.admitting.get(binding).map_or(0, HashSet::len),
+        )
     }
     pub(crate) fn seen_any(
         &self,
@@ -626,8 +654,8 @@ mod tests {
         let route = pane("%1");
         open(&l, &route);
         assert!(!l.seen_any(&route, proc(100), "test"));
-        l.record(&route, "UserPromptSubmit", 1_000, proc(100), "test");
-        l.record(&route, "user_prompt_submit", 2_000, proc(100), "test");
+        let _ = l.bind_diagnostic(&route, "UserPromptSubmit", 1_000, proc(100), "test");
+        let _ = l.bind_diagnostic(&route, "user_prompt_submit", 2_000, proc(100), "test");
         assert!(l.seen_any(&route, proc(100), "test"));
         // Normalized spellings share a slot; the raw name and ts are the
         // latest ones.
@@ -648,7 +676,7 @@ mod tests {
         let second = PaneKey::new(1, "%1");
         open(&liveness, &first);
         open(&liveness, &second);
-        liveness.record(&first, "Stop", 1_000, proc(100), "test");
+        let _ = liveness.bind_diagnostic(&first, "Stop", 1_000, proc(100), "test");
 
         assert!(liveness.seen_any(&first, proc(100), "test"));
         assert!(
@@ -656,7 +684,7 @@ mod tests {
             "a hook edge cannot cross watched session routes"
         );
 
-        liveness.record(&second, "UserPromptSubmit", 2_000, proc(200), "test");
+        let _ = liveness.bind_diagnostic(&second, "UserPromptSubmit", 2_000, proc(200), "test");
         liveness.close(&first);
         assert!(!liveness.seen_any(&first, proc(100), "test"));
         assert!(
@@ -673,7 +701,7 @@ mod tests {
         let l = HookLiveness::new();
         let route = pane("%1");
         open(&l, &route);
-        l.record(&route, "UserPromptSubmit", 1_000, proc(100), "test");
+        let _ = l.bind_diagnostic(&route, "UserPromptSubmit", 1_000, proc(100), "test");
         assert!(l.seen_any(&route, proc(100), "test"));
         // The occupant restarted: same pane, new pid, no edges from it yet.
         assert!(
@@ -684,7 +712,7 @@ mod tests {
         // The old process's exact history remains available to a delayed
         // diagnostic for a delivery that was submitted to it.
         assert!(l.seen_any(&route, proc(100), "test"));
-        l.record(&route, "Stop", 3_000, proc(200), "test");
+        let _ = l.bind_diagnostic(&route, "Stop", 3_000, proc(200), "test");
         assert!(l.seen_any(&route, proc(200), "test"));
         assert!(l.seen_any(&route, proc(100), "test"));
         let snap = l.snapshot(&route, proc(200), "test");
@@ -729,11 +757,11 @@ mod tests {
         open(&l, &route);
         let first = binding(&l, &route, proc(100), "test");
         let second = binding(&l, &route, proc(200), "test");
-        l.record(&route, "Stop", 1_000, proc(100), "test");
+        let _ = l.bind_diagnostic(&route, "Stop", 1_000, proc(100), "test");
         assert!(!l.reserve_f1_if_no_edges(&first));
         assert!(l.reserve_f1_if_no_edges(&second));
 
-        l.record(&route, "Stop", 2_000, proc(200), "test");
+        let _ = l.bind_diagnostic(&route, "Stop", 2_000, proc(200), "test");
         assert!(!l.reserve_f1_if_no_edges(&second));
         assert!(!l.reserve_f1_if_no_edges(&first));
     }
@@ -744,7 +772,7 @@ mod tests {
         let route = pane("%1");
         let agent = proc(100);
         open(&l, &route);
-        l.record(&route, "Stop", 1_000, agent, "claude");
+        let _ = l.bind_diagnostic(&route, "Stop", 1_000, agent, "claude");
 
         assert!(l.seen_any(&route, agent, "claude"));
         assert!(!l.seen_any(&route, agent, "codex"));

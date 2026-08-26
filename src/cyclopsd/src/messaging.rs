@@ -190,6 +190,7 @@ fn proven_binding_observation(
         route_evidence: Some(route_evidence.clone()),
         pane_width: Some(route.row.width),
         required_pane_width: None,
+        write_block: None,
     })
 }
 

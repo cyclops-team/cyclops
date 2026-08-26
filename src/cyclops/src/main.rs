@@ -2492,6 +2492,9 @@ fn message_wake_block_reason(
                 .wake_block
                 .map(|block| block.wire_name().to_string())
         })
+        // The named block (for example hook_admission_unproven) is more
+        // exact than the enum cause it was recorded under.
+        .or_else(|| notification.pre_write_block.clone())
         .or_else(|| {
             notification
                 .pre_write_cause
@@ -3444,6 +3447,7 @@ mod tests {
                     pre_write_cause: None,
                     pre_write_pane_width: None,
                     pre_write_required_pane_width: None,
+                    pre_write_block: None,
                     attention_cleared: None,
                     resolution: None,
                     resolution_intent: None,
@@ -3593,11 +3597,22 @@ mod tests {
         blocked.recipients[0].notification.attempt_id = Some(notification_attempt(2));
         blocked.recipients[0].notification.pre_write_cause =
             Some(cyclops_proto::NotificationPreWriteCause::WorkerFailed);
-        let line = held_queue_lines(&held_heads(&[blocked]))
+        let line = held_queue_lines(&held_heads(&[blocked.clone()]))
             .into_iter()
             .next()
             .unwrap();
         assert!(line.contains("fix worker_failed"), "{line}");
+
+        // The named block is preferred over the enum cause it was recorded under.
+        blocked.recipients[0].notification.pre_write_cause =
+            Some(cyclops_proto::NotificationPreWriteCause::WriteReadinessChanged);
+        blocked.recipients[0].notification.pre_write_block = Some("hook_admission_unproven".into());
+        let line = held_queue_lines(&held_heads(&[blocked]))
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(line.contains("hook_admission_unproven"), "{line}");
+        assert!(!line.contains("write_readiness_changed"), "{line}");
         assert!(line.contains("cyclops inbox claim m-blocked"), "{line}");
         assert!(
             line.contains(
@@ -3730,6 +3745,7 @@ mod tests {
                     pre_write_cause: None,
                     pre_write_pane_width: None,
                     pre_write_required_pane_width: None,
+                    pre_write_block: None,
                     attention_cleared: Some(false),
                     resolution: None,
                     resolution_intent: None,
@@ -3786,6 +3802,7 @@ mod tests {
             pre_write_cause: None,
             pre_write_pane_width: None,
             pre_write_required_pane_width: None,
+            pre_write_block: None,
             attention_cleared: None,
             resolution: None,
             resolution_intent: None,
@@ -3812,6 +3829,7 @@ mod tests {
             pre_write_cause: None,
             pre_write_pane_width: None,
             pre_write_required_pane_width: None,
+            pre_write_block: None,
             attention_cleared: None,
             resolution: None,
             resolution_intent: None,

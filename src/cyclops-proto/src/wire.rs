@@ -1016,6 +1016,10 @@ pub struct MessageNotificationSummary {
     /// Minimum width recorded with `pre_write_pane_width`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_write_required_pane_width: Option<u32>,
+    /// The named write block behind a pre-write hold, when the observation
+    /// recorded one (for example `hook_admission_unproven`). Content-free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_write_block: Option<String>,
     /// Present only for attention-required attempts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention_cleared: Option<bool>,
@@ -2003,6 +2007,7 @@ mod tests {
                 pre_write_cause: None,
                 pre_write_pane_width: None,
                 pre_write_required_pane_width: None,
+                pre_write_block: None,
                 attention_cleared: None,
                 resolution: None,
                 resolution_intent: None,
@@ -2087,6 +2092,7 @@ mod tests {
             pre_write_cause: None,
             pre_write_pane_width: None,
             pre_write_required_pane_width: None,
+            pre_write_block: None,
             attention_cleared: Some(false),
             resolution: None,
             resolution_intent: None,
@@ -2177,6 +2183,7 @@ mod tests {
                 pre_write_cause: None,
                 pre_write_pane_width: None,
                 pre_write_required_pane_width: None,
+                pre_write_block: None,
                 attention_cleared: None,
                 resolution: None,
                 resolution_intent: None,
@@ -2215,6 +2222,7 @@ mod tests {
             pre_write_cause: None,
             pre_write_pane_width: None,
             pre_write_required_pane_width: None,
+            pre_write_block: None,
             attention_cleared: Some(false),
             resolution: None,
             resolution_intent: Some(crate::NotificationResolution::Complete),
@@ -2305,6 +2313,7 @@ mod tests {
                 pre_write_cause: None,
                 pre_write_pane_width: None,
                 pre_write_required_pane_width: None,
+                pre_write_block: None,
                 attention_cleared: None,
                 resolution: None,
                 resolution_intent: None,
