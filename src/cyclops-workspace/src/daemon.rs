@@ -168,13 +168,34 @@ pub fn send_message(
     body: &str,
     client_key: &str,
 ) -> SendOutcome {
+    send_message_full(
+        home,
+        vec![to.to_string()],
+        subject,
+        body,
+        false,
+        None,
+        client_key,
+    )
+}
+
+/// Send one message or announcement with full routing and reply parameters.
+pub fn send_message_full(
+    home: &Path,
+    to: Vec<String>,
+    subject: &str,
+    body: &str,
+    fyi: bool,
+    reply_to: Option<String>,
+    client_key: &str,
+) -> SendOutcome {
     let params = match serde_json::to_value(cyclops_proto::MsgSendParams {
-        to: vec![to.to_string()],
+        to,
         subject: subject.to_string(),
         body: body.to_string(),
-        fyi: false,
+        fyi,
         client_key: Some(client_key.to_string()),
-        reply_to: None,
+        reply_to,
         supersedes: None,
         wait: None,
     }) {

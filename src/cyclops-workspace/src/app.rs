@@ -309,6 +309,10 @@ struct App {
     messages_queue: cyclops_ui::HumanQueue,
     /// Open message detail view when an operator opens a message.
     messages_detail: Option<cyclops_ui::Detail>,
+    /// Bounded group-chat composer state.
+    messages_composer: cyclops_ui::ComposerState,
+    /// Data-driven avatar registry for resolving agent/sender initials and icons.
+    avatar_registry: cyclops_ui::AvatarRegistry,
     /// Startup ordering and seq dedup for `record`
     /// ([`cyclops_ui::Intake`]): live entries reaching the app before
     /// [`crate::event_record::boot`] lands its backfill buffer here, and
@@ -857,6 +861,8 @@ pub async fn run_async() -> i32 {
         record: cyclops_ui::Record::new(),
         messages_queue: cyclops_ui::HumanQueue::default(),
         messages_detail: None,
+        messages_composer: cyclops_ui::ComposerState::default(),
+        avatar_registry: cyclops_ui::AvatarRegistry::default(),
         intake: cyclops_ui::Intake::new(),
         stream_reconciling: false,
         cursor_style: None,
@@ -3241,6 +3247,159 @@ async fn handle_files_key(
     }
 }
 
+/// Keys the messages drawer and group-chat composer take while active.
+async fn handle_messages_key(
+    app: &mut App,
+    key: KeyEvent,
+) -> Result<Option<InputOutcome>, cyclops_tmux::TmuxError> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    if !app.model.messages_visible {
+        return Ok(None);
+    }
+
+    // If the composer is focused and active, it handles typing and sending:
+    if app.messages_composer.focused && app.messages_composer.mode.is_some() {
+        match key.code {
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.messages_composer.push_char(c);
+                return Ok(Some(InputOutcome::Redraw));
+            }
+            KeyCode::Backspace => {
+                app.messages_composer.backspace();
+                return Ok(Some(InputOutcome::Redraw));
+            }
+            KeyCode::Esc => {
+                app.messages_composer.focused = false;
+                app.messages_composer.mode = None;
+                app.messages_composer.clear_stage();
+                return Ok(Some(InputOutcome::Redraw));
+            }
+            KeyCode::Enter => {
+                let text = app.messages_composer.text().to_string();
+                if text.trim().is_empty() {
+                    return Ok(Some(InputOutcome::NoRedraw));
+                }
+                let key_mint = format!("ws-msg-{}", uuid::Uuid::new_v4());
+                let client_key = app.messages_composer.key_for_send(|| key_mint);
+                let mode = app.messages_composer.mode.clone();
+
+                let (to, fyi, reply_to, subject) = match mode {
+                    Some(cyclops_ui::ComposerMode::Reply {
+                        ref message_id,
+                        ref reply_to_label,
+                        ..
+                    }) => (
+                        vec![reply_to_label.clone()],
+                        false,
+                        Some(message_id.clone()),
+                        format!("Re: {message_id}"),
+                    ),
+                    Some(cyclops_ui::ComposerMode::Announce {
+                        ref recipients_preview,
+                    }) => {
+                        let to = if recipients_preview.is_empty() {
+                            vec!["*".to_string()]
+                        } else {
+                            recipients_preview.clone()
+                        };
+                        (to, true, None, "Announcement".to_string())
+                    }
+                    Some(cyclops_ui::ComposerMode::Direct { ref recipient }) => (
+                        vec![recipient.clone()],
+                        false,
+                        None,
+                        "Direct Message".to_string(),
+                    ),
+                    None => return Ok(Some(InputOutcome::NoRedraw)),
+                };
+
+                let outcome = crate::daemon::send_message_full(
+                    &app.home,
+                    to,
+                    &subject,
+                    &text,
+                    fyi,
+                    reply_to,
+                    &client_key,
+                );
+                match outcome {
+                    crate::daemon::SendOutcome::Accepted(msg) => {
+                        app.messages_composer.draft.set("");
+                        app.messages_composer.mode = None;
+                        app.messages_composer.focused = false;
+                        app.messages_composer.clear_stage();
+                        app.notice.show(msg);
+                    }
+                    crate::daemon::SendOutcome::Rejected(why) => {
+                        // Draft preserved on failure so operator can retry
+                        app.messages_composer.record_not_sent(why);
+                    }
+                    crate::daemon::SendOutcome::Unknown(why) => {
+                        // Draft preserved on uncertain outcome
+                        app.messages_composer.record_uncertain(why);
+                    }
+                }
+                return Ok(Some(InputOutcome::Redraw));
+            }
+            _ => return Ok(Some(InputOutcome::Redraw)),
+        }
+    }
+
+    // When the composer is not focused, handle navigation and shortcut actions
+    if !app.messages_composer.focused || app.messages_composer.mode.is_none() {
+        match key.code {
+            KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(row) = app.messages_queue.selected() {
+                    app.messages_composer = cyclops_ui::ComposerState::new_reply(
+                        row.message_id.to_string(),
+                        row.recipient_label.clone(),
+                        Some(row.recipient),
+                        row.subject.clone(),
+                    );
+                    return Ok(Some(InputOutcome::Redraw));
+                }
+            }
+            KeyCode::Char('a') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let mut recipients: Vec<String> = app
+                    .decoration
+                    .panes
+                    .values()
+                    .filter_map(|p| p.label.clone())
+                    .collect();
+                if recipients.is_empty() {
+                    recipients = vec!["claude".into(), "codex".into(), "agy".into()];
+                }
+                app.messages_composer = cyclops_ui::ComposerState::new_announce(recipients);
+                return Ok(Some(InputOutcome::Redraw));
+            }
+            KeyCode::Char('j') | KeyCode::Down
+                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                app.messages_queue.select_next();
+                return Ok(Some(InputOutcome::Redraw));
+            }
+            KeyCode::Char('k') | KeyCode::Up if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.messages_queue.select_previous();
+                return Ok(Some(InputOutcome::Redraw));
+            }
+            KeyCode::Char('s') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let next = match app.messages_queue.scope() {
+                    cyclops_ui::Scope::Work => cyclops_ui::Scope::Inbox,
+                    cyclops_ui::Scope::Inbox => cyclops_ui::Scope::Outbound,
+                    cyclops_ui::Scope::Outbound => cyclops_ui::Scope::All,
+                    cyclops_ui::Scope::All => cyclops_ui::Scope::Work,
+                };
+                app.messages_queue.set_scope(next);
+                return Ok(Some(InputOutcome::Redraw));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(None)
+}
+
 /// One axis of pointer travel as a signed cell count.
 fn travel(from: u16, to: u16) -> i16 {
     i16::try_from(i32::from(to) - i32::from(from)).unwrap_or(0)
@@ -3975,6 +4134,11 @@ async fn handle_key(
             return Ok(outcome);
         }
     }
+    if app.model.messages_visible && !is_prefix_key(&key) && !app.router.prefix_armed() {
+        if let Some(outcome) = handle_messages_key(app, key).await? {
+            return Ok(outcome);
+        }
+    }
     match app.router.route(key) {
         RouterResult::PrefixArmed => Ok(InputOutcome::NoRedraw),
         RouterResult::Consumed => Ok(InputOutcome::NoRedraw),
@@ -4187,6 +4351,8 @@ fn draw(
                 paint_messages(
                     &app.messages_queue,
                     app.messages_detail.as_ref(),
+                    Some(&app.messages_composer),
+                    &app.avatar_registry,
                     app.notice.text(),
                     messages,
                     f.buffer_mut(),
@@ -4473,6 +4639,8 @@ mod tests {
             record: cyclops_ui::Record::new(),
             messages_queue: cyclops_ui::HumanQueue::default(),
             messages_detail: None,
+            messages_composer: cyclops_ui::ComposerState::default(),
+            avatar_registry: cyclops_ui::AvatarRegistry::default(),
             intake: cyclops_ui::Intake::new(),
             stream_reconciling: false,
             cursor_style: None,

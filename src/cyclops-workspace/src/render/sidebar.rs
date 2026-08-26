@@ -443,6 +443,8 @@ pub fn paint_sidebar_rail(
 pub fn paint_messages(
     queue: &cyclops_ui::HumanQueue,
     detail: Option<&cyclops_ui::Detail>,
+    composer: Option<&cyclops_ui::ComposerState>,
+    avatar_registry: &cyclops_ui::AvatarRegistry,
     status: Option<&str>,
     area: Rect,
     buf: &mut Buffer,
@@ -478,7 +480,14 @@ pub fn paint_messages(
     }
     let rows = match detail {
         Some(d) => cyclops_ui::detail::render_with_status(d, content_w, content_h, status),
-        None => cyclops_ui::queue::render_with_status(queue, content_w, content_h, status),
+        None => cyclops_ui::render_chat(
+            queue,
+            composer,
+            avatar_registry,
+            content_w,
+            content_h,
+            status,
+        ),
     };
     let content_rect = Rect::new(
         area.x + 1,
