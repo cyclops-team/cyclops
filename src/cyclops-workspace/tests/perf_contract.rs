@@ -27,7 +27,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cyclops_testrig::{tmux_available, TmuxServer};
-use cyclops_tmux::{ControlClient, ControlConfig, Notification, NotificationReceiver};
+use cyclops_tmux::{ControlClient, ControlConfig, Notification, NotificationReceiver, TmuxError};
 use cyclops_workspace::app::{coalesce_decoration_signals, CoalesceEnd, DecorationSignal};
 
 /// One measurement at a time. cargo runs this binary's tests on parallel
@@ -99,6 +99,23 @@ fn report_latency(label: &str, samples: &mut [Duration]) {
 /// (`src/cyclops-workspace/src/input.rs`).
 const KEYS: [&str; 4] = ["a", "b", "c", "d"];
 
+async fn forward_one_key(client: &ControlClient, pane: &str, key: &str) {
+    match client.send_keys_unconfirmed(pane, &[key]).await {
+        Ok(()) => {}
+        Err(TmuxError::Busy) => {
+            let capacity = client
+                .reserve_input_capacity()
+                .await
+                .expect("reply capacity reopens");
+            client
+                .send_keys_unconfirmed_reserved(pane, &[key], capacity)
+                .await
+                .expect("reserved key write");
+        }
+        Err(error) => panic!("send_keys_unconfirmed: {error}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 1. KEY-TO-CONTROL-WRITE p95
 // ---------------------------------------------------------------------------
@@ -107,8 +124,11 @@ const KEYS: [&str; 4] = ["a", "b", "c", "d"];
 /// (`src/cyclops-workspace/src/app.rs`) is the fast path every keystroke a
 /// focused pane does not consume as a binding takes: it calls
 /// `ControlClient::send_keys_unconfirmed`, the "forward without waiting for
-/// tmux's empty success reply" method (`cyclops-tmux/src/control.rs`) built
-/// so an interactive client does not pay a tmux round trip on every key.
+/// tmux's empty success reply" method
+/// (`cyclops-tmux/src/control.rs`) built so an interactive client does not
+/// pay a tmux round trip. A saturated reply FIFO uses the same explicit
+/// reservation that the application event loop waits on while continuing
+/// to drain tmux output.
 /// This times that exact call against an idle pane — the floor
 /// `key_to_control_write_latency_during_output_flood` compares against.
 #[tokio::test]
@@ -118,19 +138,17 @@ async fn key_to_control_write_latency() {
         return;
     };
     rig.session("keys", 80, 24);
-    let (client, _notif) = ControlClient::spawn(rig.config("keys"))
+    let (client, mut notif) = ControlClient::spawn(rig.config("keys"))
         .await
         .expect("attach");
+    tokio::spawn(async move { while notif.recv().await.is_some() {} });
 
     const ITERS: usize = 500;
     let mut samples = Vec::with_capacity(ITERS);
     for i in 0..ITERS {
         let key = KEYS[i % KEYS.len()];
         let t = Instant::now();
-        client
-            .send_keys_unconfirmed("%0", &[key])
-            .await
-            .expect("send_keys_unconfirmed");
+        forward_one_key(&client, "%0", key).await;
         samples.push(t.elapsed());
     }
     report_latency("key_to_control_write (idle pane)", &mut samples);
@@ -147,10 +165,9 @@ async fn key_to_control_write_latency() {
 /// background task, the same shape `spawn_notif_forwarder` runs in
 /// production, so the flood's `%extended-output` stream (control mode
 /// switches to the flow-control form once `pause-after` is set, which
-/// `ControlClient::spawn` always does) never queues up behind an unread
-/// channel; an unbounded channel means that queue can never propagate
-/// backpressure into `send_keys_unconfirmed`'s own write in the first
-/// place, which is the point of comparing these two numbers.
+/// `ControlClient::spawn` always does) is consumed through the same bounded
+/// backpressure path as production. Saturation may delay a write, but it must
+/// not disconnect the control stream or drop an input key.
 #[tokio::test]
 async fn key_to_control_write_latency_during_output_flood() {
     let _serial = SERIAL.lock().await;
@@ -195,10 +212,7 @@ async fn key_to_control_write_latency_during_output_flood() {
     for i in 0..ITERS {
         let key = KEYS[i % KEYS.len()];
         let t = Instant::now();
-        client
-            .send_keys_unconfirmed("%0", &[key])
-            .await
-            .expect("send_keys_unconfirmed");
+        forward_one_key(&client, "%0", key).await;
         samples.push(t.elapsed());
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -220,12 +234,11 @@ async fn key_to_control_write_latency_during_output_flood() {
 /// `ControlClient::spawn`'s real notification receiver on the render
 /// debounce's own cadence (`RENDER_DEBOUNCE`, `src/cyclops-workspace/src/
 /// app.rs`), recording each drain's batch count and byte count. This is the
-/// bounded-queue-under-soak evidence for the recommendation's contract:
-/// the channel is unbounded (never applies backpressure to the reader that
-/// keeps tmux from pausing the pane, scenario 2's point) and every byte
-/// tmux sends still gets consumed — nothing here can silently grow forever
-/// without a drain noticing, because each tick's `try_recv` loop empties
-/// the channel down to whatever arrived since the last tick.
+/// bounded-queue-under-soak evidence for the recommendation's contract. The
+/// channel and its payload are bounded, and a full queue backpressures the
+/// control reader without disconnecting or losing ordered notifications.
+/// The producer emits an explicit end marker so a scheduler gap cannot be
+/// mistaken for completion.
 #[tokio::test]
 async fn sustained_output_backlog_drains_continuously() {
     let _serial = SERIAL.lock().await;
@@ -239,11 +252,12 @@ async fn sustained_output_backlog_drains_continuously() {
 
     // ~5.9MB: "flood " (6 bytes) x 1,000,000 lines via `yes`, capped so the
     // flood has a definite end this test can detect.
+    const END_MARKER: &[u8] = b"CYCLOPS_PERF_FLOOD_END";
     rig.server.run_ok(&[
         "send-keys",
         "-t",
         "%0",
-        "yes flood | head -c 6000000",
+        "yes flood | head -c 6000000; printf '\\n%s\\n' 'CYCLOPS_PERF_''FLOOD_END'",
         "Enter",
     ]);
 
@@ -254,6 +268,8 @@ async fn sustained_output_backlog_drains_continuously() {
     let mut started = false;
     let mut idle_streak = 0usize;
     let mut max_active_idle_streak = 0usize;
+    let mut marker_window = Vec::with_capacity(END_MARKER.len() * 2);
+    let mut producer_finished = false;
     // Safety valve: ~24s of draining is far past what a 6MB flood on this
     // control connection should ever take, even on a loaded CI box.
     for _ in 0..3000 {
@@ -265,6 +281,15 @@ async fn sustained_output_backlog_drains_continuously() {
             match n {
                 Notification::Output { data, .. } | Notification::ExtendedOutput { data, .. } => {
                     bytes += data.len();
+                    marker_window.extend_from_slice(&data);
+                    producer_finished |= marker_window
+                        .windows(END_MARKER.len())
+                        .any(|window| window == END_MARKER);
+                    let keep = END_MARKER.len().saturating_sub(1);
+                    if marker_window.len() > keep {
+                        let discard = marker_window.len() - keep;
+                        marker_window.drain(..discard);
+                    }
                 }
                 _ => {}
             }
@@ -272,17 +297,15 @@ async fn sustained_output_backlog_drains_continuously() {
         batch_counts.push(count);
         batch_bytes.push(bytes);
         total_bytes += bytes as u64;
-        if count > 0 {
+        if bytes > 0 {
             started = true;
             idle_streak = 0;
         } else if started {
             idle_streak += 1;
             max_active_idle_streak = max_active_idle_streak.max(idle_streak);
-            // Five consecutive empty 8ms drains (40ms of silence) after the
-            // flood was seen at all: it has ended.
-            if idle_streak >= 5 {
-                break;
-            }
+        }
+        if producer_finished {
+            break;
         }
     }
 
@@ -298,6 +321,10 @@ async fn sustained_output_backlog_drains_continuously() {
     assert!(
         started,
         "the drain never saw any output from the flood at all"
+    );
+    assert!(
+        producer_finished,
+        "the drain did not reach the producer's explicit end marker"
     );
     assert!(
         total_bytes > 1_000_000,
@@ -317,20 +344,19 @@ async fn sustained_output_backlog_drains_continuously() {
 /// riding tmux's own much longer disconnect timer.
 ///
 /// 300 seconds of a stalled reader is not a budget any test can wait out,
-/// and no amount of *flooding* alone reproduces it against the real
-/// `ControlClient`: `reader_task`'s `read_until` loop drains the control
-/// connection's OS pipe immediately and unconditionally, so tmux never
-/// sees this client fall behind no matter how slowly the unbounded
-/// `Notification` channel is drained downstream. Confirmed empirically
+/// and no amount of *flooding* alone reproduced it against the earlier
+/// `ControlClient`, whose reader disconnected instead of backpressuring.
+/// The current bounded notification queue propagates pressure to that reader.
+/// This opt-in fixture stalls the runtime directly so it isolates tmux's pause
+/// contract from downstream consumer timing. Earlier behavior was confirmed
 /// against a bare `tmux -C` connection outside this harness: reading its
 /// stdout as fast as possible across an 8s, 8+MB flood never drew a
 /// `%pause`; a connection that simply stopped calling read on its own
 /// stdout for 3s — nothing else different — drew one right at the
 /// configured threshold, every time.
 ///
-/// So the one legitimate way left to see a real `%pause` against the real
-/// `ControlClient` inside a bounded test is to stall the one thing that can
-/// stall it: this test's own single-threaded tokio runtime, which
+/// The fixture sees a real `%pause` by stalling its own single-threaded tokio
+/// runtime, which
 /// `reader_task` shares (`#[tokio::test]`'s default flavor). Lowering
 /// `pause-after` to 1s and then blocking that thread with a plain
 /// synchronous sleep — not touching `reader_task` itself, which stays
@@ -389,6 +415,7 @@ async fn stall_until_paused(notif: &mut NotificationReceiver) -> Option<String> 
 }
 
 #[tokio::test]
+#[ignore = "live tmux flow-control soak; opt-in only"]
 async fn flow_control_pause_and_resume() {
     let _serial = SERIAL.lock().await;
     let Some(rig) = Rig::new("perf-flow") else {

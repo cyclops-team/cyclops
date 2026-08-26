@@ -23,12 +23,16 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 
 use crossterm::event::{
     self, Event, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use cyclops_tmux::{ControlClient, ControlConfig, Notification, NotificationReceiver};
+use cyclops_tmux::{
+    ControlClient, ControlConfig, InputCapacity, Notification, NotificationReceiver, TmuxError,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
@@ -101,8 +105,8 @@ const PRIORITY_BURST: usize = 8;
 /// A send worker is serial per composer, so one answer is the full action
 /// backlog the application can use.
 const ACTION_CAPACITY: usize = 1;
-/// Pointer motion is advisory. One pending terminal change is sufficient:
-/// excess motion is discarded while clicks, focus, and resize wait for it.
+/// One pending focus or resize edge is sufficient. Interactive keys, paste,
+/// and mouse actions use the priority lanes instead.
 const TERMINAL_CAPACITY: usize = 1;
 /// Match the stream UI's shipped paste quarantine. Larger clipboard data is
 /// refused before it enters the application queue.
@@ -365,7 +369,17 @@ fn arm(debounce: &mut Option<Instant>) {
 
 enum Wake {
     Message(Option<AppMsg>),
+    InputCapacity(Result<InputCapacity, TmuxError>),
     Deadline,
+}
+
+type InputCapacityFuture =
+    Pin<Box<dyn Future<Output = Result<InputCapacity, TmuxError>> + Send + 'static>>;
+
+#[derive(Debug, PartialEq, Eq)]
+struct PendingPaneInput {
+    pane: String,
+    keys: Vec<String>,
 }
 
 /// Wait for a message or the next armed deadline. The explicit due check is
@@ -492,6 +506,27 @@ async fn next_message(
     message
 }
 
+async fn next_background_message(
+    terminal_rx: &mut mpsc::Receiver<AppMsg>,
+    tmux_rx: &mut mpsc::Receiver<AppMsg>,
+    stream_rx: &mut mpsc::Receiver<AppMsg>,
+    allow_stream: bool,
+    cursor: &mut usize,
+) -> Option<AppMsg> {
+    if let Some(message) =
+        try_background_ready(terminal_rx, tmux_rx, stream_rx, allow_stream, cursor)
+    {
+        return Some(message);
+    }
+    let (lane, message) = tokio::select! {
+        message = terminal_rx.recv() => (0, message),
+        message = tmux_rx.recv() => (1, message),
+        message = stream_rx.recv(), if allow_stream => (2, message),
+    };
+    *cursor = (lane + 1) % 3;
+    message
+}
+
 async fn next_wake(
     input_rx: &mut mpsc::Receiver<AppMsg>,
     paste_rx: &mut mpsc::Receiver<AppMsg>,
@@ -533,6 +568,45 @@ async fn next_wake(
             allow_stream,
             fairness,
         ) => Wake::Message(msg),
+        _ = sleep_until(deadline) => Wake::Deadline,
+    }
+}
+
+/// Wait for one held pane-input batch to gain reply capacity while the app
+/// keeps consuming background state. Priority lanes are intentionally absent:
+/// a later key, paste, or action cannot pass the batch already accepted from
+/// the terminal. The same capacity future survives background wakes, so an
+/// output flood cannot repeatedly move it to the back of the semaphore queue.
+async fn next_pending_input_wake(
+    capacity: &mut InputCapacityFuture,
+    terminal_rx: &mut mpsc::Receiver<AppMsg>,
+    tmux_rx: &mut mpsc::Receiver<AppMsg>,
+    stream_rx: &mut mpsc::Receiver<AppMsg>,
+    allow_stream: bool,
+    background_cursor: &mut usize,
+    deadline: Option<Instant>,
+) -> Wake {
+    if deadline.is_some_and(|at| at <= Instant::now()) {
+        return Wake::Deadline;
+    }
+    let background = next_background_message(
+        terminal_rx,
+        tmux_rx,
+        stream_rx,
+        allow_stream,
+        background_cursor,
+    );
+    let Some(deadline) = deadline else {
+        return tokio::select! {
+            biased;
+            result = capacity.as_mut() => Wake::InputCapacity(result),
+            message = background => Wake::Message(message),
+        };
+    };
+    tokio::select! {
+        biased;
+        result = capacity.as_mut() => Wake::InputCapacity(result),
+        message = background => Wake::Message(message),
         _ = sleep_until(deadline) => Wake::Deadline,
     }
 }
@@ -658,11 +732,11 @@ pub async fn run_async() -> i32 {
             }
             Ok(Event::Mouse(m)) => {
                 let sent = if matches!(m.kind, MouseEventKind::Moved) {
-                    terminal_tx.try_send(AppMsg::Mouse(m)).is_ok()
+                    input_tx.try_send(AppMsg::Mouse(m)).is_ok()
                 } else {
-                    terminal_tx.blocking_send(AppMsg::Mouse(m)).is_ok()
+                    input_tx.blocking_send(AppMsg::Mouse(m)).is_ok()
                 };
-                if !sent && terminal_tx.is_closed() {
+                if !sent && input_tx.is_closed() {
                     break;
                 }
             }
@@ -876,6 +950,8 @@ pub async fn run_async() -> i32 {
     let mut debounce: Option<Instant> = None;
     let mut reconnect_deadline: Option<Instant> = None;
     let mut ingress_fairness = IngressFairness::default();
+    let mut pending_input: Option<PendingPaneInput> = None;
+    let mut input_capacity: Option<InputCapacityFuture> = None;
     // The animation clock (`crate::animate`) sits with the loop's other
     // deadlines rather than in `App`: nothing outside this loop and `draw`
     // reads it, and its wakeups are scheduled here the same one-shot way
@@ -903,19 +979,37 @@ pub async fn run_async() -> i32 {
         .into_iter()
         .flatten()
         .min();
-        match next_wake(
-            &mut input_rx,
-            &mut paste_rx,
-            &mut action_rx,
-            &mut terminal_rx,
-            &mut tmux_rx,
-            &mut stream_rx,
-            !app.stream_reconciling,
-            &mut ingress_fairness,
-            next_deadline,
-        )
-        .await
-        {
+        if pending_input.is_some() && input_capacity.is_none() {
+            input_capacity = Some(Box::pin(client.reserve_input_capacity()));
+        } else if pending_input.is_none() {
+            input_capacity = None;
+        }
+        let wake = if let Some(capacity) = input_capacity.as_mut() {
+            next_pending_input_wake(
+                capacity,
+                &mut terminal_rx,
+                &mut tmux_rx,
+                &mut stream_rx,
+                !app.stream_reconciling,
+                &mut ingress_fairness.background_cursor,
+                next_deadline,
+            )
+            .await
+        } else {
+            next_wake(
+                &mut input_rx,
+                &mut paste_rx,
+                &mut action_rx,
+                &mut terminal_rx,
+                &mut tmux_rx,
+                &mut stream_rx,
+                !app.stream_reconciling,
+                &mut ingress_fairness,
+                next_deadline,
+            )
+            .await
+        };
+        match wake {
             Wake::Message(msg) => {
                 if !handle_app_msg(
                     msg,
@@ -924,10 +1018,41 @@ pub async fn run_async() -> i32 {
                     &mut debounce,
                     &mut reconnect_deadline,
                     &mut detached,
+                    &mut pending_input,
                 )
                 .await
                 {
                     break;
+                }
+            }
+            Wake::InputCapacity(result) => {
+                input_capacity = None;
+                let pending = pending_input
+                    .take()
+                    .expect("capacity wake belongs to one pending input");
+                match result {
+                    Ok(capacity) => {
+                        let keys: Vec<&str> = pending.keys.iter().map(String::as_str).collect();
+                        if let Err(error) = client
+                            .send_keys_unconfirmed_reserved(&pending.pane, &keys, capacity)
+                            .await
+                        {
+                            log_err(&app.home, &error);
+                            app.notice.show(
+                                copy::pane_input_not_sent(&pending.pane, &error),
+                                Instant::now(),
+                            );
+                            arm(&mut debounce);
+                        }
+                    }
+                    Err(error) => {
+                        log_err(&app.home, &error);
+                        app.notice.show(
+                            copy::pane_input_not_sent(&pending.pane, &error),
+                            Instant::now(),
+                        );
+                        arm(&mut debounce);
+                    }
                 }
             }
             Wake::Deadline => {
@@ -1868,6 +1993,7 @@ enum InputOutcome {
     Detached,
     Redraw,
     NoRedraw,
+    Pending(PendingPaneInput),
 }
 
 /// The smallest grid worth declaring to tmux. Below this the terminal is
@@ -2012,6 +2138,7 @@ async fn handle_app_msg(
     debounce: &mut Option<Instant>,
     reconnect_deadline: &mut Option<Instant>,
     detached: &mut bool,
+    pending_input: &mut Option<PendingPaneInput>,
 ) -> bool {
     let Some(msg) = msg else {
         return false;
@@ -2154,6 +2281,12 @@ async fn handle_app_msg(
             }
         }
         AppMsg::LinkLost => {
+            if let Some(pending) = pending_input.take() {
+                app.notice.show(
+                    copy::pane_input_not_sent(&pending.pane, &TmuxError::Disconnected),
+                    Instant::now(),
+                );
+            }
             app.reconnect_attempt = 0;
             schedule_reconnect(app, reconnect_deadline);
             arm(debounce);
@@ -2314,6 +2447,10 @@ async fn handle_app_msg(
                 Ok(InputOutcome::Detached) => *detached = true,
                 Ok(InputOutcome::Redraw) => arm(debounce),
                 Ok(InputOutcome::NoRedraw) => {}
+                Ok(InputOutcome::Pending(pending)) => {
+                    debug_assert!(pending_input.is_none());
+                    *pending_input = Some(pending);
+                }
                 Err(e) => log_err(&app.home, &e),
             }
         }
@@ -3905,6 +4042,21 @@ fn install_reconciled_model(
     *current = fresh;
 }
 
+/// Forward one already-routed input event, retaining its exact target and
+/// key batch when the bounded reply FIFO is temporarily full.
+async fn forward_pane_input(
+    client: &ControlClient,
+    pane: String,
+    keys: Vec<String>,
+) -> Result<InputOutcome, TmuxError> {
+    let borrowed: Vec<&str> = keys.iter().map(String::as_str).collect();
+    match client.send_keys_unconfirmed(&pane, &borrowed).await {
+        Ok(()) => Ok(InputOutcome::NoRedraw),
+        Err(TmuxError::Busy) => Ok(InputOutcome::Pending(PendingPaneInput { pane, keys })),
+        Err(error) => Err(error),
+    }
+}
+
 /// Route one key to an [`Action`] (via [`action::route_binding`]) and run
 /// it through the executor. Key passthrough to the focused pane is NOT an
 /// action and stays on its own fast path below, unconfirmed and untouched.
@@ -3972,15 +4124,18 @@ async fn handle_key(
                 crate::input::SelectAllOutcome::ClearLine => {
                     // Cursor to end first, so kill-to-start takes the
                     // whole line no matter where the cursor sat.
-                    client.send_keys_unconfirmed(&pane, &["C-e", "C-u"]).await?;
-                    return Ok(InputOutcome::NoRedraw);
+                    return forward_pane_input(
+                        client,
+                        pane,
+                        vec!["C-e".to_string(), "C-u".to_string()],
+                    )
+                    .await;
                 }
                 crate::input::SelectAllOutcome::Forward => {}
             }
             let encoded = encode_send_keys(&key);
             if !encoded.is_empty() {
-                let keys: Vec<&str> = encoded.iter().map(String::as_str).collect();
-                client.send_keys_unconfirmed(&pane, &keys).await?;
+                return forward_pane_input(client, pane, encoded).await;
             }
             Ok(InputOutcome::NoRedraw)
         }
@@ -4526,6 +4681,108 @@ mod tests {
             .await,
             Wake::Deadline
         ));
+    }
+
+    #[tokio::test]
+    async fn pending_pane_input_drains_background_without_consuming_later_actions() {
+        let (input_tx, mut input_rx) = mpsc::channel(4);
+        let (paste_tx, mut paste_rx) = mpsc::channel(1);
+        let (action_tx, mut action_rx) = mpsc::channel(4);
+        let (terminal_tx, mut terminal_rx) = mpsc::channel(4);
+        let (tmux_tx, mut tmux_rx) = mpsc::channel(4);
+        let (stream_tx, mut stream_rx) = mpsc::channel(4);
+        let mut background_cursor = 0;
+        let mut capacity: InputCapacityFuture = Box::pin(std::future::pending());
+
+        input_tx
+            .try_send(AppMsg::Input(KeyEvent::new(
+                crossterm::event::KeyCode::Char('b'),
+                KeyModifiers::empty(),
+            )))
+            .expect("input lane accepts a later key");
+        input_tx
+            .try_send(AppMsg::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::empty(),
+            }))
+            .expect("input lane accepts a later mouse action");
+        paste_tx
+            .try_send(AppMsg::Paste("later paste".to_string()))
+            .expect("paste lane accepts later text");
+        action_tx
+            .try_send(AppMsg::ThemeChanged)
+            .expect("action lane accepts a later completion");
+        tmux_tx
+            .try_send(AppMsg::Redraw)
+            .expect("tmux lane carries background state");
+        terminal_tx
+            .try_send(AppMsg::Focus(true))
+            .expect("terminal lane carries focus state");
+        stream_tx
+            .try_send(AppMsg::ThemeChanged)
+            .expect("stream lane carries daemon state");
+
+        for expected in ["focus", "tmux", "stream"] {
+            let wake = next_pending_input_wake(
+                &mut capacity,
+                &mut terminal_rx,
+                &mut tmux_rx,
+                &mut stream_rx,
+                true,
+                &mut background_cursor,
+                None,
+            )
+            .await;
+            match (expected, wake) {
+                ("focus", Wake::Message(Some(AppMsg::Focus(true))))
+                | ("tmux", Wake::Message(Some(AppMsg::Redraw)))
+                | ("stream", Wake::Message(Some(AppMsg::ThemeChanged))) => {}
+                _ => panic!("pending input drained background lanes out of order"),
+            }
+        }
+        assert!(matches!(input_rx.try_recv(), Ok(AppMsg::Input(_))));
+        assert!(matches!(input_rx.try_recv(), Ok(AppMsg::Mouse(_))));
+        assert!(matches!(paste_rx.try_recv(), Ok(AppMsg::Paste(_))));
+        assert!(matches!(action_rx.try_recv(), Ok(AppMsg::ThemeChanged)));
+    }
+
+    #[tokio::test]
+    async fn disconnected_capacity_wins_without_replaying_a_later_message() {
+        let (_terminal_tx, mut terminal_rx) = mpsc::channel(4);
+        let (tmux_tx, mut tmux_rx) = mpsc::channel(4);
+        let (_stream_tx, mut stream_rx) = mpsc::channel(4);
+        let mut background_cursor = 0;
+        let mut capacity: InputCapacityFuture = Box::pin(async { Err(TmuxError::Disconnected) });
+        tmux_tx
+            .try_send(AppMsg::Redraw)
+            .expect("tmux lane accepts a ready message");
+
+        assert!(matches!(
+            next_pending_input_wake(
+                &mut capacity,
+                &mut terminal_rx,
+                &mut tmux_rx,
+                &mut stream_rx,
+                true,
+                &mut background_cursor,
+                None,
+            )
+            .await,
+            Wake::InputCapacity(Err(TmuxError::Disconnected))
+        ));
+        assert!(matches!(tmux_rx.try_recv(), Ok(AppMsg::Redraw)));
+    }
+
+    #[test]
+    fn held_input_keeps_the_original_pane_and_exact_keys() {
+        let held = PendingPaneInput {
+            pane: "%7".to_string(),
+            keys: vec!["C-e".to_string(), "C-u".to_string()],
+        };
+        assert_eq!(held.pane, "%7");
+        assert_eq!(held.keys, ["C-e", "C-u"]);
     }
 
     #[tokio::test]

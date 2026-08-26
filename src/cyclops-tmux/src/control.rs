@@ -21,10 +21,10 @@
 //! lines invalid UTF-8 on its own. Decoding must never decide whether the
 //! connection lives.
 //!
-//! Notifications enter a bounded ordered queue. Queue overflow or an
-//! oversized control line closes this connection so the owner can reconnect
-//! and rebuild a whole snapshot. The reader never skips one notification and
-//! pretends later notifications are contiguous.
+//! Notifications enter a bounded ordered queue. A full queue backpressures the
+//! reader instead of dropping ordered state or closing a healthy connection.
+//! An oversized control line still closes the connection so the owner can
+//! reconnect and rebuild a whole snapshot.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -45,9 +45,8 @@ use crate::quote::quote_arg;
 
 static SPOOL_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Notifications waiting outside the control reader. A full queue means the
-/// consumer no longer keeps up with an ordered tmux stream, so the reader
-/// disconnects and lets its owner reconcile from a fresh snapshot.
+/// Notifications waiting outside the control reader. A full queue applies
+/// bounded backpressure until the consumer makes room.
 pub const NOTIFICATION_CAPACITY: usize = 256;
 /// Aggregate retained notification payload. Item capacity still bounds
 /// bookkeeping, while this budget prevents a queue of large output records
@@ -61,9 +60,10 @@ pub const CONTROL_BLOCK_MAX_BYTES: usize = 8 << 20;
 /// Reply rows accepted in one block. This also bounds the `Vec<String>`
 /// bookkeeping when rows themselves are empty.
 pub const CONTROL_BLOCK_MAX_LINES: usize = 65_536;
-/// Commands awaiting correlated reply blocks. A caller that cannot reserve a
-/// slot is refused before writing, so the reply FIFO and command tasks stay
-/// fixed.
+/// Commands awaiting correlated reply blocks. General concurrent callers are
+/// refused before writing when no slot is available. The serialized workspace
+/// input owner may wait for a slot, but the reply FIFO stays fixed at this
+/// bound.
 pub const PENDING_REPLY_CAPACITY: usize = 64;
 /// Pause resume asks waiting behind the single resume writer.
 const PAUSE_RESUME_CAPACITY: usize = 64;
@@ -184,6 +184,16 @@ struct ReplySlot {
     _permit: OwnedSemaphorePermit,
 }
 
+/// One reserved reply slot for a pane-input command.
+///
+/// The workspace holds this only after its event loop observes that the
+/// bounded reply FIFO is full. The fields stay private so capacity can only
+/// be spent by [`ControlClient::send_keys_unconfirmed_reserved`].
+pub struct InputCapacity {
+    reply_slots: Arc<Semaphore>,
+    permit: OwnedSemaphorePermit,
+}
+
 /// Shared write side: stdin plus the FIFO of waiting reply slots. The slot
 /// is pushed while the stdin lock is held, so queue order always matches
 /// write order, which is what makes FIFO correlation sound.
@@ -217,20 +227,35 @@ impl CommandPipe {
     /// `Continue` notification in the reader itself, at the exact point that
     /// reply appears in the ordered control stream.
     async fn submit_resume(&self, cmd: &str, pane: String) -> Result<(), TmuxError> {
-        self.submit_target(cmd, ReplyTarget::Resume { pane }).await
+        validate_command_line(cmd)?;
+        let permit = self.reserve_capacity().await?;
+        self.write_target(cmd, ReplyTarget::Resume { pane }, permit)
+            .await
     }
 
     async fn submit_target(&self, cmd: &str, target: ReplyTarget) -> Result<(), TmuxError> {
-        if cmd.contains('\n') || cmd.contains('\r') {
-            return Err(TmuxError::Protocol(format!(
-                "command contains a line break: {cmd:?}"
-            )));
-        }
+        validate_command_line(cmd)?;
         let permit = match Arc::clone(&self.reply_slots).try_acquire_owned() {
             Ok(permit) => permit,
             Err(tokio::sync::TryAcquireError::NoPermits) => return Err(TmuxError::Busy),
             Err(tokio::sync::TryAcquireError::Closed) => return Err(TmuxError::Disconnected),
         };
+        self.write_target(cmd, target, permit).await
+    }
+
+    async fn reserve_capacity(&self) -> Result<OwnedSemaphorePermit, TmuxError> {
+        Arc::clone(&self.reply_slots)
+            .acquire_owned()
+            .await
+            .map_err(|_| TmuxError::Disconnected)
+    }
+
+    async fn write_target(
+        &self,
+        cmd: &str,
+        target: ReplyTarget,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<(), TmuxError> {
         let mut guard = self.stdin.lock().await;
         let Some(stdin) = guard.as_mut() else {
             return Err(TmuxError::Disconnected);
@@ -262,6 +287,9 @@ impl CommandPipe {
 
     /// Drop stdin (tmux sees EOF) and fail everything still waiting.
     async fn close(&self) {
+        // Wake capacity waiters before draining slots. Existing permits may
+        // finish their current write, but no new writer can enter this pipe.
+        self.reply_slots.close();
         *self.stdin.lock().await = None;
         let mut pending = self.pending.lock().expect("pending lock");
         while let Some(slot) = pending.pop_front() {
@@ -270,6 +298,15 @@ impl CommandPipe {
             }
         }
     }
+}
+
+fn validate_command_line(cmd: &str) -> Result<(), TmuxError> {
+    if cmd.contains('\n') || cmd.contains('\r') {
+        return Err(TmuxError::Protocol(format!(
+            "command contains a line break: {cmd:?}"
+        )));
+    }
+    Ok(())
 }
 
 struct QueuedNotification {
@@ -569,9 +606,9 @@ impl ControlClient {
     }
 
     /// Total control-mode commands written on this connection, confirmed
-    /// or fire-and-forget alike (every path through [`CommandPipe::submit`],
-    /// which is both [`ControlClient::command`] and the `_unconfirmed`
-    /// variants). Counts lines written, not replies received. Includes the
+    /// or fire-and-forget alike (every path through
+    /// [`CommandPipe::write_target`]). Counts lines written, not replies
+    /// received. Includes the
     /// attach handshake's own command, so callers proving "a small fixed
     /// number of commands" should compare a before/after delta rather than
     /// the absolute value.
@@ -706,6 +743,59 @@ impl ControlClient {
             self.command_unconfirmed(&cmd).await?;
         }
         Ok(())
+    }
+
+    /// Wait for one bounded reply slot without blocking the control reader.
+    ///
+    /// The returned future owns its semaphore wait and does not borrow this
+    /// client. An event loop can keep it pending while it drains tmux output,
+    /// then spend the opaque capacity on the exact pane-input batch that was
+    /// held. Closing the connection resolves the future as `Disconnected`.
+    pub fn reserve_input_capacity(
+        &self,
+    ) -> impl std::future::Future<Output = Result<InputCapacity, TmuxError>> + Send + 'static {
+        let reply_slots = Arc::clone(&self.pipe.reply_slots);
+        async move {
+            let owner = Arc::clone(&reply_slots);
+            reply_slots
+                .acquire_owned()
+                .await
+                .map(|permit| InputCapacity {
+                    reply_slots: owner,
+                    permit,
+                })
+                .map_err(|_| TmuxError::Disconnected)
+        }
+    }
+
+    /// Forward one held pane-input batch using capacity reserved by
+    /// [`ControlClient::reserve_input_capacity`].
+    ///
+    /// One input event must remain one tmux command. Refusing a batch that
+    /// expands to another shape prevents a later command from escaping the
+    /// reservation and failing after part of the event was written.
+    pub async fn send_keys_unconfirmed_reserved(
+        &self,
+        pane_id: &str,
+        keys: &[&str],
+        capacity: InputCapacity,
+    ) -> Result<(), TmuxError> {
+        if !Arc::ptr_eq(&self.pipe.reply_slots, &capacity.reply_slots) {
+            return Err(TmuxError::Disconnected);
+        }
+        let mut commands = send_keys_commands(pane_id, keys);
+        if commands.len() != 1 {
+            return Err(TmuxError::Protocol(format!(
+                "reserved pane input expanded to {} commands",
+                commands.len()
+            )));
+        }
+        let cmd = commands.pop().expect("one reserved command");
+        let (tx, _reply) = oneshot::channel();
+        validate_command_line(&cmd)?;
+        self.pipe
+            .write_target(&cmd, ReplyTarget::Caller(tx), capacity.permit)
+            .await
     }
 
     /// Load bytes into a named tmux buffer.
@@ -997,10 +1087,10 @@ async fn reader_task(stdout: ChildStdout, pipe: CommandPipe, notif_tx: Notificat
                 if let Notification::Pause { pane } = &n {
                     debug!(%pane, "flow control paused pane, resuming");
                     let pane = pane.clone();
-                    if enqueue_notification(&notif_tx, n).is_overflow() {
+                    if enqueue_notification(&notif_tx, n).await.exceeds_envelope() {
                         warn!(
-                            capacity = NOTIFICATION_CAPACITY,
-                            "tmux notification queue overflowed; reconnecting"
+                            bytes = NOTIFICATION_MAX_QUEUED_BYTES,
+                            "tmux notification exceeded its queue envelope; reconnecting"
                         );
                         break;
                     }
@@ -1025,10 +1115,10 @@ async fn reader_task(stdout: ChildStdout, pipe: CommandPipe, notif_tx: Notificat
                     debug!(line = %raw, "unrecognized control line");
                 }
                 // Consumer gone is fine; keep draining for command replies.
-                if enqueue_notification(&notif_tx, n).is_overflow() {
+                if enqueue_notification(&notif_tx, n).await.exceeds_envelope() {
                     warn!(
-                        capacity = NOTIFICATION_CAPACITY,
-                        "tmux notification queue overflowed; reconnecting"
+                        bytes = NOTIFICATION_MAX_QUEUED_BYTES,
+                        "tmux notification exceeded its queue envelope; reconnecting"
                     );
                     break;
                 }
@@ -1060,12 +1150,13 @@ async fn reader_task(stdout: ChildStdout, pipe: CommandPipe, notif_tx: Notificat
                                 &notif_tx,
                                 Notification::Continue { pane: pane.clone() },
                             )
-                            .is_overflow()
+                            .await
+                            .exceeds_envelope()
                             {
                                 warn!(
-                                    capacity = NOTIFICATION_CAPACITY,
+                                    bytes = NOTIFICATION_MAX_QUEUED_BYTES,
                                     %pane,
-                                    "tmux notification queue overflowed after resume; reconnecting"
+                                    "tmux resume notification exceeded its queue envelope; reconnecting"
                                 );
                                 break;
                             }
@@ -1125,34 +1216,40 @@ async fn read_control_line<R: AsyncBufRead + Unpin>(
 enum EnqueueResult {
     Sent,
     ReceiverClosed,
-    Overflow,
+    EnvelopeExceeded,
 }
 
 impl EnqueueResult {
-    fn is_overflow(self) -> bool {
-        matches!(self, Self::Overflow)
+    fn exceeds_envelope(self) -> bool {
+        matches!(self, Self::EnvelopeExceeded)
     }
 }
 
 /// Command callers may discard notifications while continuing to use the
-/// connection, so a closed receiver is harmless. A full receiver is different:
-/// ordered notification state has been lost and requires reconnect recovery.
-fn enqueue_notification(tx: &NotificationSink, notification: Notification) -> EnqueueResult {
+/// connection, so a closed receiver is harmless. A full receiver applies
+/// backpressure to preserve ordered state within fixed item and byte bounds.
+async fn enqueue_notification(tx: &NotificationSink, notification: Notification) -> EnqueueResult {
     let bytes = notification_retained_bytes(&notification).max(1);
+    if bytes > NOTIFICATION_MAX_QUEUED_BYTES {
+        return EnqueueResult::EnvelopeExceeded;
+    }
     let Ok(bytes) = u32::try_from(bytes) else {
-        return EnqueueResult::Overflow;
+        return EnqueueResult::EnvelopeExceeded;
     };
-    let permit = match Arc::clone(&tx.bytes).try_acquire_many_owned(bytes) {
+    let permit = match Arc::clone(&tx.bytes).acquire_many_owned(bytes).await {
         Ok(permit) => permit,
-        Err(_) => return EnqueueResult::Overflow,
+        Err(_) => return EnqueueResult::ReceiverClosed,
     };
-    match tx.tx.try_send(QueuedNotification {
-        notification,
-        _permit: permit,
-    }) {
+    match tx
+        .tx
+        .send(QueuedNotification {
+            notification,
+            _permit: permit,
+        })
+        .await
+    {
         Ok(()) => EnqueueResult::Sent,
-        Err(mpsc::error::TrySendError::Closed(_)) => EnqueueResult::ReceiverClosed,
-        Err(mpsc::error::TrySendError::Full(_)) => EnqueueResult::Overflow,
+        Err(_) => EnqueueResult::ReceiverClosed,
     }
 }
 
@@ -1241,6 +1338,181 @@ fn is_key_name(k: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn command_pipe_without_replies(capacity: usize) -> (CommandPipe, Child) {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn command sink");
+        let stdin = child.stdin.take().expect("command sink stdin");
+        (
+            CommandPipe {
+                stdin: Arc::new(Mutex::new(Some(stdin))),
+                pending: Arc::new(StdMutex::new(VecDeque::new())),
+                reply_slots: Arc::new(Semaphore::new(capacity)),
+                issued: Arc::new(AtomicU64::new(0)),
+            },
+            child,
+        )
+    }
+
+    #[tokio::test]
+    async fn reserved_input_capacity_never_exceeds_the_reply_bound() {
+        let (pipe, mut child) = command_pipe_without_replies(PENDING_REPLY_CAPACITY);
+        for index in 0..PENDING_REPLY_CAPACITY {
+            let _reply = pipe
+                .submit(&format!("display-message -p {index}"))
+                .await
+                .expect("fill bounded reply queue");
+        }
+        assert_eq!(pipe.pending.lock().expect("pending lock").len(), 64);
+        assert!(matches!(
+            pipe.submit("display-message -p fail-fast").await,
+            Err(TmuxError::Busy)
+        ));
+
+        let waiting_pipe = pipe.clone();
+        let mut waiting = tokio::spawn(async move {
+            let permit = waiting_pipe.reserve_capacity().await?;
+            let (tx, rx) = oneshot::channel();
+            waiting_pipe
+                .write_target(
+                    "display-message -p reserved",
+                    ReplyTarget::Caller(tx),
+                    permit,
+                )
+                .await?;
+            Ok::<_, TmuxError>(rx)
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err(),
+            "awaited input must remain pending while all reply slots are held"
+        );
+        assert_eq!(pipe.issued.load(Ordering::Relaxed), 64);
+
+        let completed = pipe.pending.lock().expect("pending lock").pop_front();
+        drop(completed);
+        let _reply = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("capacity waiter wakes")
+            .expect("capacity task completes")
+            .expect("reserved command is written");
+        assert_eq!(pipe.issued.load(Ordering::Relaxed), 65);
+        assert_eq!(pipe.pending.lock().expect("pending lock").len(), 64);
+
+        pipe.close().await;
+        child.wait().await.expect("command sink exits");
+    }
+
+    #[tokio::test]
+    async fn closing_the_pipe_wakes_capacity_waiters_as_disconnected() {
+        let (pipe, mut child) = command_pipe_without_replies(1);
+        let _reply = pipe
+            .submit("display-message -p first")
+            .await
+            .expect("fill reply queue");
+
+        let waiting_pipe = pipe.clone();
+        let mut waiting = tokio::spawn(async move { waiting_pipe.reserve_capacity().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err(),
+            "second command must wait for bounded capacity"
+        );
+
+        pipe.close().await;
+        let result = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("closed pipe wakes waiter")
+            .expect("capacity task completes");
+        assert!(matches!(result, Err(TmuxError::Disconnected)));
+        child.wait().await.expect("command sink exits");
+    }
+
+    #[tokio::test]
+    async fn paused_pane_resume_waits_for_reply_capacity_without_closing_the_pipe() {
+        let (pipe, mut child) = command_pipe_without_replies(1);
+        let _reply = pipe
+            .submit("display-message -p first")
+            .await
+            .expect("fill reply queue");
+
+        let waiting_pipe = pipe.clone();
+        let mut waiting = tokio::spawn(async move {
+            waiting_pipe
+                .submit_resume("refresh-client -A %1:continue", "%1".to_string())
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err(),
+            "resume must wait while the reply FIFO is full"
+        );
+
+        drop(pipe.pending.lock().expect("pending lock").pop_front());
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("resume wakes when capacity opens")
+            .expect("resume task completes")
+            .expect("resume command is written");
+        assert_eq!(pipe.pending.lock().expect("pending lock").len(), 1);
+
+        pipe.close().await;
+        child.wait().await.expect("command sink exits");
+    }
+
+    #[tokio::test]
+    async fn pause_is_observed_before_its_correlated_continue() {
+        let script = r#"
+            printf '%s\n' '%pause %5'
+            IFS= read -r command
+            test "$command" = "refresh-client -A '%5:continue'" || exit 42
+            printf '%s\n' '%begin 1 1 1' '%end 1 1 1'
+        "#;
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn scripted control peer");
+        let stdin = child.stdin.take().expect("script stdin");
+        let stdout = child.stdout.take().expect("script stdout");
+        let pipe = CommandPipe {
+            stdin: Arc::new(Mutex::new(Some(stdin))),
+            pending: Arc::new(StdMutex::new(VecDeque::new())),
+            reply_slots: Arc::new(Semaphore::new(PENDING_REPLY_CAPACITY)),
+            issued: Arc::new(AtomicU64::new(0)),
+        };
+        let (tx, mut rx) = mpsc::channel(4);
+        let sink = NotificationSink {
+            tx,
+            bytes: Arc::new(Semaphore::new(1024)),
+        };
+
+        let reader = tokio::spawn(reader_task(stdout, pipe, sink));
+        let pause = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("pause arrives")
+            .expect("notification queue stays open")
+            .notification;
+        assert_eq!(pause, Notification::Pause { pane: "%5".into() });
+        let resume = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("correlated continue arrives")
+            .expect("notification queue stays open")
+            .notification;
+        assert_eq!(resume, Notification::Continue { pane: "%5".into() });
+
+        reader.await.expect("reader task exits");
+        let status = child.wait().await.expect("script exits");
+        assert!(status.success(), "script rejected the resume command");
+    }
 
     #[test]
     fn router_consumes_unsolicited_initial_block_then_correlates() {
@@ -1363,8 +1635,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn notification_overflow_is_distinct_from_an_unused_receiver() {
+    #[tokio::test]
+    async fn notification_backpressure_is_distinct_from_an_unused_receiver() {
         let (tx, rx) = mpsc::channel(1);
         let tx = NotificationSink {
             tx,
@@ -1374,23 +1646,46 @@ mod tests {
             rx: NotificationQueue::Budgeted(rx),
         };
         assert_eq!(
-            enqueue_notification(&tx, Notification::SessionsChanged),
+            enqueue_notification(&tx, Notification::SessionsChanged).await,
             EnqueueResult::Sent
         );
-        assert_eq!(
-            enqueue_notification(&tx, Notification::SessionsChanged),
-            EnqueueResult::Overflow
+        let waiting_tx = tx.clone();
+        let mut waiting = tokio::spawn(async move {
+            enqueue_notification(
+                &waiting_tx,
+                Notification::WindowAdd {
+                    window: "@1".into(),
+                },
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err(),
+            "a full notification queue must backpressure its producer"
         );
         assert!(matches!(rx.try_recv(), Ok(Notification::SessionsChanged)));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .expect("notification producer wakes")
+                .expect("notification task completes"),
+            EnqueueResult::Sent
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Notification::WindowAdd { window }) if window == "@1"
+        ));
         drop(rx);
         assert_eq!(
-            enqueue_notification(&tx, Notification::SessionsChanged),
+            enqueue_notification(&tx, Notification::SessionsChanged).await,
             EnqueueResult::ReceiverClosed
         );
     }
 
-    #[test]
-    fn notification_payload_budget_is_independent_of_item_capacity() {
+    #[tokio::test]
+    async fn notification_payload_budget_backpressures_independently_of_item_capacity() {
         let (tx, rx) = mpsc::channel(2);
         let tx = NotificationSink {
             tx,
@@ -1406,20 +1701,52 @@ mod tests {
                     pane: "%0".into(),
                     data: b"ab".to_vec(),
                 },
-            ),
+            )
+            .await,
             EnqueueResult::Sent
         );
-        assert_eq!(
-            enqueue_notification(&tx, Notification::SessionsChanged),
-            EnqueueResult::Overflow
+        let waiting_tx = tx.clone();
+        let mut waiting = tokio::spawn(async move {
+            enqueue_notification(&waiting_tx, Notification::SessionsChanged).await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err(),
+            "the byte budget must backpressure before item capacity is full"
         );
         assert!(matches!(
             rx.try_recv(),
-            Ok(Notification::Output { data, .. }) if data == b"ab"
+            Ok(Notification::Output { pane, data })
+                if pane == "%0" && data == b"ab"
         ));
         assert_eq!(
-            enqueue_notification(&tx, Notification::SessionsChanged),
+            tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .expect("byte-budget producer wakes")
+                .expect("notification task completes"),
             EnqueueResult::Sent
+        );
+        assert!(matches!(rx.try_recv(), Ok(Notification::SessionsChanged)));
+    }
+
+    #[tokio::test]
+    async fn notification_larger_than_the_byte_envelope_is_refused() {
+        let (tx, _rx) = mpsc::channel(1);
+        let tx = NotificationSink {
+            tx,
+            bytes: Arc::new(Semaphore::new(NOTIFICATION_MAX_QUEUED_BYTES)),
+        };
+        assert_eq!(
+            enqueue_notification(
+                &tx,
+                Notification::Output {
+                    pane: "%0".into(),
+                    data: vec![b'x'; NOTIFICATION_MAX_QUEUED_BYTES],
+                },
+            )
+            .await,
+            EnqueueResult::EnvelopeExceeded
         );
     }
 

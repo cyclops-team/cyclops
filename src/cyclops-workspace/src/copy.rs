@@ -60,6 +60,10 @@ pub fn stream_stale(why: &str) -> String {
     format!("stream input dropped: {why}; rebuilding history")
 }
 
+pub fn pane_input_not_sent(pane: &str, error: &dyn std::fmt::Display) -> String {
+    format!("input was not sent to {pane}: {error}")
+}
+
 pub const STREAM_RECONCILED: &str = "stream rebuilt from the durable tail";
 
 // No space after the glyph: ☰ is ambiguous-width and most fonts already
