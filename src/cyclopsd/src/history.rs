@@ -497,6 +497,7 @@ pub(crate) fn open_from(
                     state: d.state,
                     ts: d.ts,
                     cause: d.cause.clone(),
+                    attempt_id: None,
                 });
             }
         }

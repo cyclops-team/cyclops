@@ -603,6 +603,7 @@ mod tests {
             "reviewer  ⚠ blocked_permission"
         );
         let delivery = AttentionItem::Delivery {
+            recipient: cyclops_proto::DeliveryRecipientIdentity::LegacyLabel("implementer".into()),
             to: "implementer".into(),
             id: "m-1".into(),
             state: DeliveryState::ParkedBlockedQuota,

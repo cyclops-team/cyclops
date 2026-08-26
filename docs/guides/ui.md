@@ -192,10 +192,15 @@ with one attention item, `◉` open with the count beside it.
 
 The stream counts two things: an agent whose state is blocked, and a
 delivery that parked on a quota or ran out of redelivery. Normal
-`cyclops status` uses the same eye vocabulary for the live pane fleet but
-does not fold durable delivery history into that grid. Mailbox, alarm, and
-stream surfaces show those delivery records and provide the actions that
-resolve them. Both scopes are owned by
+`cyclops status` uses the same eye vocabulary and the same folded record:
+its eye counts blocked panes, legacy delivery alarms, and durable mailbox
+attention and held queue heads, exactly as the stream does, and its `waiting
+on you` rows name the next action for each. The stream takes the mailbox half of
+that record from every `messages.snapshot` its refresh gate accepts, stamped
+by the same `workspace_seq` as the Messages view, so a durable alarm that
+appears or clears while the stream is open moves its eye on that edge, with
+no second read and no reconnect. Mailbox, alarm, and stream
+surfaces provide the actions that resolve them. Both scopes are owned by
 `src/cyclops-proto/src/attention.rs`.
 
 Nothing else counts, pings included. A ping is the daemon telling you
@@ -228,16 +233,18 @@ pane that was blocked in the replayed tail but is gone now counts for
 nothing: the answer lists the panes that exist, and a pane it does not
 list stops counting.
 
-That answer is read once, at startup. Nothing re-reads it, because
-re-reading it on a timer is polling. So while the UI runs, a pane that
-was blocked and then closed drops off the count on its own edge: the
-daemon reports `pane-removed` when a pane leaves the tmux table, and
-that is the pane's last transition. The firehose shows it as
-`%1 closed`.
+That answer's pane half is read once, at startup, and nothing re-reads
+it on a timer, because that would be polling; while the UI runs, a pane's
+state moves on live events alone. The mailbox half is different: it rides
+every `messages.snapshot` the refresh gate accepts, stamped by the same
+`workspace_seq` as the Messages view, so it moves on the `messages.changed`
+edge that invalidated the view, still never on a timer.
 
-`cyclops status` asks for the pane roster only. Its eye answers whether a
-live pane is blocked, and its admin-inbox suffix reports unread human mail.
-Use the mailbox, alarm, or stream surface for durable delivery alarms.
+`cyclops status` asks for the pane roster and the open deliveries. Its eye
+answers whether a live pane is blocked or anything durable waits on a human
+(a legacy delivery alarm, a mailbox attempt needing attention, a held queue
+head), and its admin-inbox suffix reports unread human mail. A closed eye
+with a held mailbox queue behind it is no longer possible.
 
 Anything the count knows about gets a line in the stream, timestamped
 when it happened, so a park from this morning reads as this morning. It

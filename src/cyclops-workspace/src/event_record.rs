@@ -165,6 +165,7 @@ mod tests {
             admin_unread: 0,
             mailbox_routes: Vec::new(),
             roster: Vec::new(),
+            mailbox: Vec::new(),
         })
     }
 

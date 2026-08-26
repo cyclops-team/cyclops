@@ -1229,10 +1229,13 @@ fn ask<T>(
 }
 
 fn cmd_status(c: &mut Client, cli: &Cli, style: &Style) -> i32 {
+    // The eye counts the record, not only the live pane fleet: open
+    // deliveries carry legacy direct-delivery alarms and, folded by the
+    // daemon, durable mailbox attention and held queue heads.
     let status: StatusResult = match ask(
         c,
         "status",
-        json!({}),
+        json!({"open_deliveries": true}),
         cli.json,
         None,
         serde_json::from_value,

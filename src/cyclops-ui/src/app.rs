@@ -274,6 +274,34 @@ fn next_client_key() -> String {
     format!("ui-{}", uuid::Uuid::new_v4())
 }
 
+/// Route and recipient maps a seed carries, in the shapes the record's seed
+/// path takes: pane id to session index, and label or pane id to exact key.
+fn seed_maps(
+    seed: &StatusSeed,
+) -> (
+    HashMap<String, usize>,
+    HashMap<String, cyclops_proto::RecipientKey>,
+) {
+    let routes = seed
+        .roster
+        .iter()
+        .map(|pane| (pane.pane_id.clone(), pane.session_idx))
+        .collect();
+    let recipients = seed
+        .mailbox_routes
+        .iter()
+        .flat_map(|route| {
+            let recipient = route.recipient();
+            let mut keys = vec![(route.label().to_string(), recipient)];
+            if let Some(pane_id) = recipient.pane_id() {
+                keys.push((pane_id.to_string(), recipient));
+            }
+            keys
+        })
+        .collect();
+    (routes, recipients)
+}
+
 impl App {
     pub fn new(theme: Theme, view: View, filter: Filter) -> App {
         App {
@@ -595,16 +623,54 @@ impl App {
 
     /// Apply a response only if it belongs to the current connection and
     /// covers every durable change already observed on the stream.
+    /// Apply a `messages.snapshot` the refresh gate accepts. The Messages
+    /// view takes the rows; the register takes the snapshot's mailbox
+    /// attention as its mailbox half, stamped by the same `workspace_seq`,
+    /// so the eye moves on the edge that invalidated the view and never on
+    /// a second, uncorrelated read. Returns the lines that changed, or
+    /// `None` when the gate rejected the snapshot.
     pub fn apply_messages_response(
         &mut self,
         request: crate::messages::RefreshRequest,
         snapshot: &cyclops_proto::MessagesSnapshotResult,
-    ) -> bool {
+    ) -> Option<Vec<Entry>> {
         if !self.refresh.finish_snapshot(request, snapshot) {
-            return false;
+            return None;
         }
         self.apply_messages(snapshot);
-        true
+        let (routes, recipients) = self.current_maps();
+        Some(
+            self.record
+                .seed_mailbox(&snapshot.mailbox_attention, &routes, &recipients),
+        )
+    }
+
+    /// The route and recipient maps the record's seed path takes, from the
+    /// roster and mailbox routes the app already holds.
+    fn current_maps(
+        &self,
+    ) -> (
+        HashMap<String, usize>,
+        HashMap<String, cyclops_proto::RecipientKey>,
+    ) {
+        let routes = self
+            .roster
+            .values()
+            .map(|row| (row.pane_id.clone(), row.session_idx))
+            .collect();
+        let recipients = self
+            .filter_routes
+            .iter()
+            .flat_map(|route| {
+                let recipient = route.recipient();
+                let mut keys = vec![(route.label().to_string(), recipient)];
+                if let Some(pane_id) = recipient.pane_id() {
+                    keys.push((pane_id.to_string(), recipient));
+                }
+                keys
+            })
+            .collect();
+        (routes, recipients)
     }
 
     /// Return the next snapshot request, if one is owed. Asked once per
@@ -823,25 +889,9 @@ impl App {
                 .insert(p.name.clone(), PaneRoute::new(p.session_idx, &p.pane_id));
         }
         // 3. The register and the backlog's lines are the model's job.
-        let routes = seed
-            .roster
-            .iter()
-            .map(|pane| (pane.pane_id.clone(), pane.session_idx))
-            .collect();
-        let recipients: HashMap<String, _> = seed
-            .mailbox_routes
-            .iter()
-            .flat_map(|route| {
-                let recipient = route.recipient();
-                let mut keys = vec![(route.label().to_string(), recipient)];
-                if let Some(pane_id) = recipient.pane_id() {
-                    keys.push((pane_id.to_string(), recipient));
-                }
-                keys
-            })
-            .collect();
+        let (routes, recipients) = seed_maps(&seed);
         self.record
-            .seed_routed(&seed.panes, &seed.open, &routes, &recipients)
+            .seed_routed(&seed.panes, &seed.open, &seed.mailbox, &routes, &recipients)
     }
 
     /// Every attention item as one phrase, in the stream's own voice
@@ -1582,6 +1632,7 @@ mod tests {
                     state_ms: Some(5_000),
                 })
                 .collect(),
+            mailbox: Vec::new(),
         }
     }
 
@@ -1593,6 +1644,7 @@ mod tests {
             state,
             ts: 1000,
             cause: None,
+            attempt_id: None,
         }
     }
 

@@ -701,6 +701,7 @@ async fn status_seed(sock: &Path) -> Result<StatusSeed, UiError> {
         })
         .saturating_add(status.mailbox_routes.len())
         .saturating_add(status.open_deliveries.len())
+        .saturating_add(status.mailbox_attention.len())
         .saturating_add(status.diagnostics.len())
         .saturating_add(status.blocked_notifications.len());
     if status_items > crate::stream::RING_CAP {

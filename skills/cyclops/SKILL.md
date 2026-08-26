@@ -265,8 +265,9 @@ cyclops status
 
 `messages` shows each message's mailbox state and each recipient's separate
 wake state. `alarm preview` lists unresolved notification attempts and their
-exact ids. `status` owns pane and legacy-delivery attention plus the admin
-unread count; it is not the mailbox alarm source. If a wake attempt needs
+exact ids. `status` counts pane attention, legacy-delivery alarms, open
+mailbox attention attempts, and held queue heads, plus the admin unread
+count; its `waiting on you` rows name the next action for each. If a wake attempt needs
 attention, inspect its exact id before taking an action:
 
 ```bash

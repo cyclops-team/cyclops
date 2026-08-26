@@ -1938,10 +1938,20 @@ fn status_result_with_refresh(
 ) -> StatusResult {
     // The ledger fold happens before the state locks are taken: it reads
     // files, and the fusion engine wants those locks back promptly.
-    let open_deliveries = if open_deliveries {
-        crate::history::open_deliveries(inner)
+    // Two halves, kept apart: the legacy session-ledger fold, and the
+    // durable mailbox rows the projection serves (the same rows a
+    // messages.snapshot carries), minus the pre-write blocks listed under
+    // blocked_notifications below so one attempt is one row.
+    let (open_deliveries, mailbox_attention) = if open_deliveries {
+        let open = crate::history::open_deliveries(inner);
+        let mailbox = inner
+            .mailbox
+            .as_ref()
+            .and_then(|service| service.mailbox_attention_rows().ok())
+            .unwrap_or_default();
+        (open, mailbox)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     let admin_unread = inner
         .mailbox
@@ -2229,6 +2239,7 @@ fn status_result_with_refresh(
         }),
         // The one process that can say this without guessing.
         pid: Some(std::process::id()),
+        mailbox_attention,
     }
 }
 
@@ -3645,6 +3656,113 @@ mod tests {
         )
         .await;
         assert_eq!(hidden.error.unwrap().code, "denied");
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    /// Item 5: the status eye counts durable mailbox attention through a
+    /// mailbox half kept apart from the legacy ledger fold: one row per
+    /// attempt, exact recipient and attempt id on the row, stable across
+    /// calls, and the same rows a messages.snapshot carries.
+    #[test]
+    fn status_mailbox_attention_folds_each_attempt_once() {
+        let (inner, path, attempt_id, message_id) = inner_with_alarm(
+            "cyc-status-eye-mailbox-attention",
+            NotificationAttentionCause::VerifyFailed,
+        );
+
+        let first = status_result(&inner, true);
+        assert!(
+            first.open_deliveries.is_empty(),
+            "the legacy half carries no mailbox rows: {:?}",
+            first.open_deliveries
+        );
+        let rows: Vec<_> = first
+            .mailbox_attention
+            .iter()
+            .filter(|row| row.id == message_id)
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "one row per attempt: {:?}",
+            first.mailbox_attention
+        );
+        let row = rows[0];
+        assert_eq!(row.to, "reviewer");
+        assert_eq!(row.state, cyclops_proto::DeliveryState::AttentionRequired);
+        assert_eq!(row.cause.as_deref(), Some("verify_failed"));
+        assert_eq!(row.attempt_id, Some(attempt_id));
+        assert!(row.recipient.is_some());
+
+        let attention = cyclops_proto::Attention::from_status(&first);
+        assert_eq!(
+            attention.count(),
+            1,
+            "the eye counts the mailbox attempt once"
+        );
+
+        let second = status_result(&inner, true);
+        assert_eq!(
+            second.mailbox_attention.len(),
+            first.mailbox_attention.len()
+        );
+        assert!(status_result(&inner, false).mailbox_attention.is_empty());
+
+        // The snapshot carries the same rows, stamped by its own seq.
+        let service = inner.mailbox.as_ref().expect("mailbox");
+        let snapshot = service
+            .messages_snapshot(service.admin().key, 0)
+            .expect("snapshot");
+        assert_eq!(
+            snapshot
+                .mailbox_attention
+                .iter()
+                .map(|row| (row.id.clone(), row.attempt_id))
+                .collect::<Vec<_>>(),
+            first
+                .mailbox_attention
+                .iter()
+                .map(|row| (row.id.clone(), row.attempt_id))
+                .collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    /// Item 5: a queue head blocked before write is mailbox attention (the
+    /// eye counts this array and a snapshot has no other), with the real
+    /// state named in the cause, and is also detailed under
+    /// blocked_notifications; the surface that prints both dedups the
+    /// detailed row by attempt id.
+    #[test]
+    fn a_pre_write_blocked_head_is_mailbox_attention() {
+        let (inner, path, attempt_id, recipient, message_id) =
+            inner_with_blocked_notification("cyc-status-eye-pre-write-head");
+        let res = status_result(&inner, true);
+        let rows: Vec<_> = res
+            .mailbox_attention
+            .iter()
+            .filter(|row| row.id == message_id.to_string())
+            .collect();
+        assert_eq!(rows.len(), 1, "{:?}", res.mailbox_attention);
+        let row = rows[0];
+        assert_eq!(row.recipient, Some(recipient));
+        assert_eq!(row.attempt_id, Some(attempt_id));
+        assert_eq!(row.state, cyclops_proto::DeliveryState::AttentionRequired);
+        assert!(
+            row.cause
+                .as_deref()
+                .is_some_and(|cause| cause.starts_with("blocked_pre_write:")),
+            "cause must name the real state: {:?}",
+            row.cause
+        );
+        assert!(
+            res.blocked_notifications
+                .iter()
+                .any(|entry| entry.notification_attempt == attempt_id),
+            "the detailed row is still served: {:?}",
+            res.blocked_notifications
+        );
+        assert_eq!(cyclops_proto::Attention::from_status(&res).count(), 1);
         std::fs::remove_dir_all(path).unwrap();
     }
 

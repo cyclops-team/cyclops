@@ -3592,6 +3592,109 @@ impl MailboxProjection {
     }
 
     /// Build one body-free view for the authenticated workspace caller.
+    /// Durable mailbox attention as `OpenDelivery` rows: one row per live
+    /// attempt, from open `attention_required` alarms and from each
+    /// recipient's pending head whose record is `attention_required` (an
+    /// operator clearance only acknowledges), `quota_held`,
+    /// `quota_reset_observed`, or `blocked_pre_write`. Held states project
+    /// onto the two legacy words a human must act on, with the cause naming
+    /// the real state. Identity is exact: rows are deduplicated by recipient
+    /// key plus message id and by attempt id, and an attempt an operator has
+    /// resolved is never a row. A pre-write-blocked head stays a row here
+    /// even though `status` also details it under `blocked_notifications`,
+    /// because the eye counts this array and a snapshot has no other; the
+    /// surface that prints both dedups the detailed row by attempt id.
+    ///
+    /// The same rows ride `status` and `messages.snapshot`, read from this
+    /// one projection, so every surface counts the same record.
+    pub(crate) fn mailbox_attention_rows(
+        &self,
+        labels: &HashMap<RecipientKey, String>,
+    ) -> Vec<cyclops_proto::OpenDelivery> {
+        use cyclops_proto::DeliveryState;
+
+        let label_for =
+            |key: &RecipientKey| labels.get(key).cloned().unwrap_or_else(|| key.to_string());
+        let row = |record: &NotificationRecord| {
+            let (state, cause) = match record.state {
+                NotificationState::QuotaHeld => (
+                    DeliveryState::ParkedBlockedQuota,
+                    Some("quota_held".to_string()),
+                ),
+                NotificationState::QuotaResetObserved => (
+                    DeliveryState::ParkedBlockedQuota,
+                    Some("quota_reset_observed".to_string()),
+                ),
+                NotificationState::BlockedPreWrite => {
+                    let why = record
+                        .pre_write_cause
+                        .map(|cause| cause.wire_name().to_string())
+                        .or_else(|| record.wake_block.map(|block| block.wire_name().to_string()))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    (
+                        DeliveryState::AttentionRequired,
+                        Some(format!("blocked_pre_write:{why}")),
+                    )
+                }
+                _ => (
+                    DeliveryState::AttentionRequired,
+                    record
+                        .cause
+                        .and_then(|cause| serde_json::to_value(cause).ok())
+                        .and_then(|value| value.as_str().map(str::to_string))
+                        .or_else(|| record.wake_block.map(|block| block.wire_name().to_string())),
+                ),
+            };
+            cyclops_proto::OpenDelivery {
+                id: record.message_id.to_string(),
+                to: label_for(&record.recipient),
+                recipient: Some(record.recipient),
+                state,
+                ts: record.updated_at,
+                cause,
+                attempt_id: Some(record.attempt_id),
+            }
+        };
+        let mut seen: HashSet<(RecipientKey, MessageId)> = HashSet::new();
+        let mut seen_attempts: HashSet<NotificationAttemptId> = HashSet::new();
+        let mut rows = Vec::new();
+        let mut push = |record: &NotificationRecord| {
+            if !seen_attempts.insert(record.attempt_id) {
+                return;
+            }
+            if seen.insert((record.recipient, record.message_id.clone())) {
+                rows.push(row(record));
+            }
+        };
+        for record in self.open_alarms() {
+            push(record);
+        }
+        for recipient in self.mailboxes.keys() {
+            let Some(head) = self.get_pending(*recipient).into_iter().next() else {
+                continue;
+            };
+            let Some(record) = self
+                .notifications
+                .get(&(*recipient, head.message_id.clone()))
+            else {
+                continue;
+            };
+            if self.resolved_attempts.contains_key(&record.attempt_id) {
+                continue;
+            }
+            if matches!(
+                record.state,
+                NotificationState::AttentionRequired
+                    | NotificationState::QuotaHeld
+                    | NotificationState::QuotaResetObserved
+                    | NotificationState::BlockedPreWrite
+            ) {
+                push(record);
+            }
+        }
+        rows
+    }
+
     pub fn messages_snapshot(
         &self,
         caller: RecipientKey,
@@ -3798,12 +3901,19 @@ impl MailboxProjection {
             open_attention_entries,
         };
 
+        let labels: HashMap<RecipientKey, String> = current_routes
+            .iter()
+            .map(|(key, route)| (*key, route.label.clone()))
+            .collect();
+        let mailbox_attention = self.mailbox_attention_rows(&labels);
+
         Ok(MessagesSnapshotResult {
             workspace_id: self.workspace_id,
             caller: Some(caller),
             workspace_seq: self.last_workspace_seq.unwrap_or(0),
             counts,
             rows,
+            mailbox_attention,
         })
     }
 
@@ -4496,6 +4606,19 @@ impl MailboxService {
         Ok(entries)
     }
 
+    /// The live notification record for one (recipient, message), if any.
+    pub(crate) fn notification_record(
+        &self,
+        recipient: RecipientKey,
+        message_id: &MessageId,
+    ) -> Option<NotificationRecord> {
+        self.store()
+            .ok()?
+            .projection()
+            .notification(recipient, message_id)
+            .cloned()
+    }
+
     pub fn pending_count(&self, recipient: RecipientKey) -> Result<usize, MailboxServiceError> {
         Ok(self.store()?.projection().pending_count(recipient))
     }
@@ -4854,6 +4977,20 @@ impl MailboxService {
     }
 
     /// Bounded body-free pre-write failures for the operator status view.
+    /// The durable mailbox attention rows `status` and `messages.snapshot`
+    /// serve, from the same projection.
+    pub(crate) fn mailbox_attention_rows(
+        &self,
+    ) -> Result<Vec<cyclops_proto::OpenDelivery>, MailboxServiceError> {
+        let directory = self.directory()?;
+        let labels: HashMap<RecipientKey, String> = directory
+            .current_routes()
+            .iter()
+            .map(|(key, route)| (*key, route.label.clone()))
+            .collect();
+        Ok(self.store()?.projection().mailbox_attention_rows(&labels))
+    }
+
     pub(crate) fn blocked_notification_snapshot(
         &self,
         now: u64,
@@ -13335,6 +13472,36 @@ mod tests {
     /// Clearing twice acknowledges once. A repeated command must not grow
     /// the journal, or an operator retrying a timed-out call rewrites
     /// history for no reason.
+    /// A head whose attempt an operator resolved is not mailbox attention,
+    /// even while its message is still the pending head.
+    #[test]
+    fn a_resolved_head_is_not_mailbox_attention() {
+        let (_scratch, mut store, message_id, bob) = operator_store("resolved-head");
+        alarm(&mut store, &message_id, bob, attempt(1), 2);
+        let labels = HashMap::new();
+        let before = store.projection().mailbox_attention_rows(&labels);
+        assert_eq!(
+            before.len(),
+            1,
+            "an open alarm on the head is one row: {before:?}"
+        );
+        assert_eq!(before[0].attempt_id, Some(attempt(1)));
+
+        store
+            .resolve_notification(
+                message_id.clone(),
+                bob,
+                attempt(1),
+                NotificationResolution::Discard,
+            )
+            .unwrap();
+        let after = store.projection().mailbox_attention_rows(&labels);
+        assert!(
+            after.is_empty(),
+            "a resolved attempt is neither an alarm nor a held head: {after:?}"
+        );
+    }
+
     #[test]
     fn clearing_an_alarm_twice_appends_one_fact() {
         let (_scratch, mut store, message_id, bob) = operator_store("clear-idempotent");

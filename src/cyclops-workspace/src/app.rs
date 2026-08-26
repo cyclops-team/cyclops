@@ -5953,6 +5953,7 @@ mod tests {
                 open_attention_entries: 0,
             },
             rows: Vec::new(),
+            mailbox_attention: Vec::new(),
         };
         app.messages_gate.connected();
         app.messages_gate.mark_dirty();

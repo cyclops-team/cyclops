@@ -453,7 +453,10 @@ fn handle(
         }
         UiMsg::MessagesRouteChanged => app.refresh.mark_dirty(),
         UiMsg::Messages { request, snapshot } => {
-            if app.apply_messages_response(request, &snapshot) {
+            if let Some(lines) = app.apply_messages_response(request, &snapshot) {
+                for e in lines {
+                    app.live(e);
+                }
                 message_follower.baseline(&snapshot);
                 if app.notice.as_deref() == Some(MESSAGE_GAP_NOTICE) {
                     app.notice = None;

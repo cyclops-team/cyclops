@@ -3,9 +3,11 @@
 //! One vocabulary, one owner. The eye is the signature device
 //! (GOALS), and it appears on three surfaces: the stream header, the
 //! `--plain` eye line, and `cyclops status`. All three read this module.
-//! None of them reimplements the predicates. Stream surfaces include both
-//! agent state and durable delivery alarms. Normal `cyclops status` uses
-//! the live agent half only.
+//! None of them reimplements the predicates. Every one of them counts three
+//! halves: live agent state, legacy session-ledger delivery alarms, and
+//! durable mailbox attention. `cyclops status` asks for open deliveries and
+//! builds [`Attention::from_status`]; [`Attention::from_live_status`] is the
+//! pane half alone, for an answer that carried no open deliveries.
 //!
 //! ## The rule
 //!
@@ -41,12 +43,15 @@
 //! decides what a count is allowed to depend on.
 //!
 //! 1. A stream asks the daemon for a `status` snapshot containing the pane
-//!    roster and open deliveries folded from the whole record. It REPLACES
-//!    both halves ([`Attention::snapshot_agents`],
-//!    [`Attention::snapshot_deliveries`]), so a pane that is gone stops
+//!    roster, the legacy open deliveries folded from the session record, and
+//!    the durable mailbox attention rows. It REPLACES all three halves
+//!    ([`Attention::snapshot_agents`], [`Attention::snapshot_deliveries`],
+//!    [`Attention::snapshot_mailbox`]), so a pane that is gone stops
 //!    counting and an item nothing could clear cannot outlive the answer.
-//!    Normal `cyclops status` asks for the pane roster only and builds the
-//!    live agent half with [`Attention::from_live_status`].
+//!    After that the mailbox half is replaced again by every
+//!    `messages.snapshot` the stream's refresh gate accepts, stamped by the
+//!    same `workspace_seq` as its Messages view. `cyclops status` reads the
+//!    same answer once and prints it.
 //! 2. Live events move one item at a time ([`Attention::observe_agent`],
 //!    [`Attention::observe_delivery`], [`Attention::forget_agent`]),
 //!    because each one IS the pane's or the delivery's next transition.
@@ -72,6 +77,7 @@ use serde::de::value::{Error as ValueError, StrDeserializer};
 use serde::de::IntoDeserializer;
 use serde::Deserialize;
 
+use crate::identity::RecipientKey;
 use crate::ledger::DeliveryState;
 use crate::state::AgentState;
 use crate::wire::{OpenDelivery, PaneStatus, StatusResult};
@@ -149,13 +155,56 @@ pub enum AttentionItem {
         name: String,
         state: AgentState,
     },
-    /// One delivery, identified by (recipient, message id). Only this
-    /// delivery's own next transition may clear it, so a later message to
-    /// the same recipient cannot close an unresolved one.
+    /// One delivery, identified by (recipient identity, message id). Only
+    /// this delivery's own next transition may clear it, so a later message
+    /// to the same recipient cannot close an unresolved one.
     Delivery {
+        /// The durable identity this row is keyed under.
+        recipient: DeliveryRecipientIdentity,
+        /// The label the row was addressed to, for display only.
         to: String,
         id: String,
         state: DeliveryState,
+    },
+}
+
+/// Who a delivery row is for, as the durable thing a surface may key on.
+///
+/// `Exact` is the recipient key the record carries. `LegacyLabel` exists
+/// only for rows written before durable endpoint identity, whose only name
+/// is the label they were addressed to. Display labels are never a key: two
+/// exact recipients may share one label, and a rename changes it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DeliveryRecipientIdentity {
+    Exact(RecipientKey),
+    LegacyLabel(String),
+}
+
+impl DeliveryRecipientIdentity {
+    pub fn of(delivery: &OpenDelivery) -> Self {
+        Self::from_parts(delivery.recipient, &delivery.to)
+    }
+
+    pub fn from_parts(recipient: Option<RecipientKey>, label: &str) -> Self {
+        match recipient {
+            Some(key) => Self::Exact(key),
+            None => Self::LegacyLabel(label.to_string()),
+        }
+    }
+}
+
+/// The structured key one attention item stands under. Surfaces that dedup,
+/// match a line to an item, or ask for a clearance use this and nothing
+/// else; a display label cannot become one except through the register's
+/// own resolution.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AttentionKey {
+    Agent {
+        pane_id: String,
+    },
+    Delivery {
+        recipient: DeliveryRecipientIdentity,
+        id: String,
     },
 }
 
@@ -208,10 +257,15 @@ impl AttentionItem {
     /// the one or two strings the register keys on ([`agent_key`] for a
     /// pane, (recipient, message id) for a delivery). Identity only, so a
     /// surface can index its own lines by it in one pass.
-    pub fn identity(&self) -> (Half, &str, &str) {
+    pub fn identity(&self) -> AttentionKey {
         match self {
-            AttentionItem::Agent { pane_id, .. } => (Half::Agent, pane_id, ""),
-            AttentionItem::Delivery { to, id, .. } => (Half::Delivery, to, id),
+            AttentionItem::Agent { pane_id, .. } => AttentionKey::Agent {
+                pane_id: pane_id.clone(),
+            },
+            AttentionItem::Delivery { recipient, id, .. } => AttentionKey::Delivery {
+                recipient: recipient.clone(),
+                id: id.clone(),
+            },
         }
     }
 
@@ -235,15 +289,25 @@ impl AttentionItem {
 #[derive(Debug, Clone, Default)]
 pub struct Attention {
     agents: BTreeMap<String, (String, AgentState)>,
-    deliveries: BTreeMap<(String, String), DeliveryState>,
+    /// Legacy session-ledger deliveries that still need a human, keyed by
+    /// durable identity plus message id; the value keeps the display label.
+    deliveries: BTreeMap<(DeliveryRecipientIdentity, String), (String, DeliveryState)>,
+    /// Durable mailbox attention (open attempts and held queue heads), keyed
+    /// the same way and kept apart from the legacy half: a snapshot replaces
+    /// only what the mailbox knows, a ledger event only what the ledger knows.
+    mailbox: BTreeMap<(DeliveryRecipientIdentity, String), (String, DeliveryState)>,
 }
 
 impl Attention {
-    /// The live pane register for the primary status grid.
+    /// The pane half of the register alone, for an answer that carried no
+    /// open deliveries.
     ///
-    /// Durable delivery alarms belong to the mailbox, alarm, and stream surfaces.
-    /// Keeping this constructor separate makes that scope explicit instead
-    /// of relying on an omitted `open_deliveries` request parameter.
+    /// `cyclops status` asks for open deliveries and builds
+    /// [`Attention::from_status`], so its eye counts the durable mailbox
+    /// half and the legacy delivery half as well as blocked panes. This
+    /// constructor exists for callers that did not ask, and makes that
+    /// narrower scope explicit instead of relying on an omitted request
+    /// parameter.
     pub fn from_live_status(res: &StatusResult) -> Attention {
         let mut attention = Attention::default();
         attention.snapshot_agents(res.sessions.iter().flat_map(|session| &session.panes).map(
@@ -271,6 +335,7 @@ impl Attention {
     pub fn from_status(res: &StatusResult) -> Attention {
         let mut attention = Attention::from_live_status(res);
         attention.snapshot_deliveries(&res.open_deliveries);
+        attention.snapshot_mailbox(&res.mailbox_attention);
         attention
     }
 
@@ -292,24 +357,145 @@ impl Attention {
     /// Wholesale for the same reason: the fold covers the whole record,
     /// so anything it does not list has been resolved or never existed.
     pub fn snapshot_deliveries(&mut self, open: &[OpenDelivery]) {
-        self.deliveries = open
-            .iter()
-            .filter(|d| delivery_needs_human(d.state))
-            .map(|d| ((d.to.clone(), d.id.clone()), d.state))
-            .collect();
+        self.deliveries = Self::keyed(open);
     }
 
-    /// One pane's latest state, from a live event.
-    ///
-    /// Stored blocked or not: the pane's next transition is what answers
-    /// for its item, and the newest line owns the display name, so an item
-    /// raised under "%1" reads as "reviewer" once the pane is adopted.
-    ///
-    /// Returns the clearance when this state ended a blocked one (rule 3).
-    /// The item it hands back wears the name the register held while the
-    /// alarm stood, not the one arriving now: the clearance exists to be
-    /// matched against the row the reader already saw, and a pane adopted
-    /// between the two lines wears a different name on each.
+    /// Replace the mailbox half from an authenticated snapshot's rows. A key
+    /// the previous mailbox half carried and this snapshot does not is an
+    /// authoritative absence: the current legacy twin of that key is removed
+    /// with it, so the count drops to what the record says now. Nothing is
+    /// remembered beyond that: a later live attention fact for the same key
+    /// may reopen it, because the event schema cannot prove that fact is the
+    /// old attempt, and the register keeps no unbounded memory.
+    pub fn snapshot_mailbox(&mut self, rows: &[OpenDelivery]) {
+        let next = Self::keyed(rows);
+        for (key, (label, _)) in &self.mailbox {
+            if next.contains_key(key) {
+                continue;
+            }
+            // The same exact key in the legacy half goes with it.
+            self.deliveries.remove(key);
+            // So does the legacy twin of the dropped key: a legacy-label row
+            // this exact row had canonicalized (same label and message,
+            // this being the only exact row carrying that label) was the
+            // same delivery, and an authoritative absence ends it too. No
+            // memory is kept; a later live legacy event may reopen it.
+            if let DeliveryRecipientIdentity::Exact(_) = &key.0 {
+                let twin = (
+                    DeliveryRecipientIdentity::LegacyLabel(label.clone()),
+                    key.1.clone(),
+                );
+                let another_exact = self.mailbox.iter().chain(self.deliveries.iter()).any(
+                    |((identity, id), (row_label, _))| {
+                        identity != &key.0
+                            && matches!(identity, DeliveryRecipientIdentity::Exact(_))
+                            && id == &key.1
+                            && row_label == label
+                    },
+                );
+                if !another_exact {
+                    self.deliveries.remove(&twin);
+                }
+            }
+        }
+        self.mailbox = next;
+    }
+
+    fn keyed(
+        rows: &[OpenDelivery],
+    ) -> BTreeMap<(DeliveryRecipientIdentity, String), (String, DeliveryState)> {
+        rows.iter()
+            .filter(|d| delivery_needs_human(d.state))
+            .map(|d| {
+                (
+                    (DeliveryRecipientIdentity::of(d), d.id.clone()),
+                    (d.to.clone(), d.state),
+                )
+            })
+            .collect()
+    }
+
+    /// Both delivery halves as one map by key, the mailbox half overriding a
+    /// legacy row with the same key: the mailbox is the newer, authenticated
+    /// answer about that attempt. Resolution, count, items, and clearance
+    /// read this union; the halves themselves stay separately replaceable.
+    fn delivery_union(
+        &self,
+    ) -> BTreeMap<&(DeliveryRecipientIdentity, String), &(String, DeliveryState)> {
+        let mut union: BTreeMap<_, _> = self.deliveries.iter().collect();
+        for (key, value) in &self.mailbox {
+            union.insert(key, value);
+        }
+        // semantic_twins: a legacy-label row and one unique exact row for
+        // the same label and message are one delivery. The exact row is
+        // the durable one, so the legacy twin drops out of the union.
+        let twins: Vec<_> = union
+            .keys()
+            .filter(|(identity, _)| matches!(identity, DeliveryRecipientIdentity::LegacyLabel(_)))
+            .filter(|(identity, id)| {
+                let DeliveryRecipientIdentity::LegacyLabel(label) = identity else {
+                    return false;
+                };
+                Self::unique_exact_in(&union, label, id).is_some()
+            })
+            .map(|key| (*key).clone())
+            .collect();
+        for key in &twins {
+            union.remove(key);
+        }
+        union
+    }
+
+    /// The one exact row carrying `label` for `id`, if exactly one does.
+    fn unique_exact_in<'a>(
+        union: &BTreeMap<&'a (DeliveryRecipientIdentity, String), &'a (String, DeliveryState)>,
+        label: &str,
+        id: &str,
+    ) -> Option<DeliveryRecipientIdentity> {
+        let mut exact = union
+            .iter()
+            .filter(|((identity, entry_id), (row_label, _))| {
+                entry_id == id
+                    && row_label == label
+                    && matches!(identity, DeliveryRecipientIdentity::Exact(_))
+            })
+            .map(|((identity, _), _)| identity.clone());
+        match (exact.next(), exact.next()) {
+            (Some(identity), None) => Some(identity),
+            _ => None,
+        }
+    }
+
+    /// Resolve a delivery reference to the key it stands under. An exact
+    /// recipient is its own key. A label resolves to an exact row only when
+    /// exactly one exact recipient in either half carries that label for
+    /// that message; none, or more than one (an alias collision), keeps the
+    /// legacy form, so an ambiguous reference can never merge two exact
+    /// recipients.
+    fn resolve(
+        &self,
+        recipient: Option<RecipientKey>,
+        to: &str,
+        id: &str,
+    ) -> (DeliveryRecipientIdentity, String) {
+        if let Some(key) = recipient {
+            return (DeliveryRecipientIdentity::Exact(key), id.to_string());
+        }
+        let legacy = (
+            DeliveryRecipientIdentity::LegacyLabel(to.to_string()),
+            id.to_string(),
+        );
+        let union = self.delivery_union();
+        // One exact row carrying this label for this message is the row the
+        // reference names, even when a legacy twin also exists; the legacy
+        // form is the answer only when no exact row, or more than one,
+        // carries the label.
+        match Self::unique_exact_in(&union, to, id) {
+            Some(identity) => (identity, id.to_string()),
+            None => legacy,
+        }
+    }
+
     pub fn observe_agent(
         &mut self,
         target: &str,
@@ -370,21 +556,35 @@ impl Attention {
     /// Returns the clearance when this transition ended an unresolved one
     /// (rule 3). The map holds only unresolved deliveries, so what came
     /// out of it IS the alarm this line answers.
+    /// The key a delivery reference stands under, by the register's own
+    /// rule: an exact recipient is its own key; a label reaches an exact row
+    /// only when exactly one exact recipient carries it for that message.
+    pub fn key_for(&self, recipient: Option<RecipientKey>, to: &str, id: &str) -> AttentionKey {
+        let (recipient, id) = self.resolve(recipient, to, id);
+        AttentionKey::Delivery { recipient, id }
+    }
+
+    /// A live ledger delivery edge. The exact recipient rides on the event
+    /// when the record has one; a label alone reaches an exact row only
+    /// when the register can resolve it unambiguously. Events move the
+    /// legacy half; the mailbox half moves only by snapshot.
     pub fn observe_delivery(
         &mut self,
         to: &str,
+        recipient: Option<RecipientKey>,
         id: Option<&str>,
         state: DeliveryState,
     ) -> Option<Resolved> {
-        let key = (to.to_string(), id.unwrap_or_default().to_string());
+        let key = self.resolve(recipient, to, id.unwrap_or_default());
         if delivery_needs_human(state) {
-            self.deliveries.insert(key, state);
+            self.deliveries.insert(key, (to.to_string(), state));
             return None;
         }
-        let was = self.deliveries.remove(&key)?;
+        let (label, was) = self.deliveries.remove(&key)?;
         Some(Resolved {
             was: AttentionItem::Delivery {
-                to: key.0,
+                recipient: key.0,
+                to: label,
                 id: key.1,
                 state: was,
             },
@@ -392,49 +592,32 @@ impl Attention {
         })
     }
 
-    /// Does the register still hold this item, by the identity a surface
-    /// indexes its own lines under ([`AttentionItem::identity`])?
-    ///
-    /// For a line that POINTS AT an item rather than being one: the
-    /// daemon's admin pings say a human is needed but are not themselves
-    /// a state, so nothing can clear them. A ping whose item the register
-    /// no longer holds is a ping about something already resolved, and
-    /// showing it beside the count put "action required" under a closed
-    /// eye (cyclops-ui `App::admits`).
-    pub fn holds(&self, id: (Half, &str, &str)) -> bool {
-        self.clearance(id).is_none()
+    pub fn holds(&self, key: &AttentionKey) -> bool {
+        self.clearance(key).is_none()
     }
 
-    /// Rule 3 asked of the register directly: how would it explain no
-    /// longer holding this item? None means it still does.
-    ///
-    /// For a surface reconciling LINES it already shows against the
-    /// daemon's answer, which is the other way an alarm ends. The live
-    /// mutators above answer the same question from the transition they
-    /// are handed; this answers it from the roster, which is the only
-    /// thing that can tell a pane that moved on from a pane that is gone.
-    pub fn clearance(&self, (half, name, id): (Half, &str, &str)) -> Option<Clearance> {
-        match half {
-            Half::Agent => match self.agents.get(name) {
+    pub fn clearance(&self, key: &AttentionKey) -> Option<Clearance> {
+        match key {
+            AttentionKey::Agent { pane_id } => match self.agents.get(pane_id) {
                 Some((_, s)) if s.is_blocked() => None,
                 Some(_) => Some(Clearance::Moved),
                 // Not on the roster at all: the answer lists the panes
                 // that exist, so this one no longer does.
                 None => Some(Clearance::PaneGone),
             },
-            Half::Delivery => match self
-                .deliveries
-                .contains_key(&(name.to_string(), id.to_string()))
-            {
-                true => None,
-                false => Some(Clearance::Moved),
-            },
+            AttentionKey::Delivery { recipient, id } => {
+                let entry = (recipient.clone(), id.clone());
+                if self.delivery_union().contains_key(&entry) {
+                    None
+                } else {
+                    Some(Clearance::Moved)
+                }
+            }
         }
     }
 
-    /// How many things need a human.
     pub fn count(&self) -> usize {
-        self.agents.values().filter(|(_, s)| s.is_blocked()).count() + self.deliveries.len()
+        self.agents.values().filter(|(_, s)| s.is_blocked()).count() + self.delivery_union().len()
     }
 
     /// Every item, sorted by name so the same backlog always reads the
@@ -450,9 +633,10 @@ impl Attention {
                 state: *state,
             })
             .chain(
-                self.deliveries
-                    .iter()
-                    .map(|((to, id), state)| AttentionItem::Delivery {
+                self.delivery_union()
+                    .into_iter()
+                    .map(|((recipient, id), (to, state))| AttentionItem::Delivery {
+                        recipient: recipient.clone(),
                         to: to.clone(),
                         id: id.clone(),
                         state: *state,
@@ -652,7 +836,192 @@ mod tests {
             blocked_notifications_total: 0,
             manifests: None,
             pid: None,
+            mailbox_attention: Vec::new(),
         }
+    }
+
+    /// One exact attempt present in both halves is one item: the union
+    /// dedups by key with the mailbox overriding, so count, items, and
+    /// label resolution never see a false duplicate.
+    #[test]
+    fn one_exact_key_in_both_halves_is_one_item() {
+        use DeliveryState::*;
+        let workspace: crate::WorkspaceId = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let session: crate::SessionInstanceId =
+            "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let key = crate::RecipientKey::agent(workspace, session, "%1".parse().unwrap());
+        let mut legacy = open("m-1", "worker", ParkedBlockedQuota);
+        legacy.recipient = Some(key);
+        let mut mailbox = open("m-1", "worker", AttentionRequired);
+        mailbox.recipient = Some(key);
+
+        let mut attention = Attention::default();
+        attention.snapshot_deliveries(std::slice::from_ref(&legacy));
+        attention.snapshot_mailbox(std::slice::from_ref(&mailbox));
+        assert_eq!(attention.count(), 1, "one key, one item");
+        let items = attention.items();
+        assert_eq!(items.len(), 1);
+        assert!(
+            matches!(&items[0], AttentionItem::Delivery { state, .. } if *state == AttentionRequired),
+            "the mailbox half overrides the legacy row: {items:?}"
+        );
+        let exact = AttentionKey::Delivery {
+            recipient: DeliveryRecipientIdentity::Exact(key),
+            id: "m-1".into(),
+        };
+        assert_eq!(
+            attention.key_for(None, "worker", "m-1"),
+            exact,
+            "label resolution stays exact, not falsely ambiguous"
+        );
+        assert!(attention.holds(&exact));
+
+        // An accepted mailbox absence removes the current legacy twin with
+        // it: the count drops to 0 immediately, with no memory kept.
+        attention.snapshot_mailbox(&[]);
+        assert_eq!(
+            attention.count(),
+            0,
+            "authoritative absence removes the twin"
+        );
+        assert!(!attention.holds(&exact));
+        assert!(attention.items().is_empty());
+        // A later live attention fact may reopen the key: the event cannot
+        // prove it is the old attempt, and the register remembers nothing,
+        // so it is counted again until the record clears it.
+        assert!(attention
+            .observe_delivery("worker", Some(key), Some("m-1"), ParkedBlockedQuota)
+            .is_none());
+        assert_eq!(attention.count(), 1, "no permanent suppression");
+        assert!(attention
+            .observe_delivery("worker", Some(key), Some("m-1"), DeliveredVerified)
+            .is_some());
+        assert_eq!(attention.count(), 0);
+    }
+
+    /// A legacy-label row and one unique exact mailbox row for the same
+    /// label and message are semantic twins: one item, resolution exact.
+    #[test]
+    fn a_legacy_row_and_its_unique_exact_twin_are_one_item() {
+        use DeliveryState::*;
+        let workspace: crate::WorkspaceId = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let session: crate::SessionInstanceId =
+            "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let key = crate::RecipientKey::agent(workspace, session, "%1".parse().unwrap());
+        let legacy = open("m-1", "reviewer", ParkedBlockedQuota); // no key
+        let mut mailbox = open("m-1", "reviewer", AttentionRequired);
+        mailbox.recipient = Some(key);
+
+        let mut attention = Attention::default();
+        attention.snapshot_deliveries(std::slice::from_ref(&legacy));
+        attention.snapshot_mailbox(std::slice::from_ref(&mailbox));
+        assert_eq!(attention.count(), 1, "semantic twins are one item");
+        let items = attention.items();
+        assert_eq!(items.len(), 1);
+        let exact = AttentionKey::Delivery {
+            recipient: DeliveryRecipientIdentity::Exact(key),
+            id: "m-1".into(),
+        };
+        assert_eq!(
+            items[0].identity(),
+            exact,
+            "the exact row is the one that stands"
+        );
+        assert_eq!(attention.key_for(None, "reviewer", "m-1"), exact);
+        assert!(attention.holds(&exact));
+        // The legacy form alone is not a standing key while its exact twin exists.
+        let legacy_key = AttentionKey::Delivery {
+            recipient: DeliveryRecipientIdentity::LegacyLabel("reviewer".into()),
+            id: "m-1".into(),
+        };
+        assert!(!attention.holds(&legacy_key));
+
+        // An accepted mailbox absence ends the pair: the exact row and the
+        // legacy twin it canonicalized go together, with no memory kept.
+        attention.snapshot_mailbox(&[]);
+        assert_eq!(attention.count(), 0, "after absence the pair is gone");
+        assert!(attention.items().is_empty());
+        assert!(!attention.holds(&exact));
+        assert!(!attention.holds(&legacy_key));
+
+        // A later live legacy event may reopen it under the legacy form,
+        // because nothing proves it is the old attempt; a live clearance
+        // then ends it.
+        assert!(attention
+            .observe_delivery("reviewer", None, Some("m-1"), ParkedBlockedQuota)
+            .is_none());
+        assert_eq!(attention.count(), 1, "no permanent suppression");
+        assert_eq!(attention.key_for(None, "reviewer", "m-1"), legacy_key);
+        assert!(attention
+            .observe_delivery("reviewer", None, Some("m-1"), DeliveredVerified)
+            .is_some());
+        assert_eq!(attention.count(), 0);
+    }
+
+    /// Two exact recipients that share a display label are two items, a
+    /// label-only reference resolves to a keyed row only when exactly one
+    /// row carries that label, and an ambiguous label never merges them.
+    #[test]
+    fn aliases_never_merge_exact_recipients() {
+        use DeliveryState::*;
+        let workspace: crate::WorkspaceId = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let session: crate::SessionInstanceId =
+            "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let first = crate::RecipientKey::agent(workspace, session, "%1".parse().unwrap());
+        let second = crate::RecipientKey::agent(workspace, session, "%2".parse().unwrap());
+        let mut a = open("m-1", "worker", AttentionRequired);
+        a.recipient = Some(first);
+        let mut b = open("m-1", "worker", AttentionRequired);
+        b.recipient = Some(second);
+
+        let mut attention = Attention::default();
+        attention.snapshot_deliveries(&[a.clone(), b.clone()]);
+        assert_eq!(attention.count(), 2, "one label, two keys, two items");
+        assert_eq!(
+            attention.items().len(),
+            2,
+            "items keep the label for display and stay apart"
+        );
+        // Ambiguous label: a label-only clearance cannot pick one of them.
+        assert!(attention
+            .observe_delivery("worker", None, Some("m-1"), DeliveredVerified)
+            .is_none());
+        assert_eq!(attention.count(), 2);
+
+        // Unambiguous label: the keyed row is the one the event names, and
+        // the key it resolves to is the exact recipient, never the label.
+        let mut only = Attention::default();
+        only.snapshot_deliveries(&[a]);
+        assert_eq!(only.count(), 1);
+        let exact = AttentionKey::Delivery {
+            recipient: DeliveryRecipientIdentity::Exact(first),
+            id: "m-1".into(),
+        };
+        assert_eq!(only.key_for(None, "worker", "m-1"), exact);
+        assert!(only.holds(&exact));
+        assert!(
+            !only.holds(&AttentionKey::Delivery {
+                recipient: DeliveryRecipientIdentity::LegacyLabel("worker".into()),
+                id: "m-1".into(),
+            }),
+            "a label is not a key: the row stands under its exact recipient"
+        );
+        let cleared = only
+            .observe_delivery("worker", None, Some("m-1"), DeliveredVerified)
+            .expect("the keyed row clears through its label");
+        assert_eq!(cleared.was.identity(), exact);
+        assert_eq!(only.count(), 0);
+
+        // A legacy row without a key keeps the label form end to end.
+        let mut legacy = Attention::default();
+        legacy.snapshot_deliveries(&[open("m-2", "reviewer", ParkedBlockedQuota)]);
+        assert!(legacy.holds(&AttentionKey::Delivery {
+            recipient: DeliveryRecipientIdentity::LegacyLabel("reviewer".into()),
+            id: "m-2".into()
+        }));
+        assert!(legacy
+            .observe_delivery("reviewer", None, Some("m-2"), DeliveredVerified)
+            .is_some());
     }
 
     fn open(id: &str, to: &str, state: DeliveryState) -> OpenDelivery {
@@ -663,6 +1032,7 @@ mod tests {
             state,
             ts: 1000,
             cause: None,
+            attempt_id: None,
         }
     }
 
@@ -724,6 +1094,9 @@ mod tests {
             a.items(),
             vec![
                 AttentionItem::Delivery {
+                    recipient: DeliveryRecipientIdentity::LegacyLabel(
+                        "implementer".into().to_string()
+                    ),
                     to: "implementer".into(),
                     id: "m-park".into(),
                     state: DeliveryState::ParkedBlockedQuota,
@@ -798,16 +1171,26 @@ mod tests {
     #[test]
     fn only_a_deliverys_own_transition_clears_it() {
         let mut a = Attention::default();
-        a.observe_delivery("reviewer", Some("m-1"), DeliveryState::AttentionRequired);
-        a.observe_delivery("reviewer", Some("m-2"), DeliveryState::Queued);
-        a.observe_delivery("reviewer", Some("m-2"), DeliveryState::DeliveredVerified);
+        a.observe_delivery(
+            "reviewer",
+            None,
+            Some("m-1"),
+            DeliveryState::AttentionRequired,
+        );
+        a.observe_delivery("reviewer", None, Some("m-2"), DeliveryState::Queued);
+        a.observe_delivery(
+            "reviewer",
+            None,
+            Some("m-2"),
+            DeliveryState::DeliveredVerified,
+        );
         assert_eq!(a.count(), 1, "m-2 closed m-1's item");
-        a.observe_delivery("reviewer", Some("m-1"), DeliveryState::Queued);
+        a.observe_delivery("reviewer", None, Some("m-1"), DeliveryState::Queued);
         assert_eq!(a.count(), 0);
         // An id-less delivery degrades to one slot for that recipient.
-        a.observe_delivery("reviewer", None, DeliveryState::ParkedBlockedQuota);
+        a.observe_delivery("reviewer", None, None, DeliveryState::ParkedBlockedQuota);
         assert_eq!(a.count(), 1);
-        a.observe_delivery("reviewer", None, DeliveryState::Queued);
+        a.observe_delivery("reviewer", None, None, DeliveryState::Queued);
         assert_eq!(a.count(), 0);
     }
 
@@ -831,6 +1214,7 @@ mod tests {
 
         a.observe_delivery(
             "implementer",
+            None,
             Some("m-1"),
             DeliveryState::ParkedBlockedQuota,
         );
@@ -896,7 +1280,12 @@ mod tests {
     fn a_pane_that_leaves_the_table_stops_counting() {
         let mut a = Attention::default();
         a.observe_agent("reviewer", Some("%1"), AgentState::BlockedPermission);
-        a.observe_delivery("reviewer", Some("m-1"), DeliveryState::AttentionRequired);
+        a.observe_delivery(
+            "reviewer",
+            None,
+            Some("m-1"),
+            DeliveryState::AttentionRequired,
+        );
         assert_eq!(a.count(), 2);
         a.forget_agent("%1");
         assert_eq!(a.count(), 1, "the pane's item outlived the pane");
@@ -906,7 +1295,7 @@ mod tests {
         a.forget_agent("%77");
         assert_eq!(a.count(), 1);
         // The delivery half is untouched: only its own transition clears it.
-        a.observe_delivery("reviewer", Some("m-1"), DeliveryState::Queued);
+        a.observe_delivery("reviewer", None, Some("m-1"), DeliveryState::Queued);
         assert_eq!(a.count(), 0);
     }
 
@@ -919,8 +1308,19 @@ mod tests {
             vec![open("m-1", "implementer", DeliveryState::AttentionRequired)],
         ));
         let items = a.items();
-        assert_eq!(items[0].identity(), (Half::Delivery, "implementer", "m-1"));
-        assert_eq!(items[1].identity(), (Half::Agent, "%1", ""));
+        assert_eq!(
+            items[0].identity(),
+            AttentionKey::Delivery {
+                recipient: DeliveryRecipientIdentity::LegacyLabel("implementer".into()),
+                id: "m-1".into(),
+            }
+        );
+        assert_eq!(
+            items[1].identity(),
+            AttentionKey::Agent {
+                pane_id: "%1".into()
+            }
+        );
         // The pane's key is agent_key's, not the label it currently wears.
         assert_eq!(agent_key("reviewer", Some("%1")), "%1");
     }
@@ -975,7 +1375,12 @@ mod tests {
             .observe_agent("reviewer", Some("%1"), AgentState::Working)
             .expect("adoption did not lose the clearance");
         assert_eq!(resolved.was.name(), "%1");
-        assert_eq!(resolved.was.identity(), (Half::Agent, "%1", ""));
+        assert_eq!(
+            resolved.was.identity(),
+            AttentionKey::Agent {
+                pane_id: "%1".into()
+            }
+        );
     }
 
     /// Rule 3, the pane's other ending: the window closed on the prompt.
@@ -1008,22 +1413,35 @@ mod tests {
     fn a_deliverys_own_transition_hands_back_what_it_ended() {
         let mut a = Attention::default();
         assert_eq!(
-            a.observe_delivery("reviewer", Some("m-1"), DeliveryState::Queued),
+            a.observe_delivery("reviewer", None, Some("m-1"), DeliveryState::Queued),
             None
         );
         assert_eq!(
-            a.observe_delivery("reviewer", Some("m-1"), DeliveryState::ParkedBlockedQuota),
+            a.observe_delivery(
+                "reviewer",
+                None,
+                Some("m-1"),
+                DeliveryState::ParkedBlockedQuota
+            ),
             None
         );
         // Another message to the same recipient ends nothing of m-1's.
         assert_eq!(
-            a.observe_delivery("reviewer", Some("m-2"), DeliveryState::DeliveredVerified),
+            a.observe_delivery(
+                "reviewer",
+                None,
+                Some("m-2"),
+                DeliveryState::DeliveredVerified
+            ),
             None
         );
         assert_eq!(
-            a.observe_delivery("reviewer", Some("m-1"), DeliveryState::Queued),
+            a.observe_delivery("reviewer", None, Some("m-1"), DeliveryState::Queued),
             Some(Resolved {
                 was: AttentionItem::Delivery {
+                    recipient: DeliveryRecipientIdentity::LegacyLabel(
+                        "reviewer".into().to_string()
+                    ),
                     to: "reviewer".into(),
                     id: "m-1".into(),
                     state: DeliveryState::ParkedBlockedQuota,
@@ -1046,23 +1464,30 @@ mod tests {
             ],
             vec![open("m-1", "implementer", DeliveryState::AttentionRequired)],
         ));
-        let blocked = (Half::Agent, "%1", "");
-        let unblocked = (Half::Agent, "%2", "");
-        let gone = (Half::Agent, "%9", "");
-        let open_one = (Half::Delivery, "implementer", "m-1");
-        let requeued = (Half::Delivery, "implementer", "m-2");
+        let agent = |pane_id: &str| AttentionKey::Agent {
+            pane_id: pane_id.into(),
+        };
+        let delivery = |to: &str, id: &str| AttentionKey::Delivery {
+            recipient: DeliveryRecipientIdentity::LegacyLabel(to.into()),
+            id: id.into(),
+        };
+        let blocked = agent("%1");
+        let unblocked = agent("%2");
+        let gone = agent("%9");
+        let open_one = delivery("implementer", "m-1");
+        let requeued = delivery("implementer", "m-2");
 
-        assert_eq!(a.clearance(blocked), None);
-        assert_eq!(a.clearance(unblocked), Some(Clearance::Moved));
+        assert_eq!(a.clearance(&blocked), None);
+        assert_eq!(a.clearance(&unblocked), Some(Clearance::Moved));
         // Not on the roster: the answer lists the panes that exist.
-        assert_eq!(a.clearance(gone), Some(Clearance::PaneGone));
-        assert_eq!(a.clearance(open_one), None);
-        assert_eq!(a.clearance(requeued), Some(Clearance::Moved));
+        assert_eq!(a.clearance(&gone), Some(Clearance::PaneGone));
+        assert_eq!(a.clearance(&open_one), None);
+        assert_eq!(a.clearance(&requeued), Some(Clearance::Moved));
 
         for id in [blocked, unblocked, gone, open_one, requeued] {
             assert_eq!(
-                a.holds(id),
-                a.clearance(id).is_none(),
+                a.holds(&id),
+                a.clearance(&id).is_none(),
                 "{id:?} got two answers to one question"
             );
         }

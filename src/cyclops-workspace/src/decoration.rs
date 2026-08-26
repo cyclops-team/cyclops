@@ -327,6 +327,7 @@ mod tests {
             blocked_notifications_total: 0,
             manifests: None,
             pid: None,
+            mailbox_attention: Vec::new(),
         }
     }
 

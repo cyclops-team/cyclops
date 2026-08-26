@@ -148,7 +148,9 @@ fn daemon_answer() -> StatusSeed {
             state: DeliveryState::ParkedBlockedQuota,
             ts: BASE + 100,
             cause: Some("blocked_quota".into()),
+            attempt_id: None,
         }],
+        mailbox: Vec::new(),
     }
 }
 

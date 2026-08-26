@@ -838,6 +838,7 @@ mod through_the_app {
                 open_attention_entries: 0,
             },
             rows,
+            mailbox_attention: Vec::new(),
         }
     }
 
@@ -984,7 +985,9 @@ mod through_the_app {
         // the connection itself do not.
         app.refresh.connected();
         let request = app.wants_messages().expect("connect owes a snapshot");
-        assert!(app.apply_messages_response(request, &snapshot(seq, rows)));
+        assert!(app
+            .apply_messages_response(request, &snapshot(seq, rows))
+            .is_some());
         app
     }
 
@@ -2921,10 +2924,12 @@ mod connection {
         assert_eq!(*app.detail.as_ref().unwrap().stage(), Stage::Open);
 
         let request = app.wants_messages().expect("reconnect owes a snapshot");
-        assert!(app.apply_messages_response(
-            request,
-            &snapshot(10, vec![wire_lifecycle("m-001", Some(7), false)])
-        ));
+        assert!(app
+            .apply_messages_response(
+                request,
+                &snapshot(10, vec![wire_lifecycle("m-001", Some(7), false)])
+            )
+            .is_some());
         assert!(app.refresh.may_mutate());
         assert_eq!(app.detail.as_ref().unwrap().target(), &frozen);
 
@@ -2980,10 +2985,12 @@ mod connection {
         );
         app.refresh.connected();
         let request = app.wants_messages().expect("reconnect owes a snapshot");
-        assert!(app.apply_messages_response(
-            request,
-            &snapshot(10, vec![wire_lifecycle("m-001", Some(7), false)])
-        ));
+        assert!(app
+            .apply_messages_response(
+                request,
+                &snapshot(10, vec![wire_lifecycle("m-001", Some(7), false)])
+            )
+            .is_some());
         assert_eq!(app.detail.as_ref().unwrap().target(), &frozen);
         assert!(app.refresh.may_mutate());
 
@@ -3012,7 +3019,9 @@ mod connection {
 
         app.refresh.connected();
         let request = app.wants_messages().expect("connect owes a snapshot");
-        assert!(app.apply_messages_response(request, &snapshot(1, Vec::new())));
+        assert!(app
+            .apply_messages_response(request, &snapshot(1, Vec::new()))
+            .is_some());
         app.notice = Some("snapshot refused safely".into());
         let noticed = cyclops_ui::build(&mut app, 80, 24).join("\n");
         assert!(noticed.contains("snapshot refused safely"), "{noticed}");

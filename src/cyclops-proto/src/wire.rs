@@ -265,6 +265,19 @@ pub struct StatusResult {
     /// ignore it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub open_deliveries: Vec<OpenDelivery>,
+    /// Durable mailbox attention: one row per live attempt for every open
+    /// `attention_required` attempt and every held queue head
+    /// (`attention_required`, `quota_held`, `quota_reset_observed`,
+    /// `blocked_pre_write`), keyed by exact recipient and carrying the
+    /// attempt id. Kept apart from `open_deliveries`, which is the legacy
+    /// session-ledger half. A pre-write-blocked head is a row here even
+    /// though `status` also details it under `blocked_notifications`: the
+    /// eye counts this array and a snapshot has no other, and a renderer
+    /// that prints both dedups the detailed row by attempt id so one attempt
+    /// is one row with one reason and one next action. Served with
+    /// `open_deliveries`; absent from daemons that predate it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mailbox_attention: Vec<OpenDelivery>,
     /// Content-free operational diagnostics derived from exact live routes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<StatusDiagnostic>,
@@ -359,6 +372,12 @@ pub struct OpenDelivery {
     /// Machine-readable cause, the same one the ledger record carries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<String>,
+    /// The mailbox notification attempt this row folds, when the row comes
+    /// from the durable mailbox rather than a legacy direct delivery. It is
+    /// what `cyclops attention show` takes. Absent on legacy rows and in
+    /// answers from daemons that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<crate::notification::NotificationAttemptId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1120,6 +1139,13 @@ pub struct MessagesSnapshotResult {
     pub workspace_seq: u64,
     pub counts: MessagesSnapshotCounts,
     pub rows: Vec<MessageSnapshotRow>,
+    /// The same durable mailbox attention rows `status` serves, read from
+    /// the same projection and stamped by this snapshot's `workspace_seq`,
+    /// so a stream that refreshes on `messages.changed` moves its eye on the
+    /// edge it was invalidated by, through the snapshot its refresh gate
+    /// accepts, with no second uncorrelated read. Absent from older daemons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mailbox_attention: Vec<OpenDelivery>,
 }
 
 /// One bounded page of durable message arrivals visible to the
@@ -1651,6 +1677,7 @@ mod tests {
             state: crate::ledger::DeliveryState::ParkedBlockedQuota,
             ts: 1_754_000_002_600,
             cause: Some("blocked_quota".into()),
+            attempt_id: None,
         };
         let back: OpenDelivery = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
         assert_eq!(back.state, crate::ledger::DeliveryState::ParkedBlockedQuota);

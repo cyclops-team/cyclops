@@ -196,6 +196,7 @@ fn snapshot(seq: u64, rows: Vec<MessageSnapshotRow>) -> MessagesSnapshotResult {
             open_attention_entries: 0,
         },
         rows,
+        mailbox_attention: Vec::new(),
     }
 }
 
@@ -1022,7 +1023,9 @@ fn applying_a_snapshot_releases_the_gate() {
     let request = app.wants_messages().expect("a reconnect owes a snapshot");
     assert!(app.wants_messages().is_none(), "one fetch at a time");
 
-    assert!(app.apply_messages_response(request, &snapshot(1, Vec::new())));
+    assert!(app
+        .apply_messages_response(request, &snapshot(1, Vec::new()))
+        .is_some());
     assert!(app.wants_messages().is_none(), "nothing changed since");
 
     app.refresh.mark_dirty();

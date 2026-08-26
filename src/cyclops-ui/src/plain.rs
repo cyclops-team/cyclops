@@ -166,10 +166,13 @@ fn apply_messages_snapshot(
     follower: &mut MessageFollower,
     request: crate::messages::RefreshRequest,
     snapshot: &cyclops_proto::MessagesSnapshotResult,
-    _out: &mut impl Write,
+    out: &mut impl Write,
 ) {
-    if !app.apply_messages_response(request, snapshot) {
+    let Some(lines) = app.apply_messages_response(request, snapshot) else {
         return;
+    };
+    for e in lines {
+        live(app, e, out);
     }
     follower.baseline(snapshot);
 }
@@ -355,6 +358,7 @@ mod tests {
                 open_attention_entries: 0,
             },
             rows,
+            mailbox_attention: Vec::new(),
         }
     }
 
@@ -531,7 +535,9 @@ mod tests {
                     state: cyclops_proto::DeliveryState::ParkedBlockedQuota,
                     ts: 43_471_000,
                     cause: Some("blocked_quota".into()),
+                    attempt_id: None,
                 }],
+                mailbox: Vec::new(),
             },
             &mut out,
         );

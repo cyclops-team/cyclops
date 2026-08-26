@@ -181,12 +181,38 @@ daemon loaded no detection rules at all and nothing on the machine can be
 addressed, while a full list means the rules are loaded and none of them
 binds that pane.
 
-`open_deliveries: true` adds an `open_deliveries` array: every delivery
-whose latest recorded state still needs a human, folded from the whole
-record. Each entry is `{id, to, state, ts, cause}`. Stream and durable-alarm
-surfaces ask for this projection. Normal `cyclops status` deliberately leaves
-it off: its eye reports the live pane fleet, while mailbox, alarm, and stream
-surfaces own durable delivery recovery.
+`open_deliveries: true` adds two arrays, kept apart. `open_deliveries` is the
+legacy session-ledger half: every direct delivery whose latest recorded state
+still needs a human, folded from the whole record, each entry
+`{id, to, state, ts, cause}`. `mailbox_attention` is the durable mailbox half:
+one row per live attempt for every open `attention_required` attempt and for
+every held queue head whose record is `attention_required` (an operator
+clearance only acknowledges and does not remove the row), `quota_held`,
+`quota_reset_observed`, or `blocked_pre_write`, each entry the same shape
+plus `recipient` (the exact key) and `attempt_id`. The row vocabulary has two
+words a human must act on, so held states project onto them with the cause
+naming the real state: `blocked_pre_write` rows read `attention_required`
+with cause `blocked_pre_write:<pre-write cause or wake block>`; the two quota
+states read `parked_blocked_quota` with `quota_held` or
+`quota_reset_observed` as cause. A pre-write-blocked head is a
+`mailbox_attention` row even though `status` also details it under
+`blocked_notifications`: the eye counts this array and a snapshot has no
+other, and a renderer that prints both dedups the detailed row by attempt
+id, so one attempt is one row with one reason and one next action. Identity
+is typed and durable: a row is keyed by its exact recipient
+(the label only for a legacy row that never carried a key) plus message id,
+and by `attempt_id`; every surface's attention register keys its items the
+same way and resolves a label-only reference to an exact row only when
+exactly one exact recipient carries that label for that message, so an alias
+can never merge two exact recipients. The next action a surface prints
+follows the state: `attention_required` with an attempt, inspect with
+`attention show --diff` then complete or discard, or the recipient claims;
+`blocked_pre_write`, fix the named cause and let the next route or composer
+evidence reopen the wake (the daemon refuses `requeue` for that state), or
+the recipient claims now; `quota_reset_observed`, `requeue`; `quota_held`,
+wait for the reset, then `requeue`. Operator pings are events and never rows.
+`cyclops status`, the stream, and the durable-alarm surfaces all read this
+projection, so every eye counts the same record.
 
 `admin_unread` is the number of pending messages in the workspace
 administrator's durable inbox. Older daemons omit it and clients read zero.
@@ -558,6 +584,13 @@ matching intent-only Discard exposes only no-key reconciliation. It does not
 require a Working observation because two fresh exact-empty and binding checks
 prove its requested effect. The opposite action remains unavailable. A client
 must not infer authority from `needs_action`.
+
+The answer also carries `mailbox_attention`: the same durable mailbox rows
+`status` serves, read from the same projection and stamped by this snapshot's
+`workspace_seq`, so a stream that refreshes on `messages.changed` moves its
+eye on the edge it was invalidated by, through the snapshot its refresh gate
+accepts, with no second uncorrelated read. Older daemons omit it; clients
+treat absence as an empty half.
 
 `messages.follow` is the lossless event-driven companion to the bounded queue
 snapshot. The authenticated caller supplies `after_seq` and a bounded `limit`.

@@ -336,6 +336,9 @@ mod tests {
             id: Some("m-1".into()),
             kind: EntryKind::Cleared {
                 was: AttentionItem::Delivery {
+                    recipient: cyclops_proto::DeliveryRecipientIdentity::LegacyLabel(
+                        "implementer".into(),
+                    ),
                     to: "implementer".into(),
                     id: "m-1".into(),
                     state: DeliveryState::ParkedBlockedQuota,
