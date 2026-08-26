@@ -123,9 +123,22 @@ impl PeerIdentity {
     /// behind it need not be.
     pub fn still_current(&self, fd: std::os::fd::RawFd) -> bool {
         match peer_identity_fd(fd) {
-            Ok(now) => now == *self && self.matches_process(ProcId::of(self.pid)),
+            Ok(now) => {
+                self.matches_socket_identity(&now) && self.matches_process(ProcId::of(self.pid))
+            }
             Err(_) => false,
         }
+    }
+
+    fn matches_socket_identity(&self, current: &PeerIdentity) -> bool {
+        if self.uid != current.uid || self.pid != current.pid || self.birth != current.birth {
+            return false;
+        }
+        #[cfg(target_os = "macos")]
+        if self.exec != current.exec {
+            return false;
+        }
+        true
     }
 
     fn matches_process(&self, current: Option<ProcId>) -> bool {
@@ -989,6 +1002,25 @@ mod tests {
                 birth: 701,
             })),
             "a reused pid belongs to a different process"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn peer_audit_token_rejects_an_exec_at_the_same_pid_and_birth() {
+        let peer = PeerIdentity {
+            uid: 501,
+            pid: 42,
+            birth: 700,
+            exec: [0; 8],
+        };
+        let mut execed = peer;
+        execed.exec[7] = 1;
+
+        assert!(peer.matches_socket_identity(&peer));
+        assert!(
+            !peer.matches_socket_identity(&execed),
+            "pidversion must separate executions with one pid and birth"
         );
     }
 
