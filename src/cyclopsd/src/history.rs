@@ -1612,6 +1612,7 @@ mod tests {
                 sender.clone(),
                 MailboxSend {
                     addresses: vec![recipient.label.clone()],
+                    recipient_keys: None,
                     subject: "canonical subject".into(),
                     body: "canonical body".into(),
                     fyi: false,

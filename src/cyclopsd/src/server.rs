@@ -1365,7 +1365,9 @@ pub(crate) fn mailbox_service_error(error: crate::mailbox::MailboxServiceError) 
                     ("no_such_message", error.to_string())
                 }
                 MailboxError::MessageNotPending(_) => ("message_not_pending", error.to_string()),
-                MailboxError::Type(_) => ("bad_request", error.to_string()),
+                MailboxError::DraftEmptyRecipients | MailboxError::Type(_) => {
+                    ("bad_request", error.to_string())
+                }
                 MailboxError::ReplyNotVisible { .. } | MailboxError::ClaimantMismatch { .. } => {
                     ("denied", error.to_string())
                 }
@@ -3093,6 +3095,7 @@ mod tests {
                 service.admin(),
                 crate::mailbox::MailboxSend {
                     addresses: vec!["reviewer".into()],
+                    recipient_keys: None,
                     subject: "Blocked".into(),
                     body: "claimable".into(),
                     fyi: false,
@@ -3191,6 +3194,102 @@ mod tests {
             2
         );
         assert_eq!(lines[1].reply_to.as_deref(), sent["msg_id"].as_str());
+        std::fs::remove_dir_all(path).ok();
+    }
+
+    #[tokio::test]
+    async fn exact_send_targets_are_current_unambiguous_and_caller_scoped() {
+        let (inner, path, _, recipient, _) = inner_with_blocked_notification("exact-send-targets");
+        let exact = ask_inner(
+            &inner,
+            "msg.send",
+            json!({
+                "to": [],
+                "recipient_keys": [recipient],
+                "subject": "Exact route",
+                "body": "Body",
+                "client_key": "exact-server-send"
+            }),
+        )
+        .await;
+        assert!(exact.error.is_none(), "{:?}", exact.error);
+        let exact = exact.result.unwrap();
+        assert_eq!(exact["deliveries"][0]["to"], "reviewer");
+
+        let snapshot = ask_inner(&inner, "messages.snapshot", json!({"recent_settled": 20})).await;
+        let snapshot: MessagesSnapshotResult =
+            serde_json::from_value(snapshot.result.unwrap()).unwrap();
+        assert_eq!(
+            snapshot.caller,
+            Some(RecipientKey::admin(snapshot.workspace_id))
+        );
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.subject.as_deref() == Some("Exact route"))
+            .unwrap();
+        assert_eq!(row.recipients[0].recipient, recipient);
+        assert_eq!(row.recipients[0].label, "reviewer");
+
+        let message_count = snapshot.counts.visible_messages;
+        let mixed = ask_inner(
+            &inner,
+            "msg.send",
+            json!({
+                "to": ["reviewer"],
+                "recipient_keys": [recipient],
+                "subject": "Mixed"
+            }),
+        )
+        .await;
+        assert_eq!(mixed.error.unwrap().code, "bad_request");
+
+        let empty = ask_inner(
+            &inner,
+            "msg.send",
+            json!({
+                "to": [],
+                "recipient_keys": [],
+                "subject": "Empty"
+            }),
+        )
+        .await;
+        assert_eq!(empty.error.unwrap().code, "bad_request");
+
+        let replacement = RecipientKey::agent(
+            recipient.workspace_id(),
+            SessionInstanceId::from_str("00000000-0000-0000-0000-000000000003").unwrap(),
+            recipient.pane_id().unwrap(),
+        );
+        let stale = ask_inner(
+            &inner,
+            "msg.send",
+            json!({
+                "to": [],
+                "recipient_keys": [replacement],
+                "subject": "Stale"
+            }),
+        )
+        .await;
+        assert_eq!(stale.error.unwrap().code, "no_such_target");
+
+        let routed_reply = ask_inner(
+            &inner,
+            "msg.send",
+            json!({
+                "to": [],
+                "recipient_keys": [recipient],
+                "subject": "Ignored",
+                "body": "Reply",
+                "reply_to": exact["msg_id"]
+            }),
+        )
+        .await;
+        assert_eq!(routed_reply.error.unwrap().code, "bad_request");
+
+        let after = ask_inner(&inner, "messages.snapshot", json!({"recent_settled": 20})).await;
+        let after: MessagesSnapshotResult = serde_json::from_value(after.result.unwrap()).unwrap();
+        assert_eq!(after.counts.visible_messages, message_count);
         std::fs::remove_dir_all(path).ok();
     }
 

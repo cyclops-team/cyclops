@@ -576,6 +576,10 @@ pub struct WorkspaceUiSetParams {
 pub struct MsgSendParams {
     /// Recipient labels. Broadcast is explicit: multiple labels or "*".
     pub to: Vec<String>,
+    /// Exact durable recipients. New interactive clients use this instead of
+    /// labels so a rename cannot retarget a message between selection and send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient_keys: Option<Vec<crate::identity::RecipientKey>>,
     pub subject: String,
     #[serde(default)]
     pub body: String,
@@ -1101,6 +1105,9 @@ pub struct MessagesSnapshotCounts {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessagesSnapshotResult {
     pub workspace_id: crate::identity::WorkspaceId,
+    /// Authenticated caller for this snapshot. Older daemons omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<crate::identity::RecipientKey>,
     /// Highest workspace journal sequence folded into this snapshot.
     pub workspace_seq: u64,
     pub counts: MessagesSnapshotCounts,
@@ -1908,6 +1915,48 @@ mod tests {
         assert!(!decoded.can_manage_attention);
         assert!(!decoded.can_withdraw_notification);
         assert!(decoded.current_route.is_none());
+    }
+
+    #[test]
+    fn exact_send_targets_and_snapshot_callers_are_additive() {
+        let workspace = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let session = "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let recipient = crate::RecipientKey::agent(workspace, session, "%3".parse().unwrap());
+
+        let exact: MsgSendParams = serde_json::from_value(serde_json::json!({
+            "to": [],
+            "recipient_keys": [recipient],
+            "subject": "Exact route"
+        }))
+        .unwrap();
+        assert_eq!(exact.recipient_keys, Some(vec![recipient]));
+
+        let legacy: MsgSendParams = serde_json::from_value(serde_json::json!({
+            "to": ["reviewer"],
+            "subject": "Label route"
+        }))
+        .unwrap();
+        assert!(legacy.recipient_keys.is_none());
+
+        let legacy_snapshot: MessagesSnapshotResult = serde_json::from_value(serde_json::json!({
+            "workspace_id": workspace,
+            "workspace_seq": 0,
+            "counts": {
+                "visible_messages": 0,
+                "returned_messages": 0,
+                "inbox_messages": 0,
+                "outbound_messages": 0,
+                "work_messages": 0,
+                "active_messages": 0,
+                "settled_messages": 0,
+                "pending_entries": 0,
+                "claimed_entries": 0,
+                "open_attention_entries": 0
+            },
+            "rows": []
+        }))
+        .unwrap();
+        assert!(legacy_snapshot.caller.is_none());
     }
 
     #[test]

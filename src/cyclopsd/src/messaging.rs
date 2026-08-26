@@ -505,6 +505,12 @@ pub(crate) fn send(
     sender: MailboxIdentity,
     params: MsgSendParams,
 ) -> Result<MsgSendResult, MailboxServiceError> {
+    if params.reply_to.is_some() && (!params.to.is_empty() || params.recipient_keys.is_some()) {
+        return Err(crate::mailbox::MailboxDirectoryError::ReplyRecipientSelectors.into());
+    }
+    if params.recipient_keys.is_some() && !params.to.is_empty() {
+        return Err(crate::mailbox::MailboxDirectoryError::MixedRecipientSelectors.into());
+    }
     let accepted = match params.reply_to {
         Some(reference) => service.reply(
             sender,
@@ -519,6 +525,7 @@ pub(crate) fn send(
             sender,
             MailboxSend {
                 addresses: params.to,
+                recipient_keys: params.recipient_keys,
                 subject: params.subject,
                 body: params.body,
                 fyi: params.fyi,

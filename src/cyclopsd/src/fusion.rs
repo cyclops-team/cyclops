@@ -7532,6 +7532,7 @@ regex = ['^IDLE']
                 service.admin(),
                 MailboxSend {
                     addresses: vec!["codex".into()],
+                    recipient_keys: None,
                     subject: "recover".into(),
                     body: "body".into(),
                     fyi: false,

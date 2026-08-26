@@ -796,6 +796,7 @@ mod through_the_app {
     pub fn snapshot(seq: u64, rows: Vec<MessageSnapshotRow>) -> MessagesSnapshotResult {
         MessagesSnapshotResult {
             workspace_id: workspace(),
+            caller: None,
             workspace_seq: seq,
             counts: MessagesSnapshotCounts {
                 visible_messages: rows.len() as u64,

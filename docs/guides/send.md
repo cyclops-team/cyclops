@@ -183,9 +183,9 @@ limited to one recipient and only succeeds while the old message is unclaimed
 and its notification has not crossed the write boundary. History remains
 append-only.
 
-Prefer `cyclops reply <id>` to `send --reply-to <id>`. Both use the same daemon
-validation, but `reply` avoids supplying routing or subject that the daemon
-will ignore.
+Prefer `cyclops reply <id>` to `cyclops send --subject "ignored" --reply-to <id>`.
+Both use the same daemon validation. Neither accepts a recipient because the
+daemon derives the exact route and subject from the referenced message.
 
 ## Attention and operator recovery
 

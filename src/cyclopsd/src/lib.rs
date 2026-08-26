@@ -4364,6 +4364,7 @@ mod tests {
             service.admin(),
             mailbox::MailboxSend {
                 addresses: vec![address],
+                recipient_keys: None,
                 subject: "Test".into(),
                 body: String::new(),
                 fyi: false,
@@ -4414,6 +4415,7 @@ mod tests {
                 service.admin(),
                 mailbox::MailboxSend {
                     addresses: vec!["admin".into()],
+                    recipient_keys: None,
                     subject: "Restart".into(),
                     body: "Persisted".into(),
                     fyi: false,

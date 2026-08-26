@@ -290,11 +290,18 @@ That is the point of it (reconcile on doubt), but do not put it in a loop.
     "msg_id":"m-7fe0df","seq":7}}
 ```
 
-`to` takes several labels, or `"*"` for every named pane. Optional params:
-`fyi` (an announcement), `client_key` (sender-scoped exact-retry key),
-`reply_to` (a visible message id) and `supersedes` (one unclaimed message
-with the same sender, recipient, and thread). The deprecated `wait` field
-is retained in protocol v1 only so the daemon can reject old callers with
+`to` takes several labels, or `"*"` for every named pane. Interactive clients
+may instead send `to: []` with `recipient_keys`, an array of exact durable
+recipient identities returned by `messages.snapshot`. The two selectors cannot
+be combined. Exact keys must still be present in the current mailbox directory,
+and the daemon snapshots their current labels only for display. A rename cannot
+retarget a selected key. `reply_to` derives its recipient from the referenced
+message and therefore permits neither selector.
+
+Other optional params are `fyi` (an announcement), `client_key`
+(sender-scoped exact-retry key), and `supersedes` (one unclaimed message with
+the same sender, recipient, and thread). The deprecated `wait` field is retained
+in protocol v1 only so the daemon can reject old callers with
 `notification_unavailable` instead of silently ignoring their request.
 
 The sender is never in the request. The daemon resolves it from the calling
@@ -514,9 +521,10 @@ FIFO state, current notification attempt and cause, attention clearance,
 guarded resolution, pre-key intent, accepted-action and consumption state, and
 a workspace sequence
 watermark. A notification resolution is reported separately as `complete` or
-`discard`; a resolved attempt is not open attention. Direction is relative to
-the caller: `inbound`, `outbound`, `self_addressed`, or administrator-only
-`workspace`. Both the message and each recipient row carry their own direction
+`discard`; a resolved attempt is not open attention. The additive `caller`
+field carries the exact authenticated `RecipientKey`; older daemons omit it.
+Direction is relative to the caller: `inbound`, `outbound`, `self_addressed`,
+or administrator-only `workspace`. Both the message and each recipient row carry their own direction
 and `needs_action` answer. A per-recipient surface must use the recipient fields
 so one broadcast mailbox cannot inherit another's state. Counts include
 caller-relative inbox, outbound, and Work totals even when settled rows are

@@ -478,7 +478,7 @@ struct SendArgs {
     #[arg(long)]
     client_key: Option<String>,
     /// Message id this replies to. Recipient and subject come from the referenced message.
-    #[arg(long, conflicts_with = "supersedes")]
+    #[arg(long, conflicts_with_all = ["target", "to", "all", "supersedes"])]
     reply_to: Option<String>,
     /// Replace one unclaimed message before its notification starts writing.
     #[arg(long, conflicts_with = "reply_to")]
@@ -1633,7 +1633,7 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
             to.push(t.clone());
         }
     }
-    if to.is_empty() {
+    if to.is_empty() && args.reply_to.is_none() {
         eprintln!("{}", copy::NO_RECIPIENT);
         return EXIT_USAGE;
     }
@@ -1664,6 +1664,7 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
     };
     let params = serde_json::to_value(MsgSendParams {
         to: to.clone(),
+        recipient_keys: None,
         subject: args.subject.clone(),
         body,
         fyi: args.fyi,
@@ -3003,7 +3004,6 @@ mod tests {
         let reply = Cli::try_parse_from([
             "cyclops",
             "send",
-            "reviewer",
             "--subject",
             "ignored for validated reply",
             "--reply-to",
@@ -3017,6 +3017,17 @@ mod tests {
         };
         assert_eq!(args.reply_to.as_deref(), Some("m-parent"));
         assert_eq!(args.client_key.as_deref(), Some("retry-1"));
+        assert!(args.target.is_none());
+        assert!(Cli::try_parse_from([
+            "cyclops",
+            "send",
+            "reviewer",
+            "--subject",
+            "ignored",
+            "--reply-to",
+            "m-parent",
+        ])
+        .is_err());
 
         let supersession = Cli::try_parse_from([
             "cyclops",

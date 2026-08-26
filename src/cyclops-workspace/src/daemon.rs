@@ -170,6 +170,7 @@ pub fn send_message(
 ) -> SendOutcome {
     let params = match serde_json::to_value(cyclops_proto::MsgSendParams {
         to: vec![to.to_string()],
+        recipient_keys: None,
         subject: subject.to_string(),
         body: body.to_string(),
         fyi: false,

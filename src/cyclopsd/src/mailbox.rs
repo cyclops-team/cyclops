@@ -582,6 +582,7 @@ pub struct MailboxIdentity {
 
 pub struct MailboxSend {
     pub addresses: Vec<String>,
+    pub recipient_keys: Option<Vec<RecipientKey>>,
     pub subject: String,
     pub body: String,
     pub fyi: bool,
@@ -637,6 +638,10 @@ pub enum MailboxDirectoryError {
     DuplicateAddress(String),
     #[error("recipient '{0}' is not in the durable mailbox directory")]
     UnknownRecipient(String),
+    #[error("recipient labels and durable recipient keys cannot be combined")]
+    MixedRecipientSelectors,
+    #[error("a reply derives its recipient from reply_to and cannot name recipients")]
+    ReplyRecipientSelectors,
     #[error("'*' must be the only recipient address")]
     MixedBroadcast,
 }
@@ -769,6 +774,26 @@ impl MailboxDirectory {
                     .cloned()
                     .ok_or_else(|| MailboxDirectoryError::UnknownRecipient(address.clone()))?
             };
+            if seen.insert(identity.key) {
+                identities.push(identity);
+            }
+        }
+        Ok(identities)
+    }
+
+    fn resolve_recipient_keys(
+        &self,
+        recipient_keys: &[RecipientKey],
+    ) -> Result<Vec<MailboxIdentity>, MailboxDirectoryError> {
+        let mut seen = HashSet::new();
+        let mut identities = Vec::with_capacity(recipient_keys.len());
+        for recipient in recipient_keys {
+            if recipient.workspace_id() != self.workspace_id {
+                return Err(MailboxDirectoryError::ForeignWorkspace);
+            }
+            let identity = self
+                .identity_for_recipient(*recipient)
+                .ok_or_else(|| MailboxDirectoryError::UnknownRecipient(recipient.to_string()))?;
             if seen.insert(identity.key) {
                 identities.push(identity);
             }
@@ -3748,6 +3773,7 @@ impl MailboxProjection {
 
         Ok(MessagesSnapshotResult {
             workspace_id: self.workspace_id,
+            caller: Some(caller),
             workspace_seq: self.last_workspace_seq.unwrap_or(0),
             counts,
             rows,
@@ -4355,8 +4381,27 @@ impl MailboxService {
         sender: MailboxIdentity,
         request: MailboxSend,
     ) -> Result<AcceptResult, MailboxServiceError> {
+        self.send_after_resolution(sender, request, || {})
+    }
+
+    fn send_after_resolution(
+        &self,
+        sender: MailboxIdentity,
+        request: MailboxSend,
+        after_resolution: impl FnOnce(),
+    ) -> Result<AcceptResult, MailboxServiceError> {
         let supersedes = request.supersedes.clone();
-        let recipients = self.directory()?.resolve(&request.addresses)?;
+        // Keep this read guard through the append. A route replacement cannot
+        // invalidate an exact recipient after validation but before acceptance.
+        let directory = self.directory()?;
+        let recipients = match request.recipient_keys.as_deref() {
+            Some(_) if !request.addresses.is_empty() => {
+                return Err(MailboxDirectoryError::MixedRecipientSelectors.into());
+            }
+            Some(recipient_keys) => directory.resolve_recipient_keys(recipient_keys)?,
+            None => directory.resolve(&request.addresses)?,
+        };
+        after_resolution();
         let draft = MessageDraft {
             kind: if request.fyi { Kind::Fyi } else { Kind::Msg },
             sender: sender.key,
@@ -7340,10 +7385,28 @@ mod tests {
     fn mailbox_send(address: &str, subject: &str, body: &str) -> MailboxSend {
         MailboxSend {
             addresses: vec![address.into()],
+            recipient_keys: None,
             subject: subject.into(),
             body: body.into(),
             fyi: false,
             client_key: None,
+            supersedes: None,
+        }
+    }
+
+    fn exact_mailbox_send(
+        recipient_keys: Vec<RecipientKey>,
+        subject: &str,
+        body: &str,
+        client_key: Option<&str>,
+    ) -> MailboxSend {
+        MailboxSend {
+            addresses: Vec::new(),
+            recipient_keys: Some(recipient_keys),
+            subject: subject.into(),
+            body: body.into(),
+            fyi: false,
+            client_key: client_key.map(str::to_string),
             supersedes: None,
         }
     }
@@ -7837,6 +7900,174 @@ mod tests {
                 .collect::<HashSet<_>>(),
             HashSet::from([first, second])
         );
+    }
+
+    #[test]
+    fn exact_recipient_sends_use_current_identity_without_label_retargeting() {
+        let scratch = StoreScratch::new("exact-recipient-send");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, _, bob, _) = test_context();
+        let pane = bob.pane_id().unwrap();
+        let directory = MailboxDirectory::new(
+            workspace,
+            [MailboxIdentity {
+                key: bob,
+                label: "reviewer".into(),
+            }],
+        )
+        .unwrap();
+        let store = MessageStore::open(&root, journal, workspace, "boot").unwrap();
+        let service = MailboxService::new(directory, store);
+
+        let first = service
+            .send(
+                service.admin(),
+                exact_mailbox_send(vec![bob, bob], "Exact", "Body", Some("exact-retry")),
+            )
+            .unwrap();
+        assert_eq!(first.recipient_keys, [bob]);
+        assert_eq!(first.recipients, ["reviewer"]);
+
+        service
+            .replace_directory(
+                MailboxDirectory::new(
+                    workspace,
+                    [MailboxIdentity {
+                        key: bob,
+                        label: "implementer".into(),
+                    }],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let retry = service
+            .send(
+                service.admin(),
+                exact_mailbox_send(vec![bob], "Exact", "Body", Some("exact-retry")),
+            )
+            .unwrap();
+        assert!(!retry.inserted);
+        assert_eq!(retry.message_id, first.message_id);
+        assert_eq!(retry.recipients, ["reviewer"]);
+
+        let mut mixed_request = exact_mailbox_send(vec![bob], "Ambiguous", "", None);
+        mixed_request.addresses.push("implementer".into());
+        let mixed = service.send(service.admin(), mixed_request).unwrap_err();
+        assert!(matches!(
+            mixed,
+            MailboxServiceError::Directory(MailboxDirectoryError::MixedRecipientSelectors)
+        ));
+
+        let replacement_session =
+            SessionInstanceId::from_str("00000000-0000-0000-0000-000000000003").unwrap();
+        let replacement = RecipientKey::agent(workspace, replacement_session, pane);
+        service
+            .replace_directory(
+                MailboxDirectory::new(
+                    workspace,
+                    [MailboxIdentity {
+                        key: replacement,
+                        label: "implementer".into(),
+                    }],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let stale = service
+            .send(
+                service.admin(),
+                exact_mailbox_send(vec![bob], "Stale", "", None),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            stale,
+            MailboxServiceError::Directory(MailboxDirectoryError::UnknownRecipient(target))
+                if target == bob.to_string()
+        ));
+
+        let current = service
+            .send(
+                service.admin(),
+                exact_mailbox_send(vec![replacement], "Current", "", None),
+            )
+            .unwrap();
+        assert_eq!(current.recipient_keys, [replacement]);
+        assert_eq!(current.recipients, ["implementer"]);
+    }
+
+    #[test]
+    fn exact_recipient_validation_stays_locked_through_acceptance() {
+        let scratch = StoreScratch::new("exact-recipient-linearization");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, _, bob, _) = test_context();
+        let pane = bob.pane_id().unwrap();
+        let directory = MailboxDirectory::new(
+            workspace,
+            [MailboxIdentity {
+                key: bob,
+                label: "reviewer".into(),
+            }],
+        )
+        .unwrap();
+        let store = MessageStore::open(&root, journal, workspace, "boot").unwrap();
+        let service = Arc::new(MailboxService::new(directory, store));
+        let (resolved_tx, resolved_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let sending = Arc::clone(&service);
+        let send = std::thread::spawn(move || {
+            sending.send_after_resolution(
+                sending.admin(),
+                exact_mailbox_send(vec![bob], "Exact", "Body", None),
+                || {
+                    resolved_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .unwrap();
+                },
+            )
+        });
+
+        resolved_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let directory_still_locked = matches!(
+            service.directory.try_write(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        release_tx.send(()).unwrap();
+        let accepted = send.join().unwrap().unwrap();
+        assert!(directory_still_locked);
+        assert_eq!(accepted.recipient_keys, [bob]);
+
+        let replacement_session =
+            SessionInstanceId::from_str("00000000-0000-0000-0000-000000000003").unwrap();
+        let replacement = RecipientKey::agent(workspace, replacement_session, pane);
+        service
+            .replace_directory(
+                MailboxDirectory::new(
+                    workspace,
+                    [MailboxIdentity {
+                        key: replacement,
+                        label: "implementer".into(),
+                    }],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let stale = service
+            .send(
+                service.admin(),
+                exact_mailbox_send(vec![bob], "Stale", "", None),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            stale,
+            MailboxServiceError::Directory(MailboxDirectoryError::UnknownRecipient(target))
+                if target == bob.to_string()
+        ));
     }
 
     #[test]
@@ -9088,6 +9319,7 @@ mod tests {
                 service.admin(),
                 MailboxSend {
                     addresses: vec!["*".into()],
+                    recipient_keys: None,
                     subject: "Broadcast".into(),
                     body: String::new(),
                     fyi: false,
