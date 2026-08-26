@@ -274,7 +274,7 @@ impl CommandPipe {
         line.push('\n');
         let write = write_command_line(stdin, line.as_bytes()).await;
         if let Err(error) = write {
-            return Err(self.poison_after_write_failure(&mut *guard, error));
+            return Err(self.poison_after_write_failure(&mut guard, error));
         }
         self.issued.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -1566,7 +1566,7 @@ mod tests {
         let mapped = {
             let mut stdin = pipe.stdin.lock().await;
             pipe.poison_after_write_failure(
-                &mut *stdin,
+                &mut stdin,
                 CommandWriteError::Unwritten(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "closed before the first byte",
