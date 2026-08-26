@@ -3,6 +3,7 @@
   "theme": "mint",
   "name": "Cyclops",
   "description": "Coordinate terminal coding agents already running in tmux.",
+  "favicon": "/favicon.png",
   "colors": {
     "primary": "#2f7a45",
     "light": "#9ec9a2",
