@@ -7630,6 +7630,7 @@ regex = ['^']
             (13, "PermissionRequest"),
         ] {
             liveness.record(&pane, event, ts, agent, "claude");
+            liveness.record_admitting_edge(&pane, event, agent, "claude");
             assert!(
                 liveness.seen_any(&pane, agent, "claude"),
                 "{event} proves wiring"
@@ -7646,7 +7647,14 @@ regex = ['^']
                 true
             ));
         }
+        // The diagnostic record alone never admits, even for SessionStart:
+        // only the separately published admitting edge does.
         liveness.record(&pane, "SessionStart", 14, agent, "claude");
+        assert!(
+            !liveness.seen_admitting_edge(&pane, agent, "claude"),
+            "diagnostic record is not admission"
+        );
+        liveness.record_admitting_edge(&pane, "SessionStart", agent, "claude");
         assert!(
             liveness.seen_admitting_edge(&pane, agent, "claude"),
             "SessionStart admits"
@@ -7665,10 +7673,17 @@ regex = ['^']
         );
         let prompt_first = PaneKey::new(0, "%10");
         liveness.open(&prompt_first);
-        liveness.record(&prompt_first, "UserPromptSubmit", 20, agent, "claude");
+        liveness.record_admitting_edge(&prompt_first, "UserPromptSubmit", agent, "claude");
         assert!(
             liveness.seen_admitting_edge(&prompt_first, agent, "claude"),
             "UserPromptSubmit qualifies"
+        );
+        // A closed pane forgets its admitting edges with its lifetime.
+        liveness.close(&prompt_first);
+        liveness.open(&prompt_first);
+        assert!(
+            !liveness.seen_admitting_edge(&prompt_first, agent, "claude"),
+            "a new lifetime begins unknown"
         );
         assert!(
             !admits(false, false, false, false, true),

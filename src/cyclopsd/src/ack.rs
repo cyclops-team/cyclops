@@ -163,6 +163,40 @@ fn dedupe_ids(payload: &Value) -> Option<(String, String)> {
 /// visible through a control-connection outage (the m1 soak lost a
 /// delivery to exactly this blindness). Fusion recompute is skipped on
 /// that path; the reading is stored and reconciles at reattach.
+/// May this report publish an admission-eligible liveness edge?
+///
+/// `SessionStart` qualifies when the exact manifest declares it available:
+/// it says the agent process is up with its hooks wired and no turn has
+/// been asked of it. `UserPromptSubmit` qualifies only when this exact
+/// manifest configures it as a lifecycle start AND the report path installed
+/// or retained an active start for the exact binding, so the edge can never
+/// be seen without its start. A manifest that merely lists
+/// `UserPromptSubmit` as available never publishes it: with no start
+/// installed, a later clean screen would otherwise read idle during the
+/// submitted turn. Every other event is refused here and again by the store.
+pub(crate) fn admitting_edge_qualifies(
+    m: &cyclops_manifest::Manifest,
+    event: &str,
+    active_start_installed: bool,
+) -> bool {
+    let available = m
+        .hooks
+        .available
+        .iter()
+        .any(|name| normalize_event(name) == event);
+    if event == normalize_event("SessionStart") {
+        return available;
+    }
+    if event == normalize_event("UserPromptSubmit") {
+        let configured_start = matches!(
+            m.hooks.lifecycle_event(event),
+            Some((LifecycleRole::Start, _))
+        );
+        return available && configured_start && active_start_installed;
+    }
+    false
+}
+
 pub(crate) async fn handle_report(
     inner: &Arc<Inner>,
     params: StateReportParams,
@@ -544,6 +578,27 @@ pub(crate) async fn handle_report(
             "hook_dispatch_superseded",
         );
     }
+    // Admission-eligible publication comes after the manifest declared this
+    // event and after any start it carries has been installed above, and
+    // before the recompute below is scheduled: one causal order, so a
+    // recompute can never see an eligible edge without its active start.
+    if let (Some(m), Some(manifest_id)) = (manifest_of(inner, &origin), origin.manifest.as_deref())
+    {
+        let active_start_installed = inner
+            .hook_readings
+            .lock()
+            .expect("hook readings lock")
+            .get(&pane)
+            .is_some_and(|current| current.active_start_for(origin.agent, Some(manifest_id)));
+        if admitting_edge_qualifies(m, &event, active_start_installed) {
+            inner.hook_liveness.record_admitting_edge(
+                &pane,
+                &params.event,
+                origin.agent,
+                manifest_id,
+            );
+        }
+    }
     if unkeyed_dispatch_start && applied_state.is_some() {
         fusion::schedule_unkeyed_dispatch_recheck(inner, &pane);
     }
@@ -730,6 +785,81 @@ pub(crate) async fn handle_report(
 
 #[cfg(test)]
 mod tests {
+    /// An available-only UserPromptSubmit never qualifies: the manifest must
+    /// configure it as a lifecycle start and the report path must have
+    /// installed the active start. SessionStart qualifies by declaration.
+    #[test]
+    fn available_only_user_prompt_submit_never_enters_the_admission_store() {
+        let with_start = cyclops_manifest::Manifest::parse(
+            r#"
+[agent]
+id = "hooked"
+display_name = "Hooked fixture"
+process_names = ["hooked"]
+
+[hooks]
+config_mechanism = "test"
+available = ["SessionStart", "UserPromptSubmit", "Stop"]
+turn_start = "UserPromptSubmit"
+turn_start_evidence = "candidate"
+ack = "UserPromptSubmit"
+ack_evidence = "dispatch"
+ack_payload_field = "prompt"
+"#,
+            std::path::Path::new("hooked.toml"),
+        )
+        .unwrap();
+        let available_only = cyclops_manifest::Manifest::parse(
+            r#"
+[agent]
+id = "listed"
+display_name = "Listed fixture"
+process_names = ["listed"]
+
+[hooks]
+config_mechanism = "test"
+available = ["SessionStart", "UserPromptSubmit", "Stop"]
+"#,
+            std::path::Path::new("listed.toml"),
+        )
+        .unwrap();
+        let prompt = super::normalize_event("UserPromptSubmit");
+        let session = super::normalize_event("SessionStart");
+        let stop = super::normalize_event("Stop");
+        assert!(super::admitting_edge_qualifies(&with_start, &prompt, true));
+        assert!(
+            !super::admitting_edge_qualifies(&with_start, &prompt, false),
+            "start not installed"
+        );
+        assert!(
+            !super::admitting_edge_qualifies(&available_only, &prompt, true),
+            "available-only"
+        );
+        assert!(!super::admitting_edge_qualifies(
+            &available_only,
+            &prompt,
+            false
+        ));
+        assert!(super::admitting_edge_qualifies(
+            &with_start,
+            &session,
+            false
+        ));
+        assert!(super::admitting_edge_qualifies(
+            &available_only,
+            &session,
+            false
+        ));
+        assert!(!super::admitting_edge_qualifies(&with_start, &stop, true));
+        let liveness = crate::selftest::HookLiveness::new();
+        let pane = crate::PaneKey::new(0, "%1");
+        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
+        liveness.open(&pane);
+        if super::admitting_edge_qualifies(&available_only, &prompt, false) {
+            liveness.record_admitting_edge(&pane, "UserPromptSubmit", agent, "listed");
+        }
+        assert!(!liveness.seen_admitting_edge(&pane, agent, "listed"));
+    }
     use super::*;
 
     #[test]

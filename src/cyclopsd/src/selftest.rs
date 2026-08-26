@@ -64,6 +64,11 @@ struct HookLivenessState {
     next_lifetime: u64,
     live: HashMap<PaneKey, PaneLifetime>,
     edges: HashMap<HookBinding, PaneEdges>,
+    /// Admission-eligible edges, kept apart from `edges`: published by the
+    /// report path only after the manifest declared the event and any start
+    /// the edge carries was installed, so a recompute can never observe an
+    /// eligible edge without its start. `edges` stays diagnostic.
+    admitting: HashMap<HookBinding, HashSet<String>>,
     f1_notified: HashSet<HookBinding>,
 }
 
@@ -160,16 +165,46 @@ impl HookLiveness {
         current_agent: crate::identity::ProcId,
         manifest: &str,
     ) -> bool {
-        const ADMITTING_EVENTS: [&str; 2] = ["SessionStart", "UserPromptSubmit"];
         let Some(binding) = self.binding(pane, current_agent, manifest) else {
             return false;
         };
         let state = self.state.lock().expect("hook liveness lock");
-        state.edges.get(&binding).is_some_and(|edges| {
-            ADMITTING_EVENTS
-                .iter()
-                .any(|event| edges.contains_key(&ack::normalize_event(event)))
-        })
+        state
+            .admitting
+            .get(&binding)
+            .is_some_and(|events| !events.is_empty())
+    }
+    /// Publish an admission-eligible edge for this exact binding. Only a
+    /// normalized `SessionStart` or `UserPromptSubmit` is ever stored; any
+    /// other event is a no-op here, whatever `record` keeps for diagnostics.
+    /// The report path calls this after the manifest declared the event and
+    /// after any start the edge carries was installed.
+    pub(crate) fn record_admitting_edge(
+        &self,
+        pane: &PaneKey,
+        raw_event: &str,
+        agent: crate::identity::ProcId,
+        manifest: &str,
+    ) {
+        const ADMITTING_EVENTS: [&str; 2] = ["SessionStart", "UserPromptSubmit"];
+        let event = ack::normalize_event(raw_event);
+        if !ADMITTING_EVENTS
+            .iter()
+            .any(|admitting| ack::normalize_event(admitting) == event)
+        {
+            return;
+        }
+        let mut state = self.state.lock().expect("hook liveness lock");
+        let Some(lifetime) = state.live.get(pane).copied() else {
+            return;
+        };
+        let binding = HookBinding {
+            pane: pane.clone(),
+            lifetime,
+            agent,
+            manifest: manifest.to_string(),
+        };
+        state.admitting.entry(binding).or_default().insert(event);
     }
     pub(crate) fn seen_any(
         &self,
@@ -213,6 +248,7 @@ impl HookLiveness {
         let mut state = self.state.lock().expect("hook liveness lock");
         state.live.remove(pane);
         state.edges.retain(|binding, _| &binding.pane != pane);
+        state.admitting.retain(|binding, _| &binding.pane != pane);
         state.f1_notified.retain(|binding| &binding.pane != pane);
     }
 
