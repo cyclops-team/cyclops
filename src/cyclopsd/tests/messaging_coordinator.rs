@@ -365,7 +365,7 @@ async fn resize_pane_and_allow_event(rig: &mut Rig, pane: &str, width: u32) {
     }
 }
 
-async fn wait_for_pane_write_ready(rig: &Rig, pane: &str) {
+async fn wait_for_pane_write_ready(rig: &mut Rig, pane: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let status = rig.ctl.request("status", json!({})).await;
@@ -781,7 +781,7 @@ async fn a_claim_before_submit_clears_only_the_exact_doorbell_and_advances_fifo(
         0
     );
     assert!(!rig.tmux.capture(&pane).contains(&first_id));
-    wait_for_pane_write_ready(&rig, &pane).await;
+    wait_for_pane_write_ready(&mut rig, &pane).await;
 
     let second =
         send_workspace_message(&rig, "claim-before-submit-second", "Second", "second body").await;
