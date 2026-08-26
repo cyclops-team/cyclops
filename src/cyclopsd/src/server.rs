@@ -427,6 +427,32 @@ pub(crate) async fn dispatch(
                 None,
             )
         }
+        "health.snapshot" => {
+            if !matches!(&req.params, Value::Null)
+                && !matches!(&req.params, Value::Object(fields) if fields.is_empty())
+            {
+                return (
+                    Response::err(
+                        id,
+                        "bad_request",
+                        "health.snapshot accepts no parameters",
+                        None,
+                    ),
+                    None,
+                );
+            }
+            // Health is observational. It reads the last committed daemon
+            // projection and never captures panes, publishes facts, or wakes
+            // delivery work.
+            let result = status_result(inner, false);
+            (
+                Response::ok(
+                    id,
+                    serde_json::to_value(result).expect("health snapshot serializes"),
+                ),
+                None,
+            )
+        }
         "pane.read" => (pane_read(inner, id, req.params).await, None),
         "daemon.quiesce" => {
             // The pre-restart hold. Absent params take the shipped bounds,
@@ -4763,6 +4789,38 @@ mod tests {
         let result = resp.result.unwrap();
         assert_eq!(result["boot_id"], "b-test");
         assert_eq!(result["sessions"], json!([]));
+
+        let (resp, _) = dispatch(&inner, req("health.snapshot"), own_peer()).await;
+        let result = resp.result.expect("health snapshot answers");
+        assert_eq!(result["boot_id"], "b-test");
+        assert_eq!(result["sessions"], json!([]));
+        assert_eq!(result["open_deliveries"], json!([]));
+    }
+
+    #[test]
+    fn health_snapshot_dispatch_cannot_enter_the_refresh_path() {
+        let source = include_str!("server.rs");
+        let arm = source
+            .split_once("        \"health.snapshot\" => {")
+            .expect("health snapshot dispatch arm")
+            .1
+            .split_once("        \"pane.read\" =>")
+            .expect("next dispatch arm")
+            .0;
+
+        assert!(arm.contains("status_result(inner, false)"));
+        for forbidden in [
+            "refresh_status_detections",
+            "recompute_pane",
+            "open_deliveries: true",
+            "engine.wake",
+            "events.send",
+        ] {
+            assert!(
+                !arm.contains(forbidden),
+                "health snapshot entered mutating path {forbidden}"
+            );
+        }
     }
 
     #[tokio::test]

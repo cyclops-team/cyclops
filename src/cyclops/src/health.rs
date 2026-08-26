@@ -101,8 +101,8 @@ struct WorkspaceMappingReport {
 
 struct SessionMappingReport {
     name: String,
-    attached: bool,
-    configured: bool,
+    attached: Option<bool>,
+    configured: Option<bool>,
     state: &'static str,
     binding: Option<SessionIdentityBinding>,
 }
@@ -470,7 +470,9 @@ fn collect() -> HealthReport {
             path: Some(home.join("config.toml")),
         });
     }
-    if daemon.running && operational.workspace.state != "current" {
+    if operational.workspace.state == "invalid"
+        || (daemon.running && operational.workspace.state != "current")
+    {
         issues.push(Issue {
             code: "workspace_mapping_unproven",
             message: operational
@@ -488,11 +490,12 @@ fn collect() -> HealthReport {
             path: Some(home.join("identity/sessions.ndjson")),
         });
     }
-    for session in operational
-        .sessions
-        .iter()
-        .filter(|session| session.state != "current")
-    {
+    for session in operational.sessions.iter().filter(|session| {
+        matches!(
+            session.state,
+            "invalid_record" | "unproven" | "conflict" | "missing_record"
+        )
+    }) {
         issues.push(Issue {
             code: "session_mapping_unproven",
             message: format!(
@@ -605,7 +608,16 @@ fn collect() -> HealthReport {
             });
         }
     }
-    if let Some(error) = &rollback.error {
+    if rollback.state == "update_active" {
+        issues.push(Issue {
+            code: "update_in_progress",
+            message: rollback
+                .error
+                .clone()
+                .unwrap_or_else(|| "another updater holds the managed pair store lease".into()),
+            path: rollback.prefix.clone(),
+        });
+    } else if let Some(error) = &rollback.error {
         issues.push(Issue {
             code: "rollback_proof_invalid",
             message: error.clone(),
@@ -776,7 +788,12 @@ fn inspect_rollback(binaries: &BinaryReport) -> RollbackReport {
 
 fn inspect_rollback_with<F>(binaries: &BinaryReport, inspect: F) -> RollbackReport
 where
-    F: FnOnce(&Path) -> Result<Option<crate::update::InstalledPairDescriptor>, String>,
+    F: FnOnce(
+        &Path,
+    ) -> Result<
+        Option<crate::update::InstalledPairDescriptor>,
+        crate::update::InstalledPairInspectionError,
+    >,
 {
     let Some(prefix) = selected_public_prefix(binaries) else {
         return rollback_unproven(
@@ -789,7 +806,27 @@ where
             Some(prefix),
             "the selected public installation has no managed rollback descriptor",
         ),
-        Err(error) => RollbackReport {
+        Err(crate::update::InstalledPairInspectionError::UpdateActive(error)) => RollbackReport {
+            state: "update_active",
+            prefix: Some(prefix),
+            selection: None,
+            active_pair: None,
+            known_good_pair: None,
+            active_identity: None,
+            known_good_identity: None,
+            active_build: None,
+            known_good_build: None,
+            active_install_replay: None,
+            known_good_install_replay: None,
+            known_good_replay_snapshot: None,
+            candidate_available: None,
+            install_replay: "unproven",
+            journal_replay: "unproven",
+            rollback_safe: None,
+            reason: "another updater holds the managed pair store lease".into(),
+            error: Some(error),
+        },
+        Err(crate::update::InstalledPairInspectionError::Invalid(error)) => RollbackReport {
             state: "invalid",
             prefix: Some(prefix),
             selection: None,
@@ -810,7 +847,7 @@ where
             error: Some(error),
         },
         Ok(Some(descriptor)) => {
-            let legacy = descriptor.active_identity.is_none();
+            let legacy = descriptor.proof_unproven || descriptor.active_identity.is_none();
             let candidate_available = !legacy && descriptor.rollback_safe;
             let state = if legacy {
                 "unproven"
@@ -820,7 +857,7 @@ where
                 "not_available"
             };
             let reason = if legacy {
-                "the legacy active pair has no recorded identity; run one update before trusting rollback"
+                "the selected pair predates complete recorded identity; run one update before trusting rollback"
             } else if candidate_available && descriptor.known_good_replay_attested {
                 "the known-good pair replayed a recorded install-time snapshot; current journal replay is checked only when rollback runs"
             } else if candidate_available {
@@ -840,9 +877,9 @@ where
                 active_pair: Some(descriptor.active_pair),
                 known_good_pair: Some(descriptor.known_good_pair),
                 active_identity: descriptor.active_identity,
-                known_good_identity: Some(descriptor.known_good_identity),
+                known_good_identity: descriptor.known_good_identity,
                 active_build: descriptor.active_build,
-                known_good_build: Some(descriptor.known_good_build),
+                known_good_build: descriptor.known_good_build,
                 active_install_replay: Some(descriptor.active_replay_attested),
                 known_good_install_replay: Some(descriptor.known_good_replay_attested),
                 known_good_replay_snapshot: descriptor.known_good_replay_snapshot,
@@ -936,7 +973,7 @@ fn inspect_daemon(home: &Path, state: &StateReport) -> DaemonReport {
         Err(error) => return daemon_unproven(crate::copy::client_error(&error, None)),
     };
     let hello = client.hello().clone();
-    let (status, status_error) = match client.request("status", json!({})) {
+    let (status, status_error) = match client.request("health.snapshot", json!({})) {
         Ok(value) => match serde_json::from_value::<StatusResult>(value) {
             Ok(status) => (Some(status), None),
             Err(error) => (None, Some(format!("decode daemon status: {error}"))),
@@ -1026,6 +1063,7 @@ fn inspect_operational(home: &Path, daemon: &DaemonReport) -> OperationalReport 
     });
 
     let mut sessions = Vec::new();
+    let mut matched_records = BTreeSet::new();
     if let Some(status) = status {
         for session in &status.sessions {
             let state = match (&session.identity, session_record_error.as_ref()) {
@@ -1034,6 +1072,7 @@ fn inspect_operational(home: &Path, daemon: &DaemonReport) -> OperationalReport 
                 (Some(binding), None)
                     if recorded_sessions.iter().any(|recorded| recorded == binding) =>
                 {
+                    matched_records.insert(binding.session_instance_id());
                     "current"
                 }
                 (Some(binding), None)
@@ -1048,16 +1087,29 @@ fn inspect_operational(home: &Path, daemon: &DaemonReport) -> OperationalReport 
             };
             sessions.push(SessionMappingReport {
                 name: session.name.clone(),
-                attached: session.attached,
-                configured: configured_set.contains(&session.name),
+                attached: Some(session.attached),
+                configured: Some(configured_set.contains(&session.name)),
                 state,
                 binding: session.identity.clone(),
             });
         }
     }
+    for binding in recorded_sessions
+        .iter()
+        .filter(|binding| !matched_records.contains(&binding.session_instance_id()))
+    {
+        sessions.push(SessionMappingReport {
+            name: binding.live_session_key().tmux_session_id().to_string(),
+            attached: None,
+            configured: None,
+            state: "runtime_unproven",
+            binding: Some(binding.clone()),
+        });
+    }
 
     let runtime_counts = sessions
         .iter()
+        .filter(|session| session.attached.is_some())
         .fold(BTreeMap::new(), |mut counts, session| {
             *counts.entry(session.name.clone()).or_insert(0usize) += 1;
             counts
@@ -1087,16 +1139,20 @@ fn inspect_operational(home: &Path, daemon: &DaemonReport) -> OperationalReport 
         for name in &seen {
             let matches = sessions
                 .iter()
-                .filter(|session| &session.name == name)
+                .filter(|session| session.attached.is_some() && &session.name == name)
                 .collect::<Vec<_>>();
-            if matches.is_empty() || matches.iter().all(|session| !session.attached) {
+            if matches.is_empty()
+                || matches
+                    .iter()
+                    .all(|session| session.attached == Some(false))
+            {
                 stale.push(name.clone());
             }
         }
     }
     let dynamic = sessions
         .iter()
-        .filter(|session| !configured_set.contains(&session.name))
+        .filter(|session| session.configured == Some(false))
         .map(|session| session.name.clone())
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -2223,16 +2279,16 @@ fn render_plain(report: &HealthReport, style: &Style) -> String {
         lines.push(format!(
             "    session {} · {} · mapping {} · {}",
             session.name,
-            if session.attached {
-                "attached"
-            } else {
-                "detached"
+            match session.attached {
+                Some(true) => "attached",
+                Some(false) => "detached",
+                None => "runtime unproven",
             },
             session.state,
-            if session.configured {
-                "configured"
-            } else {
-                "dynamic"
+            match session.configured {
+                Some(true) => "configured",
+                Some(false) => "dynamic",
+                None => "configuration unproven",
             }
         ));
     }
@@ -2527,12 +2583,13 @@ mod tests {
             active_pair: PathBuf::from("/prefix/bin/.cyclops-pairs/pairs/pair.a"),
             known_good_pair: PathBuf::from("/prefix/bin/.cyclops-pairs/pairs/pair.b"),
             active_identity: (!legacy).then(|| "0.1.0 (active-build)".into()),
-            known_good_identity: "0.1.0 (known-build)".into(),
+            known_good_identity: Some("0.1.0 (known-build)".into()),
             active_build: (!legacy).then(|| "active-build".into()),
-            known_good_build: "known-build".into(),
+            known_good_build: Some("known-build".into()),
             active_replay_attested: false,
             known_good_replay_attested: false,
             known_good_replay_snapshot: None,
+            proof_unproven: legacy,
             rollback_safe,
         }
     }
@@ -2673,10 +2730,70 @@ mod tests {
         assert_eq!(report.workspace.state, "current");
         assert_eq!(report.sessions.len(), 1);
         assert_eq!(report.sessions[0].state, "current");
+        assert_eq!(report.sessions[0].attached, Some(true));
+        assert_eq!(report.sessions[0].configured, Some(true));
         assert_eq!(report.config.state, "stale");
         assert_eq!(report.config.stale, vec!["gone"]);
         assert_eq!(report.config.duplicates, vec!["main"]);
         assert_eq!(report.watchers.state, "current");
+    }
+
+    #[test]
+    fn stopped_health_keeps_durable_identity_visible_without_inventing_runtime_state() {
+        let scratch = tempfile::tempdir().unwrap();
+        let home = scratch.path().join("state");
+        let root = cyclops_state::StateRoot::open_or_create(&home).unwrap();
+        let workspace: WorkspaceId = "11111111-1111-4111-8111-111111111111".parse().unwrap();
+        let binding = SessionIdentityBinding::new(
+            cyclops_proto::LiveSessionKey::new(
+                workspace,
+                cyclops_proto::OsBootId::new("boot-test").unwrap(),
+                ProcessInstanceId::new(81, 9001).unwrap(),
+                "$7".parse().unwrap(),
+            ),
+            "22222222-2222-4222-8222-222222222222".parse().unwrap(),
+        );
+        root.replace_file(
+            Path::new("identity/workspace-id"),
+            format!("{workspace}\n").as_bytes(),
+        )
+        .unwrap();
+        root.replace_file(
+            Path::new("identity/sessions.ndjson"),
+            format!("{}\n", serde_json::to_string(&binding).unwrap()).as_bytes(),
+        )
+        .unwrap();
+
+        let report = inspect_operational(&home, &daemon_stopped());
+
+        assert_eq!(report.workspace.state, "unproven");
+        assert_eq!(report.workspace.recorded, Some(workspace));
+        assert_eq!(report.sessions.len(), 1);
+        assert_eq!(report.sessions[0].name, "$7");
+        assert_eq!(report.sessions[0].state, "runtime_unproven");
+        assert_eq!(report.sessions[0].attached, None);
+        assert_eq!(report.sessions[0].configured, None);
+        assert_eq!(report.sessions[0].binding.as_ref(), Some(&binding));
+        let json = operational_json(&report);
+        assert_eq!(json["session_mappings"][0]["state"], "runtime_unproven");
+        assert!(json["session_mappings"][0]["attached"].is_null());
+    }
+
+    #[test]
+    fn malformed_workspace_identity_is_invalid_even_with_the_daemon_stopped() {
+        let scratch = tempfile::tempdir().unwrap();
+        let home = scratch.path().join("state");
+        let root = cyclops_state::StateRoot::open_or_create(&home).unwrap();
+        root.replace_file(Path::new("identity/workspace-id"), b"not-a-workspace\n")
+            .unwrap();
+
+        let report = inspect_operational(&home, &daemon_stopped());
+
+        assert_eq!(report.workspace.state, "invalid");
+        assert_eq!(
+            report.workspace.error.as_deref(),
+            Some("identity/workspace-id is invalid")
+        );
     }
 
     #[test]
@@ -2729,6 +2846,21 @@ mod tests {
         assert_eq!(report.state, "unproven");
         assert_eq!(report.prefix, Some(PathBuf::from("/prefix/bin")));
         assert!(report.reason.contains("no managed rollback descriptor"));
+    }
+
+    #[test]
+    fn an_active_update_is_busy_without_being_called_corruption() {
+        let binaries = binaries_with_public_selector(true);
+        let report = inspect_rollback_with(&binaries, |_| {
+            Err(crate::update::InstalledPairInspectionError::UpdateActive(
+                "pair store lease is held".into(),
+            ))
+        });
+
+        assert_eq!(report.state, "update_active");
+        assert_eq!(report.candidate_available, None);
+        assert_eq!(report.error.as_deref(), Some("pair store lease is held"));
+        assert!(!report.reason.contains("unsafe"));
     }
 
     #[test]
@@ -2797,7 +2929,9 @@ mod tests {
     fn a_tampered_pair_proof_is_an_invalid_rollback_report() {
         let binaries = binaries_with_public_selector(true);
         let report = inspect_rollback_with(&binaries, |_| {
-            Err("selected pair changed after its install proof was recorded".into())
+            Err(crate::update::InstalledPairInspectionError::Invalid(
+                "selected pair changed after its install proof was recorded".into(),
+            ))
         });
         assert_eq!(report.state, "invalid");
         assert_eq!(report.rollback_safe, None);

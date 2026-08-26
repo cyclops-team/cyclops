@@ -447,20 +447,67 @@ pub(crate) struct InstalledPairDescriptor {
     pub(crate) active_pair: PathBuf,
     pub(crate) known_good_pair: PathBuf,
     pub(crate) active_identity: Option<String>,
-    pub(crate) known_good_identity: String,
+    pub(crate) known_good_identity: Option<String>,
     pub(crate) active_build: Option<String>,
-    pub(crate) known_good_build: String,
+    pub(crate) known_good_build: Option<String>,
     pub(crate) active_replay_attested: bool,
     pub(crate) known_good_replay_attested: bool,
     pub(crate) known_good_replay_snapshot: Option<String>,
+    pub(crate) proof_unproven: bool,
     pub(crate) rollback_safe: bool,
+}
+
+#[derive(Debug)]
+pub(crate) enum InstalledPairInspectionError {
+    UpdateActive(String),
+    Invalid(String),
+}
+
+impl From<String> for InstalledPairInspectionError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+impl std::fmt::Display for InstalledPairInspectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UpdateActive(message) | Self::Invalid(message) => formatter.write_str(message),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum PairStoreOpenError {
+    UpdateActive(String),
+    Invalid(String),
+}
+
+impl From<String> for PairStoreOpenError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+impl std::fmt::Display for PairStoreOpenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UpdateActive(message) | Self::Invalid(message) => formatter.write_str(message),
+        }
+    }
 }
 
 /// Inspect the selected pair under the same kernel lease update uses.
 pub(crate) fn installed_pair_descriptor(
     prefix: &Path,
-) -> Result<Option<InstalledPairDescriptor>, String> {
-    let Some(store) = PairStore::open_existing(prefix)? else {
+) -> Result<Option<InstalledPairDescriptor>, InstalledPairInspectionError> {
+    let Some(store) = PairStore::open_existing(prefix).map_err(|error| match error {
+        PairStoreOpenError::UpdateActive(message) => {
+            InstalledPairInspectionError::UpdateActive(message)
+        }
+        PairStoreOpenError::Invalid(message) => InstalledPairInspectionError::Invalid(message),
+    })?
+    else {
         return Ok(None);
     };
     let selection = store
@@ -469,19 +516,15 @@ pub(crate) fn installed_pair_descriptor(
     let active_pair = store.root.join(&selection.active);
     let known_good_pair = store.root.join(&selection.known_good);
     let active_proof = selection.active_proof.clone();
-    let known_good_proof = selection.known_good_proof.clone().ok_or_else(|| {
-        "the selected pair predates recorded build identity; run one update before trusting rollback"
-            .to_string()
-    })?;
-    if !selection.legacy_active && active_proof.is_none() {
-        return Err(
-            "the active pair does not record its build identity; rollback is unproven".to_string(),
-        );
-    }
+    let known_good_proof = selection.known_good_proof.clone();
+    let proof_unproven =
+        known_good_proof.is_none() || (!selection.legacy_active && active_proof.is_none());
     if let Some(proof) = active_proof.as_ref() {
         verify_recorded_pair(&active_pair, proof)?;
     }
-    verify_recorded_pair(&known_good_pair, &known_good_proof)?;
+    if let Some(proof) = known_good_proof.as_ref() {
+        verify_recorded_pair(&known_good_pair, proof)?;
+    }
     if let Some(attestation) = selection.active_replay.as_ref() {
         let proof = active_proof.as_ref().ok_or_else(|| {
             "the active replay attestation has no recorded pair identity".to_string()
@@ -489,12 +532,18 @@ pub(crate) fn installed_pair_descriptor(
         verify_replay_attestation(attestation, proof)?;
     }
     if let Some(attestation) = selection.known_good_replay.as_ref() {
-        verify_replay_attestation(attestation, &known_good_proof)?;
+        let proof = known_good_proof.as_ref().ok_or_else(|| {
+            "the known-good replay attestation has no recorded pair identity".to_string()
+        })?;
+        verify_replay_attestation(attestation, proof)?;
     }
     let active_identity = active_proof.as_ref().map(|proof| proof.identity.clone());
-    let known_good_identity = known_good_proof.identity;
+    let known_good_identity = known_good_proof.map(|proof| proof.identity);
     let active_build = active_identity.as_deref().map(identity_build).transpose()?;
-    let known_good_build = identity_build(&known_good_identity)?;
+    let known_good_build = known_good_identity
+        .as_deref()
+        .map(identity_build)
+        .transpose()?;
     Ok(Some(InstalledPairDescriptor {
         selection: store.root.join(&selection.id),
         active_pair,
@@ -508,20 +557,25 @@ pub(crate) fn installed_pair_descriptor(
         known_good_replay_snapshot: selection
             .known_good_replay
             .map(|attestation| attestation.snapshot_sha256),
-        rollback_safe: !selection.legacy_active && selection.active != selection.known_good,
+        proof_unproven,
+        rollback_safe: !proof_unproven
+            && !selection.legacy_active
+            && selection.active != selection.known_good,
     }))
 }
 
 impl PairStore {
     fn open(prefix: &Path) -> Result<Self, String> {
-        Self::open_inner(prefix, true)?.ok_or_else(|| "pair store was not created".to_string())
+        Self::open_inner(prefix, true)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "pair store was not created".to_string())
     }
 
-    fn open_existing(prefix: &Path) -> Result<Option<Self>, String> {
+    fn open_existing(prefix: &Path) -> Result<Option<Self>, PairStoreOpenError> {
         Self::open_inner(prefix, false)
     }
 
-    fn open_inner(prefix: &Path, create: bool) -> Result<Option<Self>, String> {
+    fn open_inner(prefix: &Path, create: bool) -> Result<Option<Self>, PairStoreOpenError> {
         let prefix = std::fs::canonicalize(prefix)
             .map_err(|error| format!("resolve install prefix {}: {error}", prefix.display()))?;
         let root = prefix.join(PAIR_ROOT);
@@ -542,7 +596,9 @@ impl PairStore {
                     0o600,
                 )?;
             }
-            Err(error) => return Err(format!("inspect pair store {}: {error}", root.display())),
+            Err(error) => {
+                return Err(format!("inspect pair store {}: {error}", root.display()).into())
+            }
         }
         require_owner_directory(&root)?;
         let owner_marker = root.join(PAIR_OWNER);
@@ -550,7 +606,9 @@ impl PairStore {
         let owner = std::fs::read_to_string(&owner_marker)
             .map_err(|error| format!("read pair owner marker: {error}"))?;
         if owner != unsafe { libc::geteuid() }.to_string() {
-            return Err("pair store ownership marker does not match this user".to_string());
+            return Err("pair store ownership marker does not match this user"
+                .to_string()
+                .into());
         }
         let lease_path = root.join(PAIR_LEASE);
         let lease = OpenOptions::new()
@@ -563,10 +621,10 @@ impl PairStore {
             .map_err(|error| format!("open pair update lease: {error}"))?;
         require_owner_regular_file(&lease_path, 0o600)?;
         if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(format!(
+            return Err(PairStoreOpenError::UpdateActive(format!(
                 "another Cyclops update holds the pair store lease: {}",
                 std::io::Error::last_os_error()
-            ));
+            )));
         }
         let lease = ExclusiveLease(lease);
         let lease_metadata = lease
@@ -3940,9 +3998,12 @@ sys.exit(43)"#,
             descriptor.active_identity.as_deref(),
             Some("0.1.0 (new-build)")
         );
-        assert_eq!(descriptor.known_good_identity, "0.1.0 (old-build)");
+        assert_eq!(
+            descriptor.known_good_identity.as_deref(),
+            Some("0.1.0 (old-build)")
+        );
         assert_eq!(descriptor.active_build.as_deref(), Some("new-build"));
-        assert_eq!(descriptor.known_good_build, "old-build");
+        assert_eq!(descriptor.known_good_build.as_deref(), Some("old-build"));
         assert!(descriptor.active_replay_attested);
         assert!(descriptor.known_good_replay_attested);
         let old_snapshot = format!("{:064x}", 7_u8);
@@ -4025,6 +4086,45 @@ sys.exit(43)"#,
         assert_eq!(previous.active, pair);
         assert_eq!(previous.active_replay, None);
         assert_eq!(previous.known_good_replay, None);
+    }
+
+    #[test]
+    fn schema_one_selection_is_reported_as_unproven_instead_of_invalid() {
+        let scratch = Scratch::create().unwrap();
+        let prefix = scratch.path().join("bin");
+        let source = scratch.path().join("candidate");
+        directory(&prefix);
+        pair_source(&source, "build");
+        let store = PairStore::open(&prefix).unwrap();
+        let pair = store.stage(&source).unwrap();
+        let replay = recorded_replay(&store, &pair, 16);
+        let selection = store
+            .prepare_selection_with_replays(&pair, &pair, Some(replay.clone()), Some(replay))
+            .unwrap();
+        store.select(&selection).unwrap();
+        store.replace_public_link("cyclopsd").unwrap();
+        store.replace_public_link("cyclops").unwrap();
+        let descriptor_path = store.root.join(&selection.id).join(PAIR_DESCRIPTOR);
+        let mut descriptor: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&descriptor_path).unwrap()).unwrap();
+        descriptor["schema"] = serde_json::json!(1);
+        for field in [
+            "active_proof",
+            "known_good_proof",
+            "active_replay",
+            "known_good_replay",
+        ] {
+            descriptor.as_object_mut().unwrap().remove(field);
+        }
+        std::fs::write(&descriptor_path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+        drop(store);
+
+        let inspected = installed_pair_descriptor(&prefix).unwrap().unwrap();
+
+        assert!(inspected.proof_unproven);
+        assert!(!inspected.rollback_safe);
+        assert_eq!(inspected.active_identity, None);
+        assert_eq!(inspected.known_good_identity, None);
     }
 
     #[test]

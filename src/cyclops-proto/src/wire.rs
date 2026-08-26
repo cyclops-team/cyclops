@@ -126,7 +126,7 @@ pub struct MessagesChangedData {
 // Method params and results. Methods use dot notation: "ping", "status",
 // "msg.send", "msg.history", "msg.thread", "agent.wait", "agent.state.report",
 // "pane.read", "events.subscribe", "admin.notify", "hooks.verify",
-// "hooks.selftest", "theme.reload", "daemon.quiesce".
+// "hooks.selftest", "theme.reload", "daemon.quiesce", "health.snapshot".
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

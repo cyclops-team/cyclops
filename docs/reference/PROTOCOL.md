@@ -100,6 +100,7 @@ alphabet.
 |---|---|
 | `ping` | Liveness and round trip |
 | `status` | Every watched session and pane, with fused state |
+| `health.snapshot` | Last committed daemon status without pane capture or state mutation |
 | `pane.read` | A pane's screen, its recent output, or the detection view |
 | `pane.label` | Give a pane a name, or take it back |
 | `session.watch` | Start watching a tmux session the daemon was not booted with |
@@ -230,6 +231,14 @@ administrator's durable inbox. Older daemons omit it and clients read zero.
 `blocked_notifications` is a bounded body-free sample of pre-write failures.
 `blocked_notifications_total` is the complete count, so omitted sample rows are
 visible without making normal status output grow with the journal.
+
+### health.snapshot
+
+`health.snapshot` accepts no parameters. It returns the same `StatusResult`
+shape as `status`, but reads only the daemon's last committed projection. It
+does not capture panes, recompute detection, append facts, acknowledge
+delivery, or schedule work. Operational diagnostics use this method so health
+inspection remains read-only.
 
 ### daemon.quiesce
 
