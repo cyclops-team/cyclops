@@ -69,7 +69,7 @@ pub(crate) struct HookEntry {
     ///
     /// An unkeyed prompt-submit hook is provisional: it updates runtime status
     /// immediately, but a later visual Working observation must confirm it
-    /// before delivery or `wait done` may rely on it.
+    /// before delivery or `wait --until turn-ended` may rely on it.
     confirmed_start: bool,
     /// This reading is a conclusive end for one exact turn. It remains an
     /// edge, not a persistent Idle level: a later current visual Working

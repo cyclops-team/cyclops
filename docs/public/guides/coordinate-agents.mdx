@@ -50,10 +50,10 @@ state per recipient. `--all` targets adopted agents, not the admin inbox.
 ## Wait for pane activity
 
 ```bash
-cyclops wait reviewer --until done --timeout 2m
+cyclops wait reviewer --until turn-ended --timeout 2m
 ```
 
-`done` means Cyclops observed working followed by `idle` or `idle_with_input`
+`turn-ended` means Cyclops observed working followed by `idle` or `idle_with_input`
 for the same pane occupant. If the process in the pane changes while waiting,
 Cyclops exits separately instead of answering for the replacement. This
 observes pane activity. It does not identify a turn, prove write readiness, or

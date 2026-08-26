@@ -2414,25 +2414,25 @@ fn wait_reached_renders_the_badge_and_exits_zero() {
 fn wait_timeout_exits_two_with_copy() {
     let home = scratch_home("wt");
     serve_once(&home, hello(1), move |req| {
-        assert_eq!(req["params"]["until"], "done");
+        assert_eq!(req["params"]["until"], "turn_ended");
         // Default --timeout is 60s.
         assert_eq!(req["params"]["timeout_ms"], 60_000);
         (
             vec![json!({"id": req["id"], "error": {
                 "code": "timeout",
-                "message": "reviewer did not reach done within 60000ms; state was working",
-                "data": {"target": "reviewer", "until": "done", "state": "working", "waited_ms": 60_001}
+                "message": "reviewer did not reach turn ended within 60000ms; state was working",
+                "data": {"target": "reviewer", "until": "turn_ended", "state": "working", "waited_ms": 60_001}
             }})
             .to_string()],
             false,
         )
     });
-    let out = run_cyclops(&home, &["wait", "reviewer", "--until", "done"]);
+    let out = run_cyclops(&home, &["wait", "reviewer", "--until", "turn-ended"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(out.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&out.stderr).trim(),
-        "reviewer didn't reach done within 60 seconds. Last state: working. Give it more time with --timeout, or look in with cyclops status."
+        "reviewer didn't reach turn ended within 60 seconds. Last state: working. Give it more time with --timeout, or look in with cyclops status."
     );
     let _ = fs::remove_dir_all(&home);
 }
@@ -2445,13 +2445,13 @@ fn wait_occupant_changed_exits_three_with_copy() {
             vec![json!({"id": req["id"], "error": {
                 "code": "occupant_changed",
                 "message": "the pane behind reviewer died or changed occupant while waiting",
-                "data": {"target": "reviewer", "until": "done", "state": "dead", "waited_ms": 1200}
+                "data": {"target": "reviewer", "until": "turn_ended", "state": "dead", "waited_ms": 1200}
             }})
             .to_string()],
             false,
         )
     });
-    let out = run_cyclops(&home, &["wait", "reviewer", "--until", "done"]);
+    let out = run_cyclops(&home, &["wait", "reviewer", "--until", "turn-ended"]);
     assert_eq!(out.status.code(), Some(3));
     assert!(out.stdout.is_empty());
     assert_eq!(

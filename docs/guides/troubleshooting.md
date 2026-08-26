@@ -261,14 +261,14 @@ predecessor's hooks never vouch for its replacement.
 ## A wait times out
 
 ```
-reviewer didn't reach done within 60 seconds. Last state: working. Give it more time with --timeout, or look in with cyclops status.
+reviewer didn't reach turn ended within 60 seconds. Last state: working. Give it more time with --timeout, or look in with cyclops status.
 ```
 
 Exit code 2. Usually the turn is simply longer than the budget.
 
 One real limit: on an agent detected only by pane title or screen rules,
 tmux re-evaluates what cyclops subscribed to once per second, so a turn that
-starts and ends inside the same second is invisible to `--until done`.
+starts and ends inside the same second is invisible to `--until turn-ended`.
 Hook-wired agents report their edges directly and are not subject to that.
 
 ## A wait exits 3

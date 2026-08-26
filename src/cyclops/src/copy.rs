@@ -925,8 +925,13 @@ mod tests {
     #[test]
     fn wait_timeout_copy_names_state_and_next_step() {
         assert_eq!(
-            wait_timeout("reviewer", "done", Duration::from_secs(60), Some("working")),
-            "reviewer didn't reach done within 60 seconds. Last state: working. Give it more time with --timeout, or look in with cyclops status."
+            wait_timeout(
+                "reviewer",
+                "turn ended",
+                Duration::from_secs(60),
+                Some("working")
+            ),
+            "reviewer didn't reach turn ended within 60 seconds. Last state: working. Give it more time with --timeout, or look in with cyclops status."
         );
         assert_eq!(
             wait_timeout("reviewer", "idle", Duration::from_secs(5), None),

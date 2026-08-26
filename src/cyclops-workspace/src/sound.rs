@@ -81,7 +81,7 @@ fn stopped(status: PrimaryStatus) -> Option<Stopped> {
 ///    boot, and a ring per pane while the sensors settle would teach the
 ///    operator to turn the switch off.
 /// 3. It stopped, and differently from how it was stopped before: idle
-///    after working (done), needing attention or blocked after either,
+///    after working (turn ended), needing attention or blocked after either,
 ///    dead after anything. Starting to work is the operator's doing (they
 ///    just sent something) and is not news.
 /// 4. It is in the background: not the focused pane, or any pane while

@@ -300,5 +300,5 @@ the `msg.send` mailbox contract.
 - `2`: local command usage was invalid
 
 `cyclops send` does not wait for task completion. `cyclops wait <target>
---until idle|done|blocked` observes a pane, not a message. See
+--until idle|turn-ended|blocked` observes a pane, not a message. See
 [wait.md](wait.md).

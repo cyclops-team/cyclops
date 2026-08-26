@@ -258,10 +258,10 @@ gets an agent identity only through its current watched pane.
 `cyclops wait` blocks on a pane state edge without polling:
 
 ```
-cyclops wait reviewer --until done --timeout 5m
+cyclops wait reviewer --until turn-ended --timeout 5m
 ```
 
-`done` means Cyclops observed working followed by `idle` or `idle_with_input`
+`turn-ended` means Cyclops observed working followed by `idle` or `idle_with_input`
 while the same process occupied the pane. It does not identify a turn, message,
 or task, and it does not prove the pane is write-ready. Use the reviewer's reply
 from section 5 as the durable verdict. Do not treat a pane state transition as
