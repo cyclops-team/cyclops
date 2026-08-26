@@ -12,7 +12,7 @@
 </script>
 
 <svelte:head>
-	<title>Cyclops — One eye. Multiple agents. A single coordinated team.</title>
+	<title>Cyclops · One eye. Multiple agents. A single coordinated team.</title>
 	<meta
 		name="description"
 		content="Cyclops is an open-source coordination layer for coding agents running in the terminal. Coordinate and track coding agents across providers in one terminal workspace."
