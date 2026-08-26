@@ -2040,7 +2040,7 @@ fn hook_posts_wellformed_reports_and_stays_silent() {
     serve_conns(&home, hello(1), 2, move |req| {
         record.lock().unwrap().push(req.clone());
         (
-            vec![json!({"id": req["id"], "result": {"ok": true}}).to_string()],
+            vec![json!({"id": req["id"], "result": {"ok": true, "applied": true}}).to_string()],
             true,
         )
     });

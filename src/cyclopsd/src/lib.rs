@@ -4140,8 +4140,6 @@ async fn debounce_task(
             session_idx,
             &watcher,
             &pane_id,
-            false,
-            "output_settled",
             evidence_ms,
             &route_evidence,
         )

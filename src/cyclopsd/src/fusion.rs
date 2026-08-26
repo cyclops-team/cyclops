@@ -3349,8 +3349,7 @@ pub(crate) async fn recompute_pane(
         pane_id,
         force_screen,
         cause,
-        None,
-        None,
+        RecomputeEvidence::default(),
     )
     .await
 }
@@ -3375,8 +3374,10 @@ pub(crate) async fn recompute_pane_for_route_evidence(
         pane_id,
         force_screen,
         cause,
-        None,
-        Some(route_evidence),
+        RecomputeEvidence {
+            source_ms: None,
+            route: Some(route_evidence),
+        },
     )
     .await
 }
@@ -3389,8 +3390,6 @@ pub(crate) async fn recompute_pane_from_output(
     session_idx: usize,
     watcher: &SessionWatcher,
     pane_id: &str,
-    force_screen: bool,
-    cause: &str,
     evidence_ms: u64,
     route_evidence: &NotificationRouteEvidenceId,
 ) -> Option<Detection> {
@@ -3399,12 +3398,20 @@ pub(crate) async fn recompute_pane_from_output(
         session_idx,
         watcher,
         pane_id,
-        force_screen,
-        cause,
-        Some(evidence_ms),
-        Some(route_evidence),
+        false,
+        "output_settled",
+        RecomputeEvidence {
+            source_ms: Some(evidence_ms),
+            route: Some(route_evidence),
+        },
     )
     .await
+}
+
+#[derive(Default)]
+struct RecomputeEvidence<'a> {
+    source_ms: Option<u64>,
+    route: Option<&'a NotificationRouteEvidenceId>,
 }
 
 async fn recompute_pane_with_evidence(
@@ -3414,8 +3421,7 @@ async fn recompute_pane_with_evidence(
     pane_id: &str,
     force_screen: bool,
     cause: &str,
-    source_evidence_ms: Option<u64>,
-    route_evidence: Option<&NotificationRouteEvidenceId>,
+    evidence: RecomputeEvidence<'_>,
 ) -> Option<Detection> {
     let route = PaneKey::new(session_idx, pane_id);
     let prior_working_confirmed = cached_working_confirmed(inner, session_idx, pane_id);
@@ -3554,7 +3560,7 @@ async fn recompute_pane_with_evidence(
     // State and ledger timestamps name this capture. Lifecycle eligibility
     // names the event that caused it. Capping protects the same ordering if
     // the system clock moves while an output burst is settling.
-    let evidence_ms = source_evidence_ms.unwrap_or(ts).min(ts);
+    let evidence_ms = evidence.source_ms.unwrap_or(ts).min(ts);
     let candidate_lane = manifest.is_some_and(|m| {
         m.hooks.turn_start_evidence == LifecycleCertainty::Candidate
             || m.hooks.turn_end_evidence == LifecycleCertainty::Candidate
@@ -3684,7 +3690,7 @@ async fn recompute_pane_with_evidence(
             prior_ready,
             now_key,
             &det,
-            route_evidence,
+            evidence.route,
         );
         if !is_candidate_recheck_cause(cause) {
             schedule_lifecycle_recheck(inner, &route);
@@ -3750,7 +3756,7 @@ async fn recompute_pane_with_evidence(
                             prior_ready,
                             now_key,
                             &p,
-                            route_evidence,
+                            evidence.route,
                         );
                         if !is_candidate_recheck_cause(cause) {
                             schedule_lifecycle_recheck(inner, &route);
@@ -4309,7 +4315,7 @@ async fn recompute_pane_with_evidence(
         prior_ready,
         now_key,
         &detection,
-        route_evidence,
+        evidence.route,
     );
     if probe_quota_reset {
         crate::delivery::observe_quota_reset(inner, session_idx, pane_id);

@@ -3424,7 +3424,7 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
                     worker,
                     handle,
                     cause,
-                    Some(observation),
+                    Some(*observation),
                 )
                 .await;
                 return;
@@ -5601,7 +5601,7 @@ enum GateOutcome {
     /// operator-withdrawable without touching the pane.
     BlockedPreWrite {
         cause: NotificationPreWriteCause,
-        observation: NotificationPreWriteObservation,
+        observation: Box<NotificationPreWriteObservation>,
     },
     /// A mailbox notification remains durably queued or gating. The
     /// in-memory worker stops, and the next route or restart reconciliation
@@ -5707,19 +5707,19 @@ async fn gate(
                                 if last_hold.as_deref() == Some(OBSERVATION_HOLD) {
                                     return GateOutcome::BlockedPreWrite {
                                         cause: NotificationPreWriteCause::BindingUnprovable,
-                                        observation: binding_unprovable_observation(
+                                        observation: Box::new(binding_unprovable_observation(
                                             inner,
                                             handle,
                                             row.pane_pid,
                                             &manifest_id,
-                                        ),
+                                        )),
                                     };
                                 }
                                 break 'pane Some(OBSERVATION_HOLD.to_string());
                             };
                             return GateOutcome::BlockedPreWrite {
                                 cause: NotificationPreWriteCause::ComposerSemanticMissing,
-                                observation,
+                                observation: Box::new(observation),
                             };
                         }
                         let Some(det) = fusion::recompute_pane(
@@ -5749,7 +5749,7 @@ async fn gate(
                                 {
                                     return GateOutcome::BlockedPreWrite {
                                         cause: NotificationPreWriteCause::ComposerSemanticMissing,
-                                        observation,
+                                        observation: Box::new(observation),
                                     };
                                 }
                             }
@@ -5757,12 +5757,12 @@ async fn gate(
                                 if last_hold.as_deref() == Some(OBSERVATION_HOLD) {
                                     return GateOutcome::BlockedPreWrite {
                                         cause: NotificationPreWriteCause::BindingUnprovable,
-                                        observation: binding_unprovable_observation(
+                                        observation: Box::new(binding_unprovable_observation(
                                             inner,
                                             handle,
                                             row.pane_pid,
                                             &manifest_id,
-                                        ),
+                                        )),
                                     };
                                 }
                                 break 'pane Some(OBSERVATION_HOLD.to_string());
@@ -5781,12 +5781,12 @@ async fn gate(
                             else {
                                 return GateOutcome::BlockedPreWrite {
                                     cause: NotificationPreWriteCause::BindingUnprovable,
-                                    observation: binding_unprovable_observation(
+                                    observation: Box::new(binding_unprovable_observation(
                                         inner,
                                         handle,
                                         row.pane_pid,
                                         &manifest_id,
-                                    ),
+                                    )),
                                 };
                             };
                             // No width fields: a width pair is a different
@@ -5794,7 +5794,7 @@ async fn gate(
                             observation.write_block = Some(HOOK_ADMISSION_UNPROVEN.to_string());
                             return GateOutcome::BlockedPreWrite {
                                 cause: NotificationPreWriteCause::WriteReadinessChanged,
-                                observation,
+                                observation: Box::new(observation),
                             };
                         }
                         match det.state {
@@ -5832,11 +5832,13 @@ async fn gate(
                                                 return GateOutcome::BlockedPreWrite {
                                                     cause:
                                                         NotificationPreWriteCause::BindingUnprovable,
-                                                    observation: binding_unprovable_observation(
-                                                        inner,
-                                                        handle,
-                                                        row.pane_pid,
-                                                        &manifest_id,
+                                                    observation: Box::new(
+                                                        binding_unprovable_observation(
+                                                            inner,
+                                                            handle,
+                                                            row.pane_pid,
+                                                            &manifest_id,
+                                                        ),
                                                     ),
                                                 };
                                             }
@@ -5871,12 +5873,12 @@ async fn gate(
                                     {
                                         return GateOutcome::BlockedPreWrite {
                                             cause: NotificationPreWriteCause::BindingUnprovable,
-                                            observation: binding_unprovable_observation(
+                                            observation: Box::new(binding_unprovable_observation(
                                                 inner,
                                                 handle,
                                                 row.pane_pid,
                                                 &manifest_id,
-                                            ),
+                                            )),
                                         };
                                     }
                                     (false, Some("no_write_safe_composer_evidence"))
@@ -5891,18 +5893,20 @@ async fn gate(
                                         ) else {
                                             return GateOutcome::BlockedPreWrite {
                                                 cause: NotificationPreWriteCause::BindingUnprovable,
-                                                observation: binding_unprovable_observation(
-                                                    inner,
-                                                    handle,
-                                                    row.pane_pid,
-                                                    &manifest_id,
+                                                observation: Box::new(
+                                                    binding_unprovable_observation(
+                                                        inner,
+                                                        handle,
+                                                        row.pane_pid,
+                                                        &manifest_id,
+                                                    ),
                                                 ),
                                             };
                                         };
                                         return GateOutcome::BlockedPreWrite {
                                             cause:
                                                 NotificationPreWriteCause::ComposerSemanticMissing,
-                                            observation,
+                                            observation: Box::new(observation),
                                         };
                                     }
                                     (false, reason) => Some(format!(
