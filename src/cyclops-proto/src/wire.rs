@@ -631,6 +631,22 @@ pub struct MsgSendResult {
     pub inserted: Option<bool>,
 }
 
+/// Why the recipient FIFO head has no live Cyclops wake owner.
+///
+/// This is separate from the durable notification state. A message may be
+/// accepted behind another FIFO item while that head is explicitly blocked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageWakeBlock {
+    DaemonStopping,
+    RouteUnavailable,
+    AttentionResolutionPending,
+    WorkerFaulted,
+    WorkerSupervisorExited,
+    EnqueueRefused,
+    SchedulerStateUnavailable,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliveryReceipt {
     pub to: String,
@@ -647,6 +663,10 @@ pub struct DeliveryReceipt {
     /// Exact claim settlement hidden behind the compatibility state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notification_settlement: Option<MessageNotificationSettlement>,
+    /// Exact scheduler reason the recipient FIFO head has no live wake owner.
+    /// Absent for a worker-owned head and for an ordinary item queued behind it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_block: Option<MessageWakeBlock>,
     /// Queue depth ahead of this message when state is queued.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<u32>,
@@ -1577,6 +1597,7 @@ mod tests {
         assert_eq!(receipt.notification_state, None);
         assert_eq!(receipt.quota_state, None);
         assert_eq!(receipt.notification_settlement, None);
+        assert_eq!(receipt.wake_block, None);
 
         let receipt = DeliveryReceipt {
             to: "reviewer".into(),
@@ -1584,6 +1605,7 @@ mod tests {
             notification_state: None,
             quota_state: None,
             notification_settlement: None,
+            wake_block: None,
             position: Some(0),
             held_by: Some("blocked".into()),
             note: None,
@@ -1608,6 +1630,7 @@ mod tests {
                 notification_state: Some(state),
                 quota_state: None,
                 notification_settlement: None,
+                wake_block: None,
                 position: None,
                 held_by: None,
                 note: None,
@@ -1626,6 +1649,7 @@ mod tests {
             notification_state: None,
             quota_state: None,
             notification_settlement: None,
+            wake_block: None,
             position: None,
             held_by: None,
             note: None,
@@ -1640,6 +1664,7 @@ mod tests {
             notification_state: Some(MessageNotificationState::NotStarted),
             quota_state: None,
             notification_settlement: Some(MessageNotificationSettlement::WithdrawnByClaim),
+            wake_block: None,
             position: None,
             held_by: None,
             note: None,
@@ -1656,6 +1681,30 @@ mod tests {
     }
 
     #[test]
+    fn mailbox_wake_block_is_additive_and_closed() {
+        let receipt = DeliveryReceipt {
+            to: "reviewer".into(),
+            state: crate::ledger::DeliveryState::Queued,
+            notification_state: Some(MessageNotificationState::Queued),
+            quota_state: None,
+            notification_settlement: None,
+            wake_block: Some(MessageWakeBlock::WorkerSupervisorExited),
+            position: None,
+            held_by: None,
+            note: None,
+            pane: Some("%3".into()),
+        };
+        let wire = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(wire["wake_block"], "worker_supervisor_exited");
+        assert_eq!(
+            serde_json::from_value::<DeliveryReceipt>(wire)
+                .unwrap()
+                .wake_block,
+            Some(MessageWakeBlock::WorkerSupervisorExited)
+        );
+    }
+
+    #[test]
     fn durable_send_result_preserves_protocol_v1_receipts() {
         let result = MsgSendResult {
             msg_id: "m-compatible".into(),
@@ -1666,6 +1715,7 @@ mod tests {
                 notification_state: None,
                 quota_state: None,
                 notification_settlement: None,
+                wake_block: None,
                 position: None,
                 held_by: None,
                 note: None,

@@ -521,7 +521,7 @@ impl Engine {
         recipient: RecipientKey,
         handle: Arc<DeliveryHandle>,
         spawn: F,
-    ) -> Option<Arc<Worker>>
+    ) -> Result<Arc<Worker>, NotificationEnqueueRefusal>
     where
         F: FnOnce(Arc<Worker>) -> JoinHandle<()>,
     {
@@ -530,22 +530,27 @@ impl Engine {
             .lock()
             .expect("notification workers lock");
         if self.stopping.load(Ordering::SeqCst) {
-            return None;
+            return Err(NotificationEnqueueRefusal::DaemonStopping);
         }
         if let Some(entry) = entries.get_mut(&recipient) {
             let worker = Arc::clone(&entry.worker);
-            worker.enqueue_back(handle);
-            if entry.task.is_finished() && !worker.is_faulted() {
+            if entry.task.is_finished() {
                 worker.set_fault("notification worker supervisor exited");
+                return Err(NotificationEnqueueRefusal::WorkerSupervisorExited);
             }
+            if worker.is_faulted() {
+                return Err(NotificationEnqueueRefusal::WorkerFaulted);
+            }
+            worker.enqueue_back(handle);
             drop(entries);
             worker.notify.notify_one();
-            return Some(worker);
+            return Ok(worker);
         }
 
         let worker = Arc::new(Worker::new());
         worker.enqueue_back(handle);
         let task = spawn(Arc::clone(&worker));
+        let task_finished = task.is_finished();
         entries.insert(
             recipient,
             NotificationWorker {
@@ -553,9 +558,13 @@ impl Engine {
                 task,
             },
         );
+        if task_finished {
+            worker.set_fault("notification worker supervisor exited");
+            return Err(NotificationEnqueueRefusal::WorkerSupervisorExited);
+        }
         drop(entries);
         worker.notify.notify_one();
-        Some(worker)
+        Ok(worker)
     }
 
     /// Remove this exact worker only while its queue is still empty.
@@ -629,8 +638,8 @@ impl Engine {
 
     /// Whether the exact recipient worker currently owns this attempt.
     ///
-    /// The weak attempt index, queued handles, and a faulted current handle do
-    /// not prove active work.
+    /// The exact handle must be current or queued under a live, nonfaulted
+    /// supervisor. A weak attempt-index entry alone never proves active work.
     /// Status uses this only to describe the next step; mutation paths recheck
     /// their own authority immediately before acting.
     pub(crate) fn notification_worker_owns(
@@ -638,22 +647,49 @@ impl Engine {
         recipient: RecipientKey,
         attempt_id: NotificationAttemptId,
     ) -> bool {
+        self.notification_worker_refusal(recipient, attempt_id)
+            .is_none()
+    }
+
+    fn notification_worker_refusal(
+        &self,
+        recipient: RecipientKey,
+        attempt_id: NotificationAttemptId,
+    ) -> Option<NotificationEnqueueRefusal> {
+        if self.is_stopping() {
+            return Some(NotificationEnqueueRefusal::DaemonStopping);
+        }
         let workers = self
             .notification_workers
             .lock()
             .expect("notification workers lock");
         let Some(entry) = workers.get(&recipient) else {
-            return false;
+            return Some(NotificationEnqueueRefusal::AttemptUnowned);
         };
+        if entry.task.is_finished() {
+            return Some(NotificationEnqueueRefusal::WorkerSupervisorExited);
+        }
         let state = entry.worker.state.lock().expect("worker state lock");
         if state.fault.is_some() {
-            return false;
+            return Some(NotificationEnqueueRefusal::WorkerFaulted);
         }
-        state
+        let current = state
             .current
             .as_ref()
             .and_then(|handle| handle.notification.as_ref())
-            .is_some_and(|notification| notification.attempt_id() == attempt_id)
+            .is_some_and(|notification| notification.attempt_id() == attempt_id);
+        if current
+            || state.queue.iter().any(|handle| {
+                handle
+                    .notification
+                    .as_ref()
+                    .is_some_and(|notification| notification.attempt_id() == attempt_id)
+            })
+        {
+            None
+        } else {
+            Some(NotificationEnqueueRefusal::AttemptUnowned)
+        }
     }
 
     /// Seed the issued-id set from a ledger so new ids stay unique per
@@ -2443,6 +2479,7 @@ fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryRecei
             notification_state: None,
             quota_state: None,
             notification_settlement: None,
+            wake_block: None,
             position: None,
             // The gate's machine cause travels as-is when the daemon had
             // no detail to add; wording it belongs to the surface showing
@@ -2459,6 +2496,7 @@ fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryRecei
             notification_state: None,
             quota_state: None,
             notification_settlement: None,
+            wake_block: None,
             position: None,
             note: None,
             pane,
@@ -2485,6 +2523,7 @@ fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryRecei
         notification_state: None,
         quota_state: None,
         notification_settlement: None,
+        wake_block: None,
         position,
         note: None,
         pane,
@@ -2554,6 +2593,16 @@ fn worker_for(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) -> Option<A
 /// Attach an already-queued mailbox notification to the pane's existing FIFO worker.
 ///
 /// Recipient selection and oldest-pending policy belong to the coordinator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NotificationEnqueueRefusal {
+    DaemonStopping,
+    WorkerFaulted,
+    WorkerSupervisorExited,
+    AttemptUnowned,
+    ClassificationUnavailable,
+    PayloadUnavailable,
+}
+
 #[allow(dead_code)]
 pub(crate) fn enqueue_notification_attempt(
     inner: &Arc<Inner>,
@@ -2562,7 +2611,7 @@ pub(crate) fn enqueue_notification_attempt(
     display_recipient: &str,
     notification: NotificationContext,
     replace_existing: bool,
-) -> Option<Arc<DeliveryHandle>> {
+) -> Result<Arc<DeliveryHandle>, NotificationEnqueueRefusal> {
     let attempt_id = notification.attempt_id();
     let recipient = notification.recipient();
     let claimed_barrier = notification.claimed_notification_barrier();
@@ -2574,19 +2623,27 @@ pub(crate) fn enqueue_notification_attempt(
     active.retain(|_, handle| handle.strong_count() > 0);
     if !replace_existing {
         if let Some(handle) = active.get(&attempt_id).and_then(std::sync::Weak::upgrade) {
+            drop(active);
+            let refusal = inner
+                .engine
+                .notification_worker_refusal(recipient, attempt_id);
             if claimed_barrier.as_ref().is_ok_and(Option::is_some) {
                 handle
                     .claimed_notification_rerun_requested
                     .store(true, Ordering::SeqCst);
             }
-            return Some(handle);
+            return if let Some(refusal) = refusal {
+                Err(refusal)
+            } else {
+                Ok(handle)
+            };
         }
     }
     let claimed_barrier = match claimed_barrier {
         Ok(barrier) => barrier,
         Err(error) => {
             error!(message_id = %notification.message_id(), %error, "cannot classify notification enqueue");
-            return None;
+            return Err(NotificationEnqueueRefusal::ClassificationUnavailable);
         }
     };
     let doorbell = if claimed_barrier.is_some() {
@@ -2594,7 +2651,7 @@ pub(crate) fn enqueue_notification_attempt(
             Ok(record) => record,
             Err(error) => {
                 error!(message_id = %notification.message_id(), %error, "cannot rebuild claimed staged notification");
-                return None;
+                return Err(NotificationEnqueueRefusal::PayloadUnavailable);
             }
         };
         // Recovery owns the durable error result. An empty handle payload is
@@ -2630,11 +2687,11 @@ pub(crate) fn enqueue_notification_attempt(
                     task_inner, recipient, worker,
                 ))
             });
-    if worker.is_none() {
+    if let Err(refusal) = worker {
         inner.engine.retire_notification_run(&handle);
-        return None;
+        return Err(refusal);
     }
-    Some(handle)
+    Ok(handle)
 }
 
 // ---------------------------------------------------------------------------
@@ -8912,7 +8969,7 @@ mod tests {
     }
 
     fn test_worker_task() -> JoinHandle<()> {
-        tokio::spawn(async {})
+        tokio::spawn(std::future::pending())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9030,14 +9087,17 @@ mod tests {
             }
         });
 
-        assert!(result.is_none());
+        assert_eq!(
+            result.err(),
+            Some(NotificationEnqueueRefusal::DaemonStopping)
+        );
         assert!(!spawned.load(Ordering::SeqCst));
         assert!(engine.take_notification_worker_tasks().is_empty());
         assert!(engine.take_legacy_worker_tasks().is_empty());
     }
 
     #[tokio::test]
-    async fn status_worker_ownership_excludes_queued_and_different_attempts() {
+    async fn status_worker_ownership_requires_a_live_current_or_queued_attempt() {
         let engine = Engine::new();
         let (_scratch, _store, context, handle, recipient) =
             notification_fixture("status-worker-owner");
@@ -9046,10 +9106,7 @@ mod tests {
             .enqueue_notification_worker(recipient, Arc::clone(&handle), |_| test_worker_task())
             .expect("engine is running");
 
-        assert!(
-            !engine.notification_worker_owns(recipient, attempt),
-            "a queued handle was reported as active work"
-        );
+        assert!(engine.notification_worker_owns(recipient, attempt));
         let current = worker
             .current_or_next()
             .expect("queued handle becomes current");
@@ -9059,6 +9116,10 @@ mod tests {
         assert!(
             !engine.notification_worker_owns(recipient, attempt),
             "a faulted worker cannot advertise automatic reconciliation"
+        );
+        assert_eq!(
+            engine.notification_worker_refusal(recipient, attempt),
+            Some(NotificationEnqueueRefusal::WorkerFaulted)
         );
         assert!(worker.finish(&current));
         assert!(!engine.notification_worker_owns(recipient, attempt));
@@ -9108,13 +9169,19 @@ mod tests {
         let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
         let recipient = churn_recipient(workspace, 700);
         let first = DeliveryHandle::new("m-worker-first", "worker", "%1", 0, "first".into());
+        let fail = Arc::new(Notify::new());
         let worker = engine
-            .enqueue_notification_worker(recipient, Arc::clone(&first), |_| {
-                tokio::spawn(async move {
-                    panic!("simulated notification worker failure");
-                })
+            .enqueue_notification_worker(recipient, Arc::clone(&first), {
+                let fail = Arc::clone(&fail);
+                move |_| {
+                    tokio::spawn(async move {
+                        fail.notified().await;
+                        panic!("simulated notification worker failure");
+                    })
+                }
             })
             .expect("engine is running");
+        fail.notify_one();
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let finished = engine
@@ -9135,12 +9202,19 @@ mod tests {
         .expect("failed worker task finishes");
 
         let second = DeliveryHandle::new("m-worker-second", "worker", "%1", 0, "second".into());
-        let reused = engine
+        let refusal = engine
             .enqueue_notification_worker(recipient, Arc::clone(&second), |_| {
                 panic!("a failed supervisor must not restart on later traffic")
             })
-            .expect("engine is running");
-        assert!(Arc::ptr_eq(&worker, &reused));
+            .err();
+        assert_eq!(
+            refusal,
+            Some(NotificationEnqueueRefusal::WorkerSupervisorExited)
+        );
+        assert_eq!(
+            engine.notification_worker_refusal(recipient, NotificationAttemptId::generate()),
+            Some(NotificationEnqueueRefusal::WorkerSupervisorExited)
+        );
         assert!(worker.current().is_none());
         assert!(
             engine
@@ -9171,7 +9245,7 @@ mod tests {
                 .iter()
                 .map(|handle| handle.msg_id.as_str())
                 .collect::<Vec<_>>(),
-            ["m-worker-first", "m-worker-second"]
+            ["m-worker-first"]
         );
 
         let tasks = engine.take_notification_worker_tasks();

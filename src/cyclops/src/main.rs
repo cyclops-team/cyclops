@@ -2831,7 +2831,10 @@ fn read_body_file(path: &str) -> Result<String, String> {
 /// eye counts by and the daemon folds `status` by, so an exit code and an
 /// eye can never disagree about one delivery.
 fn receipts_exit(ds: &[DeliveryReceipt]) -> i32 {
-    i32::from(ds.iter().any(|d| delivery_needs_human(d.state)))
+    i32::from(
+        ds.iter()
+            .any(|d| d.wake_block.is_some() || delivery_needs_human(d.state)),
+    )
 }
 
 /// The same rule read tolerantly off the raw result for --json
@@ -2843,8 +2846,9 @@ fn receipts_exit_json(v: &Value) -> i32 {
         .and_then(Value::as_array)
         .is_some_and(|a| {
             a.iter().any(|d| {
-                serde_json::from_value::<DeliveryState>(d["state"].clone())
-                    .is_ok_and(delivery_needs_human)
+                d.get("wake_block").is_some_and(|block| !block.is_null())
+                    || serde_json::from_value::<DeliveryState>(d["state"].clone())
+                        .is_ok_and(delivery_needs_human)
             })
         });
     i32::from(bad)
@@ -3394,6 +3398,7 @@ mod tests {
             notification_state: None,
             quota_state: None,
             notification_settlement: None,
+            wake_block: None,
             position: None,
             note: None,
             pane: None,
@@ -3432,6 +3437,15 @@ mod tests {
         // One bad recipient in a broadcast is enough.
         assert_eq!(
             receipts_exit(&[receipt(DeliveredVerified), receipt(ParkedBlockedQuota)]),
+            1
+        );
+        let mut wake_blocked = receipt(Queued);
+        wake_blocked.wake_block = Some(cyclops_proto::MessageWakeBlock::EnqueueRefused);
+        assert_eq!(receipts_exit(&[wake_blocked]), 1);
+        assert_eq!(
+            receipts_exit_json(&json!({
+                "deliveries": [{"state": "queued", "wake_block": "enqueue_refused"}]
+            })),
             1
         );
         // A state this build does not know is not an error to report on:

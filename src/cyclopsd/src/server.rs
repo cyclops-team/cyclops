@@ -1352,6 +1352,9 @@ pub(crate) fn mailbox_service_error(error: crate::mailbox::MailboxServiceError) 
     use crate::mailbox::{MailboxDirectoryError, MailboxError, MailboxServiceError};
 
     let (code, message) = match error {
+        MailboxServiceError::NotificationSchedule(detail) => {
+            ("notification_schedule_failed", detail)
+        }
         MailboxServiceError::Directory(MailboxDirectoryError::UnknownRecipient(target)) => {
             ("no_such_target", format!("no mailbox recipient {target:?}"))
         }

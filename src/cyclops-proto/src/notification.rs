@@ -596,7 +596,7 @@ pub enum NotificationFact {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pre_write_cause: Option<NotificationPreWriteCause>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pre_write_observation: Option<NotificationPreWriteObservation>,
+        pre_write_observation: Option<Box<NotificationPreWriteObservation>>,
     },
     NotificationRequeued {
         record_version: u32,
@@ -1457,6 +1457,39 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn pre_write_observation_indirection_is_transparent_on_the_wire() {
+        let workspace = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let session = "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let fact = NotificationFact::NotificationTransition {
+            record_version: 1,
+            attempt_id: NotificationAttemptId::generate(),
+            message_id: MessageId::new("m-prewrite-wire").unwrap(),
+            recipient: RecipientKey::agent(workspace, session, "%3".parse().unwrap()),
+            state: NotificationState::BlockedPreWrite,
+            binding: None,
+            transport: None,
+            doorbell_format: None,
+            cause: None,
+            pre_write_cause: Some(NotificationPreWriteCause::WriteReadinessChanged),
+            pre_write_observation: Some(Box::new(NotificationPreWriteObservation {
+                pane_root: None,
+                selected_manifest: None,
+                binding: None,
+                pane_width: Some(59),
+                required_pane_width: Some(60),
+            })),
+        };
+
+        let encoded = serde_json::to_value(&fact).unwrap();
+        assert_eq!(
+            encoded["pre_write_observation"],
+            serde_json::json!({"pane_width": 59, "required_pane_width": 60})
+        );
+        let decoded: NotificationFact = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, fact);
     }
 
     #[test]

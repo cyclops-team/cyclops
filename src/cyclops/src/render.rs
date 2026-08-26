@@ -883,6 +883,7 @@ fn waiting_rows(attention: &Attention, res: &StatusResult, style: &Style) -> Vec
                 notification_state: None,
                 quota_state: None,
                 notification_settlement: None,
+                wake_block: None,
                 position: None,
                 note: None,
                 // The eye counts items from the record, which names the
@@ -2304,6 +2305,7 @@ mod tests {
             notification_state: None,
             quota_state: None,
             notification_settlement: None,
+            wake_block: None,
             position,
             note: note.map(String::from),
             pane: None,

@@ -88,9 +88,9 @@ impl RecoveryCoordinator {
 
     /// Track a same-run barrier whose delivery worker already retired.
     ///
-    /// A late exact claim can reconcile an ACK timeout after the in-memory
-    /// delivery handle is gone. The durable barrier then follows the same
-    /// clean-screen retirement path as a barrier restored at daemon boot.
+    /// An exact claim can outlive its in-memory delivery handle. The durable
+    /// barrier then follows the same bound clean-screen retirement path as a
+    /// barrier restored at daemon boot.
     pub(crate) fn track(&mut self, attempt_id: NotificationAttemptId) {
         self.tracked_attempts.insert(attempt_id);
     }

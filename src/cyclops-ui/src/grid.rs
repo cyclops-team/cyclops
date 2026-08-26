@@ -24,7 +24,7 @@
 
 use cyclops_proto::{
     AgentState, AttentionItem, Clearance, DeliveryReceipt, DeliveryState, MessageNotificationState,
-    MessageQuotaState,
+    MessageQuotaState, MessageWakeBlock,
 };
 
 /// The caller's color, for the cells this module composes.
@@ -271,29 +271,43 @@ fn mailbox_receipt_badge(
     if let Some(ahead) = receipt.position.filter(|ahead| *ahead > 0) {
         words.push_str(&format!(" {sep} {ahead} ahead"));
     }
-    let wake = if receipt.notification_settlement
+    let wake = if let Some(block) = receipt.wake_block {
+        format!("blocked ({})", wake_block_words(block))
+    } else if receipt.notification_settlement
         == Some(cyclops_proto::MessageNotificationSettlement::WithdrawnByClaim)
     {
-        "withdrawn"
+        "withdrawn".into()
     } else {
         match receipt.quota_state {
-            Some(MessageQuotaState::Held) => "quota held",
-            Some(MessageQuotaState::ResetObserved) => "quota reset observed",
+            Some(MessageQuotaState::Held) => "quota held".into(),
+            Some(MessageQuotaState::ResetObserved) => "quota reset observed".into(),
             None => match notification {
-                MessageNotificationState::NotStarted => "not started",
-                MessageNotificationState::Queued => "queued",
-                MessageNotificationState::Gating => "checking readiness",
-                MessageNotificationState::Writing => "writing",
-                MessageNotificationState::Staged => "staged",
-                MessageNotificationState::Submitted => "submitted",
-                MessageNotificationState::Notified => "notified",
-                MessageNotificationState::AttentionRequired => "needs attention",
-                MessageNotificationState::Superseded => "superseded",
+                MessageNotificationState::NotStarted => "not started".into(),
+                MessageNotificationState::Queued => "queued".into(),
+                MessageNotificationState::Gating => "checking readiness".into(),
+                MessageNotificationState::Writing => "writing".into(),
+                MessageNotificationState::Staged => "staged".into(),
+                MessageNotificationState::Submitted => "submitted".into(),
+                MessageNotificationState::Notified => "notified".into(),
+                MessageNotificationState::AttentionRequired => "needs attention".into(),
+                MessageNotificationState::Superseded => "superseded".into(),
             },
         }
     };
     words.push_str(&format!(" {sep} wake {wake}"));
     paint.badge(receipt.state, &words)
+}
+
+fn wake_block_words(block: MessageWakeBlock) -> &'static str {
+    match block {
+        MessageWakeBlock::DaemonStopping => "daemon stopping",
+        MessageWakeBlock::RouteUnavailable => "route unavailable",
+        MessageWakeBlock::AttentionResolutionPending => "attention resolution pending",
+        MessageWakeBlock::WorkerFaulted => "worker faulted",
+        MessageWakeBlock::WorkerSupervisorExited => "worker supervisor exited",
+        MessageWakeBlock::EnqueueRefused => "scheduler refused ownership",
+        MessageWakeBlock::SchedulerStateUnavailable => "scheduler state unavailable",
+    }
 }
 
 /// Human wording for the stable `DeliveryReceipt::held_by` tokens. Unknown
@@ -330,6 +344,7 @@ pub fn delivery_badge(
             notification_state: None,
             quota_state: None,
             notification_settlement: None,
+            wake_block: None,
             position: None,
             note,
             held_by: None,
@@ -383,6 +398,7 @@ mod tests {
             notification_state: None,
             quota_state: None,
             notification_settlement: None,
+            wake_block: None,
             position,
             note: note.map(String::from),
             pane: None,
@@ -497,6 +513,12 @@ mod tests {
         let mut oldest = receipt(DeliveryState::Queued, Some(0), None);
         oldest.notification_state = Some(Queued);
         assert_eq!(receipt_badge(&oldest, &Plain), "✓ accepted · wake queued");
+
+        oldest.wake_block = Some(MessageWakeBlock::WorkerSupervisorExited);
+        assert_eq!(
+            receipt_badge(&oldest, &Plain),
+            "✓ accepted · wake blocked (worker supervisor exited)"
+        );
     }
 
     #[test]

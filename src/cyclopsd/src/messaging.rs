@@ -1,12 +1,13 @@
 //! Coordinates the durable mailbox with the existing pane notification worker.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use cyclops_proto::{
-    DeliveryReceipt, DeliveryState, MessageId, MsgSendParams, MsgSendResult, NotificationBinding,
-    NotificationManifestId, NotificationPreWriteObservation, NotificationWithdrawDisposition,
-    NotificationWithdrawResult, ProcessInstanceId, RecipientKey,
+    DeliveryReceipt, DeliveryState, MessageId, MessageWakeBlock, MsgSendParams, MsgSendResult,
+    NotificationBinding, NotificationManifestId, NotificationPreWriteCause,
+    NotificationPreWriteObservation, NotificationWithdrawDisposition, NotificationWithdrawResult,
+    ProcessInstanceId, RecipientKey,
 };
 use cyclops_tmux::{PaneRow, SessionWatcher};
 use tracing::{debug, error};
@@ -23,6 +24,22 @@ pub(crate) struct NotificationRoute {
     pub(crate) label: String,
     pub(crate) watcher: Arc<SessionWatcher>,
     pub(crate) row: PaneRow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecipientScheduleOutcome {
+    WorkerOwned,
+    NoWakeNeeded,
+    Blocked(MessageWakeBlock),
+}
+
+impl RecipientScheduleOutcome {
+    fn wake_block(self) -> Option<MessageWakeBlock> {
+        match self {
+            Self::Blocked(block) => Some(block),
+            Self::WorkerOwned | Self::NoWakeNeeded => None,
+        }
+    }
 }
 
 /// Resolve a durable recipient only when its exact session instance is attached.
@@ -196,7 +213,7 @@ fn enqueue_prepared_notification(
     route: NotificationRoute,
     record: cyclops_proto::NotificationRecord,
     rerun_existing: bool,
-) {
+) -> Result<RecipientScheduleOutcome, MailboxServiceError> {
     let context = NotificationContext::new_with_changes(
         service.store_handle(),
         record.message_id,
@@ -204,14 +221,71 @@ fn enqueue_prepared_notification(
         record.attempt_id,
         service.change_publisher(),
     );
-    let _ = crate::delivery::enqueue_notification_attempt(
+    let attempt_id = context.attempt_id();
+    match crate::delivery::enqueue_notification_attempt(
         inner,
         route.session_idx,
         &route.pane_id,
         &route.label,
-        context,
+        context.clone(),
         rerun_existing,
-    );
+    ) {
+        Ok(_) if inner.engine.notification_worker_owns(recipient, attempt_id) => {
+            Ok(RecipientScheduleOutcome::WorkerOwned)
+        }
+        Ok(_) => park_unowned_notification(
+            inner,
+            &context,
+            NotificationPreWriteCause::WorkerFailed,
+            MessageWakeBlock::EnqueueRefused,
+        ),
+        Err(refusal) => {
+            let (cause, block) = match refusal {
+                crate::delivery::NotificationEnqueueRefusal::DaemonStopping => (
+                    NotificationPreWriteCause::SessionUnavailable,
+                    MessageWakeBlock::DaemonStopping,
+                ),
+                crate::delivery::NotificationEnqueueRefusal::WorkerFaulted => (
+                    NotificationPreWriteCause::WorkerFailed,
+                    MessageWakeBlock::WorkerFaulted,
+                ),
+                crate::delivery::NotificationEnqueueRefusal::WorkerSupervisorExited => (
+                    NotificationPreWriteCause::WorkerFailed,
+                    MessageWakeBlock::WorkerSupervisorExited,
+                ),
+                crate::delivery::NotificationEnqueueRefusal::PayloadUnavailable
+                | crate::delivery::NotificationEnqueueRefusal::ClassificationUnavailable => (
+                    NotificationPreWriteCause::PayloadUnavailable,
+                    MessageWakeBlock::EnqueueRefused,
+                ),
+                crate::delivery::NotificationEnqueueRefusal::AttemptUnowned => (
+                    NotificationPreWriteCause::WorkerFailed,
+                    MessageWakeBlock::EnqueueRefused,
+                ),
+            };
+            park_unowned_notification(inner, &context, cause, block)
+        }
+    }
+}
+
+fn park_unowned_notification(
+    inner: &Inner,
+    context: &NotificationContext,
+    cause: NotificationPreWriteCause,
+    block: MessageWakeBlock,
+) -> Result<RecipientScheduleOutcome, MailboxServiceError> {
+    let recorded = {
+        let _publication = inner
+            .mailbox_publication
+            .lock()
+            .expect("mailbox publication lock");
+        context
+            .record_gating()
+            .and_then(|_| context.record_pre_write_block(cause, None))
+    };
+    recorded
+        .map(|_| RecipientScheduleOutcome::Blocked(block))
+        .map_err(|error| MailboxServiceError::NotificationSchedule(error.to_string()))
 }
 
 /// Schedule only the oldest pending entry for one durable recipient.
@@ -219,18 +293,37 @@ pub(crate) fn schedule_recipient(
     inner: &Arc<Inner>,
     service: &Arc<MailboxService>,
     recipient: RecipientKey,
-) -> Result<(), MailboxServiceError> {
+) -> Result<RecipientScheduleOutcome, MailboxServiceError> {
+    let Some(record) = service.prepare_oldest_notification(recipient)? else {
+        return Ok(service
+            .notification_schedule_block(recipient)?
+            .map(RecipientScheduleOutcome::Blocked)
+            .unwrap_or(RecipientScheduleOutcome::NoWakeNeeded));
+    };
+    let context = NotificationContext::new_with_changes(
+        service.store_handle(),
+        record.message_id.clone(),
+        recipient,
+        record.attempt_id,
+        service.change_publisher(),
+    );
     if inner.engine.is_stopping() {
-        return Ok(());
+        return park_unowned_notification(
+            inner,
+            &context,
+            NotificationPreWriteCause::SessionUnavailable,
+            MessageWakeBlock::DaemonStopping,
+        );
     }
     let Some(route) = notification_route(inner, service, recipient)? else {
-        return Ok(());
+        return park_unowned_notification(
+            inner,
+            &context,
+            NotificationPreWriteCause::SessionUnavailable,
+            MessageWakeBlock::RouteUnavailable,
+        );
     };
-    let Some(record) = service.prepare_oldest_notification(recipient)? else {
-        return Ok(());
-    };
-    enqueue_prepared_notification(inner, service, recipient, route, record, false);
-    Ok(())
+    enqueue_prepared_notification(inner, service, recipient, route, record, false)
 }
 
 /// Reopen one blocked attempt under the publication lock.
@@ -288,7 +381,7 @@ fn schedule_recipient_after_route_evidence(
         prepare_recipient_after_route_evidence(inner, service, recipient)?
     };
     if let Some((route, record)) = prepared {
-        enqueue_prepared_notification(inner, service, recipient, route, record, true);
+        enqueue_prepared_notification(inner, service, recipient, route, record, true)?;
     }
     Ok(())
 }
@@ -358,11 +451,9 @@ fn finish_acceptance(
     service: &Arc<MailboxService>,
     accepted: AcceptResult,
 ) -> Result<MsgSendResult, MailboxServiceError> {
-    for recipient in accepted.recipient_keys.iter().copied() {
-        if let Err(error) = schedule_recipient(inner, service, recipient) {
-            error!(%recipient, %error, "cannot schedule accepted mailbox notification");
-        }
-    }
+    let schedule_outcomes = schedule_accepted_notifications(&accepted, |recipient| {
+        schedule_recipient(inner, service, recipient)
+    });
     let dispositions = service.message_dispositions(&accepted.message_id)?;
     Ok(MsgSendResult {
         msg_id: accepted.message_id.to_string(),
@@ -378,6 +469,10 @@ fn finish_acceptance(
                     notification_state: Some(disposition.notification_state),
                     quota_state: disposition.quota_state,
                     notification_settlement: disposition.notification_settlement,
+                    wake_block: schedule_outcomes
+                        .get(&disposition.recipient)
+                        .copied()
+                        .and_then(RecipientScheduleOutcome::wake_block),
                     position: disposition.position_ahead,
                     held_by: None,
                     note: None,
@@ -387,6 +482,21 @@ fn finish_acceptance(
             .collect::<Result<Vec<_>, MailboxServiceError>>()?,
         inserted: Some(accepted.inserted),
     })
+}
+
+fn schedule_accepted_notifications(
+    accepted: &AcceptResult,
+    mut schedule: impl FnMut(RecipientKey) -> Result<RecipientScheduleOutcome, MailboxServiceError>,
+) -> HashMap<RecipientKey, RecipientScheduleOutcome> {
+    let mut outcomes = HashMap::new();
+    for recipient in accepted.recipient_keys.iter().copied() {
+        let outcome = schedule(recipient).unwrap_or_else(|error| {
+            error!(%recipient, %error, "cannot schedule accepted mailbox notification");
+            RecipientScheduleOutcome::Blocked(MessageWakeBlock::SchedulerStateUnavailable)
+        });
+        outcomes.insert(recipient, outcome);
+    }
+    outcomes
 }
 
 pub(crate) fn send(
@@ -479,6 +589,11 @@ fn finish_claim(
     };
     if let Some(attempt_id) = consumed_doorbell {
         crate::delivery::settle_notification_claim(inner, attempt_id);
+        if let Err(error) =
+            schedule_claimed_composer_observation(inner, service, claimant, attempt_id)
+        {
+            error!(%claimant, %error, "cannot observe claimed notification composer");
+        }
     }
     if let Some(attempt_id) = claimed_ack_timeout {
         if let Err(error) =
@@ -497,6 +612,49 @@ fn finish_claim(
         }
     }
     Ok(outcome)
+}
+
+/// Reconcile one exact doorbell barrier against a fresh post-claim screen.
+///
+/// A claim can move Submitted to Notified after its delivery handle has
+/// retired. Tracking the exact attempt makes later pane observations eligible
+/// for durable composer-barrier retirement. The forced capture closes the
+/// no-output case where the composer was already clean when the claim landed.
+/// Claim identity alone never retires the barrier: recovery still requires the
+/// same bound occupant and manifest plus positive clean-composer evidence.
+fn schedule_claimed_composer_observation(
+    inner: &Arc<Inner>,
+    service: &Arc<MailboxService>,
+    recipient: RecipientKey,
+    attempt_id: cyclops_proto::NotificationAttemptId,
+) -> Result<(), MailboxServiceError> {
+    inner
+        .composer_recovery
+        .lock()
+        .expect("composer recovery lock")
+        .track(attempt_id);
+    let Some(route) = notification_route(inner, service, recipient)? else {
+        return Ok(());
+    };
+    if tokio::runtime::Handle::try_current().is_err() {
+        return Ok(());
+    }
+    let task_inner = Arc::clone(inner);
+    let session_idx = route.session_idx;
+    let pane_id = route.pane_id.clone();
+    let watcher = Arc::clone(&route.watcher);
+    inner.engine.spawn_descendant_task(async move {
+        crate::fusion::recompute_pane(
+            &task_inner,
+            session_idx,
+            &watcher,
+            &pane_id,
+            true,
+            "claimed_notification",
+        )
+        .await;
+    });
+    Ok(())
 }
 
 /// Reconcile the composer barrier after a late claim identifies an ACK timeout.
@@ -534,7 +692,7 @@ fn schedule_claimed_notification_recovery(
     let session_idx = route.session_idx;
     let pane_id = route.pane_id.clone();
     let watcher = Arc::clone(&route.watcher);
-    enqueue_prepared_notification(inner, service, recipient, route, record, true);
+    enqueue_prepared_notification(inner, service, recipient, route, record, true)?;
     if tokio::runtime::Handle::try_current().is_err() {
         return Ok(());
     }
@@ -654,5 +812,38 @@ mod tests {
             !cached_entry_is_write_ready(&entry, false, &binding(201)),
             "a reused leader pid with a new generation cannot inherit readiness"
         );
+    }
+
+    #[test]
+    fn durable_acceptance_never_reports_queued_after_schedule_failure() {
+        let workspace = "00000000-0000-4000-8000-000000000001".parse().unwrap();
+        let session = "00000000-0000-4000-8000-000000000002".parse().unwrap();
+        let first = RecipientKey::agent(workspace, session, "%3".parse().unwrap());
+        let middle = RecipientKey::agent(workspace, session, "%4".parse().unwrap());
+        let last = RecipientKey::agent(workspace, session, "%5".parse().unwrap());
+        let accepted = AcceptResult {
+            message_id: MessageId::new("m-accepted-schedule-failed").unwrap(),
+            inserted: true,
+            seq: 41,
+            recipients: vec!["first".into(), "middle".into(), "last".into()],
+            recipient_keys: vec![first, middle, last],
+        };
+
+        let mut attempted = Vec::new();
+        let outcomes = schedule_accepted_notifications(&accepted, |recipient| {
+            attempted.push(recipient);
+            if recipient == middle {
+                Err(MailboxServiceError::Poisoned)
+            } else {
+                Ok(RecipientScheduleOutcome::WorkerOwned)
+            }
+        });
+        assert_eq!(attempted, vec![first, middle, last]);
+        assert_eq!(outcomes[&first], RecipientScheduleOutcome::WorkerOwned);
+        assert_eq!(
+            outcomes[&middle],
+            RecipientScheduleOutcome::Blocked(MessageWakeBlock::SchedulerStateUnavailable)
+        );
+        assert_eq!(outcomes[&last], RecipientScheduleOutcome::WorkerOwned);
     }
 }

@@ -1222,6 +1222,7 @@ pub fn run_selftest(c: &mut Client, json: bool, style: &Style, target: &str) -> 
                 notification_state: None,
                 quota_state: None,
                 notification_settlement: None,
+                wake_block: None,
                 position: None,
                 note: None,
                 pane: None,

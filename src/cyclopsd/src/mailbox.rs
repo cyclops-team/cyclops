@@ -13,16 +13,17 @@ use cyclops_proto::{
     MailboxEntryState, MailboxFact, MailboxListItem, MailboxTypeError, MessageDirection, MessageId,
     MessageMetadata, MessageNotificationSettlement, MessageNotificationState,
     MessageNotificationSummary, MessagePresentation, MessageQuotaState, MessageRecipientRoute,
-    MessageRecipientSummary, MessageSnapshotRow, MessagesChangedArea, MessagesChangedData,
-    MessagesFollowResult, MessagesSnapshotCounts, MessagesSnapshotResult, NotificationAttemptId,
-    NotificationAttentionCause, NotificationBarrierRetirementCause, NotificationBinding,
-    NotificationFact, NotificationPreWriteCause, NotificationPreWriteObservation,
-    NotificationRecord, NotificationRequeue, NotificationResolution,
-    NotificationResolutionConsumptionEvidence, NotificationResolutionConsumptionObservation,
-    NotificationState, NotificationTransport, ProcessInstanceId, RecipientKey, RequestDigest,
-    StatusBlockedNotification, StatusNextAction, TmuxPaneId, WorkspaceId, CANONICAL_RECORD_VERSION,
-    DOORBELL_FORMAT_ATTEMPT_CLAIM, DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM,
-    DOORBELL_FORMAT_COMPACT_CLAIM, NOTIFICATION_RESOLUTION_PROOF_VERSION,
+    MessageRecipientSummary, MessageSnapshotRow, MessageWakeBlock, MessagesChangedArea,
+    MessagesChangedData, MessagesFollowResult, MessagesSnapshotCounts, MessagesSnapshotResult,
+    NotificationAttemptId, NotificationAttentionCause, NotificationBarrierRetirementCause,
+    NotificationBinding, NotificationFact, NotificationPreWriteCause,
+    NotificationPreWriteObservation, NotificationRecord, NotificationRequeue,
+    NotificationResolution, NotificationResolutionConsumptionEvidence,
+    NotificationResolutionConsumptionObservation, NotificationState, NotificationTransport,
+    ProcessInstanceId, RecipientKey, RequestDigest, StatusBlockedNotification, StatusNextAction,
+    TmuxPaneId, WorkspaceId, CANONICAL_RECORD_VERSION, DOORBELL_FORMAT_ATTEMPT_CLAIM,
+    DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM, DOORBELL_FORMAT_COMPACT_CLAIM,
+    NOTIFICATION_RESOLUTION_PROOF_VERSION,
 };
 use cyclops_state::StateRoot;
 use tokio::sync::broadcast;
@@ -1589,7 +1590,7 @@ impl MailboxProjection {
                     },
                     cause,
                     pre_write_cause,
-                    pre_write_observation,
+                    pre_write_observation: pre_write_observation.map(|observation| *observation),
                     pre_write_reopen_count: if current.state == NotificationState::BlockedPreWrite
                         && state == NotificationState::Gating
                     {
@@ -4219,6 +4220,8 @@ pub enum MailboxServiceError {
     Poisoned,
     #[error("replacement mailbox directory belongs to another workspace")]
     ForeignDirectory,
+    #[error("notification scheduler state could not be recorded: {0}")]
+    NotificationSchedule(String),
 }
 
 impl From<MailboxError> for MailboxServiceError {
@@ -4433,8 +4436,9 @@ impl MailboxService {
 
     /// Queue or resume the oldest pending notification for one recipient.
     ///
-    /// The caller first proves a live route. This method owns the atomic
-    /// mailbox decision so concurrent sends cannot mint two attempts.
+    /// This method owns the atomic mailbox decision so concurrent sends
+    /// cannot mint two attempts. The scheduler binds or explicitly blocks
+    /// the returned attempt before reporting its wake outcome.
     pub(crate) fn prepare_oldest_notification(
         &self,
         recipient: RecipientKey,
@@ -4519,6 +4523,50 @@ impl MailboxService {
         }
     }
 
+    /// Explain a `prepare_oldest_notification` miss without inventing success.
+    ///
+    /// A normal empty/admin mailbox and an already visible or in-flight head
+    /// need no scheduler warning. Durable attention and pre-write holds do.
+    pub(crate) fn notification_schedule_block(
+        &self,
+        recipient: RecipientKey,
+    ) -> Result<Option<MessageWakeBlock>, MailboxServiceError> {
+        if recipient.is_admin() {
+            return Ok(None);
+        }
+        let store = self.store()?;
+        if let Some(record) = store.projection().claimed_notification_barrier(recipient) {
+            if store
+                .projection()
+                .attention_resolution_pending(record.attempt_id)
+            {
+                return Ok(Some(MessageWakeBlock::AttentionResolutionPending));
+            }
+        }
+        let Some(message_id) = store
+            .projection()
+            .get_pending(recipient)
+            .first()
+            .map(|entry| entry.message_id.clone())
+        else {
+            return Ok(None);
+        };
+        let block = store
+            .projection()
+            .notification(recipient, &message_id)
+            .and_then(|record| {
+                matches!(
+                    record.state,
+                    NotificationState::BlockedPreWrite
+                        | NotificationState::QuotaHeld
+                        | NotificationState::QuotaResetObserved
+                        | NotificationState::AttentionRequired
+                )
+                .then_some(MessageWakeBlock::SchedulerStateUnavailable)
+            });
+        Ok(block)
+    }
+
     /// Whether the oldest pending wake is blocked only by its recorded width.
     pub(crate) fn oldest_notification_has_width_block(
         &self,
@@ -4585,6 +4633,10 @@ impl MailboxService {
                 && observation.selected_manifest.as_ref() == Some(&binding.manifest)
         });
         let cause_changed = match current.pre_write_cause {
+            Some(
+                NotificationPreWriteCause::SessionUnavailable
+                | NotificationPreWriteCause::WorkerFailed,
+            ) => complete_binding,
             Some(NotificationPreWriteCause::BindingUnprovable) => {
                 current.pre_write_observation.as_ref() != Some(&observation)
             }
@@ -6436,7 +6488,7 @@ impl MessageStore {
             doorbell_format,
             cause,
             pre_write_cause,
-            pre_write_observation,
+            pre_write_observation: pre_write_observation.map(Box::new),
         };
         self.append_notification_fact_at(message_id, recipient, fact, ts)
     }
@@ -15640,7 +15692,7 @@ mod tests {
                 current_attempt,
                 NotificationState::AttentionRequired,
                 None,
-                Some(NotificationAttentionCause::SubmitFailed),
+                Some(NotificationAttentionCause::AckTimeout),
             )
             .unwrap();
         store

@@ -1,6 +1,6 @@
 mod common;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -187,14 +187,51 @@ async fn wait_for_doorbell(rig: &Rig, pane: &str, message_id: &str) -> String {
 }
 
 fn current_compact_doorbell(rig: &Rig, message_id: &str) -> Option<String> {
-    workspace_lines(rig).into_iter().rev().find_map(|line| {
-        let data = line.data?;
-        if line.id != message_id || data["type"] != "notification_transition" {
-            return None;
+    current_notification_attempt(&workspace_lines(rig), message_id)
+        .map(cyclops_proto::render_doorbell_v3)
+}
+
+fn current_notification_attempt(
+    lines: &[LedgerLine],
+    message_id: &str,
+) -> Option<NotificationAttemptId> {
+    let mut current_by_recipient = BTreeMap::<String, String>::new();
+    for line in lines.iter().filter(|line| line.id == message_id) {
+        let Some(data) = line.data.as_ref() else {
+            continue;
+        };
+        match data["type"].as_str() {
+            Some("notification_transition" | "notification_requeued") => {
+                let (Some(recipient), Some(attempt_id)) =
+                    (data["recipient"].as_str(), data["attempt_id"].as_str())
+                else {
+                    continue;
+                };
+                current_by_recipient.insert(recipient.to_string(), attempt_id.to_string());
+            }
+            Some("notifications_requeued") => {
+                for requeue in data["requeues"].as_array().into_iter().flatten() {
+                    let (Some(recipient), Some(attempt_id)) = (
+                        requeue["recipient"].as_str(),
+                        requeue["attempt_id"].as_str(),
+                    ) else {
+                        continue;
+                    };
+                    current_by_recipient.insert(recipient.to_string(), attempt_id.to_string());
+                }
+            }
+            _ => {}
         }
-        let attempt_id = NotificationAttemptId::parse(data["attempt_id"].as_str()?).ok()?;
-        Some(cyclops_proto::render_doorbell_v3(attempt_id))
-    })
+    }
+    let mut attempts = current_by_recipient
+        .into_values()
+        .collect::<BTreeSet<_>>()
+        .into_iter();
+    let attempt_id = attempts.next()?;
+    if attempts.next().is_some() {
+        return None;
+    }
+    NotificationAttemptId::parse(&attempt_id).ok()
 }
 
 fn compact_doorbell(rig: &Rig, message_id: &str) -> String {
@@ -204,6 +241,58 @@ fn compact_doorbell(rig: &Rig, message_id: &str) -> String {
 
 fn legacy_doorbell(message_id: &str) -> String {
     cyclops_proto::render_legacy_doorbell(&MessageId::new(message_id).unwrap())
+}
+
+#[test]
+fn current_doorbell_follows_the_attempt_owned_by_a_requeue_fact() {
+    fn line(seq: u64, message_id: &str, data: Value) -> LedgerLine {
+        LedgerLine {
+            seq,
+            boot_id: "b-test".into(),
+            id: message_id.into(),
+            ts: seq,
+            kind: Kind::State,
+            from: "cyclopsd".into(),
+            to: Vec::new(),
+            subject: None,
+            body: None,
+            reply_to: None,
+            deliveries: Vec::new(),
+            data: Some(data),
+        }
+    }
+
+    let message_id = "m-requeued-doorbell";
+    let prior = "att-00000000-0000-4000-8000-000000000001";
+    let current = "att-00000000-0000-4000-8000-000000000002";
+    let recipient = "00000000-0000-4000-8000-000000000003/00000000-0000-4000-8000-000000000004/%1";
+    let lines = vec![
+        line(
+            1,
+            message_id,
+            json!({
+                "type": "notification_transition",
+                "attempt_id": prior,
+                "recipient": recipient,
+                "state": "attention_required"
+            }),
+        ),
+        line(
+            2,
+            message_id,
+            json!({
+                "type": "notification_requeued",
+                "prior_attempt_id": prior,
+                "attempt_id": current,
+                "recipient": recipient
+            }),
+        ),
+    ];
+
+    assert_eq!(
+        current_notification_attempt(&lines, message_id),
+        Some(NotificationAttemptId::parse(current).unwrap())
+    );
 }
 
 fn pane_history(rig: &Rig, pane: &str) -> String {
@@ -1167,6 +1256,107 @@ async fn an_exact_attempt_ack_timeout_claim_clears_then_advances_the_fifo() {
     assert_eq!(snapshot["result"]["counts"]["open_attention_entries"], 0);
 
     release_second.add_permits(1);
+    rig.daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exact_submitted_claim_needs_fresh_clean_composer_then_wakes_fifo() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let manifest = CAT_MANIFEST.replace(
+        "submit = \"Enter\"\n",
+        "submit = \"Enter\"\nclear_keys = [\"C-c\"]\n",
+    );
+    let pane_command = format!("python3 {} --swallow-once --clear-staged", faketui_path());
+    let mut rig = Rig::new(
+        "workspace-claimed-submitted-clean",
+        &manifest,
+        &pane_command,
+        "receipt_block_ms = 15000\nack_timeout_ms = 15000\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let (submitted_tx, mut submitted_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release_submitted = Arc::new(tokio::sync::Semaphore::new(0));
+    let first_pause = Arc::new(AtomicBool::new(true));
+    rig.daemon.set_inject_pause({
+        let release_submitted = Arc::clone(&release_submitted);
+        let first_pause = Arc::clone(&first_pause);
+        move |phase| {
+            let submitted_tx = submitted_tx.clone();
+            let release_submitted = Arc::clone(&release_submitted);
+            let should_pause = phase == "post_submit" && first_pause.swap(false, Ordering::SeqCst);
+            Box::pin(async move {
+                if !should_pause {
+                    return;
+                }
+                let _ = submitted_tx.send(());
+                release_submitted.acquire_owned().await.unwrap().forget();
+            })
+        }
+    });
+
+    let pair = send_waiting_pair(&rig, "claimed-submitted-clean").await;
+    assert_only_oldest_attempt_exists(&rig, &pair);
+    tokio::time::timeout(Duration::from_secs(5), submitted_rx.recv())
+        .await
+        .expect("first notification reached Submitted")
+        .expect("post-submit sender stayed open");
+    wait_for_notification_state(&mut rig, &pair.first, NotificationState::Submitted).await;
+    let submitted = notification_transition(&rig, &pair.first, NotificationState::Submitted)
+        .expect("durable Submitted transition");
+    let attempt_id = submitted.data.as_ref().unwrap()["attempt_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let expected =
+        cyclops_proto::render_doorbell_v3(NotificationAttemptId::parse(&attempt_id).unwrap());
+    assert!(rig.tmux.capture(&pane).contains(&expected));
+
+    rig.daemon
+        .claim_message_for_test("worker", &pair.first)
+        .expect("exact recipient claim");
+    let claim = wait_for_workspace_fact(&rig, &pair.first, "message_claimed").await;
+
+    // A fresh observation that still sees staged input must preserve the
+    // exact owner. Retrieval alone is never composer-clearance evidence.
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "C-l"]);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(rig.tmux.capture(&pane).contains(&expected));
+    assert!(workspace_lines(&rig).iter().all(|line| {
+        line.id != pair.first
+            || line
+                .data
+                .as_ref()
+                .is_none_or(|data| data["type"] != "notification_barrier_retired")
+    }));
+    assert_eq!(
+        notification_state_count(&rig, &pair.second, NotificationState::Writing),
+        0,
+        "claim alone released the FIFO"
+    );
+
+    release_submitted.add_permits(1);
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "C-c"]);
+    let retired = wait_for_workspace_fact(&rig, &pair.first, "notification_barrier_retired").await;
+    let retired_data = retired.data.as_ref().unwrap();
+    assert_eq!(retired_data["attempt_id"], attempt_id);
+    assert_eq!(retired_data["cause"], "composer_observed_clear");
+    assert!(claim.seq < retired.seq);
+
+    wait_for_notification_state(&mut rig, &pair.second, NotificationState::Writing).await;
+    let second_writing = notification_transition(&rig, &pair.second, NotificationState::Writing)
+        .expect("next FIFO notification crossed the write boundary");
+    assert!(retired.seq < second_writing.seq);
+    assert_eq!(notification_attempts(&rig, &pair.first).len(), 1);
+    assert_eq!(notification_attempts(&rig, &pair.second).len(), 1);
+    assert!(!rig.tmux.capture(&pane).contains(&expected));
+
     rig.daemon.shutdown().await;
 }
 
