@@ -21,10 +21,11 @@
 //! lines invalid UTF-8 on its own. Decoding must never decide whether the
 //! connection lives.
 //!
-//! Notifications enter a bounded ordered queue. A full queue backpressures the
-//! reader instead of dropping ordered state or closing a healthy connection.
-//! An oversized control line still closes the connection so the owner can
-//! reconnect and rebuild a whole snapshot.
+//! Notifications enter a bounded ordered queue. When that queue fills, the
+//! reader retains its queued prefix, records one explicit continuity gap, and
+//! keeps reading so a correlated command reply cannot deadlock behind output.
+//! The consumer reconciles from an authoritative snapshot after the gap. An
+//! oversized control line still closes the connection.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -33,7 +34,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
@@ -45,8 +46,9 @@ use crate::quote::quote_arg;
 
 static SPOOL_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Notifications waiting outside the control reader. A full queue applies
-/// bounded backpressure until the consumer makes room.
+/// Notifications retained outside the control reader. One extra channel slot
+/// is reserved for the continuity marker and does not increase this payload
+/// capacity.
 pub const NOTIFICATION_CAPACITY: usize = 256;
 /// Aggregate retained notification payload. Item capacity still bounds
 /// bookkeeping, while this budget prevents a queue of large output records
@@ -270,16 +272,24 @@ impl CommandPipe {
         let mut line = String::with_capacity(cmd.len() + 1);
         line.push_str(cmd);
         line.push('\n');
-        let write = async {
-            stdin.write_all(line.as_bytes()).await?;
-            stdin.flush().await
-        }
-        .await;
-        if let Err(e) = write {
-            // Our slot is the newest entry; remove it so correlation for
-            // earlier commands is unharmed.
-            self.pending.lock().expect("pending lock").pop_back();
-            return Err(TmuxError::Io(e));
+        let write = write_command_line(stdin, line.as_bytes()).await;
+        if let Err(error) = write {
+            // A failed control write poisons FIFO correlation even when no
+            // byte landed. Close the stream, then report whether this command
+            // was provably unwritten or may have reached tmux.
+            *guard = None;
+            drop(guard);
+            self.reply_slots.close();
+            let mut pending = self.pending.lock().expect("pending lock");
+            while let Some(slot) = pending.pop_front() {
+                if let ReplyTarget::Caller(tx) = slot.target {
+                    let _ = tx.send(Err(TmuxError::Disconnected));
+                }
+            }
+            return Err(match error {
+                CommandWriteError::Unwritten(error) => TmuxError::Io(error),
+                CommandWriteError::Uncertain(error) => TmuxError::WriteUncertain(error),
+            });
         }
         self.issued.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -300,6 +310,37 @@ impl CommandPipe {
     }
 }
 
+enum CommandWriteError {
+    Unwritten(std::io::Error),
+    Uncertain(std::io::Error),
+}
+
+async fn write_command_line<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    line: &[u8],
+) -> Result<(), CommandWriteError> {
+    let mut written = 0;
+    while written < line.len() {
+        match writer.write(&line[written..]).await {
+            Ok(0) => {
+                let error = std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "tmux command pipe accepted zero bytes",
+                );
+                return Err(if written == 0 {
+                    CommandWriteError::Unwritten(error)
+                } else {
+                    CommandWriteError::Uncertain(error)
+                });
+            }
+            Ok(bytes) => written += bytes,
+            Err(error) if written == 0 => return Err(CommandWriteError::Unwritten(error)),
+            Err(error) => return Err(CommandWriteError::Uncertain(error)),
+        }
+    }
+    writer.flush().await.map_err(CommandWriteError::Uncertain)
+}
+
 fn validate_command_line(cmd: &str) -> Result<(), TmuxError> {
     if cmd.contains('\n') || cmd.contains('\r') {
         return Err(TmuxError::Protocol(format!(
@@ -311,38 +352,87 @@ fn validate_command_line(cmd: &str) -> Result<(), TmuxError> {
 
 struct QueuedNotification {
     notification: Notification,
-    _permit: OwnedSemaphorePermit,
+    _item_permit: Option<OwnedSemaphorePermit>,
+    _byte_permit: Option<OwnedSemaphorePermit>,
 }
 
 #[derive(Clone)]
 struct NotificationSink {
     tx: mpsc::Sender<QueuedNotification>,
     bytes: Arc<Semaphore>,
+    items: Arc<Semaphore>,
+    gap: Arc<StdMutex<NotificationGap>>,
 }
 
-/// Bounded unsolicited control notifications. `recv` releases the queue's
-/// byte permit before handing ownership of the notification to its caller.
+#[derive(Default)]
+struct NotificationGap {
+    pending: bool,
+    epoch: u64,
+}
+
+/// Bounded unsolicited control notifications. `recv` releases a regular
+/// entry's item and byte permits before handing its notification to the
+/// caller. The single continuity marker owns neither permit.
 pub struct NotificationReceiver {
     rx: NotificationQueue,
 }
 
 enum NotificationQueue {
-    Budgeted(mpsc::Receiver<QueuedNotification>),
+    Budgeted {
+        rx: mpsc::Receiver<QueuedNotification>,
+        gap: Arc<StdMutex<NotificationGap>>,
+    },
     Direct(mpsc::Receiver<Notification>),
 }
 
 impl NotificationReceiver {
     pub async fn recv(&mut self) -> Option<Notification> {
         match &mut self.rx {
-            NotificationQueue::Budgeted(rx) => rx.recv().await.map(|queued| queued.notification),
+            NotificationQueue::Budgeted { rx, .. } => {
+                rx.recv().await.map(|queued| queued.notification)
+            }
             NotificationQueue::Direct(rx) => rx.recv().await,
         }
     }
 
     pub fn try_recv(&mut self) -> Result<Notification, mpsc::error::TryRecvError> {
         match &mut self.rx {
-            NotificationQueue::Budgeted(rx) => rx.try_recv().map(|queued| queued.notification),
+            NotificationQueue::Budgeted { rx, .. } => {
+                rx.try_recv().map(|queued| queued.notification)
+            }
             NotificationQueue::Direct(rx) => rx.try_recv(),
+        }
+    }
+
+    /// Stop the producer at the current stream segment. Used when a
+    /// downstream bounded hop loses continuity before this receiver does.
+    pub fn hold_continuity(&self) -> u64 {
+        if let NotificationQueue::Budgeted { gap, .. } = &self.rx {
+            let mut gap = gap.lock().expect("notification gap lock");
+            gap.pending = true;
+            gap.epoch
+        } else {
+            0
+        }
+    }
+
+    /// Discard the invalid suffix and let the producer begin a new segment
+    /// only after the consumer replaced all derived state.
+    pub fn resume_after_reconcile(&mut self, expected_epoch: u64) -> bool {
+        match &mut self.rx {
+            NotificationQueue::Budgeted { rx, gap } => {
+                let mut gap = gap.lock().expect("notification gap lock");
+                if gap.epoch != expected_epoch {
+                    return false;
+                }
+                while rx.try_recv().is_ok() {}
+                gap.pending = false;
+                true
+            }
+            NotificationQueue::Direct(rx) => {
+                while rx.try_recv().is_ok() {}
+                true
+            }
         }
     }
 
@@ -556,10 +646,13 @@ impl ControlClient {
             reply_slots: Arc::new(Semaphore::new(PENDING_REPLY_CAPACITY)),
             issued: Arc::new(AtomicU64::new(0)),
         };
-        let (notif_tx, notif_rx) = mpsc::channel(NOTIFICATION_CAPACITY);
+        let (notif_tx, notif_rx) = mpsc::channel(NOTIFICATION_CAPACITY + 1);
+        let gap = Arc::new(StdMutex::new(NotificationGap::default()));
         let notification_sink = NotificationSink {
             tx: notif_tx,
             bytes: Arc::new(Semaphore::new(NOTIFICATION_MAX_QUEUED_BYTES)),
+            items: Arc::new(Semaphore::new(NOTIFICATION_CAPACITY)),
+            gap: Arc::clone(&gap),
         };
         let reader = tokio::spawn(reader_task(stdout, pipe.clone(), notification_sink));
 
@@ -595,7 +688,7 @@ impl ControlClient {
         Ok((
             client,
             NotificationReceiver {
-                rx: NotificationQueue::Budgeted(notif_rx),
+                rx: NotificationQueue::Budgeted { rx: notif_rx, gap },
             },
         ))
     }
@@ -1087,7 +1180,7 @@ async fn reader_task(stdout: ChildStdout, pipe: CommandPipe, notif_tx: Notificat
                 if let Notification::Pause { pane } = &n {
                     debug!(%pane, "flow control paused pane, resuming");
                     let pane = pane.clone();
-                    if enqueue_notification(&notif_tx, n).await.exceeds_envelope() {
+                    if enqueue_notification(&notif_tx, n).exceeds_envelope() {
                         warn!(
                             bytes = NOTIFICATION_MAX_QUEUED_BYTES,
                             "tmux notification exceeded its queue envelope; reconnecting"
@@ -1115,7 +1208,7 @@ async fn reader_task(stdout: ChildStdout, pipe: CommandPipe, notif_tx: Notificat
                     debug!(line = %raw, "unrecognized control line");
                 }
                 // Consumer gone is fine; keep draining for command replies.
-                if enqueue_notification(&notif_tx, n).await.exceeds_envelope() {
+                if enqueue_notification(&notif_tx, n).exceeds_envelope() {
                     warn!(
                         bytes = NOTIFICATION_MAX_QUEUED_BYTES,
                         "tmux notification exceeded its queue envelope; reconnecting"
@@ -1150,7 +1243,6 @@ async fn reader_task(stdout: ChildStdout, pipe: CommandPipe, notif_tx: Notificat
                                 &notif_tx,
                                 Notification::Continue { pane: pane.clone() },
                             )
-                            .await
                             .exceeds_envelope()
                             {
                                 warn!(
@@ -1216,6 +1308,7 @@ async fn read_control_line<R: AsyncBufRead + Unpin>(
 enum EnqueueResult {
     Sent,
     ReceiverClosed,
+    GapRecorded,
     EnvelopeExceeded,
 }
 
@@ -1225,36 +1318,84 @@ impl EnqueueResult {
     }
 }
 
-/// Command callers may discard notifications while continuing to use the
-/// connection, so a closed receiver is harmless. A full receiver applies
-/// backpressure to preserve ordered state within fixed item and byte bounds.
-async fn enqueue_notification(tx: &NotificationSink, notification: Notification) -> EnqueueResult {
+/// Queue one notification without ever delaying correlated reply ingress.
+///
+/// The regular queue owns fixed item and byte permits. Its channel has one
+/// additional slot reserved for [`Notification::ContinuityLost`]. When
+/// either permit is unavailable, the first dropped notification places that
+/// marker after the retained prefix. Later notifications are dropped until
+/// the consumer confirms an authoritative reconciliation, so every
+/// discontinuity is explicit and coalesced without unbounded memory or a
+/// retry loop.
+fn enqueue_notification(tx: &NotificationSink, notification: Notification) -> EnqueueResult {
     let bytes = notification_retained_bytes(&notification).max(1);
     if bytes > NOTIFICATION_MAX_QUEUED_BYTES {
         return EnqueueResult::EnvelopeExceeded;
     }
+    let mut gap = tx.gap.lock().expect("notification gap lock");
+    if gap.pending {
+        gap.epoch = gap.epoch.wrapping_add(1);
+        return EnqueueResult::GapRecorded;
+    }
     let Ok(bytes) = u32::try_from(bytes) else {
         return EnqueueResult::EnvelopeExceeded;
     };
-    let permit = match Arc::clone(&tx.bytes).acquire_many_owned(bytes).await {
+    let item_permit = match Arc::clone(&tx.items).try_acquire_owned() {
         Ok(permit) => permit,
-        Err(_) => return EnqueueResult::ReceiverClosed,
+        Err(tokio::sync::TryAcquireError::NoPermits) => {
+            return record_notification_gap(tx, &mut gap);
+        }
+        Err(tokio::sync::TryAcquireError::Closed) => return EnqueueResult::ReceiverClosed,
     };
-    match tx
-        .tx
-        .send(QueuedNotification {
-            notification,
-            _permit: permit,
-        })
-        .await
-    {
+    let byte_permit = match Arc::clone(&tx.bytes).try_acquire_many_owned(bytes) {
+        Ok(permit) => permit,
+        Err(tokio::sync::TryAcquireError::NoPermits) => {
+            return record_notification_gap(tx, &mut gap);
+        }
+        Err(tokio::sync::TryAcquireError::Closed) => return EnqueueResult::ReceiverClosed,
+    };
+    match tx.tx.try_send(QueuedNotification {
+        notification,
+        _item_permit: Some(item_permit),
+        _byte_permit: Some(byte_permit),
+    }) {
         Ok(()) => EnqueueResult::Sent,
-        Err(_) => EnqueueResult::ReceiverClosed,
+        Err(mpsc::error::TrySendError::Closed(_)) => EnqueueResult::ReceiverClosed,
+        Err(mpsc::error::TrySendError::Full(_)) => record_notification_gap(tx, &mut gap),
+    }
+}
+
+fn record_notification_gap(tx: &NotificationSink, gap: &mut NotificationGap) -> EnqueueResult {
+    if gap.pending {
+        gap.epoch = gap.epoch.wrapping_add(1);
+        return EnqueueResult::GapRecorded;
+    }
+    gap.pending = true;
+    gap.epoch = gap.epoch.wrapping_add(1);
+    match tx.tx.try_send(QueuedNotification {
+        notification: Notification::ContinuityLost,
+        _item_permit: None,
+        _byte_permit: None,
+    }) {
+        Ok(()) => EnqueueResult::GapRecorded,
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            gap.pending = false;
+            EnqueueResult::ReceiverClosed
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            // Regular entries can consume only `NOTIFICATION_CAPACITY`
+            // slots, leaving one for this marker. Reaching this arm means
+            // the queue invariants were broken, so reconnect rather than
+            // continue after silent loss.
+            gap.pending = false;
+            EnqueueResult::EnvelopeExceeded
+        }
     }
 }
 
 fn notification_retained_bytes(notification: &Notification) -> usize {
     match notification {
+        Notification::ContinuityLost => 0,
         Notification::Output { pane, data } | Notification::ExtendedOutput { pane, data, .. } => {
             pane.len().saturating_add(data.len())
         }
@@ -1354,6 +1495,136 @@ mod tests {
                 issued: Arc::new(AtomicU64::new(0)),
             },
             child,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_close_before_the_first_command_byte_is_proven_unwritten() {
+        let mut child = Command::new("true")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn closed command sink");
+        let stdin = child.stdin.take().expect("closed sink stdin");
+        child.wait().await.expect("closed sink exits");
+        let pipe = CommandPipe {
+            stdin: Arc::new(Mutex::new(Some(stdin))),
+            pending: Arc::new(StdMutex::new(VecDeque::new())),
+            reply_slots: Arc::new(Semaphore::new(2)),
+            issued: Arc::new(AtomicU64::new(0)),
+        };
+
+        assert!(matches!(
+            pipe.submit("display-message -p not-sent").await,
+            Err(TmuxError::Io(_))
+        ));
+        assert!(matches!(
+            pipe.submit("display-message -p never-replay").await,
+            Err(TmuxError::Disconnected)
+        ));
+        assert!(pipe.pending.lock().expect("pending lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_partial_command_write_is_uncertain() {
+        struct PartialFailure(bool);
+
+        impl AsyncWrite for PartialFailure {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                bytes: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                if self.0 {
+                    std::task::Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "write failed after a prefix",
+                    )))
+                } else {
+                    self.0 = true;
+                    std::task::Poll::Ready(Ok(bytes.len().min(3)))
+                }
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        assert!(matches!(
+            write_command_line(
+                &mut PartialFailure(false),
+                b"display-message -p uncertain\n"
+            )
+            .await,
+            Err(CommandWriteError::Uncertain(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_flush_failure_is_observed_after_the_full_command_write() {
+        struct FlushFailure;
+
+        impl AsyncWrite for FlushFailure {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                bytes: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Ok(bytes.len()))
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "flush failed",
+                )))
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+
+        assert!(matches!(
+            write_command_line(&mut FlushFailure, b"display-message -p sent\n").await,
+            Err(CommandWriteError::Uncertain(error))
+                if error.kind() == std::io::ErrorKind::BrokenPipe
+        ));
+    }
+
+    fn notification_channel(
+        item_capacity: usize,
+        byte_capacity: usize,
+    ) -> (NotificationSink, NotificationReceiver) {
+        let (tx, rx) = mpsc::channel(item_capacity + 1);
+        let gap = Arc::new(StdMutex::new(NotificationGap::default()));
+        (
+            NotificationSink {
+                tx,
+                bytes: Arc::new(Semaphore::new(byte_capacity)),
+                items: Arc::new(Semaphore::new(item_capacity)),
+                gap: Arc::clone(&gap),
+            },
+            NotificationReceiver {
+                rx: NotificationQueue::Budgeted { rx, gap },
+            },
         )
     }
 
@@ -1489,29 +1760,106 @@ mod tests {
             reply_slots: Arc::new(Semaphore::new(PENDING_REPLY_CAPACITY)),
             issued: Arc::new(AtomicU64::new(0)),
         };
-        let (tx, mut rx) = mpsc::channel(4);
-        let sink = NotificationSink {
-            tx,
-            bytes: Arc::new(Semaphore::new(1024)),
-        };
+        let (sink, mut rx) = notification_channel(4, 1024);
 
         let reader = tokio::spawn(reader_task(stdout, pipe, sink));
         let pause = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .expect("pause arrives")
-            .expect("notification queue stays open")
-            .notification;
+            .expect("notification queue stays open");
         assert_eq!(pause, Notification::Pause { pane: "%5".into() });
         let resume = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .expect("correlated continue arrives")
-            .expect("notification queue stays open")
-            .notification;
+            .expect("notification queue stays open");
         assert_eq!(resume, Notification::Continue { pane: "%5".into() });
 
         reader.await.expect("reader task exits");
         let status = child.wait().await.expect("script exits");
         assert!(status.success(), "script rejected the resume command");
+    }
+
+    #[tokio::test]
+    async fn correlated_reply_passes_two_saturated_notification_hops() {
+        let script = r#"
+            IFS= read -r command
+            test "$command" = "display-message -p answer" || exit 42
+            index=0
+            while test "$index" -lt 12; do
+                printf '%s\n' '%sessions-changed'
+                index=$((index + 1))
+            done
+            printf '%s\n' '%begin 1 1 1' 'answer' '%end 1 1 1'
+            IFS= read -r hold
+        "#;
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn scripted control peer");
+        let stdin = child.stdin.take().expect("script stdin");
+        let stdout = child.stdout.take().expect("script stdout");
+        let pipe = CommandPipe {
+            stdin: Arc::new(Mutex::new(Some(stdin))),
+            pending: Arc::new(StdMutex::new(VecDeque::new())),
+            reply_slots: Arc::new(Semaphore::new(PENDING_REPLY_CAPACITY)),
+            issued: Arc::new(AtomicU64::new(0)),
+        };
+        let (sink, mut notifications) = notification_channel(2, 1024);
+        let reader = tokio::spawn(reader_task(stdout, pipe.clone(), sink));
+
+        // Model the workspace's second bounded hop. Its consumer is busy
+        // awaiting the command below, so the forwarder blocks after taking
+        // one item out of the control queue.
+        let (workspace_tx, mut workspace_rx) = mpsc::channel(1);
+        workspace_tx
+            .try_send(Notification::Other("occupied".into()))
+            .expect("fill workspace notification hop");
+        let forwarder = tokio::spawn(async move {
+            while let Some(notification) = notifications.recv().await {
+                if workspace_tx.send(notification).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let reply = pipe
+            .submit("display-message -p answer")
+            .await
+            .expect("command enters the bounded reply FIFO");
+        let answer = tokio::time::timeout(Duration::from_secs(1), reply)
+            .await
+            .expect("notification saturation must not delay the reply")
+            .expect("reply sender stays live")
+            .expect("script answers successfully");
+        assert_eq!(answer, vec!["answer".to_string()]);
+        assert!(
+            !reader.is_finished(),
+            "the healthy control connection must not reconnect to make progress"
+        );
+
+        assert!(matches!(
+            workspace_rx.recv().await,
+            Some(Notification::Other(value)) if value == "occupied"
+        ));
+        let mut retained_prefix = 0usize;
+        loop {
+            match workspace_rx.recv().await {
+                Some(Notification::SessionsChanged) => retained_prefix += 1,
+                Some(Notification::ContinuityLost) => break,
+                other => panic!("unexpected notification before continuity gap: {other:?}"),
+            }
+        }
+        assert!((1..=3).contains(&retained_prefix));
+
+        pipe.close().await;
+        reader
+            .await
+            .expect("reader task exits after explicit close");
+        forwarder.await.expect("notification forwarder exits");
+        child.wait().await.expect("script exits");
     }
 
     #[test]
@@ -1635,65 +1983,56 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn notification_backpressure_is_distinct_from_an_unused_receiver() {
-        let (tx, rx) = mpsc::channel(1);
-        let tx = NotificationSink {
-            tx,
-            bytes: Arc::new(Semaphore::new(NOTIFICATION_MAX_QUEUED_BYTES)),
-        };
-        let mut rx = NotificationReceiver {
-            rx: NotificationQueue::Budgeted(rx),
-        };
+    #[test]
+    fn notification_overflow_preserves_the_prefix_and_coalesces_one_gap() {
+        let (tx, mut rx) = notification_channel(1, NOTIFICATION_MAX_QUEUED_BYTES);
         assert_eq!(
-            enqueue_notification(&tx, Notification::SessionsChanged).await,
+            enqueue_notification(&tx, Notification::SessionsChanged),
             EnqueueResult::Sent
         );
-        let waiting_tx = tx.clone();
-        let mut waiting = tokio::spawn(async move {
+        assert_eq!(
             enqueue_notification(
-                &waiting_tx,
+                &tx,
                 Notification::WindowAdd {
                     window: "@1".into(),
                 },
-            )
-            .await
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
-                .await
-                .is_err(),
-            "a full notification queue must backpressure its producer"
+            ),
+            EnqueueResult::GapRecorded
+        );
+        assert_eq!(
+            enqueue_notification(
+                &tx,
+                Notification::WindowClose {
+                    window: "@2".into()
+                }
+            ),
+            EnqueueResult::GapRecorded,
+            "one gap covers the whole dropped segment"
         );
         assert!(matches!(rx.try_recv(), Ok(Notification::SessionsChanged)));
+        assert!(matches!(rx.try_recv(), Ok(Notification::ContinuityLost)));
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), waiting)
-                .await
-                .expect("notification producer wakes")
-                .expect("notification task completes"),
-            EnqueueResult::Sent
+            enqueue_notification(&tx, Notification::SessionsChanged),
+            EnqueueResult::GapRecorded,
+            "reading the marker alone cannot admit a new segment"
         );
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(Notification::WindowAdd { window }) if window == "@1"
-        ));
+        let epoch = rx.hold_continuity();
+        assert!(rx.resume_after_reconcile(epoch));
+        assert_eq!(
+            enqueue_notification(&tx, Notification::SessionsChanged),
+            EnqueueResult::Sent,
+            "authoritative reconciliation starts one new segment"
+        );
         drop(rx);
         assert_eq!(
-            enqueue_notification(&tx, Notification::SessionsChanged).await,
+            enqueue_notification(&tx, Notification::SessionsChanged),
             EnqueueResult::ReceiverClosed
         );
     }
 
-    #[tokio::test]
-    async fn notification_payload_budget_backpressures_independently_of_item_capacity() {
-        let (tx, rx) = mpsc::channel(2);
-        let tx = NotificationSink {
-            tx,
-            bytes: Arc::new(Semaphore::new(4)),
-        };
-        let mut rx = NotificationReceiver {
-            rx: NotificationQueue::Budgeted(rx),
-        };
+    #[test]
+    fn notification_payload_budget_records_a_gap_independently_of_item_capacity() {
+        let (tx, mut rx) = notification_channel(2, 4);
         assert_eq!(
             enqueue_notification(
                 &tx,
@@ -1701,42 +2040,56 @@ mod tests {
                     pane: "%0".into(),
                     data: b"ab".to_vec(),
                 },
-            )
-            .await,
+            ),
             EnqueueResult::Sent
         );
-        let waiting_tx = tx.clone();
-        let mut waiting = tokio::spawn(async move {
-            enqueue_notification(&waiting_tx, Notification::SessionsChanged).await
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
-                .await
-                .is_err(),
-            "the byte budget must backpressure before item capacity is full"
+        assert_eq!(
+            enqueue_notification(&tx, Notification::SessionsChanged),
+            EnqueueResult::GapRecorded,
+            "byte exhaustion records loss without waiting"
         );
         assert!(matches!(
             rx.try_recv(),
             Ok(Notification::Output { pane, data })
                 if pane == "%0" && data == b"ab"
         ));
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), waiting)
-                .await
-                .expect("byte-budget producer wakes")
-                .expect("notification task completes"),
-            EnqueueResult::Sent
-        );
-        assert!(matches!(rx.try_recv(), Ok(Notification::SessionsChanged)));
+        assert!(matches!(rx.try_recv(), Ok(Notification::ContinuityLost)));
     }
 
-    #[tokio::test]
-    async fn notification_larger_than_the_byte_envelope_is_refused() {
-        let (tx, _rx) = mpsc::channel(1);
-        let tx = NotificationSink {
-            tx,
-            bytes: Arc::new(Semaphore::new(NOTIFICATION_MAX_QUEUED_BYTES)),
-        };
+    #[test]
+    fn an_event_after_the_snapshot_refuses_the_continuity_cutover() {
+        let (tx, mut rx) = notification_channel(1, NOTIFICATION_MAX_QUEUED_BYTES);
+        assert_eq!(
+            enqueue_notification(&tx, Notification::SessionsChanged),
+            EnqueueResult::Sent
+        );
+        assert_eq!(
+            enqueue_notification(&tx, Notification::SessionsChanged),
+            EnqueueResult::GapRecorded
+        );
+        assert!(matches!(rx.try_recv(), Ok(Notification::SessionsChanged)));
+        assert!(matches!(rx.try_recv(), Ok(Notification::ContinuityLost)));
+
+        let snapshot_epoch = rx.hold_continuity();
+        assert_eq!(
+            enqueue_notification(
+                &tx,
+                Notification::Output {
+                    pane: "%0".into(),
+                    data: b"after capture".to_vec(),
+                },
+            ),
+            EnqueueResult::GapRecorded
+        );
+        assert!(
+            !rx.resume_after_reconcile(snapshot_epoch),
+            "an event after capture keeps the source barrier closed"
+        );
+    }
+
+    #[test]
+    fn notification_larger_than_the_byte_envelope_is_refused() {
+        let (tx, _rx) = notification_channel(1, NOTIFICATION_MAX_QUEUED_BYTES);
         assert_eq!(
             enqueue_notification(
                 &tx,
@@ -1744,8 +2097,7 @@ mod tests {
                     pane: "%0".into(),
                     data: vec![b'x'; NOTIFICATION_MAX_QUEUED_BYTES],
                 },
-            )
-            .await,
+            ),
             EnqueueResult::EnvelopeExceeded
         );
     }

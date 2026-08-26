@@ -235,10 +235,10 @@ async fn key_to_control_write_latency_during_output_flood() {
 /// debounce's own cadence (`RENDER_DEBOUNCE`, `src/cyclops-workspace/src/
 /// app.rs`), recording each drain's batch count and byte count. This is the
 /// bounded-queue-under-soak evidence for the recommendation's contract. The
-/// channel and its payload are bounded, and a full queue backpressures the
-/// control reader without disconnecting or losing ordered notifications.
-/// The producer emits an explicit end marker so a scheduler gap cannot be
-/// mistaken for completion.
+/// channel and its payload are bounded. A full queue preserves its prefix,
+/// reports one continuity gap, and resumes only after the consumer models an
+/// authoritative replacement. The producer emits an explicit end marker so
+/// a scheduler gap cannot be mistaken for completion.
 #[tokio::test]
 async fn sustained_output_backlog_drains_continuously() {
     let _serial = SERIAL.lock().await;
@@ -270,6 +270,7 @@ async fn sustained_output_backlog_drains_continuously() {
     let mut max_active_idle_streak = 0usize;
     let mut marker_window = Vec::with_capacity(END_MARKER.len() * 2);
     let mut producer_finished = false;
+    let mut continuity_gaps = 0usize;
     // Safety valve: ~24s of draining is far past what a 6MB flood on this
     // control connection should ever take, even on a loaded CI box.
     for _ in 0..3000 {
@@ -290,6 +291,11 @@ async fn sustained_output_backlog_drains_continuously() {
                         let discard = marker_window.len() - keep;
                         marker_window.drain(..discard);
                     }
+                }
+                Notification::ContinuityLost => {
+                    continuity_gaps += 1;
+                    let epoch = notif.hold_continuity();
+                    let _ = notif.resume_after_reconcile(epoch);
                 }
                 _ => {}
             }
@@ -313,7 +319,7 @@ async fn sustained_output_backlog_drains_continuously() {
     let peak_bytes = batch_bytes.iter().copied().max().unwrap_or(0);
     let nonzero_drains = batch_counts.iter().filter(|&&c| c > 0).count();
     println!(
-        "sustained_output_backlog: {} drains at {:?} cadence, {} carried data, peak_batch_count={peak_count} peak_batch_bytes={peak_bytes} total_bytes={total_bytes} max_active_idle_streak={max_active_idle_streak}",
+        "sustained_output_backlog: {} drains at {:?} cadence, {} carried data, peak_batch_count={peak_count} peak_batch_bytes={peak_bytes} total_bytes={total_bytes} max_active_idle_streak={max_active_idle_streak} continuity_gaps={continuity_gaps}",
         batch_counts.len(),
         DRAIN_CADENCE,
         nonzero_drains,

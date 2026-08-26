@@ -64,6 +64,10 @@ pub fn pane_input_not_sent(pane: &str, error: &dyn std::fmt::Display) -> String 
     format!("input was not sent to {pane}: {error}")
 }
 
+pub fn pane_input_uncertain(pane: &str, error: &dyn std::fmt::Display) -> String {
+    format!("input may have reached {pane}; it will not be replayed: {error}")
+}
+
 pub const STREAM_RECONCILED: &str = "stream rebuilt from the durable tail";
 
 // No space after the glyph: ☰ is ambiguous-width and most fonts already

@@ -8,12 +8,17 @@
 //! be valid UTF-8 on the wire (F22), and decoding must never turn a
 //! notification into an error.
 
-/// One parsed control-mode notification.
+/// One control-mode notification or adapter continuity event.
 ///
 /// Field shapes follow tmux 3.6a, verified live during M0. Ids keep their
 /// sigils: sessions `$0`, windows `@0`, panes `%0`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Notification {
+    /// The adapter dropped one or more notifications after its bounded
+    /// queue filled. This is synthetic, never parsed from tmux. Consumers
+    /// must replace derived state from an authoritative snapshot before
+    /// trusting later notifications as a contiguous stream.
+    ContinuityLost,
     /// Pane output. `data` is the raw byte stream after octal unescaping.
     Output {
         /// Pane id, e.g. "%3".

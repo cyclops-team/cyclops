@@ -36,7 +36,7 @@ use cyclops_tmux::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep_until, Duration, Instant};
 
 use crate::action;
@@ -127,10 +127,22 @@ enum AppMsg {
         attempt: dialog::ComposeAttempt,
         outcome: crate::daemon::SendOutcome,
     },
-    Input(KeyEvent),
-    Paste(String),
-    PasteTooLarge(usize),
-    Mouse(MouseEvent),
+    Input {
+        epoch: u64,
+        key: KeyEvent,
+    },
+    Paste {
+        epoch: u64,
+        text: String,
+    },
+    PasteTooLarge {
+        epoch: u64,
+        bytes: usize,
+    },
+    Mouse {
+        epoch: u64,
+        mouse: MouseEvent,
+    },
     /// The terminal's focus moved onto (`true`) or off (`false`) the
     /// workspace's tab. Drives the window background only: the theme's
     /// ground is painted onto the terminal while the workspace is looked
@@ -306,6 +318,56 @@ impl MessageDetailTask {
     }
 }
 
+impl AppMsg {
+    fn pane_input_epoch(&self) -> Option<u64> {
+        match self {
+            Self::Input { epoch, .. }
+            | Self::Paste { epoch, .. }
+            | Self::PasteTooLarge { epoch, .. }
+            | Self::Mouse { epoch, .. } => Some(*epoch),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PaneInputGate(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl PaneInputGate {
+    fn new() -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)))
+    }
+
+    fn stamp(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn close(&self) {
+        let _ = self.0.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |current| (current % 2 == 0).then_some(current.wrapping_add(1)),
+        );
+    }
+
+    fn open(&self) {
+        let _ = self.0.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |current| (current % 2 == 1).then_some(current.wrapping_add(1)),
+        );
+    }
+
+    fn accepts(&self, epoch: u64) -> bool {
+        let current = self.stamp();
+        current % 2 == 0 && epoch == current
+    }
+
+    fn is_closed(&self) -> bool {
+        self.stamp() % 2 == 1
+    }
+}
+
 /// Independent bounded lanes for work that enters the application from
 /// background tasks. Keeping the senders typed as one message vocabulary
 /// lets the handler stay the single owner of state transitions while the
@@ -314,6 +376,12 @@ impl MessageDetailTask {
 struct AppSinks {
     tmux: mpsc::Sender<AppMsg>,
     stream: mpsc::Sender<AppMsg>,
+    continuity: mpsc::Sender<ControlContinuityBarrier>,
+}
+
+struct ControlContinuityBarrier {
+    repair: oneshot::Sender<bool>,
+    cutover: oneshot::Receiver<bool>,
 }
 
 struct App {
@@ -516,6 +584,7 @@ fn arm(debounce: &mut Option<Instant>) {
 enum Wake {
     Message(Option<Box<AppMsg>>),
     InputCapacity(Result<InputCapacity, TmuxError>),
+    ControlContinuityLost(ControlContinuityBarrier),
     Deadline,
 }
 
@@ -532,6 +601,26 @@ type InputCapacityFuture =
 struct PendingPaneInput {
     pane: String,
     keys: Vec<String>,
+}
+
+/// Retire the pane-input prefix accepted before a continuity barrier. The
+/// action lane is separate and survives because it resolves against the new
+/// model after reconciliation.
+fn retire_pane_input_segment(
+    active_pane: &str,
+    pending: &mut Option<PendingPaneInput>,
+    input_rx: &mut mpsc::Receiver<AppMsg>,
+    paste_rx: &mut mpsc::Receiver<AppMsg>,
+) -> Option<String> {
+    let pending_pane = pending.take().map(|input| input.pane);
+    let mut dropped_suffix = false;
+    while input_rx.try_recv().is_ok() {
+        dropped_suffix = true;
+    }
+    while paste_rx.try_recv().is_ok() {
+        dropped_suffix = true;
+    }
+    pending_pane.or_else(|| dropped_suffix.then(|| active_pane.to_string()))
 }
 
 /// Wait for a message or the next armed deadline. The explicit due check is
@@ -680,6 +769,7 @@ async fn next_background_message(
 }
 
 async fn next_wake(
+    continuity_rx: &mut mpsc::Receiver<ControlContinuityBarrier>,
     input_rx: &mut mpsc::Receiver<AppMsg>,
     paste_rx: &mut mpsc::Receiver<AppMsg>,
     action_rx: &mut mpsc::Receiver<AppMsg>,
@@ -690,12 +780,20 @@ async fn next_wake(
     fairness: &mut IngressFairness,
     deadline: Option<Instant>,
 ) -> Wake {
+    if let Ok(ack) = continuity_rx.try_recv() {
+        return Wake::ControlContinuityLost(ack);
+    }
     if deadline.is_some_and(|at| at <= Instant::now()) {
         return Wake::Deadline;
     }
     let Some(deadline) = deadline else {
-        return Wake::message(
-            next_message(
+        return tokio::select! {
+            biased;
+            ack = continuity_rx.recv() => match ack {
+                Some(ack) => Wake::ControlContinuityLost(ack),
+                None => Wake::Message(None),
+            },
+            message = next_message(
                 input_rx,
                 paste_rx,
                 action_rx,
@@ -704,12 +802,15 @@ async fn next_wake(
                 stream_rx,
                 allow_stream,
                 fairness,
-            )
-            .await,
-        );
+            ) => Wake::message(message),
+        };
     };
     tokio::select! {
         biased;
+        ack = continuity_rx.recv() => match ack {
+            Some(ack) => Wake::ControlContinuityLost(ack),
+            None => Wake::Message(None),
+        },
         msg = next_message(
             input_rx,
             paste_rx,
@@ -730,6 +831,7 @@ async fn next_wake(
 /// the terminal. The same capacity future survives background wakes, so an
 /// output flood cannot repeatedly move it to the back of the semaphore queue.
 async fn next_pending_input_wake(
+    continuity_rx: &mut mpsc::Receiver<ControlContinuityBarrier>,
     capacity: &mut InputCapacityFuture,
     terminal_rx: &mut mpsc::Receiver<AppMsg>,
     tmux_rx: &mut mpsc::Receiver<AppMsg>,
@@ -738,6 +840,9 @@ async fn next_pending_input_wake(
     background_cursor: &mut usize,
     deadline: Option<Instant>,
 ) -> Wake {
+    if let Ok(ack) = continuity_rx.try_recv() {
+        return Wake::ControlContinuityLost(ack);
+    }
     if deadline.is_some_and(|at| at <= Instant::now()) {
         return Wake::Deadline;
     }
@@ -751,12 +856,20 @@ async fn next_pending_input_wake(
     let Some(deadline) = deadline else {
         return tokio::select! {
             biased;
+            ack = continuity_rx.recv() => match ack {
+                Some(ack) => Wake::ControlContinuityLost(ack),
+                None => Wake::Message(None),
+            },
             result = capacity.as_mut() => Wake::InputCapacity(result),
             message = background => Wake::message(message),
         };
     };
     tokio::select! {
         biased;
+        ack = continuity_rx.recv() => match ack {
+            Some(ack) => Wake::ControlContinuityLost(ack),
+            None => Wake::Message(None),
+        },
         result = capacity.as_mut() => Wake::InputCapacity(result),
         message = background => Wake::message(message),
         _ = sleep_until(deadline) => Wake::Deadline,
@@ -830,10 +943,13 @@ pub async fn run_async() -> i32 {
     let (terminal_tx, mut terminal_rx) = mpsc::channel::<AppMsg>(TERMINAL_CAPACITY);
     let (action_tx, mut action_rx) = mpsc::channel::<AppMsg>(ACTION_CAPACITY);
     let (tmux_tx, mut tmux_rx) = mpsc::channel::<AppMsg>(PAYLOAD_INGRESS_CAPACITY);
+    let (continuity_tx, mut continuity_rx) = mpsc::channel(1);
     let (stream_tx, mut stream_rx) = mpsc::channel::<AppMsg>(PAYLOAD_INGRESS_CAPACITY);
+    let pane_input_gate = PaneInputGate::new();
     let sinks = AppSinks {
         tmux: tmux_tx,
         stream: stream_tx,
+        continuity: continuity_tx,
     };
 
     let (send_request_tx, send_request_rx) =
@@ -943,31 +1059,43 @@ pub async fn run_async() -> i32 {
         }
     });
 
+    let terminal_input_gate = pane_input_gate.clone();
     std::thread::spawn(move || loop {
         match event::read() {
             Ok(Event::Key(k)) => {
                 if k.kind == KeyEventKind::Release {
                     continue;
                 }
-                if input_tx.blocking_send(AppMsg::Input(k)).is_err() {
+                let epoch = terminal_input_gate.stamp();
+                if input_tx
+                    .blocking_send(AppMsg::Input { epoch, key: k })
+                    .is_err()
+                {
                     break;
                 }
             }
             Ok(Event::Mouse(m)) => {
-                let sent = if matches!(m.kind, MouseEventKind::Moved) {
-                    input_tx.try_send(AppMsg::Mouse(m)).is_ok()
+                let epoch = terminal_input_gate.stamp();
+                let moved = matches!(m.kind, MouseEventKind::Moved);
+                let message = AppMsg::Mouse { epoch, mouse: m };
+                let sent = if moved {
+                    input_tx.try_send(message).is_ok()
                 } else {
-                    input_tx.blocking_send(AppMsg::Mouse(m)).is_ok()
+                    input_tx.blocking_send(message).is_ok()
                 };
                 if !sent && input_tx.is_closed() {
                     break;
                 }
             }
             Ok(Event::Paste(text)) => {
+                let epoch = terminal_input_gate.stamp();
                 let message = if text.len() > PASTE_MAX_BYTES {
-                    AppMsg::PasteTooLarge(text.len())
+                    AppMsg::PasteTooLarge {
+                        epoch,
+                        bytes: text.len(),
+                    }
                 } else {
-                    AppMsg::Paste(text)
+                    AppMsg::Paste { epoch, text }
                 };
                 if paste_tx.blocking_send(message).is_err() {
                     break;
@@ -986,7 +1114,7 @@ pub async fn run_async() -> i32 {
         }
     });
 
-    spawn_notif_forwarder(notif_rx, sinks.tmux.clone());
+    spawn_notif_forwarder(notif_rx, sinks.tmux.clone(), sinks.continuity.clone());
     spawn_decoration_forwarder(home.clone(), sinks.tmux.clone(), sinks.stream.clone());
 
     // Theme detection prints warnings; do it before the alternate screen
@@ -1199,6 +1327,8 @@ pub async fn run_async() -> i32 {
     let mut ingress_fairness = IngressFairness::default();
     let mut pending_input: Option<PendingPaneInput> = None;
     let mut input_capacity: Option<InputCapacityFuture> = None;
+    let mut pane_input_barrier_target: Option<String> = None;
+    let mut pane_input_notice_shown = false;
     // The animation clock (`crate::animate`) sits with the loop's other
     // deadlines rather than in `App`: nothing outside this loop and `draw`
     // reads it, and its wakeups are scheduled here the same one-shot way
@@ -1233,6 +1363,7 @@ pub async fn run_async() -> i32 {
         }
         let wake = if let Some(capacity) = input_capacity.as_mut() {
             next_pending_input_wake(
+                &mut continuity_rx,
                 capacity,
                 &mut terminal_rx,
                 &mut tmux_rx,
@@ -1244,6 +1375,7 @@ pub async fn run_async() -> i32 {
             .await
         } else {
             next_wake(
+                &mut continuity_rx,
                 &mut input_rx,
                 &mut paste_rx,
                 &mut action_rx,
@@ -1257,7 +1389,69 @@ pub async fn run_async() -> i32 {
             .await
         };
         match wake {
+            Wake::ControlContinuityLost(barrier) => {
+                pane_input_gate.close();
+                pane_input_notice_shown = false;
+                input_capacity = None;
+                let active_pane = app.model.active_tab().active_pane.clone();
+                pane_input_barrier_target = Some(active_pane.clone());
+                let before_repair = retire_pane_input_segment(
+                    &active_pane,
+                    &mut pending_input,
+                    &mut input_rx,
+                    &mut paste_rx,
+                );
+                while tmux_rx.try_recv().is_ok() {}
+                app.needs_forced_hydrate = true;
+                app.hit_map.clear();
+                let repair = reconcile(&mut app, &client).await;
+                let during_repair = retire_pane_input_segment(
+                    &active_pane,
+                    &mut pending_input,
+                    &mut input_rx,
+                    &mut paste_rx,
+                );
+                let repair = finish_control_cutover(repair, barrier).await;
+                let after_cutover = retire_pane_input_segment(
+                    &active_pane,
+                    &mut pending_input,
+                    &mut input_rx,
+                    &mut paste_rx,
+                );
+                if let Some(pane) = before_repair.or(during_repair).or(after_cutover) {
+                    show_pane_input_not_sent(
+                        &mut app,
+                        &pane,
+                        &TmuxError::Protocol("control stream continuity changed".into()),
+                        &mut debounce,
+                    );
+                    pane_input_notice_shown = true;
+                }
+                if repair.is_ok() {
+                    pane_input_gate.open();
+                }
+                settle_control_continuity_repair(&mut app, repair, &mut reconnect_deadline);
+                arm(&mut debounce);
+            }
             Wake::Message(msg) => {
+                if let Some(epoch) = msg.as_deref().and_then(AppMsg::pane_input_epoch) {
+                    if !pane_input_gate.accepts(epoch) {
+                        if !pane_input_notice_shown {
+                            let pane = pane_input_barrier_target
+                                .as_deref()
+                                .unwrap_or_else(|| app.model.active_tab().active_pane.as_str())
+                                .to_string();
+                            show_pane_input_not_sent(
+                                &mut app,
+                                &pane,
+                                &TmuxError::Protocol("control stream continuity changed".into()),
+                                &mut debounce,
+                            );
+                            pane_input_notice_shown = true;
+                        }
+                        continue;
+                    }
+                }
                 if !handle_app_msg(
                     msg.map(|message| *message),
                     &mut app,
@@ -1284,21 +1478,19 @@ pub async fn run_async() -> i32 {
                             .send_keys_unconfirmed_reserved(&pending.pane, &keys, capacity)
                             .await
                         {
-                            log_err(&app.home, &error);
-                            app.notice.show(
-                                copy::pane_input_not_sent(&pending.pane, &error),
-                                Instant::now(),
+                            let outcome =
+                                pane_input_outcome(pending.pane, pending.keys, Err(error));
+                            apply_pane_input_outcome(
+                                outcome,
+                                &mut app,
+                                &mut pending_input,
+                                &mut detached,
+                                &mut debounce,
                             );
-                            arm(&mut debounce);
                         }
                     }
                     Err(error) => {
-                        log_err(&app.home, &error);
-                        app.notice.show(
-                            copy::pane_input_not_sent(&pending.pane, &error),
-                            Instant::now(),
-                        );
-                        arm(&mut debounce);
+                        show_pane_input_not_sent(&mut app, &pending.pane, &error, &mut debounce);
                     }
                 }
             }
@@ -1374,7 +1566,7 @@ pub async fn run_async() -> i32 {
                 }
                 if reconnect_deadline.is_some_and(|deadline| deadline <= now) {
                     reconnect_deadline = None;
-                    let _ = handle_reconnect(
+                    let reconnected = handle_reconnect(
                         &mut app,
                         &mut client,
                         &control_cfg,
@@ -1382,6 +1574,33 @@ pub async fn run_async() -> i32 {
                         &mut reconnect_deadline,
                     )
                     .await;
+                    if reconnected.is_ok()
+                        && app.link_state == LinkState::Live
+                        && pane_input_gate.is_closed()
+                    {
+                        let target = pane_input_barrier_target
+                            .as_deref()
+                            .unwrap_or_else(|| app.model.active_tab().active_pane.as_str())
+                            .to_string();
+                        if retire_pane_input_segment(
+                            &target,
+                            &mut pending_input,
+                            &mut input_rx,
+                            &mut paste_rx,
+                        )
+                        .is_some()
+                            && !pane_input_notice_shown
+                        {
+                            show_pane_input_not_sent(
+                                &mut app,
+                                &target,
+                                &TmuxError::Protocol("control stream continuity changed".into()),
+                                &mut debounce,
+                            );
+                            pane_input_notice_shown = true;
+                        }
+                        pane_input_gate.open();
+                    }
                     // A fresh instant, not this wake's: reconnecting awaits
                     // the server, so `now` is stale by the time this frame
                     // is composed and the clock would date its fades to
@@ -1428,7 +1647,67 @@ fn refresh_theme_watch(app: &mut App, watch: &mut cyclops_theme::ThemeWatch) {
     }
 }
 
-fn spawn_notif_forwarder(mut rx: NotificationReceiver, tmux_tx: mpsc::Sender<AppMsg>) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ForwardOutcome {
+    Sent,
+    Reconciled,
+    Closed,
+}
+
+async fn reconcile_control_ingress(
+    rx: &mut NotificationReceiver,
+    continuity_tx: &mpsc::Sender<ControlContinuityBarrier>,
+) -> bool {
+    let epoch = rx.hold_continuity();
+    let (repair_tx, repair_rx) = oneshot::channel();
+    let (cutover_tx, cutover_rx) = oneshot::channel();
+    if continuity_tx
+        .send(ControlContinuityBarrier {
+            repair: repair_tx,
+            cutover: cutover_rx,
+        })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    match repair_rx.await {
+        Ok(true) => {
+            let complete = rx.resume_after_reconcile(epoch);
+            let _ = cutover_tx.send(complete);
+            complete
+        }
+        Ok(false) | Err(_) => {
+            let _ = cutover_tx.send(false);
+            false
+        }
+    }
+}
+
+async fn forward_notification_message(
+    rx: &mut NotificationReceiver,
+    tmux_tx: &mpsc::Sender<AppMsg>,
+    continuity_tx: &mpsc::Sender<ControlContinuityBarrier>,
+    message: AppMsg,
+) -> ForwardOutcome {
+    match tmux_tx.try_send(message) {
+        Ok(()) => ForwardOutcome::Sent,
+        Err(mpsc::error::TrySendError::Closed(_)) => ForwardOutcome::Closed,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            if reconcile_control_ingress(rx, continuity_tx).await {
+                ForwardOutcome::Reconciled
+            } else {
+                ForwardOutcome::Closed
+            }
+        }
+    }
+}
+
+fn spawn_notif_forwarder(
+    mut rx: NotificationReceiver,
+    tmux_tx: mpsc::Sender<AppMsg>,
+    continuity_tx: mpsc::Sender<ControlContinuityBarrier>,
+) {
     tokio::spawn(async move {
         let mut pending = None;
         loop {
@@ -1447,12 +1726,17 @@ fn spawn_notif_forwarder(mut rx: NotificationReceiver, tmux_tx: mpsc::Sender<App
                 | Notification::ExtendedOutput { pane, data, .. } => {
                     if data.len() > OUTPUT_BATCH_MAX_BYTES {
                         for chunk in data.chunks(OUTPUT_BATCH_MAX_BYTES) {
-                            if tmux_tx
-                                .send(AppMsg::OutputBatch(vec![(pane.clone(), chunk.to_vec())]))
-                                .await
-                                .is_err()
+                            match forward_notification_message(
+                                &mut rx,
+                                &tmux_tx,
+                                &continuity_tx,
+                                AppMsg::OutputBatch(vec![(pane.clone(), chunk.to_vec())]),
+                            )
+                            .await
                             {
-                                return;
+                                ForwardOutcome::Sent => {}
+                                ForwardOutcome::Reconciled => break,
+                                ForwardOutcome::Closed => return,
                             }
                         }
                         continue;
@@ -1478,58 +1762,74 @@ fn spawn_notif_forwarder(mut rx: NotificationReceiver, tmux_tx: mpsc::Sender<App
                             }
                         }
                     }
-                    if tmux_tx.send(AppMsg::OutputBatch(output)).await.is_err() {
-                        return;
+                    if matches!(&pending, Some(Notification::ContinuityLost)) {
+                        pending = None;
+                        if !reconcile_control_ingress(&mut rx, &continuity_tx).await {
+                            return;
+                        }
+                        continue;
+                    }
+                    match forward_notification_message(
+                        &mut rx,
+                        &tmux_tx,
+                        &continuity_tx,
+                        AppMsg::OutputBatch(output),
+                    )
+                    .await
+                    {
+                        ForwardOutcome::Sent | ForwardOutcome::Reconciled => {}
+                        ForwardOutcome::Closed => return,
                     }
                     continue;
                 }
                 other => other,
             };
-            match notification {
+            let message = match notification {
                 Notification::LayoutChange { window, rest } => {
                     let mut fields = rest.split_whitespace();
                     let layout = fields.next().unwrap_or("").to_string();
                     // rest is "layout visible-layout flags"; the flags field
                     // carries the zoom marker.
                     let flags = fields.nth(1).map(str::to_string);
-                    let _ = tmux_tx
-                        .send(AppMsg::LayoutChanged {
-                            window,
-                            layout,
-                            flags,
-                        })
-                        .await;
+                    Some(AppMsg::LayoutChanged {
+                        window,
+                        layout,
+                        flags,
+                    })
                 }
                 Notification::WindowPaneChanged { window, pane } => {
-                    let _ = tmux_tx
-                        .send(AppMsg::ActivePaneChanged { window, pane })
-                        .await;
+                    Some(AppMsg::ActivePaneChanged { window, pane })
                 }
                 Notification::SessionChanged { session, name } => {
-                    let _ = tmux_tx
-                        .send(AppMsg::SessionSwitched { session, name })
-                        .await;
+                    Some(AppMsg::SessionSwitched { session, name })
                 }
                 Notification::SessionRenamed { session, name } => {
-                    let _ = tmux_tx.send(AppMsg::SessionRenamed { session, name }).await;
+                    Some(AppMsg::SessionRenamed { session, name })
                 }
                 Notification::WindowAdd { .. }
                 | Notification::WindowClose { .. }
                 | Notification::WindowRenamed { .. }
-                | Notification::SessionsChanged => {
-                    let _ = tmux_tx.send(AppMsg::Reconcile).await;
+                | Notification::SessionsChanged => Some(AppMsg::Reconcile),
+                Notification::ContinuityLost => {
+                    if !reconcile_control_ingress(&mut rx, &continuity_tx).await {
+                        return;
+                    }
+                    None
                 }
-                Notification::Pause { pane } => {
-                    let _ = tmux_tx.send(AppMsg::PanePaused { pane }).await;
-                }
-                Notification::Continue { pane } => {
-                    let _ = tmux_tx.send(AppMsg::PaneContinued { pane }).await;
-                }
+                Notification::Pause { pane } => Some(AppMsg::PanePaused { pane }),
+                Notification::Continue { pane } => Some(AppMsg::PaneContinued { pane }),
                 Notification::Exit { .. } => {
                     let _ = tmux_tx.send(AppMsg::LinkLost).await;
                     break;
                 }
-                _ => {}
+                _ => None,
+            };
+            if let Some(message) = message {
+                match forward_notification_message(&mut rx, &tmux_tx, &continuity_tx, message).await
+                {
+                    ForwardOutcome::Sent | ForwardOutcome::Reconciled => {}
+                    ForwardOutcome::Closed => return,
+                }
             }
         }
     });
@@ -1995,6 +2295,51 @@ fn schedule_reconnect(app: &mut App, reconnect_deadline: &mut Option<Instant>) {
     *reconnect_deadline = Some(Instant::now() + delay);
 }
 
+fn settle_control_continuity_repair(
+    app: &mut App,
+    repair: Result<(), TmuxError>,
+    reconnect_deadline: &mut Option<Instant>,
+) -> bool {
+    match repair {
+        Ok(()) => {
+            app.needs_reconcile = false;
+            true
+        }
+        Err(error) => {
+            log_err(&app.home, &error);
+            app.needs_reconcile = true;
+            schedule_reconnect(app, reconnect_deadline);
+            false
+        }
+    }
+}
+
+async fn finish_control_cutover(
+    repair: Result<(), TmuxError>,
+    barrier: ControlContinuityBarrier,
+) -> Result<(), TmuxError> {
+    let snapshot_complete = repair.is_ok();
+    let cutover_complete = if barrier.repair.send(snapshot_complete).is_ok() {
+        barrier.cutover.await.unwrap_or(false)
+    } else {
+        false
+    };
+    match repair {
+        Err(error) => Err(error),
+        Ok(()) if cutover_complete => Ok(()),
+        Ok(()) => Err(TmuxError::Protocol(
+            "control events crossed the hydration cutover".into(),
+        )),
+    }
+}
+
+fn prepare_forced_hydration(app: &mut App) {
+    // Pause and Continue are stream edges, not snapshot fields. Once an
+    // edge was lost, no retained pause can be trusted. Forced capture
+    // rebuilds the display without that transient gate.
+    app.paused_panes.clear();
+}
+
 async fn handle_reconnect(
     app: &mut App,
     client: &mut ControlClient,
@@ -2007,14 +2352,18 @@ async fn handle_reconnect(
     match ControlClient::spawn(cfg).await {
         Ok((new_client, rx)) => {
             *client = new_client;
-            spawn_notif_forwarder(rx, sinks.tmux.clone());
+            spawn_notif_forwarder(rx, sinks.tmux.clone(), sinks.continuity.clone());
             app.declared_client_size = None;
             app.pinned_windows.clear();
             resize_client(app, client).await;
             // The gap this flag exists for: %output missed while the link
             // was down, with no size change to mark any pane stale.
             app.needs_forced_hydrate = true;
-            reconcile(app, client).await?;
+            if let Err(error) = reconcile(app, client).await {
+                app.reconnect_attempt += 1;
+                schedule_reconnect(app, reconnect_deadline);
+                return Err(error);
+            }
             app.link_state = LinkState::Live;
             app.reconnect_attempt = 0;
         }
@@ -2251,6 +2600,68 @@ enum InputOutcome {
     Redraw,
     NoRedraw,
     Pending(PendingPaneInput),
+    /// The first write failed before the event entered the pending-input
+    /// state. It carries target context for one visible notice, but no key
+    /// bytes, so reconnect cannot replay an event with an unknown outcome.
+    NotSent {
+        pane: String,
+        error: TmuxError,
+    },
+    /// The write began but did not complete. No key bytes are retained and
+    /// reconnect never replays them, but the notice does not claim that tmux
+    /// received nothing.
+    Uncertain {
+        pane: String,
+        error: TmuxError,
+    },
+}
+
+fn show_pane_input_not_sent(
+    app: &mut App,
+    pane: &str,
+    error: &TmuxError,
+    debounce: &mut Option<Instant>,
+) {
+    log_err(&app.home, error);
+    app.notice
+        .show(copy::pane_input_not_sent(pane, error), Instant::now());
+    arm(debounce);
+}
+
+fn show_pane_input_uncertain(
+    app: &mut App,
+    pane: &str,
+    error: &TmuxError,
+    debounce: &mut Option<Instant>,
+) {
+    log_err(&app.home, error);
+    app.notice
+        .show(copy::pane_input_uncertain(pane, error), Instant::now());
+    arm(debounce);
+}
+
+fn apply_pane_input_outcome(
+    outcome: InputOutcome,
+    app: &mut App,
+    pending_input: &mut Option<PendingPaneInput>,
+    detached: &mut bool,
+    debounce: &mut Option<Instant>,
+) {
+    match outcome {
+        InputOutcome::Detached => *detached = true,
+        InputOutcome::Redraw => arm(debounce),
+        InputOutcome::NoRedraw => {}
+        InputOutcome::Pending(pending) => {
+            debug_assert!(pending_input.is_none());
+            *pending_input = Some(pending);
+        }
+        InputOutcome::NotSent { pane, error } => {
+            show_pane_input_not_sent(app, &pane, &error, debounce);
+        }
+        InputOutcome::Uncertain { pane, error } => {
+            show_pane_input_uncertain(app, &pane, &error, debounce);
+        }
+    }
 }
 
 /// The smallest grid worth declaring to tmux. Below this the terminal is
@@ -2945,7 +3356,7 @@ async fn handle_app_msg(
             finish_messages_send(app, attempt, outcome);
             arm(debounce);
         }
-        AppMsg::Mouse(mouse) => {
+        AppMsg::Mouse { mouse, .. } => {
             // Bare motion only matters while a menu or dialog shows hover
             // highlights — or over the sidebar's create button, the one
             // piece of resting chrome that answers the mouse. Everywhere
@@ -2972,12 +3383,12 @@ async fn handle_app_msg(
             }
             arm(debounce);
         }
-        AppMsg::PasteTooLarge(bytes) => {
+        AppMsg::PasteTooLarge { bytes, .. } => {
             app.notice
                 .show(copy::paste_too_large(bytes), Instant::now());
             arm(debounce);
         }
-        AppMsg::Paste(text) => {
+        AppMsg::Paste { text, .. } => {
             if app.link_state == LinkState::ServerGone {
                 return true;
             }
@@ -3003,7 +3414,7 @@ async fn handle_app_msg(
                 log_err(&app.home, &e);
             }
         }
-        AppMsg::Input(key) => {
+        AppMsg::Input { key, .. } => {
             if app.link_state == LinkState::ServerGone {
                 return true;
             }
@@ -3026,12 +3437,8 @@ async fn handle_app_msg(
                 return true;
             }
             match handle_key(app, client, key).await {
-                Ok(InputOutcome::Detached) => *detached = true,
-                Ok(InputOutcome::Redraw) => arm(debounce),
-                Ok(InputOutcome::NoRedraw) => {}
-                Ok(InputOutcome::Pending(pending)) => {
-                    debug_assert!(pending_input.is_none());
-                    *pending_input = Some(pending);
+                Ok(outcome) => {
+                    apply_pane_input_outcome(outcome, app, pending_input, detached, debounce)
                 }
                 Err(e) => log_err(&app.home, &e),
             }
@@ -4761,8 +5168,9 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
     // forced hydrate there would snap scrolled viewports to the tail once
     // a second.
     if std::mem::take(&mut app.needs_forced_hydrate) {
+        prepare_forced_hydration(app);
         crate::sync::hydrate_visible_tab_forced(client, app.model.active_tab(), &mut app.runtimes)
-            .await;
+            .await?;
     } else {
         hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await;
     }
@@ -4874,12 +5282,22 @@ async fn forward_pane_input(
     client: &ControlClient,
     pane: String,
     keys: Vec<String>,
-) -> Result<InputOutcome, TmuxError> {
+) -> InputOutcome {
     let borrowed: Vec<&str> = keys.iter().map(String::as_str).collect();
-    match client.send_keys_unconfirmed(&pane, &borrowed).await {
-        Ok(()) => Ok(InputOutcome::NoRedraw),
-        Err(TmuxError::Busy) => Ok(InputOutcome::Pending(PendingPaneInput { pane, keys })),
-        Err(error) => Err(error),
+    let result = client.send_keys_unconfirmed(&pane, &borrowed).await;
+    pane_input_outcome(pane, keys, result)
+}
+
+fn pane_input_outcome(
+    pane: String,
+    keys: Vec<String>,
+    result: Result<(), TmuxError>,
+) -> InputOutcome {
+    match result {
+        Ok(()) => InputOutcome::NoRedraw,
+        Err(TmuxError::Busy) => InputOutcome::Pending(PendingPaneInput { pane, keys }),
+        Err(error @ TmuxError::WriteUncertain(_)) => InputOutcome::Uncertain { pane, error },
+        Err(error) => InputOutcome::NotSent { pane, error },
     }
 }
 
@@ -4955,18 +5373,18 @@ async fn handle_key(
                 crate::input::SelectAllOutcome::ClearLine => {
                     // Cursor to end first, so kill-to-start takes the
                     // whole line no matter where the cursor sat.
-                    return forward_pane_input(
+                    return Ok(forward_pane_input(
                         client,
                         pane,
                         vec!["C-e".to_string(), "C-u".to_string()],
                     )
-                    .await;
+                    .await);
                 }
                 crate::input::SelectAllOutcome::Forward => {}
             }
             let encoded = encode_send_keys(&key);
             if !encoded.is_empty() {
-                return forward_pane_input(client, pane, encoded).await;
+                return Ok(forward_pane_input(client, pane, encoded).await);
             }
             Ok(InputOutcome::NoRedraw)
         }
@@ -5872,6 +6290,7 @@ mod tests {
         let (_terminal_tx, mut terminal_rx) = mpsc::channel(4);
         let (_tmux_tx, mut tmux_rx) = mpsc::channel(4);
         let (_stream_tx, mut stream_rx) = mpsc::channel(4);
+        let (_continuity_tx, mut continuity_rx) = mpsc::channel(1);
         let mut fairness = IngressFairness::default();
         input_tx
             .send(AppMsg::Redraw)
@@ -5881,6 +6300,7 @@ mod tests {
 
         assert!(matches!(
             next_wake(
+                &mut continuity_rx,
                 &mut input_rx,
                 &mut paste_rx,
                 &mut action_rx,
@@ -5897,6 +6317,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_control_gap_preempts_ready_user_input() {
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let (_paste_tx, mut paste_rx) = mpsc::channel(1);
+        let (_action_tx, mut action_rx) = mpsc::channel(1);
+        let (_terminal_tx, mut terminal_rx) = mpsc::channel(1);
+        let (_tmux_tx, mut tmux_rx) = mpsc::channel(1);
+        let (_stream_tx, mut stream_rx) = mpsc::channel(1);
+        let (continuity_tx, mut continuity_rx) = mpsc::channel(1);
+        let mut fairness = IngressFairness::default();
+        input_tx.try_send(AppMsg::Redraw).expect("input is ready");
+        let (repair, _repair_done) = oneshot::channel();
+        let (_cutover_done, cutover) = oneshot::channel();
+        assert!(
+            continuity_tx
+                .try_send(ControlContinuityBarrier { repair, cutover })
+                .is_ok(),
+            "continuity barrier is ready"
+        );
+
+        assert!(matches!(
+            next_wake(
+                &mut continuity_rx,
+                &mut input_rx,
+                &mut paste_rx,
+                &mut action_rx,
+                &mut terminal_rx,
+                &mut tmux_rx,
+                &mut stream_rx,
+                true,
+                &mut fairness,
+                None,
+            )
+            .await,
+            Wake::ControlContinuityLost(_)
+        ));
+        assert!(matches!(input_rx.try_recv(), Ok(AppMsg::Redraw)));
+    }
+
+    #[test]
+    fn a_failed_forced_hydrate_keeps_the_app_barrier_closed() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-continuity-hydrate");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create scratch home");
+        let mut app = test_app(one_pane_model(), home.clone());
+        app.paused_panes.insert("%0".to_string());
+
+        // The Continue edge was in the dropped suffix. Preparing the
+        // authoritative capture must not preserve its earlier Pause.
+        prepare_forced_hydration(&mut app);
+        assert!(app.paused_panes.is_empty());
+
+        let mut reconnect_deadline = None;
+        let acknowledged = settle_control_continuity_repair(
+            &mut app,
+            Err(TmuxError::Protocol("forced pane capture failed".into())),
+            &mut reconnect_deadline,
+        );
+        assert!(
+            !acknowledged,
+            "an incomplete capture cannot open the barrier"
+        );
+        assert!(app.needs_reconcile);
+        assert!(matches!(
+            app.link_state,
+            LinkState::Reconnecting { attempt: 0 }
+        ));
+        assert!(reconnect_deadline.is_some());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn an_event_after_capture_keeps_the_app_barrier_closed() {
+        let (repair, repair_rx) = oneshot::channel();
+        let (cutover_tx, cutover) = oneshot::channel();
+        let source = tokio::spawn(async move {
+            assert!(repair_rx.await.expect("app reports snapshot result"));
+            cutover_tx
+                .send(false)
+                .expect("event after capture rejects cutover");
+        });
+
+        let result =
+            finish_control_cutover(Ok(()), ControlContinuityBarrier { repair, cutover }).await;
+        assert!(
+            matches!(result, Err(TmuxError::Protocol(message)) if message.contains("cutover")),
+            "snapshot success alone cannot acknowledge continuity"
+        );
+        source.await.expect("source cutover task exits");
+    }
+
+    #[tokio::test]
+    async fn input_arriving_during_cutover_wait_keeps_the_closed_epoch() {
+        let gate = PaneInputGate::new();
+        gate.close();
+        let source_gate = gate.clone();
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let (repair, repair_rx) = oneshot::channel();
+        let (cutover_tx, cutover) = oneshot::channel();
+        let source = tokio::spawn(async move {
+            assert!(repair_rx.await.expect("app reports snapshot result"));
+            input_tx
+                .send(AppMsg::Input {
+                    epoch: source_gate.stamp(),
+                    key: KeyEvent::new(crossterm::event::KeyCode::Char('x'), KeyModifiers::empty()),
+                })
+                .await
+                .expect("input arrives before source cutover");
+            cutover_tx.send(true).expect("source completes cutover");
+        });
+
+        finish_control_cutover(Ok(()), ControlContinuityBarrier { repair, cutover })
+            .await
+            .expect("snapshot and source cutover both succeed");
+        gate.open();
+        let input = input_rx.try_recv().expect("cutover input was queued");
+        assert!(
+            !gate.accepts(input.pane_input_epoch().expect("pane input epoch")),
+            "input accepted during repair cannot target the reconciled model"
+        );
+        source.await.expect("source cutover task exits");
+    }
+
+    #[tokio::test]
     async fn pending_pane_input_drains_background_without_consuming_later_actions() {
         let (input_tx, mut input_rx) = mpsc::channel(4);
         let (paste_tx, mut paste_rx) = mpsc::channel(1);
@@ -5904,25 +6447,32 @@ mod tests {
         let (terminal_tx, mut terminal_rx) = mpsc::channel(4);
         let (tmux_tx, mut tmux_rx) = mpsc::channel(4);
         let (stream_tx, mut stream_rx) = mpsc::channel(4);
+        let (_continuity_tx, mut continuity_rx) = mpsc::channel(1);
         let mut background_cursor = 0;
         let mut capacity: InputCapacityFuture = Box::pin(std::future::pending());
 
         input_tx
-            .try_send(AppMsg::Input(KeyEvent::new(
-                crossterm::event::KeyCode::Char('b'),
-                KeyModifiers::empty(),
-            )))
+            .try_send(AppMsg::Input {
+                epoch: 0,
+                key: KeyEvent::new(crossterm::event::KeyCode::Char('b'), KeyModifiers::empty()),
+            })
             .expect("input lane accepts a later key");
         input_tx
-            .try_send(AppMsg::Mouse(MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: 1,
-                row: 1,
-                modifiers: KeyModifiers::empty(),
-            }))
+            .try_send(AppMsg::Mouse {
+                epoch: 0,
+                mouse: MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 1,
+                    row: 1,
+                    modifiers: KeyModifiers::empty(),
+                },
+            })
             .expect("input lane accepts a later mouse action");
         paste_tx
-            .try_send(AppMsg::Paste("later paste".to_string()))
+            .try_send(AppMsg::Paste {
+                epoch: 0,
+                text: "later paste".to_string(),
+            })
             .expect("paste lane accepts later text");
         action_tx
             .try_send(AppMsg::ThemeChanged)
@@ -5939,6 +6489,7 @@ mod tests {
 
         for expected in ["focus", "tmux", "stream"] {
             let wake = next_pending_input_wake(
+                &mut continuity_rx,
                 &mut capacity,
                 &mut terminal_rx,
                 &mut tmux_rx,
@@ -5958,10 +6509,74 @@ mod tests {
                 _ => panic!("pending input drained background lanes out of order"),
             }
         }
-        assert!(matches!(input_rx.try_recv(), Ok(AppMsg::Input(_))));
-        assert!(matches!(input_rx.try_recv(), Ok(AppMsg::Mouse(_))));
-        assert!(matches!(paste_rx.try_recv(), Ok(AppMsg::Paste(_))));
+        assert!(matches!(input_rx.try_recv(), Ok(AppMsg::Input { .. })));
+        assert!(matches!(input_rx.try_recv(), Ok(AppMsg::Mouse { .. })));
+        assert!(matches!(paste_rx.try_recv(), Ok(AppMsg::Paste { .. })));
         assert!(matches!(action_rx.try_recv(), Ok(AppMsg::ThemeChanged)));
+    }
+
+    #[tokio::test]
+    async fn a_control_gap_retires_the_whole_pre_reconcile_input_segment() {
+        let (input_tx, mut input_rx) = mpsc::channel(4);
+        let (paste_tx, mut paste_rx) = mpsc::channel(1);
+        let mut pending = Some(PendingPaneInput {
+            pane: "%7".to_string(),
+            keys: vec!["a".to_string()],
+        });
+        for key in ['b', 'c'] {
+            input_tx
+                .try_send(AppMsg::Input {
+                    epoch: 0,
+                    key: KeyEvent::new(crossterm::event::KeyCode::Char(key), KeyModifiers::empty()),
+                })
+                .expect("later key queues behind held input");
+        }
+        paste_tx
+            .try_send(AppMsg::Paste {
+                epoch: 0,
+                text: "later paste".to_string(),
+            })
+            .expect("later paste queues behind held input");
+
+        assert_eq!(
+            retire_pane_input_segment("%9", &mut pending, &mut input_rx, &mut paste_rx),
+            Some("%7".to_string()),
+            "one notice names the target of the first held batch"
+        );
+        assert!(pending.is_none());
+        assert!(input_rx.try_recv().is_err(), "queued keys are retired");
+        assert!(paste_rx.try_recv().is_err(), "queued paste is retired");
+    }
+
+    #[tokio::test]
+    async fn input_arriving_during_repair_is_quarantined_before_cutover() {
+        let (input_tx, mut input_rx) = mpsc::channel(2);
+        let (paste_tx, mut paste_rx) = mpsc::channel(1);
+        let mut pending = None;
+        assert!(
+            retire_pane_input_segment("%3", &mut pending, &mut input_rx, &mut paste_rx).is_none(),
+            "the prefix starts empty"
+        );
+
+        input_tx
+            .try_send(AppMsg::Input {
+                epoch: 0,
+                key: KeyEvent::new(crossterm::event::KeyCode::Char('x'), KeyModifiers::empty()),
+            })
+            .expect("key arrives while capture is awaited");
+        paste_tx
+            .try_send(AppMsg::Paste {
+                epoch: 0,
+                text: "during repair".to_string(),
+            })
+            .expect("paste arrives while capture is awaited");
+
+        assert_eq!(
+            retire_pane_input_segment("%3", &mut pending, &mut input_rx, &mut paste_rx),
+            Some("%3".to_string())
+        );
+        assert!(input_rx.try_recv().is_err());
+        assert!(paste_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -5969,6 +6584,7 @@ mod tests {
         let (_terminal_tx, mut terminal_rx) = mpsc::channel(4);
         let (tmux_tx, mut tmux_rx) = mpsc::channel(4);
         let (_stream_tx, mut stream_rx) = mpsc::channel(4);
+        let (_continuity_tx, mut continuity_rx) = mpsc::channel(1);
         let mut background_cursor = 0;
         let mut capacity: InputCapacityFuture = Box::pin(async { Err(TmuxError::Disconnected) });
         tmux_tx
@@ -5977,6 +6593,7 @@ mod tests {
 
         assert!(matches!(
             next_pending_input_wake(
+                &mut continuity_rx,
                 &mut capacity,
                 &mut terminal_rx,
                 &mut tmux_rx,
@@ -5999,6 +6616,82 @@ mod tests {
         };
         assert_eq!(held.pane, "%7");
         assert_eq!(held.keys, ["C-e", "C-u"]);
+    }
+
+    #[test]
+    fn a_close_before_the_first_write_is_visible_and_never_replayable() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-input-disconnected");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create scratch home");
+        let mut app = test_app(one_pane_model(), home.clone());
+        let mut pending = None;
+        let mut detached = false;
+        let mut debounce = None;
+
+        let outcome = pane_input_outcome(
+            "%7".to_string(),
+            vec!["CYCLOPS_INPUT_MUST_NOT_REPLAY".to_string()],
+            Err(TmuxError::Disconnected),
+        );
+        apply_pane_input_outcome(
+            outcome,
+            &mut app,
+            &mut pending,
+            &mut detached,
+            &mut debounce,
+        );
+
+        assert_eq!(
+            app.notice.text(),
+            Some("input was not sent to %7: tmux control connection closed")
+        );
+        assert!(debounce.is_some(), "the visible notice earns one frame");
+        assert!(pending.is_none(), "failed key bytes are not retained");
+        assert!(!detached);
+
+        // A later link-loss event only inspects PendingPaneInput. Since the
+        // initial failure stores no key bytes there, reconnect has nothing
+        // it can replay and cannot produce a second target notice.
+        assert!(pending.take().is_none());
+        assert_eq!(
+            app.notice.text(),
+            Some("input was not sent to %7: tmux control connection closed")
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_write_failure_is_uncertain_visible_and_never_replayable() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-input-uncertain");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create scratch home");
+        let mut app = test_app(one_pane_model(), home.clone());
+        let mut pending = None;
+        let mut detached = false;
+        let mut debounce = None;
+        let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "flush failed");
+
+        let outcome = pane_input_outcome(
+            "%7".to_string(),
+            vec!["CYCLOPS_INPUT_MAY_HAVE_LANDED".to_string()],
+            Err(TmuxError::WriteUncertain(error)),
+        );
+        apply_pane_input_outcome(
+            outcome,
+            &mut app,
+            &mut pending,
+            &mut detached,
+            &mut debounce,
+        );
+
+        let notice = app.notice.text().expect("uncertain write is visible");
+        assert!(notice.contains("input may have reached %7"));
+        assert!(notice.contains("will not be replayed"));
+        assert!(!notice.contains("input was not sent"));
+        assert!(pending.is_none(), "uncertain key bytes are not retained");
+        assert!(debounce.is_some());
+        assert!(!detached);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[tokio::test]
@@ -6997,7 +7690,12 @@ mod tests {
     async fn oversized_output_is_split_without_changing_its_bytes() {
         let (notification_tx, notification_rx) = mpsc::channel(1);
         let (tmux_tx, mut tmux_rx) = mpsc::channel(3);
-        spawn_notif_forwarder(NotificationReceiver::from_bounded(notification_rx), tmux_tx);
+        let (continuity_tx, _continuity_rx) = mpsc::channel(1);
+        spawn_notif_forwarder(
+            NotificationReceiver::from_bounded(notification_rx),
+            tmux_tx,
+            continuity_tx,
+        );
 
         let bytes = vec![b'x'; OUTPUT_BATCH_MAX_BYTES + 17];
         notification_tx
@@ -7026,17 +7724,98 @@ mod tests {
     async fn a_closed_notification_stream_requests_reconnect() {
         let (notification_tx, notification_rx) = mpsc::channel(1);
         let (tmux_tx, mut tmux_rx) = mpsc::channel(1);
-        spawn_notif_forwarder(NotificationReceiver::from_bounded(notification_rx), tmux_tx);
+        let (continuity_tx, _continuity_rx) = mpsc::channel(1);
+        spawn_notif_forwarder(
+            NotificationReceiver::from_bounded(notification_rx),
+            tmux_tx,
+            continuity_tx,
+        );
 
         drop(notification_tx);
         assert!(matches!(tmux_rx.recv().await, Some(AppMsg::LinkLost)));
     }
 
     #[tokio::test]
+    async fn a_control_gap_blocks_the_suffix_until_authoritative_resync() {
+        let (notification_tx, notification_rx) = mpsc::channel(2);
+        let (tmux_tx, mut tmux_rx) = mpsc::channel(1);
+        let (continuity_tx, mut continuity_rx) = mpsc::channel(1);
+        spawn_notif_forwarder(
+            NotificationReceiver::from_bounded(notification_rx),
+            tmux_tx,
+            continuity_tx,
+        );
+
+        notification_tx
+            .send(Notification::ContinuityLost)
+            .await
+            .expect("notification channel stays open");
+        notification_tx
+            .send(Notification::Output {
+                pane: "%0".into(),
+                data: b"stale suffix".to_vec(),
+            })
+            .await
+            .expect("suffix queues behind the marker");
+
+        let barrier = continuity_rx.recv().await.expect("barrier reaches app");
+        assert!(
+            tmux_rx.try_recv().is_err(),
+            "barrier bypasses ordinary lane"
+        );
+        barrier
+            .repair
+            .send(true)
+            .expect("app confirms authoritative snapshot");
+        assert!(
+            barrier.cutover.await.expect("source answers cutover"),
+            "no event crossed the snapshot boundary"
+        );
+        tokio::task::yield_now().await;
+        assert!(tmux_rx.try_recv().is_err(), "stale suffix is discarded");
+    }
+
+    #[tokio::test]
+    async fn a_full_app_hop_raises_the_same_priority_barrier() {
+        let (notification_tx, notification_rx) = mpsc::channel(1);
+        let (tmux_tx, mut tmux_rx) = mpsc::channel(1);
+        tmux_tx
+            .try_send(AppMsg::Redraw)
+            .expect("fill the ordinary app hop");
+        let (continuity_tx, mut continuity_rx) = mpsc::channel(1);
+        spawn_notif_forwarder(
+            NotificationReceiver::from_bounded(notification_rx),
+            tmux_tx,
+            continuity_tx,
+        );
+        notification_tx
+            .send(Notification::SessionsChanged)
+            .await
+            .expect("control notification enters its own hop");
+
+        let barrier = continuity_rx
+            .recv()
+            .await
+            .expect("second-hop loss bypasses the saturated lane");
+        assert!(matches!(tmux_rx.try_recv(), Ok(AppMsg::Redraw)));
+        assert!(tmux_rx.try_recv().is_err());
+        barrier
+            .repair
+            .send(true)
+            .expect("app confirms authoritative snapshot");
+        assert!(barrier.cutover.await.expect("source answers cutover"));
+    }
+
+    #[tokio::test]
     async fn structural_notifications_do_not_overtake_pane_output() {
         let (notification_tx, notification_rx) = mpsc::channel(3);
         let (tmux_tx, mut tmux_rx) = mpsc::channel(4);
-        spawn_notif_forwarder(NotificationReceiver::from_bounded(notification_rx), tmux_tx);
+        let (continuity_tx, _continuity_rx) = mpsc::channel(1);
+        spawn_notif_forwarder(
+            NotificationReceiver::from_bounded(notification_rx),
+            tmux_tx,
+            continuity_tx,
+        );
         notification_tx
             .send(Notification::Output {
                 pane: "%0".into(),

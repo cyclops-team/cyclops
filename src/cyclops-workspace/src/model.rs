@@ -36,6 +36,10 @@ impl RuntimeRegistry {
         self.runtimes.insert(pane_id, runtime);
     }
 
+    pub fn remove(&mut self, pane_id: &str) {
+        self.runtimes.remove(pane_id);
+    }
+
     pub fn retain_visible(&mut self, visible: &[String]) {
         self.runtimes
             .retain(|id, _| visible.iter().any(|v| v == id));
