@@ -1,0 +1,15 @@
+# Nextest configuration for Cyclops CI
+# Defines execution profiles and slow-timeout behavior to prevent hung test stalls.
+
+[profile.default]
+# When a test runs longer than period, nextest reports a slow test warning.
+# After terminate-after periods (180s total), nextest terminates the hung test
+# process and names it with full failure diagnostics instead of stalling the runner.
+slow-timeout = { period = "60s", terminate-after = 3 }
+retries = 0
+fail-fast = false
+
+[profile.ci]
+slow-timeout = { period = "60s", terminate-after = 3 }
+retries = 0
+fail-fast = false
