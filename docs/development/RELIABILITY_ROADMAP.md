@@ -333,6 +333,12 @@ An earlier focused pass does not substitute for the frozen run.
 - Candidate binaries prove version identity and journal replay before install.
 - Installation replaces the CLI and daemon as one recoverable pair and retains
   one known-good pair.
+- The selected-pair record binds content-free install-time replay evidence to
+  the exact client and daemon hashes. Health reports that historical evidence
+  separately from current replay readiness.
+- The updater lease excludes concurrent mutation. Process-crash recovery at
+  each filesystem commit boundary removes only validated residue and never
+  exposes a split client and daemon pair.
 - Cleanup is dry-run by default, accepts asset classes rather than arbitrary
   paths, revalidates every target, never touches durable journals, and records
   each executed cleanup as one append-only content-free state fact.

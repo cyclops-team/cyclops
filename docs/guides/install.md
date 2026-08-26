@@ -482,8 +482,12 @@ the authenticated running daemon, same-user daemon process inventory, durable
 workspace and session mappings, configured and detached sessions, duplicate
 watcher slots, setup files, state permissions, caches, logs, and rollback
 proof. JSON callers receive the same facts under `operational` and `rollback`.
-An `unproven` replay result is not rollback approval. It means the installed
-selection record does not carry durable replay evidence.
+Health reports install-time replay evidence separately from current replay
+readiness. `attested_snapshot` means the exact selected binary pair booted a
+private state snapshot whose content-free identity is stored in the selection
+record. `current replay unproven` is still expected during ordinary health
+inspection. Cyclops proves the current journals again immediately before an
+operator requests rollback.
 
 ```bash
 cyclops health
@@ -528,6 +532,12 @@ installed selector changes. Durable records and operator-edited setup files in
 your home are preserved. Known unedited shipped themes, manifests, hook
 artifacts, and skills may advance with the installed release.
 
+The selected-pair record stores a content-free replay attestation bound to the
+exact client and daemon hashes plus the private snapshot identity. Older
+selection schemas remain readable and report replay as unproven. The
+attestation records installation evidence only. It never replaces the current
+journal replay performed by rollback.
+
 ```
   activated matched pair 1e16081
   no daemon was running; the selected pair remains stopped
@@ -542,6 +552,12 @@ the freshly installed one answering `--version` for itself. Each release is a
 directory containing the matched pair. The public commands pass through one
 `active` selector, so there is no moment where a new CLI names an old daemon.
 The previous matched pair remains as `known-good`.
+
+The pair-store lease admits one updater. A concurrent updater exits before it
+can stage, select, or repair files. If an updater process stops at a filesystem
+commit boundary, the next update removes only validated temporary selectors
+and unselected residues, repairs managed public links, and then continues. The
+public client and daemon always resolve through the same selected pair.
 
 If a daemon was running, update restarts that exact selected generation on the
 new pair. If no daemon was running, update leaves it stopped; the next

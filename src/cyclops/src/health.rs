@@ -219,7 +219,11 @@ struct RollbackReport {
     known_good_identity: Option<String>,
     active_build: Option<String>,
     known_good_build: Option<String>,
+    active_install_replay: Option<bool>,
+    known_good_install_replay: Option<bool>,
+    known_good_replay_snapshot: Option<String>,
     candidate_available: Option<bool>,
+    install_replay: &'static str,
     journal_replay: &'static str,
     rollback_safe: Option<bool>,
     reason: String,
@@ -795,7 +799,11 @@ where
             known_good_identity: None,
             active_build: None,
             known_good_build: None,
+            active_install_replay: None,
+            known_good_install_replay: None,
+            known_good_replay_snapshot: None,
             candidate_available: None,
+            install_replay: "unproven",
             journal_replay: "unproven",
             rollback_safe: None,
             reason: "the managed rollback proof is stale, changed, or unsafe".into(),
@@ -813,10 +821,17 @@ where
             };
             let reason = if legacy {
                 "the legacy active pair has no recorded identity; run one update before trusting rollback"
+            } else if candidate_available && descriptor.known_good_replay_attested {
+                "the known-good pair replayed a recorded install-time snapshot; current journal replay is checked only when rollback runs"
             } else if candidate_available {
-                "a distinct known-good pair has a validated install proof; compatibility with the current journal is unproven"
+                "a distinct known-good pair has a validated binary proof; install-time and current journal replay are unproven"
             } else {
                 "the descriptor is valid but has no distinct known-good pair"
+            };
+            let install_replay = if descriptor.known_good_replay_attested {
+                "attested_snapshot"
+            } else {
+                "unproven"
             };
             RollbackReport {
                 state,
@@ -828,7 +843,11 @@ where
                 known_good_identity: Some(descriptor.known_good_identity),
                 active_build: descriptor.active_build,
                 known_good_build: Some(descriptor.known_good_build),
+                active_install_replay: Some(descriptor.active_replay_attested),
+                known_good_install_replay: Some(descriptor.known_good_replay_attested),
+                known_good_replay_snapshot: descriptor.known_good_replay_snapshot,
                 candidate_available: Some(candidate_available),
+                install_replay,
                 journal_replay: "unproven",
                 rollback_safe: None,
                 reason: reason.into(),
@@ -849,7 +868,11 @@ fn rollback_unproven(prefix: Option<PathBuf>, reason: impl Into<String>) -> Roll
         known_good_identity: None,
         active_build: None,
         known_good_build: None,
+        active_install_replay: None,
+        known_good_install_replay: None,
+        known_good_replay_snapshot: None,
         candidate_available: None,
+        install_replay: "unproven",
         journal_replay: "unproven",
         rollback_safe: None,
         reason: reason.into(),
@@ -2391,13 +2414,18 @@ fn rollback_json(report: &RollbackReport) -> Value {
             "pair": report.active_pair.as_ref().map(|path| path.display().to_string()),
             "identity": report.active_identity.as_deref(),
             "build": report.active_build.as_deref(),
+            "install_replay_attested": report.active_install_replay,
         },
         "known_good": {
             "pair": report.known_good_pair.as_ref().map(|path| path.display().to_string()),
             "identity": report.known_good_identity.as_deref(),
             "build": report.known_good_build.as_deref(),
+            "install_replay_attested": report.known_good_install_replay,
+            "replay_snapshot_sha256": report.known_good_replay_snapshot.as_deref(),
         },
         "candidate_available": report.candidate_available,
+        "install_replay": report.install_replay,
+        "current_replay": report.journal_replay,
         "journal_replay": report.journal_replay,
         "rollback_safe": report.rollback_safe,
         "reason": report.reason.as_str(),
@@ -2412,13 +2440,14 @@ fn render_rollback_plain(report: &RollbackReport) -> Vec<String> {
         None => "unproven",
     };
     let mut lines = vec![format!(
-        "  rollback {} · candidate {} · journal replay {} · safe {} · {}",
+        "  rollback {} · candidate {} · install replay {} · current replay {} · safe {} · {}",
         report.state,
         match report.candidate_available {
             Some(true) => "available",
             Some(false) => "unavailable",
             None => "unproven",
         },
+        report.install_replay,
         report.journal_replay,
         safe,
         report.reason
@@ -2431,18 +2460,28 @@ fn render_rollback_plain(report: &RollbackReport) -> Vec<String> {
     }
     if let Some(pair) = &report.active_pair {
         lines.push(format!(
-            "    active {} · identity {} · build {}",
+            "    active {} · identity {} · build {} · install replay {}",
             pair.display(),
             report.active_identity.as_deref().unwrap_or("unproven"),
-            report.active_build.as_deref().unwrap_or("unproven")
+            report.active_build.as_deref().unwrap_or("unproven"),
+            match report.active_install_replay {
+                Some(true) => "attested",
+                Some(false) => "unproven",
+                None => "unproven",
+            }
         ));
     }
     if let Some(pair) = &report.known_good_pair {
         lines.push(format!(
-            "    known good {} · identity {} · build {}",
+            "    known good {} · identity {} · build {} · install replay {}",
             pair.display(),
             report.known_good_identity.as_deref().unwrap_or("unproven"),
-            report.known_good_build.as_deref().unwrap_or("unproven")
+            report.known_good_build.as_deref().unwrap_or("unproven"),
+            match report.known_good_install_replay {
+                Some(true) => "attested",
+                Some(false) => "unproven",
+                None => "unproven",
+            }
         ));
     }
     if let Some(error) = &report.error {
@@ -2491,6 +2530,9 @@ mod tests {
             known_good_identity: "0.1.0 (known-build)".into(),
             active_build: (!legacy).then(|| "active-build".into()),
             known_good_build: "known-build".into(),
+            active_replay_attested: false,
+            known_good_replay_attested: false,
+            known_good_replay_snapshot: None,
             rollback_safe,
         }
     }
@@ -2710,6 +2752,7 @@ mod tests {
         assert_eq!(report.state, "candidate");
         assert_eq!(report.candidate_available, Some(true));
         assert_eq!(report.journal_replay, "unproven");
+        assert_eq!(report.install_replay, "unproven");
         assert_eq!(report.rollback_safe, None);
         assert_eq!(report.active_build.as_deref(), Some("active-build"));
         assert_eq!(report.known_good_build.as_deref(), Some("known-build"));
@@ -2726,6 +2769,28 @@ mod tests {
             assert!(json.contains(fact));
             assert!(plain.contains(fact));
         }
+    }
+
+    #[test]
+    fn install_replay_attestation_never_claims_current_replay_readiness() {
+        let binaries = binaries_with_public_selector(true);
+        let mut installed = descriptor(false, true);
+        installed.active_replay_attested = true;
+        installed.known_good_replay_attested = true;
+        installed.known_good_replay_snapshot = Some("a".repeat(64));
+        let report = inspect_rollback_with(&binaries, |_| Ok(Some(installed)));
+
+        assert_eq!(report.install_replay, "attested_snapshot");
+        assert_eq!(report.journal_replay, "unproven");
+        assert_eq!(report.rollback_safe, None);
+        let json = rollback_json(&report);
+        assert_eq!(json["install_replay"], "attested_snapshot");
+        assert_eq!(json["current_replay"], "unproven");
+        let snapshot = "a".repeat(64);
+        assert_eq!(
+            json["known_good"]["replay_snapshot_sha256"].as_str(),
+            Some(snapshot.as_str())
+        );
     }
 
     #[test]
