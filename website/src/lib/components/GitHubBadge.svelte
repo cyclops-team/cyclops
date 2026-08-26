@@ -67,8 +67,8 @@
 	}
 
 	.badge:hover {
-		border-color: var(--sage);
-		color: var(--sage-ink);
+		border-color: var(--accent);
+		color: var(--accent);
 	}
 
 	.count {

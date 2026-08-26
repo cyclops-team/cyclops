@@ -61,7 +61,7 @@
 	}
 
 	nav a:hover {
-		color: var(--text);
+		color: var(--accent);
 	}
 
 	.actions {

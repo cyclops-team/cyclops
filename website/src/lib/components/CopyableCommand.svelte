@@ -110,7 +110,7 @@
 	}
 
 	button.failed {
-		color: var(--mauve);
-		border-color: var(--mauve);
+		color: var(--accent-2);
+		border-color: var(--accent-2);
 	}
 </style>

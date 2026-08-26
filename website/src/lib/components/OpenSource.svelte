@@ -5,16 +5,16 @@
 </script>
 
 <section class="section">
-	<SectionHead title="OPEN SOURCE" index="05 / Repository" />
-	<div class="panel">
+	<SectionHead title="OPEN SOURCE" index="Repository" />
+	<div class="panel split">
 		<div class="copy">
-			<h3 class="pixel heading">Built in the open.<br />Runs on your machine.</h3>
-			<p>
+			<h3 class="statement">Built in the open.<br />Runs on your machine.</h3>
+			<p class="lede">
 				Inspect it, extend it, and help shape how coding-agent teams should work. Cyclops keeps
 				coordination close to your code and terminal.
 			</p>
 			<div class="actions">
-				<a class="btn btn-secondary with-icon" href={REPO_URL} target="_blank" rel="noopener noreferrer">
+				<a class="btn btn-secondary" href={REPO_URL} target="_blank" rel="noopener noreferrer">
 					<GithubMark size={14} />
 					Star on GitHub
 				</a>
@@ -37,29 +37,21 @@
 </section>
 
 <style>
-	.panel {
-		border: 1px solid var(--line);
-		background: var(--surface);
-		padding: 44px 40px;
+	.split {
 		display: grid;
 		grid-template-columns: 1.3fr 1fr;
 		gap: 40px;
+		padding: 40px;
 	}
 
-	.heading {
-		font-weight: 700;
-		font-size: clamp(22px, 3vw, 30px);
-		color: var(--ink);
-		line-height: 1.2;
-		margin: 0 0 18px;
+	.statement {
+		font-size: clamp(22px, 2.8vw, 30px);
 	}
 
-	.copy p {
+	.lede {
 		font-size: 14.5px;
-		line-height: 1.65;
-		color: var(--muted);
-		margin: 0 0 26px;
 		max-width: 440px;
+		margin-bottom: 26px;
 	}
 
 	.copy,
@@ -72,12 +64,6 @@
 		display: flex;
 		gap: 14px;
 		flex-wrap: wrap;
-	}
-
-	.actions a {
-		display: inline-flex;
-		align-items: center;
-		gap: 8px;
 	}
 
 	.meta {
@@ -95,13 +81,6 @@
 		gap: 6px;
 	}
 
-	.label {
-		font-size: 11px;
-		letter-spacing: 1.5px;
-		text-transform: uppercase;
-		color: var(--faint);
-	}
-
 	.row a {
 		font-size: 13.5px;
 		color: var(--text);
@@ -109,13 +88,13 @@
 	}
 
 	.row a:hover {
-		color: var(--sage-ink);
+		color: var(--accent);
 	}
 
 	@media (max-width: 800px) {
-		.panel {
+		.split {
 			grid-template-columns: 1fr;
-			padding: 32px 24px;
+			padding: 28px 24px;
 		}
 
 		.meta {

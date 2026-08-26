@@ -1,6 +1,9 @@
-/* Cyclops design tokens. The light theme IS `sorbet`, the shipped theme of
-   the same name: values come from resources/themes/sorbet.toml so the page
-   and the app are the same citrus counter on peach paper. */
+/* Cyclops design tokens.
+   The page is painted in two of the product's own themes. Light is
+   `sorbet` and dark is `ember`, both lifted from resources/themes/*.toml,
+   so the page chrome and the workspace mock inside it are the same
+   palette: one product, two of its themes, never a screenshot that
+   inverted. */
 :root {
 	color-scheme: light;
 
@@ -36,9 +39,13 @@
 	--accent-2-hover: #9c3560;
 	--link: #a6461e; /* palette.1, a read link on peach */
 
-	/* Historical names. Fourteen components still read these; pointing them
-	   at the accent keeps this a theme change rather than a rename, and the
-	   rename is its own commit. */
+	/* The field behind the hero: wires and nodes one step quieter than
+	   the hairlines, so it reads as atmosphere and never as a diagram. */
+	--field-line: #dcbba3;
+	--field-node: #b8967e;
+
+	/* Historical names. Components still read these; they resolve through
+	   the accent so a theme change is a theme change. */
 	--sage: var(--accent);
 	--sage-hover: var(--accent-hover);
 	--sage-ink: var(--accent);
@@ -47,15 +54,13 @@
 	--mauve-hover: var(--accent-2-hover);
 	--mauve-ink: var(--accent-2);
 
-	/* Terminal, painted in the shipped `sorbet` theme.
-	   Values are lifted from resources/themes/sorbet.toml so what the site
-	   shows is what `cyclops theme sorbet` puts on screen. Sorbet is a light
-	   theme, so these stay light in the page's dark mode too: a depiction of
-	   the app does not invert any more than a screenshot would. */
-	--term-bg: #fff6ed; /* surface.bg, peach paper */
-	--term-line: #eed7c4; /* pane and panel rules */
+	/* The workspace mock and every pane frame on the page, in sorbet. */
+	--term-bg: #fff6ed; /* surface.bg, the pane ground */
+	--term-line: #eed7c4; /* panel rules */
 	--term-frame: #e3c3ab; /* the outer edge of a terminal block */
-	--term-pane-line: #e0c4ae; /* an inactive pane's border */
+	/* An unfocused pane's border is surface.dim drawn as one-cell glyphs,
+	   which the eye reads lighter than a solid rule of the same ink. */
+	--term-pane-line: #bda595;
 	--term-shadow: rgba(58, 43, 38, 0.18);
 	--term-text: #3a2b26; /* surface.fg, cocoa ink */
 	--term-dim: #7a6055; /* surface.dim */
@@ -65,18 +70,18 @@
 	--term-faint: #94817a;
 	--term-control: #fbe7d8; /* chrome.panel */
 	--term-control-hover: #f3d3bd; /* chrome.raised */
-	--term-neutral: #7a6055;
-	--term-active-bg: rgba(184, 75, 54, 0.09);
 
-	/* Sorbet semantics. The four state colors carry the same meaning here
-	   as they do in a pane border, and the role wheel names agents. */
+	/* Sorbet semantics. The state colors carry the same meaning here as
+	   they do in a pane border, and the role wheel names agents. */
 	--sb-accent: #b84b36; /* surface.accent, coral */
-	--sb-panel: #fbe7d8;
-	--sb-raised: #f3d3bd;
-	--sb-healthy: #2a7a4a; /* state.healthy, idle and verified */
+	--sb-panel: #fbe7d8; /* chrome.panel */
+	--sb-raised: #f3d3bd; /* chrome.raised */
+	--sb-healthy: #2a7a4a; /* state.healthy */
 	--sb-needs: #8f6416; /* state.needs_you */
 	--sb-terminal: #a02c22; /* state.terminal, a dead pane */
 	--sb-role-1: #b84b36; /* coral */
+	--sb-role-2: #a85c25; /* apricot */
+	--sb-role-3: #726c1a; /* lemon zest */
 	--sb-role-4: #487a33; /* lime */
 	--sb-role-5: #2a7a76; /* mint */
 	--sb-role-6: #4a6fae; /* blueberry */
@@ -90,67 +95,61 @@
 :root[data-theme='dark'] {
 	color-scheme: dark;
 
-	/* Surfaces */
-	--paper: #10110f;
-	--surface: #151613;
-	--surface-mid: #1b1c18;
-	--surface-deep: #181916;
-	--navbar-bg: rgba(16, 17, 15, 0.88);
+	/* Ember: a fire an hour after it stopped being a fire. The page ground
+	   is the pane ground, the same relation sorbet has, and the chrome
+	   steps UP through charcoal into scorched brown. */
+	--paper: #14100d; /* surface.bg */
+	--surface: #1a1410;
+	--surface-mid: #201a14; /* chrome.panel */
+	--surface-deep: #1c1611;
+	--navbar-bg: rgba(20, 16, 13, 0.88);
 
-	/* Ink & grays */
-	--ink: #f2f1ec;
-	--text: #d9d8d2;
-	--muted: #aaa9a2;
-	--gray: #989790;
-	--faint: #7e7d77;
+	/* Ink & grays: ash is brown, not neutral. */
+	--ink: #f7ede2; /* palette.15 */
+	--text: #f2e7db; /* surface.fg */
+	--muted: #a08b78; /* surface.dim */
+	--gray: #b39c88;
+	--faint: #8a7462;
 
 	/* Lines */
-	--line: #2d2e29;
-	--line-soft: #242520;
-	--hairline: #3b3c36;
-	--hairline-btn: #484942;
+	--line: #2b211a; /* palette.0 */
+	--line-soft: #241b15;
+	--hairline: #3c2f23; /* chrome.raised */
+	--hairline-btn: #4f3f31;
 
-	/* Accents. The dark theme is unchanged by the sorbet light theme: these
-	   are the values it has always rendered, restated here because the
-	   light block now defines them in sorbet rather than in sage. The
-	   --sage/--mauve aliases resolve through --accent, so overriding the
-	   accent is enough to carry them. */
-	--accent: #b7c396;
-	--accent-hover: #c5cfaa;
-	--accent-ink: #0a0a0a;
-	--accent-soft: #293021;
-	--accent-2: #ba9a91;
-	--accent-2-hover: #c5a69d;
-	--sage-ink: #bdc99c;
-	--mauve-ink: #c7a59b;
-	--link: #bdc99c;
+	/* The accent is the coal somebody just breathed on; its companion is
+	   the amber one step down the heat. */
+	--accent: #ff9d4d; /* surface.accent */
+	--accent-hover: #ffb06a;
+	--accent-ink: #14100d;
+	--accent-soft: #3c2f23; /* chrome.raised */
+	--accent-2: #e8c46a; /* role.2, amber */
+	--accent-2-hover: #f0d086;
+	--link: #ffb06a;
 
-	/* The terminal follows the page into the dark, and it does that by
-	   changing theme rather than by dimming: this is `ember`, the shipped
-	   dark theme, straight out of resources/themes/ember.toml. Ember is
-	   sorbet's counterpart at the warm end, amber on a charcoal the color
-	   of a log the flame has left, so the two sides of the toggle are one
-	   product in two of its own themes and not a screenshot that inverted. */
-	--term-bg: #14100d; /* surface.bg, the pane ground */
-	--term-line: #33291f;
+	--field-line: #3f3025;
+	--field-node: #75604e;
+
+	--term-bg: #14100d;
+	--term-line: #2b211a;
 	--term-frame: #3c2f23;
-	--term-pane-line: #362b21;
-	--term-text: #f2e7db; /* surface.fg */
-	--term-dim: #a08b78; /* surface.dim */
+	--term-pane-line: #5f5044;
+	--term-shadow: rgba(0, 0, 0, 0.55);
+	--term-text: #f2e7db;
+	--term-dim: #a08b78;
 	--term-faint: #8a7462; /* above state.dead, which lands under 3:1 here */
-	--term-control: #201a14; /* chrome.panel */
-	--term-control-hover: #3c2f23; /* chrome.raised */
-	--term-neutral: #a08b78;
-	--term-active-bg: rgba(255, 157, 77, 0.1);
-	--term-shadow: rgba(0, 0, 0, 0.5);
+	--term-control: #201a14;
+	--term-control-hover: #3c2f23;
 
-	--sb-accent: #ff9d4d; /* surface.accent, ember */
+	--sb-accent: #ff9d4d;
 	--sb-panel: #201a14;
 	--sb-raised: #3c2f23;
 	--sb-healthy: #9fc47f;
 	--sb-needs: #f0b95e;
 	--sb-terminal: #f2635e;
 	--sb-role-1: #ff9d4d; /* ember */
+	--sb-role-2: #e8c46a; /* amber */
+	--sb-role-3: #dc7a5c; /* rust */
 	--sb-role-4: #b9c47a; /* scorched olive */
 	--sb-role-5: #eb9aa6; /* ash rose */
 	--sb-role-6: #cfa98c; /* driftwood */
@@ -187,7 +186,7 @@ body {
 }
 
 :focus-visible {
-	outline: 2px solid var(--sage-ink);
+	outline: 2px solid var(--accent);
 	outline-offset: 2px;
 }
 
@@ -205,7 +204,7 @@ body {
 }
 
 ::selection {
-	background: var(--sage);
+	background: var(--accent);
 	color: var(--accent-ink);
 }
 
@@ -215,7 +214,7 @@ a {
 }
 
 a:hover {
-	color: var(--sage);
+	color: var(--accent);
 }
 
 @keyframes blink {
@@ -229,7 +228,10 @@ a:hover {
 	}
 }
 
-/* ---- Shared primitives ---- */
+/* ---- Shared primitives ----
+   One type scale, one label style, one panel, one pane frame. Every
+   section is built from these and nothing else, so the page reads as one
+   surface instead of seven. */
 
 .pixel {
 	font-family: var(--font-pixel);
@@ -240,14 +242,54 @@ a:hover {
 	min-width: 0;
 	max-width: 1200px;
 	margin: 0 auto;
-	padding: 56px 48px;
+	padding: 72px 48px;
 }
 
-.eyebrow {
-	font-size: 12px;
+/* The small uppercase label: section indexes, column heads, meta keys. */
+.label {
+	font-size: 11.5px;
 	letter-spacing: 2px;
-	color: var(--sage-ink);
 	text-transform: uppercase;
+	color: var(--faint);
+}
+
+/* The label in the accent, opened with the comment marker: the page's
+   own voice, used once at the top and once at the end. */
+.eyebrow {
+	font-size: 11.5px;
+	letter-spacing: 2px;
+	text-transform: uppercase;
+	color: var(--accent);
+}
+
+/* The one display size every section statement shares. */
+.statement {
+	font-family: var(--font-pixel);
+	font-weight: 700;
+	font-size: clamp(24px, 3.3vw, 36px);
+	line-height: 1.2;
+	color: var(--ink);
+	margin: 0 0 20px;
+}
+
+/* Body copy under a statement. */
+.lede {
+	max-width: 620px;
+	font-size: 15.5px;
+	line-height: 1.7;
+	color: var(--muted);
+	margin: 0;
+}
+
+/* The panel: one border, one ground, one padding scale. */
+.panel {
+	border: 1px solid var(--line);
+	background: var(--surface);
+	padding: 32px;
+}
+
+.panel.deep {
+	background: var(--surface-deep);
 }
 
 .btn {
@@ -255,11 +297,15 @@ a:hover {
 	font-size: 13px;
 	letter-spacing: 0.5px;
 	cursor: pointer;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 8px;
 }
 
 .btn-primary {
 	font-weight: 700;
-	background: var(--sage);
+	background: var(--accent);
 	color: var(--accent-ink);
 	border: none;
 	padding: 14px 26px;
@@ -267,7 +313,7 @@ a:hover {
 
 .btn-primary:hover,
 a.btn-primary:hover {
-	background: var(--sage-hover);
+	background: var(--accent-hover);
 	color: var(--accent-ink);
 }
 
@@ -281,8 +327,8 @@ a.btn-primary:hover {
 
 .btn-secondary:hover,
 a.btn-secondary:hover {
-	border-color: var(--sage);
-	color: var(--sage-ink);
+	border-color: var(--accent);
+	color: var(--accent);
 }
 
 .btn-ghost {
@@ -297,59 +343,127 @@ a.btn-secondary:hover {
 	color: var(--text);
 }
 
-/* ---- Terminal chrome ---- */
+/* ---- Pane frames ----
+   Every terminal on the page is drawn the way the workspace draws a pane:
+   a rounded single rule for a pane at rest, a double rule in the accent
+   for the focused one, the name in the top border, the split controls at
+   its right end. The mock in the hero and the snippets further down are
+   the same object at two sizes. */
 
-/* Terminal surfaces carry their own ink. Without this, anything inside
-   that does not set a color inherits the page's --text, which follows the
-   light/dark toggle and lands near-invisible on the peach ground. */
 .term {
 	border: 1px solid var(--term-frame);
 	background: var(--term-bg);
 	color: var(--term-text);
 }
 
-.term-bar {
-	display: flex;
-	align-items: center;
-	gap: 8px;
-	padding: 12px 16px;
-	background: var(--sb-panel);
-	border-bottom: 1px solid var(--term-line);
+.frame {
+	position: relative;
+	border: 1px solid var(--term-pane-line);
+	border-radius: 5px;
+	background: var(--term-bg);
+	color: var(--term-text);
+	font-family: var(--font-mono);
 }
 
-.term-dot {
-	width: 11px;
-	height: 11px;
-	border-radius: 50%;
+.frame.focus {
+	border: 3px double var(--sb-accent);
+	border-radius: 0;
 }
 
-.term-title {
+/* Everything that sits ON the border knocks the ground out behind it so
+   the rule reads as interrupted, the way the app paints a title cell. */
+.frame-title,
+.frame-ctl,
+.frame-min,
+.frame-grip,
+.frame-notice {
+	position: absolute;
+	z-index: 2;
+	top: -8px;
+	line-height: 15px;
+	padding: 0 3px;
+	background: var(--term-bg);
 	font-size: 11px;
-	color: var(--term-dim);
-	margin-left: 8px;
+	white-space: nowrap;
 }
 
-.term-body {
-	padding: 20px;
-	font-size: 13px;
-	line-height: 2;
-}
-
-.term-body .dim {
-	color: var(--term-dim);
-}
-
-.term-body .out {
+.frame-title {
+	left: 11px;
+	font-weight: 700;
 	color: var(--term-text);
 }
 
-/* A receipt is state.healthy, the same green the pane border uses. */
-.term-body .ok {
+.frame-title .sep {
+	font-weight: 400;
+	color: var(--term-dim);
+}
+
+.frame-min {
+	left: 4px;
+	color: var(--term-dim);
+}
+
+.frame-min + .frame-title {
+	left: 28px;
+}
+
+.frame-ctl {
+	right: 6px;
+	color: var(--term-dim);
+	letter-spacing: -0.4px;
+}
+
+.frame.focus .frame-ctl {
+	color: var(--sb-accent);
+}
+
+/* The workspace's transient notice, on the focused frame's bottom rule. */
+.frame-notice {
+	top: auto;
+	bottom: -8px;
+	left: 11px;
+	font-weight: 700;
+	color: var(--sb-accent);
+	background: var(--sb-panel);
+	padding: 0 6px;
+}
+
+.frame-body {
+	padding: 14px 14px 12px;
+	font-size: 12px;
+	line-height: 1.75;
+	color: var(--term-text);
+}
+
+.frame-body div {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.frame-body .dim {
+	color: var(--term-dim);
+}
+
+.frame-body .out {
+	color: var(--term-text);
+}
+
+/* A receipt is state.healthy, the same green a healthy pane uses. */
+.frame-body .ok {
 	color: var(--sb-healthy);
 }
 
-.term-body .prompt {
+.frame-body .warn {
+	color: var(--sb-needs);
+}
+
+.frame-body .prompt {
 	color: var(--sb-accent);
+}
+
+.frame-body .msg {
+	color: var(--sb-role-7);
 }
 
 .cursor {
@@ -358,6 +472,10 @@ a.btn-secondary:hover {
 
 @media (max-width: 720px) {
 	.section {
-		padding: 40px 24px;
+		padding: 48px 24px;
+	}
+
+	.panel {
+		padding: 24px;
 	}
 }

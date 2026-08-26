@@ -17,16 +17,16 @@
 </script>
 
 <section class="section">
-	<SectionHead title="THE PROBLEM" index="01 / Why Cyclops" />
-	<h3 class="pixel heading">Your agents are powerful.<br />Their teamwork is manual.</h3>
-	<p class="body">
+	<SectionHead title="THE PROBLEM" index="Why Cyclops" />
+	<h3 class="statement">Your agents are powerful.<br />Their teamwork is manual.</h3>
+	<p class="lede">
 		Developers use different coding agents for different jobs, but coordinating them still means
 		manually passing context, assigning work, and tracking progress. Cyclops gives them a shared
 		coordination layer.
 	</p>
-	<div class="compare">
+	<div class="panel compare">
 		<div class="col">
-			<div class="col-label">Before Cyclops</div>
+			<div class="label">Before Cyclops</div>
 			<ul>
 				{#each before as item (item)}
 					<li><span class="marker before-marker">✕</span>{item}</li>
@@ -34,7 +34,7 @@
 			</ul>
 		</div>
 		<div class="col">
-			<div class="col-label accent">With Cyclops</div>
+			<div class="label accent">With Cyclops</div>
 			<ul>
 				{#each after as item (item)}
 					<li><span class="marker after-marker">✓</span>{item}</li>
@@ -45,46 +45,32 @@
 </section>
 
 <style>
-	.heading {
-		font-weight: 700;
-		font-size: clamp(26px, 3.6vw, 38px);
-		color: var(--ink);
-		line-height: 1.15;
-		margin: 0 0 24px;
-	}
-
-	.body {
-		max-width: 640px;
-		font-size: 16px;
-		line-height: 1.7;
-		color: var(--muted);
-		margin: 0 0 44px;
+	.lede {
+		margin-bottom: 40px;
 	}
 
 	.compare {
 		display: grid;
 		grid-template-columns: 1fr 1fr;
-		border: 1px solid var(--line);
+		padding: 0;
 	}
 
 	.col {
-		padding: 32px;
+		padding: 28px 32px;
+		min-width: 0;
 	}
 
 	.col:first-child {
 		border-right: 1px solid var(--line);
 	}
 
-	.col-label {
-		font-size: 11px;
-		letter-spacing: 2px;
-		text-transform: uppercase;
-		color: var(--faint);
-		margin-bottom: 20px;
+	.label {
+		display: block;
+		margin-bottom: 16px;
 	}
 
-	.col-label.accent {
-		color: var(--sage-ink);
+	.label.accent {
+		color: var(--accent);
 	}
 
 	ul {
@@ -113,16 +99,20 @@
 	}
 
 	.before-marker {
-		color: var(--mauve-ink);
+		color: var(--faint);
 	}
 
 	.after-marker {
-		color: var(--sage-ink);
+		color: var(--accent);
 	}
 
 	@media (max-width: 720px) {
 		.compare {
 			grid-template-columns: 1fr;
+		}
+
+		.col {
+			padding: 24px;
 		}
 
 		.col:first-child {

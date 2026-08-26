@@ -11,8 +11,8 @@
 </script>
 
 <section class="section">
-	<SectionHead title="COMPATIBILITY" index="03 / Any agent" />
-	<h3 class="pixel heading">If it runs in your terminal,<br />it can run in Cyclops.</h3>
+	<SectionHead title="COMPATIBILITY" index="Any agent" />
+	<h3 class="statement">If it runs in your terminal,<br />it can run in Cyclops.</h3>
 	<div class="strip">
 		{#each strip as agent, i (agent.id)}
 			<span class="item">
@@ -24,14 +24,6 @@
 </section>
 
 <style>
-	.heading {
-		font-weight: 700;
-		font-size: clamp(24px, 3.4vw, 34px);
-		color: var(--ink);
-		line-height: 1.2;
-		margin: 0 0 22px;
-	}
-
 	.strip {
 		display: flex;
 		align-items: center;

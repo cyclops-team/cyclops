@@ -4,19 +4,16 @@
 	const principles = [
 		{
 			glyph: '◇',
-			color: 'var(--sage-ink)',
 			title: 'Provider-independent',
 			body: 'Use the right coding agent for each task without forcing your workflow into one provider.'
 		},
 		{
 			glyph: '▤',
-			color: 'var(--mauve-ink)',
 			title: 'Terminal-native',
 			body: 'Keep every agent inside its real terminal environment with its existing tools and context.'
 		},
 		{
 			glyph: '⇄',
-			color: 'var(--sage-hover)',
 			title: 'Reliable handoffs',
 			body: 'Route structured requests to named agents and verify that they reach the intended terminal.'
 		}
@@ -24,11 +21,11 @@
 </script>
 
 <section class="section">
-	<SectionHead title="WHY CYCLOPS" index="04 / Principles" />
+	<SectionHead title="WHY CYCLOPS" index="Principles" />
 	<div class="grid">
 		{#each principles as principle (principle.title)}
-			<div class="card">
-				<div class="glyph pixel" style="color: {principle.color}">{principle.glyph}</div>
+			<div class="panel card">
+				<div class="glyph pixel">{principle.glyph}</div>
 				<div class="title">{principle.title}</div>
 				<div class="body">{principle.body}</div>
 			</div>
@@ -44,18 +41,17 @@
 	}
 
 	.card {
-		border: 1px solid var(--line);
-		background: var(--surface);
 		padding: 28px;
 		transition: border-color 0.15s;
 	}
 
 	.card:hover {
-		border-color: var(--sage);
+		border-color: var(--accent);
 	}
 
 	.glyph {
 		font-size: 20px;
+		color: var(--accent);
 		margin-bottom: 20px;
 	}
 
@@ -67,7 +63,7 @@
 	}
 
 	.body {
-		font-size: 13px;
+		font-size: 13.5px;
 		color: var(--muted);
 		line-height: 1.6;
 	}
