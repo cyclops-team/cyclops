@@ -5214,6 +5214,11 @@ async fn paste_into_focused_pane(
         return Ok(());
     }
     let pane_id = app.model.active_tab().active_pane.clone();
+    // Paste is pane input just as surely as a keypress. Keep the viewport
+    // contract provider-neutral: an operator pasting at a live prompt must
+    // see that prompt and the resulting output, not remain pinned in the
+    // pane's local history while the bytes land below the fold.
+    snap_pane_to_tail(app, &pane_id);
     let buffer = format!("cyclops-workspace-{}-{}", std::process::id(), app.paste_seq);
     app.paste_seq = app.paste_seq.checked_add(1).ok_or_else(|| {
         cyclops_tmux::TmuxError::Protocol("workspace paste sequence overflow".into())
@@ -6126,6 +6131,33 @@ mod tests {
             sidebar_visible: true,
             messages_visible: false,
         }
+    }
+
+    #[test]
+    fn any_pane_input_attempt_returns_the_viewport_to_its_live_tail() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-input-snaps-tail");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create scratch home");
+        let mut app = test_app(one_pane_model(), home.clone());
+        let mut runtime = crate::runtime::PaneRuntime::new(40, 6);
+        for line in 0..40 {
+            runtime.feed(format!("line {line}\r\n").as_bytes());
+        }
+        runtime.scroll(-8);
+        assert!(!runtime.at_tail(), "fixture begins in scrollback");
+        app.runtimes.insert("%0".into(), runtime);
+
+        assert!(snap_pane_to_tail(&mut app, "%0"));
+        assert!(app.runtimes.get("%0").expect("runtime").at_tail());
+        assert!(
+            !snap_pane_to_tail(&mut app, "%0"),
+            "a second key or paste at the tail has no viewport work"
+        );
+        assert!(
+            !snap_pane_to_tail(&mut app, "%missing"),
+            "an event cannot move a runtime it does not own"
+        );
+        let _ = std::fs::remove_dir_all(home);
     }
 
     fn current_messages_gate(app: &mut App) {
