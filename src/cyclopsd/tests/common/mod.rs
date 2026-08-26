@@ -122,8 +122,11 @@ process_names = ["python3", "python", "Python", "cat", "sh", "dash"]
 [[rule]]
 id = "always_idle"
 state = "idle"
-priority = 100
-region = "pane_title"
+priority = 70
+region = "bottom_non_empty_lines(4)"
+# The fixture screen is the idle authority: a blank or plain pane is idle,
+# and this rule is the lifecycle evidence that confirms it.
+lifecycle_evidence = true
 regex = ['^']
 
 # The screen sensor must be able to answer for these panes, because a
@@ -153,6 +156,9 @@ id = "composer_holds_paste"
 state = "idle_with_input"
 composer_semantic = "human_input"
 priority = 80
+# A staged row is a composer semantic, never lifecycle evidence of idle:
+# the pane fuses to unknown, and only the exact owner acts on it.
+lifecycle_evidence = false
 # The active composer only. The escaped matcher rejects the dim transcript
 # prompt that the fixture paints after consuming a turn.
 region = "bottom_non_empty_lines(3)"
@@ -208,8 +214,11 @@ ack_payload_field = "prompt"
 [[rule]]
 id = "always_idle"
 state = "idle"
-priority = 100
-region = "pane_title"
+priority = 70
+region = "bottom_non_empty_lines(4)"
+# The fixture screen is the idle authority: a blank or plain pane is idle,
+# and this rule is the lifecycle evidence that confirms it.
+lifecycle_evidence = true
 regex = ['^']
 
 # The screen sensor must be able to answer for these panes, because a
@@ -239,6 +248,9 @@ id = "composer_holds_paste"
 state = "idle_with_input"
 composer_semantic = "human_input"
 priority = 80
+# A staged row is a composer semantic, never lifecycle evidence of idle:
+# the pane fuses to unknown, and only the exact owner acts on it.
+lifecycle_evidence = false
 # The active composer only. The escaped matcher rejects the dim transcript
 # prompt that the fixture paints after consuming a turn.
 region = "bottom_non_empty_lines(3)"
@@ -300,8 +312,11 @@ auto_dismiss = false
 [[rule]]
 id = "always_idle"
 state = "idle"
-priority = 100
-region = "pane_title"
+priority = 70
+region = "bottom_non_empty_lines(4)"
+# The fixture screen is the idle authority: a blank or plain pane is idle,
+# and this rule is the lifecycle evidence that confirms it.
+lifecycle_evidence = true
 regex = ['^']
 
 # The screen sensor must be able to answer for these panes, because a
@@ -331,6 +346,9 @@ id = "composer_holds_paste"
 state = "idle_with_input"
 composer_semantic = "human_input"
 priority = 80
+# A staged row is a composer semantic, never lifecycle evidence of idle:
+# the pane fuses to unknown, and only the exact owner acts on it.
+lifecycle_evidence = false
 # The active composer only. The escaped matcher rejects the dim transcript
 # prompt that the fixture paints after consuming a turn.
 region = "bottom_non_empty_lines(3)"
@@ -381,8 +399,11 @@ contains = ["Individual quota reached"]
 [[rule]]
 id = "always_idle"
 state = "idle"
-priority = 100
-region = "pane_title"
+priority = 70
+region = "bottom_non_empty_lines(4)"
+# The fixture screen is the idle authority: a blank or plain pane is idle,
+# and this rule is the lifecycle evidence that confirms it.
+lifecycle_evidence = true
 regex = ['^']
 
 # The screen sensor must be able to answer for these panes, because a
@@ -412,6 +433,9 @@ id = "composer_holds_paste"
 state = "idle_with_input"
 composer_semantic = "human_input"
 priority = 80
+# A staged row is a composer semantic, never lifecycle evidence of idle:
+# the pane fuses to unknown, and only the exact owner acts on it.
+lifecycle_evidence = false
 # The active composer only. The escaped matcher rejects the dim transcript
 # prompt that the fixture paints after consuming a turn.
 region = "bottom_non_empty_lines(3)"
@@ -462,8 +486,11 @@ contains = ["BUSY-MARKER"]
 [[rule]]
 id = "always_idle"
 state = "idle"
-priority = 100
-region = "pane_title"
+priority = 70
+region = "bottom_non_empty_lines(4)"
+# The fixture screen is the idle authority: a blank or plain pane is idle,
+# and this rule is the lifecycle evidence that confirms it.
+lifecycle_evidence = true
 regex = ['^']
 
 # The screen sensor must be able to answer for these panes, because a
@@ -493,6 +520,9 @@ id = "composer_holds_paste"
 state = "idle_with_input"
 composer_semantic = "human_input"
 priority = 80
+# A staged row is a composer semantic, never lifecycle evidence of idle:
+# the pane fuses to unknown, and only the exact owner acts on it.
+lifecycle_evidence = false
 # The active composer only. The escaped matcher rejects the dim transcript
 # prompt that the fixture paints after consuming a turn.
 region = "bottom_non_empty_lines(3)"
@@ -537,8 +567,11 @@ process_names = ["python3", "python", "Python", "cat", "sh", "bash", "dash"]
 [[rule]]
 id = "always_idle"
 state = "idle"
-priority = 100
-region = "pane_title"
+priority = 70
+region = "bottom_non_empty_lines(4)"
+# The fixture screen is the idle authority: a blank or plain pane is idle,
+# and this rule is the lifecycle evidence that confirms it.
+lifecycle_evidence = true
 regex = ['^']
 
 # Screen-idle evidence only: this fixture exists to make verification

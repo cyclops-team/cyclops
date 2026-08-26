@@ -45,6 +45,13 @@ state = "working"
 priority = 800
 region = "bottom_non_empty_lines(3)"
 line_regex = ['^FIXPROMPT']
+[[rule]]
+id = "screen_idle"
+state = "idle"
+priority = 700
+region = "bottom_non_empty_lines(3)"
+lifecycle_evidence = true
+regex = ['^']
 "#;
 
 /// Scratch CYCLOPS_HOME under the relocatable scratch root (F24), removed
@@ -290,8 +297,18 @@ async fn m0_shadow_daemon_end_to_end() {
         .await;
     assert_eq!(ack["result"]["subscribed"], true);
     tmux.run_ok(&["select-pane", "-t", "main", "-T", "IDLE ready"]);
+    // A title alone never asserts idle over a screen tier that has not
+    // confirmed it: the busy prompt row must leave the screen and the
+    // lifecycle idle rule must match before the runtime reads idle.
+    tmux.run_ok(&[
+        "send-keys",
+        "-t",
+        "main",
+        "PS1='IDLEPROMPT '; clear",
+        "Enter",
+    ]);
     // A settled output recompute can publish a Working-certainty edge after
-    // subscription. Wait for the title transition this step requested.
+    // subscription. Wait for the transition this step requested.
     let deadline = Instant::now() + Duration::from_secs(5);
     let ev = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -327,25 +344,39 @@ async fn m0_shadow_daemon_end_to_end() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // pane.read detection forces the full sensor set: title says idle,
-    // screen says working, verdict goes to the higher priority rule and
-    // the disagreement is observable.
-    let resp = c
-        .request(
-            "pane.read",
-            json!({"target": pane_id, "source": "detection"}),
-        )
-        .await;
+    // pane.read detection forces the full sensor set: the title says idle
+    // and the lifecycle idle screen rule confirms it, so the higher
+    // priority title rule decides with no disagreement. A title alone never
+    // asserts idle over a screen tier that has not confirmed it.
+    // The watcher hydrates the pane title lazily, after the screen has
+    // already confirmed idle, so wait for the title reading to arrive.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let resp = loop {
+        let resp = c
+            .request(
+                "pane.read",
+                json!({"target": pane_id, "source": "detection"}),
+            )
+            .await;
+        if resp["result"]["detection"]["decided_by"] == "title_idle" {
+            break resp;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "title reading never reached the detection: {resp}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     let det = &resp["result"]["detection"];
     assert_eq!(det["state"], "idle");
     assert_eq!(det["decided_by"], "title_idle");
-    assert_eq!(det["disagreement"], true);
+    assert_eq!(det["disagreement"], false);
     let readings = det["readings"].as_array().expect("readings array");
     assert_eq!(readings.len(), 2, "{readings:?}");
     assert_eq!(readings[0]["sensor"], "title");
     assert_eq!(readings[0]["rule"], "title_idle");
     assert_eq!(readings[1]["sensor"], "screen");
-    assert_eq!(readings[1]["rule"], "screen_busy");
+    assert_eq!(readings[1]["rule"], "screen_idle");
 
     // pane.read resolves adoption labels too, like every verb that
     // promises "label or pane id" (the v1 shim maps `read <label>` here).

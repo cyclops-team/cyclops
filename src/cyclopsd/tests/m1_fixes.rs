@@ -481,8 +481,11 @@ argv_basenames = ["claude"]
 [[rule]]
 id = "always_idle"
 state = "idle"
-priority = 100
-region = "pane_title"
+priority = 70
+region = "bottom_non_empty_lines(4)"
+# The fixture screen is the idle authority: a blank or plain pane is idle,
+# and this rule is the lifecycle evidence that confirms it.
+lifecycle_evidence = true
 regex = ['^']
 
 [injection]

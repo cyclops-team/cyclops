@@ -452,11 +452,20 @@ pub(crate) async fn handle_report(
         let matching_end = readings
             .get(&pane)
             .is_some_and(|current| match &correlation {
-                Some(turnkey::TurnCorrelation::Exact(turn)) => current.active_start_matches(
-                    origin.agent,
-                    origin.manifest.as_deref(),
-                    Some(turn),
-                ),
+                // A confirmed exact end on this binding also ends a persistent
+                // unkeyed start: the start had no key to match, and the end is
+                // separately proven on the same agent generation.
+                Some(turnkey::TurnCorrelation::Exact(turn)) => {
+                    current.active_start_matches(
+                        origin.agent,
+                        origin.manifest.as_deref(),
+                        Some(turn),
+                    ) || current.unkeyed_latch_ended_by(
+                        origin.agent,
+                        origin.manifest.as_deref(),
+                        edge_ms,
+                    )
+                }
                 Some(turnkey::TurnCorrelation::Unconfigured) => {
                     current.confirmed_unkeyed_start_for(origin.agent, origin.manifest.as_deref())
                 }
@@ -537,6 +546,12 @@ pub(crate) async fn handle_report(
     }
     if unkeyed_dispatch_start && applied_state.is_some() {
         fusion::schedule_unkeyed_dispatch_recheck(inner, &pane);
+    }
+    // A candidate end (Claude's Stop can continue through additionalContext)
+    // may trigger a fresh look at the screen but never clears a persistent
+    // start on its own; the screen's lifecycle evidence does that.
+    if is_turn_end && !lifecycle_confirmed {
+        fusion::schedule_lifecycle_recheck(inner, &pane);
     }
     if is_turn_end && lifecycle_confirmed {
         if let (Some(turn), Some(manifest)) = (exact_turn.as_ref(), origin.manifest.as_deref()) {

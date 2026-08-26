@@ -711,7 +711,7 @@ async fn pending_exact_owned_doorbell_submits_once_without_operator_input() {
     wait_for_inject_phase(&mut entered_rx, "automatic_attention_before_resolve").await;
     rig.tmux
         .run_ok(&["select-pane", "-t", &pane, "-T", "worker"]);
-    common::wait_pane_state(&mut rig, "idle").await;
+    common::wait_pane_state(&mut rig, "unknown").await;
 
     automatic.add_permits(32);
     wait_for_inject_phase(&mut entered_rx, "attention_after_action_accepted").await;
@@ -808,7 +808,7 @@ async fn claimed_exact_owned_doorbell_clears_without_another_submit() {
     wait_for_inject_phase(&mut entered_rx, "automatic_attention_before_resolve").await;
     rig.tmux
         .run_ok(&["select-pane", "-t", &pane, "-T", "worker"]);
-    common::wait_pane_state(&mut rig, "idle").await;
+    common::wait_pane_state(&mut rig, "unknown").await;
     rig.daemon
         .claim_message_for_test("worker", &message_id)
         .expect("claim before automatic resolution");

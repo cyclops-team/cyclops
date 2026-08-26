@@ -20,6 +20,11 @@ fn shipped_composer_semantics_match_measured_rules_only() {
     let all = shipped();
     let expected = [
         ("claude", "composer_empty", Clean),
+        (
+            "claude",
+            "composer_completed_terminal_suffix_2_1_246",
+            Clean,
+        ),
         ("claude", "composer_has_staged_input", HumanInput),
         ("claude", "composer_styled_input", HumanInput),
         ("claude", "composer_unstyled_input", HumanInput),
@@ -1316,4 +1321,181 @@ fn strip_sgr(s: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// MEASURED 2026-08-26: Claude keeps its bare prompt row (and any ghost text
+/// on it) on screen during a turn, so those rows may carry a composer
+/// semantic but never confirm idle; the other vendors' idle composer rules
+/// stay lifecycle evidence, and an unmarked rule defaults to evidence.
+#[test]
+fn mid_turn_composer_rows_are_not_lifecycle_evidence() {
+    let all = shipped();
+    let claude = &all["claude"];
+    for id in [
+        "composer_empty",
+        "composer_ghost_suggestion",
+        "composer_has_staged_input",
+        "composer_styled_input",
+        "composer_unstyled_input",
+    ] {
+        let rule = claude
+            .rules
+            .iter()
+            .find(|rule| rule.id == id)
+            .unwrap_or_else(|| panic!("missing claude/{id}"));
+        assert!(
+            matches!(rule.state, AgentState::Idle | AgentState::IdleWithInput),
+            "{id}"
+        );
+        assert!(!rule.lifecycle_evidence, "claude/{id} is measured mid-turn");
+    }
+    for (vendor, id) in [
+        ("codex", "composer_empty_or_ghost"),
+        ("agy", "composer_empty"),
+    ] {
+        let rule = all[vendor]
+            .rules
+            .iter()
+            .find(|rule| rule.id == id)
+            .unwrap_or_else(|| panic!("missing {vendor}/{id}"));
+        assert!(rule.lifecycle_evidence, "{vendor}/{id} confirms idle");
+    }
+}
+
+const RULE_120: &str = "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────";
+
+fn claude_frame(plain_rows: &[&str], esc_rows: &[&str]) -> (String, String) {
+    (plain_rows.join("\n"), esc_rows.join("\n"))
+}
+
+/// MEASURED 2026-08-26 (Claude Code 2.1.246, probe a91f, sanitized NDJSON
+/// db34242c…). After every Stop hook round, the current completed row in
+/// uniform 38;5;246 followed by the clean composer box is the terminal
+/// suffix; while a Stop hook still runs, an active 38;5;215 row sits below
+/// the completed row and the higher-priority active rule wins; the gerund
+/// may be painted 38;5;222; a plain capture never proves the terminal.
+#[test]
+fn claude_2_1_246_terminal_suffix_is_lifecycle_evidence_only_when_no_active_row_follows() {
+    let all = shipped();
+    let claude = &all["claude"];
+    let trailer_plain = "  ⏵⏵ don't ask on (shift+tab to cycle) · ← 1 agent";
+    let trailer_esc = "\u{1b}[39m  \u{1b}[38;5;210m⏵⏵ don't ask on\u{1b}[38;5;246m (shift+tab to cycle) · ← 1 agent\u{1b}[39m";
+    let rule_esc = format!("\u{1b}[38;5;244m{RULE_120}");
+
+    // Normal completion: terminal suffix wins, lifecycle evidence, clean.
+    let (plain, esc) = claude_frame(
+        &[
+            "✻ Sautéed for 3s · done 7:26 AM",
+            "  prior output row",
+            RULE_120,
+            "❯",
+            RULE_120,
+            trailer_plain,
+        ],
+        &[
+            "\u{1b}[38;5;246m✻\u{1b}[39m \u{1b}[38;5;246mSautéed for 3s · done 7:26 AM\u{1b}[39m",
+            "  prior output row",
+            &rule_esc,
+            "\u{1b}[39m❯",
+            &rule_esc,
+            trailer_esc,
+        ],
+    );
+    let rule = claude
+        .evaluate_esc("", &plain, Some(&esc))
+        .expect("a rule matches");
+    assert_eq!(rule.id, "composer_completed_terminal_suffix_2_1_246");
+    assert_eq!(rule.state, AgentState::Idle);
+    assert!(rule.lifecycle_evidence);
+    assert_eq!(rule.composer_semantic, Some(ComposerSemantic::Clean));
+    // The same frame captured plain never proves the terminal.
+    let rule = claude
+        .evaluate_esc("", &plain, None)
+        .expect("a rule matches");
+    assert_ne!(rule.id, "composer_completed_terminal_suffix_2_1_246");
+    assert!(!rule.lifecycle_evidence, "{}", rule.id);
+
+    // additionalContext returned, sibling Stop hook pending: active row below
+    // the completed row, the active rule wins.
+    let (plain, esc) = claude_frame(
+        &[
+            "✻ Sautéed for 6s · done 7:33 AM",
+            "  prior output row",
+            "· Deliberating… (running stop hooks… 1/2 · 1s · ↓ 68 tokens · thinking)",
+            "  prior output row",
+            RULE_120,
+            "❯",
+            RULE_120,
+            trailer_plain,
+        ],
+        &[
+            "\u{1b}[38;5;246m✻\u{1b}[39m \u{1b}[38;5;246mSautéed for 6s · done 7:33 AM\u{1b}[39m",
+            "  prior output row",
+            "\u{1b}[38;5;215m·\u{1b}[39m \u{1b}[38;5;215mDeliberating… \u{1b}[38;5;246m(running stop hooks… 1/2 · 1s · ↓\u{1b}[39m \u{1b}[38;5;246m68 tokens · \u{1b}[38;5;248mthinking\u{1b}[38;5;246m)",
+            "  prior output row",
+            &rule_esc,
+            "\u{1b}[38;5;246m❯\u{a0}\u{1b}[39m",
+            &rule_esc,
+            trailer_esc,
+        ],
+    );
+    let rule = claude
+        .evaluate_esc("", &plain, Some(&esc))
+        .expect("a rule matches");
+    assert_eq!(rule.id, "composer_working_spinner_status");
+    assert_eq!(rule.state, AgentState::Working);
+
+    // Second Stop round: gerund painted 38;5;222 with 215 inserted before the
+    // timer; the veto must still catch it.
+    let (plain, esc) = claude_frame(
+        &[
+            "✻ Sautéed for 6s · done 7:33 AM",
+            "✻ Deliberating… (running stop hooks… 0/2 · 4s · ↓ 95 tokens · thinking)",
+            RULE_120,
+            "❯",
+            RULE_120,
+            trailer_plain,
+        ],
+        &[
+            "\u{1b}[38;5;246m✻\u{1b}[39m \u{1b}[38;5;246mSautéed for 6s · done 7:33 AM\u{1b}[39m",
+            "\u{1b}[38;5;215m✻\u{1b}[39m \u{1b}[38;5;222mDeliberating…\u{1b}[38;5;215m \u{1b}[38;5;246m(running stop hooks… 0/2 · 4s · ↓\u{1b}[39m \u{1b}[38;5;246m95 tokens · thinking)",
+            &rule_esc,
+            "\u{1b}[38;5;246m❯\u{a0}\u{1b}[39m",
+            &rule_esc,
+            trailer_esc,
+        ],
+    );
+    let rule = claude
+        .evaluate_esc("", &plain, Some(&esc))
+        .expect("a rule matches");
+    assert_eq!(rule.id, "composer_working_spinner_status");
+
+    // Compact final after all hooks: an older completed row persists above the
+    // current one; the ordered suffix anchors on the current row.
+    let (plain, esc) = claude_frame(
+        &[
+            "✻ Sautéed for 6s · done 7:33 AM",
+            "  prior output row",
+            "✻ Cooked for 6s · done 7:37 AM",
+            "  prior output row",
+            RULE_120,
+            "❯",
+            RULE_120,
+            trailer_plain,
+        ],
+        &[
+            "\u{1b}[38;5;246m✻\u{1b}[39m \u{1b}[38;5;246mSautéed for 6s · done 7:33 AM\u{1b}[39m",
+            "  prior output row",
+            "\u{1b}[38;5;246m✻\u{1b}[39m \u{1b}[38;5;246mCooked for 6s · done 7:37 AM\u{1b}[39m",
+            "  prior output row",
+            &rule_esc,
+            "\u{1b}[39m❯",
+            &rule_esc,
+            trailer_esc,
+        ],
+    );
+    let rule = claude
+        .evaluate_esc("", &plain, Some(&esc))
+        .expect("a rule matches");
+    assert_eq!(rule.id, "composer_completed_terminal_suffix_2_1_246");
 }
