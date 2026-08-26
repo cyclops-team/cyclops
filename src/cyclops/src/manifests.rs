@@ -113,6 +113,7 @@ const EVER_SHIPPED_FNV64: &[&str] = &[
     "84b0dfa8ce699bb0",
     "85f276e9afffc42d",
     "884a6e869dbdea99",
+    "92e40157e2ad9b86",
     "970aabc764b3acd4",
     "97778c580f34b125",
     "98ae3fa4eca78cf3",

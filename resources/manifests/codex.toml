@@ -265,9 +265,12 @@ unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]
 # suffix began with a row the layout did not describe. Dropping blank
 # rows instead would have been worse, because an undeclared blank after
 # the sentinel is exactly how a truncated capture looks.
+# Codex 0.149.1 appends the measured `fast` service-tier token after the
+# reasoning level, so the status prefix may contain two words after the
+# model name (`gpt-5.6-sol high fast`) before the first separator.
 composer_trailer_regex = [
   '^\s*$',
-  '^\s{0,4}gpt-\S+(?: \S+)?(?: · [^·]+)+\s*$',
+  '^\s{0,4}gpt-\S+(?: \S+){0,2}(?: · [^·]+)+\s*$',
 ]
 composer_trailer_regex_esc = [
   '^(?:\x1b\[[0-9;:]*m)*\s*$',

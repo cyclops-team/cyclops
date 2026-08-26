@@ -14335,6 +14335,33 @@ mod composer_content_proof {
         }
     }
 
+    #[test]
+    fn codex_0_149_1_fast_status_keeps_exact_visible_ownership() {
+        let doorbell = "cyclops inbox claim m-att_LMRvMkzHQzixuOJNYwT8Qw";
+        let capture = concat!(
+            "\x1b[48;2;30;30;30m\n",
+            "\x1b[1m›\x1b[0m\x1b[48;2;30;30;30m ",
+            "cyclops inbox claim m-att_LMRvMkzHQzixuOJNYwT8Qw\n",
+            "\n",
+            "\x1b[49m  \x1b[38;2;246;226;183mgpt-5.6-sol high fast",
+            "\x1b[2m\x1b[39m · \x1b[0m",
+            "\x1b[38;2;171;223;167m/private/tmp/cyclops-release-final",
+            "\x1b[2m\x1b[39m · \x1b[0m",
+            "\x1b[38;2;200;169;238mWorkspace\x1b[39m\n",
+        );
+        let manifest = shipped("codex");
+
+        assert_eq!(
+            exact_staging_proof(
+                &manifest,
+                capture,
+                StagingTarget::ExactRow(doorbell),
+                doorbell,
+            ),
+            Some((true, doorbell.to_string()))
+        );
+    }
+
     /// Derived from the measured 0.149.1 prompt and trailer rows. The live
     /// 187-column capture remains release evidence; this minimized fixture
     /// proves format 3 stays exact at the supported 80-column layout.
