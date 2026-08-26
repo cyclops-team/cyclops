@@ -3633,7 +3633,7 @@ impl MailboxProjection {
                         .unwrap_or_else(|| "unknown".to_string());
                     (
                         DeliveryState::AttentionRequired,
-                        Some(format!("blocked_pre_write:{why}")),
+                        Some(cyclops_proto::delivery_pre_write_cause(&why)),
                     )
                 }
                 _ => (
@@ -13457,9 +13457,6 @@ mod tests {
         assert_eq!(store.projection().last_sequence(), Some(2));
     }
 
-    /// Clearing twice acknowledges once. A repeated command must not grow
-    /// the journal, or an operator retrying a timed-out call rewrites
-    /// history for no reason.
     /// A head whose attempt an operator resolved is not mailbox attention,
     /// even while its message is still the pending head.
     #[test]
@@ -13476,6 +13473,22 @@ mod tests {
         assert_eq!(before[0].attempt_id, Some(attempt(1)));
 
         store
+            .record_notification_resolution_intent(
+                message_id.clone(),
+                bob,
+                attempt(1),
+                NotificationResolution::Discard,
+            )
+            .unwrap();
+        store
+            .record_notification_resolution_action_accepted(
+                message_id.clone(),
+                bob,
+                attempt(1),
+                NotificationResolution::Discard,
+            )
+            .unwrap();
+        store
             .resolve_notification(
                 message_id.clone(),
                 bob,
@@ -13490,6 +13503,9 @@ mod tests {
         );
     }
 
+    /// Clearing twice acknowledges once. A repeated command must not grow
+    /// the journal, or an operator retrying a timed-out call rewrites
+    /// history for no reason.
     #[test]
     fn clearing_an_alarm_twice_appends_one_fact() {
         let (_scratch, mut store, message_id, bob) = operator_store("clear-idempotent");

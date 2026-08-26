@@ -199,9 +199,11 @@ daemon derives the exact route and subject from the referenced message.
 
 `cyclops messages` is the body-free combined view of mailbox and notification
 state. `cyclops alarm preview --older-than <age>` lists unresolved notification
-alarms and their exact attempt ids. `cyclops status` reports pane and legacy
-delivery attention plus the admin unread count; it is not the mailbox alarm
-source.
+alarms and their exact attempt ids. `cyclops status` reports blocked panes,
+legacy delivery alarms, durable mailbox attention, held queue heads, and the
+admin unread count. Its eye and `waiting on you` rows summarize that combined
+projection; use `alarm preview` when an operator needs the exact unresolved
+notification attempts.
 
 An ambiguous notification is never an invitation to resend blindly. Use its
 exact notification attempt id:

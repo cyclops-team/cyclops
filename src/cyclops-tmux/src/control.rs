@@ -1500,13 +1500,24 @@ mod tests {
 
     #[tokio::test]
     async fn a_close_before_the_first_command_byte_is_proven_unwritten() {
-        let mut child = Command::new("true")
+        // Keep the process alive after it closes stdin, and publish that
+        // close over stdout before the write. Waiting for a short-lived
+        // process to exit is not enough: pipe-close observation can race a
+        // write and turn a genuinely accepted byte into an uncertain result.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("exec 0<&-; printf 'stdin-closed\\n'; exec sleep 30")
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .spawn()
             .expect("spawn closed command sink");
         let stdin = child.stdin.take().expect("closed sink stdin");
-        child.wait().await.expect("closed sink exits");
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().expect("closed sink stdout"))
+            .read_line(&mut ready)
+            .await
+            .expect("read closed-sink readiness");
+        assert_eq!(ready, "stdin-closed\n");
         let pipe = CommandPipe {
             stdin: Arc::new(Mutex::new(Some(stdin))),
             pending: Arc::new(StdMutex::new(VecDeque::new())),
@@ -1514,10 +1525,9 @@ mod tests {
             issued: Arc::new(AtomicU64::new(0)),
         };
 
-        assert!(matches!(
-            pipe.submit("display-message -p not-sent").await,
-            Err(TmuxError::Io(_))
-        ));
+        let first = pipe.submit("display-message -p not-sent").await;
+        child.kill().await.expect("stop closed command sink");
+        assert!(matches!(first, Err(TmuxError::Io(_))));
         assert!(matches!(
             pipe.submit("display-message -p never-replay").await,
             Err(TmuxError::Disconnected)

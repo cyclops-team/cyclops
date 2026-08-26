@@ -937,21 +937,25 @@ fn waiting_rows(res: &StatusResult, style: &Style) -> Vec<String> {
             age(now_ms().saturating_sub(d.ts))
         };
         let id = &d.id;
-        let next = match (d.attempt_id.as_ref(), d.state, cause_raw) {
-            (None, _, _) => String::new(),
-            (Some(_), _, c) if c.starts_with("blocked_pre_write:") => format!(
-                " · next: fix {}; the daemon reopens the wake on the next route or composer evidence, no requeue; or the recipient claims {id} now",
-                grid::cause_words(&c["blocked_pre_write:".len()..])
-            ),
-            (Some(_), DeliveryState::ParkedBlockedQuota, "quota_reset_observed") => {
-                format!(" · next: cyclops requeue {id}")
-            }
-            (Some(_), DeliveryState::ParkedBlockedQuota, _) => {
-                format!(" · next: wait for the quota reset, then cyclops requeue {id}")
-            }
-            (Some(attempt), _, _) => format!(
-                " · next: cyclops attention show {attempt} --diff, then complete or discard; or the recipient claims {id}"
-            ),
+        let next = match d.attempt_id.as_ref() {
+            None => String::new(),
+            Some(attempt) => match cyclops_proto::delivery_pre_write_reason(cause_raw) {
+                Some(reason) => format!(
+                    " · next: fix {}; the daemon reopens the wake on the next route or composer evidence, no requeue; or the recipient claims {id} now",
+                    grid::cause_words(reason)
+                ),
+                None => match (d.state, cause_raw) {
+                    (DeliveryState::ParkedBlockedQuota, "quota_reset_observed") => {
+                        format!(" · next: cyclops requeue {id}")
+                    }
+                    (DeliveryState::ParkedBlockedQuota, _) => {
+                        format!(" · next: wait for the quota reset, then cyclops requeue {id}")
+                    }
+                    (_, _) => format!(
+                        " · next: cyclops attention show {attempt} --diff, then complete or discard; or the recipient claims {id}"
+                    ),
+                },
+            },
         };
         let detail = style.dim(&format!("{cause} · {id} · {when}{next}"));
         format!("  {}  {badge} · {detail}", style.role(&d.to, &pad(&d.to, to_w)))
@@ -1549,7 +1553,9 @@ mod tests {
         );
         assert!(out.contains("or the recipient claims m-held"), "{out}");
 
-        // A legacy row without an attempt id keeps its old detail line.
+        // Isolate the legacy half: a row without an attempt id keeps its old
+        // detail line without inheriting the mailbox row's action.
+        res.mailbox_attention.clear();
         res.open_deliveries = vec![open_delivery(
             "m-old",
             "reviewer",
@@ -2384,10 +2390,6 @@ mod tests {
     #[test]
     fn status_reports_live_panes_without_durable_delivery_alarms() {
         let mut res = fixture();
-        res.open_deliveries = vec![
-            open_delivery("m-1", "implementer", DeliveryState::ParkedBlockedQuota),
-            open_delivery("m-2", "reviewer", DeliveryState::AttentionRequired),
-        ];
         let got = render_status(&res, &Style::none(), Path::new("/x/config.toml"));
         let expected = format!(
             "‿ cyclops · watching main · tmux 3.6a · up 2m\n\
@@ -2414,14 +2416,14 @@ mod tests {
     }
 
     #[test]
-    fn status_never_renders_historical_delivery_rows() {
+    fn status_never_renders_settled_delivery_rows() {
         let mut res = fixture();
         res.open_deliveries = (0..10)
             .map(|index| {
                 let mut delivery = open_delivery(
                     &format!("m-{index:02}"),
                     "reviewer",
-                    DeliveryState::AttentionRequired,
+                    DeliveryState::DeliveredVerified,
                 );
                 delivery.ts = index + 1;
                 delivery

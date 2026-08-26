@@ -350,12 +350,12 @@ pub struct Manifests {
     pub dir: Option<String>,
 }
 
-/// One delivery still waiting on a human: redelivery exhausted, or a quota
-/// park (which never auto-retries, so nothing but an operator moves it).
+/// One legacy delivery alarm or durable mailbox wake still waiting on a human.
 ///
-/// Identity is (to, id), the same pair the delivery chain carries in the
-/// ledger, so a client can match a seeded item against the transitions it
-/// later sees on the wire and clear it on the right one.
+/// Mailbox rows include open attention attempts and held queue heads, including
+/// pre-write blocks and quota holds. Current rows are identified by exact
+/// recipient plus message id. `to` is a display label and is an identity
+/// fallback only for compatibility rows that predate durable recipient keys.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenDelivery {
     /// Message id this delivery belongs to, e.g. "m-3f9c2a".

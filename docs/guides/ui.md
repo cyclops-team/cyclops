@@ -190,16 +190,15 @@ agent of a state line. While pinned it takes the newest entry.
 The header carries cyclops's mark: `‿` closed when calm, `◑` opening
 with one attention item, `◉` open with the count beside it.
 
-The stream counts two things: an agent whose state is blocked, and a
-delivery that parked on a quota or ran out of redelivery. Normal
-`cyclops status` uses the same eye vocabulary and the same folded record:
-its eye counts blocked panes, legacy delivery alarms, and durable mailbox
-attention and held queue heads, exactly as the stream does, and its `waiting
-on you` rows name the next action for each. The stream takes the mailbox half of
-that record from every `messages.snapshot` its refresh gate accepts, stamped
-by the same `workspace_seq` as the Messages view, so a durable alarm that
-appears or clears while the stream is open moves its eye on that edge, with
-no second read and no reconnect. Mailbox, alarm, and stream
+The stream counts two things: an agent whose state is blocked, and a delivery
+whose normalized state needs a human. Normal `cyclops status` uses the same eye
+vocabulary and the same folded record: its eye counts blocked panes, legacy
+delivery alarms, durable mailbox attention, and held queue heads exactly as the
+stream does, and its `waiting on you` rows name the next action for each. The
+stream takes the mailbox half of that record from every `messages.snapshot` its
+refresh gate accepts, stamped by the same `workspace_seq` as the Messages view,
+so a durable alarm that appears or clears while the stream is open moves its eye
+on that edge, with no second read and no reconnect. Mailbox, alarm, and stream
 surfaces provide the actions that resolve them. Both scopes are owned by
 `src/cyclops-proto/src/attention.rs`.
 
@@ -210,12 +209,12 @@ names every delivery it closed, so it stands while any of them still
 does. The firehose keeps every ping either way, and a ping that names
 nothing (your own, through the `admin.notify` verb) is never dropped.
 
-An agent's item is tracked per pane, so the state a pane reports before
-you name it and the state it reports after are the same item: adopting a
-pane never strands an item nothing can clear. A delivery's item is
-tracked per message, so only that message's own next transition clears
-it: a later message to the same recipient, however it lands, never
-closes an unresolved one.
+An agent's item is tracked per pane, so the state a pane reports before you name
+it and the state it reports after are the same item: adopting a pane never
+strands an item nothing can clear. A delivery's item is tracked by exact
+recipient plus message id. A display label is a fallback only for legacy rows
+without durable identity. Only that recipient's transition for that message may
+clear the item, so broadcasts and shared aliases cannot clear one another.
 
 ### Where the count comes from
 

@@ -933,9 +933,19 @@ impl App {
 
     /// Entries the current view and filter admit, oldest first.
     pub fn visible(&self) -> Vec<&Entry> {
+        // Freeze the register lookup once for this frame. Admin pings must
+        // still answer to the current attention set, but rebuilding that set
+        // once per entry makes a large ring cost entries times open items.
+        let admission = (self.view != View::Firehose).then(|| self.record.admin_admission());
         self.record
             .entries()
-            .filter(|e| self.admits_in_view(e))
+            .filter(|e| {
+                self.view == View::Firehose
+                    || (!self.filter.is_empty() && matches!(&e.kind, EntryKind::Msg { .. }))
+                    || self
+                        .record
+                        .admits_with(e, admission.as_ref().expect("non-firehose admission"))
+            })
             .filter(|e| self.filter.matches(e))
             .collect()
     }

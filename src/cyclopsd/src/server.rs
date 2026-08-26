@@ -3749,12 +3749,12 @@ mod tests {
         assert_eq!(row.recipient, Some(recipient));
         assert_eq!(row.attempt_id, Some(attempt_id));
         assert_eq!(row.state, cyclops_proto::DeliveryState::AttentionRequired);
-        assert!(
+        assert_eq!(
             row.cause
                 .as_deref()
-                .is_some_and(|cause| cause.starts_with("blocked_pre_write:")),
-            "cause must name the real state: {:?}",
-            row.cause
+                .and_then(cyclops_proto::delivery_pre_write_reason),
+            Some(cyclops_proto::NotificationPreWriteCause::BindingUnprovable.wire_name()),
+            "cause must name the real state"
         );
         assert!(
             res.blocked_notifications

@@ -16,11 +16,13 @@
 //!    or an exhausted quota. Nothing downstream clears any of the three.
 //!    A surface that only holds the gate's WORD for that state asks
 //!    [`gate_cause_needs_human`], which maps the word back onto the state.
-//! 2. A DELIVERY needs a human while its latest recorded state is one the
-//!    pipeline cannot leave on its own ([`delivery_needs_human`]):
-//!    redelivery exhausted, or a quota park, which never auto-retries
-//!    (GOALS, finding F11). Both are terminal in the record until an
-//!    operator requeues them.
+//! 2. A DELIVERY needs a human while its normalized row is
+//!    `attention_required` or `parked_blocked_quota`
+//!    ([`delivery_needs_human`]). Those rows include legacy delivery alarms,
+//!    open mailbox attention attempts, pre-write-blocked heads, and quota
+//!    holds. Recovery follows the row's cause: a pre-write block may reopen
+//!    when its evidence changes or the recipient claims it, while exhausted
+//!    redelivery and quota states require their named operator action.
 //! 3. When an item STOPS needing a human, the transition that ended it is
 //!    part of the same story, so the register hands it back ([`Resolved`])
 //!    instead of dropping the item in silence. The live mutators return
@@ -71,7 +73,7 @@
 //! behind them. Newest wins, which is why the snapshot may not be applied
 //! last.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::de::value::{Error as ValueError, StrDeserializer};
 use serde::de::IntoDeserializer;
@@ -92,6 +94,24 @@ pub fn delivery_needs_human(state: DeliveryState) -> bool {
         state,
         DeliveryState::AttentionRequired | DeliveryState::ParkedBlockedQuota
     )
+}
+
+const DELIVERY_PRE_WRITE_CAUSE_PREFIX: &str = "blocked_pre_write:";
+
+/// Encode the reason carried by a normalized pre-write mailbox row.
+///
+/// The row uses the legacy `OpenDelivery.cause` string, so producers and
+/// consumers share this protocol-owned encoding instead of matching a prefix
+/// independently.
+pub fn delivery_pre_write_cause(reason: &str) -> String {
+    format!("{DELIVERY_PRE_WRITE_CAUSE_PREFIX}{reason}")
+}
+
+/// Decode the reason carried by a normalized pre-write mailbox row.
+pub fn delivery_pre_write_reason(cause: &str) -> Option<&str> {
+    cause
+        .strip_prefix(DELIVERY_PRE_WRITE_CAUSE_PREFIX)
+        .filter(|reason| !reason.is_empty())
 }
 
 /// The rule's agent half as the delivery gate spells it.
@@ -429,6 +449,18 @@ impl Attention {
         // semantic_twins: a legacy-label row and one unique exact row for
         // the same label and message are one delivery. The exact row is
         // the durable one, so the legacy twin drops out of the union.
+        // Count exact rows once. Searching the whole union for every legacy
+        // key makes count, item, and render paths quadratic in a backlog.
+        let mut exact_counts: HashMap<String, HashMap<String, usize>> = HashMap::new();
+        for ((identity, id), (label, _)) in &union {
+            if matches!(identity, DeliveryRecipientIdentity::Exact(_)) {
+                *exact_counts
+                    .entry(label.to_string())
+                    .or_default()
+                    .entry(id.to_string())
+                    .or_default() += 1;
+            }
+        }
         let twins: Vec<_> = union
             .keys()
             .filter(|(identity, _)| matches!(identity, DeliveryRecipientIdentity::LegacyLabel(_)))
@@ -436,7 +468,10 @@ impl Attention {
                 let DeliveryRecipientIdentity::LegacyLabel(label) = identity else {
                     return false;
                 };
-                Self::unique_exact_in(&union, label, id).is_some()
+                exact_counts
+                    .get(label.as_str())
+                    .and_then(|ids| ids.get(id.as_str()))
+                    == Some(&1)
             })
             .map(|key| (*key).clone())
             .collect();
@@ -1070,6 +1105,18 @@ mod tests {
         ] {
             assert!(!s.is_blocked(), "{s} is nobody's to clear");
         }
+    }
+
+    #[test]
+    fn a_pre_write_mailbox_cause_round_trips_through_one_protocol_encoding() {
+        let encoded = delivery_pre_write_cause("binding_unprovable");
+        assert_eq!(encoded, "blocked_pre_write:binding_unprovable");
+        assert_eq!(
+            delivery_pre_write_reason(&encoded),
+            Some("binding_unprovable")
+        );
+        assert_eq!(delivery_pre_write_reason("blocked_pre_write:"), None);
+        assert_eq!(delivery_pre_write_reason("verify_failed"), None);
     }
 
     #[test]

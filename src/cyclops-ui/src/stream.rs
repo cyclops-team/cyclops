@@ -1373,17 +1373,30 @@ impl Record {
         if items.peek().is_none() {
             return true; // names nothing the register could answer for
         }
-        items.any(|item| {
-            let key = match item {
-                PingRef::Agent(pane_id) => AttentionKey::Agent {
-                    pane_id: pane_id.to_string(),
-                },
-                PingRef::Delivery { recipient, to, id } => {
-                    self.attention.key_for(recipient, to, id)
-                }
-            };
-            self.attention.holds(&key)
-        })
+        let admission = AdminAdmission::from_attention(&self.attention);
+        items.any(|item| admission.holds(item))
+    }
+
+    /// Freeze the attention lookup once for one admin-view scan.
+    ///
+    /// A frame may inspect ten thousand entries. Rebuilding the delivery
+    /// union for every notification turns that scan into entries times open
+    /// items. The index keeps the same exact-recipient and legacy-label
+    /// resolution rule while paying for the current register once.
+    pub(crate) fn admin_admission(&self) -> AdminAdmission {
+        AdminAdmission::from_attention(&self.attention)
+    }
+
+    /// Apply the calm-view rule against one frame's frozen attention index.
+    pub(crate) fn admits_with(&self, e: &Entry, admission: &AdminAdmission) -> bool {
+        if !e.admin_visible() {
+            return false;
+        }
+        let mut items = ping_items(e).peekable();
+        if items.peek().is_none() {
+            return true;
+        }
+        items.any(|item| admission.holds(item))
     }
 
     /// Counted items with no line in `visible`.
@@ -1427,6 +1440,107 @@ impl Record {
             .filter(|(_, reached)| !reached)
             .map(|(item, _)| item)
             .collect()
+    }
+}
+
+/// Attention keys frozen for one admin-view scan.
+///
+/// A label-only delivery reference resolves to one exact recipient only
+/// when exactly one standing row carries that label and message id. Missing
+/// and ambiguous exact rows retain the legacy-label key, matching
+/// `Attention::key_for` without rebuilding its delivery union per entry.
+pub(crate) struct AdminAdmission {
+    agents: HashSet<String>,
+    exact_deliveries: HashMap<RecipientKey, HashSet<String>>,
+    legacy_deliveries: HashMap<String, HashSet<String>>,
+    exact_by_label: HashMap<String, HashMap<String, Option<RecipientKey>>>,
+}
+
+impl AdminAdmission {
+    fn from_attention(attention: &Attention) -> Self {
+        let items = attention.items();
+        let mut agents = HashSet::new();
+        let mut exact_deliveries: HashMap<RecipientKey, HashSet<String>> = HashMap::new();
+        let mut legacy_deliveries: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut exact_by_label = HashMap::new();
+        for item in &items {
+            match item {
+                AttentionItem::Agent { pane_id, .. } => {
+                    agents.insert(pane_id.clone());
+                }
+                AttentionItem::Delivery {
+                    recipient: DeliveryRecipientIdentity::Exact(recipient),
+                    to,
+                    id,
+                    ..
+                } => {
+                    exact_deliveries
+                        .entry(*recipient)
+                        .or_default()
+                        .insert(id.clone());
+                    exact_by_label
+                        .entry(to.clone())
+                        .or_insert_with(HashMap::new)
+                        .entry(id.clone())
+                        .and_modify(|found: &mut Option<RecipientKey>| {
+                            if *found != Some(*recipient) {
+                                *found = None;
+                            }
+                        })
+                        .or_insert(Some(*recipient));
+                }
+                AttentionItem::Delivery {
+                    recipient: DeliveryRecipientIdentity::LegacyLabel(label),
+                    id,
+                    ..
+                } => {
+                    legacy_deliveries
+                        .entry(label.clone())
+                        .or_default()
+                        .insert(id.clone());
+                }
+            }
+        }
+        Self {
+            agents,
+            exact_deliveries,
+            legacy_deliveries,
+            exact_by_label,
+        }
+    }
+
+    fn holds(&self, item: PingRef<'_>) -> bool {
+        match item {
+            PingRef::Agent(pane_id) => self.agents.contains(pane_id),
+            PingRef::Delivery {
+                recipient: Some(recipient),
+                id,
+                ..
+            } => self
+                .exact_deliveries
+                .get(&recipient)
+                .is_some_and(|ids| ids.contains(id)),
+            PingRef::Delivery {
+                recipient: None,
+                to,
+                id,
+            } => match self
+                .exact_by_label
+                .get(to)
+                .and_then(|ids| ids.get(id))
+                .copied()
+                .flatten()
+            {
+                Some(recipient) => self
+                    .exact_deliveries
+                    .get(&recipient)
+                    .is_some_and(|ids| ids.contains(id)),
+                None => self
+                    .legacy_deliveries
+                    .get(to)
+                    .is_some_and(|ids| ids.contains(id)),
+            },
+        }
     }
 }
 

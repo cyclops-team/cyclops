@@ -320,10 +320,9 @@ fn ui_daemon_down_reports_and_exits_one() {
     let _ = fs::remove_dir_all(&home);
 }
 
-/// One blocked pane and one parked delivery, served the way cyclopsd
-/// serves them: the delivery half rides `status` only for a caller that
-/// asked (`cyclops_proto::StatusParams`), because folding it reads the
-/// session ledgers.
+/// One blocked pane and one parked delivery, served the way cyclopsd serves
+/// them: the durable delivery half rides `status` only for a caller that
+/// asked (`cyclops_proto::StatusParams`).
 fn answer(open_deliveries: bool) -> Value {
     let mut result = json!({
         "daemon_version": "0.1.0", "proto": 1, "boot_id": "b-ui",
@@ -345,7 +344,7 @@ fn answer(open_deliveries: bool) -> Value {
     result
 }
 
-/// Normal status is live fleet state. The stream also carries durable alarms.
+/// Status and the stream report the same live fleet and durable attention.
 #[test]
 fn status_stays_live_while_the_stream_carries_durable_attention() {
     let home = scratch_home("two");
@@ -370,10 +369,10 @@ fn status_stays_live_while_the_stream_carries_durable_attention() {
     let grid = stdout_of(&run_ui(&home, &["status"]));
     let stream = stdout_of(&run_ui(&home, &["ui", "--plain"]));
 
-    // The primary grid reports one blocked pane and omits durable backlog.
+    // Both surfaces count the blocked pane and the durable delivery row.
     assert_eq!(
         grid.lines().next().unwrap_or_default(),
-        "◑ 1 cyclops · watching main · tmux 3.6a · up 2m · 1 needs attention",
+        "◉ 2 cyclops · watching main · tmux 3.6a · up 2m · 2 need attention",
         "{grid}"
     );
     assert!(
@@ -383,7 +382,7 @@ fn status_stays_live_while_the_stream_carries_durable_attention() {
         "{stream}"
     );
     assert!(grid.contains("  reviewer  ⚠ blocked_permission"), "{grid}");
-    assert!(!grid.contains("implementer  ⊘ parked · quota"), "{grid}");
+    assert!(grid.contains("implementer  ⊘ parked · quota"), "{grid}");
     assert!(stream.contains("implementer  ⊘ parked · quota"), "{stream}");
     assert!(
         stream.contains("reviewer  ⚠ blocked_permission"),
