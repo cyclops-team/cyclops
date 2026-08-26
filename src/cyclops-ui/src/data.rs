@@ -161,7 +161,7 @@ pub fn spawn_io(sinks: &UiSinks, home: &Path, backfill: usize) -> Io {
     }
 }
 
-/// The two channels the event loop drives its own IO with.
+/// Bounded command handles for the event loop's serial IO workers.
 pub struct Io {
     /// Coalesced requests to the one task that owns the event subscription.
     pub reconnect: mpsc::Sender<()>,
