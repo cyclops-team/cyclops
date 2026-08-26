@@ -357,6 +357,11 @@ const PAIR_LEASE: &str = ".lease";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UpdateBoundary {
+    PairStoreRootCreated,
+    PairStoreOwnerWritten,
+    PairStoreLeaseCreated,
+    PairStorePairsCreated,
+    PairStoreSelectionsCreated,
     PairDirectoryCreated,
     ClientCopied,
     DaemonCopied,
@@ -579,6 +584,7 @@ impl PairStore {
         let prefix = std::fs::canonicalize(prefix)
             .map_err(|error| format!("resolve install prefix {}: {error}", prefix.display()))?;
         let root = prefix.join(PAIR_ROOT);
+        let mut root_created = false;
         match std::fs::symlink_metadata(&root) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create => {
@@ -590,11 +596,9 @@ impl PairStore {
                 builder
                     .create(&root)
                     .map_err(|error| format!("create pair store {}: {error}", root.display()))?;
-                write_new(
-                    &root.join(PAIR_OWNER),
-                    unsafe { libc::geteuid() }.to_string().as_bytes(),
-                    0o600,
-                )?;
+                root_created = true;
+                sync_directory(&prefix)?;
+                crossed_update_boundary(UpdateBoundary::PairStoreRootCreated);
             }
             Err(error) => {
                 return Err(format!("inspect pair store {}: {error}", root.display()).into())
@@ -602,6 +606,27 @@ impl PairStore {
         }
         require_owner_directory(&root)?;
         let owner_marker = root.join(PAIR_OWNER);
+        if create
+            && std::fs::symlink_metadata(&owner_marker)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            if !read_directory(&root, "unfinished pair store")?.is_empty() {
+                return Err("an unfinished pair store has unexpected entries"
+                    .to_string()
+                    .into());
+            }
+            write_new(
+                &owner_marker,
+                unsafe { libc::geteuid() }.to_string().as_bytes(),
+                0o600,
+            )?;
+            sync_directory(&root)?;
+            crossed_update_boundary(UpdateBoundary::PairStoreOwnerWritten);
+        } else if root_created {
+            return Err("new pair store did not create its owner marker"
+                .to_string()
+                .into());
+        }
         require_owner_regular_file(&owner_marker, 0o600)?;
         let owner = std::fs::read_to_string(&owner_marker)
             .map_err(|error| format!("read pair owner marker: {error}"))?;
@@ -611,6 +636,8 @@ impl PairStore {
                 .into());
         }
         let lease_path = root.join(PAIR_LEASE);
+        let lease_missing = std::fs::symlink_metadata(&lease_path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
         let lease = OpenOptions::new()
             .read(true)
             .write(true)
@@ -620,6 +647,10 @@ impl PairStore {
             .open(&lease_path)
             .map_err(|error| format!("open pair update lease: {error}"))?;
         require_owner_regular_file(&lease_path, 0o600)?;
+        if lease_missing {
+            sync_directory(&root)?;
+            crossed_update_boundary(UpdateBoundary::PairStoreLeaseCreated);
+        }
         if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(PairStoreOpenError::UpdateActive(format!(
                 "another Cyclops update holds the pair store lease: {}",
@@ -646,6 +677,12 @@ impl PairStore {
                         directory.display()
                     )
                 })?;
+                sync_directory(&root)?;
+                crossed_update_boundary(if name == PAIRS_DIR {
+                    UpdateBoundary::PairStorePairsCreated
+                } else {
+                    UpdateBoundary::PairStoreSelectionsCreated
+                });
             }
             require_owner_directory(&directory)?;
         }
@@ -2840,6 +2877,18 @@ fn validate_uninstall_pair(prefix: &Path) -> Result<PathBuf, String> {
     Ok(daemon)
 }
 
+fn restart_pre_activation_pair(
+    store: &PairStore,
+    prefix: &Path,
+    selected: Option<&Selection>,
+) -> Result<(), String> {
+    if selected.is_some() {
+        start_and_prove_selected(store)
+    } else {
+        start_pair_daemon(&prefix.join("cyclopsd"))
+    }
+}
+
 fn run_install_pair(source: &Path, prefix: &Path, style: &Style) -> i32 {
     let scratch = match Scratch::create() {
         Ok(scratch) => scratch,
@@ -2866,22 +2915,6 @@ fn run_install_pair(source: &Path, prefix: &Path, style: &Style) -> i32 {
         Ok(pair) => pair,
         Err(error) => {
             eprintln!("install failed: {error}");
-            return 1;
-        }
-    };
-    let replay = match prove_candidate_replay(&pair, &cyclops_proto::cyclops_home(), &scratch) {
-        Ok(replay) => replay,
-        Err(error) => {
-            let _ = store.discard(&candidate);
-            eprintln!("install failed: candidate replay proof failed: {error}");
-            return 1;
-        }
-    };
-    let build = match identity_build(&replay.pair.identity) {
-        Ok(build) => build,
-        Err(error) => {
-            let _ = store.discard(&candidate);
-            eprintln!("install failed: candidate replay proof failed: {error}");
             return 1;
         }
     };
@@ -2918,12 +2951,39 @@ fn run_install_pair(source: &Path, prefix: &Path, style: &Style) -> i32 {
             return 1;
         }
     };
+    let replay = match prove_candidate_replay(&pair, &cyclops_proto::cyclops_home(), &scratch) {
+        Ok(replay) => replay,
+        Err(error) => {
+            if stopped.is_some() {
+                if let Err(restart_error) =
+                    restart_pre_activation_pair(&store, prefix, before_migration.as_ref())
+                {
+                    eprintln!("  previous daemon restart failed: {restart_error}");
+                }
+            }
+            let _ = store.discard(&candidate);
+            eprintln!("install failed: candidate replay proof failed: {error}");
+            return 1;
+        }
+    };
+    let build = match identity_build(&replay.pair.identity) {
+        Ok(build) => build,
+        Err(error) => {
+            if stopped.is_some() {
+                if let Err(restart_error) =
+                    restart_pre_activation_pair(&store, prefix, before_migration.as_ref())
+                {
+                    eprintln!("  previous daemon restart failed: {restart_error}");
+                }
+            }
+            let _ = store.discard(&candidate);
+            eprintln!("install failed: candidate replay proof failed: {error}");
+            return 1;
+        }
+    };
     if let Err(error) = store.migrate_direct_pair(&candidate) {
         if stopped.is_some() {
-            let restart = match before_migration.as_ref() {
-                Some(_) => start_and_prove_selected(&store),
-                None => start_pair_daemon(&prefix.join("cyclopsd")),
-            };
+            let restart = restart_pre_activation_pair(&store, prefix, before_migration.as_ref());
             if let Err(restart_error) = restart {
                 eprintln!("  previous daemon restart failed: {restart_error}");
             }
@@ -2995,9 +3055,9 @@ fn run_install_pair(source: &Path, prefix: &Path, style: &Style) -> i32 {
     0
 }
 
-/// Prove the selected known-good pair can replay current daemon inputs before
-/// any daemon stop or selector change. The pair-store lease keeps this
-/// selection stable until rollback either commits or returns.
+/// Prove the selected known-good pair can replay the quiesced daemon inputs
+/// before any selector change. The pair-store lease keeps this selection
+/// stable until rollback either commits or returns.
 fn prove_selected_rollback_replay(
     store: &PairStore,
     source_home: &Path,
@@ -3041,14 +3101,6 @@ fn run_rollback(style: &Style) -> i32 {
             return 1;
         }
     };
-    let replay =
-        match prove_selected_rollback_replay(&store, &cyclops_proto::cyclops_home(), &scratch) {
-            Ok(replay) => replay,
-            Err(error) => {
-                eprintln!("rollback failed: {error}");
-                return 1;
-            }
-        };
     let selected_daemon = match store.active_binary("cyclopsd") {
         Ok(daemon) => daemon,
         Err(error) => {
@@ -3063,6 +3115,19 @@ fn run_rollback(style: &Style) -> i32 {
             return 1;
         }
     };
+    let replay =
+        match prove_selected_rollback_replay(&store, &cyclops_proto::cyclops_home(), &scratch) {
+            Ok(replay) => replay,
+            Err(error) => {
+                if stopped.is_some() {
+                    if let Err(restart_error) = start_and_prove_selected(&store) {
+                        eprintln!("  previous daemon restart failed: {restart_error}");
+                    }
+                }
+                eprintln!("rollback failed: {error}");
+                return 1;
+            }
+        };
     let (prior, restored) = match store.rollback(replay) {
         Ok(swapped) => swapped,
         Err(error) => {
@@ -3879,6 +3944,64 @@ sys.exit(43)"#,
             assert_eq!(
                 journal_after.permissions().mode(),
                 journal_before.permissions().mode()
+            );
+        }
+    }
+
+    #[test]
+    fn every_pair_store_initialization_boundary_recovers_on_the_next_open() {
+        for boundary in [
+            UpdateBoundary::PairStoreRootCreated,
+            UpdateBoundary::PairStoreOwnerWritten,
+            UpdateBoundary::PairStoreLeaseCreated,
+            UpdateBoundary::PairStorePairsCreated,
+            UpdateBoundary::PairStoreSelectionsCreated,
+        ] {
+            let scratch = Scratch::create().unwrap();
+            let prefix = scratch.path().join("bin");
+            directory(&prefix);
+
+            crash_at(boundary, || {
+                let _ = PairStore::open(&prefix);
+            });
+
+            let recovered = PairStore::open(&prefix).unwrap();
+            recovered.require_root().unwrap();
+            require_exact_entries(
+                &recovered.root,
+                &[PAIR_OWNER, PAIR_LEASE, PAIRS_DIR, SELECTIONS_DIR],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn production_pair_changes_stop_the_daemon_before_replay_snapshot() {
+        let source = include_str!("update.rs");
+        for (function, stop_call, replay_call) in [
+            (
+                "fn run_install_pair(",
+                "let stop_result =",
+                "prove_candidate_replay(&pair",
+            ),
+            (
+                "fn run_rollback(",
+                "stop_selected_for_pair_change(&selected_daemon)",
+                "prove_selected_rollback_replay(&store",
+            ),
+        ] {
+            let body = source
+                .split_once(function)
+                .expect("production pair-change function")
+                .1
+                .split_once("\n}\n")
+                .expect("production pair-change body")
+                .0;
+            let stopped = body.find(stop_call).expect("exact daemon stop");
+            let replayed = body.find(replay_call).expect("private replay proof");
+            assert!(
+                stopped < replayed,
+                "{function} copied live journals before stopping the daemon"
             );
         }
     }

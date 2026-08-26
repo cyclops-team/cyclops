@@ -528,9 +528,11 @@ cyclops 0.1.0 (1e16081)
 Behind a newer commit, updating clones the repository and builds a candidate
 pair. The candidate CLI and daemon must report one build, then the candidate
 daemon must replay a private copy of the current journals before either
-installed selector changes. Durable records and operator-edited setup files in
-your home are preserved. Known unedited shipped themes, manifests, hook
-artifacts, and skills may advance with the installed release.
+installed selector changes. A running daemon is authenticated, quiesced, and
+stopped before that copy is taken, then restarted on the old pair if replay
+fails. Durable records and operator-edited setup files in your home are
+preserved. Known unedited shipped themes, manifests, hook artifacts, and skills
+may advance with the installed release.
 
 The selected-pair record stores a content-free replay attestation bound to the
 exact client and daemon hashes plus the private snapshot identity. Older
@@ -595,11 +597,13 @@ To restore the retained pair explicitly:
 cyclops update --rollback
 ```
 
-Rollback validates the retained pair and proves it can replay a private copy
-of the current journals before changing the selector. It does not copy
+Rollback validates the retained pair, quiesces and stops the authenticated
+daemon, then proves the retained pair can replay a private copy of the stable
+current journals before changing the selector. A failed proof restarts the
+unchanged active pair. Rollback does not copy
 binaries, rewrite journals, restore earlier configuration, or promise
-compatibility beyond that replay proof. A running daemon is quiesced and
-restarted on the retained pair. A stopped daemon stays stopped.
+compatibility beyond that replay proof. A running daemon restarts on the
+retained pair after the selector changes. A stopped daemon stays stopped.
 After a legacy first migration, rollback becomes available after the next
 matched update because no unproven legacy pair is advertised as known-good.
 
