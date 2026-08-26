@@ -41,7 +41,11 @@ the composer was written or that the message was claimed. The protocol
 reference owns the closed [`wake_block` vocabulary](../reference/PROTOCOL.md#msgsend).
 
 A position such as `2 ahead` is the recipient mailbox's FIFO position. The
-daemon never bypasses an older pending message.
+daemon never bypasses an older pending message. When the oldest pending
+message is not moving (`attention_required`, quota held, or blocked before
+write), `cyclops messages` prints one `held queue` line naming that recipient,
+the head message id, its cause, and how many wait behind it, and every
+follower cell reads `N ahead · behind <id> (<cause>)`.
 
 The body and wake use different paths. Doorbell mode never pastes the message
 body. A terminal wake stages one `inbox claim` command, while a pull client may
@@ -164,7 +168,9 @@ accepted m-c82d11
 Admin mail receives no pane notification. `cyclops status` shows the pending
 admin count. A same-user shell with no agent-vendor ancestor reads it with the
 same `cyclops inbox list` and `cyclops inbox claim <id>` commands, including a
-shell inside a watched pane. A vendor process gets an agent identity only
+shell inside a watched pane. A claim by id may take a later message; when it
+does, the answer names the oldest pending message it skipped, which still
+holds that mailbox's head, and `inbox next` claims oldest-first. A vendor process gets an agent identity only
 through its current watched pane. Broadcast `*` targets agent panes only; name
 `admin` explicitly when the operator needs a durable message.
 
@@ -245,7 +251,13 @@ those diff inputs to its journal or log.
 
 `cyclops requeue <message-id>` is an explicit operator action for a notification
 that is still eligible. `cyclops alarm clear <attempt-id>...` appends explicit
-clearances to the content-free notification alarm register. For an age-selected
+clearances to the content-free notification alarm register. A clearance
+acknowledges; it retires nothing. Under each cleared id the command prints the
+attempt's state and cause, the message and recipient it still holds, and the
+two actions that release it: a recipient claim, or `attention show --diff`
+followed by `complete` or `discard` (or `requeue` after the cause is fixed).
+At daemon start, every open attempt that no automatic reconciliation can
+retire is listed once to the operator with the same two actions. For an age-selected
 set, `cyclops alarm clear --older-than <age>` previews and prints the exact ids,
 then requires typing `clear` at a confirmation that names the count and cutoff.
 The clear request contains only those frozen ids, so a newer alarm cannot enter

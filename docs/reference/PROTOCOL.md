@@ -484,6 +484,12 @@ mailbox entry, and returns the immutable payload:
     "subject":"Review the rate limiter","thread_root":"m-7fe0df"}}}
 ```
 
+A fresh claim of a message that is not the caller's oldest pending one also
+returns the additive optional `skipped_oldest`: the oldest pending message id
+at claim time, which still holds that recipient's FIFO head and its wake. The
+field is absent for oldest-first claims, for repeat claims, and in answers to
+clients that predate it; those clients ignore it.
+
 When the `message_id` is the canonical reserved `m-att_` locator from a format
 3 doorbell, `inbox.claim` resolves the current attempt and claims its bound
 message under one mailbox-store lock. A stale or foreign issued attempt never
