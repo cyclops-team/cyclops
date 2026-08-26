@@ -1552,8 +1552,8 @@ impl About {
 
 /// Write a kind=system admin notification line and broadcast the event.
 /// `session_idx` scopes internal (delivery-driven) notifications to the
-/// recipient's ledger; None (external admin.notify) writes to every
-/// session ledger so any single-session reader sees it.
+/// recipient's ledger; None (external admin.notify) writes to every active
+/// canonical session ledger so any live single-session reader sees it.
 pub(crate) fn admin_notify(
     inner: &Arc<Inner>,
     level: NotifyLevel,
@@ -1612,7 +1612,11 @@ pub(crate) fn admin_notify(
     };
     let sessions: Vec<usize> = match session_idx {
         Some(i) => vec![i],
-        None => (0..inner.session_count()).collect(),
+        None => inner
+            .active_session_slots()
+            .into_iter()
+            .map(|(idx, _)| idx)
+            .collect(),
     };
     let mut first_seq = None;
     for idx in sessions {

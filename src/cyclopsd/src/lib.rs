@@ -275,6 +275,12 @@ pub(crate) struct Inner {
     pub(crate) extra_tasks: StdMutex<Vec<JoinHandle<()>>>,
 }
 
+#[cfg(test)]
+struct SessionRenamePause {
+    entered: std::sync::mpsc::Sender<()>,
+    release: Arc<std::sync::Barrier>,
+}
+
 pub(crate) struct SessionSlot {
     /// Mutable so a followed session rename (`PaneEvent::SessionRenamed`,
     /// `handle_pane_event`) can update it in place: `session_index` then
@@ -293,6 +299,12 @@ pub(crate) struct SessionSlot {
     /// `usize::MAX` means canonical. Any other value is the canonical slot's
     /// append-only index.
     alias_of: AtomicUsize,
+    /// Wakes an already-published session task when this slot loses a rename
+    /// collision. The atomic above is the state; this channel is only the
+    /// edge that makes a blocked task observe it immediately.
+    alias_changed: watch::Sender<Option<usize>>,
+    #[cfg(test)]
+    rename_pause: StdMutex<Option<SessionRenamePause>>,
     pub(crate) link: StdMutex<SessionLink>,
     /// Append-only session ledger at $CYCLOPS_HOME/ledger/<session>.ndjson,
     /// opened once when the slot is created (`boot`, `watch_session`) and
@@ -331,9 +343,13 @@ impl SessionSlot {
     /// and `watch_session` both build slots this way so the two paths a
     /// session can join the daemon by stay in lockstep.
     pub(crate) fn new(name: String, ledger: Arc<LedgerWriter>) -> Self {
+        let (alias_changed, _) = watch::channel(None);
         SessionSlot {
             name: StdMutex::new(name),
             alias_of: AtomicUsize::new(usize::MAX),
+            alias_changed,
+            #[cfg(test)]
+            rename_pause: StdMutex::new(None),
             link: StdMutex::new(SessionLink::default()),
             ledger,
             last_panes: StdMutex::new(HashMap::new()),
@@ -373,16 +389,22 @@ impl SessionSlot {
 
     /// Retire this slot behind `canonical_idx` without invalidating its
     /// historical index. Only the session-registration transaction calls
-    /// this, and only for a detached collision target.
+    /// this. A live loser is woken so its task tears down its duplicate
+    /// watcher instead of waiting for another tmux event.
     fn retire_as_alias(&self, canonical_idx: usize) -> bool {
-        self.alias_of
+        let retired = self
+            .alias_of
             .compare_exchange(
                 usize::MAX,
                 canonical_idx,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_ok()
+            .is_ok();
+        if retired {
+            self.alias_changed.send_replace(Some(canonical_idx));
+        }
+        retired
     }
 
     /// Current observed rows while attached, otherwise the retained rows.
@@ -2689,7 +2711,7 @@ pub(crate) async fn watch_session(
                 .then_some(idx)
         })
     {
-        rename_session_slot_locked(inner, idx, name.to_string());
+        rename_session_slot_locked(inner, idx, name.to_string(), None);
         return Ok((idx, false));
     }
     let descendant = PathBuf::from("ledger").join(format!("{name}.ndjson"));
@@ -2967,6 +2989,9 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                     }
                 }
                 watcher.shutdown().await;
+                if slot.alias_of().is_some() {
+                    return;
+                }
                 if *stop.borrow() {
                     return;
                 }
@@ -3104,7 +3129,28 @@ fn session_lifecycle(inner: &Arc<Inner>, idx: usize, attached: bool) {
 /// runtime is not durable across a restart by design, and neither is a
 /// rename of one. A restart re-reads `sessions` and watches the OLD name
 /// again, same as it always has).
-fn rename_session_slot(inner: &Arc<Inner>, idx: usize, new_name: String) {
+fn rename_session_slot(inner: &Arc<Inner>, idx: usize, new_name: String) -> bool {
+    rename_session_slot_with_identity(inner, idx, new_name, None)
+}
+
+fn rename_session_slot_with_identity(
+    inner: &Arc<Inner>,
+    idx: usize,
+    new_name: String,
+    observed_instance_id: Option<SessionInstanceId>,
+) -> bool {
+    #[cfg(test)]
+    if let Some(slot) = inner.session(idx) {
+        let pause = slot
+            .rename_pause
+            .lock()
+            .expect("session rename pause lock")
+            .take();
+        if let Some(pause) = pause {
+            pause.entered.send(()).expect("rename pause receiver");
+            pause.release.wait();
+        }
+    }
     let _registration = inner
         .session_registration
         .lock()
@@ -3113,48 +3159,71 @@ fn rename_session_slot(inner: &Arc<Inner>, idx: usize, new_name: String) {
     // lands after that barrier would split the slot name from the registry
     // name while restore is reading both, leaving Cyclops chrome behind.
     if inner.engine.is_stopping() {
-        return;
+        return true;
     }
-    rename_session_slot_locked(inner, idx, new_name);
+    rename_session_slot_locked(inner, idx, new_name, observed_instance_id)
 }
 
-fn rename_session_slot_locked(inner: &Arc<Inner>, idx: usize, new_name: String) {
+fn rename_session_slot_locked(
+    inner: &Arc<Inner>,
+    idx: usize,
+    new_name: String,
+    observed_instance_id: Option<SessionInstanceId>,
+) -> bool {
     let Some(slot) = inner.session(idx) else {
-        return;
+        return false;
     };
     if !slot.is_canonical() {
-        return;
+        return false;
     }
     let old_name = slot.name();
     if old_name == new_name {
-        return;
+        return true;
     }
 
     // A runtime-created session can be watched under its temporary name and
     // then renamed onto a configured name whose slot is still detached. The
-    // source slot owns the live watcher and therefore wins. The detached slot
+    // source slot owns the live watcher and therefore wins. The other slot
     // cannot be removed because its index may already be held by a task or a
-    // historical cursor; retire it as an alias instead. Its session task sees
-    // the alias before it can publish a second watcher for the same tmux
-    // session.
+    // historical cursor; retire it as an alias instead. If its task won the
+    // registration race and attached first, matching durable session identity
+    // proves both watchers follow the same tmux session and wakes the loser so
+    // it tears its duplicate connection down.
+    let source_instance_id = observed_instance_id.or_else(|| {
+        slot.link
+            .lock()
+            .expect("session link lock")
+            .identity
+            .as_ref()
+            .map(SessionIdentityBinding::session_instance_id)
+    });
     let collision = inner
         .active_session_slots()
         .into_iter()
         .find(|(other_idx, other)| *other_idx != idx && other.name() == new_name);
     let retired = if let Some((other_idx, other)) = collision {
-        let target_is_live = {
+        let (target_is_live, target_instance_id) = {
             let link = other.link.lock().expect("session link lock");
-            link.attached || link.watcher.is_some()
+            (
+                link.attached || link.watcher.is_some(),
+                link.identity
+                    .as_ref()
+                    .map(SessionIdentityBinding::session_instance_id),
+            )
         };
-        if target_is_live {
+        let same_live_identity = matches!(
+            (source_instance_id, target_instance_id),
+            (Some(source), Some(target)) if source == target
+        );
+        if target_is_live && !same_live_identity {
             error!(
                 source_idx = idx,
                 target_idx = other_idx,
                 old_name = %old_name,
                 new_name = %new_name,
-                "refusing to merge two live session slots after a rename collision"
+                "refusing to merge live session slots without matching durable identity"
             );
-            return;
+            return true;
         }
         if !other.retire_as_alias(idx) {
             error!(
@@ -3163,9 +3232,9 @@ fn rename_session_slot_locked(inner: &Arc<Inner>, idx: usize, new_name: String) 
                 new_name = %new_name,
                 "rename collision target changed before it could be retired"
             );
-            return;
+            return true;
         }
-        Some((other_idx, other))
+        Some((other_idx, other, target_is_live))
     } else {
         None
     };
@@ -3188,12 +3257,13 @@ fn rename_session_slot_locked(inner: &Arc<Inner>, idx: usize, new_name: String) 
     }
     refresh_mailbox_and_schedule(inner);
     info!(old_name = %old_name, new_name = %new_name, "session renamed; daemon slot now follows tmux");
-    if let Some((alias_idx, alias)) = retired {
+    if let Some((alias_idx, alias, was_live)) = retired {
         info!(
             canonical_idx = idx,
             alias_idx,
             session = %new_name,
-            "retired a detached session slot after a rename collision"
+            was_live,
+            "retired a duplicate session slot after a rename collision"
         );
         inner.append_line(
             alias_idx,
@@ -3221,6 +3291,7 @@ fn rename_session_slot_locked(inner: &Arc<Inner>, idx: usize, new_name: String) 
             }),
         ),
     );
+    true
 }
 
 /// Reconcile daemon-owned pane routes after its watcher receiver lagged.
@@ -3320,6 +3391,7 @@ async fn run_session(
     let Some(slot) = inner.session(idx) else {
         return false;
     };
+    let mut alias_changed = slot.alias_changed.subscribe();
     if !slot.is_canonical() {
         return false;
     }
@@ -3332,7 +3404,12 @@ async fn run_session(
     // below is idempotent with this check.
     let live_name = watcher.session();
     if inner.session(idx).is_some_and(|s| s.name() != live_name) {
-        rename_session_slot(inner, idx, live_name);
+        rename_session_slot_with_identity(
+            inner,
+            idx,
+            live_name,
+            Some(binding.session_instance_id()),
+        );
     }
     if !slot.is_canonical() || slot.name() != watcher.session() {
         return false;
@@ -3416,6 +3493,12 @@ async fn run_session(
     let mut debounce: HashMap<String, watch::Sender<u64>> = HashMap::new();
     loop {
         tokio::select! {
+            biased;
+            changed = alias_changed.changed() => {
+                if changed.is_err() || !slot.is_canonical() {
+                    return true;
+                }
+            }
             _ = stop.changed() => return true,
             ev = rx.recv() => match ev {
                 Ok(ev) => {
@@ -3437,8 +3520,9 @@ async fn run_session(
                     if inner
                         .session(idx)
                         .is_some_and(|s| s.name() != live_name)
+                        && !rename_session_slot(inner, idx, live_name)
                     {
-                        rename_session_slot(inner, idx, live_name);
+                        return true;
                     }
                     warn!(session = %watcher.session(), missed, "event stream lagged; reconciling");
                     if watcher.reconcile_now().await.is_err() {
@@ -4199,10 +4283,7 @@ async fn handle_pane_event(
         // guarantees the slot is renamed before any event the watcher
         // emits after the rename gets processed. See `emit_state`'s doc
         // comment for what breaks if that ordering did not hold.
-        PaneEvent::SessionRenamed { name } => {
-            rename_session_slot(inner, session_idx, name);
-            false
-        }
+        PaneEvent::SessionRenamed { name } => !rename_session_slot(inner, session_idx, name),
         PaneEvent::Reconciled => {
             let outcome = match reconcile_missed_pane_routes(inner, session_idx, watcher) {
                 Ok(outcome) => outcome,
@@ -6329,7 +6410,7 @@ process_names = ["never"]
     /// resolution failed as ambiguous. The live source slot must become the
     /// sole canonical owner while the configured slot remains readable only as
     /// a historical alias.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_runtime_session_renamed_onto_a_configured_slot_has_one_live_owner() {
         if !cyclops_testrig::tmux_available() {
             eprintln!("skipping: tmux not on PATH");
@@ -6349,9 +6430,8 @@ process_names = ["never"]
             mutable.stop = stop_rx;
         }
 
-        // This is the configured `research` slot. It deliberately has no task
-        // yet, making the rename collision deterministic; after retirement we
-        // start its task and prove it refuses to attach.
+        // The rename pause below lets this configured slot's real session task
+        // attach before the runtime watcher handles the edge.
         let configured_ledger = LedgerWriter::open(
             &inner.state_root,
             Path::new("ledger/research.ndjson"),
@@ -6367,7 +6447,6 @@ process_names = ["never"]
             sessions.push(Arc::clone(&configured));
             sessions.len() - 1
         };
-
         let (runtime_idx, added) = watch_session(&inner, "yahirh")
             .await
             .expect("runtime session is watched");
@@ -6376,7 +6455,30 @@ process_names = ["never"]
         let runtime_binding = wait_for_session_binding(&runtime, None).await;
         assert!(runtime.link.lock().unwrap().attached);
 
+        let (rename_entered_tx, rename_entered_rx) = std::sync::mpsc::channel();
+        let rename_release = Arc::new(std::sync::Barrier::new(2));
+        *runtime.rename_pause.lock().unwrap() = Some(SessionRenamePause {
+            entered: rename_entered_tx,
+            release: Arc::clone(&rename_release),
+        });
         server.run_ok(&["rename-session", "-t", "=yahirh", "research"]);
+        rename_entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("runtime rename handler reaches the registration race");
+        let configured_task = tokio::spawn(session_task(
+            Arc::clone(&inner),
+            configured_idx,
+            inner.stop.clone(),
+        ));
+        let configured_binding = wait_for_session_binding(&configured, None).await;
+        assert!(configured.link.lock().unwrap().attached);
+        assert_eq!(
+            configured_binding.session_instance_id(),
+            runtime_binding.session_instance_id(),
+            "both live watchers must be proven to follow the same tmux session"
+        );
+        rename_release.wait();
+
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if configured.alias_of() == Some(runtime_idx) && runtime.name() == "research" {
@@ -6388,19 +6490,15 @@ process_names = ["never"]
         .await
         .expect("rename collision is coalesced");
 
-        // The configured task can wake after the rename. It must observe the
-        // alias and exit instead of publishing a second watcher.
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            tokio::spawn(session_task(
-                Arc::clone(&inner),
-                configured_idx,
-                inner.stop.clone(),
-            )),
-        )
-        .await
-        .expect("retired task exits")
-        .expect("retired task does not panic");
+        tokio::time::timeout(Duration::from_secs(5), configured_task)
+            .await
+            .expect("active retired task exits")
+            .expect("retired task does not panic");
+        {
+            let link = configured.link.lock().unwrap();
+            assert!(!link.attached);
+            assert!(link.watcher.is_none());
+        }
 
         assert_eq!(inner.session_count(), 2, "both ledger indices remain");
         assert!(inner.session(configured_idx).is_some());
@@ -6449,6 +6547,27 @@ process_names = ["never"]
                 .as_ref()
                 .is_some_and(|data| data["event"] == "session_slot_aliased")
         }));
+        let alias_line_count = alias_facts.len();
+        delivery::admin_notify(
+            &inner,
+            cyclops_proto::NotifyLevel::Fyi,
+            "canonical-only notification",
+            "alias ledgers are historical",
+            None,
+            None,
+            delivery::About::default(),
+        );
+        assert_eq!(
+            configured.ledger.read_after(0).unwrap().len(),
+            alias_line_count,
+            "global live notifications must not extend a retired ledger"
+        );
+        assert!(runtime
+            .ledger
+            .read_after(0)
+            .unwrap()
+            .iter()
+            .any(|line| { line.subject.as_deref() == Some("canonical-only notification") }));
 
         let _ = stop_tx.send(true);
         let tasks = std::mem::take(&mut *inner.extra_tasks.lock().unwrap());
