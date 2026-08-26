@@ -2098,14 +2098,18 @@ fn staged_hold_ready(entry: &DetEntry) -> bool {
 /// notification? Idle-class fused states qualify. `Unknown` qualifies only
 /// when it is the honest reading of a staged row: the screen read the row as
 /// human input (never a ghost or a bare prompt), every retained reading is
-/// idle-class (an active start's Working reading refuses), at least one
-/// reading exists (a failed or empty capture refuses), the capture is fresh
-/// and out of mode. Blocked states never qualify. The exact bytes are
+/// idle-class (an active start's Working reading refuses), a current Screen
+/// reading exists (hook-only readings, a failed or an empty capture refuse),
+/// the capture is fresh and out of mode. Blocked states never qualify. The exact bytes are
 /// proven again by the caller before any key is sent.
 fn staged_frame_is_quiet(entry: &DetEntry) -> bool {
     let idle_class =
         |state: AgentState| matches!(state, AgentState::Idle | AgentState::IdleWithInput);
-    let readings_quiet = !entry.detection.readings.is_empty()
+    let readings_quiet = entry
+        .detection
+        .readings
+        .iter()
+        .any(|reading| reading.sensor == Sensor::Screen)
         && entry
             .detection
             .readings
@@ -2117,6 +2121,91 @@ fn staged_frame_is_quiet(entry: &DetEntry) -> bool {
         && !entry.detection.stale
         && (idle_class(entry.detection.state) || unknown_staged)
         && readings_quiet
+}
+
+/// Runtime-idle admission by process-bound liveness. A separate verdict from
+/// lifecycle termination: it answers "may a wake start now?" for a pane whose
+/// lifecycle evidence is absent (a fresh pane before its first completed
+/// turn, or a pane whose completed suffix scrolled away), never "did the
+/// turn end?". It admits `Idle` only when the fused state is `unknown`
+/// because the clean composer is not lifecycle evidence, the exact current
+/// agent generation has produced an authenticated hook edge in this pane
+/// lifetime (SessionStart on a fresh pane), no start is active for that
+/// generation, and the current capture is a nonstale, out-of-mode,
+/// binding-stable frame whose screen winner is a clean idle-class composer
+/// row. It never touches a hook entry and cannot end a latch.
+#[allow(clippy::too_many_arguments)]
+fn liveness_admits_idle(
+    state: AgentState,
+    decided_by: &str,
+    screen: Option<&CompiledRule>,
+    has_screen_reading: bool,
+    liveness_verified: bool,
+    active_start: bool,
+    stale: bool,
+    in_mode: bool,
+    binding_stable: bool,
+) -> bool {
+    state == AgentState::Unknown
+        && decided_by == "idle_unconfirmed"
+        && screen.is_some_and(|rule| {
+            matches!(rule.state, AgentState::Idle | AgentState::IdleWithInput)
+                && rule.composer_semantic == Some(ComposerSemantic::Clean)
+        })
+        && has_screen_reading
+        && liveness_verified
+        && !active_start
+        && !stale
+        && !in_mode
+        && binding_stable
+}
+
+#[allow(clippy::too_many_arguments)]
+fn liveness_idle_admission(
+    inner: &Inner,
+    route: &PaneKey,
+    admitted: Option<crate::identity::ProcId>,
+    manifest_id: Option<&str>,
+    screen: Option<&CompiledRule>,
+    binding_stable: bool,
+    in_mode: bool,
+    detection: &mut Detection,
+) {
+    let (Some(agent), Some(manifest_id)) = (admitted, manifest_id) else {
+        return;
+    };
+    let liveness_verified = inner
+        .manifests
+        .get(manifest_id)
+        .is_some_and(crate::selftest::declares_hooks)
+        && inner.hook_liveness.seen_any(route, agent, manifest_id);
+    let active_start = inner
+        .hook_readings
+        .lock()
+        .expect("hook readings lock")
+        .get(route)
+        .is_some_and(|entry| entry.active_start_for(agent, Some(manifest_id)));
+    let has_screen_reading = detection
+        .readings
+        .iter()
+        .any(|reading| reading.sensor == Sensor::Screen);
+    if liveness_admits_idle(
+        detection.state,
+        &detection.decided_by,
+        screen,
+        has_screen_reading,
+        liveness_verified,
+        active_start,
+        detection.stale,
+        in_mode,
+        binding_stable,
+    ) {
+        detection.state = AgentState::Idle;
+        detection.decided_by = format!(
+            "liveness:{}",
+            screen.map(|rule| rule.id.as_str()).unwrap_or("screen")
+        );
+    }
 }
 
 fn readiness_key(entry: &DetEntry) -> ReadinessKey {
@@ -3579,6 +3668,7 @@ async fn recompute_pane_with_evidence(
 
     let mut capture_binding_changed = false;
     let mut idle_confirmed = false;
+    let mut screen_winner_id: Option<String> = None;
     let mut detection = if row.dead {
         Detection {
             state: AgentState::Dead,
@@ -3693,6 +3783,7 @@ async fn recompute_pane_with_evidence(
             .as_deref()
             .and_then(|s| screen_winner_esc(m, s, screen_esc.as_deref()));
         idle_confirmed = winner_confirms_idle(s_rule);
+        screen_winner_id = s_rule.map(|rule| rule.id.clone());
         let mut det = fuse(
             m,
             t_rule,
@@ -3845,6 +3936,21 @@ async fn recompute_pane_with_evidence(
         if let Some((reading, active_start, authoritative_end)) = hook {
             apply_hook_reading(&mut detection, reading, active_start, authoritative_end);
         }
+    }
+    if let Some(m) = manifest {
+        let screen_rule = screen_winner_id
+            .as_deref()
+            .and_then(|id| m.rules.iter().find(|rule| rule.id == id));
+        liveness_idle_admission(
+            inner,
+            &route,
+            admitted,
+            manifest_id.as_deref(),
+            screen_rule,
+            !capture_binding_changed,
+            row.in_mode,
+            &mut detection,
+        );
     }
 
     let recovery_live = recovery_recipient.and_then(|recipient| match &binding_observation {
@@ -7448,6 +7554,149 @@ regex = ['^']
             entry.unkeyed_latch_ended_by(agent, Some("fix"), 3000),
             "the hook tier still ends it"
         );
+    }
+    const SHIPPED_CLAUDE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../resources/manifests/claude.toml"
+    ));
+    /// The named sequence for a fresh Claude pane: unknown before its first
+    /// authenticated edge (SessionStart), idle once liveness is verified and
+    /// no start is active, Working immediately after UserPromptSubmit, and
+    /// never admitted while any start is active.
+    #[test]
+    fn a_fresh_claude_pane_is_unknown_until_session_start_then_idle_and_never_while_a_start_is_active(
+    ) {
+        let m = Manifest::parse(SHIPPED_CLAUDE, Path::new("claude.toml")).unwrap();
+        let rule_120 = "─".repeat(120);
+        let plain = [
+            rule_120.as_str(),
+            "❯",
+            rule_120.as_str(),
+            "  ⏵⏵ don't ask on (shift+tab to cycle)",
+        ]
+        .join("\n");
+        let styled_rule = format!("\u{1b}[38;5;244m{rule_120}");
+        let esc = [
+            styled_rule.as_str(),
+            "\u{1b}[39m❯",
+            styled_rule.as_str(),
+            "\u{1b}[39m  \u{1b}[38;5;210m⏵⏵ don't ask on\u{1b}[38;5;246m (shift+tab to cycle)\u{1b}[39m",
+        ]
+        .join("\n");
+        let s = screen_winner_esc(&m, &plain, Some(&esc));
+        assert_eq!(s.map(|r| r.id.as_str()), Some("composer_empty"));
+        assert!(
+            !winner_confirms_idle(s),
+            "composer_empty is measured mid-turn"
+        );
+        let t = title_winner(&m, "✳ Fresh pane");
+        let fused = fuse(&m, t, s, true, false, 1);
+        assert_eq!(fused.state, AgentState::Unknown);
+        assert_eq!(fused.decided_by, "idle_unconfirmed");
+        assert_eq!(fused.composer_semantic, Some(ComposerSemantic::Clean));
+        let has_screen = fused.readings.iter().any(|r| r.sensor == Sensor::Screen);
+        assert!(has_screen);
+        let admits = |verified: bool, active: bool, stale: bool, in_mode: bool, stable: bool| {
+            liveness_admits_idle(
+                fused.state,
+                &fused.decided_by,
+                s,
+                has_screen,
+                verified,
+                active,
+                stale,
+                in_mode,
+                stable,
+            )
+        };
+        assert!(
+            !admits(false, false, false, false, true),
+            "before SessionStart"
+        );
+        assert!(
+            admits(true, false, false, false, true),
+            "after SessionStart"
+        );
+        let mut admitted = fused.clone();
+        admitted.state = AgentState::Idle;
+        admitted.decided_by = "liveness:composer_empty".into();
+        let stamped = admitted.clone().stamped(false, ComposerHold::Clear);
+        assert!(stamped.write_ready, "{stamped:?}");
+        let mut working = admitted.clone();
+        apply_hook_reading(&mut working, working_reading(2), true, false);
+        assert_eq!(
+            working.state,
+            AgentState::Working,
+            "immediately after UserPromptSubmit"
+        );
+        assert!(
+            !admits(true, true, false, false, true),
+            "never while a start is active"
+        );
+        assert!(!admits(true, false, true, false, true), "stale");
+        assert!(!admits(true, false, false, true, true), "in mode");
+        assert!(!admits(true, false, false, false, false), "binding changed");
+        assert!(
+            !liveness_admits_idle(
+                fused.state,
+                &fused.decided_by,
+                s,
+                false,
+                true,
+                false,
+                false,
+                false,
+                true
+            ),
+            "no screen reading"
+        );
+        for id in ["composer_ghost_suggestion", "composer_has_staged_input"] {
+            let rule = m.rules.iter().find(|r| r.id == id);
+            assert!(rule.is_some(), "{id}");
+            assert!(
+                !liveness_admits_idle(
+                    fused.state,
+                    &fused.decided_by,
+                    rule,
+                    has_screen,
+                    true,
+                    false,
+                    false,
+                    false,
+                    true
+                ),
+                "{id} never admits"
+            );
+        }
+        assert!(
+            !liveness_admits_idle(
+                AgentState::Idle,
+                "composer_completed_terminal_suffix_2_1_246",
+                s,
+                has_screen,
+                true,
+                false,
+                false,
+                false,
+                true
+            ),
+            "a lifecycle terminal frame needs no admission"
+        );
+    }
+    /// Hook-only readings never make a staged frame quiet, whatever they say.
+    #[test]
+    fn a_staged_frame_needs_a_current_screen_reading() {
+        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
+        let hook_only = staged_entry(
+            AgentState::Unknown,
+            Some(ComposerSemantic::HumanInput),
+            vec![working_reading(1).with_state(AgentState::Idle)],
+            false,
+            false,
+            "att-1",
+        );
+        assert!(!staged_entry_ready(&hook_only, "att-1", agent, "fix"));
+        assert!(!staged_hold_ready(&hook_only));
     }
     /// A keyed start is retired by its key, never by a screen terminal.
     #[test]

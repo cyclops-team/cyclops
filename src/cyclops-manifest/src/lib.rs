@@ -425,6 +425,15 @@ pub struct RawMatcher {
     /// clauses fails closed when no escaped capture was provided.
     #[serde(default)]
     pub line_regex_esc: Vec<String>,
+    /// Like `regex`, but run against the region's SGR-escaped rows joined
+    /// with newlines, so one ordered pattern can prove that styled rows sit
+    /// in a given order on the same rows the plain `regex` matched.
+    /// MEASURED (Claude Code 2.1.246, probe a91f): the completed-turn suffix
+    /// is a uniform 38;5;246 row followed by the composer box; per-line
+    /// escaped clauses cannot tie the styled row to the ordered plain
+    /// suffix, this can. Fails closed when no escaped capture was provided.
+    #[serde(default)]
+    pub regex_esc: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -466,6 +475,7 @@ pub struct CompiledMatcher {
     pub regex: Vec<regex::Regex>,
     pub line_regex: Vec<regex::Regex>,
     pub line_regex_esc: Vec<regex::Regex>,
+    pub regex_esc: Vec<regex::Regex>,
 }
 
 impl CompiledMatcher {
@@ -474,6 +484,7 @@ impl CompiledMatcher {
             && self.regex.is_empty()
             && self.line_regex.is_empty()
             && self.line_regex_esc.is_empty()
+            && self.regex_esc.is_empty()
     }
 
     /// All clauses must hold. `lines` are the region lines; `joined` is the
@@ -490,14 +501,17 @@ impl CompiledMatcher {
         {
             return false;
         }
-        let esc_ok = if self.line_regex_esc.is_empty() {
+        let esc_ok = if self.line_regex_esc.is_empty() && self.regex_esc.is_empty() {
             true
         } else {
             match esc_lines {
-                Some(el) => self
-                    .line_regex_esc
-                    .iter()
-                    .all(|r| el.iter().any(|l| r.is_match(l))),
+                Some(el) => {
+                    let joined_esc = el.join("\n");
+                    self.line_regex_esc
+                        .iter()
+                        .all(|r| el.iter().any(|l| r.is_match(l)))
+                        && self.regex_esc.iter().all(|r| r.is_match(&joined_esc))
+                }
                 None => false,
             }
         };
@@ -697,6 +711,7 @@ fn compile_matcher(
         regex: mk(&raw.regex)?,
         line_regex: mk(&raw.line_regex)?,
         line_regex_esc: mk(&raw.line_regex_esc)?,
+        regex_esc: mk(&raw.regex_esc)?,
     })
 }
 
@@ -2003,5 +2018,45 @@ mod trailer_layout_tests {
                 "unsafe key {key:?} loaded"
             );
         }
+    }
+
+    /// `regex_esc` proves an ORDER across styled rows and fails closed
+    /// without an escaped capture, like every escaped clause.
+    #[test]
+    fn regex_esc_orders_styled_rows_and_fails_closed_without_an_escaped_capture() {
+        let manifest = Manifest::parse(
+            r#"
+[agent]
+id = "esc"
+display_name = "Esc fixture"
+process_names = ["esc"]
+
+[[rule]]
+id = "done_then_prompt"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(4)"
+regex = ['(?m)^DONE\n>\s*\z']
+regex_esc = ['(?m)^\x1b\[38;5;246mDONE\x1b\[39m\n\x1b\[39m>\s*\z']
+"#,
+            Path::new("esc.toml"),
+        )
+        .unwrap();
+        let plain = "DONE\n>";
+        let esc = "\u{1b}[38;5;246mDONE\u{1b}[39m\n\u{1b}[39m>";
+        assert!(manifest.evaluate_esc("", plain, Some(esc)).is_some());
+        assert!(
+            manifest.evaluate_esc("", plain, None).is_none(),
+            "fails closed"
+        );
+        let reordered = "\u{1b}[39m>\n\u{1b}[38;5;246mDONE\u{1b}[39m";
+        assert!(manifest
+            .evaluate_esc("", ">\nDONE", Some(reordered))
+            .is_none());
+        let unstyled = "DONE\n>";
+        assert!(
+            manifest.evaluate_esc("", plain, Some(unstyled)).is_none(),
+            "plain-looking esc rows"
+        );
     }
 }

@@ -1498,4 +1498,59 @@ fn claude_2_1_246_terminal_suffix_is_lifecycle_evidence_only_when_no_active_row_
         .evaluate_esc("", &plain, Some(&esc))
         .expect("a rule matches");
     assert_eq!(rule.id, "composer_completed_terminal_suffix_2_1_246");
+
+    // MUTATION: an unstyled prose row shaped like a completed row, with no
+    // genuine styled completed row anywhere, never proves the terminal: the
+    // styling is proven on the same rows as the plain suffix.
+    let (plain, esc) = claude_frame(
+        &[
+            "✻ Baked for 3s · done 7:00 AM",
+            RULE_120,
+            "❯",
+            RULE_120,
+            trailer_plain,
+        ],
+        &[
+            "✻ Baked for 3s · done 7:00 AM",
+            &rule_esc,
+            "\u{1b}[39m❯",
+            &rule_esc,
+            trailer_esc,
+        ],
+    );
+    let rule = claude
+        .evaluate_esc("", &plain, Some(&esc))
+        .expect("a rule matches");
+    assert_ne!(
+        rule.id, "composer_completed_terminal_suffix_2_1_246",
+        "unstyled prose row"
+    );
+
+    // MUTATION: a genuine styled completed row followed by an active 215 row
+    // never proves the terminal under the escaped clause.
+    let (plain, esc) = claude_frame(
+        &[
+            "✻ Sautéed for 6s · done 7:33 AM",
+            "  prior output row",
+            RULE_120,
+            "❯",
+            RULE_120,
+            trailer_plain,
+        ],
+        &[
+            "\u{1b}[38;5;246m✻\u{1b}[39m \u{1b}[38;5;246mSautéed for 6s · done 7:33 AM\u{1b}[39m",
+            "\u{1b}[38;5;215m·\u{1b}[39m \u{1b}[38;5;215mDeliberating… \u{1b}[38;5;246m(running stop hooks… 1/2 · 1s)",
+            &rule_esc,
+            "\u{1b}[39m❯",
+            &rule_esc,
+            trailer_esc,
+        ],
+    );
+    let rule = claude
+        .evaluate_esc("", &plain, Some(&esc))
+        .expect("a rule matches");
+    assert_ne!(
+        rule.id, "composer_completed_terminal_suffix_2_1_246",
+        "active row under the escaped clause"
+    );
 }

@@ -1819,3 +1819,26 @@ the account, path, message locator, and unrelated transcript removed. The rule
 requires the `File access` header, the exact question, and the selected first
 choice together. It outranks a stale working spinner and never dismisses the
 decision automatically.
+
+## F72. A title never asserts idle; lifecycle needs screen evidence; liveness admits the first wake
+
+MEASURED 2026-08-26 on a live Claude Code 2.1.24x pane inside tmux 3.6a. The
+idle sparkle title stays in place for the whole turn and the bare prompt row
+stays on screen, so a capture that lacked a matching spinner row published
+idle from the title alone: 1203 title-idle flaps in six hours on one pane, and
+25 doorbell writes admitted into that working pane behind them (ledger and
+journal audit, GEMINI-IDLE-WHILE-WORKING.md). The manifest header's claim that
+the title is authoritative and the screen a last resort is retracted.
+
+The corrected model: hooks are the authenticated lifecycle authority (a
+candidate UserPromptSubmit promoted by a visual Working frame into a
+persistent start on the exact agent generation; no end hook is declared);
+the screen is the only sensor that confirms idle, through the completed-turn
+suffix rule measured in probe a91f (F70, F71, sanitized NDJSON db34242c…),
+proven plain-ordered and escape-ordered on the same rows; composer rows carry
+composer state but are measured mid-turn and never confirm idle. A fresh pane
+has no completed suffix, so before its first turn it is admitted idle only by
+process-bound liveness: an authenticated edge (SessionStart) from the exact
+current generation in this pane lifetime, no active start, a clean composer
+on a fresh, out-of-mode, binding-stable capture. Admission is not lifecycle
+evidence and cannot end a turn. Cross-references: F5, F6, F23, F70, F71.
