@@ -608,13 +608,13 @@ fn collect() -> HealthReport {
             });
         }
     }
-    if rollback.state == "update_active" {
+    if rollback.state == "concurrent_change" {
         issues.push(Issue {
-            code: "update_in_progress",
+            code: "rollback_inspection_changed",
             message: rollback
                 .error
                 .clone()
-                .unwrap_or_else(|| "another updater holds the managed pair store lease".into()),
+                .unwrap_or_else(|| "the managed pair changed during health inspection".into()),
             path: rollback.prefix.clone(),
         });
     } else if let Some(error) = &rollback.error {
@@ -806,26 +806,28 @@ where
             Some(prefix),
             "the selected public installation has no managed rollback descriptor",
         ),
-        Err(crate::update::InstalledPairInspectionError::UpdateActive(error)) => RollbackReport {
-            state: "update_active",
-            prefix: Some(prefix),
-            selection: None,
-            active_pair: None,
-            known_good_pair: None,
-            active_identity: None,
-            known_good_identity: None,
-            active_build: None,
-            known_good_build: None,
-            active_install_replay: None,
-            known_good_install_replay: None,
-            known_good_replay_snapshot: None,
-            candidate_available: None,
-            install_replay: "unproven",
-            journal_replay: "unproven",
-            rollback_safe: None,
-            reason: "another updater holds the managed pair store lease".into(),
-            error: Some(error),
-        },
+        Err(crate::update::InstalledPairInspectionError::ConcurrentChange(error)) => {
+            RollbackReport {
+                state: "concurrent_change",
+                prefix: Some(prefix),
+                selection: None,
+                active_pair: None,
+                known_good_pair: None,
+                active_identity: None,
+                known_good_identity: None,
+                active_build: None,
+                known_good_build: None,
+                active_install_replay: None,
+                known_good_install_replay: None,
+                known_good_replay_snapshot: None,
+                candidate_available: None,
+                install_replay: "unproven",
+                journal_replay: "unproven",
+                rollback_safe: None,
+                reason: "the managed pair changed during read-only inspection".into(),
+                error: Some(error),
+            }
+        }
         Err(crate::update::InstalledPairInspectionError::Invalid(error)) => RollbackReport {
             state: "invalid",
             prefix: Some(prefix),
@@ -2849,17 +2851,19 @@ mod tests {
     }
 
     #[test]
-    fn an_active_update_is_busy_without_being_called_corruption() {
+    fn a_concurrent_pair_change_is_busy_without_being_called_corruption() {
         let binaries = binaries_with_public_selector(true);
         let report = inspect_rollback_with(&binaries, |_| {
-            Err(crate::update::InstalledPairInspectionError::UpdateActive(
-                "pair store lease is held".into(),
-            ))
+            Err(
+                crate::update::InstalledPairInspectionError::ConcurrentChange(
+                    "pair selection changed".into(),
+                ),
+            )
         });
 
-        assert_eq!(report.state, "update_active");
+        assert_eq!(report.state, "concurrent_change");
         assert_eq!(report.candidate_available, None);
-        assert_eq!(report.error.as_deref(), Some("pair store lease is held"));
+        assert_eq!(report.error.as_deref(), Some("pair selection changed"));
         assert!(!report.reason.contains("unsafe"));
     }
 

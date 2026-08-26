@@ -193,6 +193,13 @@ pub struct FileInspection {
     pub truncated: bool,
 }
 
+/// One symbolic-link target read without following the link.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LinkInspection {
+    pub entry: InspectedEntry,
+    pub target: PathBuf,
+}
+
 /// Held read-only authority for an existing Cyclops state root.
 ///
 /// Unlike [`StateRoot`], this type never creates or repairs anything. All
@@ -539,6 +546,187 @@ impl StateInspector {
             entry,
             bytes,
             truncated,
+        }))
+    }
+
+    /// Inspect one regular file through a held descriptor.
+    ///
+    /// The callback may stream a large file without exposing a path race. The
+    /// named entry and open descriptor are rechecked after it returns.
+    pub fn inspect_file_with<T>(
+        &self,
+        descendant: &Path,
+        max_bytes: u64,
+        inspect: impl FnOnce(&mut File) -> std::io::Result<T>,
+    ) -> Result<Option<(InspectedEntry, T)>, StateError> {
+        let parts = inspection_descendant_parts(descendant)?;
+        let display_path = self.path.join(descendant);
+        let mut directory = clone_file(&self.directory, &display_path)?;
+        for part in &parts[..parts.len() - 1] {
+            let name = c_name(&display_path, part)?;
+            directory = match open_directory_at(&directory, &name) {
+                Ok(next) => next,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(path_error(
+                        &display_path,
+                        error,
+                        "state path contains a linked or non-directory component",
+                    ));
+                }
+            };
+            let metadata = directory
+                .metadata()
+                .map_err(|source| io_error(&display_path, source))?;
+            if metadata.uid() != self.owner {
+                return Err(unsafe_path(
+                    &display_path,
+                    "state directory belongs to another user",
+                ));
+            }
+        }
+
+        let leaf = c_name(
+            &display_path,
+            parts.last().expect("descendant has one component"),
+        )?;
+        let before = match stat_at_optional(&directory, &leaf, &display_path)? {
+            Some(metadata) => metadata,
+            None => return Ok(None),
+        };
+        validate_regular_stat(&before, &display_path, self.owner)?;
+        if before.st_size < 0 || before.st_size as u64 > max_bytes {
+            return Err(unsafe_path(
+                &display_path,
+                "state file exceeds the inspection byte bound",
+            ));
+        }
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        // SAFETY: directory and leaf are held descriptors and a valid C name.
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), leaf.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(path_error(
+                &display_path,
+                std::io::Error::last_os_error(),
+                "state file could not be opened for read-only inspection",
+            ));
+        }
+        // SAFETY: fd is a fresh successful openat result owned here.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let metadata = file
+            .metadata()
+            .map_err(|source| io_error(&display_path, source))?;
+        if !metadata_matches_stat(&metadata, &before) {
+            return Err(unsafe_path(
+                &display_path,
+                "state entry changed during read-only inspection",
+            ));
+        }
+        let value = inspect(&mut file).map_err(|source| io_error(&display_path, source))?;
+        inspect_after_read(&display_path);
+        let descriptor_after = file
+            .metadata()
+            .map_err(|source| io_error(&display_path, source))?;
+        if !metadata_stable_during_read(&metadata, &descriptor_after) {
+            return Err(unsafe_path(
+                &display_path,
+                "state entry changed during read-only inspection",
+            ));
+        }
+        let after = stat_at(&directory, &leaf, &display_path)?;
+        if !same_stat_identity(&before, &after) {
+            return Err(unsafe_path(
+                &display_path,
+                "state entry changed during read-only inspection",
+            ));
+        }
+        Ok(Some((
+            inspected_from_stat(display_path, &after, self.owner),
+            value,
+        )))
+    }
+
+    /// Read one symbolic link through the held root without following it.
+    pub fn read_link(
+        &self,
+        descendant: &Path,
+        max_bytes: usize,
+    ) -> Result<Option<LinkInspection>, StateError> {
+        if max_bytes > INSPECTION_PATH_BYTES_LIMIT_MAX {
+            return Err(unsafe_path(
+                &self.path.join(descendant),
+                "inspection link-byte limit exceeds the hard ceiling",
+            ));
+        }
+        let parts = inspection_descendant_parts(descendant)?;
+        let display_path = self.path.join(descendant);
+        let mut directory = clone_file(&self.directory, &display_path)?;
+        for part in &parts[..parts.len() - 1] {
+            let name = c_name(&display_path, part)?;
+            directory = match open_directory_at(&directory, &name) {
+                Ok(next) => next,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(path_error(
+                        &display_path,
+                        error,
+                        "state path contains a linked or non-directory component",
+                    ));
+                }
+            };
+        }
+        let leaf = c_name(
+            &display_path,
+            parts.last().expect("descendant has one component"),
+        )?;
+        let before = match stat_at_optional(&directory, &leaf, &display_path)? {
+            Some(metadata) => metadata,
+            None => return Ok(None),
+        };
+        if before.st_mode & libc::S_IFMT != libc::S_IFLNK
+            || before.st_uid != self.owner
+            || before.st_nlink != 1
+        {
+            return Err(unsafe_path(
+                &display_path,
+                "state link is not one owner-controlled symbolic link",
+            ));
+        }
+        let mut bytes = vec![0_u8; max_bytes.saturating_add(1)];
+        // SAFETY: directory, leaf, and output buffer are valid for readlinkat.
+        let read = unsafe {
+            libc::readlinkat(
+                directory.as_raw_fd(),
+                leaf.as_ptr(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+            )
+        };
+        if read < 0 {
+            return Err(path_error(
+                &display_path,
+                std::io::Error::last_os_error(),
+                "state link could not be read",
+            ));
+        }
+        let read = read as usize;
+        if read > max_bytes {
+            return Err(unsafe_path(
+                &display_path,
+                "state link exceeds the inspection byte bound",
+            ));
+        }
+        bytes.truncate(read);
+        let after = stat_at(&directory, &leaf, &display_path)?;
+        if !same_stat_identity(&before, &after) {
+            return Err(unsafe_path(
+                &display_path,
+                "state entry changed during read-only inspection",
+            ));
+        }
+        Ok(Some(LinkInspection {
+            entry: inspected_from_stat(display_path, &after, self.owner),
+            target: PathBuf::from(OsString::from_vec(bytes)),
         }))
     }
 

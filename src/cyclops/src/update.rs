@@ -36,6 +36,10 @@ use crate::copy;
 use crate::hash::fnv64;
 use crate::render;
 use crate::style::Style;
+use cyclops_state::{
+    DirectoryInspection, InspectedEntry, InspectedKind, InspectionLimits, LinkInspection,
+    StateInspector,
+};
 
 /// The installer's defaults (scripts/install.sh:26-27), restated because
 /// the binary cannot read that file at runtime: change them together.
@@ -464,7 +468,7 @@ pub(crate) struct InstalledPairDescriptor {
 
 #[derive(Debug)]
 pub(crate) enum InstalledPairInspectionError {
-    UpdateActive(String),
+    ConcurrentChange(String),
     Invalid(String),
 }
 
@@ -477,7 +481,9 @@ impl From<String> for InstalledPairInspectionError {
 impl std::fmt::Display for InstalledPairInspectionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UpdateActive(message) | Self::Invalid(message) => formatter.write_str(message),
+            Self::ConcurrentChange(message) | Self::Invalid(message) => {
+                formatter.write_str(message)
+            }
         }
     }
 }
@@ -502,33 +508,124 @@ impl std::fmt::Display for PairStoreOpenError {
     }
 }
 
-/// Inspect the selected pair under the same kernel lease update uses.
+#[cfg(test)]
+thread_local! {
+    static BEFORE_PAIR_INSPECTION_RECHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn before_pair_inspection_recheck() {
+    BEFORE_PAIR_INSPECTION_RECHECK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn before_pair_inspection_recheck() {}
+
+/// Inspect one immutable selected-pair snapshot without taking the updater lease.
 pub(crate) fn installed_pair_descriptor(
     prefix: &Path,
 ) -> Result<Option<InstalledPairDescriptor>, InstalledPairInspectionError> {
-    let Some(store) = PairStore::open_existing(prefix).map_err(|error| match error {
-        PairStoreOpenError::UpdateActive(message) => {
-            InstalledPairInspectionError::UpdateActive(message)
-        }
-        PairStoreOpenError::Invalid(message) => InstalledPairInspectionError::Invalid(message),
-    })?
+    let root = prefix.join(PAIR_ROOT);
+    let Some(inspector) = StateInspector::open_existing(&root)
+        .map_err(|error| InstalledPairInspectionError::Invalid(error.to_string()))?
     else {
         return Ok(None);
     };
-    let selection = store
-        .selection_descriptor()?
-        .ok_or_else(|| "the managed pair store has no active selector".to_string())?;
-    let active_pair = store.root.join(&selection.active);
-    let known_good_pair = store.root.join(&selection.known_good);
+    let selector = inspector
+        .read_link(Path::new(ACTIVE_SELECTOR), 512)
+        .map_err(|error| InstalledPairInspectionError::Invalid(error.to_string()))?
+        .ok_or_else(|| {
+            InstalledPairInspectionError::Invalid(
+                "the managed pair store has no active selector".to_string(),
+            )
+        })?;
+    let result = inspect_installed_pair_snapshot(&inspector, &selector);
+    before_pair_inspection_recheck();
+    let root_matches = inspector.path_matches_held_root().unwrap_or(false);
+    let selector_matches = inspector
+        .read_link(Path::new(ACTIVE_SELECTOR), 512)
+        .ok()
+        .flatten()
+        .as_ref()
+        == Some(&selector);
+    if !root_matches || !selector_matches {
+        return Err(InstalledPairInspectionError::ConcurrentChange(
+            "the managed pair selection changed during health inspection".to_string(),
+        ));
+    }
+    result
+        .map(Some)
+        .map_err(InstalledPairInspectionError::Invalid)
+}
+
+fn inspect_installed_pair_snapshot(
+    inspector: &StateInspector,
+    selector: &LinkInspection,
+) -> Result<InstalledPairDescriptor, String> {
+    require_inspected_directory(inspector.root(), 0o700, "pair store")?;
+    let owner = inspector
+        .read_file(Path::new(PAIR_OWNER), 64)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the pair store has no ownership marker".to_string())?;
+    require_inspected_regular(&owner.entry, 0o600, "pair owner marker")?;
+    let owner = std::str::from_utf8(&owner.bytes)
+        .map_err(|_| "the pair owner marker is not UTF-8".to_string())?;
+    if owner != unsafe { libc::geteuid() }.to_string() {
+        return Err("pair store ownership marker does not match this user".to_string());
+    }
+    let lease = inspector
+        .read_file(Path::new(PAIR_LEASE), 1)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the pair store has no updater lease file".to_string())?;
+    require_inspected_regular(&lease.entry, 0o600, "pair updater lease")?;
+
+    let target = selector
+        .target
+        .to_str()
+        .ok_or_else(|| "the active selector is not UTF-8".to_string())?;
+    validate_selection_target(target)?;
+    let selection_directory = inspector
+        .inspect_directory(Path::new(target), InspectionLimits::default())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the active selection directory is missing".to_string())?;
+    require_selection_snapshot_layout(&selection_directory)?;
+    let descriptor_relative = Path::new(target).join(PAIR_DESCRIPTOR);
+    let descriptor = inspector
+        .read_file(&descriptor_relative, 1024 * 1024)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the selected pair descriptor is missing".to_string())?;
+    require_inspected_regular(&descriptor.entry, 0o600, "selected pair descriptor")?;
+    if descriptor.truncated {
+        return Err("the selected pair descriptor exceeds its read bound".to_string());
+    }
+    let selection = decode_selection(target, &descriptor.bytes)?;
+    for name in ["cyclops", "cyclopsd"] {
+        let selected = inspector
+            .read_link(&Path::new(target).join(name), 512)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("selected {name} link is missing"))?;
+        let expected = PathBuf::from("../..").join(&selection.active).join(name);
+        if selected.target != expected {
+            return Err(format!("selected {name} does not name the active pair"));
+        }
+    }
+
+    let active_pair = inspector.path().join(&selection.active);
+    let known_good_pair = inspector.path().join(&selection.known_good);
     let active_proof = selection.active_proof.clone();
     let known_good_proof = selection.known_good_proof.clone();
     let proof_unproven =
         known_good_proof.is_none() || (!selection.legacy_active && active_proof.is_none());
     if let Some(proof) = active_proof.as_ref() {
-        verify_recorded_pair(&active_pair, proof)?;
+        verify_recorded_pair_snapshot(inspector, &selection.active, proof)?;
     }
     if let Some(proof) = known_good_proof.as_ref() {
-        verify_recorded_pair(&known_good_pair, proof)?;
+        verify_recorded_pair_snapshot(inspector, &selection.known_good, proof)?;
     }
     if let Some(attestation) = selection.active_replay.as_ref() {
         let proof = active_proof.as_ref().ok_or_else(|| {
@@ -549,8 +646,11 @@ pub(crate) fn installed_pair_descriptor(
         .as_deref()
         .map(identity_build)
         .transpose()?;
-    Ok(Some(InstalledPairDescriptor {
-        selection: store.root.join(&selection.id),
+    inspector
+        .inspect_bound_directory(&selection_directory.directory, InspectionLimits::default())
+        .map_err(|error| error.to_string())?;
+    Ok(InstalledPairDescriptor {
+        selection: inspector.path().join(&selection.id),
         active_pair,
         known_good_pair,
         active_identity,
@@ -566,7 +666,134 @@ pub(crate) fn installed_pair_descriptor(
         rollback_safe: !proof_unproven
             && !selection.legacy_active
             && selection.active != selection.known_good,
-    }))
+    })
+}
+
+fn require_selection_snapshot_layout(snapshot: &DirectoryInspection) -> Result<(), String> {
+    require_inspected_directory(&snapshot.directory, 0o700, "selection directory")?;
+    if snapshot.truncated || snapshot.entries.len() != 3 {
+        return Err("the selected pair directory has unexpected entries".to_string());
+    }
+    for name in ["cyclops", "cyclopsd", PAIR_DESCRIPTOR] {
+        if !snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.path.file_name() == Some(std::ffi::OsStr::new(name)))
+        {
+            return Err(format!("the selected pair directory is missing {name}"));
+        }
+    }
+    Ok(())
+}
+
+fn verify_recorded_pair_snapshot(
+    inspector: &StateInspector,
+    target: &str,
+    proof: &PairProof,
+) -> Result<(), String> {
+    validate_pair_target(target)?;
+    let snapshot = inspector
+        .inspect_directory(Path::new(target), InspectionLimits::default())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "selected pair {} is missing",
+                inspector.path().join(target).display()
+            )
+        })?;
+    require_inspected_directory(&snapshot.directory, 0o700, "selected pair")?;
+    if snapshot.truncated || snapshot.entries.len() != 2 {
+        return Err(format!(
+            "selected pair {} has unexpected entries",
+            inspector.path().join(target).display()
+        ));
+    }
+    let mut digests = Vec::with_capacity(2);
+    for name in ["cyclops", "cyclopsd"] {
+        let expected = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.path.file_name() == Some(std::ffi::OsStr::new(name)))
+            .ok_or_else(|| format!("selected pair is missing {name}"))?;
+        require_inspected_executable(expected, name)?;
+        let relative = Path::new(target).join(name);
+        let (observed, digest) = inspector
+            .inspect_file_with(&relative, MAX_PAIR_BINARY_BYTES, |file| {
+                let mut hasher = Sha256::new();
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    let read = file.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..read]);
+                }
+                Ok(format!("{:x}", hasher.finalize()))
+            })
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("selected pair is missing {name}"))?;
+        if &observed != expected {
+            return Err(format!("selected pair {name} changed during inspection"));
+        }
+        digests.push(digest);
+    }
+    inspector
+        .inspect_bound_directory(&snapshot.directory, InspectionLimits::default())
+        .map_err(|error| error.to_string())?;
+    if digests[0] != proof.cyclops_sha256 || digests[1] != proof.cyclopsd_sha256 {
+        return Err(format!(
+            "selected pair {} changed after its install proof was recorded",
+            inspector.path().join(target).display()
+        ));
+    }
+    identity_build(&proof.identity)?;
+    Ok(())
+}
+
+fn require_inspected_directory(
+    entry: &InspectedEntry,
+    mode: u32,
+    kind: &str,
+) -> Result<(), String> {
+    if entry.kind != InspectedKind::Directory
+        || entry.uid != unsafe { libc::geteuid() }
+        || entry.mode & 0o777 != mode
+    {
+        return Err(format!(
+            "{} is not an owner-only {kind}",
+            entry.path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn require_inspected_regular(entry: &InspectedEntry, mode: u32, kind: &str) -> Result<(), String> {
+    if entry.kind != InspectedKind::RegularFile
+        || entry.uid != unsafe { libc::geteuid() }
+        || entry.links != 1
+        || entry.mode & 0o777 != mode
+    {
+        return Err(format!(
+            "{} is not one owner-controlled {kind}",
+            entry.path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn require_inspected_executable(entry: &InspectedEntry, name: &str) -> Result<(), String> {
+    if entry.kind != InspectedKind::RegularFile
+        || entry.uid != unsafe { libc::geteuid() }
+        || entry.links != 1
+        || entry.mode & 0o100 == 0
+        || entry.mode & 0o022 != 0
+    {
+        return Err(format!(
+            "{} is not one owner-controlled executable {name}",
+            entry.path.display()
+        ));
+    }
+    Ok(())
 }
 
 impl PairStore {
@@ -1383,67 +1610,7 @@ impl PairStore {
         require_owner_regular_file(&descriptor, 0o600)?;
         let body = std::fs::read(&descriptor)
             .map_err(|error| format!("read selected pair descriptor: {error}"))?;
-        let value: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|error| format!("decode selected pair descriptor: {error}"))?;
-        let schema = value
-            .get("schema")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| "selected pair descriptor has no schema".to_string())?;
-        if !matches!(schema, 1 | 2 | 3) {
-            return Err("selected pair descriptor has an unsupported schema".to_string());
-        }
-        let active = value
-            .get("active")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "selected pair descriptor has no active pair".to_string())?;
-        let known_good = value
-            .get("known_good")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "selected pair descriptor has no known-good pair".to_string())?;
-        let legacy_active = value
-            .get("legacy_active")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let active_proof = value
-            .get("active_proof")
-            .filter(|value| !value.is_null())
-            .map(|value| serde_json::from_value::<PairProof>(value.clone()))
-            .transpose()
-            .map_err(|error| format!("decode active pair proof: {error}"))?;
-        let known_good_proof = value
-            .get("known_good_proof")
-            .filter(|value| !value.is_null())
-            .map(|value| serde_json::from_value::<PairProof>(value.clone()))
-            .transpose()
-            .map_err(|error| format!("decode known-good pair proof: {error}"))?;
-        let active_replay = value
-            .get("active_replay")
-            .filter(|value| !value.is_null())
-            .map(|value| serde_json::from_value::<ReplayAttestation>(value.clone()))
-            .transpose()
-            .map_err(|error| format!("decode active replay attestation: {error}"))?;
-        let known_good_replay = value
-            .get("known_good_replay")
-            .filter(|value| !value.is_null())
-            .map(|value| serde_json::from_value::<ReplayAttestation>(value.clone()))
-            .transpose()
-            .map_err(|error| format!("decode known-good replay attestation: {error}"))?;
-        if schema >= 2 && (known_good_proof.is_none() || (!legacy_active && active_proof.is_none()))
-        {
-            return Err(
-                "selected pair descriptor is missing a recorded build identity".to_string(),
-            );
-        }
-        Ok(Selection {
-            id: id.to_string(),
-            active: active.to_string(),
-            known_good: known_good.to_string(),
-            legacy_active,
-            active_proof,
-            known_good_proof,
-            active_replay,
-            known_good_replay,
-        })
+        decode_selection(id, &body)
     }
 
     fn require_selection(&self, selection: &Selection) -> Result<(), String> {
@@ -1588,6 +1755,67 @@ impl PairStore {
         }
         self.require_public_links()
     }
+}
+
+fn decode_selection(id: &str, body: &[u8]) -> Result<Selection, String> {
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|error| format!("decode selected pair descriptor: {error}"))?;
+    let schema = value
+        .get("schema")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "selected pair descriptor has no schema".to_string())?;
+    if !matches!(schema, 1 | 2 | 3) {
+        return Err("selected pair descriptor has an unsupported schema".to_string());
+    }
+    let active = value
+        .get("active")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "selected pair descriptor has no active pair".to_string())?;
+    let known_good = value
+        .get("known_good")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "selected pair descriptor has no known-good pair".to_string())?;
+    let legacy_active = value
+        .get("legacy_active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let active_proof = value
+        .get("active_proof")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value::<PairProof>(value.clone()))
+        .transpose()
+        .map_err(|error| format!("decode active pair proof: {error}"))?;
+    let known_good_proof = value
+        .get("known_good_proof")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value::<PairProof>(value.clone()))
+        .transpose()
+        .map_err(|error| format!("decode known-good pair proof: {error}"))?;
+    let active_replay = value
+        .get("active_replay")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value::<ReplayAttestation>(value.clone()))
+        .transpose()
+        .map_err(|error| format!("decode active replay attestation: {error}"))?;
+    let known_good_replay = value
+        .get("known_good_replay")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value::<ReplayAttestation>(value.clone()))
+        .transpose()
+        .map_err(|error| format!("decode known-good replay attestation: {error}"))?;
+    if schema >= 2 && (known_good_proof.is_none() || (!legacy_active && active_proof.is_none())) {
+        return Err("selected pair descriptor is missing a recorded build identity".to_string());
+    }
+    Ok(Selection {
+        id: id.to_string(),
+        active: active.to_string(),
+        known_good: known_good.to_string(),
+        legacy_active,
+        active_proof,
+        known_good_proof,
+        active_replay,
+        known_good_replay,
+    })
 }
 
 fn validate_pair_target(target: &str) -> Result<(), String> {
@@ -4133,7 +4361,6 @@ sys.exit(43)"#,
         store.replace_public_link("cyclops").unwrap();
         let replay = recorded_replay(&store, &new, 6);
         store.activate(&new, replay).unwrap();
-        drop(store);
         std::fs::remove_file(&old_probe).unwrap();
         std::fs::remove_file(&new_probe).unwrap();
 
@@ -4164,6 +4391,66 @@ sys.exit(43)"#,
             "health proof executed the known-good pair"
         );
         assert!(!new_probe.exists(), "health proof executed the active pair");
+        drop(store);
+    }
+
+    #[test]
+    fn selector_change_during_read_only_inspection_is_typed_as_concurrent() {
+        let scratch = Scratch::create().unwrap();
+        let prefix = scratch.path().join("bin");
+        let source = scratch.path().join("candidate");
+        directory(&prefix);
+        pair_source(&source, "build");
+        let store = PairStore::open(&prefix).unwrap();
+        let pair = store.stage(&source).unwrap();
+        let replay = recorded_replay(&store, &pair, 9);
+        let first = store
+            .prepare_selection_with_replays(
+                &pair,
+                &pair,
+                Some(replay.clone()),
+                Some(replay.clone()),
+            )
+            .unwrap();
+        let second = store
+            .prepare_selection_with_replays(&pair, &pair, Some(replay.clone()), Some(replay))
+            .unwrap();
+        store.select(&first).unwrap();
+        store.replace_public_link("cyclopsd").unwrap();
+        store.replace_public_link("cyclops").unwrap();
+        let root = store.root.clone();
+        let next = second.id.clone();
+        drop(store);
+
+        BEFORE_PAIR_INSPECTION_RECHECK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let temporary = root.join(".active.health-race");
+                std::os::unix::fs::symlink(next, &temporary).unwrap();
+                std::fs::rename(temporary, root.join(ACTIVE_SELECTOR)).unwrap();
+            }));
+        });
+        let error = installed_pair_descriptor(&prefix).unwrap_err();
+
+        assert!(matches!(
+            error,
+            InstalledPairInspectionError::ConcurrentChange(_)
+        ));
+    }
+
+    #[test]
+    fn health_pair_inspection_does_not_open_or_lock_the_updater_lease() {
+        let source = include_str!("update.rs");
+        let body = source
+            .split_once("pub(crate) fn installed_pair_descriptor(")
+            .expect("health pair inspector")
+            .1
+            .split_once("\n}\n\nfn inspect_installed_pair_snapshot")
+            .expect("health pair inspector body")
+            .0;
+
+        assert!(!body.contains("PairStore::open_existing"));
+        assert!(!body.contains("LOCK_EX"));
+        assert!(!body.contains("flock"));
     }
 
     #[test]
