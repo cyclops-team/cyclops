@@ -445,22 +445,30 @@ pub fn render_chat(
     let counts = queue.counts();
 
     // 1. Header line
+    let status_hint = status.unwrap_or("");
     if width >= 30 {
-        out.push(fit(
-            &format!(
+        let header = if !status_hint.is_empty() {
+            format!(
+                "Messages Group Chat  {}  [{status_hint}]",
+                queue.scope().word()
+            )
+        } else {
+            format!(
                 "Messages Group Chat  {}  {} shown  {} pend  {} attn",
                 queue.scope().word(),
                 counts.visible,
                 counts.pending,
                 counts.attention
-            ),
-            width,
-        ));
+            )
+        };
+        out.push(fit(&header, width));
     } else {
-        out.push(fit(
-            &format!("Chat {} !{}", counts.pending, counts.attention),
-            width,
-        ));
+        let header = if !status_hint.is_empty() {
+            format!("Chat [{status_hint}]")
+        } else {
+            format!("Chat {} !{}", counts.pending, counts.attention)
+        };
+        out.push(fit(&header, width));
     }
 
     // Reserve rows for status and composer at the bottom
@@ -1346,6 +1354,30 @@ mod tests {
         assert!(
             !joined.contains("head · held"),
             "claimed row must NOT be labelled as head: {joined}"
+        );
+    }
+
+    #[test]
+    fn render_chat_surfaces_status_hint_in_header() {
+        let queue = make_test_queue();
+        let reg = AvatarRegistry::default();
+        let lines = render_chat(
+            &queue,
+            None,
+            None,
+            &reg,
+            None,
+            None,
+            80,
+            15,
+            Some("refresh failed · Ctrl+R to retry"),
+            Some(1_010_000),
+        );
+
+        let header = &lines[0];
+        assert!(
+            header.contains("refresh failed · Ctrl+R to retry"),
+            "header must surface the link failure hint: {header}"
         );
     }
 }

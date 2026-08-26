@@ -2490,12 +2490,8 @@ async fn handle_app_msg(
                     app.messages_composer.record_uncertain(why);
                 }
             }
-            if !app.messages_snapshot_in_flight {
-                if let Some(tx) = &app.messages_snapshot_tx {
-                    let _ = tx.try_send(128);
-                    app.messages_snapshot_in_flight = true;
-                }
-            }
+            app.messages_gate.mark_dirty();
+            pump_messages_refresh(app);
             arm(debounce);
         }
         AppMsg::Mouse(mouse) => {
@@ -4638,6 +4634,11 @@ fn draw(
                     .iter()
                     .filter_map(|(id, p)| p.manifest.as_ref().map(|m| (id.clone(), m.clone())))
                     .collect();
+                let link_status = if app.messages_gate.link() == cyclops_ui::Link::Lost {
+                    Some("refresh failed · Ctrl+R to retry")
+                } else {
+                    app.notice.text()
+                };
                 paint_messages(
                     &app.messages_queue,
                     app.messages_detail.as_ref(),
@@ -4645,7 +4646,7 @@ fn draw(
                     &app.avatar_registry,
                     Some(&app.decoration.mailbox_routes),
                     Some(&pane_manifests),
-                    app.notice.text(),
+                    link_status,
                     messages,
                     f.buffer_mut(),
                     &app.paint,
