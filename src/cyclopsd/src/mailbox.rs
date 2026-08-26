@@ -13388,7 +13388,7 @@ mod tests {
         assert_eq!(summaries[1].recipient, bob);
         assert_eq!(
             summaries[0].cause,
-            Some(NotificationAttentionCause::VerifyFailed)
+            Some(NotificationAttentionCause::SubmitFailed)
         );
         let store = service.store().unwrap();
         assert_eq!(store.projection().last_sequence(), Some(before + 1));
