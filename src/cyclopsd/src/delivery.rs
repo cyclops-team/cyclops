@@ -10826,6 +10826,7 @@ composer_trailer_required_prefix = 1
             events: broadcast::channel(16).0,
             detections: StdMutex::new(HashMap::new()),
             pane_recomputes: StdMutex::new(HashMap::new()),
+            route_evidence_generations: StdMutex::new(HashMap::new()),
             lifecycle_rechecks: StdMutex::new(HashMap::new()),
             registry: StdMutex::new(registry),
             theme: StdMutex::new(cyclops_theme::ThemeWatch::new(path)),

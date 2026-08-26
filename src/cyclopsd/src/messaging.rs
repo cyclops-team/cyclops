@@ -1149,6 +1149,7 @@ mod tests {
                 agent: ProcessInstanceId::new(4002, 818_002).unwrap(),
                 manifest: NotificationManifestId::new("claude").unwrap(),
             }),
+            route_evidence: None,
             pane_width: Some(120),
             required_pane_width: None,
         }
@@ -1602,6 +1603,7 @@ mod tests {
                     pane_root: Some(ProcessInstanceId::new(4000, 818_000).unwrap()),
                     selected_manifest: Some(NotificationManifestId::new("codex").unwrap()),
                     binding: None,
+                    route_evidence: None,
                     pane_width: None,
                     required_pane_width: None,
                 }),
