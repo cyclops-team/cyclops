@@ -240,7 +240,6 @@ pub fn proven_status_label(mailbox: MailboxWord, wake: WakeWord) -> &'static str
         (_, WakeWord::ResolvedDiscarded) => "Wake discarded",
         (_, WakeWord::Cleared) => "Cleared",
         (MailboxWord::Pending, WakeWord::NotStarted) => "Accepted (wake not started)",
-        (MailboxWord::Pending, _) => "Accepted (pending)",
         (MailboxWord::DeliveredDirect, _) => "Delivered direct",
         (MailboxWord::Superseded, _) => "Superseded",
     }
@@ -262,8 +261,7 @@ pub fn proven_status_short(mailbox: MailboxWord, wake: WakeWord) -> &'static str
             ".wake-pend"
         }
         (_, WakeWord::Submitted | WakeWord::Notified | WakeWord::ResolvedSubmitted) => "^wake-sent",
-        (_, WakeWord::NotStarted) => "*acc-nostart",
-        (MailboxWord::Pending, _) => "*acc-pend",
+        (MailboxWord::Pending, WakeWord::NotStarted) => "*acc-nostart",
         (MailboxWord::DeliveredDirect, _) => "=dir",
         (MailboxWord::Superseded, _) => "-sprsd",
     }
@@ -450,19 +448,68 @@ fn timeline_viewport_top(
         .unwrap_or(last_top)
 }
 
+/// Read-only context used to paint one Messages frame.
+#[derive(Clone, Copy)]
+pub struct ChatRenderContext<'a> {
+    pub detail: Option<&'a Detail>,
+    pub composer: Option<&'a ComposerState>,
+    pub avatar_registry: &'a AvatarRegistry,
+    pub live_routes: Option<&'a [cyclops_proto::StatusMailboxRoute]>,
+    pub pane_manifests: Option<&'a HashMap<String, String>>,
+    pub status: Option<&'a str>,
+    pub now_ms: Option<u64>,
+}
+
+impl<'a> ChatRenderContext<'a> {
+    pub fn new(avatar_registry: &'a AvatarRegistry) -> Self {
+        Self {
+            detail: None,
+            composer: None,
+            avatar_registry,
+            live_routes: None,
+            pane_manifests: None,
+            status: None,
+            now_ms: None,
+        }
+    }
+
+    pub fn with_detail(mut self, detail: &'a Detail) -> Self {
+        self.detail = Some(detail);
+        self
+    }
+
+    pub fn with_composer(mut self, composer: &'a ComposerState) -> Self {
+        self.composer = Some(composer);
+        self
+    }
+
+    pub fn with_status(mut self, status: &'a str) -> Self {
+        self.status = Some(status);
+        self
+    }
+
+    pub fn at(mut self, now_ms: u64) -> Self {
+        self.now_ms = Some(now_ms);
+        self
+    }
+}
+
 /// Render the group-chat timeline and bottom bounded composer into exact-width lines.
 pub fn render_chat(
     queue: &HumanQueue,
-    detail: Option<&Detail>,
-    composer: Option<&ComposerState>,
-    avatar_registry: &AvatarRegistry,
-    live_routes: Option<&[cyclops_proto::StatusMailboxRoute]>,
-    pane_manifests: Option<&HashMap<String, String>>,
+    context: ChatRenderContext<'_>,
     width: usize,
     height: usize,
-    status: Option<&str>,
-    now_ms: Option<u64>,
 ) -> Vec<String> {
+    let ChatRenderContext {
+        detail,
+        composer,
+        avatar_registry,
+        live_routes,
+        pane_manifests,
+        status,
+        now_ms,
+    } = context;
     if width == 0 || height == 0 {
         return Vec::new();
     }
@@ -809,6 +856,28 @@ mod tests {
         MessageId, NotificationAttentionCause, NotificationPreWriteCause, RecipientKey,
     };
 
+    trait FixtureParse: Sized {
+        type Error;
+
+        fn parse(value: &str) -> Result<Self, Self::Error>;
+    }
+
+    impl FixtureParse for RecipientKey {
+        type Error = cyclops_proto::IdentityError;
+
+        fn parse(value: &str) -> Result<Self, Self::Error> {
+            value.parse()
+        }
+    }
+
+    impl FixtureParse for MessageId {
+        type Error = cyclops_proto::MailboxTypeError;
+
+        fn parse(value: &str) -> Result<Self, Self::Error> {
+            MessageId::new(value)
+        }
+    }
+
     fn make_test_queue() -> HumanQueue {
         let mut queue = HumanQueue::default();
         let s0 = RecipientKey::parse(
@@ -910,18 +979,7 @@ mod tests {
     fn render_chat_distinguishes_direct_and_broadcast_by_structure() {
         let queue = make_test_queue();
         let reg = AvatarRegistry::default();
-        let lines = render_chat(
-            &queue,
-            None,
-            None,
-            &reg,
-            None,
-            None,
-            80,
-            20,
-            None,
-            Some(1_010_000),
-        );
+        let lines = render_chat(&queue, ChatRenderContext::new(&reg).at(1_010_000), 80, 20);
 
         let joined = lines.join("\n");
         assert!(
@@ -959,30 +1017,18 @@ mod tests {
         assert!(queue.select(&QueueTarget::new(message.clone(), claude)));
         let claude_frame = render_chat(
             &queue,
-            None,
-            None,
-            &registry,
-            None,
-            None,
+            ChatRenderContext::new(&registry).at(1_010_000),
             80,
             20,
-            None,
-            Some(1_010_000),
         )
         .join("\n");
         assert!(claude_frame.contains("  >[claude]"), "{claude_frame}");
         assert!(!claude_frame.contains("  >[codex]"), "{claude_frame}");
         let claude_narrow = render_chat(
             &queue,
-            None,
-            None,
-            &registry,
-            None,
-            None,
+            ChatRenderContext::new(&registry).at(1_010_000),
             18,
             10,
-            None,
-            Some(1_010_000),
         )
         .join("\n");
         assert!(claude_narrow.contains("-> >claude +1"), "{claude_narrow}");
@@ -991,30 +1037,18 @@ mod tests {
         assert!(queue.select(&QueueTarget::new(message, codex)));
         let codex_frame = render_chat(
             &queue,
-            None,
-            None,
-            &registry,
-            None,
-            None,
+            ChatRenderContext::new(&registry).at(1_010_000),
             80,
             20,
-            None,
-            Some(1_010_000),
         )
         .join("\n");
         assert!(codex_frame.contains("  >[codex]"), "{codex_frame}");
         assert!(!codex_frame.contains("  >[claude]"), "{codex_frame}");
         let codex_narrow = render_chat(
             &queue,
-            None,
-            None,
-            &registry,
-            None,
-            None,
+            ChatRenderContext::new(&registry).at(1_010_000),
             18,
             10,
-            None,
-            Some(1_010_000),
         )
         .join("\n");
         assert!(codex_narrow.contains("-> >codex +1"), "{codex_narrow}");
@@ -1044,15 +1078,11 @@ mod tests {
 
         let frame = render_chat(
             &queue,
-            Some(&detail),
-            None,
-            &AvatarRegistry::default(),
-            None,
-            None,
+            ChatRenderContext::new(&AvatarRegistry::default())
+                .with_detail(&detail)
+                .at(1_010_000),
             80,
             20,
-            None,
-            Some(1_010_000),
         )
         .join("\n");
         assert!(frame.contains("[CL] claude"), "{frame}");
@@ -1105,15 +1135,9 @@ mod tests {
         for (width, height) in [(18, 10), (80, 12)] {
             let frame = render_chat(
                 &queue,
-                None,
-                None,
-                &AvatarRegistry::default(),
-                None,
-                None,
+                ChatRenderContext::new(&AvatarRegistry::default()).at(1_010_000),
                 width,
                 height,
-                None,
-                Some(1_010_000),
             );
             let selected_id = if width < 24 {
                 "000000"
@@ -1158,18 +1182,7 @@ mod tests {
     fn render_chat_narrow_width_fallback() {
         let queue = make_test_queue();
         let reg = AvatarRegistry::default();
-        let lines = render_chat(
-            &queue,
-            None,
-            None,
-            &reg,
-            None,
-            None,
-            18,
-            10,
-            None,
-            Some(1_010_000),
-        );
+        let lines = render_chat(&queue, ChatRenderContext::new(&reg).at(1_010_000), 18, 10);
 
         assert_eq!(lines.len(), 10);
         for line in &lines {
@@ -1226,15 +1239,11 @@ mod tests {
         let queue = make_test_queue();
         let lines = render_chat(
             &queue,
-            None,
-            Some(&composer),
-            &reg,
-            None,
-            None,
+            ChatRenderContext::new(&reg)
+                .with_composer(&composer)
+                .at(1_010_000),
             80,
             10,
-            None,
-            Some(1_010_000),
         );
         let joined = lines.join("\n");
         assert!(
@@ -1464,18 +1473,7 @@ mod tests {
         });
 
         let reg = AvatarRegistry::default();
-        let lines = render_chat(
-            &queue,
-            None,
-            None,
-            &reg,
-            None,
-            None,
-            80,
-            25,
-            None,
-            Some(1_010_000),
-        );
+        let lines = render_chat(&queue, ChatRenderContext::new(&reg).at(1_010_000), 80, 25);
 
         let joined = lines.join("\n");
         assert!(
@@ -1518,18 +1516,7 @@ mod tests {
         });
 
         let reg = AvatarRegistry::default();
-        let lines = render_chat(
-            &queue,
-            None,
-            None,
-            &reg,
-            None,
-            None,
-            80,
-            15,
-            None,
-            Some(1_010_000),
-        );
+        let lines = render_chat(&queue, ChatRenderContext::new(&reg).at(1_010_000), 80, 15);
 
         let joined = lines.join("\n");
         assert!(
@@ -1570,18 +1557,7 @@ mod tests {
         });
 
         let reg = AvatarRegistry::default();
-        let lines = render_chat(
-            &queue,
-            None,
-            None,
-            &reg,
-            None,
-            None,
-            80,
-            15,
-            None,
-            Some(1_010_000),
-        );
+        let lines = render_chat(&queue, ChatRenderContext::new(&reg).at(1_010_000), 80, 15);
 
         let joined = lines.join("\n");
         assert!(
@@ -1600,15 +1576,11 @@ mod tests {
         let reg = AvatarRegistry::default();
         let lines = render_chat(
             &queue,
-            None,
-            None,
-            &reg,
-            None,
-            None,
+            ChatRenderContext::new(&reg)
+                .with_status("refresh failed · Ctrl+R to retry")
+                .at(1_010_000),
             80,
             15,
-            Some("refresh failed · Ctrl+R to retry"),
-            Some(1_010_000),
         );
 
         let header = &lines[0];

@@ -1926,7 +1926,14 @@ mod tests {
             // starts at column 1: the two chrome edges compose, and the
             // ring below is asserted against the split rather than against
             // a hardcoded corner.
-            let areas = crate::render::chrome_areas_for(area, false, 22, tab_bar_visible);
+            let areas = crate::render::chrome_areas_for(
+                area,
+                false,
+                22,
+                tab_bar_visible,
+                false,
+                crate::render::MESSAGES_DEFAULT_WIDTH,
+            );
             let declared = tmux_client_size(areas.canvas, &tabs[0]);
             let backend = TestBackend::new(area.width, area.height);
             let mut term = Terminal::new(backend).unwrap();

@@ -427,7 +427,7 @@ fn action_words(action: BindingAction) -> String {
         BindingAction::RenameWorkspace => "Rename session".into(),
         BindingAction::CloseWorkspace => "Close session".into(),
         BindingAction::ToggleSidebar => "Toggle sidebar".into(),
-        BindingAction::ToggleMessages => "Toggle messages".into(),
+        BindingAction::ToggleMessages => crate::copy::BINDING_TOGGLE_MESSAGES.into(),
         BindingAction::ToggleTabBar => "Toggle tab bar".into(),
         BindingAction::ToggleFiles => "Toggle file panel".into(),
         BindingAction::FocusFiles => "Keyboard into the file panel".into(),

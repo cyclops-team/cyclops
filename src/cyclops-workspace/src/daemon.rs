@@ -336,19 +336,6 @@ pub fn fetch_messages_snapshot(
         .map_err(|e| format!("cannot decode messages.snapshot result: {e}"))
 }
 
-/// Claim a message in the durable inbox to authorize body and thread inspection.
-pub fn fetch_message_claim(
-    home: &Path,
-    message_id: &cyclops_proto::MessageId,
-) -> Result<cyclops_proto::InboxClaimResult, String> {
-    let params = serde_json::to_value(cyclops_proto::InboxClaimParams {
-        message_id: message_id.clone(),
-    })
-    .map_err(|e| format!("cannot encode inbox.claim params: {e}"))?;
-    let value = request(home, "inbox.claim", params)?;
-    serde_json::from_value(value).map_err(|e| format!("cannot decode inbox.claim result: {e}"))
-}
-
 /// Current daemon status. Callers pass the shared protocol params so the
 /// choice to include the delivery half of attention stays visible at the
 /// surface that needs it.

@@ -2621,7 +2621,7 @@ fn finish_message_detail(
 }
 
 /// Request current message state without inventing connection evidence.
-pub(crate) fn request_messages_snapshot(app: &mut App) {
+fn request_messages_snapshot(app: &mut App) {
     match app.messages_gate.link() {
         cyclops_ui::Link::Connected => {
             app.messages_gate.mark_dirty();
@@ -2635,7 +2635,7 @@ pub(crate) fn request_messages_snapshot(app: &mut App) {
 }
 
 /// Pump the Messages drawer refresh gate, issuing a snapshot fetch if one is owed and none in flight.
-pub(crate) fn pump_messages_refresh(app: &mut App) {
+fn pump_messages_refresh(app: &mut App) {
     if !app.model.messages_visible {
         return;
     }
@@ -3168,6 +3168,11 @@ fn cancel_drag(app: &mut App) {
             // Sidebar motion is only visual until mouse-up, so Escape can
             // restore the start without a compensating tmux resize.
             app.prefs.sidebar_width = width;
+        }
+        if let Some(width) = crate::render::messages_width_on_cancel(&drag, app.term_size.0) {
+            // The Messages divider follows the same preview contract as
+            // the sidebar: Escape restores the width from mouse-down.
+            app.prefs.messages_width = width;
         }
     }
 }
@@ -5301,6 +5306,28 @@ pub fn print_help_and_exit() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    trait FixtureParse: Sized {
+        type Error;
+
+        fn parse(value: &str) -> Result<Self, Self::Error>;
+    }
+
+    impl FixtureParse for cyclops_proto::RecipientKey {
+        type Error = cyclops_proto::IdentityError;
+
+        fn parse(value: &str) -> Result<Self, Self::Error> {
+            value.parse()
+        }
+    }
+
+    impl FixtureParse for cyclops_proto::MessageId {
+        type Error = cyclops_proto::MailboxTypeError;
+
+        fn parse(value: &str) -> Result<Self, Self::Error> {
+            cyclops_proto::MessageId::new(value)
+        }
+    }
 
     #[test]
     fn workspace_log_refuses_a_link_without_touching_its_target() {

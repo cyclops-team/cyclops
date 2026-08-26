@@ -489,15 +489,17 @@ pub fn paint_messages(
 
     let rows = cyclops_ui::render_chat(
         queue,
-        detail,
-        composer,
-        avatar_registry,
-        live_routes,
-        pane_manifests,
+        cyclops_ui::ChatRenderContext {
+            detail,
+            composer,
+            avatar_registry,
+            live_routes,
+            pane_manifests,
+            status,
+            now_ms,
+        },
         content_w,
         content_h,
-        status,
-        now_ms,
     );
     let content_rect = Rect::new(
         area.x + 1,
@@ -1174,6 +1176,7 @@ fn paint_insertion_rule(buf: &mut Buffer, area: Rect, y: u16, paint: &Paint) {
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::MouseButton;
     use ratatui::backend::TestBackend;
     use ratatui::style::Color as RtColor;
     use ratatui::Terminal;

@@ -152,6 +152,20 @@ impl AvatarRegistry {
 mod tests {
     use super::*;
 
+    trait FixtureParse: Sized {
+        type Error;
+
+        fn parse(value: &str) -> Result<Self, Self::Error>;
+    }
+
+    impl FixtureParse for cyclops_proto::RecipientKey {
+        type Error = cyclops_proto::IdentityError;
+
+        fn parse(value: &str) -> Result<Self, Self::Error> {
+            value.parse()
+        }
+    }
+
     #[test]
     fn default_registry_resolves_known_agents() {
         let reg = AvatarRegistry::default();

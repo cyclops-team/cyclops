@@ -444,6 +444,8 @@ mod tests {
         let prefs = WorkspacePrefs {
             sidebar_visible: false,
             sidebar_width: 28,
+            messages_visible: true,
+            messages_width: 29,
             files_rows: 8,
             // An offered tab, so this pins the round trip and not the
             // coercion. `a_tab_no_longer_offered_loads_as_the_default`
@@ -582,6 +584,8 @@ mod tests {
         for key in [
             "sidebar_visible",
             "sidebar_width",
+            "messages_visible",
+            "messages_width",
             "sidebar_tab",
             "tab_bar_visible",
             "motion",
@@ -618,6 +622,8 @@ mod tests {
                 files_rows: 8,
                 sidebar_visible: true,
                 sidebar_width: 31,
+                messages_visible: false,
+                messages_width: crate::render::MESSAGES_DEFAULT_WIDTH,
                 sidebar_tab: SidebarTab::Sessions,
                 tab_bar_visible: true,
                 motion: true,
