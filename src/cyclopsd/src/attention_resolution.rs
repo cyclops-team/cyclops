@@ -1408,6 +1408,7 @@ composer_continuation_regex = '^  (?P<content>.*)$'
                 doorbell_format: None,
                 cause: None,
                 pre_write_cause: None,
+                wake_block: None,
                 pre_write_observation: None,
                 pre_write_reopen_count: 0,
                 started_seq: 1,

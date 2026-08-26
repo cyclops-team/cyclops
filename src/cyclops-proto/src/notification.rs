@@ -518,6 +518,13 @@ pub struct NotificationRecord {
     pub cause: Option<NotificationAttentionCause>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_write_cause: Option<NotificationPreWriteCause>,
+    /// Exact scheduler outcome that left this attempt without a live owner.
+    ///
+    /// This is separate from `pre_write_cause`: the latter describes the
+    /// terminal boundary, while this field preserves the recoverable wake
+    /// diagnosis across daemon restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_block: Option<crate::wire::MessageWakeBlock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_write_observation: Option<NotificationPreWriteObservation>,
     /// Automatic evidence-driven reopens already used by this attempt.
@@ -601,6 +608,9 @@ pub enum NotificationFact {
         cause: Option<NotificationAttentionCause>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pre_write_cause: Option<NotificationPreWriteCause>,
+        /// Exact scheduler outcome for a pre-write block.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wake_block: Option<crate::wire::MessageWakeBlock>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pre_write_observation: Option<Box<NotificationPreWriteObservation>>,
     },
@@ -1069,6 +1079,7 @@ mod tests {
             doorbell_format: None,
             cause: None,
             pre_write_cause: None,
+            wake_block: None,
             pre_write_observation: None,
             pre_write_reopen_count: 0,
             started_seq: 1,
@@ -1230,6 +1241,7 @@ mod tests {
             doorbell_format: Some(DOORBELL_FORMAT_ATTEMPT_CLAIM),
             cause: Some(NotificationAttentionCause::AckTimeout),
             pre_write_cause: None,
+            wake_block: None,
             pre_write_observation: None,
             pre_write_reopen_count: 0,
             started_seq: 1,
@@ -1449,6 +1461,7 @@ mod tests {
             doorbell_format: Some(DOORBELL_FORMAT_ATTEMPT_CLAIM),
             cause: None,
             pre_write_cause: None,
+            wake_block: None,
             pre_write_observation: None,
         };
         let encoded = serde_json::to_value(current).unwrap();
@@ -1480,6 +1493,7 @@ mod tests {
             doorbell_format: None,
             cause: None,
             pre_write_cause: Some(NotificationPreWriteCause::WriteReadinessChanged),
+            wake_block: None,
             pre_write_observation: Some(Box::new(NotificationPreWriteObservation {
                 pane_root: None,
                 selected_manifest: None,

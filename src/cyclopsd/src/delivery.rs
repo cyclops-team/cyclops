@@ -3156,7 +3156,9 @@ fn record_notification_prewrite_block(
 ) -> Option<NotificationRecord> {
     let recorded = {
         let _publication = publication.lock().expect("mailbox publication lock");
-        notification.record_pre_write_block(cause, observation)
+        let wake_block = (cause == NotificationPreWriteCause::ComposerOwnershipUnproven)
+            .then_some(cyclops_proto::MessageWakeBlock::ComposerOwnershipUnproven);
+        notification.record_pre_write_block_with_wake_block(cause, observation, wake_block)
     };
     match recorded {
         Ok(record) => Some(record),

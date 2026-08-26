@@ -413,6 +413,12 @@ fn blocked_notification_rows(res: &StatusResult, style: &Style) -> Vec<String> {
             .or_else(|| {
                 item.recipient
                     .notification
+                    .wake_block
+                    .map(|block| block.label().to_string())
+            })
+            .or_else(|| {
+                item.recipient
+                    .notification
                     .pre_write_cause
                     .map(|cause| cause.label().to_string())
             })
@@ -1611,6 +1617,7 @@ mod tests {
                     fifo_position: Some(2),
                     notification: cyclops_proto::MessageNotificationSummary {
                         state: cyclops_proto::MessageNotificationState::Gating,
+                        wake_block: None,
                         quota_state: None,
                         settlement: None,
                         operator_withdrawn: None,
@@ -1687,6 +1694,17 @@ mod tests {
         assert!(rendered.contains("worker failed"), "{rendered}");
         assert!(rendered.contains("waited 1m"), "{rendered}");
         assert!(rendered.contains("reviewer-now (%1)"), "{rendered}");
+
+        status.blocked_notifications[0]
+            .recipient
+            .notification
+            .wake_block = Some(cyclops_proto::MessageWakeBlock::WorkerSupervisorExited);
+        let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
+        assert!(rendered.contains("worker supervisor exited"), "{rendered}");
+        assert!(
+            !rendered.contains("scheduler state unavailable"),
+            "{rendered}"
+        );
         assert!(
             rendered.contains(&format!(
                 "workspace admin: cyclops notification withdraw {attempt} --recipient {recipient}"

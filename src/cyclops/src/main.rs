@@ -2142,13 +2142,8 @@ fn message_recipient_cell(
                 Some(cyclops_proto::MessageQuotaState::ResetObserved) => format!(
                 "quota reset observed · admin next: cyclops requeue {message_id} · message wide"
             ),
-                None => match recipient.notification.pre_write_cause {
-                    Some(cause) => {
-                        let reason = recipient
-                            .notification
-                            .pane_width_block()
-                            .map(|(observed, required)| copy::pane_too_narrow(observed, required))
-                            .unwrap_or_else(|| cause.wire_name().to_string());
+                None => match message_wake_block_reason(&recipient.notification) {
+                    Some(reason) => {
                         let mut blocked = format!("wake blocked before write: {reason}");
                         if let Some(updated_at) = recipient.notification.updated_at {
                             blocked.push_str(&format!(
@@ -2279,6 +2274,24 @@ fn message_recipient_cell(
         "{} [{mailbox}; {notification}{availability}]",
         recipient.label
     )
+}
+
+fn message_wake_block_reason(
+    notification: &cyclops_proto::MessageNotificationSummary,
+) -> Option<String> {
+    notification
+        .pane_width_block()
+        .map(|(observed, required)| copy::pane_too_narrow(observed, required))
+        .or_else(|| {
+            notification
+                .wake_block
+                .map(|block| block.wire_name().to_string())
+        })
+        .or_else(|| {
+            notification
+                .pre_write_cause
+                .map(|cause| cause.wire_name().to_string())
+        })
 }
 
 fn print_claim_payload(message: &cyclops_proto::InboxMessage) {
@@ -3165,6 +3178,7 @@ mod tests {
                 fifo_position: Some(2),
                 notification: cyclops_proto::MessageNotificationSummary {
                     state: cyclops_proto::MessageNotificationState::AttentionRequired,
+                    wake_block: None,
                     quota_state: None,
                     settlement: None,
                     operator_withdrawn: None,
@@ -3211,6 +3225,7 @@ mod tests {
         not_started.fifo_position = Some(1);
         not_started.notification = cyclops_proto::MessageNotificationSummary {
             state: cyclops_proto::MessageNotificationState::NotStarted,
+            wake_block: None,
             quota_state: None,
             settlement: None,
             operator_withdrawn: None,
@@ -3235,6 +3250,7 @@ mod tests {
         gating.available = false;
         gating.notification = cyclops_proto::MessageNotificationSummary {
             state: cyclops_proto::MessageNotificationState::Gating,
+            wake_block: None,
             quota_state: None,
             settlement: None,
             operator_withdrawn: None,
@@ -3345,6 +3361,12 @@ mod tests {
             ),
             "{cell}"
         );
+
+        worker_failed.notification.wake_block =
+            Some(cyclops_proto::MessageWakeBlock::WorkerSupervisorExited);
+        let cell = message_recipient_cell(&row.message_id, &worker_failed);
+        assert!(cell.contains("worker_supervisor_exited"), "{cell}");
+        assert!(!cell.contains("scheduler_state_unavailable"), "{cell}");
     }
 
     /// The preview line shows the cause in the protocol's own spelling.

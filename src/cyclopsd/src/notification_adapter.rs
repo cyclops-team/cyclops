@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex as StdMutex};
 
 use cyclops_proto::{
-    LedgerLine, MailboxEntry, MailboxEntryState, MessageId, MessagesChangedArea,
+    LedgerLine, MailboxEntry, MailboxEntryState, MessageId, MessageWakeBlock, MessagesChangedArea,
     NotificationAttemptId, NotificationAttentionCause, NotificationBinding, NotificationManifestId,
     NotificationPreWriteCause, NotificationPreWriteObservation, NotificationRecord,
     NotificationState, NotificationTransport, ProcessInstanceId, RecipientKey,
@@ -440,6 +440,16 @@ impl NotificationContext {
         cause: NotificationPreWriteCause,
         observation: Option<NotificationPreWriteObservation>,
     ) -> Result<NotificationRecord, NotificationAdapterError> {
+        self.record_pre_write_block_with_wake_block(cause, observation, None)
+    }
+
+    /// Stop this attempt and retain why no scheduler worker owns its wake.
+    pub(crate) fn record_pre_write_block_with_wake_block(
+        &self,
+        cause: NotificationPreWriteCause,
+        observation: Option<NotificationPreWriteObservation>,
+        wake_block: Option<MessageWakeBlock>,
+    ) -> Result<NotificationRecord, NotificationAdapterError> {
         let mut store = self
             .store
             .lock()
@@ -458,12 +468,13 @@ impl NotificationContext {
         if current.state != NotificationState::Gating {
             return Err(NotificationAdapterError::TerminalConflict(current.state));
         }
-        let record = store.block_notification_before_write(
+        let record = store.block_notification_before_write_with_wake_block(
             self.message_id.clone(),
             self.recipient,
             self.attempt_id,
             cause,
             observation,
+            wake_block,
         )?;
         self.publish_transition(&record);
         Ok(record)

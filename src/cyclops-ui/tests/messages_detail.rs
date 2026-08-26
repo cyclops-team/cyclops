@@ -53,6 +53,7 @@ fn row(
         wake,
         cause: None,
         pre_write_cause: None,
+        wake_block: None,
         pre_write_pane_width: None,
         pre_write_required_pane_width: None,
         current_route: None,
@@ -280,6 +281,16 @@ fn a_width_block_says_what_was_observed_and_required() {
         "{frame}"
     );
     assert!(!frame.contains("write readiness changed"), "{frame}");
+}
+
+#[test]
+fn a_blocked_detail_names_the_durable_scheduler_cause() {
+    let mut row = blocked();
+    row.wake_block = Some(cyclops_proto::MessageWakeBlock::WorkerSupervisorExited);
+
+    let frame = render(&opened(&row, Loaded::default()), 80, 24).join("\n");
+    assert!(frame.contains("worker supervisor exited"), "{frame}");
+    assert!(!frame.contains("scheduler state unavailable"), "{frame}");
 }
 
 #[test]
@@ -809,6 +820,7 @@ mod through_the_app {
             } else {
                 MessageNotificationState::Notified
             },
+            wake_block: None,
             quota_state: None,
             settlement: None,
             operator_withdrawn: None,

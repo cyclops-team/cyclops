@@ -281,7 +281,7 @@ fn park_unowned_notification(
             .expect("mailbox publication lock");
         context
             .record_gating()
-            .and_then(|_| context.record_pre_write_block(cause, None))
+            .and_then(|_| context.record_pre_write_block_with_wake_block(cause, None, Some(block)))
     };
     recorded
         .map(|_| RecipientScheduleOutcome::Blocked(block))

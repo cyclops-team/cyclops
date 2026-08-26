@@ -17,8 +17,8 @@
 //!   row" and never resolves anything itself.
 
 use cyclops_proto::{
-    MessageId, MessageRecipientRoute, NotificationAttemptId, NotificationAttentionCause,
-    NotificationPreWriteCause, RecipientKey,
+    MessageId, MessageRecipientRoute, MessageWakeBlock, NotificationAttemptId,
+    NotificationAttentionCause, NotificationPreWriteCause, RecipientKey,
 };
 
 use crate::grid::display_width;
@@ -224,6 +224,8 @@ pub struct QueueRow {
     pub wake: WakeWord,
     pub cause: Option<NotificationAttentionCause>,
     pub pre_write_cause: Option<NotificationPreWriteCause>,
+    /// Exact durable reason this wake has no live scheduler owner.
+    pub wake_block: Option<MessageWakeBlock>,
     pub pre_write_pane_width: Option<u32>,
     pub pre_write_required_pane_width: Option<u32>,
     /// Current live route. The immutable send-time label remains the fallback.

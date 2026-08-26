@@ -377,6 +377,16 @@ still expose visible bytes for inspection, but terminal capture alone cannot
 make `trailer_anchored` true and cannot authorize `complete` or a submit key.
 Application-level composer proof must bind the complete unsubmitted bytes to
 the same attempt and process generation before this path can be enabled.
+
+A `blocked_pre_write` transition may carry `wake_block`, the exact closed
+scheduler outcome that left the attempt without a live owner. The projection
+retains it across replay and exposes it on
+`MessageNotificationSummary.wake_block`. Current values distinguish daemon
+shutdown, missing route, pending attention resolution, worker fault, worker
+supervisor exit, enqueue refusal, and unproven complete composer ownership.
+`scheduler_state_unavailable` is reserved for legacy blocked facts that did
+not journal the exact outcome.
+
 Admin has no pane route, so an accepted admin message reports `not_started` and
 remains in the durable admin inbox without a notification attempt.
 

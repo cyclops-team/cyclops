@@ -40,6 +40,7 @@ fn attempt(n: u64) -> NotificationAttemptId {
 fn wake(state: MessageNotificationState) -> MessageNotificationSummary {
     MessageNotificationSummary {
         state,
+        wake_block: None,
         quota_state: None,
         settlement: None,
         operator_withdrawn: None,
@@ -60,6 +61,7 @@ fn wake(state: MessageNotificationState) -> MessageNotificationSummary {
 fn alarm(n: u64, cleared: bool) -> MessageNotificationSummary {
     MessageNotificationSummary {
         state: MessageNotificationState::AttentionRequired,
+        wake_block: None,
         quota_state: None,
         settlement: None,
         operator_withdrawn: None,
@@ -80,6 +82,7 @@ fn alarm(n: u64, cleared: bool) -> MessageNotificationSummary {
 fn quota(n: u64, state: MessageQuotaState) -> MessageNotificationSummary {
     MessageNotificationSummary {
         state: MessageNotificationState::AttentionRequired,
+        wake_block: None,
         quota_state: Some(state),
         settlement: None,
         operator_withdrawn: None,

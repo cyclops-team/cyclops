@@ -267,6 +267,7 @@ pub struct Detail {
     can_manage_attention: bool,
     /// The daemon's answer for this exact unwritten wake and authenticated caller.
     can_withdraw_notification: bool,
+    wake_block: Option<cyclops_proto::MessageWakeBlock>,
     pre_write_cause: Option<NotificationPreWriteCause>,
     pre_write_pane_width: Option<u32>,
     pre_write_required_pane_width: Option<u32>,
@@ -308,6 +309,7 @@ impl Detail {
             },
             can_manage_attention: row.can_manage_attention,
             can_withdraw_notification: row.can_withdraw_notification,
+            wake_block: row.wake_block,
             pre_write_cause: row.pre_write_cause,
             pre_write_pane_width: row.pre_write_pane_width,
             pre_write_required_pane_width: row.pre_write_required_pane_width,
@@ -493,6 +495,7 @@ impl Detail {
                     || row.resolution_intent != self.resolution_intent
                     || row.resolution_action_accepted != self.resolution_action_accepted
                     || row.resolution_consumption_observed != self.resolution_consumption_observed
+                    || row.wake_block != self.wake_block
                     || row.pre_write_cause != self.pre_write_cause
                     || row.pre_write_pane_width != self.pre_write_pane_width
                     || row.pre_write_required_pane_width != self.pre_write_required_pane_width
@@ -504,6 +507,7 @@ impl Detail {
                     self.resolution_intent = row.resolution_intent;
                     self.resolution_action_accepted = row.resolution_action_accepted;
                     self.resolution_consumption_observed = row.resolution_consumption_observed;
+                    self.wake_block = row.wake_block;
                     self.pre_write_cause = row.pre_write_cause;
                     self.pre_write_pane_width = row.pre_write_pane_width;
                     self.pre_write_required_pane_width = row.pre_write_required_pane_width;
@@ -742,6 +746,7 @@ impl Detail {
         if action == Action::WithdrawNotification {
             self.can_withdraw_notification = false;
             self.wake = WakeWord::WithdrawnByOperator;
+            self.wake_block = None;
             self.pre_write_cause = None;
             self.pre_write_pane_width = None;
             self.pre_write_required_pane_width = None;
@@ -1013,10 +1018,11 @@ pub(crate) fn render_with_status(
                     "wake blocked before write: pane too narrow ({observed}, requires {required})"
                 ));
             } else {
-                let reason = match detail.pre_write_cause {
-                    Some(cause) => cause.label(),
-                    None => "reason unavailable",
-                };
+                let reason = detail
+                    .wake_block
+                    .map(cyclops_proto::MessageWakeBlock::label)
+                    .or_else(|| detail.pre_write_cause.map(NotificationPreWriteCause::label))
+                    .unwrap_or("reason unavailable");
                 body.push(format!("wake blocked before write: {reason}"));
             }
             body.push(format!(

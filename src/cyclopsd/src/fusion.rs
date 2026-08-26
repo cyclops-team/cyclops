@@ -6485,6 +6485,7 @@ contains = ["working"]
             doorbell_format: Some(DOORBELL_FORMAT_COMPACT_CLAIM),
             cause: None,
             pre_write_cause: None,
+            wake_block: None,
             pre_write_observation: None,
             pre_write_reopen_count: 0,
             started_seq: 2,

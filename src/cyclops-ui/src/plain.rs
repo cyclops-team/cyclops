@@ -380,6 +380,7 @@ mod tests {
                 fifo_position: Some(1),
                 notification: MessageNotificationSummary {
                     state: MessageNotificationState::NotStarted,
+                    wake_block: None,
                     quota_state: None,
                     settlement: None,
                     operator_withdrawn: None,

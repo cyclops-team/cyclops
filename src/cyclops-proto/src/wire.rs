@@ -644,7 +644,38 @@ pub enum MessageWakeBlock {
     WorkerFaulted,
     WorkerSupervisorExited,
     EnqueueRefused,
+    ComposerOwnershipUnproven,
     SchedulerStateUnavailable,
+}
+
+impl MessageWakeBlock {
+    /// Stable protocol spelling used by terminal and JSON clients.
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::DaemonStopping => "daemon_stopping",
+            Self::RouteUnavailable => "route_unavailable",
+            Self::AttentionResolutionPending => "attention_resolution_pending",
+            Self::WorkerFaulted => "worker_faulted",
+            Self::WorkerSupervisorExited => "worker_supervisor_exited",
+            Self::EnqueueRefused => "enqueue_refused",
+            Self::ComposerOwnershipUnproven => "composer_ownership_unproven",
+            Self::SchedulerStateUnavailable => "scheduler_state_unavailable",
+        }
+    }
+
+    /// Human wording shared by receipts, snapshots, and operator surfaces.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DaemonStopping => "daemon stopping",
+            Self::RouteUnavailable => "route unavailable",
+            Self::AttentionResolutionPending => "attention resolution pending",
+            Self::WorkerFaulted => "worker faulted",
+            Self::WorkerSupervisorExited => "worker supervisor exited",
+            Self::EnqueueRefused => "scheduler refused ownership",
+            Self::ComposerOwnershipUnproven => "complete composer ownership unproven",
+            Self::SchedulerStateUnavailable => "scheduler state unavailable",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -918,6 +949,12 @@ impl MessageNotificationSettlement {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageNotificationSummary {
     pub state: MessageNotificationState,
+    /// Exact durable reason this wake has no live terminal owner.
+    ///
+    /// Missing values identify legacy records whose exact scheduler outcome
+    /// was not journaled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_block: Option<MessageWakeBlock>,
     /// Exact quota phase. When present, `state` remains
     /// `attention_required` for old-client compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1702,6 +1739,14 @@ mod tests {
                 .wake_block,
             Some(MessageWakeBlock::WorkerSupervisorExited)
         );
+
+        let legacy_summary: MessageNotificationSummary =
+            serde_json::from_value(serde_json::json!({ "state": "gating" })).unwrap();
+        assert_eq!(legacy_summary.wake_block, None);
+        assert_eq!(
+            MessageWakeBlock::ComposerOwnershipUnproven.wire_name(),
+            "composer_ownership_unproven"
+        );
     }
 
     #[test]
@@ -1832,6 +1877,7 @@ mod tests {
             fifo_position: Some(1),
             notification: MessageNotificationSummary {
                 state: MessageNotificationState::NotStarted,
+                wake_block: None,
                 quota_state: None,
                 settlement: None,
                 operator_withdrawn: None,
@@ -1868,6 +1914,7 @@ mod tests {
     fn notification_resolution_is_optional_and_round_trips() {
         let unresolved = MessageNotificationSummary {
             state: MessageNotificationState::AttentionRequired,
+            wake_block: None,
             quota_state: None,
             settlement: None,
             operator_withdrawn: None,
@@ -1955,6 +2002,7 @@ mod tests {
         ] {
             let summary = MessageNotificationSummary {
                 state: internal.into(),
+                wake_block: None,
                 quota_state: MessageQuotaState::from_notification(internal),
                 settlement: None,
                 operator_withdrawn: None,
@@ -1990,6 +2038,7 @@ mod tests {
     fn resolution_boundaries_are_distinct_from_completion() {
         let summary = MessageNotificationSummary {
             state: MessageNotificationState::AttentionRequired,
+            wake_block: None,
             quota_state: None,
             settlement: None,
             operator_withdrawn: None,
@@ -2078,6 +2127,7 @@ mod tests {
         ] {
             let summary = MessageNotificationSummary {
                 state: internal.into(),
+                wake_block: None,
                 quota_state: None,
                 settlement: MessageNotificationSettlement::from_notification(internal),
                 operator_withdrawn: None,

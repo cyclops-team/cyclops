@@ -272,7 +272,7 @@ fn mailbox_receipt_badge(
         words.push_str(&format!(" {sep} {ahead} ahead"));
     }
     let wake = if let Some(block) = receipt.wake_block {
-        format!("blocked ({})", wake_block_words(block))
+        format!("blocked ({})", block.label())
     } else if receipt.notification_settlement
         == Some(cyclops_proto::MessageNotificationSettlement::WithdrawnByClaim)
     {
@@ -296,18 +296,6 @@ fn mailbox_receipt_badge(
     };
     words.push_str(&format!(" {sep} wake {wake}"));
     paint.badge(receipt.state, &words)
-}
-
-fn wake_block_words(block: MessageWakeBlock) -> &'static str {
-    match block {
-        MessageWakeBlock::DaemonStopping => "daemon stopping",
-        MessageWakeBlock::RouteUnavailable => "route unavailable",
-        MessageWakeBlock::AttentionResolutionPending => "attention resolution pending",
-        MessageWakeBlock::WorkerFaulted => "worker faulted",
-        MessageWakeBlock::WorkerSupervisorExited => "worker supervisor exited",
-        MessageWakeBlock::EnqueueRefused => "scheduler refused ownership",
-        MessageWakeBlock::SchedulerStateUnavailable => "scheduler state unavailable",
-    }
 }
 
 /// Human wording for the stable `DeliveryReceipt::held_by` tokens. Unknown

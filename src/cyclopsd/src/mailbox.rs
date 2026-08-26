@@ -1145,6 +1145,7 @@ impl MailboxProjection {
                         doorbell_format: current.doorbell_format,
                         cause: None,
                         pre_write_cause: None,
+                        wake_block: None,
                         pre_write_observation: None,
                         pre_write_reopen_count: current.pre_write_reopen_count,
                         started_seq: current.started_seq,
@@ -1288,6 +1289,7 @@ impl MailboxProjection {
                         doorbell_format: current.doorbell_format,
                         cause: None,
                         pre_write_cause: None,
+                        wake_block: None,
                         pre_write_observation: None,
                         pre_write_reopen_count: current.pre_write_reopen_count,
                         started_seq: current.started_seq,
@@ -1406,6 +1408,7 @@ impl MailboxProjection {
             doorbell_format,
             cause,
             pre_write_cause,
+            wake_block,
             pre_write_observation,
         } = fact
         else {
@@ -1529,7 +1532,10 @@ impl MailboxProjection {
                     });
                 }
             }
-        } else if pre_write_cause.is_some() || pre_write_observation.is_some() {
+        } else if pre_write_cause.is_some()
+            || wake_block.is_some()
+            || pre_write_observation.is_some()
+        {
             return Err(MailboxError::NotificationPreWriteCauseForbidden);
         }
 
@@ -1556,6 +1562,7 @@ impl MailboxProjection {
                         doorbell_format: None,
                         cause: None,
                         pre_write_cause: None,
+                        wake_block: None,
                         pre_write_observation: None,
                         pre_write_reopen_count: 0,
                         started_seq: line.seq,
@@ -1588,6 +1595,7 @@ impl MailboxProjection {
                     },
                     cause,
                     pre_write_cause,
+                    wake_block,
                     pre_write_observation: pre_write_observation.map(|observation| *observation),
                     pre_write_reopen_count: if current.state == NotificationState::BlockedPreWrite
                         && state == NotificationState::Gating
@@ -1741,6 +1749,7 @@ impl MailboxProjection {
                 doorbell_format: None,
                 cause: None,
                 pre_write_cause: None,
+                wake_block: None,
                 pre_write_observation: None,
                 pre_write_reopen_count: 0,
                 started_seq: line.seq,
@@ -1995,6 +2004,7 @@ impl MailboxProjection {
                 doorbell_format: current.doorbell_format,
                 cause: None,
                 pre_write_cause: None,
+                wake_block: None,
                 pre_write_observation: None,
                 pre_write_reopen_count: current.pre_write_reopen_count,
                 started_seq: current.started_seq,
@@ -3265,6 +3275,7 @@ impl MailboxProjection {
         let Some(record) = record else {
             return MessageNotificationSummary {
                 state: MessageNotificationState::NotStarted,
+                wake_block: None,
                 quota_state: None,
                 settlement: None,
                 operator_withdrawn: None,
@@ -3303,6 +3314,10 @@ impl MailboxProjection {
         let width_block = notification_pre_write_width_block(record);
         MessageNotificationSummary {
             state: record.state.into(),
+            wake_block: record.wake_block.or_else(|| {
+                self.attention_resolution_pending(record.attempt_id)
+                    .then_some(MessageWakeBlock::AttentionResolutionPending)
+            }),
             quota_state: MessageQuotaState::from_notification(record.state),
             settlement: self.notification_settlement(record),
             operator_withdrawn: (record.state == NotificationState::WithdrawnByOperator)
@@ -4553,6 +4568,9 @@ impl MailboxService {
             .projection()
             .notification(recipient, &message_id)
             .and_then(|record| {
+                if let Some(block) = record.wake_block {
+                    return Some(block);
+                }
                 matches!(
                     record.state,
                     NotificationState::BlockedPreWrite
@@ -6357,6 +6375,26 @@ impl MessageStore {
         cause: NotificationPreWriteCause,
         observation: Option<NotificationPreWriteObservation>,
     ) -> Result<NotificationRecord, MessageStoreError> {
+        self.block_notification_before_write_with_wake_block(
+            message_id,
+            recipient,
+            attempt_id,
+            cause,
+            observation,
+            None,
+        )
+    }
+
+    /// Stop one exact attempt while retaining its scheduler diagnosis.
+    pub fn block_notification_before_write_with_wake_block(
+        &mut self,
+        message_id: MessageId,
+        recipient: RecipientKey,
+        attempt_id: NotificationAttemptId,
+        cause: NotificationPreWriteCause,
+        observation: Option<NotificationPreWriteObservation>,
+        wake_block: Option<MessageWakeBlock>,
+    ) -> Result<NotificationRecord, MessageStoreError> {
         #[cfg(test)]
         if self.fail_pre_write_block_appends > 0 {
             self.fail_pre_write_block_appends -= 1;
@@ -6376,6 +6414,7 @@ impl MessageStore {
             None,
             None,
             Some(cause),
+            wake_block,
             observation,
             now_ms(),
         )
@@ -6456,6 +6495,7 @@ impl MessageStore {
             cause,
             None,
             None,
+            None,
             ts,
         )
     }
@@ -6472,6 +6512,7 @@ impl MessageStore {
         doorbell_format: Option<u32>,
         cause: Option<NotificationAttentionCause>,
         pre_write_cause: Option<NotificationPreWriteCause>,
+        wake_block: Option<MessageWakeBlock>,
         pre_write_observation: Option<NotificationPreWriteObservation>,
         ts: u64,
     ) -> Result<NotificationRecord, MessageStoreError> {
@@ -6486,6 +6527,7 @@ impl MessageStore {
             doorbell_format,
             cause,
             pre_write_cause,
+            wake_block,
             pre_write_observation: pre_write_observation.map(Box::new),
         };
         self.append_notification_fact_at(message_id, recipient, fact, ts)
@@ -8601,6 +8643,68 @@ mod tests {
     }
 
     #[test]
+    fn exact_scheduler_wake_block_survives_replay_and_snapshot() {
+        let scratch = StoreScratch::new("scheduler-wake-block-replay");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, _, bob, _) = test_context();
+        let make_directory = || {
+            MailboxDirectory::new(
+                workspace,
+                [MailboxIdentity {
+                    key: bob,
+                    label: "reviewer".into(),
+                }],
+            )
+            .unwrap()
+        };
+        let store = MessageStore::open(&root, journal, workspace, "boot-1").unwrap();
+        let service = MailboxService::new(make_directory(), store);
+        let accepted = service
+            .send(service.admin(), mailbox_send("reviewer", "Task", ""))
+            .unwrap();
+        let queued = service.prepare_oldest_notification(bob).unwrap().unwrap();
+        let context = crate::notification_adapter::NotificationContext::new(
+            service.store_handle(),
+            accepted.message_id.clone(),
+            bob,
+            queued.attempt_id,
+        );
+        context.record_gating().unwrap();
+        context
+            .record_pre_write_block_with_wake_block(
+                NotificationPreWriteCause::WorkerFailed,
+                None,
+                Some(MessageWakeBlock::WorkerSupervisorExited),
+            )
+            .unwrap();
+
+        assert_eq!(
+            service.notification_schedule_block(bob).unwrap(),
+            Some(MessageWakeBlock::WorkerSupervisorExited)
+        );
+        let snapshot = service.messages_snapshot(service.admin().key, 10).unwrap();
+        assert_eq!(
+            snapshot.rows[0].recipients[0].notification.wake_block,
+            Some(MessageWakeBlock::WorkerSupervisorExited)
+        );
+
+        drop(context);
+        drop(service);
+        let reopened = MessageStore::open(&root, journal, workspace, "boot-2").unwrap();
+        let service = MailboxService::new(make_directory(), reopened);
+        assert_eq!(
+            service.notification_schedule_block(bob).unwrap(),
+            Some(MessageWakeBlock::WorkerSupervisorExited)
+        );
+        let snapshot = service.messages_snapshot(service.admin().key, 10).unwrap();
+        assert_eq!(
+            snapshot.rows[0].recipients[0].notification.wake_block,
+            Some(MessageWakeBlock::WorkerSupervisorExited)
+        );
+    }
+
+    #[test]
     fn operator_withdrawal_is_durable_idempotent_and_advances_notification_fifo() {
         let scratch = StoreScratch::new("operator-prewrite-withdrawal");
         let root = scratch.root();
@@ -10254,6 +10358,7 @@ mod tests {
                     doorbell_format: None,
                     cause: None,
                     pre_write_cause: None,
+                    wake_block: None,
                     pre_write_observation: None,
                 })
                 .unwrap(),
@@ -16152,6 +16257,7 @@ mod tests {
                     doorbell_format: None,
                     cause: None,
                     pre_write_cause: None,
+                    wake_block: None,
                     pre_write_observation: None,
                 })
                 .unwrap(),

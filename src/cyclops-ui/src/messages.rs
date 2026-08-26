@@ -268,6 +268,7 @@ fn row_for(
         wake,
         cause: to.notification.cause,
         pre_write_cause: to.notification.pre_write_cause,
+        wake_block: to.notification.wake_block,
         pre_write_pane_width: to.notification.pre_write_pane_width,
         pre_write_required_pane_width: to.notification.pre_write_required_pane_width,
         current_route: to.current_route.clone(),
@@ -313,7 +314,7 @@ fn wake_word(n: &cyclops_proto::MessageNotificationSummary) -> WakeWord {
     if n.settlement == Some(MessageNotificationSettlement::WithdrawnByClaim) {
         return WakeWord::Withdrawn;
     }
-    if n.pre_write_cause.is_some() {
+    if n.wake_block.is_some() || n.pre_write_cause.is_some() {
         return WakeWord::BlockedBeforeWrite;
     }
     match n.quota_state {
