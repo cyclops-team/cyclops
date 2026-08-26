@@ -704,20 +704,30 @@ impl Engine {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn id_is_preloaded(&self, id: &str) -> bool {
-        self.issued.lock().expect("issued lock").contains(id)
-    }
-
     /// Mint a short unique message id, e.g. "m-3f9c2a".
     fn mint_msg_id(&self) -> String {
+        self.mint_msg_id_with(|| format!("m-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]))
+    }
+
+    fn mint_msg_id_with(&self, mut candidate: impl FnMut() -> String) -> String {
         let mut issued = self.issued.lock().expect("issued lock");
         loop {
-            let id = format!("m-{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
+            let id = candidate();
             if issued.insert(id.clone()) {
                 return id;
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mint_msg_id_from(&self, candidates: &[&str]) -> String {
+        let mut candidates = candidates.iter();
+        self.mint_msg_id_with(|| {
+            candidates
+                .next()
+                .expect("test candidate sequence exhausted")
+                .to_string()
+        })
     }
 }
 

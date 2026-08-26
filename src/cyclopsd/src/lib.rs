@@ -4919,9 +4919,13 @@ mod tests {
         let mut cfg = Config::defaults(&home);
         cfg.sessions = vec!["research".into()];
         let daemon = boot(cfg).await.unwrap();
-        assert!(
-            daemon.inner.engine.id_is_preloaded(legacy_id),
-            "an id visible through linked history must be reserved before requests can mint ids"
+        assert_eq!(
+            daemon
+                .inner
+                .engine
+                .mint_msg_id_from(&[legacy_id, "m-fedcba"]),
+            "m-fedcba",
+            "an id visible through linked history must be rejected by the real mint path"
         );
 
         let lines = daemon
