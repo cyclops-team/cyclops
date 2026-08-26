@@ -32,6 +32,8 @@
 	h2 {
 		font-weight: 700;
 		font-size: clamp(28px, 4.6vw, 48px);
+		letter-spacing: -0.04em;
+		word-spacing: -0.2em;
 		color: var(--ink);
 		line-height: 1.05;
 		margin: 0;

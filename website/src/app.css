@@ -270,14 +270,24 @@ a:hover {
 	color: var(--accent);
 }
 
-/* The one display size every section statement shares. */
+/* The one display size every section statement shares.
+   Silkscreen's caps are wider than they are tall and it ships with a lot
+   of air between letters and words, which at this size reads as a line
+   that has been stretched sideways. The tracking pulls the letters back
+   together and the scale lifts the caps until they stand taller than
+   they are wide; the transform does not change the layout box, so the
+   bottom margin carries the extra height. */
 .statement {
 	font-family: var(--font-pixel);
 	font-weight: 700;
 	font-size: clamp(24px, 3.3vw, 36px);
 	line-height: 1.2;
+	letter-spacing: -0.06em;
+	word-spacing: -0.25em;
 	color: var(--ink);
-	margin: 0 0 20px;
+	margin: 0 0 calc(20px + 0.4em);
+	transform: scaleY(1.18);
+	transform-origin: left top;
 }
 
 /* Body copy under a statement. */
