@@ -146,6 +146,8 @@ async fn send_workspace_message(rig: &Rig, client_key: &str, subject: &str, body
 struct WaitingPair {
     first: String,
     second: String,
+    first_receipt: Value,
+    second_receipt: Value,
 }
 
 async fn send_waiting_pair(rig: &Rig, key_prefix: &str) -> WaitingPair {
@@ -162,6 +164,8 @@ async fn send_waiting_pair(rig: &Rig, key_prefix: &str) -> WaitingPair {
     WaitingPair {
         first: first["msg_id"].as_str().unwrap().to_string(),
         second: second["msg_id"].as_str().unwrap().to_string(),
+        first_receipt: first["deliveries"][0].clone(),
+        second_receipt: second["deliveries"][0].clone(),
     }
 }
 
@@ -2135,6 +2139,19 @@ async fn codex_ghost_with_unprovable_binding_blocks_once_and_withdrawal_advances
     wait_pane_state(&mut rig, "idle").await;
 
     let pair = send_waiting_pair(&rig, "unprovable-binding").await;
+    assert_eq!(pair.first_receipt["notification_state"], "gating");
+    assert_eq!(
+        pair.first_receipt["pre_write_cause"], "binding_unprovable",
+        "msg.send must return the worker's first durable pre-write disposition"
+    );
+    assert!(
+        pair.second_receipt.get("pre_write_cause").is_none(),
+        "the follower must not inherit the head's pre-write block"
+    );
+    assert!(
+        pair.second_receipt.get("wake_block").is_none(),
+        "the follower must not inherit the head's scheduler state"
+    );
     wait_for_notification_state(&mut rig, &pair.first, NotificationState::BlockedPreWrite).await;
     let gate_trace: Vec<String> = rig
         .ledger_lines()

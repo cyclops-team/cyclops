@@ -28,7 +28,8 @@ pub struct Config {
     /// Redelivery attempts after the first failure. The soak needed zero;
     /// one bounded retry is the ceiling, never a loop.
     pub delivery_retry_max: u32,
-    /// Cap on how long msg.send blocks for a receipt on the idle path.
+    /// Cap on observing the first durable disposition of a head whose cached
+    /// pane verdict says the worker can decide immediately.
     pub receipt_block_ms: u64,
     /// One admin notification when a delivery has been held in gating this
     /// long (working pane, human typing, detached session). Visibility for

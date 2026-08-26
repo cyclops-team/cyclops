@@ -1332,6 +1332,7 @@ impl Daemon {
             .identity_for_address(from)
             .map_err(server::mailbox_service_error)?;
         let result = messaging::send(&self.inner, service, sender, params)
+            .await
             .map_err(server::mailbox_service_error)?;
         serde_json::to_value(result).map_err(|error| WireError {
             code: "internal".to_string(),

@@ -271,7 +271,9 @@ fn mailbox_receipt_badge(
     if let Some(ahead) = receipt.position.filter(|ahead| *ahead > 0) {
         words.push_str(&format!(" {sep} {ahead} ahead"));
     }
-    let wake = if let Some(block) = receipt.wake_block {
+    let wake = if let Some(cause) = receipt.pre_write_cause {
+        format!("blocked before write ({})", cause.label())
+    } else if let Some(block) = receipt.wake_block {
         format!("blocked ({})", block.label())
     } else if receipt.notification_settlement
         == Some(cyclops_proto::MessageNotificationSettlement::WithdrawnByClaim)
@@ -332,6 +334,7 @@ pub fn delivery_badge(
             notification_state: None,
             quota_state: None,
             notification_settlement: None,
+            pre_write_cause: None,
             wake_block: None,
             position: None,
             note,
@@ -387,6 +390,7 @@ mod tests {
             notification_state: None,
             quota_state: None,
             notification_settlement: None,
+            pre_write_cause: None,
             wake_block: None,
             position,
             note: note.map(String::from),
@@ -507,6 +511,12 @@ mod tests {
         assert_eq!(
             receipt_badge(&oldest, &Plain),
             "✓ accepted · wake blocked (worker supervisor exited)"
+        );
+
+        oldest.pre_write_cause = Some(cyclops_proto::NotificationPreWriteCause::BindingUnprovable);
+        assert_eq!(
+            receipt_badge(&oldest, &Plain),
+            "✓ accepted · wake blocked before write (binding unprovable)"
         );
     }
 

@@ -477,7 +477,7 @@ pub(crate) async fn dispatch(
             )
         }
         "msg.send" => (msg_send(inner, id, req.params, peer).await, None),
-        "msg.reply" => (msg_reply(inner, id, req.params, peer), None),
+        "msg.reply" => (msg_reply(inner, id, req.params, peer).await, None),
         "inbox.list" => (inbox_list(inner, id, req.params, peer), None),
         "inbox.claim" => (inbox_claim(inner, id, req.params, peer), None),
         "messages.snapshot" => (messages_snapshot(inner, id, req.params, peer), None),
@@ -821,7 +821,7 @@ async fn msg_send(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> R
             "a reply cannot be an announcement or supersede another message",
         );
     }
-    match crate::messaging::send(inner, &service, sender, params) {
+    match crate::messaging::send(inner, &service, sender, params).await {
         Ok(result) => Response::ok(
             id,
             serde_json::to_value(result).expect("message acceptance serializes"),
@@ -830,7 +830,7 @@ async fn msg_send(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> R
     }
 }
 
-fn msg_reply(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
+async fn msg_reply(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
     let params: ReplyParams = match decode_params(&id, params, "msg.reply params") {
         Ok(params) => params,
         Err(response) => return response,
@@ -846,7 +846,9 @@ fn msg_reply(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Respon
         params.message_id,
         params.body,
         params.client_key,
-    ) {
+    )
+    .await
+    {
         Ok(result) => Response::ok(
             id,
             serde_json::to_value(result).expect("reply acceptance serializes"),

@@ -352,6 +352,15 @@ claimable. The closed values are `daemon_stopping`, `route_unavailable`,
 `attention_resolution_pending`, `worker_faulted`, `worker_supervisor_exited`,
 `enqueue_refused`, and `scheduler_state_unavailable`.
 
+`DeliveryReceipt.pre_write_cause` is the separate optional terminal-boundary
+reason for a durable `blocked_pre_write` attempt, such as
+`binding_unprovable`. `msg.send` subscribes to `messages.changed` before
+scheduling an immediately decidable head, then reads the exact durable
+recipient, message, and attempt projection. The event is only an invalidation;
+the projection supplies the receipt. The shared observation deadline changes
+no state. A message queued behind an older head reports `not_started` and its
+position, with neither the head's `wake_block` nor its `pre_write_cause`.
+
 For a non-admin recipient, the daemon selects one transport at the terminal
 write boundary. An exact installed claim skill selects the content-free
 doorbell:

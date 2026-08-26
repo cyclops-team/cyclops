@@ -281,14 +281,17 @@ Notification-worker and legacy direct-delivery tuning, with defaults shown:
 ```toml
 ack_timeout_ms = 1500        # hook ACK window after a notification or legacy test write
 delivery_retry_max = 1       # retries only when no notification or legacy payload bytes reached the pane
-receipt_block_ms = 2500      # legacy direct-delivery receipt cap
+receipt_block_ms = 2500      # cap for observing an immediately decidable receipt
 gate_hold_notify_ms = 120000 # one admin ping when a worker is held this long
 ```
 
-These settings do not delay standard `cyclops send` acceptance. Standard send
-returns after the durable mailbox write and reports the current one-line wake
-state. Keep `receipt_block_ms` under 5000 for legacy direct-delivery operations:
-the CLI gives a socket read five seconds before it calls the connection lost.
+Standard `cyclops send` acceptance is durable before notification scheduling.
+When the cached pane verdict says the FIFO head can be decided immediately,
+the response observes its first durable wake disposition for at most
+`receipt_block_ms`. Working and otherwise held panes return their current state
+without this wait. The deadline records no fact and never decides delivery
+state. Keep it under 5000 because the CLI gives a socket read five seconds
+before it calls the connection lost.
 
 `delivery_retry_max` applies only to failures proven before a notification or
 legacy payload write: detach or missing manifest, a pre-write occupant rebind,

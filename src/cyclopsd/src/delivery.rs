@@ -2480,6 +2480,7 @@ fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryRecei
             notification_state: None,
             quota_state: None,
             notification_settlement: None,
+            pre_write_cause: None,
             wake_block: None,
             position: None,
             // The gate's machine cause travels as-is when the daemon had
@@ -2497,6 +2498,7 @@ fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryRecei
             notification_state: None,
             quota_state: None,
             notification_settlement: None,
+            pre_write_cause: None,
             wake_block: None,
             position: None,
             note: None,
@@ -2524,6 +2526,7 @@ fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryRecei
         notification_state: None,
         quota_state: None,
         notification_settlement: None,
+        pre_write_cause: None,
         wake_block: None,
         position,
         note: None,

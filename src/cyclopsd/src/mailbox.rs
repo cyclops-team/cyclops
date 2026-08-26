@@ -605,10 +605,22 @@ pub struct MailboxSend {
 pub(crate) struct MessageDisposition {
     pub recipient: RecipientKey,
     pub label: String,
+    pub attempt_id: Option<NotificationAttemptId>,
+    pub notification_state_raw: Option<NotificationState>,
     pub notification_state: MessageNotificationState,
     pub quota_state: Option<MessageQuotaState>,
     pub notification_settlement: Option<MessageNotificationSettlement>,
+    pub pre_write_cause: Option<NotificationPreWriteCause>,
+    pub wake_block: Option<MessageWakeBlock>,
     pub position_ahead: Option<u32>,
+}
+
+/// Exact durable FIFO head whose existing state prevents a fresh schedule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NotificationScheduleBlock {
+    pub message_id: MessageId,
+    pub attempt_id: NotificationAttemptId,
+    pub block: MessageWakeBlock,
 }
 
 /// Immutable authorization inputs for one unresolved attention attempt.
@@ -4755,7 +4767,7 @@ impl MailboxService {
     pub(crate) fn notification_schedule_block(
         &self,
         recipient: RecipientKey,
-    ) -> Result<Option<MessageWakeBlock>, MailboxServiceError> {
+    ) -> Result<Option<NotificationScheduleBlock>, MailboxServiceError> {
         if recipient.is_admin() {
             return Ok(None);
         }
@@ -4765,7 +4777,11 @@ impl MailboxService {
                 .projection()
                 .attention_resolution_pending(record.attempt_id)
             {
-                return Ok(Some(MessageWakeBlock::AttentionResolutionPending));
+                return Ok(Some(NotificationScheduleBlock {
+                    message_id: record.message_id.clone(),
+                    attempt_id: record.attempt_id,
+                    block: MessageWakeBlock::AttentionResolutionPending,
+                }));
             }
         }
         let Some(message_id) = store
@@ -4776,23 +4792,24 @@ impl MailboxService {
         else {
             return Ok(None);
         };
-        let block = store
-            .projection()
-            .notification(recipient, &message_id)
-            .and_then(|record| {
-                if let Some(block) = record.wake_block {
-                    return Some(block);
-                }
-                matches!(
-                    record.state,
-                    NotificationState::BlockedPreWrite
-                        | NotificationState::QuotaHeld
-                        | NotificationState::QuotaResetObserved
-                        | NotificationState::AttentionRequired
-                )
-                .then_some(MessageWakeBlock::SchedulerStateUnavailable)
-            });
-        Ok(block)
+        let Some(record) = store.projection().notification(recipient, &message_id) else {
+            return Ok(None);
+        };
+        let block = record.wake_block.or_else(|| {
+            matches!(
+                record.state,
+                NotificationState::BlockedPreWrite
+                    | NotificationState::QuotaHeld
+                    | NotificationState::QuotaResetObserved
+                    | NotificationState::AttentionRequired
+            )
+            .then_some(MessageWakeBlock::SchedulerStateUnavailable)
+        });
+        Ok(block.map(|block| NotificationScheduleBlock {
+            message_id,
+            attempt_id: record.attempt_id,
+            block,
+        }))
     }
 
     /// Whether the oldest pending wake is blocked only by its recorded width.
@@ -4925,6 +4942,7 @@ impl MailboxService {
                     .position(|entry| &entry.message_id == message_id)
                     .and_then(|position| u32::try_from(position).ok());
                 let record = store.projection().notification(recipient, message_id);
+                let notification_state_raw = record.map(|record| record.state);
                 let notification_state = record
                     .map(|record| record.state.into())
                     .unwrap_or(MessageNotificationState::NotStarted);
@@ -4935,9 +4953,13 @@ impl MailboxService {
                 MessageDisposition {
                     recipient,
                     label,
+                    attempt_id: record.map(|record| record.attempt_id),
+                    notification_state_raw,
                     notification_state,
                     quota_state,
                     notification_settlement,
+                    pre_write_cause: record.and_then(|record| record.pre_write_cause),
+                    wake_block: record.and_then(|record| record.wake_block),
                     position_ahead,
                 }
             })
@@ -9221,7 +9243,11 @@ mod tests {
 
         assert_eq!(
             service.notification_schedule_block(bob).unwrap(),
-            Some(MessageWakeBlock::WorkerSupervisorExited)
+            Some(NotificationScheduleBlock {
+                message_id: accepted.message_id.clone(),
+                attempt_id: queued.attempt_id,
+                block: MessageWakeBlock::WorkerSupervisorExited,
+            })
         );
         let live_record = service
             .store()
@@ -9243,7 +9269,11 @@ mod tests {
         let service = MailboxService::new(make_directory(), reopened);
         assert_eq!(
             service.notification_schedule_block(bob).unwrap(),
-            Some(MessageWakeBlock::WorkerSupervisorExited)
+            Some(NotificationScheduleBlock {
+                message_id: accepted.message_id.clone(),
+                attempt_id: queued.attempt_id,
+                block: MessageWakeBlock::WorkerSupervisorExited,
+            })
         );
         let replayed_record = service
             .store()

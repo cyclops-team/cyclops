@@ -722,6 +722,10 @@ pub struct DeliveryReceipt {
     /// Exact claim settlement hidden behind the compatibility state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notification_settlement: Option<MessageNotificationSettlement>,
+    /// Exact durable reason this notification stopped before terminal bytes.
+    /// Separate from `wake_block`, which describes scheduler ownership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_write_cause: Option<crate::notification::NotificationPreWriteCause>,
     /// Exact scheduler reason the recipient FIFO head has no live wake owner.
     /// Absent for a worker-owned head and for an ordinary item queued behind it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1692,6 +1696,7 @@ mod tests {
         assert_eq!(receipt.notification_state, None);
         assert_eq!(receipt.quota_state, None);
         assert_eq!(receipt.notification_settlement, None);
+        assert_eq!(receipt.pre_write_cause, None);
         assert_eq!(receipt.wake_block, None);
 
         let receipt = DeliveryReceipt {
@@ -1700,6 +1705,7 @@ mod tests {
             notification_state: None,
             quota_state: None,
             notification_settlement: None,
+            pre_write_cause: None,
             wake_block: None,
             position: Some(0),
             held_by: Some("blocked".into()),
@@ -1725,6 +1731,7 @@ mod tests {
                 notification_state: Some(state),
                 quota_state: None,
                 notification_settlement: None,
+                pre_write_cause: None,
                 wake_block: None,
                 position: None,
                 held_by: None,
@@ -1744,6 +1751,7 @@ mod tests {
             notification_state: None,
             quota_state: None,
             notification_settlement: None,
+            pre_write_cause: None,
             wake_block: None,
             position: None,
             held_by: None,
@@ -1759,6 +1767,7 @@ mod tests {
             notification_state: Some(MessageNotificationState::NotStarted),
             quota_state: None,
             notification_settlement: Some(MessageNotificationSettlement::WithdrawnByClaim),
+            pre_write_cause: None,
             wake_block: None,
             position: None,
             held_by: None,
@@ -1783,6 +1792,7 @@ mod tests {
             notification_state: Some(MessageNotificationState::Queued),
             quota_state: None,
             notification_settlement: None,
+            pre_write_cause: None,
             wake_block: Some(MessageWakeBlock::WorkerSupervisorExited),
             position: None,
             held_by: None,
@@ -1808,6 +1818,28 @@ mod tests {
     }
 
     #[test]
+    fn mailbox_pre_write_cause_is_additive_and_separate_from_scheduler_state() {
+        let mut receipt: DeliveryReceipt = serde_json::from_value(serde_json::json!({
+            "to": "reviewer",
+            "state": "queued",
+            "notification_state": "gating"
+        }))
+        .unwrap();
+        assert_eq!(receipt.pre_write_cause, None);
+
+        receipt.pre_write_cause = Some(crate::NotificationPreWriteCause::BindingUnprovable);
+        let wire = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(wire["pre_write_cause"], "binding_unprovable");
+        assert!(wire.get("wake_block").is_none());
+        let round_trip: DeliveryReceipt = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            round_trip.pre_write_cause,
+            Some(crate::NotificationPreWriteCause::BindingUnprovable)
+        );
+        assert_eq!(round_trip.wake_block, None);
+    }
+
+    #[test]
     fn durable_send_result_preserves_protocol_v1_receipts() {
         let result = MsgSendResult {
             msg_id: "m-compatible".into(),
@@ -1818,6 +1850,7 @@ mod tests {
                 notification_state: None,
                 quota_state: None,
                 notification_settlement: None,
+                pre_write_cause: None,
                 wake_block: None,
                 position: None,
                 held_by: None,

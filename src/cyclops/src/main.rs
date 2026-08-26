@@ -3091,10 +3091,9 @@ fn read_body_file(path: &str) -> Result<String, String> {
 /// eye counts by and the daemon folds `status` by, so an exit code and an
 /// eye can never disagree about one delivery.
 fn receipts_exit(ds: &[DeliveryReceipt]) -> i32 {
-    i32::from(
-        ds.iter()
-            .any(|d| d.wake_block.is_some() || delivery_needs_human(d.state)),
-    )
+    i32::from(ds.iter().any(|d| {
+        d.pre_write_cause.is_some() || d.wake_block.is_some() || delivery_needs_human(d.state)
+    }))
 }
 
 /// The same rule read tolerantly off the raw result for --json
@@ -3106,7 +3105,9 @@ fn receipts_exit_json(v: &Value) -> i32 {
         .and_then(Value::as_array)
         .is_some_and(|a| {
             a.iter().any(|d| {
-                d.get("wake_block").is_some_and(|block| !block.is_null())
+                d.get("pre_write_cause")
+                    .is_some_and(|cause| !cause.is_null())
+                    || d.get("wake_block").is_some_and(|block| !block.is_null())
                     || serde_json::from_value::<DeliveryState>(d["state"].clone())
                         .is_ok_and(delivery_needs_human)
             })
@@ -3970,6 +3971,7 @@ mod tests {
             notification_state: None,
             quota_state: None,
             notification_settlement: None,
+            pre_write_cause: None,
             wake_block: None,
             position: None,
             note: None,
@@ -4017,6 +4019,19 @@ mod tests {
         assert_eq!(
             receipts_exit_json(&json!({
                 "deliveries": [{"state": "queued", "wake_block": "enqueue_refused"}]
+            })),
+            1
+        );
+        let mut pre_write_blocked = receipt(Queued);
+        pre_write_blocked.pre_write_cause =
+            Some(cyclops_proto::NotificationPreWriteCause::BindingUnprovable);
+        assert_eq!(receipts_exit(&[pre_write_blocked]), 1);
+        assert_eq!(
+            receipts_exit_json(&json!({
+                "deliveries": [{
+                    "state": "queued",
+                    "pre_write_cause": "binding_unprovable"
+                }]
             })),
             1
         );
