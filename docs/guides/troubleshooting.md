@@ -373,12 +373,12 @@ there were no borders to repaint, and the next command picks the theme up.
 
 ## Tests fail on a machine where the code is fine
 
-Run them with `--no-fail-fast`. Cargo stops at the first failing test binary
-and hides every binary after it, which is how one portability bug looked
-like a green build for two milestones:
+Run them with `--no-fail-fast`. Nextest must keep scheduling after a failure
+so one run reports the full set instead of hiding later failures:
 
 ```bash
-cargo test --workspace --no-fail-fast
+cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
+cargo test -p cyclopsd --all-targets --no-fail-fast
 ```
 
 If the failure is a permission error under `/private/tmp`, relocate the

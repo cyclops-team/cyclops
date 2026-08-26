@@ -1129,7 +1129,9 @@ At minimum, verify the current equivalents of:
 ```bash
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --no-fail-fast
+cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
+cargo test -p cyclopsd --all-targets --no-fail-fast
+cargo test --workspace --doc
 python3 scripts/check-doc-paths.py
 ./tests/e2e/parity-check.sh
 ```

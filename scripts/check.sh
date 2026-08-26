@@ -29,11 +29,21 @@ stage() {
     printf '   %ss\n' "$(( $(date +%s) - start ))"
 }
 
+# Both halves of the Rust gate run even when the first fails, so one pass
+# reports every failure; the stage fails if either did. Same as CI.
+rust_tests() {
+    status=0
+    cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast || status=$?
+    cargo test -p cyclopsd --all-targets --no-fail-fast || status=$?
+    cargo test --workspace --doc || status=$?
+    return "$status"
+}
+
 stage "messaging docs" ./tests/e2e/messaging-docs-parity.sh
 stage "fmt" cargo fmt --all --check
 stage "clippy" cargo clippy --workspace --all-targets -- -D warnings
 stage "doc paths" python3 scripts/check-doc-paths.py
-stage "test" cargo test --workspace --no-fail-fast
+stage "test" rust_tests
 
 if [ "$fast" = "1" ]; then
     printf '== fast pass done (skipped: shim, parity)\n'

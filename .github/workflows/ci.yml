@@ -41,15 +41,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.100
       - name: Install tmux
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y tmux; else brew install tmux; fi
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      # --no-fail-fast: cargo stops at the first failing test binary, which
-      # hides every binary after it. One run should report every failure.
-      - run: cargo test --workspace --no-fail-fast
-      # The commPact shim is bash + python, invisible to cargo test; its
+      # --no-fail-fast keeps scheduling after a failure so one run reports
+      # every failing test instead of hiding the remaining failures. The
+      # doctests run even when nextest failed, for the same reason; the
+      # step fails if either did.
+      - name: Rust tests
+        run: |
+          status=0
+          cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast || status=$?
+          cargo test -p cyclopsd --all-targets --no-fail-fast || status=$?
+          cargo test --workspace --doc || status=$?
+          exit "$status"
+      # The commPact shim is bash + python, invisible to nextest; its
       # suite reuses the cyclops debug binary the tests above just built.
       # Runs even when tests failed, for the same reason.
       - name: commPact shim tests
@@ -82,8 +94,12 @@ jobs:
           CYCLOPS_TEST_TMP: ${{ runner.os == 'macOS' && '/private/var/tmp/cyc-relocated' || '/tmp/cyc-relocated' }}
         run: |
           mkdir -p "$CYCLOPS_TEST_TMP"
-          cargo test --workspace --no-fail-fast
-          python3 scripts/commpact-shim/test_shim.py
+          status=0
+          cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast || status=$?
+          cargo test -p cyclopsd --all-targets --no-fail-fast || status=$?
+          cargo test --workspace --doc || status=$?
+          python3 scripts/commpact-shim/test_shim.py || status=$?
+          exit "$status"
 
   # The installer is what a stranger runs first, so it gets its own gate:
   # build, place the binaries, edit a shell profile, set the home up, then
@@ -102,6 +118,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Install tmux
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y tmux; else brew install tmux; fi
@@ -118,6 +135,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.100
       - name: Build tmux from master
         run: |
           sudo apt-get update
@@ -126,4 +147,12 @@ jobs:
           cd /tmp/tmux-head && sh autogen.sh && ./configure && make -j
           sudo make install
           tmux -V
-      - run: cargo test --workspace --no-fail-fast
+      # Both halves of the Rust gate, same as the test job: the doctests
+      # run even when nextest failed, and the step fails if either did.
+      - name: Rust tests against tmux HEAD
+        run: |
+          status=0
+          cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast || status=$?
+          cargo test -p cyclopsd --all-targets --no-fail-fast || status=$?
+          cargo test --workspace --doc || status=$?
+          exit "$status"

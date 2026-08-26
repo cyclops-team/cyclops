@@ -652,11 +652,18 @@ enum UntilArg {
 }
 
 impl UntilArg {
-    fn word(self) -> &'static str {
+    fn wire_word(self) -> &'static str {
         match self {
             UntilArg::Idle => "idle",
             UntilArg::TurnEnded => "turn_ended",
             UntilArg::Blocked => "blocked",
+        }
+    }
+
+    fn human_word(self) -> &'static str {
+        match self {
+            UntilArg::TurnEnded => "turn ended",
+            other => other.wire_word(),
         }
     }
 }
@@ -2967,7 +2974,7 @@ fn cmd_wait(cli: &Cli, style: &Style, target: &str, until: UntilArg, timeout: &s
     c.set_read_timeout(budget + WAIT_READ_SLACK);
     let params = json!({
         "target": target,
-        "until": until.word(),
+        "until": until.wire_word(),
         "timeout_ms": budget.as_millis() as u64,
     });
     match c.request("agent.wait", params) {
@@ -3002,7 +3009,7 @@ fn cmd_wait(cli: &Cli, style: &Style, target: &str, until: UntilArg, timeout: &s
             } else if code == "timeout" {
                 eprintln!(
                     "{}",
-                    copy::wait_timeout(target, until.word(), budget, data["state"].as_str())
+                    copy::wait_timeout(target, until.human_word(), budget, data["state"].as_str(),)
                 );
             } else {
                 eprintln!("{}", copy::wait_occupant_changed(target));

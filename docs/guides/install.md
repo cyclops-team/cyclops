@@ -428,8 +428,16 @@ Teaching it another one is a single TOML file:
 
 ## Run the tests
 
+Install the same nextest release used in CI once:
+
 ```bash
-cargo test --workspace --no-fail-fast
+cargo install cargo-nextest --locked --version 0.9.100
+```
+
+```bash
+cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
+cargo test -p cyclopsd --all-targets --no-fail-fast
+cargo test --workspace --doc
 python3 scripts/commpact-shim/test_shim.py
 ./tests/e2e/parity-check.sh
 ```
@@ -445,9 +453,8 @@ does a release build, and CI runs it as its own job. The parity gate also
 requires `website/static/install.sh` to be byte-for-byte identical to the
 tested repository installer.
 
-`--no-fail-fast` is not optional: cargo stops at the first failing test
-binary and hides every binary after it, which is how one portability bug
-looked like a green build for two milestones.
+`--no-fail-fast` is not optional: nextest must keep scheduling after a failure
+so one run reports every failing test.
 
 Tests need tmux on PATH; the ones that need it skip cleanly without it.
 Every test runs against its own tmux server (`-L cyc-<tag>-<pid>`), never
@@ -460,7 +467,8 @@ elsewhere. Move it with `CYCLOPS_TEST_TMP`:
 
 ```bash
 mkdir -p /private/var/tmp/cyc-relocated
-CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated cargo test --workspace --no-fail-fast
+CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
+CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated cargo test -p cyclopsd --all-targets --no-fail-fast
 ```
 
 Use it when `/private/tmp` is not writable, and when you want to check
