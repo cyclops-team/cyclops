@@ -34,6 +34,11 @@ pub const ALARM_CLEARANCE_CANCELLED: &str = "alarm clearance cancelled";
 
 pub const SETUP_HOME_UNAVAILABLE: &str = "HOME is not set, so setup paths cannot be inspected";
 
+/// Explain why a notification cannot fit without changing its recorded cause.
+pub fn pane_too_narrow(observed: u32, required: u32) -> String {
+    format!("pane too narrow ({observed}, requires {required})")
+}
+
 pub fn alarm_clear_confirmation(count: usize, older_than: &str) -> String {
     format!("Clear {count} alarms selected by --older-than {older_than}? Type clear to confirm: ")
 }

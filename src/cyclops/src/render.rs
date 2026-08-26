@@ -409,9 +409,7 @@ fn blocked_notification_rows(res: &StatusResult, style: &Style) -> Vec<String> {
             .recipient
             .notification
             .pane_width_block()
-            .map(|(observed, required)| {
-                format!("pane too narrow ({observed}, requires {required})")
-            })
+            .map(|(observed, required)| copy::pane_too_narrow(observed, required))
             .or_else(|| {
                 item.recipient
                     .notification

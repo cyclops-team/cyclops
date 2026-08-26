@@ -34,6 +34,12 @@ The receipt reports two separate facts:
   `not started`, `queued`, `checking readiness`, `writing`, `staged`,
   `submitted`, `notified`, `withdrawn`, `needs attention`, or `superseded`.
 
+When the recipient FIFO head has no live notification worker, the receipt also
+reports `wake blocked (<reason>)`. The message remains accepted and claimable.
+This field explains why the wake has no current owner; it does not prove that
+the composer was written or that the message was claimed. The protocol
+reference owns the closed [`wake_block` vocabulary](../reference/PROTOCOL.md#msgsend).
+
 A position such as `2 ahead` is the recipient mailbox's FIFO position. The
 daemon never bypasses an older pending message.
 
@@ -48,7 +54,7 @@ view of mailbox and wake state.
 The preferred path is this content-free notification:
 
 ```text
-cyclops inbox claim m-att_<lossless-attempt-token>
+cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
 ```
 
 The daemon selects it only when `cyclops setup check` reports `mailbox
@@ -220,7 +226,7 @@ A wake that stops before writing reports one exact cause, including
 `write_readiness_changed`, `spool_failed`, `binding_unprovable`,
 `composer_semantic_missing`, or `worker_failed`. The message remains claimable.
 For format 3, `write_readiness_changed` with an observed width below its
-recorded required width is shown as `pane_too_narrow`. The width pair is
+recorded required width is shown as `pane too narrow`. The width pair is
 content-free, no pane write occurred, and a later size edge may reopen that
 same attempt once.
 A workspace administrator can release the FIFO without touching the pane:

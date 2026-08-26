@@ -311,12 +311,20 @@ sender-scoped `client_key` resolves to an existing exact request. Each
 `position`, when present, is the number of older pending entries in that
 recipient's FIFO.
 
+`DeliveryReceipt.wake_block` is an optional `MessageWakeBlock`. It is present
+when the recipient FIFO head has no live notification owner and is absent for
+a worker-owned head or an ordinary item queued behind that head. It does not
+change durable acceptance or `notification_state`; the message remains
+claimable. The closed values are `daemon_stopping`, `route_unavailable`,
+`attention_resolution_pending`, `worker_faulted`, `worker_supervisor_exited`,
+`enqueue_refused`, and `scheduler_state_unavailable`.
+
 For a non-admin recipient, the daemon selects one transport at the terminal
 write boundary. An exact installed claim skill selects the content-free
 doorbell:
 
 ```text
-cyclops inbox claim m-att_<lossless-attempt-token>
+cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
 ```
 
 The 22-character URL-safe token encodes the complete 128-bit notification
@@ -331,7 +339,7 @@ A delayed command for a replaced attempt cannot claim its replacement.
 Format 3 must fit one exact composer row. A pane narrower than 60 columns is
 recorded as `blocked_pre_write` with the compatible cause
 `write_readiness_changed`, plus its observed and required widths. Current
-clients render that evidence as `pane_too_narrow`. No paste occurs. A later
+clients render that evidence as `pane too narrow`. No paste occurs. A later
 width observation meeting the recorded requirement may reopen that same
 attempt once. The operator may withdraw it while it remains provably
 pre-write.

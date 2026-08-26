@@ -2147,9 +2147,7 @@ fn message_recipient_cell(
                         let reason = recipient
                             .notification
                             .pane_width_block()
-                            .map(|(observed, required)| {
-                                format!("pane_too_narrow ({observed}, requires {required})")
-                            })
+                            .map(|(observed, required)| copy::pane_too_narrow(observed, required))
                             .unwrap_or_else(|| cause.wire_name().to_string());
                         let mut blocked = format!("wake blocked before write: {reason}");
                         if let Some(updated_at) = recipient.notification.updated_at {

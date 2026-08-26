@@ -206,7 +206,7 @@ pane rather than anything the request claimed. The body is durable, but the
 reviewer's pane receives only a one-line wake:
 
 ```text
-cyclops inbox claim m-att_<22-character-attempt-token>
+cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
 ```
 
 The reserved locator claims its exact current message through the positional
