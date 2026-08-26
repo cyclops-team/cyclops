@@ -1908,8 +1908,24 @@ composer as lifecycle evidence, below the live Working rule; typed input cannot
 match it. A stable capture may end the stranded start through the same
 manifest-owned terminal seam used by other no-end-hook vendor paths.
 
-The current-version daemon-restart cell remains before the full-ruleset
-`version_tested` claim may advance.
+The current-version daemon-restart cell then passed in an isolated workspace on
+Cyclops build `75c3237`. A fresh delivery
+`m-216f8ee1a4b141aabc2e8edfbcdd359b` completed queued, gating, writing,
+staged, submitting, submitted, notified, exact claim, and reply on agent
+generation `(pid 89835, birth 1787784287123624)`. The conversation was resumed
+as a new agent generation `(pid 94911, birth 1787784301720307)` and delivery
+`m-5d03fff0fcb6420baf1464caf2ad4251` completed the same sequence. The daemon
+then restarted from boot `185c6f8a-7f26-4a81-9ba2-85ec111d94a4` to boot
+`4749b293-6be6-4305-9ce1-e4f341a3b127` without replacing the resumed agent.
+Post-restart delivery `m-1bd189527ad04bdd9ee819220c9e72e5` completed the
+same sequence through exact claim and reply, bound to that same resumed process
+generation and the new daemon boot. No rebound, duplicate write, or operator
+submission occurred in any of the three cells. Evidence is preserved under
+`/private/tmp/codex-01491-restart-evidence`.
+
+This completes the measured 0.149.1 fresh, resumed, and daemon-restart matrix.
+The shipped manifest's full-ruleset `version_tested` claim may advance to
+`0.149.1`; later Codex versions still require their own evidence.
 
 ## F74. Claude 2.1.246 completed rows carry two duration units and two trailer rows
 

@@ -104,7 +104,7 @@ fn version_tested_matches_each_authoritative_fixture() {
         (
             "codex",
             version_between(
-                include_str!("fixtures/codex_working_composer_plain.txt"),
+                include_str!("fixtures/codex_staged_0_149_1_esc.txt"),
                 "OpenAI Codex (v",
                 ")",
             ),
