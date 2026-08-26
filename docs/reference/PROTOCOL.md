@@ -605,8 +605,11 @@ measured terminal layout, the full foreground and agent process generations,
 the manifest, and a positively classified staged composer. With `diff`, it
 also returns the expected payload and safely extracted composer content so the
 CLI can compute a local diff. A direct fallback diff contains the message body
-and is available only to the authenticated workspace administrator. Diff bytes
-are never journaled, logged, or emitted as events.
+and is available only to the authenticated workspace administrator or the
+exact durable recipient of that attempt. Other recipients receive the same
+denial for unknown, ambiguous, and unauthorized ids, so the endpoint does not
+leak attempt existence. Diff bytes are never journaled, logged, or emitted as
+events. `attention.complete` and `attention.discard` remain administrator-only.
 `attention.complete` and `attention.discard` take the same id shape. Complete
 requires all five checks again immediately before the submit key. Discard uses
 the same guarded clear sequence when the exact notification remains staged.

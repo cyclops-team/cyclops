@@ -1115,17 +1115,32 @@ async fn attention_show(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    if !caller.key.is_admin() {
-        return wire_error_response(id, mailbox_admin_required());
-    }
-    let target = match attention_target(&service, &params.id) {
+    attention_show_for_caller(inner, id, params, &service, caller.key).await
+}
+
+async fn attention_show_for_caller(
+    inner: &Arc<Inner>,
+    id: Value,
+    params: AttentionShowParams,
+    service: &Arc<crate::mailbox::MailboxService>,
+    caller: RecipientKey,
+) -> Response {
+    // A non-admin caller learns nothing from a lookup failure: not whether
+    // the id exists, nor which candidates an ambiguous prefix names.
+    let target = match attention_target(service, &params.id) {
         Ok(target) => target,
+        Err(_) if !caller.is_admin() => return wire_error_response(id, mailbox_admin_required()),
         Err(error) => return wire_error_response(id, error),
     };
+    if !attention_show_allowed(&caller, &target.record) {
+        return wire_error_response(id, mailbox_admin_required());
+    }
     // Diff mode returns the exact payload selected at the write boundary.
-    // Direct compatibility attempts can therefore include message content.
-    // The endpoint is admin-only, and neither diff input is logged or stored.
-    let result = crate::attention_resolution::show(inner, &service, &target, params.diff).await;
+    // Direct compatibility attempts can therefore include message content,
+    // which is why only the administrator and the attempt's own recipient,
+    // who may already claim that body, can ask. Neither diff input is
+    // logged or stored.
+    let result = crate::attention_resolution::show(inner, service, &target, params.diff).await;
     Response::ok(
         id,
         serde_json::to_value(result).expect("attention show result serializes"),
@@ -1215,6 +1230,17 @@ fn attention_action_error(error: crate::attention_resolution::AttentionActionErr
             data: None,
         },
     }
+}
+
+/// Who may read an attention attempt. `show` is read-only and the attempt's
+/// recipient is the one party that can say what its own composer holds, so
+/// it may look; every other non-admin identity is refused. `complete` and
+/// `discard` stay administrator-only and do not consult this.
+pub(crate) fn attention_show_allowed(
+    caller: &cyclops_proto::RecipientKey,
+    record: &cyclops_proto::NotificationRecord,
+) -> bool {
+    caller.is_admin() || *caller == record.recipient
 }
 
 fn require_mailbox_admin(inner: &Arc<Inner>, peer: Peer) -> Result<(), WireError> {
@@ -3431,6 +3457,88 @@ mod tests {
             "a read, retry, re-claim, or failed mutation emitted a change"
         );
         std::fs::remove_dir_all(path).ok();
+    }
+
+    /// The attempt's recipient may read its own attention record. The
+    /// administrator may read any, and every other identity is refused.
+    #[test]
+    fn attention_show_admits_admin_and_the_attempts_recipient_only() {
+        let workspace: cyclops_proto::WorkspaceId =
+            "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let session: cyclops_proto::SessionInstanceId =
+            "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let recipient =
+            cyclops_proto::RecipientKey::agent(workspace, session, "%1".parse().unwrap());
+        let stranger =
+            cyclops_proto::RecipientKey::agent(workspace, session, "%2".parse().unwrap());
+        let admin = cyclops_proto::RecipientKey::admin(workspace);
+        let record = cyclops_proto::NotificationRecord {
+            attempt_id: cyclops_proto::NotificationAttemptId::parse(
+                "att-00000000-0000-4000-8000-000000000001",
+            )
+            .unwrap(),
+            message_id: cyclops_proto::MessageId::new("m-1").unwrap(),
+            recipient,
+            state: cyclops_proto::NotificationState::AttentionRequired,
+            binding: None,
+            transport: cyclops_proto::NotificationTransport::Doorbell,
+            doorbell_format: Some(2),
+            cause: Some(cyclops_proto::NotificationAttentionCause::VerifyFailed),
+            pre_write_cause: None,
+            wake_block: None,
+            pre_write_observation: None,
+            pre_write_reopen_count: 0,
+            started_seq: 1,
+            updated_seq: 2,
+            updated_at: 3,
+        };
+        assert!(attention_show_allowed(&admin, &record));
+        assert!(attention_show_allowed(&recipient, &record));
+        assert!(!attention_show_allowed(&stranger, &record));
+    }
+
+    #[tokio::test]
+    async fn attention_show_endpoint_admits_the_exact_recipient_without_leaking_other_ids() {
+        let (inner, path, attempt_id, _) = inner_with_alarm(
+            "cyc-attention-show-recipient",
+            NotificationAttentionCause::VerifyFailed,
+        );
+        let workspace: cyclops_proto::WorkspaceId =
+            "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let session: cyclops_proto::SessionInstanceId =
+            "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let recipient =
+            RecipientKey::agent(workspace, session, TmuxPaneId::from_str("%1").unwrap());
+        let stranger = RecipientKey::agent(workspace, session, TmuxPaneId::from_str("%2").unwrap());
+        let service = inner.mailbox.as_ref().unwrap();
+        let params = AttentionShowParams {
+            id: attempt_id.to_string(),
+            diff: true,
+        };
+
+        let shown =
+            attention_show_for_caller(&inner, json!(1), params.clone(), service, recipient).await;
+        assert!(shown.error.is_none(), "{:?}", shown.error);
+        let shown: cyclops_proto::AttentionShowResult =
+            serde_json::from_value(shown.result.unwrap()).unwrap();
+        assert_eq!(shown.attempt_id, attempt_id);
+
+        let denied = attention_show_for_caller(&inner, json!(2), params, service, stranger).await;
+        assert_eq!(denied.error.unwrap().code, "denied");
+
+        let hidden = attention_show_for_caller(
+            &inner,
+            json!(3),
+            AttentionShowParams {
+                id: "att-00000000-0000-4000-8000-000000000099".into(),
+                diff: true,
+            },
+            service,
+            stranger,
+        )
+        .await;
+        assert_eq!(hidden.error.unwrap().code, "denied");
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[tokio::test]

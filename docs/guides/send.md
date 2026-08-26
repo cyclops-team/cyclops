@@ -211,7 +211,9 @@ cyclops attention complete <attempt-id>
 cyclops attention discard <attempt-id>
 ```
 
-`show` is read-only. `complete` and `discard` recheck the exact attempt,
+`show` is read-only and available to the workspace administrator or the exact
+durable recipient of that attempt. `complete` and `discard` remain
+administrator-only and recheck the exact attempt,
 terminal layout, process generations, manifest, and current terminal safety.
 An uncertain result must be inspected and must not be repeated as a fresh
 terminal action. Reconciliation never sends a second key. `cyclops messages`
@@ -236,8 +238,10 @@ cyclops notification withdraw <attempt-id> --recipient <recipient-key>
 ```
 
 `show --diff` returns the exact selected transport bytes to the authenticated
-workspace administrator. A direct fallback diff therefore contains the message
-payload. The daemon does not write those diff inputs to its journal or log.
+workspace administrator or that attempt's exact durable recipient. A direct
+fallback diff therefore contains the message payload. Other recipients receive
+the same denial for missing and unauthorized ids. The daemon does not write
+those diff inputs to its journal or log.
 
 `cyclops requeue <message-id>` is an explicit operator action for a notification
 that is still eligible. `cyclops alarm clear <attempt-id>...` appends explicit

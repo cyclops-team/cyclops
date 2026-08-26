@@ -431,9 +431,10 @@ The boot requeue above carries them across.
 require the exact unresolved attempt, the original process and manifest
 binding, exact expected composer bytes, anchored trailer layout, and a current
 safe terminal state. Diff inputs can contain a direct fallback payload. They
-are returned only to the authenticated workspace administrator and never enter
-the journal or daemon log. Requeue and alarm clearance remain explicit
-operator actions and never create an automatic retry loop.
+are returned only to the authenticated workspace administrator or the exact
+durable recipient of that attempt and never enter the journal or daemon log.
+Complete and discard remain administrator-only. Requeue and alarm clearance
+remain explicit operator actions and never create an automatic retry loop.
 
 An exact-attempt `verify_failed` doorbell uses the same proof and settlement
 path automatically. Pending work selects one submit. An exact recipient claim
