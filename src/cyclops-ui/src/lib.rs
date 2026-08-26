@@ -64,7 +64,7 @@ pub use app::{App, Command, Density, RosterRow, RowTarget, View};
 pub use cyclops_proto::{Attention, AttentionItem, Eye, PaneSnapshot};
 pub use data::{read_backfill, read_backfill_report, BackfillReport, UiMsg};
 pub use detail::{Action, Back, Check, Detail, Draft, Loaded, Request, Stage, ThreadEntry};
-pub use frame::build;
+pub use frame::{build, messages_help};
 pub use health::BuildHealth;
 pub use input::Key;
 pub use messages::{

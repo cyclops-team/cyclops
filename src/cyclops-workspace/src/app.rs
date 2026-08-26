@@ -305,6 +305,10 @@ struct App {
     /// so the Stream tab and the CLI show one history rather than two that
     /// agree only on formatting.
     record: cyclops_ui::Record,
+    /// The shared Cyclops watch Messages model (HumanQueue).
+    messages_queue: cyclops_ui::HumanQueue,
+    /// Open message detail view when an operator opens a message.
+    messages_detail: Option<cyclops_ui::Detail>,
     /// Startup ordering and seq dedup for `record`
     /// ([`cyclops_ui::Intake`]): live entries reaching the app before
     /// [`crate::event_record::boot`] lands its backfill buffer here, and
@@ -761,6 +765,7 @@ pub async fn run_async() -> i32 {
     // sidebar wide and painted another, and the first reconcile would
     // fight the declaration. `chrome_for` is the one geometry both read.
     model.sidebar_visible = prefs.sidebar_visible;
+    model.messages_visible = prefs.messages_visible;
     let chrome_canvas =
         chrome_for(Rect::new(0, 0, term_size.0, term_size.1), &model, &prefs).canvas;
     let boot_size = crate::render::tmux_client_size(chrome_canvas, model.active_tab());
@@ -775,7 +780,12 @@ pub async fn run_async() -> i32 {
                     // A fresh snapshot knows nothing about UI-owned
                     // preferences; re-carry visibility the same way
                     // `install_reconciled_model` does for every later one.
-                    install_reconciled_model(&mut model, resized, prefs.sidebar_visible);
+                    install_reconciled_model(
+                        &mut model,
+                        resized,
+                        prefs.sidebar_visible,
+                        prefs.messages_visible,
+                    );
                     apply_workspace_order(&mut model, &prefs.workspace_order);
                 }
             }
@@ -845,6 +855,8 @@ pub async fn run_async() -> i32 {
         files_probe_at: None,
         files_root_pending: true,
         record: cyclops_ui::Record::new(),
+        messages_queue: cyclops_ui::HumanQueue::default(),
+        messages_detail: None,
         intake: cyclops_ui::Intake::new(),
         stream_reconciling: false,
         cursor_style: None,
@@ -1669,6 +1681,8 @@ fn chrome_for(
         model.sidebar_visible,
         prefs.sidebar_width.max(crate::render::SIDEBAR_MIN_WIDTH),
         prefs.tab_bar_visible,
+        model.messages_visible,
+        prefs.messages_width.max(crate::render::MESSAGES_MIN_WIDTH),
     )
 }
 
@@ -2882,6 +2896,12 @@ async fn handle_mouse(
                     app.drag = Some(DragState::on_down(DragTarget::Sidebar, col, row));
                     return Ok(());
                 }
+                HitTarget::MessagesDivider => {
+                    app.close_menu();
+                    clear_selection(app);
+                    app.drag = Some(DragState::on_down(DragTarget::Messages, col, row));
+                    return Ok(());
+                }
                 HitTarget::SidebarSplit => {
                     app.close_menu();
                     clear_selection(app);
@@ -2997,6 +3017,12 @@ async fn handle_mouse(
                         crate::render::sidebar_width_for_column(col, app.term_size.0);
                 }
                 if app.drag.as_ref().is_some_and(|drag| {
+                    drag.is_active() && matches!(&drag.target, DragTarget::Messages)
+                }) {
+                    app.prefs.messages_width =
+                        crate::render::messages_width_for_column(col, app.term_size.0);
+                }
+                if app.drag.as_ref().is_some_and(|drag| {
                     drag.is_active() && matches!(&drag.target, DragTarget::SidebarSplit)
                 }) {
                     app.prefs.files_rows = files_rows_for_row(app, row);
@@ -3031,6 +3057,15 @@ async fn handle_mouse(
             if sidebar_drag {
                 app.prefs.sidebar_width =
                     crate::render::sidebar_width_for_column(col, app.term_size.0);
+                app.save_prefs_or_log();
+                resize_client(app, client).await;
+            }
+            let messages_drag = app.drag.as_ref().is_some_and(|drag| {
+                drag.is_active() && matches!(&drag.target, DragTarget::Messages)
+            });
+            if messages_drag {
+                app.prefs.messages_width =
+                    crate::render::messages_width_for_column(col, app.term_size.0);
                 app.save_prefs_or_log();
                 resize_client(app, client).await;
             }
@@ -3763,7 +3798,12 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
     let session = app.model.session.session.clone();
     let mut model = fetch_workspace_model(client, &session).await?;
     apply_workspace_order(&mut model, &app.prefs.workspace_order);
-    install_reconciled_model(&mut app.model, model, app.prefs.sidebar_visible);
+    install_reconciled_model(
+        &mut app.model,
+        model,
+        app.prefs.sidebar_visible,
+        app.prefs.messages_visible,
+    );
     expand_active_workspace(
         &app.model.workspaces,
         app.model.active_workspace,
@@ -3902,8 +3942,10 @@ fn install_reconciled_model(
     current: &mut WorkspaceModel,
     mut fresh: WorkspaceModel,
     sidebar_visible: bool,
+    messages_visible: bool,
 ) {
     fresh.sidebar_visible = sidebar_visible;
+    fresh.messages_visible = messages_visible;
     *current = fresh;
 }
 
@@ -4141,6 +4183,27 @@ fn draw(
                     app.hover,
                 );
             }
+            if let Some(messages) = areas.messages {
+                paint_messages(
+                    &app.messages_queue,
+                    app.messages_detail.as_ref(),
+                    app.notice.text(),
+                    messages,
+                    f.buffer_mut(),
+                    &app.paint,
+                    &mut app.hit_map,
+                    app.hover,
+                );
+            }
+            if let Some(messages_rail) = areas.messages_rail {
+                paint_messages_rail(
+                    messages_rail,
+                    f.buffer_mut(),
+                    &app.paint,
+                    &mut app.hit_map,
+                    app.hover,
+                );
+            }
             paint_tab_bar(
                 &app.model.session.tabs,
                 app.model.session.active_tab,
@@ -4199,6 +4262,19 @@ fn draw(
                     app.drag.as_ref(),
                 );
             }
+            if let Some(messages) = areas.messages {
+                if areas.canvas.width > 0 && areas.canvas.height > 0 {
+                    let divider = Rect::new(messages.x, messages.y, 1, messages.height);
+                    app.hit_map.push(divider, HitTarget::MessagesDivider);
+                    paint_messages_resize_feedback(
+                        f.buffer_mut(),
+                        divider,
+                        &app.paint,
+                        app.hover,
+                        app.drag.as_ref(),
+                    );
+                }
+            }
             // Menus paint after panes so their hit regions shadow them.
             paint_menu(
                 &app.menu,
@@ -4211,6 +4287,7 @@ fn draw(
                     tab_bar: app.prefs.tab_bar_visible,
                     motion: app.prefs.motion,
                     stream: app.sidebar_tab == crate::persist::SidebarTab::Stream,
+                    messages: app.model.messages_visible,
                     files: app.prefs.files_rows > 0,
                 },
             );
@@ -4394,6 +4471,8 @@ mod tests {
             files_probe_at: None,
             files_root_pending: true,
             record: cyclops_ui::Record::new(),
+            messages_queue: cyclops_ui::HumanQueue::default(),
+            messages_detail: None,
             intake: cyclops_ui::Intake::new(),
             stream_reconciling: false,
             cursor_style: None,
@@ -4440,6 +4519,7 @@ mod tests {
                 active_tab: 0,
             },
             sidebar_visible: true,
+            messages_visible: false,
         }
     }
 
@@ -5799,6 +5879,7 @@ mod tests {
                 active_tab: 0,
             },
             sidebar_visible: true,
+            messages_visible: false,
         };
         let mut app = test_app(
             model,
@@ -5865,6 +5946,7 @@ mod tests {
                 active_tab: 0,
             },
             sidebar_visible: true,
+            messages_visible: false,
         };
         let fresh = WorkspaceModel {
             workspaces: vec![],
@@ -5875,12 +5957,14 @@ mod tests {
                 active_tab: 1,
             },
             sidebar_visible: true,
+            messages_visible: false,
         };
 
-        install_reconciled_model(&mut current, fresh, false);
+        install_reconciled_model(&mut current, fresh, false, false);
 
         assert_eq!(current.active_tab().window_id, "@2");
         assert!(!current.sidebar_visible);
+        assert!(!current.messages_visible);
     }
 
     #[test]
@@ -5913,6 +5997,7 @@ mod tests {
                 active_tab: 0,
             },
             sidebar_visible: true,
+            messages_visible: false,
         };
 
         apply_workspace_order(&mut model, &["beta".into(), "alpha".into()]);
@@ -6076,6 +6161,7 @@ mod tests {
                 active_tab: 0,
             },
             sidebar_visible: true,
+            messages_visible: false,
         };
         let mut app = test_app(model, home.clone());
 
@@ -6208,6 +6294,7 @@ mod tests {
                 active_tab: 0,
             },
             sidebar_visible: true,
+            messages_visible: false,
         };
         let mut app = test_app(
             model,
@@ -6306,6 +6393,7 @@ mod tests {
                 active_tab: 0,
             },
             sidebar_visible: true,
+            messages_visible: false,
         };
         let mut app = test_app(model, home);
         app.decoration = DecorationSnapshot {

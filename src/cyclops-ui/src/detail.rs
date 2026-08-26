@@ -940,7 +940,7 @@ pub fn render(detail: &Detail, width: usize, height: usize) -> Vec<String> {
     render_with_status(detail, width, height, None)
 }
 
-pub(crate) fn render_with_status(
+pub fn render_with_status(
     detail: &Detail,
     width: usize,
     height: usize,

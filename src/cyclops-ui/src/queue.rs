@@ -698,7 +698,7 @@ pub fn render(queue: &HumanQueue, width: usize, height: usize) -> Vec<String> {
     render_with_status(queue, width, height, None)
 }
 
-pub(crate) fn render_with_status(
+pub fn render_with_status(
     queue: &HumanQueue,
     width: usize,
     height: usize,

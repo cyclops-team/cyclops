@@ -137,6 +137,10 @@ pub const MENU_NEW_WORKSPACE: &str = "New session";
 
 pub const MENU_TOGGLE_EVENTS: &str = "Event stream";
 
+pub const MENU_TOGGLE_MESSAGES: &str = "Messages";
+
+pub const BINDING_TOGGLE_MESSAGES: &str = "Toggle messages";
+
 /// Marks a menu row whose setting is on, and the active row in the theme
 /// picker. One cell in every monospace font, chosen by state and never by
 /// theme, so it reads under `NO_COLOR` (rule 11).

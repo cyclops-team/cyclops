@@ -34,6 +34,8 @@ use crate::theme::{self, Paint};
 /// theme and under `NO_COLOR` (rule 11).
 pub const SIDEBAR_COLLAPSE: &str = "◂";
 pub const SIDEBAR_EXPAND: &str = "▸";
+pub const MESSAGES_COLLAPSE: &str = "▸";
+pub const MESSAGES_EXPAND: &str = "◂";
 
 /// The one column at the panel's own outer edge that still answers as the
 /// resize handle. The handle itself moved: it used to be this hidden
@@ -247,6 +249,7 @@ pub fn paint_sidebar(
         toggle_reach(edge),
         edge,
         SIDEBAR_COLLAPSE,
+        HitTarget::SidebarToggle,
         paint,
         hits,
         hover,
@@ -423,27 +426,146 @@ pub fn paint_sidebar_rail(
     // The rail has no resize divider to share with, so the whole column is
     // the control. The glyph still centers, so it sits at the same height
     // as the open panel's and the eye keeps its place across a collapse.
-    paint_toggle(buf, area, area, SIDEBAR_EXPAND, paint, hits, hover);
+    paint_toggle(
+        buf,
+        area,
+        area,
+        SIDEBAR_EXPAND,
+        HitTarget::SidebarToggle,
+        paint,
+        hits,
+        hover,
+    );
 }
 
-/// Paint one sidebar chevron centered in `hit`, register `hit` as the
-/// toggle, and light `lit` while the pointer is inside `hit`.
-///
-/// The two rectangles come apart because the open panel and the collapsed
-/// rail are not the same shape of control. The rail owns its whole column
-/// and can answer on every row of it. The panel's edge is also the resize
-/// divider, so only a band of it can answer, but the operator still reads
-/// the edge as one object and expects the whole edge to respond. So the
-/// band takes the clicks and the edge takes the light.
-///
-/// The glyph centers rather than sitting at the foot, in both states: an
-/// edge control belongs at the middle of its edge, and centering is what
-/// keeps the chevron at the same height when the panel becomes a rail.
+/// Render the messages surface on the right edge: the left-edge divider and collapse
+/// chevron, and the messages queue or open detail.
+pub fn paint_messages(
+    queue: &cyclops_ui::HumanQueue,
+    detail: Option<&cyclops_ui::Detail>,
+    status: Option<&str>,
+    area: Rect,
+    buf: &mut Buffer,
+    paint: &Paint,
+    hits: &mut HitMap,
+    hover: Option<(u16, u16)>,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    buf.set_style(area, theme::chrome_panel(paint));
+
+    // The left edge of the right messages panel is the divider/toggle
+    let edge = Rect::new(area.x, area.y, 1, area.height);
+    let grab = Rect::new(edge.x, edge.y, 1, edge.height);
+    hits.push(grab, HitTarget::MessagesDivider);
+    let hit = toggle_reach(edge);
+    paint_toggle(
+        buf,
+        hit,
+        edge,
+        MESSAGES_COLLAPSE,
+        HitTarget::MessagesToggle,
+        paint,
+        hits,
+        hover,
+    );
+
+    let content_w = area.width.saturating_sub(1) as usize;
+    let content_h = area.height as usize;
+    if content_w == 0 || content_h == 0 {
+        return;
+    }
+    let rows = match detail {
+        Some(d) => cyclops_ui::detail::render_with_status(d, content_w, content_h, status),
+        None => cyclops_ui::queue::render_with_status(queue, content_w, content_h, status),
+    };
+    let content_rect = Rect::new(
+        area.x + 1,
+        area.y,
+        area.width.saturating_sub(1),
+        area.height,
+    );
+    let style = theme::chrome_panel(paint);
+    for (i, row) in rows.into_iter().enumerate() {
+        if i >= content_rect.height as usize {
+            break;
+        }
+        let y = content_rect.y + i as u16;
+        super::overlay_text(buf, content_rect, content_rect.x, y, &row, style);
+    }
+}
+
+/// Render the rail a collapsed messages drawer leaves behind on the right edge.
+pub fn paint_messages_rail(
+    area: Rect,
+    buf: &mut Buffer,
+    paint: &Paint,
+    hits: &mut HitMap,
+    hover: Option<(u16, u16)>,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    buf.set_style(area, theme::chrome_panel(paint));
+    paint_toggle(
+        buf,
+        area,
+        area,
+        MESSAGES_EXPAND,
+        HitTarget::MessagesToggle,
+        paint,
+        hits,
+        hover,
+    );
+}
+
+/// Paint the hover / drag indicator on the messages drawer resize handle.
+pub fn paint_messages_resize_feedback(
+    buf: &mut Buffer,
+    divider: Rect,
+    paint: &Paint,
+    hover: Option<(u16, u16)>,
+    drag: Option<&DragState>,
+) {
+    if divider.width == 0 || divider.height == 0 {
+        return;
+    }
+    let resizing = drag.is_some_and(|drag| matches!(drag.target, DragTarget::Messages));
+    let hovered = hover.is_some_and(|(col, row)| {
+        col >= divider.x
+            && col < divider.x + divider.width
+            && row >= divider.y
+            && row < divider.y + divider.height
+    });
+    let band = toggle_reach(divider);
+    if resizing {
+        for row in divider.y..divider.y + divider.height {
+            if let Some(cell) = buf.cell_mut((divider.x, row)) {
+                cell.set_symbol("│");
+                cell.set_style(theme::border_focused(paint));
+            }
+        }
+    } else if hovered {
+        for row in divider.y..divider.y + divider.height {
+            if row < band.y || row >= band.y + band.height {
+                if let Some(cell) = buf.cell_mut((divider.x, row)) {
+                    cell.set_symbol("│");
+                    cell.set_style(theme::border_hover(paint));
+                }
+            }
+        }
+    }
+}
+
+/// Paint one chevron centered in `hit`, register `hit` as `target`, and light
+/// `lit` while the pointer is inside `hit`.
 fn paint_toggle(
     buf: &mut Buffer,
     hit: Rect,
     lit: Rect,
     glyph: &str,
+    target: HitTarget,
     paint: &Paint,
     hits: &mut HitMap,
     hover: Option<(u16, u16)>,
@@ -459,9 +581,6 @@ fn paint_toggle(
     } else {
         theme::add_button(paint)
     };
-    // Feedback has to reach the whole object the pointer thinks it found.
-    // Lighting the glyph alone answered a hover the operator made rows
-    // away from it.
     if hovered {
         for row in lit.y..lit.y + lit.height {
             for col in lit.x..lit.x + lit.width {
@@ -471,18 +590,12 @@ fn paint_toggle(
             }
         }
     }
-    // Centered on the EDGE, not on the clickable band. Both states pass
-    // the whole column as `lit`, so this is the one expression that puts
-    // the chevron on the same row whether the panel is open or collapsed.
-    // Centering on `hit` instead would shift it by a row when the band is
-    // shorter than the edge. The band always contains the edge's midpoint,
-    // so the painted glyph is always clickable.
     let y = lit.y + lit.height / 2;
     if let Some(cell) = buf.cell_mut((hit.x, y)) {
         cell.set_symbol(glyph);
         cell.set_style(style);
     }
-    hits.push(hit, HitTarget::SidebarToggle);
+    hits.push(hit, target);
 }
 
 /// The Cyclops mark, right-aligned on the header row.
@@ -3250,6 +3363,63 @@ mod tests {
             seam,
             vec![bottom - MIN_FILES_ROWS - 1],
             "the seam stops at the file panel's own floor"
+        );
+    }
+
+    #[test]
+    fn the_collapsed_messages_rail_answers_the_mouse_and_reopens_the_drawer() {
+        let area = Rect::new(199, 0, 1, 50);
+        let mut buf = Buffer::empty(area);
+        let mut hits = HitMap::default();
+        let paint = Paint::for_test();
+        paint_messages_rail(area, &mut buf, &paint, &mut hits, None);
+
+        for y in 0..area.height {
+            assert!(
+                matches!(hits.hit(199, y), Some(HitTarget::MessagesToggle)),
+                "row {y} of the messages rail must be clickable"
+            );
+        }
+        assert_eq!(
+            crate::action::route_mouse_click(&HitTarget::MessagesToggle, MouseButton::Left),
+            Some(crate::action::Action::ToggleMessages),
+            "clicking the messages rail routes to Action::ToggleMessages"
+        );
+        assert_eq!(
+            buf[(199, area.height / 2)].symbol(),
+            MESSAGES_EXPAND,
+            "collapsed, the chevron points left to open the messages drawer"
+        );
+    }
+
+    #[test]
+    fn the_open_messages_drawer_carves_divider_and_collapse_chevron() {
+        let area = Rect::new(170, 0, 30, 50);
+        let mut buf = Buffer::empty(area);
+        let mut hits = HitMap::default();
+        let paint = Paint::for_test();
+        let queue = cyclops_ui::HumanQueue::default();
+        paint_messages(&queue, None, None, area, &mut buf, &paint, &mut hits, None);
+
+        let band = toggle_reach(Rect::new(170, 0, 1, 50));
+        for y in 0..area.height {
+            let in_band = y >= band.y && y < band.y + band.height;
+            if in_band {
+                assert!(
+                    matches!(hits.hit(170, y), Some(HitTarget::MessagesToggle)),
+                    "row {y} in band must be MessagesToggle"
+                );
+            } else {
+                assert!(
+                    matches!(hits.hit(170, y), Some(HitTarget::MessagesDivider)),
+                    "row {y} outside band must be MessagesDivider"
+                );
+            }
+        }
+        assert_eq!(
+            buf[(170, area.height / 2)].symbol(),
+            MESSAGES_COLLAPSE,
+            "open, the chevron points right to collapse the messages drawer"
         );
     }
 }
