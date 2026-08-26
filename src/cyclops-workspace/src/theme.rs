@@ -79,6 +79,22 @@ impl Paint {
         Style::new().fg(rt_color(self.theme.role(label), self.truecolor))
     }
 
+    /// The same stable role color as ground, with the panel's ink on top:
+    /// an agent's avatar chip in the messages drawer. With color off the
+    /// chip reverses, so it still reads as a chip (rule 11).
+    pub fn role_ground(&self, label: &str) -> Style {
+        if !self.colors_enabled {
+            return Style::new().add_modifier(Modifier::REVERSED);
+        }
+        Style::new()
+            .fg(rt_color(
+                self.theme.resolve(tokens::CHROME_PANEL),
+                self.truecolor,
+            ))
+            .bg(rt_color(self.theme.role(label), self.truecolor))
+            .add_modifier(Modifier::BOLD)
+    }
+
     pub fn state(&self, state: cyclops_proto::AgentState) -> Style {
         self.style_token(cyclops_theme::state_token(state))
     }

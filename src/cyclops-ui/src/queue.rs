@@ -361,6 +361,44 @@ impl QueueRow {
     }
 }
 
+/// The one tmux session a reader has narrowed the queue to: its name for
+/// the header and the panes that are in it right now.
+///
+/// A message belongs to a session through its parties. A row is in the
+/// session when its sender or its recipient sits in one of these panes;
+/// the current route counts as well, because a recipient that moved
+/// panes is still the same agent. Admin has no pane, so an admin message
+/// follows the agent on the other end, and a row with no agent in any
+/// pane (admin to admin) shows only when every session is shown.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SessionFilter {
+    pub name: String,
+    pub panes: std::collections::BTreeSet<String>,
+}
+
+impl SessionFilter {
+    pub fn new(name: impl Into<String>, panes: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            name: name.into(),
+            panes: panes.into_iter().collect(),
+        }
+    }
+
+    fn holds(&self, key: RecipientKey) -> bool {
+        key.pane_id()
+            .is_some_and(|pane| self.panes.contains(&pane.to_string()))
+    }
+
+    pub fn admits(&self, row: &QueueRow) -> bool {
+        self.holds(row.sender)
+            || self.holds(row.recipient)
+            || row
+                .current_route
+                .as_ref()
+                .is_some_and(|route| self.panes.contains(&route.pane_id.to_string()))
+    }
+}
+
 /// What the reader is looking at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -450,6 +488,9 @@ pub struct HumanQueue {
     /// daemon's FIFO sequence within each band.
     rows: Vec<QueueRow>,
     scope: Scope,
+    /// The one session the reader narrowed to, or every session.
+    /// Applied under the scope: Work in one session is still Work.
+    session: Option<SessionFilter>,
     /// Indices into `rows` admitted by the current scope. Rebuilt only
     /// when the snapshot or the scope changes, so a keypress costs one
     /// index step rather than a filter over the whole snapshot.
@@ -481,6 +522,7 @@ impl HumanQueue {
             watermark: 0,
             rows: Vec::new(),
             scope: Scope::Work,
+            session: None,
             view: Vec::new(),
             counts: Counts::default(),
             selected: None,
@@ -528,14 +570,33 @@ impl HumanQueue {
         self.place(previous.and_then(|target| self.view_position(&target)));
     }
 
-    /// Filter to the scope, then order: attention above inbox, and the
-    /// daemon's own sequence inside each band. Ties break on the target
-    /// id so two reads of one state produce one order.
+    pub fn session_filter(&self) -> Option<&SessionFilter> {
+        self.session.as_ref()
+    }
+
+    /// Narrow to one session, or widen to all of them. A filter equal to
+    /// the current one costs nothing, so a caller may re-derive it every
+    /// frame from the live pane table without rebuilding the view.
+    pub fn set_session_filter(&mut self, session: Option<SessionFilter>) {
+        if session == self.session {
+            return;
+        }
+        let previous = self.selected.clone();
+        self.session = session;
+        self.rebuild_view();
+        self.place(previous.and_then(|target| self.view_position(&target)));
+    }
+
+    /// Filter to the session and the scope, then order: attention above
+    /// inbox, and the daemon's own sequence inside each band. Ties break
+    /// on the target id so two reads of one state produce one order.
     fn rebuild_view(&mut self) {
         let scope = self.scope;
+        let session = self.session.as_ref();
         let rows = &self.rows;
+        let in_session = |row: &QueueRow| session.is_none_or(|filter| filter.admits(row));
         let mut view: Vec<usize> = (0..rows.len())
-            .filter(|&i| scope.admits(&rows[i]))
+            .filter(|&i| in_session(&rows[i]) && scope.admits(&rows[i]))
             .collect();
         view.sort_by(|&a, &b| {
             let (a, b) = (&rows[a], &rows[b]);
@@ -546,17 +607,19 @@ impl HumanQueue {
                 // so the allocation here is not on the common path.
                 .then_with(|| a.target.tiebreak().cmp(&b.target.tiebreak()))
         });
-        self.view = view;
+        // The header's numbers describe what the reader is looking at:
+        // narrowed to one session, they count that session's rows.
+        let counted: Vec<&QueueRow> = rows.iter().filter(|row| in_session(row)).collect();
         self.counts = Counts {
-            visible: self.view.len(),
-            attention: self.rows.iter().filter(|r| r.needs_human()).count(),
-            pending: self
-                .rows
+            visible: view.len(),
+            attention: counted.iter().filter(|r| r.needs_human()).count(),
+            pending: counted
                 .iter()
                 .filter(|r| r.mailbox == MailboxWord::Pending)
                 .count(),
-            total: self.rows.len(),
+            total: counted.len(),
         };
+        self.view = view;
     }
 
     /// Move the cursor to one position in the view, id and index together.

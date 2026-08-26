@@ -547,6 +547,10 @@ struct App {
     stream_reconcile_requests: Option<std::sync::mpsc::SyncSender<()>>,
     /// Whether the Messages drawer has active keyboard focus.
     messages_focused: bool,
+    /// Whether the drawer shows only the active workspace's session. The
+    /// filter itself is re-derived from the live pane table every frame
+    /// (`sync_messages_session_filter`); this is the operator's choice.
+    messages_session_scoped: bool,
     /// Refresh gate and connection lifecycle for the Messages drawer.
     messages_gate: cyclops_ui::RefreshGate,
     /// Exact failure from the last whole-snapshot RPC. Kept until another
@@ -1298,6 +1302,7 @@ pub async fn run_async() -> i32 {
         send_requests: Some(send_request_tx),
         stream_reconcile_requests: Some(stream_reconcile_tx),
         messages_focused: false,
+        messages_session_scoped: true,
         messages_gate: cyclops_ui::RefreshGate::new(),
         messages_refresh_error: None,
         messages_send_tx: Some(messages_send_tx),
@@ -1428,7 +1433,7 @@ pub async fn run_async() -> i32 {
                     show_pane_input_not_sent(
                         &mut app,
                         &pane,
-                        &TmuxError::Protocol("control stream continuity changed".into()),
+                        &TmuxError::Protocol(copy::CONTROL_STREAM_GAP.into()),
                         &mut debounce,
                     );
                     pane_input_notice_shown = true;
@@ -1450,7 +1455,7 @@ pub async fn run_async() -> i32 {
                             show_pane_input_not_sent(
                                 &mut app,
                                 &pane,
-                                &TmuxError::Protocol("control stream continuity changed".into()),
+                                &TmuxError::Protocol(copy::CONTROL_STREAM_GAP.into()),
                                 &mut debounce,
                             );
                             pane_input_notice_shown = true;
@@ -1600,7 +1605,7 @@ pub async fn run_async() -> i32 {
                             show_pane_input_not_sent(
                                 &mut app,
                                 &target,
-                                &TmuxError::Protocol("control stream continuity changed".into()),
+                                &TmuxError::Protocol(copy::CONTROL_STREAM_GAP.into()),
                                 &mut debounce,
                             );
                             pane_input_notice_shown = true;
@@ -4557,10 +4562,27 @@ async fn handle_messages_key(
                     .show("Refused: no reachable mailbox routes", Instant::now());
                 return Ok(Some(InputOutcome::Redraw));
             }
+            // `@all` means everyone the drawer is showing: narrowed to one
+            // session, an announcement stays inside that session.
+            let session = app.messages_queue.session_filter();
             let recipients: Vec<(cyclops_proto::RecipientKey, String)> = routes
                 .iter()
+                .filter(|r| {
+                    session.is_none_or(|filter| {
+                        r.recipient
+                            .pane_id()
+                            .is_some_and(|pane| filter.panes.contains(&pane.to_string()))
+                    })
+                })
                 .map(|r| (r.recipient, r.label.clone()))
                 .collect();
+            if recipients.is_empty() {
+                app.messages_composer
+                    .record_not_sent("no mailbox routes in this session".into());
+                app.notice
+                    .show("Refused: no mailbox routes in this session", Instant::now());
+                return Ok(Some(InputOutcome::Redraw));
+            }
             messages_composer_changed(app);
             app.messages_composer = cyclops_ui::ComposerState::new_announce(recipients);
             app.messages_composer.bind_sender(app.messages_caller);
@@ -4592,10 +4614,45 @@ async fn handle_messages_key(
             app.messages_queue.set_scope(next);
             return Ok(Some(InputOutcome::Redraw));
         }
+        KeyCode::Char('t') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.messages_session_scoped = !app.messages_session_scoped;
+            sync_messages_session_filter(app);
+            return Ok(Some(InputOutcome::Redraw));
+        }
         _ => {}
     }
 
     Ok(None)
+}
+
+/// The session filter the drawer should apply right now: the active
+/// workspace's name and the panes linked into its windows, or none when the
+/// operator asked for every session.
+///
+/// Derived, never stored: panes join and leave a session while the drawer
+/// is open, and a stored pane set would go stale the moment one did. The
+/// queue ignores a filter equal to its current one, so deriving it every
+/// frame costs a small set build and no view rebuild.
+fn messages_session_filter(app: &App) -> Option<cyclops_ui::SessionFilter> {
+    if !app.messages_session_scoped {
+        return None;
+    }
+    let workspace = app.model.workspaces.get(app.model.active_workspace)?;
+    let panes = app
+        .decoration
+        .panes
+        .values()
+        .filter(|pane| workspace.window_ids.contains(&pane.window_id))
+        .map(|pane| pane.pane_id.clone());
+    Some(cyclops_ui::SessionFilter::new(
+        workspace.name.clone(),
+        panes,
+    ))
+}
+
+fn sync_messages_session_filter(app: &mut App) {
+    let filter = messages_session_filter(app);
+    app.messages_queue.set_session_filter(filter);
 }
 
 /// One axis of pointer travel as a signed cell count.
@@ -5545,6 +5602,9 @@ fn draw<B: Backend>(
     motion.set_preference(app.prefs.motion, motion_capable(&app.paint));
     motion.observe(observed(app), now);
     app.hit_map.clear();
+    // Before the frame, not during it: the drawer's session filter follows
+    // the live pane table, and the queue takes it by value.
+    sync_messages_session_filter(app);
     let mut shown_cursor: Option<crate::render::HostCursor> = None;
     // The whole call, write and flush included: what the slow-terminal
     // latch measures is the cost of putting a frame on the wire, not the
@@ -5934,6 +5994,7 @@ mod tests {
             send_requests: None,
             stream_reconcile_requests: None,
             messages_focused: false,
+            messages_session_scoped: true,
             messages_gate: cyclops_ui::RefreshGate::new(),
             messages_refresh_error: None,
             messages_send_tx: None,

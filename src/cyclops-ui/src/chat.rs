@@ -231,6 +231,9 @@ pub enum ChatAction {
     Announce,
     Open,
     Scope,
+    /// Flip the drawer between the messages of the session the operator is
+    /// looking at and the messages of every watched session.
+    Sessions,
     /// Only offered while a refresh has failed: the retry the status line
     /// tells the operator to press.
     Retry,
@@ -244,12 +247,21 @@ impl ChatAction {
             ChatAction::Announce => "a announce",
             ChatAction::Open => "enter open",
             ChatAction::Scope => "s scope",
+            ChatAction::Sessions => "t sessions",
             ChatAction::Retry => "^R retry",
         }
     }
+
+    /// The button as printed: the label with one cell of air on each side,
+    /// so a click on the button's edge still lands on the verb and the
+    /// painted fill has a shape rather than hugging the letters.
+    pub fn button(self) -> String {
+        format!(" {} ", self.label())
+    }
 }
 
-const ACTION_SEPARATOR: &str = " | ";
+/// The air between two buttons in the strip.
+const ACTION_GAP: &str = " ";
 
 /// The verbs the strip offers right now. `refresh_failed` adds the retry.
 pub fn chat_actions(refresh_failed: bool) -> Vec<ChatAction> {
@@ -258,6 +270,7 @@ pub fn chat_actions(refresh_failed: bool) -> Vec<ChatAction> {
         ChatAction::Announce,
         ChatAction::Open,
         ChatAction::Scope,
+        ChatAction::Sessions,
     ];
     if refresh_failed {
         actions.insert(0, ChatAction::Retry);
@@ -267,32 +280,240 @@ pub fn chat_actions(refresh_failed: bool) -> Vec<ChatAction> {
 
 /// The strip as text, and where each verb sits in it.
 ///
-/// Returns the rendered row plus one column span per verb that actually
-/// fit. A verb the width could not hold is absent from the spans rather
+/// Returns the rendered row plus one column span per button that actually
+/// fit. A button the width could not hold is absent from the spans rather
 /// than mapped to a truncated word, so a click can never land on half a
-/// verb and dispatch the whole one.
+/// verb and dispatch the whole one. The spans cover the padded button, not
+/// only its letters: the fill is the control, and its edge is clickable.
 pub fn chat_action_strip(
     width: usize,
     refresh_failed: bool,
 ) -> (String, Vec<(ChatAction, usize, usize)>) {
-    let mut text = String::new();
+    let line = chat_action_line(width, refresh_failed);
     let mut spans = Vec::new();
+    let mut col = 0usize;
+    for span in &line.spans {
+        let w = display_width(&span.text);
+        if let ChatInk::Button(action) = span.ink {
+            spans.push((action, col, col + w));
+        }
+        col += w;
+    }
+    (line.text(), spans)
+}
+
+/// The strip as a styled line: every button that fits, centered in the row.
+///
+/// Centered because the strip is a bar of controls, not a sentence. Left
+/// aligned it read as a caption under the timeline; centered it reads as
+/// the footer of a panel, which is what it is.
+pub fn chat_action_line(width: usize, refresh_failed: bool) -> ChatLine {
+    let mut buttons: Vec<(ChatAction, String)> = Vec::new();
+    let mut used = 0usize;
     for action in chat_actions(refresh_failed) {
-        let separator = if text.is_empty() {
-            ""
+        let button = action.button();
+        let gap = if buttons.is_empty() {
+            0
         } else {
-            ACTION_SEPARATOR
+            display_width(ACTION_GAP)
         };
-        let start = display_width(&text) + display_width(separator);
-        let end = start + display_width(action.label());
-        if end > width {
+        let w = display_width(&button);
+        if used + gap + w > width {
             break;
         }
-        text.push_str(separator);
-        text.push_str(action.label());
-        spans.push((action, start, end));
+        used += gap + w;
+        buttons.push((action, button));
     }
-    (fit(&text, width), spans)
+    let mut line = ChatLine::new(ChatLineKind::Strip);
+    let lead = width.saturating_sub(used) / 2;
+    line.push(" ".repeat(lead), ChatInk::Text);
+    for (i, (action, button)) in buttons.into_iter().enumerate() {
+        if i > 0 {
+            line.push(ACTION_GAP, ChatInk::Text);
+        }
+        line.push(button, ChatInk::Button(action));
+    }
+    line.fitted(width)
+}
+
+/// How one run of text in a drawer line is inked.
+///
+/// The renderer names what a run *is*; the surface that paints it owns the
+/// palette. `cyclops-ui` has no colors, so a name here is a fact about the
+/// text (this is an agent's name, this needs a person) and never a hue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatInk {
+    /// Ordinary text.
+    Text,
+    /// Secondary detail: times, ids, arrows, rules.
+    Dim,
+    /// The selection mark, the panel's own word, the `@all` address.
+    Accent,
+    /// An agent's name, keyed by its display label. The workspace paints
+    /// it in the same stable role color the agent's pane border and
+    /// sidebar row already carry, so a name means one thing everywhere.
+    Role(String),
+    /// The avatar chip for a label: the role color as ground, the panel
+    /// ink on top. Same key as [`ChatInk::Role`] so chip and name match.
+    Avatar(String),
+    /// A wake or mailbox fact that needs a person.
+    Attention,
+    /// A wake or mailbox fact that ended well: claimed, delivered, notified.
+    Healthy,
+    /// One footer button. The surface lights it under the pointer.
+    Button(ChatAction),
+}
+
+/// One inked run of text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatSpan {
+    pub text: String,
+    pub ink: ChatInk,
+}
+
+/// What a drawer line is, so a surface can find the strip or the header
+/// without matching on the words the renderer happened to print.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatLineKind {
+    Header,
+    /// A line of one message: its heading, body, or thread history.
+    Message,
+    /// One recipient's proven mailbox and wake fact.
+    Status,
+    /// The bar above the footer.
+    Rule,
+    /// The one-line status row above the footer, when there is one.
+    Notice,
+    Composer,
+    /// The footer button bar.
+    Strip,
+    Blank,
+}
+
+/// One exact-width line of the drawer: inked runs that concatenate to the
+/// plain row [`render_chat`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatLine {
+    pub kind: ChatLineKind,
+    pub spans: Vec<ChatSpan>,
+}
+
+impl ChatLine {
+    pub fn new(kind: ChatLineKind) -> Self {
+        Self {
+            kind,
+            spans: Vec::new(),
+        }
+    }
+
+    /// Append one run. An empty run is dropped rather than kept as a
+    /// zero-width span a painter would have to step over.
+    pub fn push(&mut self, text: impl Into<String>, ink: ChatInk) -> &mut Self {
+        let text = text.into();
+        if !text.is_empty() {
+            self.spans.push(ChatSpan { text, ink });
+        }
+        self
+    }
+
+    /// The row as plain text, every run concatenated in order.
+    pub fn text(&self) -> String {
+        self.spans.iter().map(|span| span.text.as_str()).collect()
+    }
+
+    /// Display columns the row occupies.
+    pub fn width(&self) -> usize {
+        self.spans
+            .iter()
+            .map(|span| display_width(&span.text))
+            .sum()
+    }
+
+    /// Cut or pad to exactly `width` cells, the way [`fit`] does for plain
+    /// text, keeping the ink of every run that survives the cut.
+    pub fn fitted(mut self, width: usize) -> Self {
+        let mut kept = Vec::with_capacity(self.spans.len() + 1);
+        let mut used = 0usize;
+        for span in self.spans.drain(..) {
+            if used >= width {
+                break;
+            }
+            let room = width - used;
+            let w = display_width(&span.text);
+            if w <= room {
+                used += w;
+                kept.push(span);
+            } else {
+                kept.push(ChatSpan {
+                    text: fit(&span.text, room),
+                    ink: span.ink,
+                });
+                used = width;
+                break;
+            }
+        }
+        if used < width {
+            kept.push(ChatSpan {
+                text: " ".repeat(width - used),
+                ink: ChatInk::Text,
+            });
+        }
+        self.spans = kept;
+        self
+    }
+}
+
+/// A line of plain text, fitted.
+fn plain(kind: ChatLineKind, text: &str, width: usize) -> ChatLine {
+    let mut line = ChatLine::new(kind);
+    line.push(text, ChatInk::Text);
+    line.fitted(width)
+}
+
+/// Break text into rows no wider than `width`, on spaces where there are
+/// spaces and inside a word only when the word alone is wider than the
+/// row. Existing line breaks are kept; a blank line stays a blank line.
+///
+/// A drawer that cut every body at its right edge lost the end of every
+/// sentence longer than the panel, which on a narrow drawer was most of
+/// them. Wrapping costs rows; losing the words cost the message.
+pub fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for raw in text.split('\n') {
+        let mut row = String::new();
+        let mut row_w = 0usize;
+        for word in raw.split_whitespace() {
+            let word_w = display_width(word);
+            if row_w > 0 && row_w + 1 + word_w <= width {
+                row.push(' ');
+                row.push_str(word);
+                row_w += 1 + word_w;
+                continue;
+            }
+            if row_w > 0 {
+                rows.push(std::mem::take(&mut row));
+                row_w = 0;
+            }
+            if word_w <= width {
+                row.push_str(word);
+                row_w = word_w;
+                continue;
+            }
+            // A single word wider than the row: cut it at cell boundaries.
+            for ch in word.chars() {
+                let w = display_width(&ch.to_string());
+                if row_w + w > width && row_w > 0 {
+                    rows.push(std::mem::take(&mut row));
+                    row_w = 0;
+                }
+                row.push(ch);
+                row_w += w;
+            }
+        }
+        rows.push(row);
+    }
+    rows
 }
 
 /// Computes the exact proven delivery truth label from mailbox and wake states.
@@ -583,13 +804,71 @@ impl<'a> ChatRenderContext<'a> {
     }
 }
 
-/// Render the group-chat timeline and bottom bounded composer into exact-width lines.
+/// The short form of a message id for a row: enough to tell two apart,
+/// not the whole thirty-four cells. The full id is in the detail.
+fn short_id(id: &MessageId) -> &str {
+    let s = id.as_str();
+    &s[..s.len().min(10)]
+}
+
+/// The avatar as a chip: the badge with one cell of air each side, so the
+/// painted ground has a shape a reader recognises as an avatar.
+fn chip(avatar: &Avatar) -> String {
+    format!(" {} ", avatar.badge())
+}
+
+/// The glyph and ink for one recipient's proven state.
+fn status_ink(entry: &RecipientEntry) -> (&'static str, ChatInk) {
+    if entry.is_attention {
+        return ("!", ChatInk::Attention);
+    }
+    let healthy = matches!(
+        entry.mailbox,
+        MailboxWord::Claimed | MailboxWord::DeliveredDirect
+    ) || matches!(
+        entry.wake,
+        WakeWord::Submitted | WakeWord::Notified | WakeWord::ResolvedSubmitted
+    );
+    if healthy {
+        ("✓", ChatInk::Healthy)
+    } else {
+        ("·", ChatInk::Dim)
+    }
+}
+
+/// A status hint that names a failure is inked for attention; the rest
+/// (reconnecting, a passing notice) is detail.
+fn hint_ink(hint: &str) -> ChatInk {
+    if hint.contains("failed") || hint.contains("refused") {
+        ChatInk::Attention
+    } else {
+        ChatInk::Dim
+    }
+}
+
+/// Render the group-chat timeline and bottom bounded composer into plain
+/// exact-width lines: [`render_chat_lines`] with the ink dropped, for
+/// readers that only want the words.
 pub fn render_chat(
     queue: &HumanQueue,
     context: ChatRenderContext<'_>,
     width: usize,
     height: usize,
 ) -> Vec<String> {
+    render_chat_lines(queue, context, width, height)
+        .iter()
+        .map(ChatLine::text)
+        .collect()
+}
+
+/// Render the group-chat timeline and bottom bounded composer into
+/// exact-width inked lines.
+pub fn render_chat_lines(
+    queue: &HumanQueue,
+    context: ChatRenderContext<'_>,
+    width: usize,
+    height: usize,
+) -> Vec<ChatLine> {
     let ChatRenderContext {
         detail,
         composer,
@@ -604,35 +883,47 @@ pub fn render_chat(
         return Vec::new();
     }
 
-    let mut out: Vec<String> = Vec::with_capacity(height);
+    let mut out: Vec<ChatLine> = Vec::with_capacity(height);
     let counts = queue.counts();
+    let session_word = match queue.session_filter() {
+        Some(filter) => format!("session {}", filter.name),
+        None => "all sessions".to_string(),
+    };
 
     // 1. Header line
     let status_hint = status.unwrap_or("");
+    let mut header = ChatLine::new(ChatLineKind::Header);
     if width >= 30 {
-        let header = if !status_hint.is_empty() {
-            format!(
-                "Messages Group Chat  {}  [{status_hint}]",
-                queue.scope().word()
-            )
+        header.push("Messages", ChatInk::Accent);
+        header.push("  ", ChatInk::Text);
+        header.push(queue.scope().word(), ChatInk::Text);
+        header.push(" · ", ChatInk::Dim);
+        header.push(&session_word, ChatInk::Text);
+        header.push("  ", ChatInk::Text);
+        if !status_hint.is_empty() {
+            header.push(status_hint, hint_ink(status_hint));
         } else {
-            format!(
-                "Messages Group Chat  {}  {} shown  {} pend  {} attn",
-                queue.scope().word(),
-                counts.visible,
-                counts.pending,
-                counts.attention
-            )
-        };
-        out.push(fit(&header, width));
+            header.push(
+                format!(
+                    "{} shown · {} pend · {} attn",
+                    counts.visible, counts.pending, counts.attention
+                ),
+                ChatInk::Dim,
+            );
+        }
     } else {
-        let header = if !status_hint.is_empty() {
-            format!("Chat [{status_hint}]")
+        header.push("Chat", ChatInk::Accent);
+        header.push(" ", ChatInk::Text);
+        if !status_hint.is_empty() {
+            header.push(status_hint, hint_ink(status_hint));
         } else {
-            format!("Chat {} !{}", counts.pending, counts.attention)
-        };
-        out.push(fit(&header, width));
+            header.push(
+                format!("{} !{}", counts.pending, counts.attention),
+                ChatInk::Dim,
+            );
+        }
     }
+    out.push(header.fitted(width));
 
     // Reserve rows for status and composer at the bottom
     let composer_rows = if composer.is_some_and(|c| c.mode.is_some()) {
@@ -655,8 +946,15 @@ pub fn render_chat(
         detail,
     );
 
-    let mut timeline_lines: Vec<String> = Vec::new();
+    let mut timeline: Vec<ChatLine> = Vec::new();
     let mut selected_anchor_line: Option<usize> = None;
+    let pending_behind = |entry: &RecipientEntry| {
+        visible_rows
+            .iter()
+            .filter(|row| row.recipient == entry.recipient && row.mailbox == MailboxWord::Pending)
+            .count()
+            .saturating_sub(1)
+    };
 
     if width < 24 {
         // Ultra-narrow mode: 1-2 lines per entry using initials (never icon only)
@@ -668,7 +966,7 @@ pub fn render_chat(
                 " "
             };
             let s_initials = &item.sender_avatar.initials;
-            let short_id = if item.message_id.as_str().len() > 6 {
+            let short = if item.message_id.as_str().len() > 6 {
                 &item.message_id.as_str()[item.message_id.as_str().len() - 6..]
             } else {
                 item.message_id.as_str()
@@ -682,8 +980,8 @@ pub fn render_chat(
                 .map(|r| proven_status_short(r.mailbox, r.wake))
                 .unwrap_or("*pend");
 
-            let line1 = format!("{sel_mark}{attn_mark}[{s_initials}]{short_id} {status_short}");
-            timeline_lines.push(fit(&line1, width));
+            let line1 = format!("{sel_mark}{attn_mark}[{s_initials}]{short} {status_short}");
+            timeline.push(plain(ChatLineKind::Message, &line1, width));
             let recip_labels = match item
                 .recipients
                 .iter()
@@ -700,171 +998,186 @@ pub fn render_chat(
                     .collect::<Vec<_>>()
                     .join(","),
             };
-            let line2 = format!(" -> {recip_labels}");
-            timeline_lines.push(fit(&line2, width));
+            timeline.push(plain(
+                ChatLineKind::Message,
+                &format!(" -> {recip_labels}"),
+                width,
+            ));
             if item.is_selected {
-                selected_anchor_line = Some(timeline_lines.len().saturating_sub(1));
+                selected_anchor_line = Some(timeline.len().saturating_sub(1));
             }
 
             if let Some(r) = shown_recipient {
                 if r.is_attention || r.cause.is_some() {
                     let is_head = r.mailbox == MailboxWord::Pending && r.fifo_position == Some(1);
                     let cause_desc = r.cause.as_deref().unwrap_or(status_short);
-                    if is_head {
-                        let total_pending = visible_rows
-                            .iter()
-                            .filter(|row| {
-                                row.recipient == r.recipient && row.mailbox == MailboxWord::Pending
-                            })
-                            .count();
-                        let behind_count = total_pending.saturating_sub(1);
-                        let behind_desc = if behind_count > 0 {
-                            format!(" · {behind_count} behind")
+                    let line3 = if is_head {
+                        let behind = pending_behind(r);
+                        let behind_desc = if behind > 0 {
+                            format!(" · {behind} behind")
                         } else {
                             String::new()
                         };
-                        let line3 = format!(" ! [head · held: {cause_desc}{behind_desc}]");
-                        timeline_lines.push(fit(&line3, width));
+                        format!(" ! [head · held: {cause_desc}{behind_desc}]")
                     } else {
-                        let line3 = format!(" ! [held: {cause_desc}]");
-                        timeline_lines.push(fit(&line3, width));
-                    }
+                        format!(" ! [held: {cause_desc}]")
+                    };
+                    let mut line = ChatLine::new(ChatLineKind::Status);
+                    line.push(line3, ChatInk::Attention);
+                    timeline.push(line.fitted(width));
                 }
             }
         }
     } else {
-        // Full group-chat bubble mode
+        // Full group-chat mode: one heading, the wrapped body, one proven
+        // fact per recipient.
+        let body_width = width.saturating_sub(3).max(1);
         for item in &items {
-            let sel_mark = if item.is_selected { ">" } else { " " };
-            let attn_mark = if item.recipients.iter().any(|r| r.is_attention) {
-                "!"
-            } else {
-                " "
-            };
-            let s_badge = item.sender_avatar.badge();
-            let time_str = format_time(item.ts, now_ms);
-
-            let header = if item.is_broadcast {
-                format!(
-                    "{sel_mark}{attn_mark}[BC] [{s_badge}] {} -> @all ({time_str}) [{}]",
-                    item.sender_label, item.message_id
-                )
+            let mut heading = ChatLine::new(ChatLineKind::Message);
+            heading.push(if item.is_selected { "> " } else { "  " }, ChatInk::Accent);
+            heading.push(
+                chip(&item.sender_avatar),
+                ChatInk::Avatar(item.sender_label.clone()),
+            );
+            heading.push(" ", ChatInk::Text);
+            heading.push(&item.sender_label, ChatInk::Role(item.sender_label.clone()));
+            heading.push(" → ", ChatInk::Dim);
+            if item.is_broadcast {
+                heading.push("@all", ChatInk::Accent);
+                heading.push(format!(" ({})", item.recipients.len()), ChatInk::Dim);
             } else if let Some(r) = item.recipients.first() {
-                let r_badge = r.avatar.badge();
-                format!(
-                    "{sel_mark}{attn_mark}[DIR] [{s_badge}] {} -> [{r_badge}] {} ({time_str}) [{}]",
-                    item.sender_label, r.label, item.message_id
-                )
+                heading.push(chip(&r.avatar), ChatInk::Avatar(r.label.clone()));
+                heading.push(" ", ChatInk::Text);
+                heading.push(&r.label, ChatInk::Role(r.label.clone()));
+            }
+            let time = format_time(item.ts, now_ms);
+            let used = heading.width();
+            let time_w = display_width(&time);
+            if used + 2 + time_w <= width {
+                heading.push(" ".repeat(width - used - time_w), ChatInk::Text);
             } else {
-                format!(
-                    "{sel_mark}{attn_mark}[{s_badge}] {} ({time_str}) [{}]",
-                    item.sender_label, item.message_id
-                )
-            };
-            timeline_lines.push(fit(&header, width));
+                heading.push("  ", ChatInk::Text);
+            }
+            heading.push(time, ChatInk::Dim);
+            timeline.push(heading.fitted(width));
+            if item.is_selected {
+                selected_anchor_line = Some(timeline.len().saturating_sub(1));
+            }
 
             if let Some(ref reply) = item.reply_to {
-                timeline_lines.push(fit(&format!("   ↳ reply to {reply}"), width));
+                let mut line = ChatLine::new(ChatLineKind::Message);
+                line.push("   ↳ reply to ", ChatInk::Dim);
+                line.push(short_id(reply), ChatInk::Dim);
+                timeline.push(line.fitted(width));
             }
 
             // Expose authorized thread history if present in detail
             for entry in &item.thread_history {
                 let entry_avatar = Avatar::from_label(&entry.sender_label);
-                let entry_time = format_time(entry.ts, now_ms);
-                timeline_lines.push(fit(
-                    &format!(
-                        "   [{}] {} ({entry_time}):",
-                        entry_avatar.badge(),
-                        entry.sender_label
-                    ),
-                    width,
-                ));
+                let mut line = ChatLine::new(ChatLineKind::Message);
+                line.push("   ", ChatInk::Text);
+                line.push(
+                    chip(&entry_avatar),
+                    ChatInk::Avatar(entry.sender_label.clone()),
+                );
+                line.push(" ", ChatInk::Text);
+                line.push(
+                    &entry.sender_label,
+                    ChatInk::Role(entry.sender_label.clone()),
+                );
+                line.push("  ", ChatInk::Text);
+                line.push(format_time(entry.ts, now_ms), ChatInk::Dim);
+                timeline.push(line.fitted(width));
                 if let Some(ref b) = entry.body {
-                    for bline in b.lines() {
-                        timeline_lines.push(fit(&format!("     {bline}"), width));
+                    for row in wrap_words(b, width.saturating_sub(5).max(1)) {
+                        let mut line = ChatLine::new(ChatLineKind::Message);
+                        line.push("     ", ChatInk::Text);
+                        line.push(row, ChatInk::Text);
+                        timeline.push(line.fitted(width));
                     }
                 }
             }
 
             // If message body is authorized, expose it; otherwise show metadata subject
-            if let Some(ref body) = item.authorized_body {
-                for line in body.lines() {
-                    timeline_lines.push(fit(&format!("   {line}"), width));
+            let words = item.authorized_body.as_deref().or(item.subject.as_deref());
+            if let Some(words) = words {
+                for row in wrap_words(words, body_width) {
+                    let mut line = ChatLine::new(ChatLineKind::Message);
+                    line.push("   ", ChatInk::Text);
+                    line.push(row, ChatInk::Text);
+                    timeline.push(line.fitted(width));
                 }
-            } else if let Some(ref subj) = item.subject {
-                timeline_lines.push(fit(&format!("   {subj}"), width));
             }
 
             // Recipient delivery truth states
             for r in &item.recipients {
                 let status_label = proven_status_label(r.mailbox, r.wake);
-                let recipient_mark = if r.is_selected { ">" } else { " " };
-                let states = format!(
-                    "  {recipient_mark}[{}] [{status_label}] [mail: {}] [wake: {}]",
-                    r.label,
-                    r.mailbox.short(),
-                    r.wake.short()
-                );
-                timeline_lines.push(fit(&states, width));
+                let (glyph, ink) = status_ink(r);
+                let mut line = ChatLine::new(ChatLineKind::Status);
+                if item.is_broadcast {
+                    line.push(if r.is_selected { "  > " } else { "    " }, ChatInk::Accent);
+                    line.push(&r.label, ChatInk::Role(r.label.clone()));
+                    line.push(" ", ChatInk::Text);
+                } else {
+                    line.push("   ", ChatInk::Text);
+                }
+                line.push(glyph, ink.clone());
+                line.push(" ", ChatInk::Text);
+                line.push(status_label, ink);
+                line.push(" · ", ChatInk::Dim);
+                line.push(short_id(&item.message_id), ChatInk::Dim);
+                timeline.push(line.fitted(width));
                 if r.is_selected {
-                    selected_anchor_line = Some(timeline_lines.len().saturating_sub(1));
+                    selected_anchor_line = Some(timeline.len().saturating_sub(1));
                 }
                 if r.is_attention || r.cause.is_some() {
                     let is_head = r.mailbox == MailboxWord::Pending && r.fifo_position == Some(1);
                     let cause_desc = r.cause.as_deref().unwrap_or(status_label);
-                    if is_head {
-                        let total_pending = visible_rows
-                            .iter()
-                            .filter(|row| {
-                                row.recipient == r.recipient && row.mailbox == MailboxWord::Pending
-                            })
-                            .count();
-                        let behind_count = total_pending.saturating_sub(1);
-                        let behind_desc = if behind_count > 0 {
-                            format!(" · {behind_count} behind")
+                    let held = if is_head {
+                        let behind = pending_behind(r);
+                        let behind_desc = if behind > 0 {
+                            format!(" · {behind} behind")
                         } else {
                             String::new()
                         };
-                        let held_line = format!("   ! [head · held: {cause_desc}{behind_desc}]");
-                        timeline_lines.push(fit(&held_line, width));
+                        format!("   ! head · held: {cause_desc}{behind_desc}")
                     } else {
                         let pos_desc = r
                             .fifo_position
                             .map(|pos| format!(" · pos {pos}"))
                             .unwrap_or_default();
-                        let held_line = format!("   ! [held: {cause_desc}{pos_desc}]");
-                        timeline_lines.push(fit(&held_line, width));
-                    }
+                        format!("   ! held: {cause_desc}{pos_desc}")
+                    };
+                    let mut line = ChatLine::new(ChatLineKind::Status);
+                    line.push(held, ChatInk::Attention);
+                    timeline.push(line.fitted(width));
                 }
             }
-            timeline_lines.push(fit("", width));
+            timeline.push(plain(ChatLineKind::Blank, "", width));
         }
     }
 
     // Viewport slicing for timeline
-    let total_lines = timeline_lines.len();
+    let total_lines = timeline.len();
     let start_line = timeline_viewport_top(total_lines, timeline_height, selected_anchor_line);
-    for line in timeline_lines
-        .into_iter()
-        .skip(start_line)
-        .take(timeline_height)
-    {
-        out.push(line);
-    }
+    out.extend(timeline.into_iter().skip(start_line).take(timeline_height));
 
     // Fill blank space if timeline is shorter than allocated height
     while out.len() < 1 + timeline_height {
-        out.push(fit("", width));
+        out.push(plain(ChatLineKind::Blank, "", width));
     }
 
     // 3. Status row (if present)
     if let Some(status_text) = status {
-        out.push(fit(status_text, width));
+        let mut line = ChatLine::new(ChatLineKind::Notice);
+        line.push(status_text, hint_ink(status_text));
+        out.push(line.fitted(width));
     }
 
     // 4. Bottom Bounded Composer
-    if let Some(c) = composer {
-        if let Some(ref mode) = c.mode {
+    let rule = "─".repeat(width);
+    match composer.and_then(|c| c.mode.as_ref().map(|mode| (c, mode))) {
+        Some((c, mode)) => {
             let sender = match c.sender {
                 Some(sender) if sender.is_admin() => "admin".to_string(),
                 Some(sender) => sender
@@ -873,67 +1186,85 @@ pub fn render_chat(
                     .unwrap_or_else(|| sender.to_string()),
                 None => "unavailable (read-only)".to_string(),
             };
-            let mode_header = match mode {
+            let mut mode_header = ChatLine::new(ChatLineKind::Composer);
+            mode_header.push("── ", ChatInk::Dim);
+            match mode {
                 ComposerMode::Reply {
                     message_id,
                     origin_label,
                     ..
-                } => format!("── Reply to @{origin_label} ({message_id}) · sending as {sender} ──"),
+                } => {
+                    mode_header.push("Reply to @", ChatInk::Accent);
+                    mode_header.push(origin_label, ChatInk::Role(origin_label.clone()));
+                    mode_header.push(format!(" ({message_id})"), ChatInk::Dim);
+                }
                 ComposerMode::Announce { recipients } => {
                     let preview = recipients
                         .iter()
                         .map(|(_, l)| l.as_str())
                         .collect::<Vec<_>>()
                         .join(", ");
-                    format!("── Announce to @all ({preview}) · sending as {sender} ──")
+                    mode_header.push("Announce to @all", ChatInk::Accent);
+                    mode_header.push(format!(" ({preview})"), ChatInk::Dim);
                 }
                 ComposerMode::Direct {
                     recipient_label, ..
                 } => {
-                    format!("── Direct to @{recipient_label} · sending as {sender} ──")
+                    mode_header.push("Direct to @", ChatInk::Accent);
+                    mode_header.push(recipient_label, ChatInk::Role(recipient_label.clone()));
                 }
-            };
-            out.push(fit(&mode_header, width));
+            }
+            mode_header.push(format!(" · sending as {sender} "), ChatInk::Dim);
+            let used = mode_header.width();
+            if used < width {
+                mode_header.push("─".repeat(width - used), ChatInk::Dim);
+            }
+            out.push(mode_header.fitted(width));
 
             // Stage error / outcome banner if failed, not sent, or uncertain
-            if let Some(ref stage) = c.stage {
-                let stage_banner = match stage {
-                    Stage::NotSent { why, .. } => {
-                        format!("! [Not sent: {why} (draft preserved, Enter to retry)]")
-                    }
-                    Stage::Uncertain { why, .. } => {
-                        format!(
-                            "! [Uncertain: reconciliation required; draft preserved; outcome unconfirmed: {why}]"
-                        )
-                    }
-                    Stage::Failed { why, .. } => {
-                        format!("! [Refused: {why} (draft preserved)]")
-                    }
-                    Stage::Acting(action) => {
-                        format!("... [Sending {}...]", action.word())
-                    }
-                    _ => String::new(),
-                };
-                if !stage_banner.is_empty() {
-                    out.push(fit(&stage_banner, width));
-                } else {
-                    let input_line = format!("> {}_", c.text());
-                    out.push(fit(&input_line, width));
+            let stage_banner = match c.stage {
+                Some(Stage::NotSent { ref why, .. }) => {
+                    format!("! Not sent: {why} (draft preserved, Enter to retry)")
                 }
+                Some(Stage::Uncertain { ref why, .. }) => format!(
+                    "! Uncertain: reconciliation required; draft preserved; outcome unconfirmed: {why}"
+                ),
+                Some(Stage::Failed { ref why, .. }) => {
+                    format!("! Refused: {why} (draft preserved)")
+                }
+                Some(Stage::Acting(ref action)) => format!("... Sending {}...", action.word()),
+                _ => String::new(),
+            };
+            if stage_banner.is_empty() {
+                let mut input = ChatLine::new(ChatLineKind::Composer);
+                input.push("> ", ChatInk::Accent);
+                input.push(c.text(), ChatInk::Text);
+                input.push("_", ChatInk::Dim);
+                out.push(input.fitted(width));
             } else {
-                let input_line = format!("> {}_", c.text());
-                out.push(fit(&input_line, width));
+                let ink = if stage_banner.starts_with('!') {
+                    ChatInk::Attention
+                } else {
+                    ChatInk::Dim
+                };
+                let mut banner = ChatLine::new(ChatLineKind::Composer);
+                banner.push(stage_banner, ink);
+                out.push(banner.fitted(width));
             }
 
-            let help = "Enter send | Esc cancel | r reply | a announce";
-            out.push(fit(help, width));
-        } else {
-            out.push(fit("── Messages Group Chat ──", width));
-            out.push(chat_action_strip(width, retry_available).0);
+            let mut help = ChatLine::new(ChatLineKind::Composer);
+            help.push(
+                "Enter send · Esc cancel · r reply · a announce",
+                ChatInk::Dim,
+            );
+            out.push(help.fitted(width));
         }
-    } else {
-        out.push(fit("── Messages Group Chat ──", width));
-        out.push(chat_action_strip(width, retry_available).0);
+        None => {
+            let mut bar = ChatLine::new(ChatLineKind::Rule);
+            bar.push(rule, ChatInk::Dim);
+            out.push(bar.fitted(width));
+            out.push(chat_action_line(width, retry_available));
+        }
     }
 
     out.truncate(height);
@@ -950,14 +1281,79 @@ mod strip_tests {
     #[test]
     fn every_reported_span_covers_exactly_its_own_verb() {
         let (row, spans) = chat_action_strip(80, false);
-        assert_eq!(spans.len(), 4, "{row}");
+        assert_eq!(spans.len(), 5, "{row}");
         for (action, start, end) in spans {
             assert_eq!(
                 &row[start..end],
-                action.label(),
-                "span for {action:?} must cover its own word in {row:?}"
+                action.button(),
+                "span for {action:?} must cover its own button in {row:?}"
             );
         }
+    }
+
+    /// The bar is centered: the same air on both sides of the buttons,
+    /// give or take the odd cell, so it reads as a footer and not a caption.
+    #[test]
+    fn the_strip_is_centered_in_its_row() {
+        let (row, spans) = chat_action_strip(80, false);
+        let first = spans.first().map(|(_, start, _)| *start).unwrap();
+        let last = spans.last().map(|(_, _, end)| *end).unwrap();
+        assert_eq!(display_width(&row), 80);
+        assert!(
+            first.abs_diff(80 - last) <= 1,
+            "lead {first} and trail {} must match: {row:?}",
+            80 - last
+        );
+    }
+
+    /// Every button span is inked as that button, so the surface can light
+    /// exactly the control under the pointer.
+    #[test]
+    fn every_button_is_inked_as_its_own_verb() {
+        let line = chat_action_line(80, true);
+        let buttons: Vec<ChatAction> = line
+            .spans
+            .iter()
+            .filter_map(|span| match span.ink {
+                ChatInk::Button(action) => Some(action),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(buttons, chat_actions(true));
+    }
+
+    #[test]
+    fn words_wrap_on_spaces_and_only_cut_inside_an_overlong_word() {
+        assert_eq!(
+            wrap_words("the quick brown fox jumps", 10),
+            vec!["the quick", "brown fox", "jumps"]
+        );
+        assert_eq!(
+            wrap_words("abcdefghijkl end", 5),
+            vec!["abcde", "fghij", "kl", "end"]
+        );
+        assert_eq!(wrap_words("one\n\ntwo", 10), vec!["one", "", "two"]);
+        assert_eq!(
+            wrap_words("wide 漢字 glyphs", 6),
+            vec!["wide", "漢字", "glyphs"]
+        );
+    }
+
+    /// A fitted line keeps the ink of every run that survives the cut and
+    /// pads with plain cells, so the plain text is exactly the width.
+    #[test]
+    fn a_fitted_line_keeps_its_ink_and_its_width() {
+        let mut line = ChatLine::new(ChatLineKind::Message);
+        line.push("claude", ChatInk::Role("claude".into()));
+        line.push(" → ", ChatInk::Dim);
+        line.push("codex and more", ChatInk::Role("codex".into()));
+        let fitted = line.clone().fitted(12);
+        assert_eq!(fitted.text(), "claude → cod");
+        assert_eq!(fitted.spans.len(), 3);
+        assert_eq!(fitted.spans[2].ink, ChatInk::Role("codex".into()));
+        let padded = line.fitted(30);
+        assert_eq!(display_width(&padded.text()), 30);
+        assert_eq!(padded.spans.last().unwrap().ink, ChatInk::Text);
     }
 
     /// A verb the width cannot hold is absent rather than truncated: a
@@ -980,7 +1376,10 @@ mod strip_tests {
         let (healthy, _) = chat_action_strip(80, false);
         assert!(!healthy.contains("retry"), "{healthy:?}");
         let (failed, spans) = chat_action_strip(80, true);
-        assert!(failed.starts_with(ChatAction::Retry.label()), "{failed:?}");
+        assert!(
+            failed.trim_start().starts_with(ChatAction::Retry.label()),
+            "{failed:?}"
+        );
         assert_eq!(spans[0].0, ChatAction::Retry);
 
         let registry = AvatarRegistry::default();
@@ -1012,7 +1411,7 @@ mod strip_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::queue::{Direction, QueueTarget, Scope, Snapshot};
+    use crate::queue::{Direction, QueueTarget, Scope, SessionFilter, Snapshot};
     use cyclops_proto::{
         MessageId, NotificationAttentionCause, NotificationPreWriteCause, RecipientKey,
     };
@@ -1144,21 +1543,56 @@ mod tests {
 
         let joined = lines.join("\n");
         assert!(
-            joined.contains("[DIR]"),
-            "single-recipient message must be marked [DIR]"
+            joined.contains("operator →  CL  claude"),
+            "a single-recipient message names its one recipient:\n{joined}"
         );
         assert!(
-            joined.contains("[BC]"),
-            "multi-recipient broadcast must be marked [BC]"
+            joined.contains("operator → @all (2)"),
+            "a multi-recipient broadcast is addressed to everyone:\n{joined}"
         );
         assert!(
-            joined.contains("[CL]"),
+            !joined.contains("[DIR]") && !joined.contains("[BC]"),
+            "the direction is the address, not a tag:\n{joined}"
+        );
+        assert!(
+            joined.contains(" CL "),
             "an unproven claude label must use initials"
         );
         assert!(
             !joined.contains('✳'),
             "an unproven claude label received an official icon"
         );
+    }
+
+    /// Narrowed to one session, the drawer shows the rows whose parties
+    /// sit in that session's panes, counts only those, and names the
+    /// session in its header; widened again, everything comes back.
+    #[test]
+    fn a_session_filter_narrows_rows_counts_and_the_header() {
+        let mut queue = make_test_queue();
+        let registry = AvatarRegistry::default();
+        let all = queue.counts();
+        assert_eq!(all.total, 3);
+
+        // %2 (codex) is the only pane in this session: the broadcast
+        // reaches it, the direct message to claude (%1) does not.
+        queue.set_session_filter(Some(SessionFilter::new("beta", ["%2".to_string()])));
+        let narrowed = queue.counts();
+        assert_eq!(narrowed.total, 1, "one row has a party in %2");
+        assert_eq!(narrowed.visible, 1);
+        assert!(queue.visible().all(|row| row.recipient_label == "codex"));
+        let frame = render_chat(&queue, ChatRenderContext::new(&registry), 80, 20).join("\n");
+        assert!(frame.contains("session beta"), "{frame}");
+        assert!(!frame.contains("Direct instruction"), "{frame}");
+
+        // The sender's pane counts too: the operator sits in %0.
+        queue.set_session_filter(Some(SessionFilter::new("alpha", ["%0".to_string()])));
+        assert_eq!(queue.counts().total, 3, "every row was sent from %0");
+
+        queue.set_session_filter(None);
+        assert_eq!(queue.counts(), all);
+        let frame = render_chat(&queue, ChatRenderContext::new(&registry), 80, 20).join("\n");
+        assert!(frame.contains("all sessions"), "{frame}");
     }
 
     #[test]
@@ -1183,8 +1617,8 @@ mod tests {
             20,
         )
         .join("\n");
-        assert!(claude_frame.contains("  >[claude]"), "{claude_frame}");
-        assert!(!claude_frame.contains("  >[codex]"), "{claude_frame}");
+        assert!(claude_frame.contains("  > claude"), "{claude_frame}");
+        assert!(!claude_frame.contains("  > codex"), "{claude_frame}");
         let claude_narrow = render_chat(
             &queue,
             ChatRenderContext::new(&registry).at(1_010_000),
@@ -1203,8 +1637,8 @@ mod tests {
             20,
         )
         .join("\n");
-        assert!(codex_frame.contains("  >[codex]"), "{codex_frame}");
-        assert!(!codex_frame.contains("  >[claude]"), "{codex_frame}");
+        assert!(codex_frame.contains("  > codex"), "{codex_frame}");
+        assert!(!codex_frame.contains("  > claude"), "{codex_frame}");
         let codex_narrow = render_chat(
             &queue,
             ChatRenderContext::new(&registry).at(1_010_000),
@@ -1246,8 +1680,8 @@ mod tests {
             20,
         )
         .join("\n");
-        assert!(frame.contains("[CL] claude"), "{frame}");
-        assert!(!frame.contains("✳ claude"), "{frame}");
+        assert!(frame.contains(" CL  claude"), "{frame}");
+        assert!(!frame.contains("✳"), "{frame}");
     }
 
     #[test]
@@ -1300,15 +1734,14 @@ mod tests {
                 width,
                 height,
             );
-            let selected_id = if width < 24 {
-                "000000"
-            } else {
-                "m-0000000000000000"
-            };
+            // Narrow rows carry the id's tail on the marked row; wide rows
+            // carry its head on the status row under the marked heading.
+            let selected_id = if width < 24 { "000000" } else { "m-00000000" };
+            let marked = frame.iter().position(|line| line.starts_with('>'));
             assert!(
-                frame
+                marked.is_some_and(|at| frame[at..(at + 3).min(frame.len())]
                     .iter()
-                    .any(|line| line.starts_with('>') && line.contains(selected_id)),
+                    .any(|line| line.contains(selected_id))),
                 "selected older message is outside the {width}x{height} viewport:\n{}",
                 frame.join("\n")
             );

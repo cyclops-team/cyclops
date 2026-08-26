@@ -23,7 +23,8 @@
 //!    single glyph that says which way the click moves things, with a hit
 //!    target as large as that chrome allows and a fill under the mouse
 //!    (`theme::add_button` / `add_button_hover`). The tab strip's `+`, the
-//!    sidebar footer's `+`, and the sidebar chevron are all this.
+//!    sidebar footer's `+`, the sidebar chevron, and the messages drawer's
+//!    footer buttons are all this.
 //! 2. When a surface is put away it has no chrome left to host its own
 //!    switch, so the app menu carries it, and the app menu stays
 //!    reachable because a collapsed sidebar keeps a rail
