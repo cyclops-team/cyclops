@@ -878,6 +878,7 @@ fn assessment_result(
             message_id: target.record.message_id.clone(),
             recipient: target.record.recipient,
             checks,
+            verify_outcome: target.record.verify_outcome,
             expected: include_diff.then_some(expected).flatten(),
             observed: include_diff.then_some(observed).flatten(),
         },
@@ -1358,6 +1359,7 @@ composer_continuation_regex = '^  (?P<content>.*)$'
                 transport: cyclops_proto::NotificationTransport::Doorbell,
                 doorbell_format: None,
                 cause: None,
+                verify_outcome: None,
                 pre_write_cause: None,
                 wake_block: None,
                 pre_write_observation: None,
@@ -1399,5 +1401,15 @@ composer_continuation_regex = '^  (?P<content>.*)$'
             terminal_action_safe: true,
         };
         assert!(!checks.all_pass());
+
+        target.record.verify_outcome = Some(cyclops_proto::NotificationVerifyOutcome {
+            kind: cyclops_proto::NotificationVerifyFailureKind::Mismatch,
+            observed_composer: cyclops_proto::ComposerState::ComposerAmbiguous,
+        });
+        let assessment = assessment_result(&target, checks, None, None, false, None);
+        assert_eq!(
+            assessment.result.verify_outcome,
+            target.record.verify_outcome
+        );
     }
 }

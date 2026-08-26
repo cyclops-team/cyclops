@@ -6523,6 +6523,7 @@ contains = ["working"]
             transport: NotificationTransport::Doorbell,
             doorbell_format: Some(DOORBELL_FORMAT_COMPACT_CLAIM),
             cause: None,
+            verify_outcome: None,
             pre_write_cause: None,
             wake_block: None,
             pre_write_observation: None,

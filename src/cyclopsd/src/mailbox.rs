@@ -20,10 +20,10 @@ use cyclops_proto::{
     NotificationPreWriteObservation, NotificationRecord, NotificationRequeue,
     NotificationResolution, NotificationResolutionConsumptionEvidence,
     NotificationResolutionConsumptionObservation, NotificationState, NotificationTransport,
-    ProcessInstanceId, RecipientKey, RequestDigest, StatusBlockedNotification, StatusNextAction,
-    TmuxPaneId, WorkspaceId, CANONICAL_RECORD_VERSION, DOORBELL_FORMAT_ATTEMPT_CLAIM,
-    DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM, DOORBELL_FORMAT_COMPACT_CLAIM,
-    NOTIFICATION_RESOLUTION_PROOF_VERSION,
+    NotificationVerifyOutcome, ProcessInstanceId, RecipientKey, RequestDigest,
+    StatusBlockedNotification, StatusNextAction, TmuxPaneId, WorkspaceId, CANONICAL_RECORD_VERSION,
+    DOORBELL_FORMAT_ATTEMPT_CLAIM, DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM,
+    DOORBELL_FORMAT_COMPACT_CLAIM, NOTIFICATION_RESOLUTION_PROOF_VERSION,
 };
 use cyclops_state::StateRoot;
 use tokio::sync::broadcast;
@@ -288,6 +288,10 @@ pub enum MailboxError {
     NotificationCauseRequired,
     #[error("notification cause is only allowed on an attention transition")]
     NotificationCauseForbidden,
+    #[error("verify_failed requires a content-free verification outcome")]
+    NotificationVerifyOutcomeRequired,
+    #[error("verification outcome is only valid for verify_failed attention")]
+    NotificationVerifyOutcomeForbidden,
     #[error("a blocked pre-write notification requires one pre-write cause")]
     NotificationPreWriteCauseRequired,
     #[error("a blocked pre-write notification requires the selected gate manifest")]
@@ -1169,6 +1173,7 @@ impl MailboxProjection {
                         transport: current.transport,
                         doorbell_format: current.doorbell_format,
                         cause: None,
+                        verify_outcome: None,
                         pre_write_cause: None,
                         wake_block: None,
                         pre_write_observation: None,
@@ -1313,6 +1318,7 @@ impl MailboxProjection {
                         transport: current.transport,
                         doorbell_format: current.doorbell_format,
                         cause: None,
+                        verify_outcome: None,
                         pre_write_cause: None,
                         wake_block: None,
                         pre_write_observation: None,
@@ -1432,6 +1438,7 @@ impl MailboxProjection {
             transport,
             doorbell_format,
             cause,
+            verify_outcome,
             pre_write_cause,
             wake_block,
             pre_write_observation,
@@ -1514,8 +1521,19 @@ impl MailboxProjection {
                     state: prior.state,
                 });
             }
+            match (attention_cause, verify_outcome) {
+                (NotificationAttentionCause::VerifyFailed, None) if !replaying => {
+                    return Err(MailboxError::NotificationVerifyOutcomeRequired);
+                }
+                (NotificationAttentionCause::VerifyFailed, _) | (_, None) => {}
+                (_, Some(_)) => {
+                    return Err(MailboxError::NotificationVerifyOutcomeForbidden);
+                }
+            }
         } else if cause.is_some() {
             return Err(MailboxError::NotificationCauseForbidden);
+        } else if verify_outcome.is_some() {
+            return Err(MailboxError::NotificationVerifyOutcomeForbidden);
         }
         if state == NotificationState::BlockedPreWrite {
             if pre_write_cause.is_none() {
@@ -1586,6 +1604,7 @@ impl MailboxProjection {
                         transport: NotificationTransport::Doorbell,
                         doorbell_format: None,
                         cause: None,
+                        verify_outcome: None,
                         pre_write_cause: None,
                         wake_block: None,
                         pre_write_observation: None,
@@ -1619,6 +1638,7 @@ impl MailboxProjection {
                         current.doorbell_format
                     },
                     cause,
+                    verify_outcome,
                     pre_write_cause,
                     wake_block,
                     pre_write_observation: pre_write_observation.map(|observation| *observation),
@@ -1773,6 +1793,7 @@ impl MailboxProjection {
                 transport: NotificationTransport::Doorbell,
                 doorbell_format: None,
                 cause: None,
+                verify_outcome: None,
                 pre_write_cause: None,
                 wake_block: None,
                 pre_write_observation: None,
@@ -2028,6 +2049,7 @@ impl MailboxProjection {
                 transport: current.transport,
                 doorbell_format: current.doorbell_format,
                 cause: None,
+                verify_outcome: None,
                 pre_write_cause: None,
                 wake_block: None,
                 pre_write_observation: None,
@@ -3306,6 +3328,7 @@ impl MailboxProjection {
                 operator_withdrawn: None,
                 attempt_id: None,
                 cause: None,
+                verify_outcome: None,
                 pre_write_cause: None,
                 pre_write_pane_width: None,
                 pre_write_required_pane_width: None,
@@ -3349,6 +3372,7 @@ impl MailboxProjection {
                 .then_some(true),
             attempt_id: Some(record.attempt_id),
             cause: record.cause,
+            verify_outcome: record.verify_outcome,
             pre_write_cause: record.pre_write_cause,
             pre_write_pane_width: width_block.map(|(observed, _)| observed),
             pre_write_required_pane_width: width_block.map(|(_, required)| required),
@@ -6411,6 +6435,31 @@ impl MessageStore {
         )
     }
 
+    /// Record one post-write verification failure with its content-free evidence.
+    pub fn advance_notification_with_verify_outcome(
+        &mut self,
+        message_id: MessageId,
+        recipient: RecipientKey,
+        attempt_id: NotificationAttemptId,
+        outcome: NotificationVerifyOutcome,
+    ) -> Result<NotificationRecord, MessageStoreError> {
+        self.append_notification_transition_full_at(
+            message_id,
+            recipient,
+            attempt_id,
+            NotificationState::AttentionRequired,
+            None,
+            None,
+            None,
+            Some(NotificationAttentionCause::VerifyFailed),
+            Some(outcome),
+            None,
+            None,
+            None,
+            now_ms(),
+        )
+    }
+
     /// Stop one exact attempt before any terminal write.
     pub fn block_notification_before_write(
         &mut self,
@@ -6454,6 +6503,7 @@ impl MessageStore {
             recipient,
             attempt_id,
             NotificationState::BlockedPreWrite,
+            None,
             None,
             None,
             None,
@@ -6529,6 +6579,9 @@ impl MessageStore {
         cause: Option<NotificationAttentionCause>,
         ts: u64,
     ) -> Result<NotificationRecord, MessageStoreError> {
+        let verify_outcome = (state == NotificationState::AttentionRequired
+            && cause == Some(NotificationAttentionCause::VerifyFailed))
+        .then(NotificationVerifyOutcome::ambiguous);
         self.append_notification_transition_full_at(
             message_id,
             recipient,
@@ -6538,6 +6591,7 @@ impl MessageStore {
             transport,
             doorbell_format,
             cause,
+            verify_outcome,
             None,
             None,
             None,
@@ -6556,6 +6610,7 @@ impl MessageStore {
         transport: Option<NotificationTransport>,
         doorbell_format: Option<u32>,
         cause: Option<NotificationAttentionCause>,
+        verify_outcome: Option<NotificationVerifyOutcome>,
         pre_write_cause: Option<NotificationPreWriteCause>,
         wake_block: Option<MessageWakeBlock>,
         pre_write_observation: Option<NotificationPreWriteObservation>,
@@ -6571,6 +6626,7 @@ impl MessageStore {
             transport,
             doorbell_format,
             cause,
+            verify_outcome,
             pre_write_cause,
             wake_block,
             pre_write_observation: pre_write_observation.map(Box::new),
@@ -8874,7 +8930,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_scheduler_wake_block_survives_replay_and_snapshot() {
+    fn worker_ownership_loss_is_journaled_and_live_projection_equals_replay() {
         let scratch = StoreScratch::new("scheduler-wake-block-replay");
         let root = scratch.root();
         let journal = Path::new("workspaces/current/messages.ndjson");
@@ -8914,9 +8970,17 @@ mod tests {
             service.notification_schedule_block(bob).unwrap(),
             Some(MessageWakeBlock::WorkerSupervisorExited)
         );
+        let live_record = service
+            .store()
+            .unwrap()
+            .projection()
+            .notification(bob, &accepted.message_id)
+            .cloned()
+            .unwrap();
         let snapshot = service.messages_snapshot(service.admin().key, 10).unwrap();
+        let live_summary = snapshot.rows[0].recipients[0].notification.clone();
         assert_eq!(
-            snapshot.rows[0].recipients[0].notification.wake_block,
+            live_summary.wake_block,
             Some(MessageWakeBlock::WorkerSupervisorExited)
         );
 
@@ -8928,7 +8992,16 @@ mod tests {
             service.notification_schedule_block(bob).unwrap(),
             Some(MessageWakeBlock::WorkerSupervisorExited)
         );
+        let replayed_record = service
+            .store()
+            .unwrap()
+            .projection()
+            .notification(bob, &accepted.message_id)
+            .cloned()
+            .unwrap();
+        assert_eq!(replayed_record, live_record);
         let snapshot = service.messages_snapshot(service.admin().key, 10).unwrap();
+        assert_eq!(snapshot.rows[0].recipients[0].notification, live_summary);
         assert_eq!(
             snapshot.rows[0].recipients[0].notification.wake_block,
             Some(MessageWakeBlock::WorkerSupervisorExited)
@@ -10589,6 +10662,7 @@ mod tests {
                     transport: None,
                     doorbell_format: None,
                     cause: None,
+                    verify_outcome: None,
                     pre_write_cause: None,
                     wake_block: None,
                     pre_write_observation: None,
@@ -14749,10 +14823,31 @@ mod tests {
             alarms[0].cause,
             Some(NotificationAttentionCause::VerifyFailed)
         );
+        assert_eq!(
+            alarms[0].verify_outcome,
+            Some(NotificationVerifyOutcome::ambiguous())
+        );
         assert_eq!(alarms[1].message_id, submit);
         assert_eq!(
             alarms[1].cause,
             Some(NotificationAttentionCause::SubmitFailed)
+        );
+        assert_eq!(alarms[1].verify_outcome, None);
+
+        let snapshot = reopened
+            .projection()
+            .messages_snapshot(admin, 10, &HashMap::new())
+            .unwrap();
+        let verify_summary = &snapshot
+            .rows
+            .iter()
+            .find(|row| row.message_id == verify)
+            .unwrap()
+            .recipients[0]
+            .notification;
+        assert_eq!(
+            verify_summary.verify_outcome,
+            Some(NotificationVerifyOutcome::ambiguous())
         );
     }
 
@@ -16488,6 +16583,7 @@ mod tests {
                     transport: None,
                     doorbell_format: None,
                     cause: None,
+                    verify_outcome: None,
                     pre_write_cause: None,
                     wake_block: None,
                     pre_write_observation: None,

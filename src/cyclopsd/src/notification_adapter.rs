@@ -434,6 +434,40 @@ impl NotificationContext {
         self.record_terminal(NotificationState::AttentionRequired, Some(cause))
     }
 
+    /// Record a verification alarm with the exact content-free evidence class.
+    pub(crate) fn record_verify_attention(
+        &self,
+        outcome: cyclops_proto::NotificationVerifyOutcome,
+    ) -> Result<NotificationRecord, NotificationAdapterError> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| NotificationAdapterError::StoreLockPoisoned)?;
+        if let Some(current) = store
+            .projection()
+            .notification(self.recipient, &self.message_id)
+            .cloned()
+        {
+            if !self.owns(&current) {
+                return Err(NotificationAdapterError::TerminalConflict(current.state));
+            }
+            if current.state == NotificationState::AttentionRequired {
+                return Ok(current);
+            }
+            if current.state.is_terminal() {
+                return Err(NotificationAdapterError::TerminalConflict(current.state));
+            }
+        }
+        let record = store.advance_notification_with_verify_outcome(
+            self.message_id.clone(),
+            self.recipient,
+            self.attempt_id,
+            outcome,
+        )?;
+        self.publish_transition(&record);
+        Ok(record)
+    }
+
     /// Stop this exact attempt after proving that no terminal write occurred.
     pub(crate) fn record_pre_write_block(
         &self,

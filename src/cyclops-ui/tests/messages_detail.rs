@@ -854,6 +854,7 @@ mod through_the_app {
             operator_withdrawn: None,
             attempt_id: alarmed.then(|| attempt(n)),
             cause: alarmed.then_some(NotificationAttentionCause::VerifyFailed),
+            verify_outcome: None,
             pre_write_cause: None,
             pre_write_pane_width: None,
             pre_write_required_pane_width: None,

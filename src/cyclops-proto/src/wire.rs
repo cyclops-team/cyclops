@@ -981,6 +981,9 @@ pub struct MessageNotificationSummary {
     pub attempt_id: Option<crate::notification::NotificationAttemptId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<crate::notification::NotificationAttentionCause>,
+    /// Content-free detail recorded with a `verify_failed` transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_outcome: Option<crate::notification::NotificationVerifyOutcome>,
     /// Exact reason an attempt stopped before any terminal write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_write_cause: Option<crate::notification::NotificationPreWriteCause>,
@@ -1283,6 +1286,12 @@ pub struct AttentionShowResult {
     pub message_id: crate::mailbox::MessageId,
     pub recipient: crate::identity::RecipientKey,
     pub checks: AttentionChecks,
+    /// Verification evidence captured when this attempt entered attention.
+    ///
+    /// Missing values identify legacy attempts. Current composer checks remain
+    /// separate because they describe the pane at inspection time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_outcome: Option<crate::notification::NotificationVerifyOutcome>,
     /// Present only for an explicit diff request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected: Option<String>,
@@ -1895,6 +1904,7 @@ mod tests {
                 operator_withdrawn: None,
                 attempt_id: None,
                 cause: None,
+                verify_outcome: None,
                 pre_write_cause: None,
                 pre_write_pane_width: None,
                 pre_write_required_pane_width: None,
@@ -1975,6 +1985,10 @@ mod tests {
             operator_withdrawn: None,
             attempt_id: None,
             cause: Some(crate::NotificationAttentionCause::VerifyFailed),
+            verify_outcome: Some(crate::NotificationVerifyOutcome {
+                kind: crate::NotificationVerifyFailureKind::Mismatch,
+                observed_composer: crate::ComposerState::ComposerAmbiguous,
+            }),
             pre_write_cause: None,
             pre_write_pane_width: None,
             pre_write_required_pane_width: None,
@@ -1989,6 +2003,7 @@ mod tests {
         assert!(unresolved_wire.get("resolution").is_none());
         let decoded: MessageNotificationSummary = serde_json::from_value(unresolved_wire).unwrap();
         assert_eq!(decoded.resolution, None);
+        assert_eq!(decoded.verify_outcome, unresolved.verify_outcome);
 
         let resolved = MessageNotificationSummary {
             resolution: Some(crate::NotificationResolution::Discard),
@@ -2063,6 +2078,7 @@ mod tests {
                 operator_withdrawn: None,
                 attempt_id: None,
                 cause: None,
+                verify_outcome: None,
                 pre_write_cause: None,
                 pre_write_pane_width: None,
                 pre_write_required_pane_width: None,
@@ -2087,6 +2103,7 @@ mod tests {
         let current: MessageNotificationSummary = serde_json::from_value(old_wire).unwrap();
         assert_eq!(current.quota_state, None);
         assert_eq!(current.settlement, None);
+        assert_eq!(current.verify_outcome, None);
     }
 
     #[test]
@@ -2099,6 +2116,7 @@ mod tests {
             operator_withdrawn: None,
             attempt_id: None,
             cause: Some(crate::NotificationAttentionCause::VerifyFailed),
+            verify_outcome: None,
             pre_write_cause: None,
             pre_write_pane_width: None,
             pre_write_required_pane_width: None,
@@ -2188,6 +2206,7 @@ mod tests {
                 operator_withdrawn: None,
                 attempt_id: None,
                 cause: None,
+                verify_outcome: None,
                 pre_write_cause: None,
                 pre_write_pane_width: None,
                 pre_write_required_pane_width: None,
@@ -2240,6 +2259,7 @@ mod tests {
                 manifest_matches: true,
                 terminal_action_safe: true,
             },
+            verify_outcome: None,
             expected: None,
             observed: None,
         };
@@ -2249,7 +2269,14 @@ mod tests {
         assert!(value.get("observed").is_none());
         assert!(base.checks.all_pass());
 
+        let legacy: AttentionShowResult = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(legacy.verify_outcome, None);
+
         let with_diff = AttentionShowResult {
+            verify_outcome: Some(crate::NotificationVerifyOutcome {
+                kind: crate::NotificationVerifyFailureKind::Timeout,
+                observed_composer: crate::ComposerState::ComposerAmbiguous,
+            }),
             expected: Some("expected bytes".into()),
             observed: Some("observed bytes".into()),
             ..base
@@ -2257,6 +2284,7 @@ mod tests {
         let value = serde_json::to_value(&with_diff).unwrap();
         assert_eq!(value["expected"], "expected bytes");
         assert_eq!(value["observed"], "observed bytes");
+        assert_eq!(value["verify_outcome"]["kind"], "timeout");
         assert!(value.get("diff").is_none());
     }
 }

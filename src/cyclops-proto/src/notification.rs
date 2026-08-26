@@ -9,7 +9,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
-use crate::{MessageId, ProcessInstanceId, RecipientKey};
+use crate::{ComposerState, MessageId, ProcessInstanceId, RecipientKey};
 
 /// Errors returned by validated notification identifiers.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -339,6 +339,40 @@ pub enum NotificationAttentionCause {
     TransportOutcomeUnknown,
 }
 
+/// Closed reason an exact post-write composer verification failed.
+///
+/// The journal records classification only. Captured terminal bytes remain
+/// local to the verifier and never enter durable state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationVerifyFailureKind {
+    /// The composer exposed content that did not equal the staged doorbell.
+    Mismatch,
+    /// No usable capture arrived during the bounded verification window.
+    Timeout,
+    /// The expected Cyclops-owned content was no longer present.
+    OwnerMissing,
+    /// Available evidence could not assign one exact failure class.
+    Ambiguous,
+}
+
+/// Content-free observation attached to a `verify_failed` transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationVerifyOutcome {
+    pub kind: NotificationVerifyFailureKind,
+    pub observed_composer: ComposerState,
+}
+
+impl NotificationVerifyOutcome {
+    /// Conservative fallback for callers that know only that verification failed.
+    pub const fn ambiguous() -> Self {
+        Self {
+            kind: NotificationVerifyFailureKind::Ambiguous,
+            observed_composer: ComposerState::ComposerAmbiguous,
+        }
+    }
+}
+
 /// Operator decision for one staged notification attempt.
 ///
 /// The journal stores only this closed decision and the attempt identity.
@@ -516,6 +550,11 @@ pub struct NotificationRecord {
     pub doorbell_format: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cause: Option<NotificationAttentionCause>,
+    /// Closed, content-free detail for a `verify_failed` transition.
+    ///
+    /// Older journal rows omit this field and replay with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_outcome: Option<NotificationVerifyOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_write_cause: Option<NotificationPreWriteCause>,
     /// Exact scheduler outcome that left this attempt without a live owner.
@@ -606,6 +645,9 @@ pub enum NotificationFact {
         doorbell_format: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         cause: Option<NotificationAttentionCause>,
+        /// Present only when `cause` is `verify_failed`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verify_outcome: Option<NotificationVerifyOutcome>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pre_write_cause: Option<NotificationPreWriteCause>,
         /// Exact scheduler outcome for a pre-write block.
@@ -1078,6 +1120,7 @@ mod tests {
             transport: NotificationTransport::DirectPayload,
             doorbell_format: None,
             cause: None,
+            verify_outcome: None,
             pre_write_cause: None,
             wake_block: None,
             pre_write_observation: None,
@@ -1240,6 +1283,7 @@ mod tests {
             transport: NotificationTransport::Doorbell,
             doorbell_format: Some(DOORBELL_FORMAT_ATTEMPT_CLAIM),
             cause: Some(NotificationAttentionCause::AckTimeout),
+            verify_outcome: None,
             pre_write_cause: None,
             wake_block: None,
             pre_write_observation: None,
@@ -1446,6 +1490,7 @@ mod tests {
             decoded,
             NotificationFact::NotificationTransition {
                 doorbell_format: None,
+                verify_outcome: None,
                 ..
             }
         ));
@@ -1460,6 +1505,7 @@ mod tests {
             transport: Some(NotificationTransport::Doorbell),
             doorbell_format: Some(DOORBELL_FORMAT_ATTEMPT_CLAIM),
             cause: None,
+            verify_outcome: None,
             pre_write_cause: None,
             wake_block: None,
             pre_write_observation: None,
@@ -1492,6 +1538,7 @@ mod tests {
             transport: None,
             doorbell_format: None,
             cause: None,
+            verify_outcome: None,
             pre_write_cause: Some(NotificationPreWriteCause::WriteReadinessChanged),
             wake_block: None,
             pre_write_observation: Some(Box::new(NotificationPreWriteObservation {

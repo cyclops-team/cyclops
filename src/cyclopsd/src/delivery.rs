@@ -36,12 +36,13 @@ use cyclops_manifest::{
     mailbox_capability, strip_csi, AckEvidence, Manifest, UnstyledComposerProof,
 };
 use cyclops_proto::{
-    AgentState, ComposerSemantic, Delivery, DeliveryReceipt, DeliveryState, Detection, Event, Kind,
-    LedgerLine, MessageId, MsgSendParams, MsgSendResult, NotificationAttemptId,
-    NotificationAttentionCause, NotificationBinding, NotificationManifestId,
+    AgentState, ComposerSemantic, ComposerState, Delivery, DeliveryReceipt, DeliveryState,
+    Detection, Event, Kind, LedgerLine, MessageId, MsgSendParams, MsgSendResult,
+    NotificationAttemptId, NotificationAttentionCause, NotificationBinding, NotificationManifestId,
     NotificationPreWriteCause, NotificationPreWriteObservation, NotificationRecord,
-    NotificationState, NotificationTransport, NotifyLevel, ProcessInstanceId, QuiesceResult,
-    RecipientKey, Sensor, StatusDiagnostic, VerifiedBy, WaitUntil, WireError,
+    NotificationState, NotificationTransport, NotificationVerifyFailureKind,
+    NotificationVerifyOutcome, NotifyLevel, ProcessInstanceId, QuiesceResult, RecipientKey, Sensor,
+    StatusDiagnostic, VerifiedBy, WaitUntil, WireError,
 };
 use cyclops_tmux::{ControlClient, PaneEvent, PaneRow, SessionWatcher};
 use serde_json::{json, Value};
@@ -3552,6 +3553,7 @@ struct AttemptFailure {
     cause: String,
     boundary: WriteBoundary,
     pre_write_block: Option<Box<PreWriteBlock>>,
+    verify_outcome: Option<NotificationVerifyOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3569,6 +3571,7 @@ impl AttemptFailure {
                 cause: block,
                 observation: None,
             })),
+            verify_outcome: None,
         }
     }
 
@@ -3608,6 +3611,7 @@ impl AttemptFailure {
                 cause: NotificationPreWriteCause::BindingUnprovable,
                 observation,
             })),
+            verify_outcome: None,
         }
     }
 
@@ -3620,6 +3624,7 @@ impl AttemptFailure {
                 cause: NotificationPreWriteCause::WriteReadinessChanged,
                 observation: Some(observation),
             })),
+            verify_outcome: None,
         }
     }
 
@@ -3650,6 +3655,7 @@ impl AttemptFailure {
             cause: "barrier_held".into(),
             boundary: WriteBoundary::BeforeWrite,
             pre_write_block: None,
+            verify_outcome: None,
         }
     }
 
@@ -3662,15 +3668,42 @@ impl AttemptFailure {
             cause: "paste_failed".into(),
             boundary: WriteBoundary::AfterWrite,
             pre_write_block: None,
+            verify_outcome: None,
         }
     }
 
     fn verify_failed() -> Self {
+        Self::verify_failed_with(NotificationVerifyOutcome::ambiguous())
+    }
+
+    fn verify_failed_with(verify_outcome: NotificationVerifyOutcome) -> Self {
         Self {
             cause: "verify_failed".into(),
             boundary: WriteBoundary::AfterWrite,
             pre_write_block: None,
+            verify_outcome: Some(verify_outcome),
         }
+    }
+
+    fn verify_timeout() -> Self {
+        Self::verify_failed_with(NotificationVerifyOutcome {
+            kind: NotificationVerifyFailureKind::Timeout,
+            observed_composer: ComposerState::ComposerAmbiguous,
+        })
+    }
+
+    fn verify_mismatch(observed_composer: ComposerState) -> Self {
+        Self::verify_failed_with(NotificationVerifyOutcome {
+            kind: NotificationVerifyFailureKind::Mismatch,
+            observed_composer,
+        })
+    }
+
+    fn verify_owner_missing(observed_composer: ComposerState) -> Self {
+        Self::verify_failed_with(NotificationVerifyOutcome {
+            kind: NotificationVerifyFailureKind::OwnerMissing,
+            observed_composer,
+        })
     }
 
     fn pane_rebound_after_paste() -> Self {
@@ -3678,6 +3711,7 @@ impl AttemptFailure {
             cause: "pane_rebound_after_paste".into(),
             boundary: WriteBoundary::AfterWrite,
             pre_write_block: None,
+            verify_outcome: None,
         }
     }
 
@@ -3686,6 +3720,7 @@ impl AttemptFailure {
             cause: "submit_failed".into(),
             boundary: WriteBoundary::AfterWrite,
             pre_write_block: None,
+            verify_outcome: None,
         }
     }
 
@@ -3697,6 +3732,7 @@ impl AttemptFailure {
             cause: "receipt_occupant_changed".into(),
             boundary: WriteBoundary::AfterWrite,
             pre_write_block: None,
+            verify_outcome: None,
         }
     }
 
@@ -3705,6 +3741,7 @@ impl AttemptFailure {
             cause: "ack_timeout".into(),
             boundary: WriteBoundary::AfterWrite,
             pre_write_block: None,
+            verify_outcome: None,
         }
     }
 
@@ -3715,6 +3752,7 @@ impl AttemptFailure {
             cause: NOTIFICATION_RECORD_FAILED.into(),
             boundary: WriteBoundary::AfterWrite,
             pre_write_block: None,
+            verify_outcome: None,
         }
     }
 
@@ -3723,6 +3761,7 @@ impl AttemptFailure {
             cause: CLAIMED_STAGED_SETTLEMENT_FAILED.into(),
             boundary: WriteBoundary::AfterWrite,
             pre_write_block: None,
+            verify_outcome: None,
         }
     }
 
@@ -3750,6 +3789,7 @@ impl AttemptFailure {
                 cause,
                 boundary: WriteBoundary::BeforeWrite,
                 pre_write_block: None,
+                verify_outcome: None,
             },
             "paste_failed" => Self::paste_failed(),
             "verify_failed" => Self::verify_failed(),
@@ -3758,6 +3798,7 @@ impl AttemptFailure {
                 cause,
                 boundary: WriteBoundary::AfterWrite,
                 pre_write_block: None,
+                verify_outcome: None,
             },
         }
     }
@@ -4114,7 +4155,7 @@ async fn attempt_delivery(
             // Nobody looked, so nobody may press Enter.
             unregister_ack(inner, handle);
             gate_line(inner, handle, "rebound", None, Some("recheck_unobservable"));
-            return AttemptOutcome::Failed(AttemptFailure::verify_failed());
+            return AttemptOutcome::Failed(AttemptFailure::verify_timeout());
         }
     };
     // Not just "something valid is staged": the SAME thing must be staged.
@@ -4130,7 +4171,9 @@ async fn attempt_delivery(
     ) {
         unregister_ack(inner, handle);
         gate_line(inner, handle, "rebound", None, Some("staging_changed"));
-        return AttemptOutcome::Failed(AttemptFailure::verify_failed());
+        return AttemptOutcome::Failed(AttemptFailure::verify_mismatch(
+            ComposerState::ComposerAmbiguous,
+        ));
     }
     // The capture above took time, so the occupant is checked once more
     // after it. Otherwise the last thing proven about who owns the pane is
@@ -4196,7 +4239,9 @@ async fn attempt_delivery(
                         None,
                         Some("staging_changed_after_submit_reservation"),
                     );
-                    return AttemptOutcome::Failed(AttemptFailure::verify_failed());
+                    return AttemptOutcome::Failed(AttemptFailure::verify_mismatch(
+                        ComposerState::ComposerAmbiguous,
+                    ));
                 }
                 if let Err(detail) =
                     notification_staged_action_safe(inner, handle, manifest, &now, &proven)
@@ -4219,7 +4264,7 @@ async fn attempt_delivery(
                     None,
                     Some("reserved_staging_unobservable"),
                 );
-                return AttemptOutcome::Failed(AttemptFailure::verify_failed());
+                return AttemptOutcome::Failed(AttemptFailure::verify_timeout());
             }
         }
     }
@@ -4649,7 +4694,7 @@ async fn reconcile_claimed_notification_barrier<I: Injector>(
     };
     let staged = match injector.capture_joined_escaped(&handle.pane_id).await {
         Ok(screen) => screen,
-        Err(_) => return AttemptOutcome::Failed(AttemptFailure::verify_failed()),
+        Err(_) => return AttemptOutcome::Failed(AttemptFailure::verify_timeout()),
     };
     if proven_binding_unchanged(inner, handle, proven).is_err() {
         return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
@@ -4694,7 +4739,16 @@ async fn reconcile_claimed_notification_barrier<I: Injector>(
             // input is sent again.
         }
         ClaimedStagedAction::Refuse => {
-            return AttemptOutcome::Failed(AttemptFailure::verify_failed());
+            let failure = match composer {
+                ClaimedStagedComposer::Clean => {
+                    AttemptFailure::verify_owner_missing(ComposerState::ComposerClean)
+                }
+                ClaimedStagedComposer::Ambiguous => AttemptFailure::verify_failed(),
+                ClaimedStagedComposer::ExactDoorbell => {
+                    unreachable!("an exact claimed doorbell cannot select the refusal action")
+                }
+            };
+            return AttemptOutcome::Failed(failure);
         }
     }
 
@@ -5108,7 +5162,13 @@ async fn fail_attempt(
         }
         if matches!(failure.boundary, WriteBoundary::AfterWrite) {
             if let Some(notification) = &handle.notification {
-                match notification.record_attention(notification_attention_cause(&failure.cause)) {
+                let result = match failure.verify_outcome {
+                    Some(outcome) => notification.record_verify_attention(outcome),
+                    None => {
+                        notification.record_attention(notification_attention_cause(&failure.cause))
+                    }
+                };
+                match result {
                     Ok(record) => {
                         if record.needs_exact_owned_reconciliation() {
                             crate::attention_resolution::schedule_exact_owned_reconciliation(
@@ -9676,6 +9736,32 @@ mod tests {
         }
         let exhausted = AttemptFailure::spool_failed();
         assert!(!should_retry(&exhausted, 2, 1));
+
+        assert_eq!(
+            AttemptFailure::verify_failed().verify_outcome,
+            Some(NotificationVerifyOutcome::ambiguous())
+        );
+        assert_eq!(
+            AttemptFailure::verify_timeout().verify_outcome,
+            Some(NotificationVerifyOutcome {
+                kind: NotificationVerifyFailureKind::Timeout,
+                observed_composer: ComposerState::ComposerAmbiguous,
+            })
+        );
+        assert_eq!(
+            AttemptFailure::verify_mismatch(ComposerState::HumanDraft).verify_outcome,
+            Some(NotificationVerifyOutcome {
+                kind: NotificationVerifyFailureKind::Mismatch,
+                observed_composer: ComposerState::HumanDraft,
+            })
+        );
+        assert_eq!(
+            AttemptFailure::verify_owner_missing(ComposerState::ComposerClean).verify_outcome,
+            Some(NotificationVerifyOutcome {
+                kind: NotificationVerifyFailureKind::OwnerMissing,
+                observed_composer: ComposerState::ComposerClean,
+            })
+        );
 
         let pane_too_narrow = AttemptFailure::pane_too_narrow(NotificationPreWriteObservation {
             pane_root: Some(ProcessInstanceId::new(1, 1).unwrap()),

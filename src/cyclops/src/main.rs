@@ -2256,6 +2256,16 @@ fn message_recipient_cell(
                 serde_json::to_value(cause).unwrap_or(Value::Null),
             ));
         }
+        if let Some(outcome) = recipient.notification.verify_outcome {
+            notification.push_str(":verify=");
+            notification.push_str(&wire_word(
+                serde_json::to_value(outcome.kind).unwrap_or(Value::Null),
+            ));
+            notification.push('/');
+            notification.push_str(&wire_word(
+                serde_json::to_value(outcome.observed_composer).unwrap_or(Value::Null),
+            ));
+        }
         if let Some(cleared) = recipient.notification.attention_cleared {
             notification.push(':');
             notification.push_str(if cleared { "cleared" } else { "open" });
@@ -2651,6 +2661,20 @@ fn print_attention_checks(style: &Style, result: &cyclops_proto::AttentionShowRe
     for (name, passed) in copy::attention_check_rows(&result.checks) {
         println!("  {name}: {}", copy::attention_check_value(passed));
     }
+    if let Some(line) = attention_verify_failure_line(result.verify_outcome) {
+        println!("  {line}");
+    }
+}
+
+fn attention_verify_failure_line(
+    outcome: Option<cyclops_proto::NotificationVerifyOutcome>,
+) -> Option<String> {
+    outcome.map(|outcome| {
+        let kind = wire_word(serde_json::to_value(outcome.kind).unwrap_or(Value::Null));
+        let composer =
+            wire_word(serde_json::to_value(outcome.observed_composer).unwrap_or(Value::Null));
+        format!("verification failure: {kind} · composer {composer}")
+    })
 }
 
 /// Compact line diff computed by the client. The daemon never receives it.
@@ -3196,6 +3220,10 @@ mod tests {
                     operator_withdrawn: None,
                     attempt_id: Some(attempt),
                     cause: Some(cyclops_proto::NotificationAttentionCause::VerifyFailed),
+                    verify_outcome: Some(cyclops_proto::NotificationVerifyOutcome {
+                        kind: cyclops_proto::NotificationVerifyFailureKind::Mismatch,
+                        observed_composer: cyclops_proto::ComposerState::HumanDraft,
+                    }),
                     pre_write_cause: None,
                     pre_write_pane_width: None,
                     pre_write_required_pane_width: None,
@@ -3218,7 +3246,7 @@ mod tests {
         let line = message_snapshot_line("m-1".into(), &row);
         assert_eq!(
             line,
-            "m-1 outbound · work · admin -> reviewer [pending · 1 ahead; needs attention:verify_failed:open att-00000000-0000-4000-8000-000000000001] · Review · thread 3"
+            "m-1 outbound · work · admin -> reviewer [pending · 1 ahead; needs attention:verify_failed:verify=mismatch/human_draft:open att-00000000-0000-4000-8000-000000000001] · Review · thread 3"
         );
         let json = serde_json::to_value(&row).unwrap();
         assert_eq!(json["direction"], "outbound");
@@ -3231,7 +3259,15 @@ mod tests {
             json["recipients"][0]["notification"]["cause"],
             "verify_failed"
         );
+        assert_eq!(
+            json["recipients"][0]["notification"]["verify_outcome"]["kind"],
+            "mismatch"
+        );
         assert!(json.get("body").is_none());
+        assert_eq!(
+            attention_verify_failure_line(row.recipients[0].notification.verify_outcome).as_deref(),
+            Some("verification failure: mismatch · composer human_draft")
+        );
 
         let mut not_started = row.recipients[0].clone();
         not_started.fifo_position = Some(1);
@@ -3243,6 +3279,7 @@ mod tests {
             operator_withdrawn: None,
             attempt_id: None,
             cause: None,
+            verify_outcome: None,
             pre_write_cause: None,
             pre_write_pane_width: None,
             pre_write_required_pane_width: None,
@@ -3268,6 +3305,7 @@ mod tests {
             operator_withdrawn: None,
             attempt_id: Some(attempt),
             cause: None,
+            verify_outcome: None,
             pre_write_cause: None,
             pre_write_pane_width: None,
             pre_write_required_pane_width: None,

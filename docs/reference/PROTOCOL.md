@@ -386,6 +386,13 @@ intent are one mailbox transaction, so a concurrent claim lands wholly before
 or after that boundary. Any changed binding, human or trailing text, modal, or
 unprovable content leaves one attention item and sends no key.
 
+Every current `verify_failed` transition also carries `verify_outcome`. It is
+content-free: a closed failure kind (`mismatch`, `timeout`, `owner_missing`, or
+`ambiguous`) plus the observed composer class. It never contains captured
+terminal bytes. `messages.snapshot` and `attention.show` expose the same
+durable outcome. Older journal rows and older peers omit it and decode as an
+unknown legacy outcome.
+
 A `blocked_pre_write` transition may carry `wake_block`, the exact closed
 scheduler outcome that left the attempt without a live owner. The projection
 retains it across replay and exposes it on
