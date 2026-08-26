@@ -7,8 +7,8 @@ use std::time::Duration;
 use cyclops_proto::{
     DeliveryReceipt, DeliveryState, MessageId, MessageWakeBlock, MsgSendParams, MsgSendResult,
     NotificationAttemptId, NotificationBinding, NotificationManifestId, NotificationPreWriteCause,
-    NotificationPreWriteObservation, NotificationState, NotificationWithdrawDisposition,
-    NotificationWithdrawResult, ProcessInstanceId, RecipientKey,
+    NotificationPreWriteObservation, NotificationRouteEvidenceId, NotificationState,
+    NotificationWithdrawDisposition, NotificationWithdrawResult, ProcessInstanceId, RecipientKey,
 };
 use cyclops_tmux::{PaneRow, SessionWatcher};
 use tokio::time::Instant;
@@ -139,6 +139,7 @@ fn proven_binding_observation(
     inner: &Inner,
     recipient: RecipientKey,
     route: &NotificationRoute,
+    route_evidence: &NotificationRouteEvidenceId,
 ) -> Option<NotificationPreWriteObservation> {
     let Some(pane_root) =
         crate::identity::ProcId::of(route.row.pane_pid).and_then(process_instance)
@@ -186,6 +187,7 @@ fn proven_binding_observation(
             agent: process_instance(binding.agent)?,
             manifest: NotificationManifestId::new(binding.manifest).ok()?,
         }),
+        route_evidence: Some(route_evidence.clone()),
         pane_width: Some(route.row.width),
         required_pane_width: None,
     })
@@ -406,11 +408,16 @@ fn prepare_recipient_after_route_evidence(
     inner: &Arc<Inner>,
     service: &Arc<MailboxService>,
     recipient: RecipientKey,
+    route_evidence: &NotificationRouteEvidenceId,
 ) -> Result<Option<(NotificationRoute, cyclops_proto::NotificationRecord)>, MailboxServiceError> {
     let Some(route) = notification_route(inner, service, recipient)? else {
         return Ok(None);
     };
-    let Some(observation) = proven_binding_observation(inner, recipient, &route) else {
+    if inner.route_evidence_id(route.session_idx, &route.pane_id) != *route_evidence {
+        return Ok(None);
+    }
+    let Some(observation) = proven_binding_observation(inner, recipient, &route, route_evidence)
+    else {
         return Ok(None);
     };
     let write_ready = route_is_write_ready(inner, &route, &observation);
@@ -421,10 +428,13 @@ fn prepare_recipient_after_route_evidence(
     {
         return Ok(None);
     }
-    let Some(confirmed) = proven_binding_observation(inner, recipient, &confirmed_route) else {
+    let Some(confirmed) =
+        proven_binding_observation(inner, recipient, &confirmed_route, route_evidence)
+    else {
         return Ok(None);
     };
     if confirmed != observation
+        || inner.route_evidence_id(route.session_idx, &route.pane_id) != *route_evidence
         || route_is_write_ready(inner, &confirmed_route, &confirmed) != write_ready
     {
         return Ok(None);
@@ -444,13 +454,14 @@ fn schedule_recipient_after_route_evidence(
     inner: &Arc<Inner>,
     service: &Arc<MailboxService>,
     recipient: RecipientKey,
+    route_evidence: &NotificationRouteEvidenceId,
 ) -> Result<(), MailboxServiceError> {
     let prepared = {
         let _publication = inner
             .mailbox_publication
             .lock()
             .expect("mailbox publication lock");
-        prepare_recipient_after_route_evidence(inner, service, recipient)?
+        prepare_recipient_after_route_evidence(inner, service, recipient, route_evidence)?
     };
     if let Some((route, record)) = prepared {
         enqueue_prepared_notification(inner, service, recipient, route, record, true)?;
@@ -458,8 +469,35 @@ fn schedule_recipient_after_route_evidence(
     Ok(())
 }
 
-/// Reconcile one pane after its route, process, or readiness evidence changed.
-pub(crate) fn schedule_route_changed(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) {
+/// Reconcile one pane under the token minted by its causal event source.
+pub(crate) fn schedule_route_evidence(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    pane_id: &str,
+    route_evidence: &NotificationRouteEvidenceId,
+) {
+    if inner.route_evidence_id(session_idx, pane_id) != *route_evidence {
+        return;
+    }
+    schedule_route_reconciliation_with_evidence(inner, session_idx, pane_id, route_evidence);
+}
+
+/// Reconcile current route state without inventing a new evidence edge.
+///
+/// Delivery uses this after a durable pre-write block so an edge that raced
+/// ahead of the append is not lost. If no such edge occurred, the durable and
+/// live observations retain the same identity and the pass is a no-op.
+pub(crate) fn schedule_route_reconciliation(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) {
+    let route_evidence = inner.route_evidence_id(session_idx, pane_id);
+    schedule_route_reconciliation_with_evidence(inner, session_idx, pane_id, &route_evidence);
+}
+
+fn schedule_route_reconciliation_with_evidence(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    pane_id: &str,
+    route_evidence: &NotificationRouteEvidenceId,
+) {
     let Some(service) = inner.mailbox.as_ref() else {
         return;
     };
@@ -469,7 +507,9 @@ pub(crate) fn schedule_route_changed(inner: &Arc<Inner>, session_idx: usize, pan
     if let Err(error) = schedule_recipient(inner, service, recipient) {
         error!(%recipient, %error, "cannot schedule mailbox notification for changed route");
     }
-    if let Err(error) = schedule_recipient_after_route_evidence(inner, service, recipient) {
+    if let Err(error) =
+        schedule_recipient_after_route_evidence(inner, service, recipient, route_evidence)
+    {
         error!(%recipient, %error, "cannot reopen blocked mailbox notification");
     }
     crate::attention_resolution::schedule_exact_owned_reconciliation(inner, recipient);
@@ -479,7 +519,12 @@ pub(crate) fn schedule_route_changed(inner: &Arc<Inner>, session_idx: usize, pan
 ///
 /// Size-only events remain irrelevant to normal delivery and state fusion.
 /// Once the exact blocked attempt reopens, later size events are no-ops.
-pub(crate) fn schedule_pane_size_changed(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) {
+pub(crate) fn schedule_pane_size_changed(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    pane_id: &str,
+    route_evidence: &NotificationRouteEvidenceId,
+) {
     let Some(service) = inner.mailbox.as_ref() else {
         return;
     };
@@ -488,7 +533,9 @@ pub(crate) fn schedule_pane_size_changed(inner: &Arc<Inner>, session_idx: usize,
     };
     match service.oldest_notification_has_width_block(recipient) {
         Ok(true) => {
-            if let Err(error) = schedule_recipient_after_route_evidence(inner, service, recipient) {
+            if let Err(error) =
+                schedule_recipient_after_route_evidence(inner, service, recipient, route_evidence)
+            {
                 error!(%recipient, %error, "cannot reopen width-blocked mailbox notification");
             }
         }

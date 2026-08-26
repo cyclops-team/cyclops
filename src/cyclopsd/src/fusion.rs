@@ -27,8 +27,8 @@ use cyclops_manifest::{
 };
 use cyclops_proto::{
     AgentState, ComposerHold, ComposerProof, ComposerSemantic, ComposerState, Detection,
-    NotificationAttemptId, NotificationAttentionCause, NotificationState, ProcessInstanceId,
-    RecipientKey, Sensor, SensorReading,
+    NotificationAttemptId, NotificationAttentionCause, NotificationRouteEvidenceId,
+    NotificationState, ProcessInstanceId, RecipientKey, Sensor, SensorReading,
 };
 #[cfg(test)]
 use cyclops_proto::{NotificationTransport, DOORBELL_FORMAT_COMPACT_CLAIM};
@@ -1764,7 +1764,7 @@ pub(crate) fn set_hold_owned(
         entry.detection = entry.detection.clone().stamped(entry.in_mode, hold);
         (prior_ready, entry.detection.clone())
     };
-    wake_readiness(inner, session_idx, pane_id, Some(prior_ready), &det);
+    wake_readiness_after_mutation(inner, session_idx, pane_id, prior_ready, &det);
     true
 }
 
@@ -1836,7 +1836,7 @@ pub(crate) fn bind_turn(
         entry.detection = entry.detection.clone().stamped(entry.in_mode, entry.hold);
         (prior_ready, entry.detection.clone(), end_already_present)
     };
-    wake_readiness(inner, session_idx, pane_id, Some(prior_ready), &det);
+    wake_readiness_after_mutation(inner, session_idx, pane_id, prior_ready, &det);
     Some(BoundTurn {
         end_already_present,
     })
@@ -1900,7 +1900,7 @@ pub(crate) fn claim_hold(
         entry.detection = entry.detection.clone().stamped(entry.in_mode, entry.hold);
         (prior_ready, entry.detection.clone())
     };
-    wake_readiness(inner, session_idx, pane_id, Some(prior_ready), &det);
+    wake_readiness_after_mutation(inner, session_idx, pane_id, prior_ready, &det);
     true
 }
 
@@ -1938,7 +1938,7 @@ pub(crate) fn release_unwritten_hold(
         entry.detection = entry.detection.clone().stamped(entry.in_mode, entry.hold);
         (prior_ready, entry.detection.clone())
     };
-    wake_readiness(inner, session_idx, pane_id, Some(prior_ready), &det);
+    wake_readiness_after_mutation(inner, session_idx, pane_id, prior_ready, &det);
     true
 }
 
@@ -2040,7 +2040,7 @@ pub(crate) async fn resolve_staged_hold(
         entry.detection = entry.detection.clone().stamped(entry.in_mode, entry.hold);
         (prior_ready, entry.detection.clone())
     };
-    wake_readiness(inner, session_idx, pane_id, Some(prior_ready), &det);
+    wake_readiness_after_mutation(inner, session_idx, pane_id, prior_ready, &det);
     true
 }
 
@@ -2053,16 +2053,16 @@ pub(crate) async fn resolve_staged_hold(
 /// would be a transition that never happened, so this is its own event
 /// and it names no ledger line.
 ///
-/// First sight is not a public readiness change. It still reconciles the
-/// route because process replacement can retire the prior detection before a
-/// delivery records its durable pre-write block. The first clean detection is
-/// then the only positive edge available to reopen that exact attempt.
+/// First sight is not a public readiness change. A caller carrying a causal
+/// token may still reconcile it. Tokenless status, lifecycle, and synthetic
+/// captures are observational only and never create route evidence.
 fn wake_readiness(
     inner: &Arc<Inner>,
     session_idx: usize,
     pane_id: &str,
     prior: Option<(bool, Option<String>)>,
     det: &Detection,
+    route_evidence: Option<&NotificationRouteEvidenceId>,
 ) {
     let now = (det.write_ready, det.write_block.clone());
     let decision = readiness_wake_decision(prior.as_ref(), &now);
@@ -2079,8 +2079,33 @@ fn wake_readiness(
         );
     }
     if decision.reconcile_route {
-        crate::messaging::schedule_route_changed(inner, session_idx, pane_id);
+        if let Some(route_evidence) = route_evidence {
+            crate::messaging::schedule_route_evidence(inner, session_idx, pane_id, route_evidence);
+        }
     }
+}
+
+/// Publish a readiness mutation, minting one token only when it creates a
+/// route-reconciliation edge.
+fn wake_readiness_after_mutation(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    pane_id: &str,
+    prior: (bool, Option<String>),
+    det: &Detection,
+) {
+    let now = (det.write_ready, det.write_block.clone());
+    let route_evidence = readiness_wake_decision(Some(&prior), &now)
+        .reconcile_route
+        .then(|| inner.advance_route_evidence(session_idx, pane_id));
+    wake_readiness(
+        inner,
+        session_idx,
+        pane_id,
+        Some(prior),
+        det,
+        route_evidence.as_ref(),
+    );
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3029,6 +3054,33 @@ pub(crate) async fn recompute_pane(
         force_screen,
         cause,
         None,
+        None,
+    )
+    .await
+}
+
+/// Recompute while reusing one supplied route-evidence token.
+///
+/// Causal event sources mint the token before entering. Synthetic
+/// reconciliation supplies the current token so it cannot create an edge.
+pub(crate) async fn recompute_pane_for_route_evidence(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    watcher: &SessionWatcher,
+    pane_id: &str,
+    force_screen: bool,
+    cause: &str,
+    route_evidence: &NotificationRouteEvidenceId,
+) -> Option<Detection> {
+    recompute_pane_with_evidence(
+        inner,
+        session_idx,
+        watcher,
+        pane_id,
+        force_screen,
+        cause,
+        None,
+        Some(route_evidence),
     )
     .await
 }
@@ -3044,6 +3096,7 @@ pub(crate) async fn recompute_pane_from_output(
     force_screen: bool,
     cause: &str,
     evidence_ms: u64,
+    route_evidence: &NotificationRouteEvidenceId,
 ) -> Option<Detection> {
     recompute_pane_with_evidence(
         inner,
@@ -3053,6 +3106,7 @@ pub(crate) async fn recompute_pane_from_output(
         force_screen,
         cause,
         Some(evidence_ms),
+        Some(route_evidence),
     )
     .await
 }
@@ -3065,6 +3119,7 @@ async fn recompute_pane_with_evidence(
     force_screen: bool,
     cause: &str,
     source_evidence_ms: Option<u64>,
+    route_evidence: Option<&NotificationRouteEvidenceId>,
 ) -> Option<Detection> {
     let route = PaneKey::new(session_idx, pane_id);
     let prior_working_confirmed = cached_working_confirmed(inner, session_idx, pane_id);
@@ -3324,7 +3379,14 @@ async fn recompute_pane_with_evidence(
         }
         // Entering a mode refuses a write without touching the runtime
         // state, so this is the wake that has no state edge behind it.
-        wake_readiness(inner, session_idx, pane_id, prior_ready, &det);
+        wake_readiness(
+            inner,
+            session_idx,
+            pane_id,
+            prior_ready,
+            &det,
+            route_evidence,
+        );
         if !is_candidate_recheck_cause(cause) {
             schedule_lifecycle_recheck(inner, &route);
         }
@@ -3377,7 +3439,14 @@ async fn recompute_pane_with_evidence(
                         // was write-ready and is now refused on stale
                         // evidence has to wake whoever was gating on the
                         // old answer.
-                        wake_readiness(inner, session_idx, pane_id, prior_ready, &p);
+                        wake_readiness(
+                            inner,
+                            session_idx,
+                            pane_id,
+                            prior_ready,
+                            &p,
+                            route_evidence,
+                        );
                         if !is_candidate_recheck_cause(cause) {
                             schedule_lifecycle_recheck(inner, &route);
                         }
@@ -3880,7 +3949,14 @@ async fn recompute_pane_with_evidence(
     // a delivery sleeping on `not_write_ready:composer_hold` would sleep
     // through its own release. This wake is broadcast only. It is not a
     // state transition and must never be written to the ledger as one.
-    wake_readiness(inner, session_idx, pane_id, prior_ready, &detection);
+    wake_readiness(
+        inner,
+        session_idx,
+        pane_id,
+        prior_ready,
+        &detection,
+        route_evidence,
+    );
     if probe_quota_reset {
         crate::delivery::observe_quota_reset(inner, session_idx, pane_id);
     }
@@ -4124,6 +4200,22 @@ line_regex = ['^ACTIVE']
                 reconcile_route: true,
             }
         );
+    }
+
+    #[test]
+    fn tokenless_readiness_is_observational_and_a_mutation_mints_once() {
+        let inner = inner_with(BTreeMap::new());
+        let pane_id = "%1";
+        let mut ready = quota_detection(Sensor::Screen, AgentState::Idle);
+        ready.write_ready = true;
+        let held = (false, Some("composer_hold".to_string()));
+        let initial = inner.route_evidence_id(0, pane_id);
+
+        wake_readiness(&inner, 0, pane_id, Some(held.clone()), &ready, None);
+        assert_eq!(inner.route_evidence_id(0, pane_id), initial);
+
+        wake_readiness_after_mutation(&inner, 0, pane_id, held, &ready);
+        assert_eq!(inner.route_evidence_id(0, pane_id).generation, 1);
     }
 
     #[test]
@@ -7829,6 +7921,7 @@ regex = ['^IDLE']
             session_registration: StdMutex::new(()),
             events: tokio::sync::broadcast::channel(16).0,
             detections: StdMutex::new(HashMap::new()),
+            route_evidence_generations: StdMutex::new(HashMap::new()),
             pane_recomputes: StdMutex::new(HashMap::new()),
             lifecycle_rechecks: StdMutex::new(HashMap::new()),
             registry: StdMutex::new(registry),
@@ -7842,6 +7935,7 @@ regex = ['^IDLE']
             hook_liveness: crate::selftest::HookLiveness::new(),
             inject_pause: StdMutex::new(None),
             fail_chrome_restore: std::sync::atomic::AtomicBool::new(false),
+            fail_next_final_binding_observation: std::sync::atomic::AtomicBool::new(false),
             workspace_ui: StdMutex::new(crate::workspace_ui::WorkspaceUiState::default()),
             shutdown_request: tokio::sync::watch::channel(false).0,
             stop,

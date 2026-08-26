@@ -307,6 +307,14 @@ impl NotificationPreWriteCause {
 /// A later scheduler compares this stamp with a fresh observation. The same
 /// stamp cannot reopen the attempt and produce another identical retry chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationRouteEvidenceId {
+    /// Daemon run that observed this route evidence.
+    pub boot_id: String,
+    /// Pane-local causal observation generation within the daemon run.
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotificationPreWriteObservation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_root: Option<ProcessInstanceId>,
@@ -317,12 +325,22 @@ pub struct NotificationPreWriteObservation {
     /// even when the pane process generation does not change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_manifest: Option<NotificationManifestId>,
-    /// The complete binding observed at the write boundary.
+    /// The last complete binding observed during the attempt's pre-write proof.
     ///
-    /// None is a failed proof. A binding is kept whole so the journal cannot
-    /// represent a partially proven leader, agent, or manifest as authority.
+    /// A failed terminal lookup retains an earlier admitted binding when one
+    /// exists. That baseline lets a later scheduler distinguish the unchanged
+    /// occupant from a real process edge. None means no complete binding was
+    /// observed. A binding is kept whole so the journal cannot represent a
+    /// partially proven leader, agent, or manifest as authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding: Option<NotificationBinding>,
+    /// Identity of the causal route observation behind this proof.
+    ///
+    /// Synthetic reconciliation reuses the current identity. A watcher,
+    /// process, adoption, or readiness edge advances it, including when the
+    /// resulting complete process binding is identical to the prior proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_evidence: Option<NotificationRouteEvidenceId>,
     /// Pane width observed without storing any terminal content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_width: Option<u32>,
@@ -1111,6 +1129,7 @@ mod tests {
         .unwrap();
         assert_eq!(prior.pane_width, Some(59));
         assert_eq!(prior.required_pane_width, None);
+        assert_eq!(prior.route_evidence, None);
     }
 
     #[test]
@@ -1558,6 +1577,10 @@ mod tests {
                 pane_root: None,
                 selected_manifest: None,
                 binding: None,
+                route_evidence: Some(NotificationRouteEvidenceId {
+                    boot_id: "boot-route".into(),
+                    generation: 9,
+                }),
                 pane_width: Some(59),
                 required_pane_width: Some(60),
             })),
@@ -1566,7 +1589,11 @@ mod tests {
         let encoded = serde_json::to_value(&fact).unwrap();
         assert_eq!(
             encoded["pre_write_observation"],
-            serde_json::json!({"pane_width": 59, "required_pane_width": 60})
+            serde_json::json!({
+                "route_evidence": {"boot_id": "boot-route", "generation": 9},
+                "pane_width": 59,
+                "required_pane_width": 60
+            })
         );
         let decoded: NotificationFact = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, fact);

@@ -298,8 +298,25 @@ A durable resolution intent projects `attention_resolution_pending` into the
 same receipt field until that exact attempt settles; it is not inferred from the
 notification state.
 An exact positive route and composer-readiness observation may reopen the same
-attempt once. The cached verdict must carry the same pane-root, foreground
-leader, agent process generation, and manifest as the fresh route proof.
+attempt once. Each durable pre-write observation carries the daemon boot and a
+pane-local causal evidence generation. Watcher, process, and adoption sources
+advance that identity exactly once before recompute. Standalone readiness
+mutations advance it only when the tuple changes. Readiness scheduling inside a
+source recompute and every follow-on schedule reuse the same identity. This
+includes a `CurrentCommand` edge when an exec-in-place changes the foreground
+command or selected manifest without changing the pane root or readiness tuple.
+Tokenless lifecycle, status, and inspection recomputes may publish a readiness
+change, but they neither advance route evidence nor reconcile delivery.
+The immediate post-append reconciliation also reuses the current identity, so
+unchanged evidence is a no-op while an edge that raced ahead of the append is not
+lost. A later generation may reopen even when its complete process binding is
+identical. The cached verdict must still carry the same pane-root,
+foreground leader, agent process generation, and manifest as the fresh route
+proof. A non-width readiness block additionally requires a positive write-ready
+verdict under a strictly later token. When that block has no binding or width
+observation, it still records the current route token as a comparison baseline
+without treating the token as binding proof. Width recovery requires an actual
+width change across the recorded minimum.
 
 A workspace administrator may also withdraw the exact current attempt while it
 is `queued` or `gating`. Those states and `blocked_pre_write` are all durably

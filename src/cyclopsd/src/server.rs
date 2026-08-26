@@ -2796,6 +2796,7 @@ mod tests {
             session_registration: StdMutex::new(()),
             events: broadcast::channel(16).0,
             detections: StdMutex::new(HashMap::<crate::PaneKey, DetEntry>::new()),
+            route_evidence_generations: StdMutex::new(HashMap::new()),
             pane_recomputes: StdMutex::new(HashMap::new()),
             lifecycle_rechecks: StdMutex::new(HashMap::new()),
             registry: StdMutex::new(registry),
@@ -2809,6 +2810,7 @@ mod tests {
             hook_liveness: crate::selftest::HookLiveness::new(),
             inject_pause: StdMutex::new(None),
             fail_chrome_restore: std::sync::atomic::AtomicBool::new(false),
+            fail_next_final_binding_observation: std::sync::atomic::AtomicBool::new(false),
             workspace_ui: StdMutex::new(crate::workspace_ui::WorkspaceUiState::default()),
             shutdown_request: watch::channel(false).0,
             // No production sender behind this in tests: nothing here
@@ -3282,6 +3284,7 @@ mod tests {
                     pane_root: None,
                     selected_manifest: Some(NotificationManifestId::new("codex").unwrap()),
                     binding: None,
+                    route_evidence: None,
                     pane_width: None,
                     required_pane_width: None,
                 }),

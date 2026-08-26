@@ -2104,6 +2104,238 @@ async fn same_route_with_a_new_pane_root_reproves_before_writing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn codex_ghost_binding_failure_reopens_only_after_new_route_evidence() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let manifest = include_str!("../../../resources/manifests/codex.toml").replace(
+        "process_names = [\"codex\"]",
+        "process_names = [\"Python\", \"python3\"]",
+    );
+    let ghost_pane = concat!(
+        r#"python3 -c 'import sys,time; "#,
+        r#"sys.stdout.write("\033[1m\033[38;2;255;178;66m›\033[0m "#,
+        r#"\033[2mSummarize recent commits\033[0m"); "#,
+        r#"sys.stdout.flush(); time.sleep(3600)'"#,
+    );
+    let mut rig = Rig::new("codex-final-binding-unprovable", &manifest, ghost_pane, "").await;
+    let pane = rig.pane_ids().await[0].clone();
+    let named = rig
+        .ctl
+        .request(
+            "pane.label",
+            json!({"target": pane, "label": "worker", "manifest": "codex"}),
+        )
+        .await;
+    assert_eq!(named["result"]["label"], "worker", "{named}");
+    assert_eq!(named["result"]["manifest"], "codex", "{named}");
+    wait_pane_state(&mut rig, "idle").await;
+
+    // The OS observation used for the final write-boundary binding proof is
+    // an external boundary. Fail that one observation after the real screen
+    // capture has admitted the measured Codex ghost suggestion.
+    rig.daemon.fail_next_final_binding_observation();
+    let sent = send_workspace_message(
+        &rig,
+        "codex-final-binding-unprovable",
+        "Final binding",
+        "private body",
+    )
+    .await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::BlockedPreWrite).await;
+
+    let gate_trace: Vec<String> = rig
+        .ledger_lines()
+        .iter()
+        .filter(|line| line["kind"] == "gate" && line["id"] == message_id)
+        .map(|line| {
+            format!(
+                "{}:{}:{}",
+                line["data"]["action"].as_str().unwrap_or(""),
+                line["data"]["rule"].as_str().unwrap_or(""),
+                line["data"]["cause"].as_str().unwrap_or("")
+            )
+        })
+        .collect();
+    assert_eq!(
+        gate_trace,
+        vec![
+            "proceed:composer_ghost_suggestion:".to_string(),
+            "rebound::binding_unprovable".to_string(),
+        ]
+    );
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::BlockedPreWrite),
+        1
+    );
+    for state in [
+        NotificationState::Writing,
+        NotificationState::Staged,
+        NotificationState::Submitting,
+        NotificationState::Submitted,
+    ] {
+        assert_eq!(notification_state_count(&rig, &message_id, state), 0);
+    }
+    assert!(!pane_history(&rig, &pane).contains(&compact_doorbell(&rig, &message_id)));
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::Gating),
+        1,
+        "the synthetic post-block reconciliation reopened unchanged evidence"
+    );
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::BlockedPreWrite),
+        1,
+        "elapsed time repeated the terminal block"
+    );
+
+    // A later explicit route observation is causal evidence even when the
+    // proven process binding is unchanged. Reopen the exact attempt once and
+    // fail its terminal observation again so the bounded result stays
+    // inspectable without writing the notification.
+    rig.daemon.fail_next_final_binding_observation();
+    let observed = rig
+        .ctl
+        .request(
+            "pane.label",
+            json!({"target": pane, "label": "worker", "manifest": "codex"}),
+        )
+        .await;
+    assert_eq!(observed["result"]["label"], "worker", "{observed}");
+    let reopened_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if notification_state_count(&rig, &message_id, NotificationState::BlockedPreWrite) >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < reopened_deadline,
+            "new same-binding route evidence did not reopen the attempt: {:#?}",
+            workspace_lines(&rig)
+                .into_iter()
+                .filter(|line| line.id == message_id)
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    for _ in 0..3 {
+        let repeated = rig
+            .ctl
+            .request(
+                "pane.label",
+                json!({"target": pane, "label": "worker", "manifest": "codex"}),
+            )
+            .await;
+        assert_eq!(repeated["result"]["label"], "worker", "{repeated}");
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(notification_attempts(&rig, &message_id).len(), 1);
+    assert_eq!(
+        rig.ledger_lines()
+            .iter()
+            .filter(|line| line["kind"] == "gate" && line["id"] == message_id)
+            .count(),
+        gate_trace.len() * 2,
+        "route evidence reopened more than once"
+    );
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::BlockedPreWrite),
+        2,
+        "repeated evidence escaped the one-reopen bound"
+    );
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::Gating),
+        2,
+        "repeated evidence reopened the exact attempt again"
+    );
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::Writing),
+        0
+    );
+    assert!(!pane_history(&rig, &pane).contains(&compact_doorbell(&rig, &message_id)));
+
+    rig.daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn current_command_exec_in_place_reopens_blocked_binding() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let fixture_dir = cyclops_proto::scratch::scratch_dir(&format!(
+        "current-command-evidence-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&fixture_dir).unwrap();
+    let release_fifo = fixture_dir.join("release.fifo");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&release_fifo)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let pane_command = format!(
+        "sh -c 'printf \"❯\\n\"; read release < {}; exec cat'",
+        release_fifo.display()
+    );
+    let mut rig = Rig::new(
+        "workspace-current-command-evidence",
+        CAT_MANIFEST,
+        &pane_command,
+        "delivery_retry_max = 0",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+    let pane_root = pane_pid(&rig, &pane);
+
+    rig.daemon.fail_next_final_binding_observation();
+    let sent = send_workspace_message(
+        &rig,
+        "current-command-binding",
+        "Current command binding",
+        "private body",
+    )
+    .await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::BlockedPreWrite).await;
+    let blocked = notification_transition(&rig, &message_id, NotificationState::BlockedPreWrite)
+        .expect("the terminal binding observation failed closed");
+    let blocked_data = blocked.data.as_ref().expect("blocked transition data");
+    assert_eq!(blocked_data["pre_write_cause"], "binding_unprovable");
+    assert_eq!(
+        blocked_data["pre_write_observation"]["binding"]["pane_root"]["pid"],
+        pane_root
+    );
+
+    fs::write(&release_fifo, b"exec\n").unwrap();
+    assert_eq!(
+        pane_pid(&rig, &pane),
+        pane_root,
+        "exec-in-place must preserve the pane process generation"
+    );
+
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::Writing).await;
+    let writing = notification_transition(&rig, &message_id, NotificationState::Writing)
+        .expect("CurrentCommand evidence reopened the exact attempt");
+    let writing_data = writing.data.as_ref().expect("writing transition data");
+    assert_eq!(writing_data["binding"]["pane_root"]["pid"], pane_root);
+    assert_eq!(
+        writing_data["binding"]["agent"]["pid"],
+        blocked_data["pre_write_observation"]["binding"]["agent"]["pid"],
+        "the causal edge changed the command without changing process identity"
+    );
+    assert_eq!(notification_attempts(&rig, &message_id).len(), 1);
+
+    rig.daemon.shutdown().await;
+    fs::remove_dir_all(fixture_dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn codex_ghost_with_unprovable_binding_blocks_once_and_withdrawal_advances_fifo() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");

@@ -88,8 +88,8 @@ use cyclops_ledger::LedgerWriter;
 use cyclops_manifest::Manifest;
 use cyclops_proto::{
     AdminNotifyParams, AgentState, Detection, Event, Kind, LedgerLine, MessageId, MsgSendParams,
-    ProcessInstanceId, RecipientKey, SessionIdentityBinding, SessionInstanceId, StateReportParams,
-    TmuxPaneId, TmuxSessionId, WireError, WorkspaceId,
+    NotificationRouteEvidenceId, ProcessInstanceId, RecipientKey, SessionIdentityBinding,
+    SessionInstanceId, StateReportParams, TmuxPaneId, TmuxSessionId, WireError, WorkspaceId,
 };
 use cyclops_state::{RepairSummary, StateRoot};
 use cyclops_tmux::{
@@ -198,6 +198,9 @@ pub(crate) struct Inner {
     pub(crate) events: broadcast::Sender<Event>,
     /// Cached fusion verdict per exact watched pane route.
     pub(crate) detections: StdMutex<HashMap<PaneKey, DetEntry>>,
+    /// Pane-local causal route observation generation for notification
+    /// reproof. Synthetic reconciliation reads this map without advancing it.
+    pub(crate) route_evidence_generations: StdMutex<HashMap<PaneKey, u64>>,
     /// One observation transaction per pane. Capture and cache commit stay in
     /// order, so an older slow capture cannot overwrite a newer verdict or
     /// mutate lifecycle candidates after the newer observation settled them.
@@ -253,6 +256,9 @@ pub(crate) struct Inner {
     /// Test-only: make the `--clear` chrome restore fail the way tmux
     /// refusing a command would. See [`Daemon::fail_chrome_restore`].
     pub(crate) fail_chrome_restore: AtomicBool,
+    /// Test-only: make the next final pre-write process observation
+    /// unavailable after the admitting capture has completed.
+    pub(crate) fail_next_final_binding_observation: AtomicBool,
     /// Last-active workspace/tab for the terminal workspace UI.
     pub(crate) workspace_ui: StdMutex<workspace_ui::WorkspaceUiState>,
     /// Self-shutdown request sent only after a successful daemon.shutdown
@@ -652,6 +658,48 @@ impl Inner {
             .get(&PaneKey::new(session_idx, pane_id))
             .map(|e| e.detection.state)
             .unwrap_or(AgentState::Unknown)
+    }
+
+    /// Current durable identity for this pane's route evidence.
+    pub(crate) fn route_evidence_id(
+        &self,
+        session_idx: usize,
+        pane_id: &str,
+    ) -> NotificationRouteEvidenceId {
+        let generation = self
+            .route_evidence_generations
+            .lock()
+            .expect("route evidence generations lock")
+            .get(&PaneKey::new(session_idx, pane_id))
+            .copied()
+            .unwrap_or(0);
+        NotificationRouteEvidenceId {
+            boot_id: self.boot_id.clone(),
+            generation,
+        }
+    }
+
+    /// Advance one real watcher, process, adoption, or readiness observation.
+    pub(crate) fn advance_route_evidence(
+        &self,
+        session_idx: usize,
+        pane_id: &str,
+    ) -> NotificationRouteEvidenceId {
+        let generation = {
+            let mut generations = self
+                .route_evidence_generations
+                .lock()
+                .expect("route evidence generations lock");
+            let generation = generations
+                .entry(PaneKey::new(session_idx, pane_id))
+                .or_insert(0);
+            *generation = generation.saturating_add(1);
+            *generation
+        };
+        NotificationRouteEvidenceId {
+            boot_id: self.boot_id.clone(),
+            generation,
+        }
     }
 
     /// Durable recipient for a pane inside one exact daemon session slot.
@@ -1525,6 +1573,16 @@ impl Daemon {
         self.inner.fail_chrome_restore.store(on, Ordering::SeqCst);
     }
 
+    /// Test-only seam: fail the next OS binding observation at the exact
+    /// terminal write boundary. The one-shot models a real process-table
+    /// observation failure without replacing the authenticated pane process.
+    #[doc(hidden)]
+    pub fn fail_next_final_binding_observation(&self) {
+        self.inner
+            .fail_next_final_binding_observation
+            .store(true, Ordering::SeqCst);
+    }
+
     /// Adopt a pane under a label, or un-adopt it. `target` is a pane id or
     /// an existing label; `label: None` clears.
     pub async fn label_pane(
@@ -1879,8 +1937,18 @@ async fn adopt_pane(
     // 3. Paint.
     paint_chrome(inner, session_idx, pane_id).await;
     // 4. Re-read.
-    fusion::recompute_pane(inner, session_idx, watcher, pane_id, false, "pane_labeled").await;
-    messaging::schedule_route_changed(inner, session_idx, pane_id);
+    let route_evidence = inner.advance_route_evidence(session_idx, pane_id);
+    fusion::recompute_pane_for_route_evidence(
+        inner,
+        session_idx,
+        watcher,
+        pane_id,
+        false,
+        "pane_labeled",
+        &route_evidence,
+    )
+    .await;
+    messaging::schedule_route_evidence(inner, session_idx, pane_id, &route_evidence);
     Ok(())
 }
 
@@ -1974,7 +2042,18 @@ async fn unadopt_pane(
     messaging::schedule_available(inner);
     // 5. Re-read.
     if let Some(w) = watcher {
-        fusion::recompute_pane(inner, session_idx, w, pane_id, false, "pane_unlabeled").await;
+        let route_evidence = inner.advance_route_evidence(session_idx, pane_id);
+        fusion::recompute_pane_for_route_evidence(
+            inner,
+            session_idx,
+            w,
+            pane_id,
+            false,
+            "pane_unlabeled",
+            &route_evidence,
+        )
+        .await;
+        messaging::schedule_route_evidence(inner, session_idx, pane_id, &route_evidence);
     }
     Ok(())
 }
@@ -2406,6 +2485,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         session_registration: StdMutex::new(()),
         events,
         detections: StdMutex::new(HashMap::new()),
+        route_evidence_generations: StdMutex::new(HashMap::new()),
         pane_recomputes: StdMutex::new(HashMap::new()),
         lifecycle_rechecks: StdMutex::new(HashMap::new()),
         registry: StdMutex::new(adoptions),
@@ -2419,6 +2499,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         hook_liveness: selftest::HookLiveness::new(),
         inject_pause: StdMutex::new(None),
         fail_chrome_restore: AtomicBool::new(false),
+        fail_next_final_binding_observation: AtomicBool::new(false),
         workspace_ui: StdMutex::new(workspace_ui::WorkspaceUiState::default()),
         shutdown_request,
         stop: stop_rx,
@@ -3159,8 +3240,18 @@ async fn run_session(
     // already knows which panes are named and which manifest is pinned.
     reconcile_adoptions(inner, idx, watcher, &kept).await;
     for row in watcher.snapshot() {
-        fusion::recompute_pane(inner, idx, watcher, &row.pane_id, false, "bootstrap").await;
-        messaging::schedule_route_changed(inner, idx, &row.pane_id);
+        let route_evidence = inner.advance_route_evidence(idx, &row.pane_id);
+        fusion::recompute_pane_for_route_evidence(
+            inner,
+            idx,
+            watcher,
+            &row.pane_id,
+            false,
+            "bootstrap",
+            &route_evidence,
+        )
+        .await;
+        messaging::schedule_route_evidence(inner, idx, &row.pane_id, &route_evidence);
     }
     // Per-pane debounce kickers for output activity.
     let mut debounce: HashMap<String, watch::Sender<u64>> = HashMap::new();
@@ -3199,8 +3290,22 @@ async fn run_session(
                         return true;
                     }
                     for row in watcher.snapshot() {
-                        fusion::recompute_pane(inner, idx, watcher, &row.pane_id, false, "lag_reconcile").await;
-                        messaging::schedule_route_changed(inner, idx, &row.pane_id);
+                        let route_evidence = inner.advance_route_evidence(idx, &row.pane_id);
+                        fusion::recompute_pane_for_route_evidence(
+                            inner,
+                            idx,
+                            watcher,
+                            &row.pane_id,
+                            false,
+                            "lag_reconcile",
+                            &route_evidence,
+                        ).await;
+                        messaging::schedule_route_evidence(
+                            inner,
+                            idx,
+                            &row.pane_id,
+                            &route_evidence,
+                        );
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => return true,
@@ -3676,16 +3781,18 @@ async fn handle_pane_event(
                     .mailbox_panes
                     .insert(row.pane_id.clone(), ObservedPane::capture(row.clone()));
             });
-            fusion::recompute_pane(
+            let route_evidence = inner.advance_route_evidence(session_idx, &row.pane_id);
+            fusion::recompute_pane_for_route_evidence(
                 inner,
                 session_idx,
                 watcher,
                 &row.pane_id,
                 false,
                 "pane_added",
+                &route_evidence,
             )
             .await;
-            messaging::schedule_route_changed(inner, session_idx, &row.pane_id);
+            messaging::schedule_route_evidence(inner, session_idx, &row.pane_id, &route_evidence);
             false
         }
         PaneEvent::PaneRemoved(id) => {
@@ -3757,6 +3864,11 @@ async fn handle_pane_event(
                     .detections
                     .lock()
                     .expect("detections lock")
+                    .remove(&pane);
+                inner
+                    .route_evidence_generations
+                    .lock()
+                    .expect("route evidence generations lock")
                     .remove(&pane);
                 // Stored turn ends die only with the physical pane. A
                 // session transfer keeps the exact end and composer hold
@@ -3867,14 +3979,27 @@ async fn handle_pane_event(
                 )
             });
             let size_changed = changed.iter().any(|field| matches!(field, PaneField::Size));
-            if relevant {
-                fusion::recompute_pane(inner, session_idx, watcher, &id, false, "pane_changed")
-                    .await;
+            let route_changed = relevant || occupant_changed;
+            let route_evidence = if route_changed {
+                inner.advance_route_evidence(session_idx, &id)
+            } else {
+                inner.route_evidence_id(session_idx, &id)
+            };
+            if route_changed {
+                fusion::recompute_pane_for_route_evidence(
+                    inner,
+                    session_idx,
+                    watcher,
+                    &id,
+                    false,
+                    "pane_changed",
+                    &route_evidence,
+                )
+                .await;
+                messaging::schedule_route_evidence(inner, session_idx, &id, &route_evidence);
             }
-            if occupant_changed {
-                messaging::schedule_route_changed(inner, session_idx, &id);
-            } else if size_changed {
-                messaging::schedule_pane_size_changed(inner, session_idx, &id);
+            if size_changed {
+                messaging::schedule_pane_size_changed(inner, session_idx, &id, &route_evidence);
             }
             // A move does not touch agent state, but it does move half the
             // chrome: the pane carries its own options and the window's
@@ -3931,16 +4056,18 @@ async fn handle_pane_event(
                 return false;
             }
             for pane_id in outcome.changed_panes {
-                fusion::recompute_pane(
+                let route_evidence = inner.advance_route_evidence(session_idx, &pane_id);
+                fusion::recompute_pane_for_route_evidence(
                     inner,
                     session_idx,
                     watcher,
                     &pane_id,
                     false,
                     "pane_reconciled",
+                    &route_evidence,
                 )
                 .await;
-                messaging::schedule_route_changed(inner, session_idx, &pane_id);
+                messaging::schedule_route_evidence(inner, session_idx, &pane_id, &route_evidence);
             }
             false
         }
@@ -4007,6 +4134,7 @@ async fn debounce_task(
         let Some(evidence_ms) = settled_output_evidence(&mut rx).await else {
             return;
         };
+        let route_evidence = inner.advance_route_evidence(session_idx, &pane_id);
         fusion::recompute_pane_from_output(
             &inner,
             session_idx,
@@ -4015,9 +4143,10 @@ async fn debounce_task(
             false,
             "output_settled",
             evidence_ms,
+            &route_evidence,
         )
         .await;
-        messaging::schedule_route_changed(&inner, session_idx, &pane_id);
+        messaging::schedule_route_evidence(&inner, session_idx, &pane_id, &route_evidence);
         if rx.changed().await.is_err() {
             return;
         }
@@ -4195,6 +4324,7 @@ mod tests {
             session_registration: StdMutex::new(()),
             events: broadcast::channel(16).0,
             detections: StdMutex::new(HashMap::new()),
+            route_evidence_generations: StdMutex::new(HashMap::new()),
             pane_recomputes: StdMutex::new(HashMap::new()),
             lifecycle_rechecks: StdMutex::new(HashMap::new()),
             registry: StdMutex::new(registry),
@@ -4208,6 +4338,7 @@ mod tests {
             hook_liveness: selftest::HookLiveness::new(),
             inject_pause: StdMutex::new(None),
             fail_chrome_restore: AtomicBool::new(false),
+            fail_next_final_binding_observation: AtomicBool::new(false),
             workspace_ui: StdMutex::new(workspace_ui::WorkspaceUiState::default()),
             shutdown_request: watch::channel(false).0,
             stop: watch::channel(false).1,

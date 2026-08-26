@@ -40,9 +40,9 @@ use cyclops_proto::{
     Detection, Event, Kind, LedgerLine, MessageId, MsgSendParams, MsgSendResult,
     NotificationAttemptId, NotificationAttentionCause, NotificationBinding, NotificationManifestId,
     NotificationPreWriteCause, NotificationPreWriteObservation, NotificationRecord,
-    NotificationState, NotificationTransport, NotificationVerifyFailureKind,
-    NotificationVerifyOutcome, NotifyLevel, ProcessInstanceId, QuiesceResult, RecipientKey, Sensor,
-    StatusDiagnostic, VerifiedBy, WaitUntil, WireError,
+    NotificationRouteEvidenceId, NotificationState, NotificationTransport,
+    NotificationVerifyFailureKind, NotificationVerifyOutcome, NotifyLevel, ProcessInstanceId,
+    QuiesceResult, RecipientKey, Sensor, StatusDiagnostic, VerifiedBy, WaitUntil, WireError,
 };
 use cyclops_tmux::{ControlClient, PaneEvent, PaneRow, SessionWatcher, TmuxError};
 use serde_json::{json, Value};
@@ -3116,30 +3116,38 @@ async fn persist_notification_prewrite_block(
     let Some(notification) = &handle.notification else {
         return;
     };
+    let route_evidence = inner.route_evidence_id(handle.session_idx, &handle.pane_id);
     if let Some(record) = record_notification_prewrite_block(
         notification,
         worker,
         &inner.mailbox_publication,
         cause,
         observation,
+        &route_evidence,
     ) {
         notify_notification_prewrite_blocked(inner, handle, &record);
         // A positive route edge can race just ahead of this append and see
         // only Gating. Reconcile once after the durable block exists so that
         // edge is not lost. The mailbox projection enforces the one-reopen
         // limit and exact binding checks.
-        crate::messaging::schedule_route_changed(inner, handle.session_idx, &handle.pane_id);
+        crate::messaging::schedule_route_reconciliation(inner, handle.session_idx, &handle.pane_id);
         if let Some(watcher) = inner.watcher_of(handle.session_idx) {
-            fusion::recompute_pane(
+            let route_evidence = inner.route_evidence_id(handle.session_idx, &handle.pane_id);
+            fusion::recompute_pane_for_route_evidence(
                 inner,
                 handle.session_idx,
                 &watcher,
                 &handle.pane_id,
                 true,
                 "prewrite_block_reconcile",
+                &route_evidence,
             )
             .await;
-            crate::messaging::schedule_route_changed(inner, handle.session_idx, &handle.pane_id);
+            crate::messaging::schedule_route_reconciliation(
+                inner,
+                handle.session_idx,
+                &handle.pane_id,
+            );
         }
     }
 }
@@ -3150,7 +3158,23 @@ fn record_notification_prewrite_block(
     publication: &StdMutex<()>,
     cause: NotificationPreWriteCause,
     observation: Option<NotificationPreWriteObservation>,
+    route_evidence: &NotificationRouteEvidenceId,
 ) -> Option<NotificationRecord> {
+    let observation =
+        if cause == NotificationPreWriteCause::WriteReadinessChanged && observation.is_none() {
+            // A readiness race can lack binding or width evidence, but it still
+            // needs the route generation under which the write was refused.
+            Some(NotificationPreWriteObservation {
+                pane_root: None,
+                selected_manifest: None,
+                binding: None,
+                route_evidence: Some(route_evidence.clone()),
+                pane_width: None,
+                required_pane_width: None,
+            })
+        } else {
+            observation
+        };
     let recorded = {
         let _publication = publication.lock().expect("mailbox publication lock");
         let wake_block = (cause == NotificationPreWriteCause::ComposerOwnershipUnproven)
@@ -3315,9 +3339,11 @@ fn exact_prewrite_watcher(
     match handle_route(inner, handle) {
         HandleRoute::Exact(watcher) => Ok(watcher),
         HandleRoute::BindingChanged => Err(AttemptFailure::pane_rebound_before_paste()),
-        HandleRoute::BindingUnprovable { pane_pid } => Err(AttemptFailure::binding_unprovable(
-            Some(binding_unprovable_observation(pane_pid, manifest_id)),
-        )),
+        HandleRoute::BindingUnprovable { pane_pid } => {
+            Err(AttemptFailure::binding_unprovable(Some(
+                binding_unprovable_observation(inner, handle, pane_pid, manifest_id),
+            )))
+        }
         HandleRoute::Unavailable => Err(AttemptFailure::session_detached()),
     }
 }
@@ -3964,22 +3990,33 @@ async fn attempt_delivery(
         injector.discard().await;
         return AttemptOutcome::Failed(AttemptFailure::session_detached());
     };
-    let observed_binding = fusion::admitted_binding(inner, handle.session_idx, &final_row);
+    let observed_binding = if inner
+        .fail_next_final_binding_observation
+        .swap(false, Ordering::SeqCst)
+    {
+        None
+    } else {
+        fusion::admitted_binding(inner, handle.session_idx, &final_row)
+    };
+    // Retain the last complete binding that this attempt genuinely observed.
+    // If the terminal lookup itself is unavailable, this prior proof is the
+    // durable baseline that prevents the unchanged occupant from looking like
+    // a new route edge and reopening the same blocked attempt.
+    let evidence_binding = observed_binding.as_ref().or(observed.as_ref());
     let observation =
         handle
             .notification
             .as_ref()
             .map(|notification| NotificationPreWriteObservation {
-                pane_root: observed_binding
-                    .as_ref()
+                pane_root: evidence_binding
                     .and_then(|binding| process_instance_id(binding.pane_root)),
                 selected_manifest: Some(
                     NotificationManifestId::new(manifest_id)
                         .expect("loaded manifest ids are validated before delivery"),
                 ),
-                binding: observed_binding
-                    .as_ref()
+                binding: evidence_binding
                     .and_then(|binding| notification_binding(notification.recipient(), binding)),
+                route_evidence: Some(inner.route_evidence_id(handle.session_idx, &handle.pane_id)),
                 pane_width: Some(final_row.width),
                 required_pane_width: None,
             });
@@ -3989,6 +4026,14 @@ async fn attempt_delivery(
         // identity while becoming another program.
         Some(binding) if binding.manifest == manifest_id => binding,
         _ => {
+            // Width is a separate paired observation used only by the
+            // pane-too-narrow bookend below. Carrying an observed width
+            // without its required width makes a binding failure invalid
+            // durable data and would strand the attempt in Gating.
+            let observation = observation.map(|mut observation| {
+                observation.pane_width = None;
+                observation
+            });
             gate_line(inner, handle, "rebound", None, Some("binding_unprovable"));
             injector.discard().await;
             return AttemptOutcome::Failed(AttemptFailure::binding_unprovable(observation));
@@ -5051,6 +5096,8 @@ fn process_instance_id(process: crate::identity::ProcId) -> Option<ProcessInstan
 }
 
 fn binding_unprovable_observation(
+    inner: &Inner,
+    handle: &DeliveryHandle,
     pane_pid: i32,
     manifest_id: &str,
 ) -> NotificationPreWriteObservation {
@@ -5058,6 +5105,7 @@ fn binding_unprovable_observation(
         pane_root: process_instance(pane_pid),
         selected_manifest: NotificationManifestId::new(manifest_id).ok(),
         binding: None,
+        route_evidence: Some(inner.route_evidence_id(handle.session_idx, &handle.pane_id)),
         pane_width: None,
         required_pane_width: None,
     }
@@ -5088,6 +5136,7 @@ fn composer_semantic_observation(
         pane_root: Some(process_instance_id(binding.pane_root)?),
         selected_manifest: Some(NotificationManifestId::new(&binding.manifest).ok()?),
         binding: Some(notification_binding(notification.recipient(), &binding)?),
+        route_evidence: Some(inner.route_evidence_id(handle.session_idx, &handle.pane_id)),
         pane_width: None,
         required_pane_width: None,
     })
@@ -5612,6 +5661,8 @@ async fn gate(
                                     return GateOutcome::BlockedPreWrite {
                                         cause: NotificationPreWriteCause::BindingUnprovable,
                                         observation: binding_unprovable_observation(
+                                            inner,
+                                            handle,
                                             row.pane_pid,
                                             &manifest_id,
                                         ),
@@ -5660,6 +5711,8 @@ async fn gate(
                                     return GateOutcome::BlockedPreWrite {
                                         cause: NotificationPreWriteCause::BindingUnprovable,
                                         observation: binding_unprovable_observation(
+                                            inner,
+                                            handle,
                                             row.pane_pid,
                                             &manifest_id,
                                         ),
@@ -5704,6 +5757,8 @@ async fn gate(
                                                     cause:
                                                         NotificationPreWriteCause::BindingUnprovable,
                                                     observation: binding_unprovable_observation(
+                                                        inner,
+                                                        handle,
                                                         row.pane_pid,
                                                         &manifest_id,
                                                     ),
@@ -5741,6 +5796,8 @@ async fn gate(
                                         return GateOutcome::BlockedPreWrite {
                                             cause: NotificationPreWriteCause::BindingUnprovable,
                                             observation: binding_unprovable_observation(
+                                                inner,
+                                                handle,
                                                 row.pane_pid,
                                                 &manifest_id,
                                             ),
@@ -5759,6 +5816,8 @@ async fn gate(
                                             return GateOutcome::BlockedPreWrite {
                                                 cause: NotificationPreWriteCause::BindingUnprovable,
                                                 observation: binding_unprovable_observation(
+                                                    inner,
+                                                    handle,
                                                     row.pane_pid,
                                                     &manifest_id,
                                                 ),
@@ -9013,7 +9072,9 @@ mod tests {
     };
     use cyclops_state::StateRoot;
 
-    use crate::mailbox::{MessageDraft, MessageStore};
+    use crate::mailbox::{
+        MailboxDirectory, MailboxIdentity, MailboxSend, MailboxService, MessageDraft, MessageStore,
+    };
 
     struct NotificationScratch(PathBuf);
 
@@ -9866,6 +9927,7 @@ mod tests {
             pane_root: Some(ProcessInstanceId::new(1, 1).unwrap()),
             selected_manifest: Some(NotificationManifestId::new("codex").unwrap()),
             binding: None,
+            route_evidence: None,
             pane_width: Some(cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH - 1),
             required_pane_width: None,
         });
@@ -11712,6 +11774,10 @@ composer_trailer_required_prefix = 1
             &StdMutex::new(()),
             NotificationPreWriteCause::WriteReadinessChanged,
             None,
+            &NotificationRouteEvidenceId {
+                boot_id: "boot".into(),
+                generation: 1,
+            },
         );
         assert!(record.is_none());
         assert!(worker.is_faulted());
@@ -11742,6 +11808,178 @@ composer_trailer_required_prefix = 1
     }
 
     #[test]
+    fn readiness_block_persistence_records_route_baseline_and_reopens_once() {
+        let path = cyclops_proto::scratch::scratch_dir(&format!(
+            "readiness-route-baseline-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _scratch = NotificationScratch(path.clone());
+        let root = StateRoot::open_or_create(&path).unwrap();
+        let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let session = SessionInstanceId::from_str("00000000-0000-4000-8000-000000000002").unwrap();
+        let recipient =
+            RecipientKey::agent(workspace, session, TmuxPaneId::from_str("%1").unwrap());
+        let directory = || {
+            MailboxDirectory::new(
+                workspace,
+                [MailboxIdentity {
+                    key: recipient,
+                    label: "reviewer".into(),
+                }],
+            )
+            .unwrap()
+        };
+        let store = MessageStore::open(
+            &root,
+            Path::new("workspaces/current/messages.ndjson"),
+            workspace,
+            "boot",
+        )
+        .unwrap();
+        let service = MailboxService::new(directory(), store);
+        let message = service
+            .send(
+                service.admin(),
+                MailboxSend {
+                    addresses: vec!["reviewer".into()],
+                    recipient_keys: None,
+                    subject: "Wake".into(),
+                    body: "Review the mailbox".into(),
+                    fyi: false,
+                    client_key: None,
+                    supersedes: None,
+                },
+            )
+            .unwrap();
+        let queued = service
+            .prepare_oldest_notification(recipient)
+            .unwrap()
+            .unwrap();
+        let context = NotificationContext::new(
+            service.store_handle(),
+            message.message_id,
+            recipient,
+            queued.attempt_id,
+        );
+        context.record_gating().unwrap();
+        let worker = Worker::new();
+        let route_evidence = |generation| NotificationRouteEvidenceId {
+            boot_id: "boot".into(),
+            generation,
+        };
+        let baseline = route_evidence(7);
+        let blocked = record_notification_prewrite_block(
+            &context,
+            &worker,
+            &StdMutex::new(()),
+            NotificationPreWriteCause::WriteReadinessChanged,
+            None,
+            &baseline,
+        )
+        .expect("readiness block");
+        let stored = blocked
+            .pre_write_observation
+            .as_ref()
+            .expect("route baseline");
+        assert_eq!(stored.route_evidence.as_ref(), Some(&baseline));
+        assert!(stored.pane_root.is_none());
+        assert!(stored.selected_manifest.is_none());
+        assert!(stored.binding.is_none());
+        assert!(stored.pane_width.is_none());
+        assert!(stored.required_pane_width.is_none());
+
+        let message_id = context.message_id().clone();
+        drop(context);
+        drop(service);
+        let store = MessageStore::open(
+            &root,
+            Path::new("workspaces/current/messages.ndjson"),
+            workspace,
+            "boot",
+        )
+        .unwrap();
+        let service = MailboxService::new(directory(), store);
+        let replay_store = service.store_handle();
+        let replayed = replay_store
+            .lock()
+            .unwrap()
+            .projection()
+            .notification(recipient, &message_id)
+            .cloned()
+            .expect("replayed readiness block");
+        assert_eq!(
+            replayed
+                .pre_write_observation
+                .as_ref()
+                .and_then(|observation| observation.route_evidence.as_ref()),
+            Some(&baseline)
+        );
+
+        let pane_root = ProcessInstanceId::new(3999, 817_999).unwrap();
+        let manifest = NotificationManifestId::new("codex").unwrap();
+        let binding = NotificationBinding {
+            recipient,
+            pane_root: Some(pane_root),
+            leader: Some(ProcessInstanceId::new(4000, 818_000).unwrap()),
+            agent: ProcessInstanceId::new(4242, 818_221).unwrap(),
+            manifest: manifest.clone(),
+        };
+        let observation = |generation| NotificationPreWriteObservation {
+            pane_root: Some(pane_root),
+            selected_manifest: Some(manifest.clone()),
+            binding: Some(binding.clone()),
+            route_evidence: Some(route_evidence(generation)),
+            pane_width: None,
+            required_pane_width: None,
+        };
+        let lines_before = service.journal_lines().unwrap().len();
+        assert!(service
+            .reopen_oldest_notification_after_route_evidence(recipient, observation(7), true)
+            .unwrap()
+            .is_none());
+        assert!(service
+            .reopen_oldest_notification_after_route_evidence(recipient, observation(6), true)
+            .unwrap()
+            .is_none());
+        assert_eq!(service.journal_lines().unwrap().len(), lines_before);
+        assert!(service
+            .reopen_oldest_notification_after_route_evidence(recipient, observation(8), false)
+            .unwrap()
+            .is_none());
+
+        let reopened = service
+            .reopen_oldest_notification_after_route_evidence(recipient, observation(8), true)
+            .unwrap()
+            .expect("later ready route reopens");
+        assert_eq!(reopened.attempt_id, queued.attempt_id);
+        assert_eq!(reopened.state, NotificationState::Gating);
+        assert_eq!(reopened.pre_write_reopen_count, 1);
+
+        let reopened_context = NotificationContext::new(
+            service.store_handle(),
+            message_id,
+            recipient,
+            queued.attempt_id,
+        );
+        let blocked_again = record_notification_prewrite_block(
+            &reopened_context,
+            &worker,
+            &StdMutex::new(()),
+            NotificationPreWriteCause::WriteReadinessChanged,
+            None,
+            &route_evidence(8),
+        )
+        .expect("second readiness block");
+        assert_eq!(blocked_again.pre_write_reopen_count, 1);
+        let lines_before_repeat = service.journal_lines().unwrap().len();
+        assert!(service
+            .reopen_oldest_notification_after_route_evidence(recipient, observation(9), true)
+            .unwrap()
+            .is_none());
+        assert_eq!(service.journal_lines().unwrap().len(), lines_before_repeat);
+    }
+
+    #[test]
     fn a_claim_that_wins_the_prewrite_block_releases_fifo_without_faulting() {
         let (_scratch, store, context, handle, recipient) =
             notification_fixture("claim-wins-prewrite-block");
@@ -11767,6 +12005,10 @@ composer_trailer_required_prefix = 1
             &StdMutex::new(()),
             NotificationPreWriteCause::WriteReadinessChanged,
             None,
+            &NotificationRouteEvidenceId {
+                boot_id: "boot".into(),
+                generation: 1,
+            },
         );
         assert!(record.is_none());
         assert!(!worker.is_faulted());
