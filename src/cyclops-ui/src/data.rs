@@ -1331,7 +1331,7 @@ mod tests {
         match rx.recv().await.unwrap() {
             UiMsg::MessagesChanged(changed) => gate.messages_changed(&changed),
             _ => panic!("the startup invalidation was not typed"),
-        }
+        };
         let refresh = gate.begin().expect("the acknowledgement owes a snapshot");
         refresh_tx.send(refresh).await.unwrap();
 

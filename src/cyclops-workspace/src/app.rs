@@ -191,7 +191,6 @@ enum AppMsg {
 /// receivers enforce priority.
 #[derive(Clone)]
 struct AppSinks {
-    action: mpsc::Sender<AppMsg>,
     tmux: mpsc::Sender<AppMsg>,
     stream: mpsc::Sender<AppMsg>,
 }
@@ -607,7 +606,6 @@ pub async fn run_async() -> i32 {
     let (tmux_tx, mut tmux_rx) = mpsc::channel::<AppMsg>(PAYLOAD_INGRESS_CAPACITY);
     let (stream_tx, mut stream_rx) = mpsc::channel::<AppMsg>(PAYLOAD_INGRESS_CAPACITY);
     let sinks = AppSinks {
-        action: action_tx.clone(),
         tmux: tmux_tx,
         stream: stream_tx,
     };

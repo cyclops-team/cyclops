@@ -8607,7 +8607,7 @@ mod tests {
         let scratch = StoreScratch::new("operator-prewrite-withdrawal");
         let root = scratch.root();
         let journal = Path::new("workspaces/current/messages.ndjson");
-        let (workspace, admin, bob, carol) = test_context();
+        let (workspace, admin, bob, _carol) = test_context();
         let make_directory = || {
             MailboxDirectory::new(
                 workspace,
