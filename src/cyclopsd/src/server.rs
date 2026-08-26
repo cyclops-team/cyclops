@@ -1468,9 +1468,9 @@ fn wire_error_response(id: Value, error: WireError) -> Response {
 pub(crate) fn sender_panes(inner: &Inner) -> Vec<(String, Option<String>, i32)> {
     let labels = inner.labels();
     inner
-        .session_slots()
+        .active_session_slots()
         .iter()
-        .flat_map(|slot| {
+        .flat_map(|(_, slot)| {
             let link = slot.link.lock().expect("session link lock");
             link.watcher
                 .as_ref()
@@ -1742,7 +1742,7 @@ type StatusRefreshJob = (crate::PaneKey, StatusRefreshFuture);
 async fn refresh_status_detections(inner: &Arc<Inner>) -> HashSet<crate::PaneKey> {
     let deadline = tokio::time::Instant::now() + STATUS_REFRESH_BUDGET;
     let mut jobs = VecDeque::new();
-    for session_idx in 0..inner.session_slots().len() {
+    for (session_idx, _) in inner.active_session_slots() {
         let Some(watcher) = inner.watcher_of(session_idx) else {
             continue;
         };
@@ -1993,9 +1993,8 @@ fn status_result_with_refresh(
     // fusion stamps first so no journal read runs under the detection lock.
     let detections = inner.detections.lock().expect("detections lock").clone();
     let sessions = inner
-        .session_slots()
-        .iter()
-        .enumerate()
+        .active_session_slots()
+        .into_iter()
         .map(|(session_idx, slot)| {
             let link = slot.link.lock().expect("session link lock");
             let instance_id = link
@@ -2371,9 +2370,9 @@ fn resolve_target(inner: &Inner, target: &str) -> Option<(usize, Arc<SessionWatc
 
 fn known_panes(inner: &Inner) -> Vec<String> {
     inner
-        .session_slots()
+        .active_session_slots()
         .iter()
-        .flat_map(|slot| {
+        .flat_map(|(_, slot)| {
             let link = slot.link.lock().expect("session link lock");
             link.watcher
                 .as_ref()

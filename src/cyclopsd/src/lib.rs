@@ -80,7 +80,7 @@ pub use delivery::render_payload;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -283,6 +283,16 @@ pub(crate) struct SessionSlot {
     /// one tmux session. Go through [`SessionSlot::name`] and
     /// [`SessionSlot::rename`] rather than the field directly.
     name: StdMutex<String>,
+    /// A rename can make a live runtime slot collide with a configured slot
+    /// that was still waiting for that name. Indices are durable for the
+    /// daemon's lifetime, so the losing slot cannot be removed from
+    /// `Inner::sessions`; it becomes an alias of the live canonical slot
+    /// instead. Historical ledger reads may still address this slot by index,
+    /// while every live traversal skips it.
+    ///
+    /// `usize::MAX` means canonical. Any other value is the canonical slot's
+    /// append-only index.
+    alias_of: AtomicUsize,
     pub(crate) link: StdMutex<SessionLink>,
     /// Append-only session ledger at $CYCLOPS_HOME/ledger/<session>.ndjson,
     /// opened once when the slot is created (`boot`, `watch_session`) and
@@ -323,6 +333,7 @@ impl SessionSlot {
     pub(crate) fn new(name: String, ledger: Arc<LedgerWriter>) -> Self {
         SessionSlot {
             name: StdMutex::new(name),
+            alias_of: AtomicUsize::new(usize::MAX),
             link: StdMutex::new(SessionLink::default()),
             ledger,
             last_panes: StdMutex::new(HashMap::new()),
@@ -349,6 +360,29 @@ impl SessionSlot {
             return None;
         }
         Some(std::mem::replace(&mut *name, new_name))
+    }
+
+    fn alias_of(&self) -> Option<usize> {
+        let idx = self.alias_of.load(Ordering::Acquire);
+        (idx != usize::MAX).then_some(idx)
+    }
+
+    fn is_canonical(&self) -> bool {
+        self.alias_of().is_none()
+    }
+
+    /// Retire this slot behind `canonical_idx` without invalidating its
+    /// historical index. Only the session-registration transaction calls
+    /// this, and only for a detached collision target.
+    fn retire_as_alias(&self, canonical_idx: usize) -> bool {
+        self.alias_of
+            .compare_exchange(
+                usize::MAX,
+                canonical_idx,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     /// Current observed rows while attached, otherwise the retained rows.
@@ -520,8 +554,9 @@ impl Inner {
             .cloned()
     }
 
-    /// How many sessions are watched right now (configured plus any added
-    /// since boot).
+    /// How many append-only session slots exist (configured plus any added
+    /// since boot). Retired aliases remain in this count because callers that
+    /// walk `0..session_count()` use the result as stable ledger indices.
     pub(crate) fn session_count(&self) -> usize {
         self.sessions.lock().expect("sessions lock").len()
     }
@@ -532,7 +567,8 @@ impl Inner {
             .lock()
             .expect("sessions lock")
             .iter()
-            .position(|s| s.name() == name)
+            .enumerate()
+            .find_map(|(idx, slot)| (slot.is_canonical() && slot.name() == name).then_some(idx))
     }
 
     /// A cloned snapshot of every session slot, for iteration. Lock the
@@ -540,6 +576,21 @@ impl Inner {
     /// span the loop body that follows.
     pub(crate) fn session_slots(&self) -> Vec<Arc<SessionSlot>> {
         self.sessions.lock().expect("sessions lock").clone()
+    }
+
+    /// Canonical live slots with their append-only indices. A retired alias
+    /// remains available through `session(idx)` and `session_slots()` for
+    /// historical ledger reads, but must never take part in routing, status,
+    /// mailbox publication, or another watcher attachment.
+    pub(crate) fn active_session_slots(&self) -> Vec<(usize, Arc<SessionSlot>)> {
+        self.sessions
+            .lock()
+            .expect("sessions lock")
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.is_canonical())
+            .map(|(idx, slot)| (idx, Arc::clone(slot)))
+            .collect()
     }
 
     /// Emit a fused-state change: one kind=state ledger line on the
@@ -812,6 +863,9 @@ impl Inner {
     /// Live watcher for a session slot, if attached.
     pub(crate) fn watcher_of(&self, session_idx: usize) -> Option<Arc<SessionWatcher>> {
         let slot = self.session(session_idx)?;
+        if !slot.is_canonical() {
+            return None;
+        }
         let link = slot.link.lock().expect("session link lock");
         link.watcher.as_ref().map(Arc::clone)
     }
@@ -828,7 +882,7 @@ impl Inner {
         if let Some(recipient) = exact {
             let session_instance_id = recipient.session_instance_id()?;
             let pane_id = recipient.pane_id()?.to_string();
-            for (idx, slot) in self.session_slots().into_iter().enumerate() {
+            for (idx, slot) in self.active_session_slots() {
                 let watcher = {
                     let link = slot.link.lock().expect("session link lock");
                     if link
@@ -860,7 +914,7 @@ impl Inner {
         }
         let wanted = name;
         let mut found = None;
-        for (idx, slot) in self.session_slots().into_iter().enumerate() {
+        for (idx, slot) in self.active_session_slots() {
             let watcher = {
                 let link = slot.link.lock().expect("session link lock");
                 link.watcher.as_ref().map(Arc::clone)
@@ -890,7 +944,7 @@ impl Inner {
         if let Some(recipient) = exact {
             let session_instance_id = recipient.session_instance_id()?;
             let pane_id = recipient.pane_id()?.to_string();
-            for (idx, slot) in self.session_slots().into_iter().enumerate() {
+            for (idx, slot) in self.active_session_slots() {
                 let link = slot.link.lock().expect("session link lock");
                 if link.attached
                     || link
@@ -928,7 +982,7 @@ impl Inner {
         }
         let wanted = name;
         let mut found = None;
-        for (idx, slot) in self.session_slots().into_iter().enumerate() {
+        for (idx, slot) in self.active_session_slots() {
             if slot.link.lock().expect("session link lock").attached {
                 continue; // live table is authoritative while attached
             }
@@ -977,9 +1031,8 @@ fn mailbox_routes(
     proposed: Option<&MailboxRouteOverride<'_>>,
 ) -> Vec<MailboxSessionRoute> {
     inner
-        .session_slots()
+        .active_session_slots()
         .into_iter()
-        .enumerate()
         .filter_map(|(idx, slot)| {
             proposed
                 .filter(|route| route.session_idx == idx)
@@ -1735,15 +1788,19 @@ pub(crate) async fn label_pane(
 fn label_taken_words(inner: &Inner, label: &str, holder: &registry::Adoption) -> String {
     let session_idx = inner.session_index(&holder.session).or_else(|| {
         let instance_id = holder.recipient?.session_instance_id()?;
-        inner.session_slots().iter().position(|slot| {
-            slot.link
-                .lock()
-                .expect("session link lock")
-                .identity
-                .as_ref()
-                .map(|identity| identity.session_instance_id())
-                == Some(instance_id)
-        })
+        inner
+            .active_session_slots()
+            .into_iter()
+            .find_map(|(idx, slot)| {
+                slot.link
+                    .lock()
+                    .expect("session link lock")
+                    .identity
+                    .as_ref()
+                    .map(|identity| identity.session_instance_id())
+                    .is_some_and(|candidate| candidate == instance_id)
+                    .then_some(idx)
+            })
     });
     let attached = session_idx
         .and_then(|idx| inner.session(idx))
@@ -2108,7 +2165,7 @@ fn chrome_not_restored(
 /// out, because there the window keeps its text while a named pane is
 /// still in it.)
 async fn restore_all_chrome(inner: &Arc<Inner>) {
-    for (idx, slot) in inner.session_slots().into_iter().enumerate() {
+    for (idx, slot) in inner.active_session_slots() {
         let Some(watcher) = inner.watcher_of(idx) else {
             continue;
         };
@@ -2617,9 +2674,8 @@ pub(crate) async fn watch_session(
     // here and dedup against it instead of opening a second ledger and
     // watcher for the same tmux session.
     if let Some(idx) = inner
-        .session_slots()
-        .iter()
-        .enumerate()
+        .active_session_slots()
+        .into_iter()
         .find_map(|(idx, slot)| {
             let watcher = slot
                 .link
@@ -2808,6 +2864,13 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
         if *stop.borrow() {
             return;
         }
+        if let Some(canonical_idx) = slot.alias_of() {
+            info!(
+                alias_idx = idx,
+                canonical_idx, "retired session-slot task stopped"
+            );
+            return;
+        }
         // Re-read on every attempt, not cached once outside the loop: a
         // rename followed while attached (`handle_pane_event`'s
         // `SessionRenamed` arm) updates this slot in place, and if the
@@ -2828,6 +2891,10 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
         match SessionWatcher::connect(ccfg).await {
             Ok(watcher) => {
                 let watcher = Arc::new(watcher);
+                if slot.alias_of().is_some() {
+                    watcher.shutdown().await;
+                    return;
+                }
                 let binding = match observe_session_identity(&inner, &watcher).await {
                     Ok(binding) => binding,
                     Err(error) => {
@@ -2840,8 +2907,15 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                         continue;
                     }
                 };
+                if slot.alias_of().is_some() {
+                    watcher.shutdown().await;
+                    return;
+                }
                 if !run_session(&inner, idx, &watcher, binding, stop.clone()).await {
                     watcher.shutdown().await;
+                    if slot.alias_of().is_some() {
+                        return;
+                    }
                     if reconnect_delay(&mut stop, backoff).await {
                         return;
                     }
@@ -3048,9 +3122,58 @@ fn rename_session_slot_locked(inner: &Arc<Inner>, idx: usize, new_name: String) 
     let Some(slot) = inner.session(idx) else {
         return;
     };
-    let Some(old_name) = slot.rename(new_name.clone()) else {
+    if !slot.is_canonical() {
         return;
+    }
+    let old_name = slot.name();
+    if old_name == new_name {
+        return;
+    }
+
+    // A runtime-created session can be watched under its temporary name and
+    // then renamed onto a configured name whose slot is still detached. The
+    // source slot owns the live watcher and therefore wins. The detached slot
+    // cannot be removed because its index may already be held by a task or a
+    // historical cursor; retire it as an alias instead. Its session task sees
+    // the alias before it can publish a second watcher for the same tmux
+    // session.
+    let collision = inner
+        .active_session_slots()
+        .into_iter()
+        .find(|(other_idx, other)| *other_idx != idx && other.name() == new_name);
+    let retired = if let Some((other_idx, other)) = collision {
+        let target_is_live = {
+            let link = other.link.lock().expect("session link lock");
+            link.attached || link.watcher.is_some()
+        };
+        if target_is_live {
+            error!(
+                source_idx = idx,
+                target_idx = other_idx,
+                old_name = %old_name,
+                new_name = %new_name,
+                "refusing to merge two live session slots after a rename collision"
+            );
+            return;
+        }
+        if !other.retire_as_alias(idx) {
+            error!(
+                source_idx = idx,
+                target_idx = other_idx,
+                new_name = %new_name,
+                "rename collision target changed before it could be retired"
+            );
+            return;
+        }
+        Some((other_idx, other))
+    } else {
+        None
     };
+
+    let replaced = slot
+        .rename(new_name.clone())
+        .expect("the old and new session names were checked above");
+    debug_assert_eq!(replaced, old_name);
     // Adoptions and their chrome snapshots are session-scoped even though
     // their tmux pane/window ids do not change on a rename. Move those
     // durable facts with the slot or every in_session(new_name) path
@@ -3065,6 +3188,27 @@ fn rename_session_slot_locked(inner: &Arc<Inner>, idx: usize, new_name: String) 
     }
     refresh_mailbox_and_schedule(inner);
     info!(old_name = %old_name, new_name = %new_name, "session renamed; daemon slot now follows tmux");
+    if let Some((alias_idx, alias)) = retired {
+        info!(
+            canonical_idx = idx,
+            alias_idx,
+            session = %new_name,
+            "retired a detached session slot after a rename collision"
+        );
+        inner.append_line(
+            alias_idx,
+            daemon_line(
+                Kind::System,
+                inner.mint_event_id(),
+                json!({
+                    "event": "session_slot_aliased",
+                    "session": &new_name,
+                    "canonical_session_idx": idx,
+                }),
+            ),
+        );
+        debug_assert_eq!(alias.alias_of(), Some(idx));
+    }
     inner.append_line(
         idx,
         daemon_line(
@@ -3173,6 +3317,12 @@ async fn run_session(
     binding: SessionIdentityBinding,
     mut stop: watch::Receiver<bool>,
 ) -> bool {
+    let Some(slot) = inner.session(idx) else {
+        return false;
+    };
+    if !slot.is_canonical() {
+        return false;
+    }
     let mut rx = watcher.subscribe();
     // A rename can land after SessionWatcher::connect returns but before
     // this receiver exists. Broadcast channels do not replay that event;
@@ -3183,6 +3333,9 @@ async fn run_session(
     let live_name = watcher.session();
     if inner.session(idx).is_some_and(|s| s.name() != live_name) {
         rename_session_slot(inner, idx, live_name);
+    }
+    if !slot.is_canonical() || slot.name() != watcher.session() {
+        return false;
     }
     let rows: Vec<ObservedPane> = watcher
         .snapshot()
@@ -3212,10 +3365,18 @@ async fn run_session(
             .hook_liveness
             .open(&PaneKey::new(idx, &pane.row.pane_id));
     }
+    // A detached slot may have been retired as an alias while this task was
+    // observing process generations or reconciling adoption records. Share
+    // the registration barrier with rename collision handling so the losing
+    // task can never publish a second live route after retirement.
+    let _registration = inner
+        .session_registration
+        .lock()
+        .expect("session registration lock");
+    if !slot.is_canonical() {
+        return false;
+    }
     if let Err(error) = publish_mailbox_transition(inner, &route, || {
-        let slot = inner
-            .session(idx)
-            .expect("session_idx valid: append-only, never removed");
         let mut link = slot.link.lock().expect("session link lock");
         link.identity = Some(binding);
         link.attached = true;
@@ -3229,9 +3390,7 @@ async fn run_session(
         warn!(session = %watcher.session(), error = %error, "cannot publish mailbox directory");
         return false;
     }
-    let slot = inner
-        .session(idx)
-        .expect("session_idx valid: append-only, never removed");
+    drop(_registration);
     info!(session = %slot.name(), "attached to tmux session");
     session_lifecycle(inner, idx, true);
     // Bootstrap: the watcher's table is already authoritative; evaluate
@@ -6160,6 +6319,148 @@ process_names = ["never"]
         assert_eq!(slot.name(), "new-name");
 
         watcher.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A terminal workspace is initially watched under its temporary tmux
+    /// name, then renamed to the configured workspace name. If that configured
+    /// slot was still detached, the rename used to leave two live watchers for
+    /// one tmux session: status rendered the session twice and raw pane-id
+    /// resolution failed as ambiguous. The live source slot must become the
+    /// sole canonical owner while the configured slot remains readable only as
+    /// a historical alias.
+    #[tokio::test]
+    async fn a_runtime_session_renamed_onto_a_configured_slot_has_one_live_owner() {
+        if !cyclops_testrig::tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let server = cyclops_testrig::TmuxServer::new("rename-configured-collision");
+        server.run_ok(&["new-session", "-d", "-s", "yahirh", "/bin/sh"]);
+
+        let mut inner = bare_inner("cyc-rename-configured-collision");
+        let home = inner.cfg.home.clone();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        {
+            let mutable = Arc::get_mut(&mut inner).expect("bare inner is unique");
+            mutable.cfg.tmux_socket = Some(server.socket().to_string());
+            mutable.cfg.tmux_config = Some(PathBuf::from("/dev/null"));
+            mutable.shutdown_request = stop_tx.clone();
+            mutable.stop = stop_rx;
+        }
+
+        // This is the configured `research` slot. It deliberately has no task
+        // yet, making the rename collision deterministic; after retirement we
+        // start its task and prove it refuses to attach.
+        let configured_ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/research.ndjson"),
+            &inner.boot_id,
+        )
+        .unwrap();
+        let configured = Arc::new(SessionSlot::new(
+            "research".into(),
+            Arc::new(configured_ledger),
+        ));
+        let configured_idx = {
+            let mut sessions = inner.sessions.lock().unwrap();
+            sessions.push(Arc::clone(&configured));
+            sessions.len() - 1
+        };
+
+        let (runtime_idx, added) = watch_session(&inner, "yahirh")
+            .await
+            .expect("runtime session is watched");
+        assert!(added);
+        let runtime = inner.session(runtime_idx).unwrap();
+        let runtime_binding = wait_for_session_binding(&runtime, None).await;
+        assert!(runtime.link.lock().unwrap().attached);
+
+        server.run_ok(&["rename-session", "-t", "=yahirh", "research"]);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if configured.alias_of() == Some(runtime_idx) && runtime.name() == "research" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("rename collision is coalesced");
+
+        // The configured task can wake after the rename. It must observe the
+        // alias and exit instead of publishing a second watcher.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::spawn(session_task(
+                Arc::clone(&inner),
+                configured_idx,
+                inner.stop.clone(),
+            )),
+        )
+        .await
+        .expect("retired task exits")
+        .expect("retired task does not panic");
+
+        assert_eq!(inner.session_count(), 2, "both ledger indices remain");
+        assert!(inner.session(configured_idx).is_some());
+        assert_eq!(inner.session_index("research"), Some(runtime_idx));
+        let active = inner.active_session_slots();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].0, runtime_idx);
+
+        let live_identities: Vec<_> = active
+            .iter()
+            .filter_map(|(idx, slot)| {
+                let link = slot.link.lock().unwrap();
+                (link.attached && link.watcher.is_some())
+                    .then(|| (*idx, link.identity.as_ref().unwrap().session_instance_id()))
+            })
+            .collect();
+        assert_eq!(
+            live_identities,
+            vec![(runtime_idx, runtime_binding.session_instance_id())]
+        );
+        let mailbox = mailbox_routes(&inner, None);
+        assert_eq!(mailbox.len(), 1);
+        assert_eq!(mailbox[0].session_idx, runtime_idx);
+        assert_eq!(
+            mailbox[0].instance_id,
+            runtime_binding.session_instance_id()
+        );
+
+        let status = server::status_result(&inner, false);
+        assert_eq!(status.sessions.len(), 1);
+        assert_eq!(status.sessions[0].name, "research");
+        assert_eq!(status.sessions[0].panes.len(), 1);
+        let pane_id = status.sessions[0].panes[0].pane_id.clone();
+        assert_eq!(
+            inner.resolve_recipient(&pane_id),
+            Some((runtime_idx, pane_id.clone()))
+        );
+        let labeled = label_pane(&inner, &pane_id, Some("gemini-research".into()), None)
+            .await
+            .expect("a raw pane id remains labelable");
+        assert_eq!(labeled["label"], "gemini-research");
+
+        let alias_facts = configured.ledger.read_after(0).unwrap();
+        assert!(alias_facts.iter().any(|line| {
+            line.data
+                .as_ref()
+                .is_some_and(|data| data["event"] == "session_slot_aliased")
+        }));
+
+        let _ = stop_tx.send(true);
+        let tasks = std::mem::take(&mut *inner.extra_tasks.lock().unwrap());
+        for task in tasks {
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("runtime session task stops")
+                .expect("runtime session task does not panic");
+        }
+        drop(runtime);
+        drop(configured);
+        drop(inner);
         let _ = std::fs::remove_dir_all(home);
     }
 

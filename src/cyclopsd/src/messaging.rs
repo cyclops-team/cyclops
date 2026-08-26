@@ -89,7 +89,7 @@ pub(crate) fn notification_route(
     };
     let pane_id = pane_id.to_string();
     let mut matched = None;
-    for (session_idx, slot) in inner.session_slots().into_iter().enumerate() {
+    for (session_idx, slot) in inner.active_session_slots() {
         let watcher = {
             let link = slot.link.lock().expect("session link lock");
             if !link.attached
