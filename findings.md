@@ -1780,4 +1780,43 @@ exact-staging proof.
 This evidence is narrow. It measures the occupied and empty composer prompt,
 transcript echo styling, and the two-row trailer on 1.1.21. It does not reprove
 the working, modal, quota, hook, lifecycle, restart, or multiline direct-payload
-rules, so `version_tested` remains bound to the authoritative 1.1.11 fixture.
+rules. F71 adds current permission-modal evidence, but the full-ruleset
+`version_tested` claim remains bound to 1.1.11.
+
+## F71. AGY 1.1.21 replaces every prior state signal with a file-access modal
+
+MEASURED 2026-08-26 on macOS with tmux 3.6a and Antigravity CLI 1.1.21.
+Frozen release candidate `74ea6cc` sent one compact doorbell to pane `%40`.
+The exact notification moved through queued, gating, writing, staged,
+submitting, submitted, and notified with one process binding. The screen then
+moved from `composer_empty` to `screen_working` and finally to `no_rule`.
+Both the outcome and final detector reads returned `unknown`, no sensor
+readings, and `stale: false`. The final status had held that answer for 5.8
+seconds, so this was not a capture failure or a repaint between frames.
+
+A later read-only capture of the same pane process still showed the submitted
+doorbell echo and this unresolved screen:
+
+```text
+File access
+Read: <external-file>
+Reason: outside workspace
+Allow access to this file?
+> 1. Yes, allow access
+  2. Yes, and always allow non-workspace access
+  3. No, deny access
+```
+
+AGY removes the composer and working spinner while this decision is open. Its
+pane title remains the hostname, and no hook reports the permission state. The
+screen manifest is therefore the only source that can classify it. The shipped
+manifest had no matching permission rule, so fusion correctly failed closed to
+`unknown` but could not tell the operator what needed attention.
+
+The fixtures `agy_file_access_permission_plain.txt` and
+`agy_file_access_permission_esc.txt` preserve the measured modal structure with
+the account, path, message locator, and unrelated transcript removed. The rule
+requires the `File access` header, the exact question, and the selected first
+choice together. It outranks a stale working spinner and never dismisses the
+decision automatically. This capture proves only the 1.1.21 file-access modal;
+`version_tested` remains 1.1.11 until the complete ruleset is remeasured.

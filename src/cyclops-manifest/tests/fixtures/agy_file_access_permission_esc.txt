@@ -1,0 +1,11 @@
+[1m[94mAntigravity CLI 1.1.21[0m
+[1m[33mFile access[0m
+[90m────────────────────────────────────────────────────────────────
+[37mRead: <external-file>[39m
+[37mReason: outside workspace[39m
+[1mAllow access to this file?[0m
+[94m> 1. Yes, allow access[39m
+  2. Yes, and always allow non-workspace access
+  3. No, deny access
+  [1m[94m↑/↓[0m[90m Navigate[39m
+[38;5;152mGemini 3.7 Flash[38;5;251m · [38;5;217mHigh[38;5;251m · [38;5;151m<workspace>[38;5;251m · [38;5;182mFull[38;5;251m · [38;5;151mCtx: 98%

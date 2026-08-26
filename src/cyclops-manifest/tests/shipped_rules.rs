@@ -646,6 +646,74 @@ fn agy_working_outranks_the_cleared_composer() {
     assert_eq!(r.state, AgentState::Idle);
 }
 
+/// MEASURED 2026-08-26 (agy 1.1.21, tmux 3.6a), SAFETY: a file-access
+/// decision replaces the composer and spinner with a numbered modal. The pane
+/// must read blocked_permission rather than falling through to unknown.
+#[test]
+fn agy_file_access_permission_is_blocked_by_the_exact_live_shape() {
+    let agy = &shipped()["agy"];
+    let plain = include_str!("fixtures/agy_file_access_permission_plain.txt");
+    let esc = include_str!("fixtures/agy_file_access_permission_esc.txt");
+
+    let rule = agy.evaluate_esc("mac", plain, Some(esc)).unwrap();
+    assert_eq!(rule.id, "file_access_permission");
+    assert_eq!(rule.state, AgentState::BlockedPermission);
+    assert!(
+        !rule.auto_dismiss,
+        "the access decision belongs to the human"
+    );
+}
+
+#[test]
+fn agy_file_access_permission_requires_every_measured_clause() {
+    let agy = &shipped()["agy"];
+    let permission = agy
+        .rules
+        .iter()
+        .find(|rule| rule.id == "file_access_permission")
+        .expect("file_access_permission rule");
+    let exact = include_str!("fixtures/agy_file_access_permission_plain.txt");
+    assert!(permission.matches(exact, &non_empty(exact)));
+
+    for incomplete in [
+        exact.replace("File access", "File review"),
+        exact.replace("Allow access to this file?", "Review this file?"),
+        exact.replace("> 1. Yes, allow access", "  1. Yes, allow access"),
+    ] {
+        assert!(
+            !permission.matches(&incomplete, &non_empty(&incomplete)),
+            "a partial modal shape must not block ordinary agent output"
+        );
+    }
+}
+
+#[test]
+fn agy_file_access_permission_outranks_a_stale_spinner() {
+    let agy = &shipped()["agy"];
+    let capture = "⣷ Generating...\n\
+                   File access\n\
+                   Allow access to this file?\n\
+                   > 1. Yes, allow access";
+    let lines = non_empty(capture);
+    let working = agy
+        .rules
+        .iter()
+        .find(|rule| rule.id == "screen_working")
+        .expect("screen_working rule");
+    let permission = agy
+        .rules
+        .iter()
+        .find(|rule| rule.id == "file_access_permission")
+        .expect("file_access_permission rule");
+
+    assert!(working.matches(capture, &lines));
+    assert!(permission.matches(capture, &lines));
+    assert!(permission.priority > working.priority);
+    let rule = agy.evaluate("mac", capture).unwrap();
+    assert_eq!(rule.id, "file_access_permission");
+    assert_eq!(rule.state, AgentState::BlockedPermission);
+}
+
 /// M1 soak, BINDING: native Claude installs report pane_current_command as
 /// the version string ("2.1.220"), so process_names never binds. The
 /// manifest must carry the argv fallback data the daemon binds with.
