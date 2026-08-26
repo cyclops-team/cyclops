@@ -140,6 +140,9 @@ pub const MENU_TOGGLE_MESSAGES: &str = "Messages";
 /// The composer, in the menu because the `@` button that opens it lives
 /// in the sidebar footer, and a collapsed sidebar has no footer to click.
 pub const MENU_COMPOSE: &str = "Send a message";
+/// Repaint the workspace surface. In the menu because a garbled frame is
+/// exactly when a chord is hardest to remember.
+pub const MENU_REDRAW: &str = "Redraw";
 
 pub const BINDING_TOGGLE_MESSAGES: &str = "Toggle messages";
 

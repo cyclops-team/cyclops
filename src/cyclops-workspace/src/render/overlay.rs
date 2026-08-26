@@ -1161,6 +1161,9 @@ pub fn menu_items(menu: &MenuState, checks: MenuChecks) -> Vec<MenuRow> {
             // carries no check of its own; the card marks the theme and
             // the sound row that are on with the same glyph. The
             // keybinding reference is a section of that card.
+            // A garbled frame is exactly when a chord is hardest to
+            // remember, so the repair has a row as well as `Ctrl+B r`.
+            (copy::MENU_REDRAW, BindingAction::Redraw, None),
             (copy::MENU_SETTINGS, BindingAction::ShowSettings, None),
             (copy::MENU_DETACH, BindingAction::Detach, None),
         ],
@@ -1555,6 +1558,7 @@ mod tests {
                 BindingAction::ToggleMotion,
                 // The keybinding reference is a section of the settings
                 // card, so it needs no item of its own.
+                BindingAction::Redraw,
                 BindingAction::ShowSettings,
                 BindingAction::Detach,
             ]

@@ -139,6 +139,13 @@ pub(super) async fn execute(
         }
         Action::NamePane { pane_id, label } => name_pane(app, pane_id, label),
 
+        Action::RequestRedraw => {
+            // The renderer drains this before its next frame. Nothing else
+            // is touched: not the daemon, not a pane, not the mailbox, not
+            // the layout.
+            app.repaint_requested = true;
+            Ok(Outcome::default())
+        }
         Action::RequestCompose => {
             // Prefilled with the focused pane's label when it has one,
             // because the agent you are looking at is the one you are
@@ -173,8 +180,17 @@ pub(super) async fn execute(
             });
             Ok(Outcome::default())
         }
-        Action::NewTab { name } => new_tab(app, client, name).await,
-        Action::SelectTab { window_id } => select_tab(app, client, window_id).await,
+        Action::NewTab { name } => {
+            // A tab appearing or the strip gaining a row changes what the
+            // canvas owns.
+            app.layout_changed();
+            new_tab(app, client, name).await
+        }
+        Action::SelectTab { window_id } => {
+            // A different tab is a different pane layout entirely.
+            app.layout_changed();
+            select_tab(app, client, window_id).await
+        }
         Action::RequestRenameTab { window_id } => {
             let Some(tab) = app
                 .model
@@ -197,7 +213,10 @@ pub(super) async fn execute(
             app.hover = None;
             Ok(Outcome::reconcile())
         }
-        Action::CloseTab { window_id } => close_tab(app, client, window_id).await,
+        Action::CloseTab { window_id } => {
+            app.layout_changed();
+            close_tab(app, client, window_id).await
+        }
         Action::MoveTab {
             window_id,
             destination,
@@ -250,6 +269,7 @@ pub(super) async fn execute(
         Action::ToggleMessages => {
             app.model.messages_visible = !app.model.messages_visible;
             app.prefs.messages_visible = app.model.messages_visible;
+            app.layout_changed();
             if app.model.messages_visible {
                 app.messages_focused = true;
                 super::request_messages_snapshot(app);
@@ -290,6 +310,7 @@ pub(super) async fn execute(
             // enters into it: the strip shows because the operator has not
             // said otherwise.
             app.prefs.tab_bar_visible = !app.prefs.tab_bar_visible;
+            app.layout_changed();
             super::resize_client(app, client).await;
             Ok(Outcome {
                 persist: true,
@@ -306,7 +327,10 @@ pub(super) async fn execute(
                 0
             };
             // No `resize_client`: the seam is inside the sidebar, so no
-            // column changed hands and no pane reflows.
+            // column changed hands and no pane reflows. The rows the panel
+            // occupied still hold its glyphs, though, which is why the
+            // repaint is requested here and not folded into the resize.
+            app.layout_changed();
             Ok(Outcome {
                 persist: true,
                 ..Outcome::default()
@@ -493,6 +517,7 @@ pub(super) async fn execute(
 /// boot, so a workspace quit collapsed reopens collapsed.
 async fn commit_sidebar_visibility(app: &mut App, client: &ControlClient) -> Outcome {
     app.prefs.sidebar_visible = app.model.sidebar_visible;
+    app.layout_changed();
     super::resize_client(app, client).await;
     Outcome {
         persist: true,
@@ -1454,6 +1479,9 @@ mod tests {
             folder_probe_at: None,
             send_requests: None,
             stream_reconcile_requests: None,
+            repaint_requested: false,
+            repaint_resize_pending: false,
+            repaint_resize_settle_at: None,
             messages_focused: false,
             messages_session_scoped: true,
             messages_gate: cyclops_ui::RefreshGate::new(),

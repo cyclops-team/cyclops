@@ -545,6 +545,17 @@ struct App {
     /// One fixed stream replacement worker. Gap edges coalesce in its
     /// single slot while the current replacement is loading.
     stream_reconcile_requests: Option<std::sync::mpsc::SyncSender<()>>,
+    /// A host resize arrived and tmux has not been told the new size yet.
+    /// Drained on the render beat so a drag-resize burst costs one tmux
+    /// call at the final size rather than one per intermediate size.
+    repaint_resize_pending: bool,
+    /// When the current resize burst is considered finished. Slid forward
+    /// by every arriving resize, so a continuous drag never sends.
+    repaint_resize_settle_at: Option<Instant>,
+    /// Set when something decided the frame the user is looking at is not
+    /// the frame the renderer thinks it wrote. Drained by [`RenderOwner`]
+    /// before its next frame, which then repaints every cell.
+    pub(crate) repaint_requested: bool,
     /// Whether the Messages drawer has active keyboard focus.
     messages_focused: bool,
     /// Whether the drawer shows only the active workspace's session. The
@@ -1223,15 +1234,16 @@ pub async fn run_async() -> i32 {
     let mut runtimes = RuntimeRegistry::default();
     hydrate_visible_tab(&client, model.active_tab(), &mut runtimes).await;
 
-    let mut terminal = match Terminal::new(CrosstermBackend::new(io::stdout())) {
-        Ok(t) => t,
-        Err(e) => {
-            drop(guard);
-            eprintln!("{e}");
-            client.shutdown().await;
-            return 1;
-        }
-    };
+    let mut renderer =
+        match Terminal::new(CrosstermBackend::new(io::stdout())).map(RenderOwner::new) {
+            Ok(t) => t,
+            Err(e) => {
+                drop(guard);
+                eprintln!("{e}");
+                client.shutdown().await;
+                return 1;
+            }
+        };
 
     let expanded_workspaces = model
         .workspaces
@@ -1301,6 +1313,9 @@ pub async fn run_async() -> i32 {
         folder_probe_at: None,
         send_requests: Some(send_request_tx),
         stream_reconcile_requests: Some(stream_reconcile_tx),
+        repaint_requested: false,
+        repaint_resize_pending: false,
+        repaint_resize_settle_at: None,
         messages_focused: false,
         messages_session_scoped: true,
         messages_gate: cyclops_ui::RefreshGate::new(),
@@ -1346,7 +1361,9 @@ pub async fn run_async() -> i32 {
     // the render debounce is.
     let mut motion = Motion::new(app.prefs.motion && motion_capable(&app.paint));
     let mut detached = false;
-    let _ = draw(&mut terminal, &mut app, &mut motion, Instant::now());
+    if let Err(error) = renderer.frame(&mut app, &mut motion, Instant::now()) {
+        log_err(&app.home, &error);
+    }
     while !detached {
         // Every iteration, because everything that turns the file panel on
         // is somewhere else: the sidebar reopening, the tab going back to
@@ -1356,17 +1373,22 @@ pub async fn run_async() -> i32 {
         // on screen, so asking every time is both cheaper to reason about
         // and the only version that cannot go stale.
         arm_files_probe(&mut app);
-        let next_deadline = [
+        let next_deadline = soonest([
             debounce,
             reconnect_deadline,
             app.folder_probe_at,
             app.files_probe_at,
             app.notice.deadline(),
             motion.deadline(),
-        ]
-        .into_iter()
-        .flatten()
-        .min();
+            // The resize settle window is a one-shot deadline like every
+            // other entry here. Each arriving resize REPLACES it, so a
+            // drag slides one deadline rather than queueing many, and the
+            // loop wakes once when the burst has stopped. It must never
+            // be answered by re-arming the render beat: that would be a
+            // deadline rescheduling itself, which is the definition of a
+            // poll and is exactly what INVARIANTS forbids.
+            app.repaint_resize_settle_at,
+        ]);
         if pending_input.is_some() && input_capacity.is_none() {
             input_capacity = Some(Box::pin(client.reserve_input_capacity()));
         } else if pending_input.is_none() {
@@ -1414,6 +1436,9 @@ pub async fn run_async() -> i32 {
                 );
                 while tmux_rx.try_recv().is_ok() {}
                 app.needs_forced_hydrate = true;
+                // Byte continuity was lost, and the host surface may have lost
+                // frame continuity with it.
+                app.repaint_requested = true;
                 app.hit_map.clear();
                 let repair = reconcile(&mut app, &client).await;
                 let during_repair = retire_pane_input_segment(
@@ -1523,6 +1548,9 @@ pub async fn run_async() -> i32 {
                 // draw below so a motion frame and a render deadline that
                 // came due together collapse into one draw.
                 let motion_frame = motion.tick(now);
+                if apply_settled_resize(&mut app, &client, now).await {
+                    arm(&mut debounce);
+                }
                 if debounce.is_some_and(|deadline| deadline <= now) {
                     debounce = None;
                     let resize_applied = match apply_live_divider(&mut app, &client).await {
@@ -1552,12 +1580,16 @@ pub async fn run_async() -> i32 {
                     if let Some(watch) = theme_watch.as_mut() {
                         refresh_theme_watch(&mut app, watch);
                     }
-                    let _ = draw(&mut terminal, &mut app, &mut motion, now);
+                    if let Err(error) = renderer.frame(&mut app, &mut motion, now) {
+                        log_err(&app.home, &error);
+                    }
                 } else if notice_expired || motion_frame {
                     // Nothing else is due: the expiry or the fade is the
                     // only reason this frame exists, and it owes exactly
                     // one.
-                    let _ = draw(&mut terminal, &mut app, &mut motion, now);
+                    if let Err(error) = renderer.frame(&mut app, &mut motion, now) {
+                        log_err(&app.home, &error);
+                    }
                 }
                 if app.folder_probe_at.is_some_and(|due| due <= now) {
                     app.folder_probe_at = None;
@@ -1572,7 +1604,9 @@ pub async fn run_async() -> i32 {
                     // redrawing on each of those would be a workspace that
                     // repaints forever over a folder nobody touched.
                     if probe_files(&mut app, &client).await {
-                        let _ = draw(&mut terminal, &mut app, &mut motion, Instant::now());
+                        if let Err(error) = renderer.frame(&mut app, &mut motion, Instant::now()) {
+                            log_err(&app.home, &error);
+                        }
                     }
                 }
                 if reconnect_deadline.is_some_and(|deadline| deadline <= now) {
@@ -1616,13 +1650,15 @@ pub async fn run_async() -> i32 {
                     // the server, so `now` is stale by the time this frame
                     // is composed and the clock would date its fades to
                     // before the work.
-                    let _ = draw(&mut terminal, &mut app, &mut motion, Instant::now());
+                    if let Err(error) = renderer.frame(&mut app, &mut motion, Instant::now()) {
+                        log_err(&app.home, &error);
+                    }
                 }
             }
         }
     }
 
-    drop(terminal);
+    drop(renderer);
     drop(guard);
     client.shutdown().await;
     if detached {
@@ -2337,6 +2373,9 @@ async fn handle_reconnect(
             // The gap this flag exists for: %output missed while the link
             // was down, with no size change to mark any pane stale.
             app.needs_forced_hydrate = true;
+            // Byte continuity was lost, and the host surface may have lost
+            // frame continuity with it.
+            app.repaint_requested = true;
             if let Err(error) = reconcile(app, client).await {
                 app.reconnect_attempt += 1;
                 schedule_reconnect(app, reconnect_deadline);
@@ -2533,6 +2572,19 @@ impl App {
     /// are comfort, and no preference is worth interrupting the operator's
     /// session over. Every save goes through here so that trade-off is
     /// decided once.
+    /// A chrome surface appeared, vanished, or changed the space it owns.
+    ///
+    /// The cells the previous layout occupied still hold its glyphs until
+    /// something writes them, and a diff frame writes only what the new
+    /// layout believes changed, so a collapsed sidebar or drawer can leave
+    /// its own contents behind. Named rather than folded into
+    /// `resize_client` because telling tmux a new size and repainting a
+    /// surface are different jobs, and one of the four topology mutations
+    /// does not resize at all.
+    pub(crate) fn layout_changed(&mut self) {
+        self.repaint_requested = true;
+    }
+
     fn save_prefs_or_log(&self) {
         if let Err(error) = persist::save_prefs(&self.home, &self.prefs) {
             log_err(&self.home, &error);
@@ -3082,6 +3134,9 @@ async fn handle_app_msg(
                 // re-emits the theme's ground even though it has not
                 // changed since focus left.
                 app.window_bg = None;
+                // Another program owned this surface while focus was away
+                // and may have written over it.
+                app.repaint_requested = true;
                 arm(debounce);
             } else {
                 // Immediately, not on a frame: an unfocused workspace may
@@ -3099,8 +3154,16 @@ async fn handle_app_msg(
         AppMsg::Resized(w, h) => {
             app.term_size = (w, h);
             app.hit_map.clear();
-            resize_client(app, client).await;
-            arm(debounce);
+            // Bookkeeping only. A drag delivers a resize per host frame,
+            // and answering each one would cost a `resize-pane` round trip
+            // that reflows every agent's TUI plus a full repaint that
+            // clears and rewrites the surface. Both belong to the burst
+            // rather than to its events, so this records the latest size,
+            // drops geometry that described the old one, and slides the
+            // one-shot settle deadline. `apply_settled_resize` owns the
+            // single resize and the single repaint when it expires.
+            app.repaint_resize_pending = true;
+            app.repaint_resize_settle_at = Some(Instant::now() + RESIZE_SETTLE);
         }
         AppMsg::Reconcile => {
             app.needs_reconcile = true;
@@ -3168,6 +3231,9 @@ async fn handle_app_msg(
                     resize_client(app, client).await;
                     app.needs_hydrate = true;
                     app.hit_map.clear();
+                    // tmux moved a seam under us, so the cells the old
+                    // split owned are not the cells the new one does.
+                    app.layout_changed();
                 }
             } else {
                 app.needs_reconcile = true;
@@ -3595,9 +3661,16 @@ async fn settle_lost_release(app: &mut App, client: &ControlClient) -> bool {
             match drag.target {
                 DragTarget::Sidebar | DragTarget::Messages => {
                     app.save_prefs_or_log();
+                    // Same commit as a release the app actually saw, so
+                    // the same topology epoch: the panel is keeping the
+                    // width the preview left it at.
+                    app.layout_changed();
                     resize_client(app, client).await;
                 }
-                DragTarget::SidebarSplit => app.save_prefs_or_log(),
+                DragTarget::SidebarSplit => {
+                    app.save_prefs_or_log();
+                    app.layout_changed();
+                }
                 _ => {}
             }
         }
@@ -3622,6 +3695,14 @@ fn cancel_drag(app: &mut App) {
             // The Messages divider follows the same preview contract as
             // the sidebar: Escape restores the width from mouse-down.
             app.prefs.messages_width = width;
+        }
+        // A cancelled chrome drag snaps a panel back to where it started,
+        // which vacates every column the preview had taken.
+        if matches!(
+            drag.target,
+            DragTarget::Sidebar | DragTarget::Messages | DragTarget::SidebarSplit
+        ) {
+            app.layout_changed();
         }
     }
 }
@@ -4235,6 +4316,9 @@ async fn handle_mouse(
                 app.prefs.sidebar_width =
                     crate::render::sidebar_width_for_column(col, app.term_size.0);
                 app.save_prefs_or_log();
+                // The panel settled at a new width, so the columns it gave
+                // up or took belong to a different surface now.
+                app.layout_changed();
                 resize_client(app, client).await;
             }
             let messages_drag = app.drag.as_ref().is_some_and(|drag| {
@@ -4244,6 +4328,7 @@ async fn handle_mouse(
                 app.prefs.messages_width =
                     crate::render::messages_width_for_column(col, app.term_size.0);
                 app.save_prefs_or_log();
+                app.layout_changed();
                 resize_client(app, client).await;
             }
             let split_drag = app.drag.as_ref().is_some_and(|drag| {
@@ -4251,6 +4336,7 @@ async fn handle_mouse(
             });
             if split_drag {
                 app.prefs.files_rows = files_rows_for_row(app, row);
+                app.layout_changed();
                 // No `resize_client`: this seam is inside the sidebar, so
                 // no column changed hands and no pane reflows.
                 app.save_prefs_or_log();
@@ -5265,6 +5351,9 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
         app.prefs.sidebar_visible,
         app.prefs.messages_visible,
     );
+    // An authoritative replacement: panes may have appeared, closed,
+    // moved window, or changed proportion since the frame on screen.
+    app.layout_changed();
     expand_active_workspace(
         &app.model.workspaces,
         app.model.active_workspace,
@@ -5406,6 +5495,11 @@ fn install_reconciled_model(
     sidebar_visible: bool,
     messages_visible: bool,
 ) {
+    // The one place a whole model is replaced by a fresh snapshot, so it
+    // is the one place that knows the layout on screen may no longer be
+    // the layout that was drawn. Panes may have appeared, closed, moved
+    // window, or changed proportion, and a diff frame writes only what
+    // the new model believes changed.
     fresh.sidebar_visible = sidebar_visible;
     fresh.messages_visible = messages_visible;
     *current = fresh;
@@ -5627,6 +5721,137 @@ async fn handle_dialog_key(
 /// reading. `observe` runs first and is the only place an animation starts;
 /// see `crate::animate` for why arming is a diff rather than a call at each
 /// site.
+/// How long a host resize must stop arriving before tmux is told.
+///
+/// A pointer drag on a window edge delivers a resize per frame the host
+/// renders, roughly every 16ms at 60Hz, so anything at or below that
+/// settles mid-drag and sends again. Three of those is the smallest
+/// window that cannot, and 50ms is imperceptible once the drag stops.
+/// Not a poll: it only decides whether the beat that already runs may
+/// send yet.
+const RESIZE_SETTLE: Duration = Duration::from_millis(50);
+
+/// Answer a resize burst that has stopped moving: one tmux call and one
+/// repaint, at the size the drag ended on.
+///
+/// Answered by its own one-shot deadline rather than by the render beat,
+/// and nothing re-arms it: each arriving resize replaces the deadline and
+/// expiry clears it, so a drag of any length costs one wake, one
+/// `resize-pane`, and one full repaint however many events the host sent.
+/// Returns whether it acted, which is the caller's cue to draw the frame
+/// the repaint asked for.
+async fn apply_settled_resize(app: &mut App, client: &ControlClient, now: Instant) -> bool {
+    if !resize_due(
+        app.repaint_resize_pending,
+        app.repaint_resize_settle_at,
+        now,
+    ) {
+        return false;
+    }
+    app.repaint_resize_pending = false;
+    app.repaint_resize_settle_at = None;
+    // The host reflowed what it kept, so cells the old layout owned may
+    // still hold its glyphs. One epoch for the whole burst.
+    app.layout_changed();
+    resize_client(app, client).await;
+    true
+}
+
+/// The soonest of the loop's one-shot deadlines, or none when the loop has
+/// nothing to wake for.
+///
+/// Named so the selection can be exercised: every entry is a one-shot that
+/// its own event replaces, and answering one clears it. Nothing here may
+/// be re-armed by the wake it caused, which is what keeps an idle
+/// workspace genuinely idle.
+fn soonest<const N: usize>(candidates: [Option<Instant>; N]) -> Option<Instant> {
+    candidates.into_iter().flatten().min()
+}
+
+/// Whether a pending resize has stopped moving and may go to tmux.
+///
+/// Pure so the coalescing rule can be exercised against an explicit clock
+/// rather than a sleep: a burst re-arms `settle_at`, and only the first
+/// beat after the burst stops answers true.
+fn resize_due(pending: bool, settle_at: Option<Instant>, now: Instant) -> bool {
+    pending && settle_at.is_some_and(|at| now >= at)
+}
+
+/// The one owner of the host terminal surface.
+///
+/// Ratatui draws by diffing against the frame it believes it last wrote.
+/// That belief is only true if every write reached the terminal, and the
+/// workspace used to discard the `io::Result` at every draw site, so a
+/// failed or partial write left the remembered baseline ahead of the
+/// pixels the user could see. Nothing ever reconciled the difference, so
+/// corrupted cells stayed corrupted until something else happened to
+/// rewrite them. That is the whole mechanism behind garbled text that
+/// persists.
+///
+/// This owner makes the repair edge-driven and explicit. A repaint is
+/// requested at the moments frame continuity is known to break, and the
+/// next frame then invalidates the baseline and writes every cell once.
+/// There is no periodic clear and no redraw loop: an idle workspace still
+/// writes nothing.
+///
+/// It deliberately owns nothing else. It does not know about panes,
+/// messages, vendors, or the daemon, and a repaint changes no application
+/// state.
+struct RenderOwner<B: Backend> {
+    terminal: Terminal<B>,
+    /// The next frame must write every cell rather than a diff. Set here
+    /// on a failed write, and requested from anywhere else through
+    /// `App::repaint_requested`, so there is one way to ask and one place
+    /// that decides.
+    repaint_pending: bool,
+}
+
+impl<B: Backend> RenderOwner<B> {
+    /// Starts pending: the first frame of a session has no baseline worth
+    /// diffing against.
+    fn new(terminal: Terminal<B>) -> Self {
+        Self {
+            terminal,
+            repaint_pending: true,
+        }
+    }
+
+    /// Draw one frame, repainting in full when an epoch is pending.
+    ///
+    /// Every failure takes the same exit, and that is the point of the
+    /// split below: invalidating the baseline can fail exactly like
+    /// writing the frame can, and an early return from the clear would
+    /// leave a hit map describing a frame that was never delivered. So
+    /// `paint` is allowed to fail anywhere and `frame` owns what a failure
+    /// means: drop the geometry, because a click resolved against it would
+    /// answer for pixels nobody saw, and re-arm the epoch, because the
+    /// surface is now in a state this renderer cannot describe.
+    fn frame(&mut self, app: &mut App, motion: &mut Motion, now: Instant) -> Result<(), B::Error> {
+        if std::mem::take(&mut app.repaint_requested) {
+            self.repaint_pending = true;
+        }
+        match self.paint(app, motion, now) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                app.hit_map.clear();
+                self.repaint_pending = true;
+                Err(error)
+            }
+        }
+    }
+
+    /// The two writes one frame makes, in order. The epoch clears only
+    /// once it has actually been delivered, so a clear that failed is
+    /// still pending for the next frame.
+    fn paint(&mut self, app: &mut App, motion: &mut Motion, now: Instant) -> Result<(), B::Error> {
+        if self.repaint_pending {
+            self.terminal.clear()?;
+            self.repaint_pending = false;
+        }
+        draw(&mut self.terminal, app, motion, now)
+    }
+}
+
 fn draw<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -5996,6 +6221,360 @@ mod tests {
         assert!(!is_prefix_key(&up));
     }
 
+    use ratatui::backend::TestBackend;
+
+    /// The repair the whole slice exists for: a failed write must not
+    /// leave the renderer believing it painted the frame the user is
+    /// looking at, and it must not leave hit geometry describing pixels
+    /// nobody saw. A backend that fails once, then succeeds, proves both
+    /// halves in one pass.
+    #[derive(Debug)]
+    struct FlakyBackend {
+        inner: TestBackend,
+        fail_next_flush: bool,
+        /// Fails the first backend call `Terminal::clear` makes, which is
+        /// the cursor query it snapshots before invalidating the baseline.
+        /// That is how the clear half of `paint` is exercised: the
+        /// observable failure has to happen inside the `?` on
+        /// `terminal.clear()`, and the clear itself is not reached in this
+        /// harness.
+        fail_next_clear: bool,
+        /// Cells handed to the backend across every frame. Ratatui writes
+        /// only what differs from its remembered buffer, so this is the
+        /// observable that separates a repaint from a diff: an epoch
+        /// rewrites the surface, an unchanged frame writes nothing.
+        cells_written: usize,
+    }
+
+    /// `TestBackend` cannot fail, so a wrapper is the only way to exercise
+    /// the path that matters. Delegation is mechanical; the one behaviour
+    /// under test is the single failing flush.
+    impl Backend for FlakyBackend {
+        type Error = io::Error;
+
+        fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            let mut counted = 0usize;
+            let content = content.inspect(|_| counted += 1);
+            let result = self.inner.draw(content).map_err(|e| match e {});
+            self.cells_written += counted;
+            result
+        }
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            self.inner.hide_cursor().map_err(|e| match e {})
+        }
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.inner.show_cursor().map_err(|e| match e {})
+        }
+        fn get_cursor_position(&mut self) -> io::Result<ratatui::layout::Position> {
+            if std::mem::take(&mut self.fail_next_clear) {
+                return Err(io::Error::other("host clear failed"));
+            }
+            self.inner.get_cursor_position().map_err(|e| match e {})
+        }
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            position: P,
+        ) -> io::Result<()> {
+            self.inner
+                .set_cursor_position(position)
+                .map_err(|e| match e {})
+        }
+        fn clear(&mut self) -> io::Result<()> {
+            self.inner.clear().map_err(|e| match e {})
+        }
+        fn clear_region(&mut self, region: ratatui::backend::ClearType) -> io::Result<()> {
+            self.inner.clear_region(region).map_err(|e| match e {})
+        }
+        fn size(&self) -> io::Result<ratatui::layout::Size> {
+            self.inner.size().map_err(|e| match e {})
+        }
+        fn window_size(&mut self) -> io::Result<ratatui::backend::WindowSize> {
+            self.inner.window_size().map_err(|e| match e {})
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if std::mem::take(&mut self.fail_next_flush) {
+                return Err(io::Error::other("host write failed"));
+            }
+            self.inner.flush().map_err(|e| match e {})
+        }
+    }
+
+    #[test]
+    fn a_failed_frame_rearms_a_full_repaint_and_drops_hit_geometry() {
+        let backend = FlakyBackend {
+            inner: TestBackend::new(80, 24),
+            fail_next_flush: true,
+            fail_next_clear: false,
+            cells_written: 0,
+        };
+        let mut renderer = RenderOwner::new(Terminal::new(backend).expect("terminal"));
+        let mut app = test_app(
+            one_pane_model(),
+            cyclops_proto::scratch::scratch_dir("render-owner-failed-frame"),
+        );
+        let mut motion = Motion::new(false);
+
+        // The boot frame is pending by construction and this one fails.
+        assert!(renderer.repaint_pending, "a fresh surface has no baseline");
+        let first = renderer.frame(&mut app, &mut motion, Instant::now());
+        assert!(first.is_err(), "the backend was told to fail this write");
+        assert!(
+            renderer.repaint_pending,
+            "a frame that did not reach the terminal must re-arm a full repaint"
+        );
+        assert!(
+            app.hit_map.hit(0, 0).is_none(),
+            "hit geometry outlived the frame it described"
+        );
+
+        // The next frame succeeds and clears the epoch.
+        renderer
+            .frame(&mut app, &mut motion, Instant::now())
+            .expect("second frame writes");
+        assert!(
+            !renderer.repaint_pending,
+            "a delivered frame leaves nothing pending"
+        );
+    }
+
+    /// The other half of the same contract: invalidating the baseline can
+    /// fail exactly like writing the frame can, and it must take the same
+    /// exit. An early return from the clear would leave a hit map
+    /// describing a frame that was never delivered and would clear the
+    /// epoch that had not actually happened.
+    #[test]
+    fn a_failed_clear_takes_the_same_exit_as_a_failed_write() {
+        let mut renderer = RenderOwner::new(
+            Terminal::new(FlakyBackend {
+                inner: ratatui::backend::TestBackend::new(60, 20),
+                fail_next_flush: false,
+                fail_next_clear: true,
+                cells_written: 0,
+            })
+            .expect("terminal"),
+        );
+        let home = cyclops_proto::scratch::scratch_dir("render-owner-failed-clear");
+        let mut app = test_app(one_pane_model(), home.clone());
+        let mut motion = Motion::new(false);
+
+        assert!(renderer.repaint_pending, "boot has no baseline");
+        // Seed geometry that a click could resolve against, so the
+        // assertion below is about the drop rather than about an empty
+        // map that was never populated.
+        app.hit_map.push(
+            Rect::new(0, 0, 4, 1),
+            HitTarget::PaneBody {
+                pane_id: "%0".to_string(),
+            },
+        );
+        assert!(
+            app.hit_map.hit(0, 0).is_some(),
+            "the seeded hit target must exist before the failure"
+        );
+        let first = renderer.frame(&mut app, &mut motion, Instant::now());
+        assert!(
+            first.is_err(),
+            "the backend was told to fail inside terminal.clear()"
+        );
+        assert!(
+            renderer.repaint_pending,
+            "a clear that failed left the epoch spent"
+        );
+        assert!(
+            app.hit_map.hit(0, 0).is_none(),
+            "hit geometry outlived a frame that was never delivered"
+        );
+
+        renderer
+            .frame(&mut app, &mut motion, Instant::now())
+            .expect("the next frame clears and draws");
+        assert!(!renderer.repaint_pending);
+        assert!(
+            renderer.terminal.backend().cells_written > 0,
+            "the recovered frame wrote nothing"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// Anything may ask for a repaint through `App`, and the renderer
+    /// drains that request exactly once.
+    #[test]
+    fn a_requested_repaint_is_consumed_by_the_next_frame() {
+        let mut renderer = RenderOwner::new(
+            Terminal::new(FlakyBackend {
+                inner: TestBackend::new(40, 12),
+                fail_next_flush: false,
+                fail_next_clear: false,
+                cells_written: 0,
+            })
+            .expect("terminal"),
+        );
+        let mut app = test_app(
+            one_pane_model(),
+            cyclops_proto::scratch::scratch_dir("render-owner-requested"),
+        );
+        let mut motion = Motion::new(false);
+        renderer
+            .frame(&mut app, &mut motion, Instant::now())
+            .expect("boot frame");
+
+        app.repaint_requested = true;
+        renderer
+            .frame(&mut app, &mut motion, Instant::now())
+            .expect("repaint frame");
+        assert!(
+            !app.repaint_requested,
+            "the request must be drained, not left to repaint every frame"
+        );
+        assert!(!renderer.repaint_pending);
+        let after_repaint = renderer.terminal.backend().cells_written;
+        assert!(
+            after_repaint > 0,
+            "the repaint frame wrote nothing to the surface"
+        );
+
+        // Nothing changed, so an ordinary frame is a diff and writes
+        // nothing. That is what makes the epoch meaningful: without one,
+        // a surface the host corrupted would never be rewritten.
+        renderer
+            .frame(&mut app, &mut motion, Instant::now())
+            .expect("diff frame");
+        assert_eq!(
+            renderer.terminal.backend().cells_written,
+            after_repaint,
+            "an unchanged frame must write no cells"
+        );
+
+        // And asking again rewrites the surface.
+        app.repaint_requested = true;
+        renderer
+            .frame(&mut app, &mut motion, Instant::now())
+            .expect("second repaint");
+        assert!(
+            renderer.terminal.backend().cells_written > after_repaint,
+            "a requested repaint must rewrite the surface"
+        );
+    }
+
+    /// The whole resize contract, driven through the real event handler
+    /// and the real settle seam rather than by mutating fields: a drag
+    /// costs zero tmux calls and zero full repaints while it is moving,
+    /// then exactly one of each at the size it ended on.
+    ///
+    /// `declared_client_size` is the observable for the tmux call, because
+    /// only a successful `resize_client` sets it.
+    #[tokio::test]
+    async fn a_resize_burst_costs_one_call_and_one_repaint_at_the_final_size() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-resize-burst");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "120",
+            "-y",
+            "40",
+            "/bin/sh",
+        ]);
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (mut client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-resize-burst-home");
+        let mut app = test_app(one_pane_model(), home.clone());
+        app.model.session.session = "s".to_string();
+        app.term_size = (120, 40);
+        app.repaint_requested = false;
+        assert!(app.declared_client_size.is_none(), "nothing declared yet");
+
+        let mut debounce = None;
+        let mut reconnect_deadline = None;
+        let mut detached = false;
+        let mut pending_input = None;
+        let mut previous_settle: Option<Instant> = None;
+
+        for size in [(118u16, 40u16), (112, 40), (104, 40), (96, 40)] {
+            handle_app_msg(
+                Some(AppMsg::Resized(size.0, size.1)),
+                &mut app,
+                &mut client,
+                &mut debounce,
+                &mut reconnect_deadline,
+                &mut detached,
+                &mut pending_input,
+            )
+            .await;
+
+            assert_eq!(app.term_size, size, "the latest size must win");
+            assert!(
+                !app.repaint_requested,
+                "an event inside the burst asked for a full repaint"
+            );
+            assert!(
+                app.declared_client_size.is_none(),
+                "an event inside the burst sent tmux an intermediate size"
+            );
+            let settle = app
+                .repaint_resize_settle_at
+                .expect("a resize arms the settle deadline");
+            if let Some(previous) = previous_settle {
+                assert!(settle > previous, "the deadline must slide, not queue");
+            }
+            previous_settle = Some(settle);
+            assert_eq!(
+                soonest([debounce, app.repaint_resize_settle_at]),
+                app.repaint_resize_settle_at,
+                "the settle deadline must be what the loop wakes for"
+            );
+        }
+
+        let settle = previous_settle.expect("armed");
+        assert!(
+            !apply_settled_resize(&mut app, &client, settle - Duration::from_millis(1)).await,
+            "the burst was answered before it settled"
+        );
+        assert!(app.declared_client_size.is_none());
+        assert!(!app.repaint_requested);
+
+        assert!(
+            apply_settled_resize(&mut app, &client, settle).await,
+            "the settled burst was not answered"
+        );
+        assert!(app.repaint_requested, "the burst asked for no repaint");
+        let declared = app
+            .declared_client_size
+            .expect("the settled burst told tmux nothing");
+        assert!(
+            declared.0 <= 96,
+            "tmux was told a size from inside the burst: {declared:?}"
+        );
+        assert_eq!(
+            app.repaint_resize_settle_at, None,
+            "the deadline outlived it"
+        );
+
+        app.repaint_requested = false;
+        assert!(
+            !apply_settled_resize(&mut app, &client, settle + RESIZE_SETTLE).await,
+            "a drained burst answered twice"
+        );
+        assert!(!app.repaint_requested);
+        assert_eq!(app.declared_client_size, Some(declared));
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
     fn test_app(model: WorkspaceModel, home: std::path::PathBuf) -> App {
         App {
             model,
@@ -6049,6 +6628,9 @@ mod tests {
             folder_probe_at: None,
             send_requests: None,
             stream_reconcile_requests: None,
+            repaint_requested: false,
+            repaint_resize_pending: false,
+            repaint_resize_settle_at: None,
             messages_focused: false,
             messages_session_scoped: true,
             messages_gate: cyclops_ui::RefreshGate::new(),
@@ -6510,6 +7092,529 @@ mod tests {
         assert!(!app.prefs.messages_visible);
         assert!(!app.messages_focused);
         client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// Every chrome topology change must ask for a repaint. A diff frame
+    /// writes only what the new layout believes changed, so a surface that
+    /// vanished leaves its own glyphs behind: the sidebar's rows, the
+    /// drawer's messages, the tab strip. This is the epoch that was
+    /// missing when the owner first landed.
+    #[tokio::test]
+    async fn every_layout_topology_change_requests_one_repaint() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-topology-epoch");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "/bin/sh",
+        ]);
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-topology-epoch-home");
+        let mut app = test_app(one_pane_model(), home.clone());
+        app.term_size = (80, 24);
+
+        let tab = app.model.active_tab().window_id.clone();
+        for action in [
+            crate::action::Action::ToggleSidebar,
+            crate::action::Action::ToggleMessages,
+            crate::action::Action::ToggleTabBar,
+            crate::action::Action::ToggleFiles,
+            crate::action::Action::SelectTab {
+                window_id: tab.clone(),
+            },
+            crate::action::Action::NewTab { name: None },
+            crate::action::Action::CloseTab { window_id: tab },
+        ] {
+            app.repaint_requested = false;
+            // A tab action may legitimately fail against a rig session
+            // that has already lost the window; the epoch is the contract
+            // under test, not the tmux outcome.
+            let _ = exec::execute(&mut app, &client, action.clone()).await;
+            assert!(
+                app.repaint_requested,
+                "{action:?} changed the layout without asking for a repaint"
+            );
+        }
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// Render one app at one size through its own owner, and hand back the
+    /// buffer. The comparison the resize and bleed tests make is only
+    /// meaningful against a frame that never saw the other state.
+    fn clean_frame(app: &mut App, cols: u16, rows: u16) -> ratatui::buffer::Buffer {
+        let mut renderer = RenderOwner::new(
+            Terminal::new(FlakyBackend {
+                inner: ratatui::backend::TestBackend::new(cols, rows),
+                fail_next_flush: false,
+                fail_next_clear: false,
+                cells_written: 0,
+            })
+            .expect("terminal"),
+        );
+        let mut motion = Motion::new(false);
+        renderer
+            .frame(app, &mut motion, Instant::now())
+            .expect("clean frame");
+        renderer.terminal.backend().inner.buffer().clone()
+    }
+
+    /// Shrinking then growing must land on exactly the frame a workspace
+    /// that opened at the final size would have drawn. A diff frame has no
+    /// reason to rewrite cells the smaller layout never touched, so without
+    /// the resize epoch the grown frame keeps whatever the host left there.
+    #[test]
+    fn a_resize_down_then_up_matches_a_clean_render_at_the_final_size() {
+        let home = cyclops_proto::scratch::scratch_dir("render-owner-resize-roundtrip");
+        let mut motion = Motion::new(false);
+        let mut app = test_app(one_pane_model(), home.clone());
+        app.term_size = (80, 24);
+        let mut renderer = RenderOwner::new(
+            Terminal::new(FlakyBackend {
+                inner: ratatui::backend::TestBackend::new(80, 24),
+                fail_next_flush: false,
+                fail_next_clear: false,
+                cells_written: 0,
+            })
+            .expect("terminal"),
+        );
+        renderer
+            .frame(&mut app, &mut motion, Instant::now())
+            .expect("first frame");
+
+        for (cols, rows) in [(48u16, 14u16), (80, 24)] {
+            renderer.terminal.backend_mut().inner.resize(cols, rows);
+            app.term_size = (cols, rows);
+            // What `AppMsg::Resized` does, without the tmux round trip.
+            app.repaint_requested = true;
+            renderer
+                .frame(&mut app, &mut motion, Instant::now())
+                .expect("resized frame");
+        }
+
+        let mut fresh = test_app(one_pane_model(), home.clone());
+        fresh.term_size = (80, 24);
+        assert_eq!(
+            renderer.terminal.backend().inner.buffer(),
+            &clean_frame(&mut fresh, 80, 24),
+            "the grown frame kept cells from the smaller layout"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// Focus regain asks for a repaint, and asks exactly once: another
+    /// program owned the surface while focus was away, and the request is
+    /// drained by the frame that answers it rather than repainting forever.
+    #[tokio::test]
+    async fn focus_regain_requests_exactly_one_repaint() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-focus-epoch");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "/bin/sh",
+        ]);
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (mut client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-focus-epoch-home");
+        let mut app = test_app(one_pane_model(), home.clone());
+        app.term_size = (80, 24);
+        app.repaint_requested = false;
+        let mut debounce = None;
+        let mut reconnect_deadline = None;
+        let mut detached = false;
+        let mut pending_input = None;
+
+        handle_app_msg(
+            Some(AppMsg::Focus(true)),
+            &mut app,
+            &mut client,
+            &mut debounce,
+            &mut reconnect_deadline,
+            &mut detached,
+            &mut pending_input,
+        )
+        .await;
+        assert!(app.repaint_requested, "focus regain must ask for a repaint");
+
+        // One frame answers it and nothing repaints after that. The
+        // reconnect epoch (`handle_reconnect`) shares this same single
+        // drain, which is what makes "exactly one" true for both.
+        let mut renderer = RenderOwner::new(
+            Terminal::new(FlakyBackend {
+                inner: ratatui::backend::TestBackend::new(80, 24),
+                fail_next_flush: false,
+                fail_next_clear: false,
+                cells_written: 0,
+            })
+            .expect("terminal"),
+        );
+        let mut motion = Motion::new(false);
+        renderer
+            .frame(&mut app, &mut motion, Instant::now())
+            .expect("frame");
+        assert!(!app.repaint_requested, "the request outlived its frame");
+        let after = renderer.terminal.backend().cells_written;
+        renderer
+            .frame(&mut app, &mut motion, Instant::now())
+            .expect("frame");
+        assert_eq!(
+            renderer.terminal.backend().cells_written,
+            after,
+            "focus regain repainted more than once"
+        );
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A reconnect is a frame-continuity break as much as a byte one: the
+    /// old control client is gone, the model is rebuilt, and the surface
+    /// on screen was drawn against a connection that no longer exists.
+    /// This drives the real `handle_reconnect` rather than asserting a
+    /// comment, and pins that it asks exactly once.
+    #[tokio::test]
+    async fn a_reconnect_requests_exactly_one_repaint() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-reconnect-epoch");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "/bin/sh",
+        ]);
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (mut client, _rx) = ControlClient::spawn(cfg.clone()).await.expect("attach");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-reconnect-epoch-home");
+        let mut app = test_app(one_pane_model(), home.clone());
+        app.model.session.session = "s".to_string();
+        app.term_size = (80, 24);
+        app.repaint_requested = false;
+
+        let (tmux_tx, _tmux_rx) = mpsc::channel(8);
+        let (stream_tx, _stream_rx) = mpsc::channel(8);
+        let (continuity_tx, _continuity_rx) = mpsc::channel(1);
+        let sinks = AppSinks {
+            tmux: tmux_tx,
+            stream: stream_tx,
+            continuity: continuity_tx,
+        };
+        let mut deadline = None;
+
+        handle_reconnect(&mut app, &mut client, &cfg, &sinks, &mut deadline)
+            .await
+            .expect("reconnect to the live rig");
+        assert!(app.repaint_requested, "a reconnect must ask for a repaint");
+
+        let mut renderer = RenderOwner::new(
+            Terminal::new(FlakyBackend {
+                inner: ratatui::backend::TestBackend::new(80, 24),
+                fail_next_flush: false,
+                fail_next_clear: false,
+                cells_written: 0,
+            })
+            .expect("terminal"),
+        );
+        let mut motion = Motion::new(false);
+        renderer
+            .frame(&mut app, &mut motion, Instant::now())
+            .expect("frame");
+        assert!(!app.repaint_requested, "the request outlived its frame");
+        let after = renderer.terminal.backend().cells_written;
+        renderer
+            .frame(&mut app, &mut motion, Instant::now())
+            .expect("frame");
+        assert_eq!(
+            renderer.terminal.backend().cells_written,
+            after,
+            "a reconnect repainted more than once"
+        );
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// The repair is a repaint and nothing else. It must not close a
+    /// dialog, move a panel, change a preference, or touch the layout,
+    /// because an operator reaches for it when the screen is wrong and not
+    /// when they want the workspace rearranged.
+    #[tokio::test]
+    async fn the_repaint_action_repairs_the_surface_without_touching_state() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-redraw-action");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "/bin/sh",
+        ]);
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-redraw-action-home");
+        let mut app = test_app(one_pane_model(), home.clone());
+        app.term_size = (80, 24);
+        let before = (
+            app.model.sidebar_visible,
+            app.model.messages_visible,
+            app.prefs.clone(),
+            app.term_size,
+            app.sidebar_tab,
+        );
+
+        let outcome = exec::execute(&mut app, &client, crate::action::Action::RequestRedraw)
+            .await
+            .expect("redraw");
+
+        assert!(app.repaint_requested, "the action asked for nothing");
+        assert!(!outcome.persist, "a repaint is not a preference change");
+        assert!(!outcome.reconcile, "a repaint is not a model change");
+        assert!(!outcome.detach);
+        assert_eq!(
+            (
+                app.model.sidebar_visible,
+                app.model.messages_visible,
+                app.prefs.clone(),
+                app.term_size,
+                app.sidebar_tab,
+            ),
+            before,
+            "the repaint mutated application state"
+        );
+
+        // The menu row reaches the same action as the chord.
+        let ctx = route_context(&app);
+        assert_eq!(
+            crate::action::route_menu_item(
+                &MenuState::AppMenu,
+                crate::bindings::BindingAction::Redraw,
+                &ctx,
+            ),
+            Some(crate::action::Action::RequestRedraw),
+            "the app-menu Redraw row must reach the same action as Ctrl+B r"
+        );
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// The drawer's own no-stale-glyph equality, the mirror of the
+    /// sidebar's. A vanished drawer owns columns on the other edge, and a
+    /// diff frame has no reason to rewrite them.
+    #[test]
+    fn collapsing_the_drawer_leaves_no_cell_of_it_behind() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-collapse-drawer");
+        let mut motion = Motion::new(false);
+        let mut collapsed = test_app(one_pane_model(), home.clone());
+        collapsed.term_size = (100, 24);
+        collapsed.model.messages_visible = true;
+        let mut renderer = RenderOwner::new(
+            Terminal::new(FlakyBackend {
+                inner: ratatui::backend::TestBackend::new(100, 24),
+                fail_next_flush: false,
+                fail_next_clear: false,
+                cells_written: 0,
+            })
+            .expect("terminal"),
+        );
+        renderer
+            .frame(&mut collapsed, &mut motion, Instant::now())
+            .expect("frame with the drawer");
+        collapsed.model.messages_visible = false;
+        collapsed.layout_changed();
+        renderer
+            .frame(&mut collapsed, &mut motion, Instant::now())
+            .expect("frame after the collapse");
+
+        let mut clean = test_app(one_pane_model(), home.clone());
+        clean.term_size = (100, 24);
+        clean.model.messages_visible = false;
+        assert_eq!(
+            renderer.terminal.backend().inner.buffer(),
+            &clean_frame(&mut clean, 100, 24),
+            "the collapsed frame kept cells the drawer had drawn"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A cancelled chrome drag snaps the panel back to the width it had at
+    /// mouse-down, vacating every column the preview had taken, so it is a
+    /// topology change like any other.
+    #[test]
+    fn cancelling_a_chrome_drag_requests_a_repaint() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-drag-cancel-epoch");
+        for target in [
+            DragTarget::Sidebar,
+            DragTarget::Messages,
+            DragTarget::SidebarSplit,
+        ] {
+            let mut app = test_app(one_pane_model(), home.clone());
+            app.term_size = (100, 24);
+            app.repaint_requested = false;
+            let mut drag = DragState::on_down(target.clone(), 10, 10);
+            drag.on_move(40, 10);
+            app.drag = Some(drag);
+
+            cancel_drag(&mut app);
+
+            assert!(
+                app.repaint_requested,
+                "cancelling {target:?} vacated columns without asking for a repaint"
+            );
+            assert!(app.drag.is_none());
+        }
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A reconcile replaces the whole model from a fresh snapshot: panes
+    /// may have appeared, closed, moved window, or changed proportion
+    /// since the frame on screen, and a diff frame writes only what the
+    /// new model believes changed.
+    #[tokio::test]
+    async fn an_authoritative_model_replacement_requests_a_repaint() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-reconcile-epoch");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "/bin/sh",
+        ]);
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-reconcile-epoch-home");
+        let mut app = test_app(one_pane_model(), home.clone());
+        app.model.session.session = "s".to_string();
+        app.term_size = (80, 24);
+        app.repaint_requested = false;
+
+        reconcile(&mut app, &client).await.expect("reconcile");
+        assert!(
+            app.repaint_requested,
+            "an authoritative model replacement must ask for a repaint"
+        );
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// Collapsing a surface must leave the frame identical to one rendered
+    /// from a workspace that started collapsed. Anything else is a stale
+    /// cell the diff had no reason to touch.
+    #[test]
+    fn collapsing_the_sidebar_leaves_no_cell_of_it_behind() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-collapse-clean");
+        let mut motion = Motion::new(false);
+
+        // One workspace opens with the sidebar, then collapses it.
+        let mut collapsed = test_app(one_pane_model(), home.clone());
+        collapsed.term_size = (80, 24);
+        collapsed.model.sidebar_visible = true;
+        let mut renderer = RenderOwner::new(
+            Terminal::new(FlakyBackend {
+                inner: ratatui::backend::TestBackend::new(80, 24),
+                fail_next_flush: false,
+                fail_next_clear: false,
+                cells_written: 0,
+            })
+            .expect("terminal"),
+        );
+        renderer
+            .frame(&mut collapsed, &mut motion, Instant::now())
+            .expect("frame with the sidebar");
+        collapsed.model.sidebar_visible = false;
+        collapsed.layout_changed();
+        renderer
+            .frame(&mut collapsed, &mut motion, Instant::now())
+            .expect("frame after the collapse");
+
+        // Another opens already collapsed, and never had a sidebar to
+        // leave behind.
+        let mut clean = test_app(one_pane_model(), home.clone());
+        clean.term_size = (80, 24);
+        clean.model.sidebar_visible = false;
+        let mut clean_renderer = RenderOwner::new(
+            Terminal::new(FlakyBackend {
+                inner: ratatui::backend::TestBackend::new(80, 24),
+                fail_next_flush: false,
+                fail_next_clear: false,
+                cells_written: 0,
+            })
+            .expect("terminal"),
+        );
+        clean_renderer
+            .frame(&mut clean, &mut motion, Instant::now())
+            .expect("clean collapsed frame");
+
+        assert_eq!(
+            renderer.terminal.backend().inner.buffer(),
+            clean_renderer.terminal.backend().inner.buffer(),
+            "the collapsed frame kept cells the sidebar had drawn"
+        );
         let _ = std::fs::remove_dir_all(home);
     }
 
