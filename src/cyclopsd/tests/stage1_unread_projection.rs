@@ -360,3 +360,44 @@ async fn slice1_withdrawal_leaves_message_pending_and_unread() {
         .unwrap();
     assert_eq!(worker_route["unread"], 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slice1_direct_delivery_clears_unread_projection() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+
+    let mut rig = Rig::new("s1direct", CAT_MANIFEST, "cat", "").await;
+    rig.wait_attached(1).await;
+    let pane = rig.pane_ids().await[0].clone();
+
+    let resp = rig
+        .ctl
+        .request(
+            "pane.label",
+            json!({"target": pane, "label": "worker", "manifest": "fix"}),
+        )
+        .await;
+    assert_eq!(resp["result"]["label"], "worker", "{resp}");
+
+    let send = rig
+        .daemon
+        .deliver_payload(
+            "admin",
+            serde_json::from_value(json!({
+                "to": ["worker"],
+                "subject": "Direct",
+                "body": "Direct payload",
+                "client_key": "s1-direct-key"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(send["deliveries"].as_array().unwrap().len(), 1);
+
+    // Direct delivery settles to DeliveredDirect, so unread should clear to 0!
+    wait_for_option(&rig, &pane, "").await;
+    wait_for_border_needle(&rig, &pane, "✉", false).await;
+}

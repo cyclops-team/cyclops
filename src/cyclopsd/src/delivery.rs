@@ -3097,6 +3097,11 @@ fn recover_failed_job(
                         worker.set_fault(format!("direct settlement recovery failed: {error}"));
                         return false;
                     }
+                    let inner_clone = Arc::clone(inner);
+                    let recipient = notification.recipient();
+                    tokio::spawn(async move {
+                        crate::sync_recipient_unread(&inner_clone, recipient).await;
+                    });
                     if let Some(service) = &inner.mailbox {
                         if let Err(error) = crate::messaging::schedule_recipient(
                             inner,
@@ -6423,6 +6428,11 @@ fn record_notification_notified(
         Ok(_) => {
             if handle.notification_transport() == Some(NotificationTransport::DirectPayload) {
                 notification.record_delivered_direct()?;
+                let inner_clone = Arc::clone(inner);
+                let recipient = notification.recipient();
+                tokio::spawn(async move {
+                    crate::sync_recipient_unread(&inner_clone, recipient).await;
+                });
                 if let Some(service) = &inner.mailbox {
                     if let Err(error) = crate::messaging::schedule_recipient(
                         inner,
