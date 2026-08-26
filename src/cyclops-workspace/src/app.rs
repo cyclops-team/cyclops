@@ -3125,6 +3125,11 @@ async fn handle_app_msg(
                 // operator is looking at their own shell right now.
                 crate::term_guard::yield_window_background();
                 app.window_bg = None;
+                // The button, if held, is let go somewhere this app will
+                // never hear about.
+                if settle_lost_release(app, client).await {
+                    arm(debounce);
+                }
             }
         }
         AppMsg::Resized(w, h) => {
@@ -3382,6 +3387,10 @@ async fn handle_app_msg(
             if matches!(mouse.kind, MouseEventKind::Moved)
                 && !app.menu.is_open()
                 && app.dialog.is_none()
+                // Bare motion while something is still picked up is the
+                // release this app never saw; `handle_mouse` settles it.
+                && app.drag.is_none()
+                && !app.selection.is_dragging()
                 && !crate::input::mouse::motion_touches_hover_button(
                     &app.hit_map,
                     app.hover,
@@ -3595,6 +3604,49 @@ mod compose_send_tests {
     }
 }
 
+/// Finish a pickup whose release the workspace never saw.
+///
+/// A button let go outside the terminal, or while focus was elsewhere,
+/// sends no Up here. The next event that can arrive is proof it happened:
+/// bare motion is reported only with no button held, a fresh press cannot
+/// begin while the old one is still down, and a window losing focus takes
+/// the button's release with it. Left in place, the stale pickup finished
+/// on the operator's NEXT click instead: the divider it held was dragged
+/// from wherever the pointer last was to wherever that click landed (the
+/// pane "randomly" resizing), and a selection still being dragged kept the
+/// wheel swallowed over every other pane (scrolling "locked") until a click
+/// happened to land on the right one.
+///
+/// Nothing is applied here. A divider already applied every step it made
+/// while the button was held; the sidebar and drawer widths a drag
+/// previewed stay where the operator left them and are saved, as a release
+/// would have saved them; a selection ends where it stood and is copied,
+/// the same as a release over the pane. Returns whether anything was
+/// settled, which is a frame's worth of change.
+async fn settle_lost_release(app: &mut App, client: &ControlClient) -> bool {
+    let mut settled = false;
+    if let Some(drag) = app.drag.take() {
+        settled = true;
+        if drag.is_active() {
+            match drag.target {
+                DragTarget::Sidebar | DragTarget::Messages => {
+                    app.save_prefs_or_log();
+                    resize_client(app, client).await;
+                }
+                DragTarget::SidebarSplit => app.save_prefs_or_log(),
+                _ => {}
+            }
+        }
+    }
+    if app.selection.is_dragging() {
+        settled = true;
+        if let Some(pane) = app.selection.finish_drag() {
+            copy_selection(app, &pane);
+        }
+    }
+    settled
+}
+
 fn cancel_drag(app: &mut App) {
     if let Some(drag) = app.drag.take() {
         if let Some(width) = crate::render::sidebar_width_on_cancel(&drag, app.term_size.0) {
@@ -3656,6 +3708,7 @@ async fn handle_mouse(
     // arm-side filter drops motion when neither is open.
     if matches!(mouse.kind, MouseEventKind::Moved) {
         app.hover = Some((col, row));
+        settle_lost_release(app, client).await;
         return Ok(());
     }
     // An open dialog owns the mouse: its buttons respond, nothing else.
@@ -3831,6 +3884,13 @@ async fn handle_mouse(
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
+            // A press ends any previous pickup before it can start a new
+            // one: the button cannot go down again while it is still down,
+            // so a drag still held here lost its release. Same guard the
+            // dialog branch has; without it a divider drag that ended
+            // outside the terminal finished on this click instead, with
+            // the whole distance between the two as its resize.
+            settle_lost_release(app, client).await;
             let Some(target) = app.hit_map.hit(col, row).cloned() else {
                 app.close_menu();
                 clear_selection(app);
@@ -5154,6 +5214,11 @@ async fn paste_into_focused_pane(
         return Ok(());
     }
     let pane_id = app.model.active_tab().active_pane.clone();
+    // Paste is pane input just as surely as a keypress. Keep the viewport
+    // contract provider-neutral: an operator pasting at a live prompt must
+    // see that prompt and the resulting output, not remain pinned in the
+    // pane's local history while the bytes land below the fold.
+    snap_pane_to_tail(app, &pane_id);
     let buffer = format!("cyclops-workspace-{}-{}", std::process::id(), app.paste_seq);
     app.paste_seq = app.paste_seq.checked_add(1).ok_or_else(|| {
         cyclops_tmux::TmuxError::Protocol("workspace paste sequence overflow".into())
@@ -5384,6 +5449,29 @@ fn install_reconciled_model(
 
 /// Forward one already-routed input event, retaining its exact target and
 /// key batch when the bounded reply FIFO is temporarily full.
+/// A key typed into a pane means the operator is at its prompt, so the
+/// viewport returns to the live tail first, the way every terminal
+/// emulator does. Without this a pane the wheel had left a few lines back
+/// stayed there: new output kept the view pinned to the history it was
+/// reading, the prompt the keys went to was below the fold, and the pane
+/// read as "locked" until the operator scrolled all the way down by hand.
+/// Returns whether the viewport moved.
+fn snap_pane_to_tail(app: &mut App, pane: &str) -> bool {
+    app.runtimes
+        .get_mut(pane)
+        .is_some_and(|runtime| runtime.scroll_to_tail())
+}
+
+/// A snapped viewport is a visible change even when the keys themselves
+/// earned no frame.
+fn redraw_if_snapped(outcome: InputOutcome, snapped: bool) -> InputOutcome {
+    if snapped && matches!(outcome, InputOutcome::NoRedraw) {
+        InputOutcome::Redraw
+    } else {
+        outcome
+    }
+}
+
 async fn forward_pane_input(
     client: &ControlClient,
     pane: String,
@@ -5479,18 +5567,22 @@ async fn handle_key(
                 crate::input::SelectAllOutcome::ClearLine => {
                     // Cursor to end first, so kill-to-start takes the
                     // whole line no matter where the cursor sat.
-                    return Ok(forward_pane_input(
+                    let snapped = snap_pane_to_tail(app, &pane);
+                    let outcome = forward_pane_input(
                         client,
                         pane,
                         vec!["C-e".to_string(), "C-u".to_string()],
                     )
-                    .await);
+                    .await;
+                    return Ok(redraw_if_snapped(outcome, snapped));
                 }
                 crate::input::SelectAllOutcome::Forward => {}
             }
             let encoded = encode_send_keys(&key);
             if !encoded.is_empty() {
-                return Ok(forward_pane_input(client, pane, encoded).await);
+                let snapped = snap_pane_to_tail(app, &pane);
+                let outcome = forward_pane_input(client, pane, encoded).await;
+                return Ok(redraw_if_snapped(outcome, snapped));
             }
             Ok(InputOutcome::NoRedraw)
         }
@@ -6039,6 +6131,33 @@ mod tests {
             sidebar_visible: true,
             messages_visible: false,
         }
+    }
+
+    #[test]
+    fn any_pane_input_attempt_returns_the_viewport_to_its_live_tail() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-input-snaps-tail");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create scratch home");
+        let mut app = test_app(one_pane_model(), home.clone());
+        let mut runtime = crate::runtime::PaneRuntime::new(40, 6);
+        for line in 0..40 {
+            runtime.feed(format!("line {line}\r\n").as_bytes());
+        }
+        runtime.scroll(-8);
+        assert!(!runtime.at_tail(), "fixture begins in scrollback");
+        app.runtimes.insert("%0".into(), runtime);
+
+        assert!(snap_pane_to_tail(&mut app, "%0"));
+        assert!(app.runtimes.get("%0").expect("runtime").at_tail());
+        assert!(
+            !snap_pane_to_tail(&mut app, "%0"),
+            "a second key or paste at the tail has no viewport work"
+        );
+        assert!(
+            !snap_pane_to_tail(&mut app, "%missing"),
+            "an event cannot move a runtime it does not own"
+        );
+        let _ = std::fs::remove_dir_all(home);
     }
 
     fn current_messages_gate(app: &mut App) {
@@ -8946,6 +9065,149 @@ mod tests {
             after[0].1,
             before[0].1 + 3,
             "the top pane must grow by the dragged rows"
+        );
+        client.shutdown().await;
+    }
+
+    /// The resize the operator reported as random: a divider drag whose
+    /// release the workspace never saw (let go outside the terminal) used
+    /// to finish on the next click anywhere, resizing by the whole distance
+    /// from where the pointer had been to where that click landed. Bare
+    /// motion proves the button is up and settles the drag; so does a fresh
+    /// press. Either way the next click is only a click.
+    #[tokio::test]
+    async fn a_release_the_workspace_never_saw_is_settled_before_the_next_click() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("app-lost-release");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "/bin/sh",
+        ]);
+        server.run_ok(&["split-window", "-v", "-t", "s"]);
+        let heights = |server: &TmuxServer| -> Vec<(String, u16)> {
+            String::from_utf8_lossy(
+                &server
+                    .run(&["list-panes", "-t", "s", "-F", "#{pane_id} #{pane_height}"])
+                    .stdout,
+            )
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                Some((fields.next()?.to_string(), fields.next()?.parse().ok()?))
+            })
+            .collect()
+        };
+        let before = heights(&server);
+        assert_eq!(before.len(), 2);
+        let (top, bottom) = (before[0].0.clone(), before[1].0.clone());
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let mut app = stacked_app_with_painted_hits(
+            &top,
+            &bottom,
+            cyclops_proto::scratch::scratch_dir("app-lost-release-home"),
+        );
+        let mut detached = false;
+        let body_row = (0..12)
+            .find(|&y| {
+                matches!(
+                    app.hit_map.hit(20, y),
+                    Some(HitTarget::PaneBody { pane_id }) if *pane_id == bottom
+                )
+            })
+            .expect("the bottom pane paints a body");
+
+        // One resize, applied while the button was held, exactly as the
+        // render debounce applies it.
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+        ] {
+            let row = if matches!(kind, MouseEventKind::Down(_)) {
+                5
+            } else {
+                8
+            };
+            handle_mouse(&mut app, &client, mouse_at(kind, 20, row), &mut detached)
+                .await
+                .expect("press and drag");
+        }
+        apply_live_divider(&mut app, &client)
+            .await
+            .expect("the held drag applies");
+        let resized = heights(&server);
+        assert_eq!(resized[0].1, before[0].1 + 3, "the drag resized once");
+
+        // The button goes up somewhere this app never hears about. The
+        // first bare motion is the proof.
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(MouseEventKind::Moved, 20, 2),
+            &mut detached,
+        )
+        .await
+        .expect("motion");
+        assert!(app.drag.is_none(), "bare motion settles the lost release");
+
+        // A click on the other pane is only a click.
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            handle_mouse(
+                &mut app,
+                &client,
+                mouse_at(kind, 20, body_row),
+                &mut detached,
+            )
+            .await
+            .expect("click");
+        }
+        assert_eq!(heights(&server), resized, "the click resized nothing");
+        assert!(app.drag.is_none());
+
+        // A terminal that reports no bare motion: the next press itself
+        // is the proof, and still resizes nothing.
+        // The hit map is the frame painted before the resize, so the seam
+        // is still on row 5 there; tmux resolves the resize by pane, not
+        // by row, so that is the seam to press.
+        for (kind, row) in [
+            (MouseEventKind::Down(MouseButton::Left), 5),
+            (MouseEventKind::Drag(MouseButton::Left), 9),
+        ] {
+            handle_mouse(&mut app, &client, mouse_at(kind, 20, row), &mut detached)
+                .await
+                .expect("press and drag");
+        }
+        assert!(app.drag.is_some(), "a drag is in flight");
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            handle_mouse(&mut app, &client, mouse_at(kind, 20, 2), &mut detached)
+                .await
+                .expect("click");
+        }
+        assert!(app.drag.is_none(), "the press settled the lost release");
+        assert_eq!(
+            heights(&server),
+            resized,
+            "the unapplied motion of a lost drag is never applied by a click"
         );
         client.shutdown().await;
     }
