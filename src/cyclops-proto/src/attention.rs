@@ -324,7 +324,7 @@ impl Attention {
     ///
     /// The stream UI normalizes the same answer into its own seed because
     /// it also needs the pane roster for focus jumps, then calls the same
-    /// two snapshot methods as this constructor.
+    /// three snapshot methods as this constructor.
     ///
     /// Scope note: the delivery half is exactly what the answer carried.
     /// `open_deliveries` rides `status` only when the caller asks for it

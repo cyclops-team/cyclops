@@ -1940,8 +1940,8 @@ fn status_result_with_refresh(
     // files, and the fusion engine wants those locks back promptly.
     // Two halves, kept apart: the legacy session-ledger fold, and the
     // durable mailbox rows the projection serves (the same rows a
-    // messages.snapshot carries), minus the pre-write blocks listed under
-    // blocked_notifications below so one attempt is one row.
+    // messages.snapshot carries), including pre-write blocks. A renderer
+    // that also prints blocked_notifications deduplicates by attempt id.
     let (open_deliveries, mailbox_attention) = if open_deliveries {
         let open = crate::history::open_deliveries(inner);
         let mailbox = inner
