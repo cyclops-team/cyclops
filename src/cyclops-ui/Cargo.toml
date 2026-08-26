@@ -12,6 +12,7 @@ cyclops-state.workspace = true
 cyclops-theme.workspace = true
 cyclops-tmux.workspace = true
 tokio.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 libc.workspace = true
 
