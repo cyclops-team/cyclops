@@ -1141,6 +1141,7 @@ mod tests {
     fn durable_observation(recipient: RecipientKey) -> NotificationPreWriteObservation {
         let pane_root = ProcessInstanceId::new(4000, 818_000).unwrap();
         NotificationPreWriteObservation {
+            write_block: None,
             pane_root: Some(pane_root),
             selected_manifest: Some(NotificationManifestId::new("claude").unwrap()),
             binding: Some(NotificationBinding {
@@ -1601,6 +1602,7 @@ mod tests {
             .record_pre_write_block(
                 NotificationPreWriteCause::BindingUnprovable,
                 Some(NotificationPreWriteObservation {
+                    write_block: None,
                     pane_root: Some(ProcessInstanceId::new(4000, 818_000).unwrap()),
                     selected_manifest: Some(NotificationManifestId::new("codex").unwrap()),
                     binding: None,

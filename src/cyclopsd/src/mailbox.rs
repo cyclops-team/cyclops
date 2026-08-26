@@ -9286,6 +9286,7 @@ mod tests {
             ..notification_binding(bob)
         };
         let changed_observation = NotificationPreWriteObservation {
+            write_block: None,
             pane_root: changed_binding.pane_root,
             selected_manifest: Some(changed_binding.manifest.clone()),
             binding: Some(changed_binding),

@@ -3168,6 +3168,7 @@ fn record_notification_prewrite_block(
             // A readiness race can lack binding or width evidence, but it still
             // needs the route generation under which the write was refused.
             Some(NotificationPreWriteObservation {
+                write_block: None,
                 pane_root: None,
                 selected_manifest: None,
                 binding: None,
@@ -5781,6 +5782,8 @@ async fn gate(
                                 return GateOutcome::BlockedPreWrite {
                                     cause: NotificationPreWriteCause::BindingUnprovable,
                                     observation: binding_unprovable_observation(
+                                        inner,
+                                        handle,
                                         row.pane_pid,
                                         &manifest_id,
                                     ),
@@ -12000,6 +12003,7 @@ composer_trailer_required_prefix = 1
             manifest: manifest.clone(),
         };
         let observation = |generation| NotificationPreWriteObservation {
+            write_block: None,
             pane_root: Some(pane_root),
             selected_manifest: Some(manifest.clone()),
             binding: Some(binding.clone()),
