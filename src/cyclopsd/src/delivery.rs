@@ -1765,7 +1765,7 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
         attempts: u32,
         owner: usize,
         owners: BTreeSet<usize>,
-        rank: (u64, u64, u64, u64),
+        rank: u64,
     }
     fn consider(
         chains: &mut HashMap<(String, String), Chain>,
@@ -1773,7 +1773,7 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
         state: DeliveryState,
         attempts: u32,
         owner: usize,
-        rank: (u64, u64, u64, u64),
+        rank: u64,
     ) {
         match chains.entry(key) {
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -1789,8 +1789,9 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
                 let current = entry.get_mut();
                 current.owners.insert(owner);
                 // A terminal fact in the configured root closes unresolved
-                // history in a linked journal. Otherwise transition time is
-                // authoritative; the remaining fields make ties stable.
+                // history in a linked journal. Otherwise the family's
+                // descendant-first/root-last scan is its causal order; wall
+                // clocks from separate journal files are not comparable.
                 let terminal_wins = receipt_resolved(state) && !receipt_resolved(current.state);
                 let same_class_is_newer = receipt_resolved(state)
                     == receipt_resolved(current.state)
@@ -1864,7 +1865,7 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
                                 d.state,
                                 d.attempts,
                                 *idx,
-                                (d.ts, line.ts, line.seq, scan_order),
+                                scan_order,
                             );
                         }
                     }
@@ -1884,12 +1885,7 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
                         state,
                         record.map(|delivery| delivery.attempts).unwrap_or(0),
                         *idx,
-                        (
-                            record.map(|delivery| delivery.ts).unwrap_or(line.ts),
-                            line.ts,
-                            line.seq,
-                            scan_order,
-                        ),
+                        scan_order,
                     );
                 }
                 _ => {}

@@ -448,13 +448,13 @@ pub(crate) fn session_journal_replay(
         }
     }
 
-    fn append_descendants_first(
+    fn collect_descendants_first(
         node_idx: usize,
         owner: usize,
         nodes: &[SessionJournalNode],
         by_journal: &HashMap<String, usize>,
         visited: &mut HashSet<usize>,
-        lines: &mut Vec<LedgerLine>,
+        order: &mut Vec<usize>,
     ) {
         if !visited.insert(node_idx)
             || nodes[node_idx].owners.len() != 1
@@ -464,29 +464,51 @@ pub(crate) fn session_journal_replay(
         }
         for linked in &nodes[node_idx].links {
             if let Some(linked_idx) = by_journal.get(linked).copied() {
-                append_descendants_first(linked_idx, owner, nodes, by_journal, visited, lines);
+                collect_descendants_first(linked_idx, owner, nodes, by_journal, visited, order);
             }
         }
-        lines.extend(nodes[node_idx].lines.iter().cloned());
+        order.push(node_idx);
     }
 
     let mut recovery = Vec::new();
+    let mut history_order = Vec::new();
+    let mut history_seen = HashSet::new();
     for (owner, root_idx) in root_nodes {
         let mut visited = HashSet::new();
-        let mut lines = Vec::new();
-        append_descendants_first(
+        let mut family = Vec::new();
+        collect_descendants_first(
             root_idx,
             owner,
             &nodes,
             &by_journal,
             &mut visited,
-            &mut lines,
+            &mut family,
         );
+        let lines = family
+            .iter()
+            .flat_map(|node_idx| nodes[*node_idx].lines.iter().cloned())
+            .collect();
+        for node_idx in family {
+            if history_seen.insert(node_idx) {
+                history_order.push(node_idx);
+            }
+        }
         recovery.push((owner, lines));
     }
-    let files = nodes
+    // Ambiguously owned or otherwise unreachable nodes stay visible to
+    // history and id preload, but follow the unambiguous causal families.
+    for node_idx in 0..nodes.len() {
+        if history_seen.insert(node_idx) {
+            history_order.push(node_idx);
+        }
+    }
+    let mut nodes = nodes.into_iter().map(Some).collect::<Vec<_>>();
+    let files = history_order
         .into_iter()
-        .map(|node| (node.journal, node.lines))
+        .map(|node_idx| {
+            let node = nodes[node_idx].take().expect("journal emitted once");
+            (node.journal, node.lines)
+        })
         .collect();
     SessionJournalReplay { files, recovery }
 }
@@ -573,7 +595,7 @@ pub(crate) fn fold_messages(lines: &[LedgerLine]) -> Vec<LedgerLine> {
 }
 
 type DeliveryKey = (String, String);
-type DeliveryRank = (u64, u64, u64, usize);
+type DeliveryRank = (usize, u64);
 
 /// Merge per-file folded messages into one stream. Compatibility copies
 /// merge only when no workspace record owns their id. Other copies dedupe
@@ -586,6 +608,7 @@ pub(crate) fn merge_files(
     let workspace_ids = workspace_record_ids(files, workspace_file);
     let mut merged: Vec<LedgerLine> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
+    let mut delivery_sources: HashMap<DeliveryKey, usize> = HashMap::new();
     for (file_index, file) in files.iter().enumerate() {
         for msg in fold_messages(file) {
             if workspace_ids.contains(msg.id.as_str()) && Some(file_index) != workspace_file {
@@ -593,12 +616,16 @@ pub(crate) fn merge_files(
             }
             match index.get(&msg.id) {
                 None => {
+                    for delivery in &msg.deliveries {
+                        delivery_sources.insert((msg.id.clone(), delivery.to.clone()), file_index);
+                    }
                     index.insert(msg.id.clone(), merged.len());
                     merged.push(msg);
                 }
                 Some(&i) => {
                     let kept = &mut merged[i];
                     for d in msg.deliveries {
+                        let key = (msg.id.clone(), d.to.clone());
                         match kept.deliveries.iter_mut().find(|k| k.to == d.to) {
                             Some(k) => {
                                 // Newest transition wins; on a ts tie the
@@ -610,9 +637,13 @@ pub(crate) fn merge_files(
                                         && d.state != cyclops_proto::DeliveryState::Queued);
                                 if advanced {
                                     *k = d;
+                                    delivery_sources.insert(key, file_index);
                                 }
                             }
-                            None => kept.deliveries.push(d),
+                            None => {
+                                kept.deliveries.push(d);
+                                delivery_sources.insert(key, file_index);
+                            }
                         }
                     }
                 }
@@ -626,8 +657,10 @@ pub(crate) fn merge_files(
     // have merged. Workspace-owned ids still accept facts only from the
     // workspace journal.
     let mut states: HashMap<DeliveryKey, (DeliveryRank, Delivery)> = HashMap::new();
+    let mut scan_order = 0_u64;
     for (file_index, file) in files.iter().enumerate() {
         for line in file {
+            scan_order = scan_order.saturating_add(1);
             if line.kind != Kind::State
                 || (workspace_ids.contains(line.id.as_str()) && Some(file_index) != workspace_file)
                 || !line
@@ -641,13 +674,13 @@ pub(crate) fn merge_files(
                 continue;
             };
             let key = (line.id.clone(), record.to.clone());
-            let rank = (record.ts, line.ts, line.seq, file_index);
+            let rank = (file_index, scan_order);
             if states.get(&key).is_none_or(|(current, _)| rank > *current) {
                 states.insert(key, (rank, record.clone()));
             }
         }
     }
-    for ((id, to), (_, record)) in states {
+    for ((id, to), (rank, record)) in states {
         let Some(&message_index) = index.get(&id) else {
             continue;
         };
@@ -657,7 +690,13 @@ pub(crate) fn merge_files(
             .iter_mut()
             .find(|delivery| delivery.to == to)
         {
-            Some(current) if record.ts >= current.ts => *current = record,
+            Some(current)
+                if delivery_sources
+                    .get(&(id.clone(), to.clone()))
+                    .is_none_or(|source| rank.0 >= *source) =>
+            {
+                *current = record
+            }
             Some(_) => {}
             None => message.deliveries.push(record),
         }

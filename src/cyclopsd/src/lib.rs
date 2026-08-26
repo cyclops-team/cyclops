@@ -4884,9 +4884,13 @@ mod tests {
                 .unwrap();
 
         let legacy_id = "m-abcdef";
+        let skewed_id = "m-123456";
         let assert_terminal_history =
             |configured_lines: Vec<LedgerLine>, linked_lines: Vec<LedgerLine>| {
-                let history = history::merge_files(&[configured_lines, linked_lines], None);
+                // The replay traversal presents a family descendants-first
+                // and configured-root-last. Wall clocks in the older file
+                // may be ahead; causal family order still decides.
+                let history = history::merge_files(&[linked_lines, configured_lines], None);
                 let records = history
                     .iter()
                     .filter(|line| line.id == legacy_id)
@@ -4900,6 +4904,16 @@ mod tests {
                     records[0].deliveries[0].state,
                     cyclops_proto::DeliveryState::AttentionRequired,
                     "the terminal root fact must dominate the linked submitted copy"
+                );
+                let gating = history
+                    .iter()
+                    .filter(|line| line.id == skewed_id)
+                    .collect::<Vec<_>>();
+                assert_eq!(gating.len(), 1, "the skewed chain remains one message");
+                assert_eq!(
+                    gating[0].deliveries[0].state,
+                    cyclops_proto::DeliveryState::RetryQueued,
+                    "the root retry fact must follow the future-dated linked gating fact"
                 );
             };
         let mut message = daemon_line(Kind::Msg, legacy_id.into(), json!({"hosted": ["%0"]}));
@@ -4916,6 +4930,22 @@ mod tests {
             cause: None,
         }];
         linked.append(message).unwrap();
+        let future_ms = unix_ms().saturating_add(86_400_000);
+        let mut gating = daemon_line(Kind::Msg, skewed_id.into(), json!({"hosted": ["%1"]}));
+        gating.ts = future_ms;
+        gating.from = "admin".into();
+        gating.to = vec!["%1".into()];
+        gating.subject = Some("future-dated before restart".into());
+        gating.body = Some("body".into());
+        gating.deliveries = vec![cyclops_proto::Delivery {
+            to: "%1".into(),
+            state: cyclops_proto::DeliveryState::Gating,
+            verified_by: None,
+            attempts: 1,
+            ts: future_ms,
+            cause: None,
+        }];
+        linked.append(gating).unwrap();
         configured
             .append(daemon_line(
                 Kind::System,
@@ -4939,7 +4969,7 @@ mod tests {
             daemon
                 .inner
                 .engine
-                .mint_msg_id_from(&[legacy_id, "m-fedcba"]),
+                .mint_msg_id_from(&[legacy_id, skewed_id, "m-fedcba"]),
             "m-fedcba",
             "an id visible through linked history must be rejected by the real mint path"
         );
@@ -4963,6 +4993,17 @@ mod tests {
             })
             .count();
         assert_eq!(settlements, 1, "linked in-flight chain must settle once");
+        let retries = lines
+            .iter()
+            .filter(|line| {
+                line.id == skewed_id
+                    && line.kind == Kind::State
+                    && line.data.as_ref().is_some_and(|data| {
+                        data["to_state"] == "retry_queued" && data["cause"] == "daemon_restart"
+                    })
+            })
+            .count();
+        assert_eq!(retries, 1, "linked gating chain must requeue once");
         let linked_lines = cyclops_ledger::read_after(
             &daemon.inner.state_root,
             Path::new("ledger/runtime.ndjson"),
@@ -4996,6 +5037,20 @@ mod tests {
         assert_eq!(
             settlements, 1,
             "a linked chain already settled into its root must not settle again"
+        );
+        let retries = configured_lines
+            .iter()
+            .filter(|line| {
+                line.id == skewed_id
+                    && line.kind == Kind::State
+                    && line.data.as_ref().is_some_and(|data| {
+                        data["to_state"] == "retry_queued" && data["cause"] == "daemon_restart"
+                    })
+            })
+            .count();
+        assert_eq!(
+            retries, 1,
+            "future timestamps must not make a linked gating fact requeue twice"
         );
         let linked_lines = cyclops_ledger::read_after(
             &daemon.inner.state_root,
