@@ -2313,6 +2313,7 @@ pub(crate) async fn msg_send(
                 let handle =
                     DeliveryHandle::new(&msg_id, name, pane_id, *session_idx, payload.clone());
                 inner.engine.track(&handle);
+                crate::sync_pane_unread(inner, pane_id).await;
                 let Some(worker) = worker_for(inner, *session_idx, pane_id) else {
                     advance(
                         inner,

@@ -1452,6 +1452,7 @@ mod tests {
             working_confirmed: None,
             hooks_verified: None,
             manifest_display_name: None,
+            unread: None,
         }
     }
 

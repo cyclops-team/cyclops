@@ -2308,6 +2308,14 @@ async fn paint_adoptions(
     let theme = inner.theme_now();
     for a in adoptions {
         let state = inner.cached_state(session_idx, &a.pane_id);
+        let unread = inner
+            .mailbox
+            .as_ref()
+            .and_then(|m| {
+                let recipient = a.recipient?;
+                m.pending_count(recipient).ok()
+            })
+            .unwrap_or(0);
         if let Err(e) = chrome::apply(
             &watcher.client(),
             inner.cfg.chrome,
@@ -2316,11 +2324,62 @@ async fn paint_adoptions(
             &a.label,
             state,
             &theme,
+            unread,
         )
         .await
         {
             warn!(pane = %a.pane_id, error = %e, "cannot write pane chrome");
         }
+    }
+}
+
+/// Update the @cyclops_unread option on an adopted pane.
+pub(crate) async fn sync_pane_unread(inner: &Arc<Inner>, pane_id: &str) {
+    let adoptions = inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .exact_adoptions();
+    let Some(adoption) = adoptions.into_iter().find(|a| a.pane_id == pane_id) else {
+        return;
+    };
+    let Some(session_idx) = inner
+        .active_session_slots()
+        .into_iter()
+        .find_map(|(idx, slot)| {
+            let link = slot.link.lock().expect("session link lock");
+            let watcher = link.watcher.as_ref()?;
+            let snapshot = watcher.snapshot();
+            snapshot.iter().any(|r| r.pane_id == pane_id).then_some(idx)
+        })
+    else {
+        return;
+    };
+    let Some(watcher) = inner.watcher_of(session_idx) else {
+        return;
+    };
+    let unread = inner
+        .mailbox
+        .as_ref()
+        .and_then(|m| {
+            let recipient = adoption.recipient?;
+            m.pending_count(recipient).ok()
+        })
+        .unwrap_or(0);
+    if let Err(e) =
+        chrome::update_unread(&watcher.client(), inner.cfg.chrome, pane_id, unread).await
+    {
+        warn!(pane = %pane_id, error = %e, "cannot update pane unread option");
+    }
+}
+
+/// Update the @cyclops_unread option for a recipient key.
+pub(crate) async fn sync_recipient_unread(
+    inner: &Arc<Inner>,
+    recipient: cyclops_proto::RecipientKey,
+) {
+    if let Some(pane_id) = recipient.pane_id() {
+        sync_pane_unread(inner, &pane_id.to_string()).await;
     }
 }
 

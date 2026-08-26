@@ -215,6 +215,7 @@ fn a_late_source_removal_keeps_the_transferred_pane_focusable() {
         working_confirmed: None,
         hooks_verified: None,
         manifest_display_name: None,
+        unread: None,
     };
     let status = StatusResult {
         daemon_version: "0.1.0".into(),
