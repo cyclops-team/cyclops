@@ -1,6 +1,9 @@
 <script lang="ts">
 	import SectionHead from './SectionHead.svelte';
 	import AgentMark, { type MarkKind } from './AgentMark.svelte';
+	import { REPO_URL } from '$lib/config';
+
+	const MANIFESTS_URL = `${REPO_URL}/blob/main/docs/reference/MANIFESTS.md`;
 
 	// The four manifests that ship (resources/manifests/*.toml), then the
 	// one you write. Each row is the CLI's command, the way a pane names it,
@@ -27,11 +30,26 @@
 		</div>
 		<ul class="marks" aria-label="Agents Cyclops recognises">
 			{#each agents as agent (agent.kind)}
-				<li class="mark">
-					<AgentMark kind={agent.kind} size={64} />
-					<span class="cmd">{agent.cmd}</span>
-					<span class="name">{agent.name}</span>
-				</li>
+				{#if agent.kind === 'any'}
+					<!-- The fifth card takes the rest of the row: it is the one that
+					     is about the reader's agent, so it gets the room and the link. -->
+					<li class="mark yours">
+						<AgentMark kind={agent.kind} size={64} />
+						<div class="yours-text">
+							<span class="cmd">{agent.cmd}</span>
+							<span class="name">{agent.name}</span>
+							<a class="more" href={MANIFESTS_URL} target="_blank" rel="noopener noreferrer"
+								>Write a manifest →</a
+							>
+						</div>
+					</li>
+				{:else}
+					<li class="mark">
+						<AgentMark kind={agent.kind} size={64} />
+						<span class="cmd">{agent.cmd}</span>
+						<span class="name">{agent.name}</span>
+					</li>
+				{/if}
 			{/each}
 		</ul>
 	</div>
@@ -84,6 +102,35 @@
 		margin-bottom: 8px;
 	}
 
+	.yours {
+		grid-column: span 2;
+		flex-direction: row;
+		justify-content: center;
+		gap: 20px;
+		padding: 22px 24px 18px;
+	}
+
+	.yours :global(canvas) {
+		margin-bottom: 0;
+	}
+
+	.yours-text {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		min-width: 0;
+	}
+
+	.more {
+		margin-top: 6px;
+		font-size: 12px;
+		color: var(--accent);
+	}
+
+	.more:hover {
+		text-decoration: underline;
+	}
+
 	.cmd {
 		font-size: 13px;
 		color: var(--ink);
@@ -107,8 +154,18 @@
 			grid-template-columns: repeat(2, 1fr);
 		}
 
-		.mark:last-child {
-			grid-column: span 2;
+		.yours {
+			flex-direction: column;
+			gap: 4px;
+			text-align: center;
+		}
+
+		.yours :global(canvas) {
+			margin-bottom: 8px;
+		}
+
+		.yours-text {
+			align-items: center;
 		}
 	}
 </style>
