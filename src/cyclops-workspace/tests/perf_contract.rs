@@ -271,6 +271,7 @@ async fn sustained_output_backlog_drains_continuously() {
     let mut marker_window = Vec::with_capacity(END_MARKER.len() * 2);
     let mut producer_finished = false;
     let mut continuity_gaps = 0usize;
+    let mut continuity_pending = false;
     // Safety valve: ~24s of draining is far past what a 6MB flood on this
     // control connection should ever take, even on a loaded CI box.
     for _ in 0..3000 {
@@ -294,10 +295,26 @@ async fn sustained_output_backlog_drains_continuously() {
                 }
                 Notification::ContinuityLost => {
                     continuity_gaps += 1;
-                    let epoch = notif.hold_continuity();
-                    let _ = notif.resume_after_reconcile(epoch);
+                    continuity_pending = true;
                 }
                 _ => {}
+            }
+        }
+        if continuity_pending {
+            // A gap discards output until an authoritative pane capture and
+            // a stable epoch agree. Retry on later drain ticks while the
+            // producer is still moving instead of ignoring a failed resume
+            // and leaving the receiver held forever.
+            let epoch = notif.hold_continuity();
+            let capture = rig.server.run(&["capture-pane", "-p", "-t", "%0"]);
+            if capture.status.success() {
+                producer_finished |= capture
+                    .stdout
+                    .windows(END_MARKER.len())
+                    .any(|window| window == END_MARKER);
+                if notif.resume_after_reconcile(epoch) {
+                    continuity_pending = false;
+                }
             }
         }
         batch_counts.push(count);
@@ -310,7 +327,7 @@ async fn sustained_output_backlog_drains_continuously() {
             idle_streak += 1;
             max_active_idle_streak = max_active_idle_streak.max(idle_streak);
         }
-        if producer_finished {
+        if producer_finished && !continuity_pending {
             break;
         }
     }
@@ -331,6 +348,10 @@ async fn sustained_output_backlog_drains_continuously() {
     assert!(
         producer_finished,
         "the drain did not reach the producer's explicit end marker"
+    );
+    assert!(
+        !continuity_pending,
+        "the receiver stayed held after the authoritative pane capture"
     );
     assert!(
         total_bytes > 1_000_000,
