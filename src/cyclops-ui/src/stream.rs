@@ -948,6 +948,18 @@ impl Record {
         self.entries.iter()
     }
 
+    /// Calm-view entries, oldest first, with one attention lookup per scan.
+    ///
+    /// Renderers outside this crate must not rebuild the delivery union for
+    /// every entry. This iterator freezes the admission index once and keeps
+    /// exact-recipient and legacy-label resolution inside the stream model.
+    pub fn admitted_entries(&self) -> impl Iterator<Item = &Entry> {
+        let admission = AdminAdmission::from_attention(&self.attention);
+        self.entries
+            .iter()
+            .filter(move |entry| self.admits_with(entry, &admission))
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }

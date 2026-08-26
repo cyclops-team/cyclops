@@ -42,8 +42,7 @@ pub struct EventRow<'a> {
 pub fn event_stream_rows(record: &Record) -> Vec<EventRow<'_>> {
     let plain = cyclops_ui::Theme::none();
     record
-        .entries()
-        .filter(|e| record.admits(e))
+        .admitted_entries()
         .map(|entry| EventRow {
             entry,
             lines: entry.lines(&plain, true),

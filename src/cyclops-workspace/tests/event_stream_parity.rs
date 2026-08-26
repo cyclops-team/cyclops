@@ -175,8 +175,7 @@ fn feed_like_workspace(record: &mut Record, intake: &mut Intake, step: Step) {
 fn cyclops_watch_rows(record: &Record) -> Vec<String> {
     let plain = Theme::none();
     record
-        .entries()
-        .filter(|e| record.admits(e))
+        .admitted_entries()
         .flat_map(|e| e.lines(&plain, true))
         .collect()
 }

@@ -172,8 +172,7 @@ mod tests {
     fn admitted_lines(record: &Record) -> Vec<String> {
         let plain = cyclops_ui::Theme::none();
         record
-            .entries()
-            .filter(|e| record.admits(e))
+            .admitted_entries()
             .flat_map(|e| e.lines(&plain, true))
             .collect()
     }
