@@ -356,7 +356,7 @@ pub struct Manifests {
 /// Identity is (to, id), the same pair the delivery chain carries in the
 /// ledger, so a client can match a seeded item against the transitions it
 /// later sees on the wire and clear it on the right one.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenDelivery {
     /// Message id this delivery belongs to, e.g. "m-3f9c2a".
     pub id: String,
