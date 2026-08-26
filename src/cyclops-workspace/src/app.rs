@@ -6722,7 +6722,11 @@ mod tests {
             let width = crate::render::clamp_sidebar_width(want, full.width);
             app.prefs.sidebar_width = width;
             let (grid, _) = declared_for(&app);
-            let messages_rail = app.chrome(full).messages_rail.width;
+            let messages_rail = app
+                .chrome(full)
+                .messages_rail
+                .expect("closed Messages rail")
+                .width;
             assert_eq!(
                 i32::from(width)
                     + i32::from(grid)
