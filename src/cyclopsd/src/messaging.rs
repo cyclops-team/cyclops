@@ -938,6 +938,7 @@ pub(crate) fn withdraw_notification(
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::str::FromStr;
 
@@ -1370,6 +1371,16 @@ mod tests {
         service
             .record_attention_resolution_intent(&target, NotificationResolution::Complete)
             .unwrap();
+        let schedule_block = service
+            .notification_schedule_block(recipient)
+            .unwrap()
+            .unwrap();
+        assert_eq!(schedule_block.message_id, accepted.message_id);
+        assert_eq!(schedule_block.attempt_id, attention.attempt_id);
+        assert_eq!(
+            schedule_block.block,
+            MessageWakeBlock::AttentionResolutionPending
+        );
 
         let disposition = service
             .message_dispositions(&accepted.message_id)
@@ -1532,7 +1543,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_committed_block_before_receive_is_found_by_the_initial_projection_read() {
+    async fn a_current_block_without_a_scheduler_fact_invents_no_wake_block() {
         let (_scratch, service, events, recipient, _) = mailbox_service("initial-read", 8);
         let (accepted, context, head) = queued_attempt(&service);
         context.record_gating().unwrap();
@@ -1549,6 +1560,10 @@ mod tests {
                 }),
             )
             .unwrap();
+        assert_eq!(
+            service.notification_schedule_block(recipient).unwrap(),
+            None
+        );
         let outcomes = HashMap::from([(
             recipient,
             RecipientScheduleOutcome::WorkerOwned {
@@ -1575,10 +1590,79 @@ mod tests {
             Some(NotificationPreWriteCause::BindingUnprovable)
         );
         assert_eq!(
-            dispositions[0].wake_block,
-            Some(MessageWakeBlock::SchedulerStateUnavailable),
-            "a blocked pre-write row without an exact scheduler outcome keeps the compatibility fallback"
+            dispositions[0].wake_block, None,
+            "a current block without a recorded scheduler outcome stays unknown"
         );
+    }
+
+    #[test]
+    fn a_pre_wake_block_journal_row_replays_without_inventing_a_scheduler_outcome() {
+        let (scratch, service, _events, recipient, _) =
+            mailbox_service("legacy-block-no-wake-block", 8);
+        let (accepted, context, head) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        let seq = service
+            .store_handle()
+            .lock()
+            .unwrap()
+            .projection()
+            .last_sequence()
+            .unwrap()
+            + 1;
+        let line = cyclops_proto::LedgerLine {
+            seq,
+            boot_id: "boot-before-wake-block".into(),
+            id: accepted.message_id.to_string(),
+            ts: 1_700_000_000_000 + seq,
+            kind: cyclops_proto::Kind::State,
+            from: "cyclopsd".into(),
+            to: vec![recipient.to_string()],
+            subject: None,
+            body: None,
+            reply_to: None,
+            deliveries: Vec::new(),
+            data: Some(serde_json::json!({
+                "type": "notification_transition",
+                "record_version": cyclops_proto::CANONICAL_RECORD_VERSION,
+                "attempt_id": head.attempt_id,
+                "message_id": accepted.message_id,
+                "recipient": recipient,
+                "state": "blocked_pre_write",
+                "pre_write_cause": "worker_failed"
+            })),
+        };
+        assert!(line.data.as_ref().unwrap().get("wake_block").is_none());
+        drop(context);
+        drop(service);
+
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let mut file = root.open_append(journal).unwrap();
+        serde_json::to_writer(&mut file, &line).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.sync_data().unwrap();
+        drop(file);
+
+        let (workspace, directory, replayed_recipient, _) = test_directory();
+        assert_eq!(replayed_recipient, recipient);
+        let replayed = MailboxService::new(
+            directory,
+            MessageStore::open(&root, journal, workspace, "boot-replay").unwrap(),
+        );
+        assert_eq!(
+            replayed.notification_schedule_block(recipient).unwrap(),
+            None
+        );
+        let disposition = replayed
+            .message_dispositions(&line.id.parse().unwrap())
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            disposition.notification_state_raw,
+            Some(NotificationState::BlockedPreWrite)
+        );
+        assert_eq!(disposition.wake_block, None);
+        assert_eq!(receipt_from_disposition(disposition, None).wake_block, None);
     }
 
     #[tokio::test]

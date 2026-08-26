@@ -578,21 +578,14 @@ fn notification_pre_write_width_block(record: &NotificationRecord) -> Option<(u3
         .filter(|(observed, required)| observed < required)
 }
 
-/// Exact projected scheduler outcome, plus the compatibility answer for a
-/// blocked pre-write row written before `wake_block` existed.
+/// Exact projected scheduler outcome or a pending durable resolution.
 fn notification_wake_block(
     record: &NotificationRecord,
     attention_resolution_pending: bool,
 ) -> Option<MessageWakeBlock> {
-    record
-        .wake_block
-        .or_else(|| {
-            attention_resolution_pending.then_some(MessageWakeBlock::AttentionResolutionPending)
-        })
-        .or_else(|| {
-            (record.state == NotificationState::BlockedPreWrite)
-                .then_some(MessageWakeBlock::SchedulerStateUnavailable)
-        })
+    record.wake_block.or_else(|| {
+        attention_resolution_pending.then_some(MessageWakeBlock::AttentionResolutionPending)
+    })
 }
 
 struct ReplyDerivation {

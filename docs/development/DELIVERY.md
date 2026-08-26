@@ -290,13 +290,13 @@ workspace administrator may withdraw that exact unwritten
 notification to release the recipient FIFO.
 The transition also records the exact closed scheduler outcome when no live
 worker owns the wake. Replay, send receipts, status, and message detail read
-that same `wake_block`; they do not reconstruct a generic reason from an
-attention or quota state. A legacy `blocked_pre_write` row without the additive
-field remains readable and reports `scheduler_state_unavailable`; new scheduler
-failures record a specific outcome or fail the request if that fact cannot be
-persisted. A durable resolution intent projects `attention_resolution_pending`
-into the same receipt field until that exact attempt settles; it is not inferred
-from the notification state.
+that same `wake_block`; they do not reconstruct a reason from notification
+state. A historical `blocked_pre_write` row without the additive field remains
+readable and reports no scheduler outcome. New scheduler ownership failures
+record a specific outcome or fail the request if that fact cannot be persisted.
+A durable resolution intent projects `attention_resolution_pending` into the
+same receipt field until that exact attempt settles; it is not inferred from the
+notification state.
 An exact positive route and composer-readiness observation may reopen the same
 attempt once. The cached verdict must carry the same pane-root, foreground
 leader, agent process generation, and manifest as the fresh route proof.
