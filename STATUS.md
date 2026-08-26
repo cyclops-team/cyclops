@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-08-25. Cyclops is pre-release software at version `0.1.0`.
+Updated 2026-08-26. Cyclops is pre-release software at version `0.1.0`.
 The Rust implementation on `main` is the current product; the shell/Python
 implementation remains available as the read-only `v1` branch and
 `v1-final` tag.
@@ -96,11 +96,11 @@ whenever coverage grows.
   chrome or a vendor version without sufficient current evidence holds terminal
   writes instead of guessing. The 2026-08-25 evidence snapshot is:
 
-  | Vendor | Shipped full-ruleset fixture | Newer live evidence | Remaining gap |
+  | Vendor | Shipped version claim | Newer live evidence | Remaining gap |
   | --- | --- | --- | --- |
   | Claude Code | 2.1.221 | 2.1.239 composer extraction, clearing, and stage-and-clear soak | Current idle, working, staged, modal, and quota matrix |
   | Codex CLI | 0.147.0 | 0.149.1 occupied-prompt and no-color trailer structure; 0.149.0 clearing, title spinner, and stage-and-clear soak | Current full matrix, fresh and resumed delivery, and live hook payload capture |
-  | Antigravity CLI | 1.1.11 | 1.1.18 stage-and-clear soak | Current full matrix and exact composer recovery evidence |
+  | Antigravity CLI | 1.1.21 | 1.1.21 exact composer and file-access permission; 1.1.18 stage-and-clear soak | Current full matrix beyond the measured composer and permission states, plus lifecycle evidence |
   | Cursor Agent CLI | 2026.07.23-e383d2b | No installed binary on the evidence host | Installed current binary, full matrix, and paired start and end hook payloads |
 
   The soak proves staging verification and cleanup only. It does not promote a

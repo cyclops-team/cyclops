@@ -9,7 +9,7 @@
 [agent]
 id = "agy"
 display_name = "Antigravity CLI"
-version_tested = "1.1.11"
+version_tested = "1.1.21"
 process_names = ["agy"]
 default_model_observed = "Gemini 3.6 Flash (High)"
 # What `cyclops start --agents agy` runs in a pane. The bare CLI; the ACK
@@ -137,6 +137,20 @@ startup logo, which is U+2580 block elements, not braille."""
 evidence = "MEASURED 2026-08-08, agy 1.1.11, fixtures/agy_working_composer_plain.txt; spinner present in frames 1-7 of a polled tool turn and absent from frame 8 on"
 
 [[rule]]
+id = "file_access_permission"
+state = "blocked_permission"
+priority = 1500
+region = "bottom_non_empty_lines(16)"
+contains = ["File access", "Allow access to this file?"]
+line_regex = ['^\s*>\s*1\.\s+Yes, allow access\s*$']
+note = """AGY replaces the composer with a numbered access decision while a tool
+waits on a file outside the workspace. All three measured clauses are required
+so ordinary agent prose cannot look like permission to submit a key. This
+decision belongs to the human and Cyclops never dismisses it."""
+evidence = "MEASURED 2026-08-26, agy 1.1.21, fixtures/agy_file_access_permission_{plain,esc}.txt"
+auto_dismiss = false
+
+[[rule]]
 id = "quota_exhausted"
 state = "blocked_quota"
 priority = 1400
@@ -175,7 +189,7 @@ submit = "Enter"
 verify_before_submit = true
 verify_pattern = ["<message_id>"]
 safe_states = ["idle"]
-unsafe_states = ["blocked_modal", "idle_with_input"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]
 first_paste_caveat = """MEASURED: the first paste after TUI startup did not stage
 (staged_in_composer=false) while the second did. Composer readiness lags the
 first rendered prompt glyph. Verify-before-submit catches this; a blind
