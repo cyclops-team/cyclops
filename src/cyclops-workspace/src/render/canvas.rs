@@ -270,11 +270,11 @@ pub fn paint_window(
 /// which leaves every shallower branch finishing that many cells short and
 /// the deepest one looking like it overhangs the rest.
 ///
-/// Only the border moves. Leaf content rects stay exactly the size tmux
-/// reported, because a live child terminal maps one runtime cell to one
-/// screen cell and cropping or stretching it would corrupt what it drew —
-/// the surplus simply becomes gutter inside the box, which is already how
-/// this renderer treats every cell tmux does not own.
+/// Only the border moves. At the driver's extent, leaf content rects stay
+/// exactly the size tmux reported. A smaller follower canvas may fit their
+/// card bounds, but the renderer still paints only a 1:1 leading viewport of
+/// each live child terminal; it never stretches a runtime cell. Any surplus
+/// remains gutter inside the box, as for every cell tmux does not own.
 fn outer_frames(slots: &[PaneSlot]) -> Vec<Rect> {
     let edge_right = slots
         .iter()

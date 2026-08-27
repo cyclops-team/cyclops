@@ -17,7 +17,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 
 use cyclops_ui::Record;
 
@@ -441,8 +441,9 @@ pub fn paint_sidebar_rail(
     );
 }
 
-/// Render the messages surface on the right edge: the left-edge divider and collapse
-/// chevron, and the messages queue or open detail.
+/// Render Messages as a pane-framed peer on the right edge: its left border
+/// remains the resize divider and collapse control, while the other three
+/// borders make the space it owns unambiguous beside the agent grid.
 pub fn paint_messages(
     queue: &cyclops_ui::HumanQueue,
     detail: Option<&cyclops_ui::Detail>,
@@ -452,6 +453,7 @@ pub fn paint_messages(
     pane_manifests: Option<&HashMap<String, String>>,
     status: Option<&str>,
     retry_available: bool,
+    focused: bool,
     area: Rect,
     buf: &mut Buffer,
     paint: &Paint,
@@ -462,6 +464,19 @@ pub fn paint_messages(
         return;
     }
     buf.set_style(area, theme::chrome_panel(paint));
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(if focused {
+            BorderType::Double
+        } else {
+            BorderType::Rounded
+        })
+        .border_style(if focused {
+            theme::pane_border_focused(paint)
+        } else {
+            theme::pane_border(paint)
+        })
+        .render(area, buf);
 
     // The left edge of the right messages panel is the divider/toggle
     let edge = Rect::new(area.x, area.y, 1, area.height);
@@ -479,8 +494,8 @@ pub fn paint_messages(
         hover,
     );
 
-    let content_w = area.width.saturating_sub(1) as usize;
-    let content_h = area.height as usize;
+    let content_w = area.width.saturating_sub(2) as usize;
+    let content_h = area.height.saturating_sub(2) as usize;
     if content_w == 0 || content_h == 0 {
         return;
     }
@@ -506,9 +521,9 @@ pub fn paint_messages(
     );
     let content_rect = Rect::new(
         area.x + 1,
-        area.y,
-        area.width.saturating_sub(1),
-        area.height,
+        area.y + 1,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
     );
     let pointed = |rect: Rect| {
         hover.is_some_and(|(col, row)| {
@@ -3457,7 +3472,7 @@ mod tests {
         let queue = cyclops_ui::HumanQueue::new();
         let registry = cyclops_ui::AvatarRegistry::default();
         paint_messages(
-            &queue, None, None, &registry, None, None, None, false, area, &mut buf, &paint,
+            &queue, None, None, &registry, None, None, None, false, false, area, &mut buf, &paint,
             &mut hits, None,
         );
 
@@ -3504,8 +3519,8 @@ mod tests {
                 let mut buf = Buffer::empty(area);
                 let mut hits = HitMap::default();
                 paint_messages(
-                    &queue, None, None, &registry, None, None, None, false, area, &mut buf, &paint,
-                    &mut hits, None,
+                    &queue, None, None, &registry, None, None, None, false, false, area, &mut buf,
+                    &paint, &mut hits, None,
                 );
                 matches!(hits.hit(x, y), Some(HitTarget::MessagesAction(found)) if *found == action)
             })
@@ -3515,8 +3530,8 @@ mod tests {
             let mut buf = Buffer::empty(area);
             let mut hits = HitMap::default();
             paint_messages(
-                &queue, None, None, &registry, None, None, None, false, area, &mut buf, &paint,
-                &mut hits, hover,
+                &queue, None, None, &registry, None, None, None, false, false, area, &mut buf,
+                &paint, &mut hits, hover,
             );
             buf
         };
@@ -3588,7 +3603,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         let mut hits = HitMap::default();
         paint_messages(
-            &queue, None, None, &registry, None, None, None, false, area, &mut buf, &paint,
+            &queue, None, None, &registry, None, None, None, false, false, area, &mut buf, &paint,
             &mut hits, None,
         );
         let row_text = |y: u16| -> String {
@@ -3600,7 +3615,10 @@ mod tests {
             .find(|&y| row_text(y).contains("claudex"))
             .expect("the heading names the sender");
         let text = row_text(y);
-        let name_col = area.x + text.find("claudex").unwrap() as u16;
+        let column_of = |needle: &str| {
+            area.x + Span::raw(&text[..text.find(needle).expect("label in row")]).width() as u16
+        };
+        let name_col = column_of("claudex");
         assert_eq!(
             buf.cell((name_col, y)).unwrap().fg,
             paint.role("claudex").fg.unwrap(),
@@ -3612,7 +3630,7 @@ mod tests {
             paint.role("claudex").fg.unwrap(),
             "the avatar chip is grounded in the same color"
         );
-        let codey_col = area.x + text.find("codey").unwrap() as u16;
+        let codey_col = column_of("codey");
         assert_eq!(
             buf.cell((codey_col, y)).unwrap().fg,
             paint.role("codey").fg.unwrap(),
@@ -3661,6 +3679,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
             area,
             &mut buf,

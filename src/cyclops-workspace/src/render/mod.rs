@@ -2,10 +2,10 @@
 //! chrome into a Ratatui buffer, and the top-level chrome layout every
 //! surface below is painted into.
 //!
-//! Panes render at their tmux cell coordinates 1:1. The workspace subtracts
-//! the extra cells used by its separator bands before declaring
-//! the client size, then restores those cells only as chrome. Nothing scales;
-//! a runtime grid lands on exactly the cells tmux gave the pane.
+//! Visible pane cells render 1:1 from the runtime's leading viewport. At the
+//! sizing driver's extent, pane geometry is cell-exact; a smaller follower
+//! may proportionally fit local card bounds to reserve chrome, but never
+//! scales runtime cells or changes the shared tmux window.
 //!
 //! This module does not own persistence, daemon queries, or attention
 //! predicates — it reads whatever state its callers hand it and paints or

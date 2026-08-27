@@ -6456,6 +6456,7 @@ fn draw<B: Backend>(
                     Some(&pane_manifests),
                     link_status,
                     app.messages_refresh_error.is_some(),
+                    app.messages_focused,
                     messages,
                     f.buffer_mut(),
                     &app.paint,
@@ -7871,6 +7872,54 @@ mod tests {
         }
     }
 
+    fn messages_peer_model() -> WorkspaceModel {
+        let tab = crate::model::TabModel {
+            window_id: "@0".into(),
+            name: "1".into(),
+            layout: crate::layout::ResolvedLayout::Split {
+                dir: crate::layout::SplitDir::Horizontal,
+                x: 0,
+                y: 0,
+                width: 90,
+                height: 20,
+                children: vec![
+                    crate::layout::ResolvedLayout::Leaf {
+                        pane_id: "%0".into(),
+                        x: 0,
+                        y: 0,
+                        width: 60,
+                        height: 20,
+                    },
+                    crate::layout::ResolvedLayout::Leaf {
+                        pane_id: "%1".into(),
+                        x: 61,
+                        y: 0,
+                        width: 29,
+                        height: 20,
+                    },
+                ],
+            },
+            active_pane: "%1".into(),
+            zoomed: false,
+        };
+        WorkspaceModel {
+            workspaces: vec![crate::model::WorkspaceRow {
+                session_id: "$0".into(),
+                name: "s".into(),
+                tab_count: 1,
+                window_ids: vec!["@0".into()],
+            }],
+            active_workspace: 0,
+            session: crate::model::SessionModel {
+                session: "s".into(),
+                tabs: vec![tab],
+                active_tab: 0,
+            },
+            sidebar_visible: false,
+            messages_visible: false,
+        }
+    }
+
     #[test]
     fn any_pane_input_attempt_returns_the_viewport_to_its_live_tail() {
         let home = cyclops_proto::scratch::scratch_dir("workspace-input-snaps-tail");
@@ -8683,6 +8732,95 @@ mod tests {
             &clean_frame(&mut clean, 100, 24),
             "the collapsed frame kept cells the drawer had drawn"
         );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// Messages is a peer surface, not paint placed over the pane grid.
+    /// Opening it reserves one bordered rectangle, reflows both agent cards
+    /// into the remaining canvas, and closing it restores the same grid.
+    /// A narrow client must keep the selected trailing pane on screen even
+    /// when it cannot resize the shared tmux window.
+    #[test]
+    fn messages_is_a_bordered_peer_that_never_hides_the_selected_agent() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-messages-peer");
+        let mut app = test_app(messages_peer_model(), home.clone());
+        app.term_size = (96, 24);
+
+        let _closed = clean_frame(&mut app, 96, 24);
+        let closed_left = app
+            .hit_map
+            .pane_geometry("%0")
+            .expect("closed left pane")
+            .inner;
+        let closed_right = app
+            .hit_map
+            .pane_geometry("%1")
+            .expect("closed selected pane")
+            .inner;
+
+        app.model.messages_visible = true;
+        app.messages_focused = true;
+        app.layout_changed();
+        let opened = clean_frame(&mut app, 96, 24);
+        let messages = app
+            .chrome(Rect::new(0, 0, 96, 24))
+            .messages
+            .expect("Messages peer rectangle");
+        let opened_left = app
+            .hit_map
+            .pane_geometry("%0")
+            .expect("open left pane")
+            .inner;
+        let opened_right = app
+            .hit_map
+            .pane_geometry("%1")
+            .expect("open selected pane")
+            .inner;
+        assert!(opened_left.right() <= messages.x);
+        assert!(opened_right.right() <= messages.x);
+        assert!(opened_left.width < closed_left.width);
+        assert!(opened_right.width < closed_right.width);
+        assert!(
+            (i32::from(opened_right.width) * 60 - i32::from(opened_left.width) * 29).abs() <= 60,
+            "both cards must reflow, not clip only the trailing card"
+        );
+        assert_eq!(opened[(messages.x, messages.y)].symbol(), "╔");
+        assert_eq!(opened[(messages.right() - 1, messages.y)].symbol(), "╗");
+        assert_eq!(opened[(messages.x, messages.bottom() - 1)].symbol(), "╚");
+        assert_eq!(
+            opened[(messages.right() - 1, messages.bottom() - 1)].symbol(),
+            "╝"
+        );
+
+        app.model.messages_visible = false;
+        app.messages_focused = false;
+        app.layout_changed();
+        let _closed_again = clean_frame(&mut app, 96, 24);
+        assert_eq!(
+            app.hit_map
+                .pane_geometry("%0")
+                .expect("restored left pane")
+                .inner,
+            closed_left
+        );
+        assert_eq!(
+            app.hit_map
+                .pane_geometry("%1")
+                .expect("restored selected pane")
+                .inner,
+            closed_right
+        );
+
+        app.model.messages_visible = true;
+        app.messages_focused = true;
+        app.term_size = (60, 24);
+        app.layout_changed();
+        let _narrow = clean_frame(&mut app, 60, 24);
+        assert!(
+            app.hit_map.pane_geometry("%1").is_some(),
+            "narrow Messages view hid the selected agent"
+        );
+
         let _ = std::fs::remove_dir_all(home);
     }
 
