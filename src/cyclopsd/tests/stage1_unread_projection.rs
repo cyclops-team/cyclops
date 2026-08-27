@@ -54,6 +54,260 @@ async fn wait_for_border_needle(rig: &Rig, pane: &str, needle: &str, should_cont
     );
 }
 
+async fn wait_for_pending_unread_projection_count(rig: &Rig, expected: usize) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if rig.daemon.pending_unread_projection_count_for_test() == expected {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!(
+        "timed out waiting for {expected} pending unread recipient(s); got {}",
+        rig.daemon.pending_unread_projection_count_for_test()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_acceptance_never_waits_on_tmux_unread_chrome() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+
+    let mut rig = Rig::new(
+        "s1unread-acceptance",
+        CAT_MANIFEST,
+        "cat",
+        "receipt_block_ms = 100\n",
+    )
+    .await;
+    rig.wait_attached(1).await;
+    let pane = rig.pane_ids().await[0].clone();
+    let response = rig
+        .ctl
+        .request(
+            "pane.label",
+            json!({"target": pane, "label": "worker", "manifest": "fix"}),
+        )
+        .await;
+    assert_eq!(response["result"]["label"], "worker", "{response}");
+
+    let unread_chrome = rig.daemon.hold_unread_projection_for_test().await;
+    let send = tokio::time::timeout(
+        Duration::from_secs(1),
+        rig.daemon.msg_send(
+            "admin",
+            serde_json::from_value(json!({
+                "to": ["worker"],
+                "subject": "Mailbox truth",
+                "body": "Chrome may be wedged",
+                "client_key": "s1-unread-does-not-block"
+            }))
+            .unwrap(),
+        ),
+    )
+    .await
+    .expect("durable acceptance waited on tmux unread chrome")
+    .unwrap();
+    let message_id = send["msg_id"].as_str().unwrap();
+    rig.daemon
+        .claim_message_for_test("worker", message_id)
+        .expect("the accepted message is immediately claimable");
+    drop(unread_chrome);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unread_projection_coalesces_a_burst_without_dropping_the_newest_count() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+
+    let mut rig = Rig::new(
+        "s1unread-coalesce",
+        CAT_MANIFEST,
+        "cat",
+        "receipt_block_ms = 100\n",
+    )
+    .await;
+    rig.wait_attached(1).await;
+    let pane = rig.pane_ids().await[0].clone();
+    let response = rig
+        .ctl
+        .request(
+            "pane.label",
+            json!({"target": pane, "label": "worker", "manifest": "fix"}),
+        )
+        .await;
+    assert_eq!(response["result"]["label"], "worker", "{response}");
+
+    let first_write = rig.daemon.pause_next_unread_projection_for_test();
+    for index in 0..3 {
+        rig.daemon
+            .msg_send(
+                "admin",
+                serde_json::from_value(json!({
+                    "to": ["worker"],
+                    "subject": format!("Burst {index}"),
+                    "body": "The durable count must win",
+                    "client_key": format!("s1-unread-coalesce-{index}")
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        if index == 0 {
+            tokio::time::timeout(Duration::from_secs(2), first_write.wait_until_derived())
+                .await
+                .expect("the first unread pass never reached its derived-count boundary");
+        }
+    }
+    wait_for_pending_unread_projection_count(&rig, 1).await;
+
+    // Let the stale count of one reach tmux, then stop the second pass after
+    // it derives three. This pins the interleaving that a try-lock/drop design
+    // loses: the newest fact arrived after derivation but before the old write.
+    let second_write = rig.daemon.pause_next_unread_projection_for_test();
+    first_write.release();
+    tokio::time::timeout(Duration::from_secs(2), second_write.wait_until_derived())
+        .await
+        .expect("the dirty recipient was dropped after the stale tmux write");
+    assert_eq!(
+        option(&rig, "-p", &pane, "@cyclops_unread")
+            .split_whitespace()
+            .nth(1),
+        Some("1"),
+        "the first tmux write must carry the stale pre-burst count"
+    );
+    second_write.release();
+
+    wait_for_option(&rig, &pane, "3").await;
+    wait_for_pending_unread_projection_count(&rig, 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unadopt_is_the_last_chrome_writer_after_an_in_flight_unread_projection() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+
+    let mut rig = Rig::new(
+        "s1unread-unadopt",
+        CAT_MANIFEST,
+        "cat",
+        "receipt_block_ms = 100\n",
+    )
+    .await;
+    rig.wait_attached(1).await;
+    let pane = rig.pane_ids().await[0].clone();
+    let response = rig
+        .ctl
+        .request(
+            "pane.label",
+            json!({"target": pane, "label": "worker", "manifest": "fix"}),
+        )
+        .await;
+    assert_eq!(response["result"]["label"], "worker", "{response}");
+
+    let unread_chrome = rig.daemon.hold_unread_projection_for_test().await;
+    rig.daemon
+        .msg_send(
+            "admin",
+            serde_json::from_value(json!({
+                "to": ["worker"],
+                "subject": "Clear wins",
+                "body": "No late badge may repaint the pane",
+                "client_key": "s1-unread-unadopt"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    wait_for_pending_unread_projection_count(&rig, 0).await;
+    tokio::task::yield_now().await;
+
+    let response = {
+        let clear = rig
+            .ctl
+            .request("pane.label", json!({"target": "worker", "label": null}));
+        tokio::pin!(clear);
+        tokio::select! {
+            response = &mut clear => panic!("unadopt bypassed the unread projection gate: {response}"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        drop(unread_chrome);
+        clear.await
+    };
+    assert_eq!(response["result"]["label"], serde_json::Value::Null);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        option(&rig, "-p", &pane, "@cyclops_unread").is_empty(),
+        "an unread projection repainted the pane after unadopt"
+    );
+    wait_for_border_needle(&rig, &pane, "✉", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_joins_the_unread_worker_before_restoring_user_chrome() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+
+    let mut rig = Rig::new(
+        "s1unread-shutdown",
+        CAT_MANIFEST,
+        "cat",
+        "receipt_block_ms = 100\n",
+    )
+    .await;
+    rig.wait_attached(1).await;
+    let pane = rig.pane_ids().await[0].clone();
+    let response = rig
+        .ctl
+        .request(
+            "pane.label",
+            json!({"target": pane, "label": "worker", "manifest": "fix"}),
+        )
+        .await;
+    assert_eq!(response["result"]["label"], "worker", "{response}");
+
+    let unread_chrome = rig.daemon.hold_unread_projection_for_test().await;
+    rig.daemon
+        .msg_send(
+            "admin",
+            serde_json::from_value(json!({
+                "to": ["worker"],
+                "subject": "Shutdown order",
+                "body": "The user's chrome must be last",
+                "client_key": "s1-unread-shutdown"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    wait_for_pending_unread_projection_count(&rig, 0).await;
+    tokio::task::yield_now().await;
+
+    let shutdown = rig.daemon.shutdown();
+    tokio::pin!(shutdown);
+    tokio::select! {
+        () = &mut shutdown => panic!("shutdown bypassed the held unread projection"),
+        _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+    }
+    drop(unread_chrome);
+    shutdown.await;
+
+    assert!(
+        option(&rig, "-p", &pane, "@cyclops_unread").is_empty(),
+        "the unread worker repainted Cyclops chrome after shutdown restore"
+    );
+    assert!(!border_text(&rig, &pane).contains("✉"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn slice1_unread_lifecycle_and_reconstruction() {
     if !tmux_available() {

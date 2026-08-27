@@ -696,8 +696,13 @@ async fn finish_acceptance(
     let schedule = schedule_accepted_notifications(&accepted, |recipient| {
         schedule_recipient(inner, service, recipient)
     });
-    for recipient in &accepted.recipient_keys {
-        crate::sync_recipient_unread(inner, *recipient).await;
+    // The journal append is the acceptance boundary. Pane chrome is a
+    // best-effort projection of that truth and must never hold the response
+    // behind a slow tmux server. One daemon-owned worker coalesces dirtiness
+    // per recipient and re-derives the current durable count after every
+    // blocked write; msg.send neither waits nor allocates one task per fact.
+    for recipient in accepted.recipient_keys.iter().copied() {
+        crate::schedule_recipient_unread(inner, recipient);
     }
     let deadline = Instant::now() + Duration::from_millis(inner.cfg.receipt_block_ms);
     let dispositions = observe_first_durable_dispositions(
@@ -872,10 +877,7 @@ fn finish_claim(
             error!(%claimant, %error, "cannot schedule mailbox notification after claim");
         }
     }
-    let inner_clone = Arc::clone(inner);
-    tokio::spawn(async move {
-        crate::sync_recipient_unread(&inner_clone, claimant).await;
-    });
+    crate::schedule_recipient_unread(inner, claimant);
     Ok(outcome)
 }
 
@@ -987,10 +989,7 @@ pub(crate) fn requeue(
         if let Err(error) = schedule_recipient(inner, service, recipient) {
             error!(%recipient, %error, "cannot schedule requeued mailbox notification");
         }
-        let inner_clone = Arc::clone(inner);
-        tokio::spawn(async move {
-            crate::sync_recipient_unread(&inner_clone, recipient).await;
-        });
+        crate::schedule_recipient_unread(inner, recipient);
     }
     Ok(!records.is_empty())
 }
@@ -1014,10 +1013,7 @@ pub(crate) fn withdraw_notification(
     if let Err(error) = schedule_recipient(inner, service, recipient) {
         error!(%recipient, %error, "cannot schedule mailbox notification after withdrawal");
     }
-    let inner_clone = Arc::clone(inner);
-    tokio::spawn(async move {
-        crate::sync_recipient_unread(&inner_clone, recipient).await;
-    });
+    crate::schedule_recipient_unread(inner, recipient);
     Ok(NotificationWithdrawResult {
         attempt_id,
         message_id: record.message_id,

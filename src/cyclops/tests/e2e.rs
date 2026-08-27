@@ -1839,7 +1839,7 @@ fn send_all_targets_star_and_reports_screen_verification() {
 }
 
 #[test]
-fn send_parked_exits_one_with_reset_hint() {
+fn send_parked_with_required_wake_exits_one_with_reset_hint() {
     let home = scratch_home("sk");
     serve_once(&home, hello(1), move |req| {
         (
@@ -1856,7 +1856,15 @@ fn send_parked_exits_one_with_reset_hint() {
     });
     let out = run_cyclops(
         &home,
-        &["send", "reviewer", "--subject", "s", "--body", "b"],
+        &[
+            "send",
+            "reviewer",
+            "--subject",
+            "s",
+            "--body",
+            "b",
+            "--require-wake",
+        ],
     );
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
@@ -1870,13 +1878,108 @@ fn send_parked_exits_one_with_reset_hint() {
     let _ = fs::remove_dir_all(&home);
 }
 
+#[test]
+fn accepted_send_with_blocked_wake_defaults_to_success() {
+    let home = scratch_home("sk-default");
+    serve_once(&home, hello(1), move |req| {
+        (
+            vec![json!({"id": req["id"], "result": {
+                "msg_id": "m-b3", "seq": 13, "inserted": true,
+                "deliveries": [{
+                    "to": "reviewer", "state": "parked_blocked_quota",
+                    "note": "resets in 135h"
+                }]
+            }})
+            .to_string()],
+            false,
+        )
+    });
+    let out = run_cyclops(
+        &home,
+        &["send", "reviewer", "--subject", "s", "--body", "b"],
+    );
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with("accepted m-b3\n"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("message is kept as parked"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn mailbox_attention_with_required_wake_exits_one_in_plain_and_json() {
+    let production_result = || {
+        json!({
+            "msg_id": "m-mailbox", "seq": 14, "inserted": true,
+            "deliveries": [{
+                "to": "reviewer",
+                "state": "queued",
+                "notification_state": "attention_required",
+                "quota_state": "held"
+            }]
+        })
+    };
+
+    let plain_home = scratch_home("sk-mailbox-plain");
+    serve_once(&plain_home, hello(1), move |req| {
+        (
+            vec![json!({"id": req["id"], "result": production_result()}).to_string()],
+            false,
+        )
+    });
+    let plain = run_cyclops(
+        &plain_home,
+        &["send", "reviewer", "--subject", "s", "--require-wake"],
+    );
+    assert_eq!(plain.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&plain.stdout),
+        "accepted m-mailbox\n✓ accepted · wake quota held\n"
+    );
+    let _ = fs::remove_dir_all(&plain_home);
+
+    let json_home = scratch_home("sk-mailbox-json");
+    let expected = production_result();
+    let response = expected.clone();
+    serve_once(&json_home, hello(1), move |req| {
+        (
+            vec![json!({"id": req["id"], "result": response}).to_string()],
+            false,
+        )
+    });
+    let machine = run_cyclops(
+        &json_home,
+        &[
+            "send",
+            "reviewer",
+            "--subject",
+            "s",
+            "--require-wake",
+            "--json",
+        ],
+    );
+    assert_eq!(machine.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&machine.stdout).trim(),
+        expected.to_string()
+    );
+    assert!(machine.stderr.is_empty());
+    let _ = fs::remove_dir_all(&json_home);
+}
+
 /// A send to a pane nothing detects, in the shape the daemon answers
 /// with: the gate's machine cause plus the pane as data. The badge words
 /// the cause and names the pane, the follow-up says the message did not
-/// arrive and carries the command that fixes it, and the exit code keeps a
-/// script from branching on it as a delivery.
+/// arrive and carries the command that fixes it. `--require-wake` lets a
+/// script require more than durable acceptance.
 #[test]
-fn send_to_an_undetected_pane_says_it_did_not_arrive_and_exits_one() {
+fn send_to_an_undetected_pane_says_it_did_not_arrive_and_required_wake_exits_one() {
     let home = scratch_home("sund");
     serve_once(&home, hello(1), move |req| {
         (
@@ -1891,7 +1994,10 @@ fn send_to_an_undetected_pane_says_it_did_not_arrive_and_exits_one() {
             false,
         )
     });
-    let out = run_cyclops(&home, &["send", "worker", "--subject", "hello"]);
+    let out = run_cyclops(
+        &home,
+        &["send", "worker", "--subject", "hello", "--require-wake"],
+    );
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
@@ -1926,7 +2032,7 @@ fn an_older_daemon_without_the_pane_field_still_gets_worded_copy() {
         )
     });
     let out = run_cyclops(&home, &["send", "worker", "--subject", "hello"]);
-    assert_eq!(out.status.code(), Some(1));
+    assert!(out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "⚠ needs attention · nothing detects its pane\n"
@@ -1979,7 +2085,17 @@ fn send_json_passthrough_keeps_the_exit_code() {
             false,
         )
     });
-    let out = run_cyclops(&home, &["send", "reviewer", "--subject", "s", "--json"]);
+    let out = run_cyclops(
+        &home,
+        &[
+            "send",
+            "reviewer",
+            "--subject",
+            "s",
+            "--json",
+            "--require-wake",
+        ],
+    );
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), expected);
     assert!(

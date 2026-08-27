@@ -47,7 +47,9 @@ cyclops send --all --subject "Standup in 5" --fyi
 
 `--to` adds recipients, `--body-file -` reads the body from stdin,
 `--reply-to` links a reply, and `--all` broadcasts to every adopted agent.
-Name `admin` explicitly to send to the durable operator inbox.
+Name `admin` explicitly to send to the durable operator inbox. By default a
+durably accepted send exits 0 even when its optional terminal wake needs
+attention. Add `--require-wake` when a script also requires a healthy wake.
 
 A successful send proves durable acceptance, not recipient claim or task
 completion. If the response is lost, inspect current state and retry only with
@@ -91,8 +93,9 @@ and documentation should use `watch`.
 
 - `0`: the command succeeded; for sends, the message was accepted or an exact
   client-key retry found the existing message.
-- `1`: no successful response. A send may already be durable if the response
-  was lost.
+- `1`: no successful response. With `send --require-wake`, it can instead mean
+  the message is durable while its optional terminal wake needs attention. A
+  send may also already be durable if its response was lost.
 - `2`: usage error, or `wait` timed out.
 - `3`: the waited-on pane died or changed occupant.
 

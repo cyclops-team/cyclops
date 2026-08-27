@@ -44,6 +44,30 @@ opens one attention entry and never writes the payload a second time. Attention
 recovery rebuilds the expected bytes from the durable transport: the fixed row
 for a doorbell, or the canonical message payload for direct fallback.
 
+## Runtime and composer are independent axes
+
+`Idle` and `Working` describe what the agent is doing for the operator. They do
+not decide whether a notification may write. Composer evidence answers that
+separate safety question:
+
+- `Clean` can admit a notification while the agent is idle or working.
+- `WithInput` holds the notification without changing durable acceptance.
+- `Ambiguous` also holds. Absence of detected text is never proof of a clean
+  composer.
+- modal, permission, quota, dead, and unknown runtime states keep their own
+  explicit refusal or attention semantics.
+
+The daemon reacts to pane and lifecycle evidence rather than polling. When a
+held composer becomes positively clean, the same FIFO attempt resumes; the
+sender does not requeue it. The mailbox body remains claimable over the socket
+throughout the hold.
+
+The terminal write is only a notification transport. Mailbox acceptance,
+claim, reply, ordering, and replay do not depend on the full-screen workspace
+UI. Raw tmux injection remains a manual emergency path outside this contract:
+Cyclops never falls back to an unrecorded paste after an uncertain daemon
+outcome.
+
 Current terminal-action settlements append `notification_resolved` with
 `proof_version: 1` and replay only after the exact intent, action, and required
 consumption facts. Missing proof versions are limited to historical format 1

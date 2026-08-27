@@ -43,10 +43,11 @@ reference owns the closed [`wake_block` vocabulary](../reference/PROTOCOL.md#msg
 A durable failure before terminal bytes reports `wake blocked before write
 (<reason>)`. Its `pre_write_cause` is separate from `wake_block`: the first
 names the failed write-boundary proof, while the second names why no scheduler
-worker owns the wake. The plain and JSON commands exit 1 when either field is
-present, but the message remains durably accepted and claimable. Inspect the
-named cause before requeueing; a retry without changed evidence cannot clear a
-terminal pre-write block.
+worker owns the wake. The plain and JSON commands still exit 0 because the
+message remains durably accepted and claimable. Add `--require-wake` when a
+script must exit 1 for either field or for another wake state that needs
+operator attention. Inspect the named cause before requeueing; a retry without
+changed evidence cannot clear a terminal pre-write block.
 
 A position such as `2 ahead` is the recipient mailbox's FIFO position. The
 daemon never bypasses an older pending message. When the oldest pending
@@ -294,9 +295,11 @@ the `msg.send` mailbox contract.
 
 - `0`: the message was accepted, or the idempotency key named an existing
   accepted message
-- `1`: no success response was received. The daemon may have refused the
-  request, or the response may have been lost after durable acceptance. Inspect
-  current state and reuse the same explicit client key for any exact retry
+- `1`: no success response was received; with `--require-wake`, it can also
+  mean the message was accepted but its optional terminal wake needs operator
+  attention. Inspect current state before retrying. Reuse the same explicit
+  client key for any exact retry because a response can be lost after durable
+  acceptance
 - `2`: local command usage was invalid
 
 `cyclops send` does not wait for task completion. `cyclops wait <target>

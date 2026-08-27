@@ -97,7 +97,7 @@ use cyclops_tmux::{
     ControlConfig, PaneEvent, PaneField, PaneRow, SessionWatcher, TmuxError, TmuxVersion,
 };
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, watch, Notify};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -170,6 +170,13 @@ pub(crate) struct Inner {
     /// (2) `sync_pane_unread` acquires this gate with no std guard held.
     /// (3) Code executed under it must not recurse into `sync_pane_unread`.
     pub(crate) unread_projection_gate: tokio::sync::Mutex<()>,
+    /// Recipient keys whose tmux unread projection is dirty. One daemon-owned
+    /// worker drains this set, so a burst allocates neither one task nor one
+    /// queue entry per message.
+    unread_projection_pending: StdMutex<HashSet<RecipientKey>>,
+    unread_projection_wake: Notify,
+    unread_projection_stopping: AtomicBool,
+    unread_projection_pause: StdMutex<Option<Arc<UnreadProjectionTestPause>>>,
     #[cfg(test)]
     mailbox_publish_pause: StdMutex<Option<MailboxPublishPause>>,
     pub(crate) boot_id: String,
@@ -1320,7 +1327,31 @@ pub struct Daemon {
     inner: Arc<Inner>,
     stop: watch::Sender<bool>,
     tasks: StdMutex<Vec<JoinHandle<()>>>,
+    unread_projection_task: StdMutex<Option<JoinHandle<()>>>,
     socket_cleanup: StdMutex<Option<cyclops_state::BoundSocketCleanup>>,
+}
+
+/// Test-only coordination at the exact stale-projection boundary.
+///
+/// It is always compiled because integration tests exercise the public daemon
+/// type as a dependency. Production never arms it, so the hot path performs
+/// only one uncontended `None` check.
+#[doc(hidden)]
+pub struct UnreadProjectionTestPause {
+    derived: Notify,
+    release: Notify,
+}
+
+impl UnreadProjectionTestPause {
+    #[doc(hidden)]
+    pub async fn wait_until_derived(&self) {
+        self.derived.notified().await;
+    }
+
+    #[doc(hidden)]
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 impl Daemon {
@@ -1352,6 +1383,15 @@ impl Daemon {
         // the latch turns that into a durable pending item instead of an
         // untracked task that outlives shutdown.
         self.inner.engine.begin_stopping();
+        self.inner
+            .unread_projection_stopping
+            .store(true, Ordering::Release);
+        self.inner
+            .unread_projection_pending
+            .lock()
+            .expect("unread projection pending lock")
+            .clear();
+        self.inner.unread_projection_wake.notify_one();
         // Wait for a registration that crossed the stopping edge to finish.
         // Later session.watch calls acquire this lock, observe stopping, and
         // refuse before opening a ledger or publishing a task.
@@ -1368,6 +1408,23 @@ impl Daemon {
         )
         .await
         .is_ok();
+        // The unread worker owns optional tmux chrome writes outside delivery
+        // supervision. Join or cancel it before restoring the user's chrome,
+        // otherwise a late badge write can repaint Cyclops after shutdown.
+        let unread_projection_task = self
+            .unread_projection_task
+            .lock()
+            .expect("unread projection task lock")
+            .take();
+        if let Some(mut task) = unread_projection_task {
+            if tokio::time::timeout(SHUTDOWN_GRACE, &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
+        }
         if descendants_stopped {
             restore_all_chrome(&self.inner).await;
         } else {
@@ -1488,6 +1545,49 @@ impl Daemon {
             message: error.to_string(),
             data: None,
         })
+    }
+
+    /// Test seam for proving mailbox acceptance does not wait on tmux chrome.
+    ///
+    /// Socket authentication and unread rendering have separate coverage.
+    #[doc(hidden)]
+    pub async fn hold_unread_projection_for_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.inner.unread_projection_gate.lock().await
+    }
+
+    /// Number of coalesced recipient keys awaiting an unread projection.
+    ///
+    /// This exposes queue cardinality, never message content. Tests use it to
+    /// prove a burst creates one bounded dirty key and that a fact arriving
+    /// behind an in-flight tmux write is not dropped.
+    #[doc(hidden)]
+    pub fn pending_unread_projection_count_for_test(&self) -> usize {
+        self.inner
+            .unread_projection_pending
+            .lock()
+            .expect("unread projection pending lock")
+            .len()
+    }
+
+    /// Pause the next unread projection after it derives the durable count but
+    /// before tmux receives that value.
+    #[doc(hidden)]
+    pub fn pause_next_unread_projection_for_test(&self) -> Arc<UnreadProjectionTestPause> {
+        let pause = Arc::new(UnreadProjectionTestPause {
+            derived: Notify::new(),
+            release: Notify::new(),
+        });
+        let replaced = self
+            .inner
+            .unread_projection_pause
+            .lock()
+            .expect("unread projection pause lock")
+            .replace(Arc::clone(&pause));
+        assert!(
+            replaced.is_none(),
+            "an unread projection pause is already armed"
+        );
+        pause
     }
 
     /// Test seam for an exact mailbox claim while a delivery worker is paused.
@@ -2180,6 +2280,11 @@ async fn unadopt_pane(
     session_idx: usize,
     pane_id: &str,
 ) -> Result<(), WireError> {
+    // A best-effort unread write may still be in flight after msg.send has
+    // returned. Clear owns the final chrome write, so order it after that
+    // projection and keep later projections from observing the adoption
+    // until its registry entry is gone.
+    let _unread_projection = inner.unread_projection_gate.lock().await;
     let route = watcher.and_then(|watcher| adoption_route(inner, watcher, session_idx, pane_id));
     let Some((recipient, pane_root, _)) = route else {
         return Ok(());
@@ -2403,6 +2508,65 @@ async fn paint_adoptions(
 /// Update the @cyclops_unread option on an adopted pane.
 pub(crate) async fn sync_pane_unread(inner: &Arc<Inner>, pane_id: &str) {
     let _gate = inner.unread_projection_gate.lock().await;
+    sync_pane_unread_with_gate(inner, pane_id).await;
+}
+
+/// Mark one recipient's unread chrome dirty without waiting on tmux.
+///
+/// The pending set coalesces any number of facts for the same recipient. The
+/// daemon-owned worker re-derives the authoritative count after each dirty
+/// edge, so a fact committed while an older tmux write is blocked cannot be
+/// lost behind that stale write.
+pub(crate) fn schedule_recipient_unread(inner: &Arc<Inner>, recipient: RecipientKey) {
+    if inner.unread_projection_stopping.load(Ordering::Acquire) {
+        return;
+    }
+    let inserted = {
+        let mut pending = inner
+            .unread_projection_pending
+            .lock()
+            .expect("unread projection pending lock");
+        if inner.unread_projection_stopping.load(Ordering::Acquire) {
+            return;
+        }
+        pending.insert(recipient)
+    };
+    if inserted {
+        inner.unread_projection_wake.notify_one();
+    }
+}
+
+/// Drain unread projections until shutdown. The set is checked before each
+/// wait so a notify racing the wait is retained as either a set entry or a
+/// Notify permit.
+async fn unread_projection_task(inner: Arc<Inner>) {
+    loop {
+        if inner.unread_projection_stopping.load(Ordering::Acquire) {
+            return;
+        }
+        let recipients = std::mem::take(
+            &mut *inner
+                .unread_projection_pending
+                .lock()
+                .expect("unread projection pending lock"),
+        );
+        if recipients.is_empty() {
+            inner.unread_projection_wake.notified().await;
+            continue;
+        }
+        for recipient in recipients {
+            if inner.unread_projection_stopping.load(Ordering::Acquire) {
+                return;
+            }
+            sync_recipient_unread(&inner, recipient).await;
+        }
+    }
+}
+
+/// Derive and paint one unread count while the caller owns the projection
+/// gate. Keeping the tmux work here makes the blocking and best-effort entry
+/// points share one authoritative projection read.
+async fn sync_pane_unread_with_gate(inner: &Arc<Inner>, pane_id: &str) {
     let adoptions = inner
         .registry
         .lock()
@@ -2434,6 +2598,15 @@ pub(crate) async fn sync_pane_unread(inner: &Arc<Inner>, pane_id: &str) {
             m.pending_count(recipient).ok()
         })
         .unwrap_or(0);
+    let pause = inner
+        .unread_projection_pause
+        .lock()
+        .expect("unread projection pause lock")
+        .take();
+    if let Some(pause) = pause {
+        pause.derived.notify_one();
+        pause.release.notified().await;
+    }
     if let Err(e) =
         chrome::update_unread(&watcher.client(), inner.cfg.chrome, pane_id, unread).await
     {
@@ -2739,6 +2912,10 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         )),
         mailbox_publication: StdMutex::new(()),
         unread_projection_gate: tokio::sync::Mutex::new(()),
+        unread_projection_pending: StdMutex::new(HashSet::new()),
+        unread_projection_wake: Notify::new(),
+        unread_projection_stopping: AtomicBool::new(false),
+        unread_projection_pause: StdMutex::new(None),
         #[cfg(test)]
         mailbox_publish_pause: StdMutex::new(None),
         boot_id,
@@ -2826,6 +3003,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         listener,
         inner.stop.clone(),
     )));
+    let unread_projection_task = tokio::spawn(unread_projection_task(Arc::clone(&inner)));
     info!(
         boot_id = %inner.boot_id,
         sessions = inner.session_count(),
@@ -2837,6 +3015,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         inner,
         stop,
         tasks: StdMutex::new(tasks),
+        unread_projection_task: StdMutex::new(Some(unread_projection_task)),
         socket_cleanup: StdMutex::new(Some(socket_cleanup)),
     })
 }
@@ -4769,6 +4948,10 @@ mod tests {
             composer_recovery: StdMutex::new(composer_recovery::RecoveryCoordinator::default()),
             mailbox_publication: StdMutex::new(()),
             unread_projection_gate: tokio::sync::Mutex::new(()),
+            unread_projection_pending: StdMutex::new(HashSet::new()),
+            unread_projection_wake: Notify::new(),
+            unread_projection_stopping: AtomicBool::new(false),
+            unread_projection_pause: StdMutex::new(None),
             mailbox_publish_pause: StdMutex::new(None),
             boot_id: "b-test".into(),
             started: Instant::now(),

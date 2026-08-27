@@ -197,7 +197,9 @@ cmd_send() {
     usage_die "send requires --body-file (v1 always passed --body-file -)"
   fi
 
-  local -a args=(send "$target" --subject "$subject" --body-file "$body_file")
+  # v1 treated a blocked terminal wake as failure. The v2 CLI defaults to
+  # durable mailbox acceptance, so ask explicitly for the legacy contract.
+  local -a args=(send "$target" --subject "$subject" --body-file "$body_file" --require-wake)
   if [[ "$json" == true ]]; then
     args+=(--json)
   fi
