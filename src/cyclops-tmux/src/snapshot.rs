@@ -37,24 +37,71 @@
 //! problem; the baseline's `W + 3` was `W + 3` one-shot tmux *processes*, and
 //! this is two, regardless of `W`.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::control::ControlClient;
 use crate::error::TmuxError;
 use crate::quote::quote_arg;
 
-/// One pane in a [`SnapshotWindow`].
+/// Recorded minimization provenance for a pane stored in `@cyclops_pane_minimized_v1`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaneMinimizationProvenance {
+    /// No minimization option set on this pane.
+    None,
+    /// Deliberately minimized pane with verified pre-collapse height.
+    Minimized { original_height: u16 },
+    /// Non-empty option payload present but corrupted or invalid.
+    Malformed(String),
+}
+
+impl PaneMinimizationProvenance {
+    /// Parse from raw tmux option string.
+    pub fn parse(raw: &str) -> Self {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Self::None;
+        }
+        if let Some(rest) = trimmed.strip_prefix("v1:") {
+            if let Ok(height) = rest.parse::<u16>() {
+                if height >= 2 {
+                    return Self::Minimized {
+                        original_height: height,
+                    };
+                }
+            }
+            return Self::Malformed(raw.to_string());
+        }
+        Self::Malformed(raw.to_string())
+    }
+
+    pub fn is_minimized(&self) -> bool {
+        matches!(self, Self::Minimized { .. })
+    }
+
+    pub fn is_malformed(&self) -> bool {
+        matches!(self, Self::Malformed(_))
+    }
+
+    pub fn original_height(&self) -> Option<u16> {
+        match self {
+            Self::Minimized { original_height } => Some(*original_height),
+            _ => None,
+        }
+    }
+}
+
+/// One pane on a window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotPane {
-    /// Pane id, e.g. `%3`.
     pub id: String,
     /// Zero-based pane index in the window.
     pub index: usize,
     pub active: bool,
     pub width: u32,
     pub height: u32,
-    /// Recorded pre-minimize height if deliberately minimized by operator.
-    pub minimized: Option<u16>,
+    /// Recorded pre-minimize provenance if deliberately minimized by operator.
+    pub minimization: PaneMinimizationProvenance,
 }
 
 /// One window in a [`SnapshotSession`], with its panes in pane-index order.
@@ -103,7 +150,7 @@ pub struct WorkspaceSnapshot {
 /// `window_name` in `crate::session::list_windows` and `crate::watcher`'s
 /// `PANE_FORMAT`) lands inside the name instead of corrupting the fields
 /// after it — there are none after it.
-const SNAPSHOT_PANE_FORMAT: &str = "#{session_id}\t#{session_attached}\t#{window_id}\t#{window_index}\t#{window_active}\t#{window_zoomed_flag}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_width}\t#{pane_height}\t#{@cyclops_pane_minimized}\t#{window_layout}\t#{window_name}";
+const SNAPSHOT_PANE_FORMAT: &str = "#{session_id}\t#{session_attached}\t#{window_id}\t#{window_index}\t#{window_active}\t#{window_zoomed_flag}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_width}\t#{pane_height}\t#{@cyclops_pane_minimized_v1}\t#{window_layout}\t#{window_name}";
 
 /// Number of tab-separated fields in [`SNAPSHOT_PANE_FORMAT`].
 const SNAPSHOT_PANE_FIELDS: usize = 14;
@@ -147,14 +194,15 @@ impl ControlClient {
         let mut attached: HashMap<String, bool> = HashMap::new();
         let mut windows_by_session: HashMap<String, HashMap<String, SnapshotWindow>> =
             HashMap::new();
-        for line in &pane_lines {
+        for line in pane_lines {
             if line.is_empty() {
                 continue;
             }
-            let raw = parse_pane_line(line)?;
+            let raw = parse_pane_line(&line)?;
             attached.insert(raw.session_id.clone(), raw.session_attached);
-            let windows = windows_by_session.entry(raw.session_id).or_default();
-            let window = windows
+            let window = windows_by_session
+                .entry(raw.session_id.clone())
+                .or_default()
                 .entry(raw.window_id.clone())
                 .or_insert_with(|| SnapshotWindow {
                     id: raw.window_id,
@@ -171,7 +219,7 @@ impl ControlClient {
                 active: raw.pane_active,
                 width: raw.pane_width,
                 height: raw.pane_height,
-                minimized: raw.pane_minimized,
+                minimization: raw.pane_minimized,
             });
         }
 
@@ -225,7 +273,7 @@ struct RawPaneLine {
     pane_active: bool,
     pane_width: u32,
     pane_height: u32,
-    pane_minimized: Option<u16>,
+    pane_minimized: PaneMinimizationProvenance,
     window_layout: String,
     window_name: String,
 }
@@ -248,12 +296,7 @@ fn parse_pane_line(line: &str) -> Result<RawPaneLine, TmuxError> {
     let pane_active = next()? == "1";
     let pane_width = parse_u32(next()?, "pane_width")?;
     let pane_height = parse_u32(next()?, "pane_height")?;
-    let pane_minimized_raw = next()?;
-    let pane_minimized = if pane_minimized_raw.is_empty() {
-        None
-    } else {
-        pane_minimized_raw.parse::<u16>().ok()
-    };
+    let pane_minimized = PaneMinimizationProvenance::parse(next()?);
     let window_layout = next()?.to_string();
     let window_name = next()?.to_string();
     Ok(RawPaneLine {
@@ -325,16 +368,29 @@ mod tests {
         assert!(raw.pane_active);
         assert_eq!(raw.pane_width, 80);
         assert_eq!(raw.pane_height, 24);
-        assert_eq!(raw.pane_minimized, None);
+        assert_eq!(raw.pane_minimized, PaneMinimizationProvenance::None);
         assert_eq!(raw.window_layout, "8205,80x24,0,0{...}");
         // The trailing field swallows every tab after the 13th: a window
         // name that happens to contain literal tabs still parses whole
         // instead of corrupting fields that do not exist after it.
         assert_eq!(raw.window_name, "name\twith\ttabs");
 
-        let line_min = "$0\t1\t@1\t2\t1\t0\t%3\t1\t1\t80\t24\t23\t8205,80x24,0,0{...}\tname";
+        let line_min = "$0\t1\t@1\t2\t1\t0\t%3\t1\t1\t80\t24\tv1:23\t8205,80x24,0,0{...}\tname";
         let raw_min = parse_pane_line(line_min).expect("parses with minimized");
-        assert_eq!(raw_min.pane_minimized, Some(23));
+        assert_eq!(
+            raw_min.pane_minimized,
+            PaneMinimizationProvenance::Minimized {
+                original_height: 23
+            }
+        );
+
+        let line_malformed =
+            "$0\t1\t@1\t2\t1\t0\t%3\t1\t1\t80\t24\tcorrupted\t8205,80x24,0,0{...}\tname";
+        let raw_malformed = parse_pane_line(line_malformed).expect("parses with malformed");
+        assert_eq!(
+            raw_malformed.pane_minimized,
+            PaneMinimizationProvenance::Malformed("corrupted".to_string())
+        );
     }
 
     #[test]

@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use cyclops_tmux::{ControlClient, TmuxError};
 use uuid::Uuid;
 
-use super::App;
+use super::{log_err, App};
 use crate::action::{Action, Insertion, TabDestination};
 use crate::copy;
 use crate::daemon;
@@ -341,47 +341,52 @@ pub(super) async fn execute(
             })
         }
         Action::ToggleMinimizePane { pane_id } => {
-            match app.minimized.remove(&pane_id) {
-                Some(rows) => {
-                    let restore_rows = if rows <= crate::render::MINIMIZED_ROWS {
-                        10
-                    } else {
-                        rows
-                    };
-                    let _ = client
-                        .command(&format!(
-                            "set-option -p -t {} -u @cyclops_pane_minimized",
-                            cyclops_tmux::quote_arg(&pane_id)
-                        ))
-                        .await;
-                    client.resize_pane_height(&pane_id, restore_rows).await?;
+            let prov = app
+                .model
+                .active_tab()
+                .minimization_provenance
+                .get(&pane_id)
+                .cloned()
+                .unwrap_or(cyclops_tmux::PaneMinimizationProvenance::None);
+
+            match prov {
+                cyclops_tmux::PaneMinimizationProvenance::Malformed(bad) => {
+                    log_err(
+                        &app.home,
+                        &format!(
+                            "{pane_id}: minimization record is unreadable ({bad}), \
+                             so this workspace will not size it or delete the record"
+                        ),
+                    );
+                    app.notice.show(
+                        format!("refused: minimization record on {pane_id} is unreadable"),
+                        tokio::time::Instant::now(),
+                    );
                 }
-                None => {
+                cyclops_tmux::PaneMinimizationProvenance::Minimized { original_height } => {
+                    client.resize_pane_height(&pane_id, original_height).await?;
+                    client
+                        .unset_pane_option(&pane_id, cyclops_tmux::PANE_MINIMIZED_OPTION_V1)
+                        .await?;
+                    app.minimized.remove(&pane_id);
+                }
+                cyclops_tmux::PaneMinimizationProvenance::None => {
                     let Some(geometry) = app.hit_map.pane_geometry(&pane_id) else {
                         return Ok(Outcome::default());
                     };
                     let was = geometry.inner.height;
-                    if was <= crate::render::MINIMIZED_ROWS {
-                        // Compressed pane without provenance: restore deterministically
-                        let _ = client
-                            .command(&format!(
-                                "set-option -p -t {} -u @cyclops_pane_minimized",
-                                cyclops_tmux::quote_arg(&pane_id)
-                            ))
-                            .await;
-                        client.resize_pane_height(&pane_id, 10).await?;
-                    } else {
-                        app.minimized.insert(pane_id.clone(), was);
-                        let _ = client
-                            .command(&format!(
-                                "set-option -p -t {} @cyclops_pane_minimized {}",
-                                cyclops_tmux::quote_arg(&pane_id),
-                                was
-                            ))
-                            .await;
+                    if was > crate::render::MINIMIZED_ROWS {
+                        client
+                            .set_pane_option(
+                                &pane_id,
+                                cyclops_tmux::PANE_MINIMIZED_OPTION_V1,
+                                &format!("v1:{was}"),
+                            )
+                            .await?;
                         client
                             .resize_pane_height(&pane_id, crate::render::MINIMIZED_ROWS)
                             .await?;
+                        app.minimized.insert(pane_id.clone(), was);
                     }
                 }
             }
@@ -1441,6 +1446,7 @@ mod tests {
             active_pane: pane_id.to_string(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         };
         WorkspaceModel {
             workspaces: vec![WorkspaceRow {
@@ -1641,6 +1647,7 @@ mod tests {
             active_pane: pane_id.to_string(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         }
     }
 

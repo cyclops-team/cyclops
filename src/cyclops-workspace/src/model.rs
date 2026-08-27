@@ -16,6 +16,7 @@ pub struct TabModel {
     pub active_pane: String,
     pub zoomed: bool,
     pub minimized: HashMap<String, u16>,
+    pub minimization_provenance: HashMap<String, cyclops_tmux::PaneMinimizationProvenance>,
 }
 
 /// Live runtimes for panes on the visible tab only.
@@ -80,6 +81,7 @@ impl SessionModel {
             active_pane: "%0".to_string(),
             zoomed: false,
             minimized: HashMap::new(),
+            minimization_provenance: HashMap::new(),
         });
         self.tabs
             .get(self.active_tab)

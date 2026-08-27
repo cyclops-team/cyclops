@@ -302,8 +302,7 @@ pub enum Action {
     ToggleTabBar,
     /// Open or close the sidebar's file panel.
     /// Collapse a pane to its own title bar, or put it back to the height
-    /// it had. Session state: a minimized pane is not a preference, it is
-    /// where you left the furniture this afternoon.
+    /// it had. Persisted in tmux pane option `@cyclops_pane_minimized_v1`.
     ToggleMinimizePane {
         pane_id: String,
     },
@@ -1058,6 +1057,7 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         }
     }
 

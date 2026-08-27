@@ -2545,6 +2545,7 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         };
         let mut decoration = DecorationSnapshot {
             online: true,
@@ -2646,6 +2647,7 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         };
         let mut decoration = DecorationSnapshot {
             online: true,
@@ -2702,6 +2704,7 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         };
         let mut decoration = DecorationSnapshot {
             online: true,
@@ -2859,6 +2862,7 @@ mod tests {
             active_pane: "%0".to_string(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         }
     }
 

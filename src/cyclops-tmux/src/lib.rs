@@ -90,7 +90,7 @@ pub use error::TmuxError;
 pub use focus::focus_pane;
 pub use hydration::HydrationBundle;
 pub use notify::Notification;
-pub use ops::{PaneDirection, SplitDirection};
+pub use ops::{PaneDirection, SplitDirection, PANE_MINIMIZED_OPTION_V1};
 pub use quote::quote_arg;
 pub use session::{
     active_pane, current_session, list_panes, list_sessions, list_window_memberships, list_windows,
@@ -100,6 +100,8 @@ pub use sizing::{
     release_session_sizing, Captured, ClientIdentity, PriorWindowSize, ReleaseOutcome,
     ReleasedWindow, Restored, PRIOR_WINDOW_SIZE_OPTION, WINDOW_DRIVER_OPTION,
 };
-pub use snapshot::{SnapshotPane, SnapshotSession, SnapshotWindow, WorkspaceSnapshot};
+pub use snapshot::{
+    PaneMinimizationProvenance, SnapshotPane, SnapshotSession, SnapshotWindow, WorkspaceSnapshot,
+};
 pub use version::TmuxVersion;
 pub use watcher::{PaneEvent, PaneField, PaneRow, SessionWatcher};

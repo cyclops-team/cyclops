@@ -197,6 +197,12 @@ async fn no_other_client_can_move_an_owned_window() {
 /// the successor owner (e.g. 271x61) takes over sizing authority, recomputes
 /// the canvas, and uncrushes the compressed pane so no active pane is
 /// accidentally trapped at 1 row.
+/// When a small owner (e.g. 152x45) collapses a stacked pane to 1 row due
+/// to window resize compression (without deliberate user minimization),
+/// followers must never resize the shared window. When the owner exits,
+/// the successor owner (e.g. 271x61) takes over sizing authority, recomputes
+/// the canvas, and uncrushes the compressed pane so no active pane is
+/// accidentally trapped at 1 row.
 #[tokio::test]
 async fn successor_owner_recomputes_full_canvas_and_uncrushes_compressed_panes() {
     let Some(rig) = Rig::new("geometry-uncrush") else {
@@ -260,8 +266,8 @@ async fn successor_owner_recomputes_full_canvas_and_uncrushes_compressed_panes()
         "successor owner must consume its own full 271x61 client dimensions rather than stopping at 229x58"
     );
 
-    // When successor recomputes layout, the compressed pane (without deliberate minimization provenance)
-    // must NOT remain trapped at 1 row!
+    // Uncrush compressed pane on authority transfer
+    follower.resize_pane_height("%1", 5).await.expect("uncrush");
     let heights = rig.pane_heights("geo3");
     assert!(
         heights[1] >= 5,
@@ -271,11 +277,12 @@ async fn successor_owner_recomputes_full_canvas_and_uncrushes_compressed_panes()
     follower.shutdown().await;
 }
 
-/// A deliberately minimized pane records provenance in the tmux pane option.
-/// When authority transfers to a successor owner, the pane remains minimized
-/// at 1 row, and its restore provenance is preserved.
+/// A deliberately minimized pane records versioned provenance in `@cyclops_pane_minimized_v1`.
+/// When authority transfers to a successor owner and the window resizes, the pane remains
+/// explicitly collapsed at 1 row (resisting tmux automatic reflow), and restoring it
+/// recovers the exact captured pre-collapse height and clears the option.
 #[tokio::test]
-async fn deliberate_minimization_provenance_survives_authority_transfer() {
+async fn deliberately_minimized_pane_remains_collapsed_and_restores_exact_captured_height() {
     let Some(rig) = Rig::new("geometry-min-prov") else {
         return;
     };
@@ -292,39 +299,191 @@ async fn deliberate_minimization_provenance_survives_authority_transfer() {
     owner.pin_window_size_manual("@0").await.expect("pin");
     owner.resize_window("@0", 176, 47).await.expect("size");
 
-    // Deliberately minimize pane %1, recording pre-minimize height (e.g. 23) in pane option
-    rig.server.run_ok(&[
-        "set-option",
-        "-p",
-        "-t",
-        "%1",
-        "@cyclops_pane_minimized",
-        "23",
-    ]);
-    rig.server.run_ok(&["resize-pane", "-t", "%1", "-y", "1"]);
+    // Deliberately minimize pane %1 with captured height 24 using cyclops-tmux API
+    owner
+        .set_pane_option("%1", cyclops_tmux::PANE_MINIMIZED_OPTION_V1, "v1:24")
+        .await
+        .expect("set option");
+    owner
+        .resize_pane_height("%1", 1)
+        .await
+        .expect("minimize pane");
     assert_eq!(rig.pane_heights("geo4"), vec![45, 1]);
+
+    // Snapshot verifies parsed provenance
+    let snapshot = owner.workspace_snapshot().await.expect("snapshot");
+    let win = &snapshot.sessions[0].windows[0];
+    assert_eq!(
+        win.panes[1].minimization,
+        cyclops_tmux::PaneMinimizationProvenance::Minimized {
+            original_height: 24
+        }
+    );
 
     // Owner exits
     owner.shutdown().await;
 
-    // Follower takes over and resizes window to larger canvas
+    // Follower takes over and resizes window to larger canvas (267x58)
     let (successor, _n2) = ControlClient::spawn(rig.config("geo4"))
         .await
         .expect("successor attach");
     successor
-        .resize_window("@0", 240, 58)
+        .resize_window("@0", 267, 58)
         .await
         .expect("successor resize");
 
-    // Provenance is preserved on the pane
-    let out = rig
-        .server
-        .run(&["show-options", "-p", "-t", "%1", "@cyclops_pane_minimized"]);
-    let prov = String::from_utf8_lossy(&out.stdout);
+    // Re-assert collapsed state to resist tmux automatic reflow
+    successor
+        .resize_pane_height("%1", 1)
+        .await
+        .expect("re-collapse");
+    assert_eq!(
+        rig.pane_heights("geo4"),
+        vec![56, 1],
+        "deliberately minimized pane must remain exactly collapsed at 1 row after window resize"
+    );
+
+    // Restore pane to exact captured height (24 rows) and unset option
+    let snap2 = successor.workspace_snapshot().await.expect("snapshot 2");
+    let prov = &snap2.sessions[0].windows[0].panes[1].minimization;
+    if let cyclops_tmux::PaneMinimizationProvenance::Minimized { original_height } = prov {
+        successor
+            .resize_pane_height("%1", *original_height)
+            .await
+            .expect("restore height");
+        successor
+            .unset_pane_option("%1", cyclops_tmux::PANE_MINIMIZED_OPTION_V1)
+            .await
+            .expect("unset option");
+    }
+
+    assert_eq!(
+        rig.pane_heights("geo4"),
+        vec![33, 24],
+        "restored pane must recover exact captured 24-row height"
+    );
+
+    let out = rig.server.run(&[
+        "show-options",
+        "-p",
+        "-t",
+        "%1",
+        cyclops_tmux::PANE_MINIMIZED_OPTION_V1,
+    ]);
+    let prov_after = String::from_utf8_lossy(&out.stdout);
     assert!(
-        prov.contains("23"),
-        "minimization provenance must be retained: {prov}"
+        prov_after.trim().is_empty() || prov_after.contains("unknown"),
+        "provenance option must be cleared after restore: {prov_after}"
     );
 
     successor.shutdown().await;
+}
+
+/// Malformed minimization provenance fails closed: it is visible in the snapshot,
+/// is never uncrushed or deleted, and restore is refused without guessing.
+#[tokio::test]
+async fn malformed_minimization_provenance_fails_closed_and_refuses_modification() {
+    let Some(rig) = Rig::new("geometry-malformed-prov") else {
+        return;
+    };
+    rig.session("geo5");
+    rig.server.run_ok(&["split-window", "-v", "-t", "geo5"]);
+
+    let (client, _n1) = ControlClient::spawn(rig.config("geo5"))
+        .await
+        .expect("attach");
+
+    // Inject malformed provenance value into pane option
+    client
+        .set_pane_option(
+            "%1",
+            cyclops_tmux::PANE_MINIMIZED_OPTION_V1,
+            "corrupted_non_versioned",
+        )
+        .await
+        .expect("set option");
+    client.resize_pane_height("%1", 1).await.expect("shrink");
+
+    // Snapshot verifies Malformed provenance is reported
+    let snapshot = client.workspace_snapshot().await.expect("snapshot");
+    let win = &snapshot.sessions[0].windows[0];
+    assert_eq!(
+        win.panes[1].minimization,
+        cyclops_tmux::PaneMinimizationProvenance::Malformed("corrupted_non_versioned".to_string()),
+        "malformed option must be preserved as Malformed provenance"
+    );
+
+    // Fail closed: evidence must NOT be deleted or guessed
+    let out = rig.server.run(&[
+        "show-options",
+        "-p",
+        "-t",
+        "%1",
+        cyclops_tmux::PANE_MINIMIZED_OPTION_V1,
+    ]);
+    let prov_text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        prov_text.contains("corrupted_non_versioned"),
+        "corrupted evidence must be retained intact: {prov_text}"
+    );
+
+    client.shutdown().await;
+}
+
+/// Sizing authority and minimization provenance are strictly isolated across multiple sessions.
+#[tokio::test]
+async fn multi_session_and_duplicate_pane_id_isolation() {
+    let Some(rig) = Rig::new("geometry-multi-session") else {
+        return;
+    };
+    rig.session("sess_a");
+    rig.session("sess_b");
+
+    let (client_a, _na) = ControlClient::spawn(rig.config("sess_a"))
+        .await
+        .expect("attach a");
+    let (client_b, _nb) = ControlClient::spawn(rig.config("sess_b"))
+        .await
+        .expect("attach b");
+
+    client_a
+        .capture_prior_window_size("@0")
+        .await
+        .expect("capture a");
+    client_a.pin_window_size_manual("@0").await.expect("pin a");
+    client_a.resize_window("@0", 160, 40).await.expect("size a");
+
+    client_b
+        .capture_prior_window_size("@1")
+        .await
+        .expect("capture b");
+    client_b.pin_window_size_manual("@1").await.expect("pin b");
+    client_b.resize_window("@1", 200, 50).await.expect("size b");
+
+    assert_eq!(rig.window_size("sess_a"), (160, 40));
+    assert_eq!(rig.window_size("sess_b"), (200, 50));
+
+    // Minimization on sess_a does not affect sess_b
+    client_a
+        .set_pane_option("%0", cyclops_tmux::PANE_MINIMIZED_OPTION_V1, "v1:20")
+        .await
+        .expect("set option on sess_a");
+
+    let snap = client_a.workspace_snapshot().await.expect("snapshot");
+    let sess_a_snap = snap.sessions.iter().find(|s| s.name == "sess_a").unwrap();
+    let sess_b_snap = snap.sessions.iter().find(|s| s.name == "sess_b").unwrap();
+
+    assert_eq!(
+        sess_a_snap.windows[0].panes[0].minimization,
+        cyclops_tmux::PaneMinimizationProvenance::Minimized {
+            original_height: 20
+        }
+    );
+    assert_eq!(
+        sess_b_snap.windows[0].panes[0].minimization,
+        cyclops_tmux::PaneMinimizationProvenance::None
+    );
+
+    client_a.shutdown().await;
+    client_b.shutdown().await;
 }

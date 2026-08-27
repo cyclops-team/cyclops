@@ -428,12 +428,11 @@ struct App {
     /// arriving in an unfocused tab cannot re-paint the operator's
     /// terminal behind their back. Starts `true`: focus reporting only
     /// speaks on changes, and a workspace is launched by someone looking
-    /// at it.
     window_focused: bool,
-    /// Panes collapsed to their title bar, mapped to the height each had
-    /// before. Not persisted: a minimized pane is where you left the
-    /// furniture this afternoon, not a preference, and restoring one on
-    /// launch would hide a pane an operator has no memory of collapsing.
+    /// Panes deliberately collapsed to their title bar, mapped to the pre-collapse
+    /// height each had before. Persisted in tmux pane option `@cyclops_pane_minimized_v1`
+    /// (`v1:<height>`) so intentional minimization survives across reconnects,
+    /// authority transfers, and window resizing without accidental uncrush.
     minimized: std::collections::HashMap<String, u16>,
     reconnect_attempt: usize,
     /// One-shot, set by the reconnect path: the next reconcile rehydrates
@@ -2950,6 +2949,8 @@ struct Adopted {
     /// At least one window was pinned that was not pinned before, so it is
     /// carrying whatever size it had rather than this workspace's canvas.
     took_a_window: bool,
+    /// True when this client transitioned from follower to authoritative sizing owner.
+    authority_transferred: bool,
 }
 
 /// Take ownership of a session's displayed windows: record what each one's
@@ -2967,6 +2968,7 @@ async fn adopt_windows(
         return Adopted {
             newly_following: !followed_before && sizing.following.contains(session),
             took_a_window: false,
+            authority_transferred: false,
         };
     }
     // A window that has been closed is not owned any more, and there is
@@ -3035,6 +3037,7 @@ async fn adopt_windows(
     Adopted {
         newly_following: false,
         took_a_window,
+        authority_transferred: followed_before,
     }
 }
 
@@ -3206,18 +3209,57 @@ async fn resize_client(app: &mut App, client: &ControlClient) {
     }
     size_owned_windows(&app.sizing, client, size, &app.home).await;
     app.declared_client_size = Some(size);
-    uncrush_compressed_panes(app, client).await;
 }
 
-/// If a stacked pane was crushed down to <= 1 row during small window geometry
-/// and lacks deliberate minimization provenance, uncrush it so it does not
-/// remain trapped at 1 row after authority transfer.
-async fn uncrush_compressed_panes(app: &App, client: &ControlClient) {
+/// Reconcile pane geometry upon owner authority takeover:
+/// 1. Panes with deliberate minimization provenance (`Minimized { original_height }`)
+///    must remain collapsed at 1 row after tmux automatic reflow.
+/// 2. Panes that were accidentally crushed (height <= 1 row and `None` provenance)
+///    are uncrushed to a viable height (e.g. 5 rows or fair share) because the new owner has room.
+/// 3. Panes with malformed provenance (`Malformed(bad)`) fail closed: do NOT touch or uncrush,
+///    log visible warning.
+async fn reconcile_workspace_geometry_on_takeover(
+    app: &App,
+    client: &ControlClient,
+    session: &str,
+) {
+    // Exact sizing authority guard: only the authoritative owner of this session may size panes.
+    if !app.sizing.owned.contains_key(session) {
+        return;
+    }
     let tab = app.model.active_tab();
     let slots = crate::model::visible_pane_dims(tab);
     for (pane_id, _cols, rows) in slots {
-        if rows <= crate::render::MINIMIZED_ROWS && !app.minimized.contains_key(&pane_id) {
-            let _ = client.resize_pane_height(&pane_id, 5).await;
+        let prov = tab
+            .minimization_provenance
+            .get(&pane_id)
+            .cloned()
+            .unwrap_or(cyclops_tmux::PaneMinimizationProvenance::None);
+
+        match prov {
+            cyclops_tmux::PaneMinimizationProvenance::Minimized { .. } => {
+                // If tmux automatic reflow expanded a deliberately minimized pane, re-collapse it to 1 row.
+                if rows > crate::render::MINIMIZED_ROWS {
+                    let _ = client
+                        .resize_pane_height(&pane_id, crate::render::MINIMIZED_ROWS)
+                        .await;
+                }
+            }
+            cyclops_tmux::PaneMinimizationProvenance::None => {
+                // Accidental compression: uncrush if collapsed to <= 1 row without provenance
+                if rows <= crate::render::MINIMIZED_ROWS {
+                    let _ = client.resize_pane_height(&pane_id, 5).await;
+                }
+            }
+            cyclops_tmux::PaneMinimizationProvenance::Malformed(bad) => {
+                // Fail closed: retain corrupted evidence, do not uncrush, do not delete
+                log_err(
+                    &app.home,
+                    &format!(
+                        "{pane_id}: malformed minimization provenance ({bad}), refusing recovery"
+                    ),
+                );
+            }
         }
     }
 }
@@ -5893,7 +5935,7 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
         app.notice
             .show(copy::SIZING_FOLLOWER.to_string(), Instant::now());
     }
-    if adopted.took_a_window {
+    if adopted.authority_transferred || adopted.took_a_window {
         // A window pinned just now is holding whatever size it had before
         // this workspace touched it, and the canvas may not have moved, so
         // the unchanged-canvas guard in `resize_client` would skip it and
@@ -5901,6 +5943,9 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
         app.declared_client_size = None;
     }
     resize_client(app, client).await;
+    if adopted.authority_transferred || adopted.took_a_window {
+        reconcile_workspace_geometry_on_takeover(app, client, &session).await;
+    }
     // Forced only when continuity was actually lost: a control-mode
     // reconnect missed %output while the layout stood still, so the size
     // check would leave same-sized panes showing stale content and stale
@@ -7507,7 +7552,8 @@ mod tests {
             first,
             Adopted {
                 newly_following: false,
-                took_a_window: true
+                took_a_window: true,
+                authority_transferred: false,
             },
             "the boot window was not reported as taken"
         );
@@ -7902,6 +7948,7 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         };
         WorkspaceModel {
             workspaces: vec![crate::model::WorkspaceRow {
@@ -9383,6 +9430,7 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         };
         let tabs = vec![tab("@0"), tab("@1")];
         let mut pinned = BTreeSet::new();
@@ -11225,6 +11273,7 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         };
         let model = WorkspaceModel {
             workspaces: vec![row("$a", "a"), row("$b", "b"), row("$c", "c")],
@@ -11293,6 +11342,7 @@ mod tests {
             active_pane: pane.into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         };
         let mut current = WorkspaceModel {
             workspaces: vec![],
@@ -11339,6 +11389,7 @@ mod tests {
             active_pane: "%1".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         };
         let row = |id: &str, name: &str| crate::model::WorkspaceRow {
             session_id: id.into(),
@@ -11510,6 +11561,7 @@ mod tests {
             active_pane: "%0".into(),
             zoomed: false,
             minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         };
         let model = WorkspaceModel {
             workspaces: vec![row("$a", "a"), row("$b", "b"), row("$c", "c")],
@@ -11650,6 +11702,7 @@ mod tests {
                     active_pane: dragged.clone(),
                     zoomed: false,
                     minimized: std::collections::HashMap::new(),
+                    minimization_provenance: std::collections::HashMap::new(),
                 }],
                 active_tab: 0,
             },
@@ -11750,6 +11803,7 @@ mod tests {
                     active_pane: bottom.into(),
                     zoomed: false,
                     minimized: std::collections::HashMap::new(),
+                    minimization_provenance: std::collections::HashMap::new(),
                 }],
                 active_tab: 0,
             },
