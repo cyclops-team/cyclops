@@ -19,10 +19,12 @@
 //! The tmux-backed tests use `cyclops_testrig::TmuxServer` and skip cleanly
 //! when no tmux binary is on PATH, exactly like `baseline.rs` and
 //! `hydration.rs`. The two pure decoration-coalescing tests touch no tmux at
-//! all, and the terminal-restoration test additionally skips when
-//! `target/debug/cyclops`/`cyclopsd` are not built.
+//! all, and the terminal-restoration test additionally FAILS when
+//! `target/debug/cyclops`/`cyclopsd` are not built, rather than skipping:
+//! it drives the real binaries, so without them it would pass while testing
+//! nothing, which is how a measured 15-second hang once sat green (F75).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -824,6 +826,63 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// The `debug` directory cargo actually built into, derived from THIS test
+/// binary rather than from the repository layout.
+///
+/// `repo_root/target/debug` is only correct when nobody redirected the
+/// build. `CARGO_TARGET_DIR` moves it, a relative value resolves against
+/// the workspace rather than the caller, and `build.target-dir` in a cargo
+/// config moves it without any environment variable at all. Reading the
+/// env var would cover one of those three.
+///
+/// The test binary itself is the reliable witness: cargo runs it from
+/// `<target>/debug/deps/<name>-<hash>`, so the directory holding the
+/// product binaries is its grandparent, whatever the caller configured.
+/// This matters beyond tidiness: the failure below tells the reader to run
+/// `cargo build`, and if the two disagree about where that lands, the
+/// message is an instruction that cannot succeed.
+fn debug_dir_of(test_exe: &Path) -> Option<PathBuf> {
+    let deps = test_exe.parent()?;
+    if deps.file_name()? != "deps" {
+        return None;
+    }
+    Some(deps.parent()?.to_path_buf())
+}
+
+fn debug_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(debug_dir_of)
+        .unwrap_or_else(|| repo_root().join("target/debug"))
+}
+
+/// Both layouts resolve to the directory holding the product binaries.
+///
+/// The override case is the one that regressed: with `CARGO_TARGET_DIR`
+/// set, `cargo build` writes to the configured target while this test used
+/// to look under the repository, so it failed while telling the reader to
+/// run a command that could never satisfy it.
+#[test]
+fn the_debug_directory_follows_wherever_cargo_built() {
+    let default = Path::new("/repo/target/debug/deps/perf_contract-abc123");
+    assert_eq!(
+        debug_dir_of(default),
+        Some(PathBuf::from("/repo/target/debug"))
+    );
+
+    let overridden = Path::new("/somewhere/else/debug/deps/perf_contract-abc123");
+    assert_eq!(
+        debug_dir_of(overridden),
+        Some(PathBuf::from("/somewhere/else/debug"))
+    );
+
+    // Anything that is not a cargo test layout resolves to nothing, so the
+    // caller falls back rather than inventing a directory.
+    assert_eq!(debug_dir_of(Path::new("/bin/ls")), None);
+    assert_eq!(debug_dir_of(Path::new("perf_contract")), None);
+}
+
 fn wait_until(deadline: Instant, what: &str, mut poll: impl FnMut() -> bool) {
     loop {
         if poll() {
@@ -852,16 +911,41 @@ fn quitting_leaves_the_alternate_screen_and_returns_to_a_shell_prompt() {
         eprintln!("skipping: no tmux binary on PATH");
         return;
     }
-    let cyclops_bin = repo_root().join("target/debug/cyclops");
-    let cyclopsd_bin = repo_root().join("target/debug/cyclopsd");
-    if !cyclops_bin.is_file() || !cyclopsd_bin.is_file() {
-        eprintln!(
-            "skipping: {} and/or {} are not built",
-            cyclops_bin.display(),
-            cyclopsd_bin.display()
-        );
-        return;
-    }
+    let debug = debug_dir();
+    let cyclops_bin = debug.join("cyclops");
+    let cyclopsd_bin = debug.join("cyclopsd");
+    // FAILS rather than skips, and that is the whole point of this block.
+    //
+    // MEASURED (F75): a defect that left the workspace showing nothing for
+    // the full 15s budget of this test, on tmux 3.4, 3.6a and next-3.8
+    // alike, sat green in local runs for exactly one reason: this test used
+    // to print "skipping ... are not built" and return Ok. A gate that
+    // cannot fail for the reason it exists is indistinguishable from a gate
+    // that passed, and the person reading the output cannot tell them
+    // apart.
+    //
+    // Skipping on absent tmux above is different in kind: a machine with no
+    // tmux genuinely cannot run this, and no amount of building fixes it.
+    // Absent binaries are a step the runner forgot, which is repairable and
+    // therefore worth failing over.
+    assert!(
+        cyclops_bin.is_file() && cyclopsd_bin.is_file(),
+        "this test drives the real binaries and they are not built, so it \
+         would otherwise pass without testing anything. Build them first:\n\
+         \n    cargo build -p cyclops -p cyclopsd --bins\n\n\
+         missing: {}{}{}",
+        if cyclops_bin.is_file() {
+            String::new()
+        } else {
+            format!("\n  {}", cyclops_bin.display())
+        },
+        if cyclopsd_bin.is_file() {
+            String::new()
+        } else {
+            format!("\n  {}", cyclopsd_bin.display())
+        },
+        "",
+    );
 
     // A short scratch home: the daemon's AF_UNIX socket path must stay
     // under macOS's ~104-byte cap (cyclops-proto::scratch's rule, which
