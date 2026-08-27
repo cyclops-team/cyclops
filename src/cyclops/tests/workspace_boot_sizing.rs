@@ -174,17 +174,18 @@ fn persisted_open_messages_uses_collapsed_rail_size_through_real_boot() {
     wait_until("the real workspace to enter its alternate screen", || {
         alternate_on(rig.outer(), &host_pane)
     });
-    wait_until("the persisted-open workspace to paint", || {
-        let screen = rig.outer().capture(&host_pane);
-        screen.contains('╭') || screen.contains('╔')
+    wait_until("the persisted-open Messages pane to paint", || {
+        rig.outer().capture(&host_pane).contains("Chat 0 !0")
     });
     wait_until("the production cold-boot resize", || {
         first_resize(rig.target()).is_some()
     });
-    let screen = rig.outer().capture(&host_pane);
-    assert!(
-        screen.contains("Chat 0 !0"),
-        "the persisted-open Messages pane did not paint:\n{screen}"
+    // Resizing the outer TUI clears and repaints its alternate screen. Do not
+    // turn that normal transition into a one-shot capture race: require the
+    // persisted-open pane to be visible again after the first resize.
+    wait_until(
+        "the Messages pane to repaint after the first resize",
+        || rig.outer().capture(&host_pane).contains("Chat 0 !0"),
     );
     assert_eq!(
         first_resize(rig.target()),
