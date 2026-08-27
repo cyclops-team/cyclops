@@ -26,6 +26,15 @@ the pane opens or closes. Instead, this viewer proportionally fits the agent
 card rectangles into the smaller canvas and shows each runtime as a 1:1
 leading viewport. The runtime cells are clipped, never scaled.
 
+Every shared size declaration, including cold boot, reconnect, reconcile and
+host resize, uses the geometry of the collapsed one-column Messages rail.
+When Messages is open, Cyclops adds back only the part of its actual rendered
+width beyond that rail before deriving the tmux target. It does not add back
+the closed rail itself. Messages visibility and width therefore cannot change
+shared pane geometry, while the closed agent grid remains cell-exact. At
+exhausted widths where neither the Messages pane nor its rail fits, the same
+target is derived from the actual post-sidebar region before local layout.
+
 Closing the Messages pane returns the width it reserved, apart from its
 one-column reopen rail, and restores the exact pre-open local grid. It does
 not expand that grid beyond the current tmux source. If the terminal is wider

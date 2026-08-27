@@ -1224,9 +1224,7 @@ pub async fn run_async() -> i32 {
     // fight the declaration. `chrome_for` is the one geometry both read.
     model.sidebar_visible = prefs.sidebar_visible;
     model.messages_visible = prefs.messages_visible;
-    let chrome_canvas =
-        chrome_for(Rect::new(0, 0, term_size.0, term_size.1), &model, &prefs).canvas;
-    let boot_size = crate::render::tmux_client_size(chrome_canvas, model.active_tab());
+    let boot_size = desired_tmux_size(Rect::new(0, 0, term_size.0, term_size.1), &model, &prefs);
     let mut declared_client_size = None;
     if declarable(boot_size) {
         size_owned_windows(&sizing, &client, boot_size, &home).await;
@@ -2467,6 +2465,14 @@ fn chrome_for(
     )
 }
 
+/// Shared tmux target for boot and every later size declaration.
+fn desired_tmux_size(area: Rect, model: &WorkspaceModel, prefs: &WorkspacePrefs) -> (u16, u16) {
+    crate::render::tmux_client_size(
+        chrome_for(area, model, prefs).tmux_sizing_canvas(),
+        model.active_tab(),
+    )
+}
+
 /// Whether the workspace may animate (`crate::animate`). Capability first,
 /// then intent: the first two are not preferences, they are "there is
 /// nothing to fade".
@@ -3173,10 +3179,7 @@ async fn rekey_ownership(
 
 async fn resize_client(app: &mut App, client: &ControlClient) {
     let (w, h) = app.term_size;
-    let size = crate::render::tmux_client_size(
-        app.chrome(Rect::new(0, 0, w, h)).canvas,
-        app.model.active_tab(),
-    );
+    let size = desired_tmux_size(Rect::new(0, 0, w, h), &app.model, &app.prefs);
     if !declarable(size) || app.declared_client_size == Some(size) {
         return;
     }
@@ -8833,6 +8836,188 @@ mod tests {
         let _ = std::fs::remove_dir_all(home);
     }
 
+    fn nested_tmux_model(
+        server: &cyclops_testrig::TmuxServer,
+        session: &str,
+    ) -> (WorkspaceModel, String) {
+        let output = server.run(&["list-windows", "-t", session, "-F", "#{window_id}"]);
+        let window_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let source = nested_tmux_layout(server, &window_id);
+        let node = crate::layout::parse_layout(&source).expect("parse nested layout");
+        let layout = crate::layout::resolve_layout(&node, &[]).expect("resolve nested layout");
+        let output = server.run(&[
+            "list-panes",
+            "-t",
+            session,
+            "-f",
+            "#{pane_active}",
+            "-F",
+            "#{pane_id}",
+        ]);
+        let active_pane = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let mut model = messages_pane_model();
+        model.session.session = session.into();
+        model.session.tabs[0].window_id = window_id.clone();
+        model.session.tabs[0].layout = layout;
+        model.session.tabs[0].active_pane = active_pane;
+        model.workspaces[0].name = session.into();
+        model.workspaces[0].window_ids = vec![window_id.clone()];
+        (model, window_id)
+    }
+
+    fn nested_tmux_layout(server: &cyclops_testrig::TmuxServer, window_id: &str) -> String {
+        let output = server.run(&["display-message", "-p", "-t", window_id, "#{window_layout}"]);
+        assert!(
+            output.status.success(),
+            "read nested layout: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn start_nested_tmux(server: &cyclops_testrig::TmuxServer, session: &str) {
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-x",
+            "100",
+            "-y",
+            "30",
+            "-s",
+            session,
+            "/bin/sh",
+        ]);
+        server.run_ok(&["split-window", "-h", "-l", "30", "-t", session, "/bin/sh"]);
+        server.run_ok(&["split-window", "-v", "-l", "5", "-t", session, "/bin/sh"]);
+    }
+
+    async fn persisted_boot_sizing_observation(
+        tag: &str,
+        messages_visible: bool,
+    ) -> ((u16, u16), String, (u16, u16)) {
+        use cyclops_testrig::TmuxServer;
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        let server = TmuxServer::new(tag);
+        start_nested_tmux(&server, "s");
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let (mut model, window_id) = nested_tmux_model(&server, "s");
+        model.sidebar_visible = false;
+        model.messages_visible = messages_visible;
+        let prefs = WorkspacePrefs {
+            sidebar_visible: false,
+            messages_visible,
+            ..WorkspacePrefs::default()
+        };
+        let home = cyclops_proto::scratch::scratch_dir(tag);
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create scratch home");
+        let mut sizing = WindowSizing::default();
+        let adopted = adopt_windows(&mut sizing, &client, "s", &model.session.tabs, &home).await;
+        assert!(adopted.took_a_window, "boot fixture must own its window");
+
+        // The collapsed Messages rail is the reference geometry regardless
+        // of persisted visibility. Derive it independently from the paint
+        // canvas so a helper that also adds back the rail cannot self-verify.
+        model.messages_visible = false;
+        let collapsed_rail_target = crate::render::tmux_client_size(
+            chrome_for(Rect::new(0, 0, 100, 30), &model, &prefs).canvas,
+            model.active_tab(),
+        );
+        model.messages_visible = messages_visible;
+        // These are the production cold-boot calculation and write, after
+        // persisted visibility has been installed on the model.
+        let declared = desired_tmux_size(Rect::new(0, 0, 100, 30), &model, &prefs);
+        size_owned_windows(&sizing, &client, declared, &home).await;
+        let layout = nested_tmux_layout(&server, &window_id);
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+        (declared, layout, collapsed_rail_target)
+    }
+
+    #[tokio::test]
+    async fn persisted_open_cold_boot_sizes_nested_tmux_like_messages_closed() {
+        if !cyclops_testrig::tmux_available() {
+            return;
+        }
+        let closed = persisted_boot_sizing_observation("boot-messages-closed", false).await;
+        let open = persisted_boot_sizing_observation("boot-messages-open", true).await;
+        assert_eq!(
+            closed.0, closed.2,
+            "cold boot added back the collapsed Messages rail"
+        );
+        assert_eq!(
+            open.0, open.2,
+            "persisted-open cold boot did not use collapsed-rail geometry"
+        );
+        assert_eq!(
+            open.0, closed.0,
+            "persisted Messages visibility changed the cold-boot tmux target"
+        );
+        assert_eq!(
+            open.1, closed.1,
+            "persisted-open cold boot rebalanced the nested tmux layout"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_with_open_resized_messages_keeps_nested_tmux_layout() {
+        use cyclops_testrig::TmuxServer;
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !cyclops_testrig::tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("reconcile-open-messages");
+        start_nested_tmux(&server, "s");
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let (mut model, window_id) = nested_tmux_model(&server, "s");
+        model.sidebar_visible = false;
+        model.messages_visible = false;
+        let home = cyclops_proto::scratch::scratch_dir("reconcile-open-messages-home");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create scratch home");
+        let mut app = test_app(model, home.clone());
+        app.term_size = (100, 30);
+        app.prefs.sidebar_visible = false;
+        app.prefs.messages_visible = false;
+
+        reconcile(&mut app, &client)
+            .await
+            .expect("closed reconcile");
+        let closed_size = app.declared_client_size.expect("closed size declared");
+        let closed_layout = nested_tmux_layout(&server, &window_id);
+
+        app.prefs.messages_visible = true;
+        app.prefs.messages_width = 41;
+        // Reconnect clears this cache before its generic reconcile. Force
+        // that lifecycle path so equality cannot pass only by skipping it.
+        app.declared_client_size = None;
+        reconcile(&mut app, &client)
+            .await
+            .expect("open Messages reconcile");
+        assert!(app.model.messages_visible);
+        assert_eq!(
+            app.declared_client_size,
+            Some(closed_size),
+            "changed local Messages width changed the generic tmux target"
+        );
+        assert_eq!(
+            nested_tmux_layout(&server, &window_id),
+            closed_layout,
+            "generic reconcile rebalanced nested tmux for local Messages chrome"
+        );
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
     async fn nested_layout_after_messages_width_drag(
         lost_release: bool,
     ) -> (String, String, Option<(u16, u16)>, u16, u16) {
@@ -10797,77 +10982,97 @@ mod tests {
         assert_eq!(reconnect.socket_name, boot.socket_name);
     }
 
-    /// Boot declares a canvas and the first frame paints one; they must be
-    /// the same canvas for every combination of the two chrome edges an
-    /// operator can put away. A disagreement here is the bug class of
-    /// 626ec09, panels painted for the wrong terminal, and it is only
-    /// impossible while boot and `App::chrome` read the SAME persisted
-    /// flags, which is what this walks.
+    /// Boot sizing and the first frame must derive from the same chrome for
+    /// every persisted visibility combination. The paint canvas may be
+    /// narrower while Messages is open, but the shared target must remain
+    /// the collapsed-rail geometry returned by `desired_tmux_size`.
     #[test]
     fn boot_declares_the_geometry_the_first_frame_paints_for_every_chrome_combination() {
         let area = Rect::new(0, 0, 200, 50);
         for sidebar_visible in [true, false] {
             for tab_bar_visible in [true, false] {
-                let prefs = WorkspacePrefs {
-                    sidebar_visible,
-                    tab_bar_visible,
-                    ..WorkspacePrefs::default()
-                };
-                let what = format!("sidebar {sidebar_visible}, tab bar {tab_bar_visible}");
+                let mut messages_independent_size = None;
+                for messages_visible in [true, false] {
+                    let prefs = WorkspacePrefs {
+                        sidebar_visible,
+                        tab_bar_visible,
+                        messages_visible,
+                        ..WorkspacePrefs::default()
+                    };
+                    let what = format!(
+                        "sidebar {sidebar_visible}, tab bar {tab_bar_visible}, \
+                         Messages {messages_visible}"
+                    );
 
-                // What `run_async` does before it declares: the persisted
-                // visibility lands on the model, then boot sizes from it.
-                let mut model = one_pane_model();
-                model.sidebar_visible = prefs.sidebar_visible;
-                let boot = chrome_for(area, &model, &prefs);
-                let declared = crate::render::tmux_client_size(boot.canvas, model.active_tab());
+                    // What `run_async` does before it declares: persisted
+                    // visibility lands on the model, then boot sizes from it.
+                    let mut model = one_pane_model();
+                    model.sidebar_visible = prefs.sidebar_visible;
+                    model.messages_visible = prefs.messages_visible;
+                    let boot = chrome_for(area, &model, &prefs);
+                    let declared = desired_tmux_size(area, &model, &prefs);
+                    if let Some(expected) = messages_independent_size {
+                        assert_eq!(
+                            declared, expected,
+                            "{what}: Messages visibility changed the shared tmux target"
+                        );
+                    } else {
+                        messages_independent_size = Some(declared);
+                    }
 
-                let mut app = test_app(
-                    model,
-                    cyclops_proto::scratch::scratch_dir("app-boot-chrome"),
-                );
-                app.prefs = prefs;
-                let painted = app.chrome(area);
+                    let mut app = test_app(
+                        model,
+                        cyclops_proto::scratch::scratch_dir("app-boot-chrome"),
+                    );
+                    app.prefs = prefs;
+                    let painted = app.chrome(area);
 
-                assert_eq!(painted, boot, "{what}: the first frame moved the chrome");
-                assert_eq!(
-                    crate::render::tmux_client_size(painted.canvas, app.model.active_tab()),
-                    declared,
-                    "{what}: the first frame must paint the canvas boot declared"
-                );
+                    assert_eq!(painted, boot, "{what}: the first frame moved the chrome");
+                    assert_eq!(
+                        desired_tmux_size(area, &app.model, &app.prefs),
+                        declared,
+                        "{what}: boot and runtime sizing geometry drifted"
+                    );
 
-                // And each flag really does change the geometry, or the
-                // agreement above would be agreement about nothing. The
-                // default prefs width (`WorkspacePrefs::default()`) is no
-                // longer clamped up to the minimum — the minimum is a drag
-                // floor now, well below the default — so the expected edge
-                // is the default width the fresh prefs above actually carry.
-                let expected_left = if sidebar_visible {
-                    crate::render::SIDEBAR_DEFAULT_WIDTH
-                } else {
-                    1
-                };
-                assert_eq!(painted.canvas.x, expected_left, "{what}: canvas left edge");
-                assert_eq!(
-                    painted.sidebar.is_some(),
-                    sidebar_visible,
-                    "{what}: the panel"
-                );
-                assert_eq!(
-                    painted.rail.is_some(),
-                    !sidebar_visible,
-                    "{what}: collapsing leaves a rail, never nothing"
-                );
-                assert_eq!(
-                    painted.tab_bar.height,
-                    u16::from(tab_bar_visible),
-                    "{what}: the strip's row"
-                );
-                assert_eq!(
-                    painted.canvas.y,
-                    u16::from(tab_bar_visible),
-                    "{what}: the canvas takes the row the strip does not"
-                );
+                    // And each flag really does change paint geometry, or
+                    // the agreement above would be agreement about nothing.
+                    let expected_left = if sidebar_visible {
+                        crate::render::SIDEBAR_DEFAULT_WIDTH
+                    } else {
+                        1
+                    };
+                    assert_eq!(painted.canvas.x, expected_left, "{what}: canvas left edge");
+                    assert_eq!(
+                        painted.sidebar.is_some(),
+                        sidebar_visible,
+                        "{what}: sidebar"
+                    );
+                    assert_eq!(
+                        painted.rail.is_some(),
+                        !sidebar_visible,
+                        "{what}: collapsing leaves a rail, never nothing"
+                    );
+                    assert_eq!(
+                        painted.messages.is_some(),
+                        messages_visible,
+                        "{what}: Messages"
+                    );
+                    assert_eq!(
+                        painted.messages_rail.is_some(),
+                        !messages_visible,
+                        "{what}: closed Messages leaves its rail"
+                    );
+                    assert_eq!(
+                        painted.tab_bar.height,
+                        u16::from(tab_bar_visible),
+                        "{what}: the strip's row"
+                    );
+                    assert_eq!(
+                        painted.canvas.y,
+                        u16::from(tab_bar_visible),
+                        "{what}: the canvas takes the row the strip does not"
+                    );
+                }
             }
         }
     }

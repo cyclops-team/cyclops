@@ -121,6 +121,22 @@ pub struct ChromeAreas {
     pub canvas: Rect,
     pub messages: Option<Rect>,
     pub messages_rail: Option<Rect>,
+    tmux_sizing_canvas: Rect,
+}
+
+impl ChromeAreas {
+    /// Agent canvas used to derive the shared tmux window size.
+    ///
+    /// This is distinct from [`Self::canvas`], which is the local paint
+    /// canvas after the Messages pane has reserved its peer region. Shared
+    /// sizing always uses the collapsed one-column Messages rail geometry.
+    /// In ordinary layouts a closed pane already has this canvas, while an
+    /// open pane gives back only its actual width beyond the rail. Computing
+    /// the rectangle while chrome is split also covers terminals too narrow
+    /// to render the Messages pane or its rail.
+    pub fn tmux_sizing_canvas(&self) -> Rect {
+        self.tmux_sizing_canvas
+    }
 }
 
 /// Split one frame into the sidebar (or its rail), Messages pane (or its
@@ -160,6 +176,14 @@ pub fn chrome_areas_for(
     } else {
         None
     };
+    // Shared tmux sizing is Messages-independent: it always sees the actual
+    // post-sidebar region with a collapsed Messages rail. Capture that shape
+    // before local open/closed paint geometry consumes the right edge.
+    let tmux_sizing_width = if main.width > MESSAGES_RAIL_WIDTH {
+        main.width - MESSAGES_RAIL_WIDTH
+    } else {
+        main.width
+    };
     let messages = if messages_visible && main.width > 4 {
         let w = clamp_messages_width(messages_width, main.width);
         let m = Rect::new(main.x + main.width - w, main.y, w, main.height);
@@ -197,6 +221,12 @@ pub fn chrome_areas_for(
         main.width,
         main.height.saturating_sub(bar_h),
     );
+    let tmux_sizing_canvas = Rect::new(
+        main.x,
+        main.y + bar_h,
+        tmux_sizing_width,
+        main.height.saturating_sub(bar_h),
+    );
     ChromeAreas {
         sidebar,
         rail,
@@ -204,6 +234,7 @@ pub fn chrome_areas_for(
         canvas,
         messages,
         messages_rail,
+        tmux_sizing_canvas,
     }
 }
 
@@ -1126,6 +1157,43 @@ mod tests {
             areas.canvas,
             Rect::new(1, 1, 200 - 1 - MESSAGES_MIN_WIDTH, 49)
         );
+    }
+
+    #[test]
+    fn tmux_sizing_canvas_is_the_collapsed_messages_rail_geometry() {
+        for sidebar_visible in [false, true] {
+            for tab_bar_visible in [false, true] {
+                for terminal_width in 1..=200 {
+                    let area = Rect::new(0, 0, terminal_width, 40);
+                    let closed =
+                        chrome_areas_for(area, sidebar_visible, 24, tab_bar_visible, false, 24);
+                    let open = chrome_areas_for(
+                        area,
+                        sidebar_visible,
+                        24,
+                        tab_bar_visible,
+                        true,
+                        u16::MAX,
+                    );
+                    if let Some(messages) = open.messages {
+                        if messages.width > MESSAGES_RAIL_WIDTH {
+                            assert!(open.canvas.width < closed.canvas.width);
+                        }
+                    }
+                    assert_eq!(
+                        open.tmux_sizing_canvas(),
+                        closed.tmux_sizing_canvas(),
+                        "width {terminal_width}, sidebar {sidebar_visible}, tab bar \
+                         {tab_bar_visible}: Messages pane visibility changed shared sizing geometry"
+                    );
+                    assert_eq!(
+                        closed.tmux_sizing_canvas(),
+                        closed.canvas,
+                        "the collapsed Messages rail stays reserved in shared sizing geometry"
+                    );
+                }
+            }
+        }
     }
 
     /// Hiding the strip is the operator's own choice now, not a tab count:

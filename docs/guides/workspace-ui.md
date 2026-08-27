@@ -196,6 +196,11 @@ the sizing driver or a follower. Pane-divider dragging is disabled during
 that fitted view because local and tmux cell distances no longer match. The
 Messages pane's own width handle remains active.
 
+Cold boot, reconnect, reconcile and terminal resize all use the same shared
+target: the agent canvas with only the collapsed one-column Messages rail
+reserved. Opening or widening Messages changes the local fit, not that target;
+exhausted widths derive it from the actual region left after sidebar chrome.
+
 ## Mouse
 
 Click a pane, its border, a tab, a workspace row, or a nested agent row to
