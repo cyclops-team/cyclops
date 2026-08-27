@@ -239,6 +239,7 @@ mod tests {
         let stale_routes = [cyclops_proto::StatusMailboxRoute {
             recipient: replacement,
             label: "claude".into(),
+            unread: None,
         }];
 
         let stale =
@@ -249,6 +250,7 @@ mod tests {
         let live_routes = [cyclops_proto::StatusMailboxRoute {
             recipient: endpoint,
             label: "renamed-agent".into(),
+            unread: None,
         }];
         let proven = reg.resolve_route_endpoint(
             &endpoint,

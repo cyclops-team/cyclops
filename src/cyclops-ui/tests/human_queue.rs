@@ -829,3 +829,61 @@ fn state_is_words_and_symbols_and_the_two_records_stay_apart() {
     assert!(frame.contains("pending"), "{frame}");
     assert!(frame.contains("needs attention"), "{frame}");
 }
+
+#[test]
+fn scope_transparency_explains_hidden_pending_rows_and_prompts_s_for_all() {
+    let mut q = HumanQueue::new();
+    // Outbound message to an agent: pending, but needs_action is false.
+    let mut row = message("m-out-1", 1, "worker");
+    row.needs_action = false;
+    row.mailbox = MailboxWord::Pending;
+    row.direction = Direction::Outbound;
+
+    q.replace(snapshot(1, vec![row]));
+    // Scope::Work only shows needs_action == true, so 0 shown, 1 pending.
+    q.set_scope(Scope::Work);
+    assert_eq!(q.counts().visible, 0);
+    assert_eq!(q.counts().pending, 1);
+    assert_eq!(q.hidden_pending(), 1);
+
+    let frame = render(&q, 80, 24).join("\n");
+    assert!(
+        frame.contains("press s for all"),
+        "header or copy must explain hidden pending rows: {frame}"
+    );
+    assert!(
+        frame.contains("1 pending hidden by scope"),
+        "empty body must announce count of hidden pending rows: {frame}"
+    );
+
+    // Switching to Scope::All unhides the row.
+    q.set_scope(Scope::All);
+    assert_eq!(q.hidden_pending(), 0);
+    let all_frame = render(&q, 80, 24).join("\n");
+    assert!(!all_frame.contains("press s for all"));
+    assert_eq!(q.counts().visible, 1);
+}
+
+#[test]
+fn chat_scope_transparency_explains_hidden_pending_rows_in_header_and_empty_state() {
+    let mut q = HumanQueue::new();
+    let mut row = message("m-out-2", 1, "worker");
+    row.needs_action = false;
+    row.mailbox = MailboxWord::Pending;
+    row.direction = Direction::Outbound;
+
+    q.replace(snapshot(1, vec![row]));
+    q.set_scope(Scope::Work);
+
+    let avatars = cyclops_ui::AvatarRegistry::default();
+    let context = cyclops_ui::ChatRenderContext::new(&avatars);
+    let chat_frame = cyclops_ui::render_chat(&q, context, 80, 24).join("\n");
+    assert!(
+        chat_frame.contains("press s for all"),
+        "chat header or notice must explain hidden pending rows: {chat_frame}"
+    );
+    assert!(
+        chat_frame.contains("1 pending hidden by scope"),
+        "chat empty timeline must announce hidden pending rows: {chat_frame}"
+    );
+}

@@ -5,6 +5,14 @@ pub const DEFAULT_SESSION_NAME: &str = "main";
 
 pub const DETACHED: &str = "Detached from session.";
 
+/// Shown once when another workspace already sizes this session.
+///
+/// The honest version of a fact the operator would otherwise have to guess
+/// at from a window that will not fit: this workspace is rendering inside
+/// somebody else's geometry on purpose, and the panes are not broken.
+pub const SIZING_FOLLOWER: &str =
+    "Another Cyclops workspace sizes this session; this one follows its layout.";
+
 pub const HELP_HINT: &str = "Run cyclops --help for commands.";
 
 pub const CONFIRM_CLOSE_PANE: &str = "Close this pane? An agent may be running.";
@@ -134,6 +142,9 @@ pub const MENU_TOGGLE_MESSAGES: &str = "Messages";
 /// The composer, in the menu because the `@` button that opens it lives
 /// in the sidebar footer, and a collapsed sidebar has no footer to click.
 pub const MENU_COMPOSE: &str = "Send a message";
+/// Repaint the workspace surface. In the menu because a garbled frame is
+/// exactly when a chord is hardest to remember.
+pub const MENU_REDRAW: &str = "Redraw";
 
 pub const BINDING_TOGGLE_MESSAGES: &str = "Toggle messages";
 

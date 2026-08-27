@@ -5,6 +5,12 @@ use std::io::IsTerminal;
 use cyclops_theme::{tokens, Color as ThemeColor, Theme};
 use ratatui::style::{Color as RtColor, Modifier, Style};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostPalette {
+    pub fg: (u8, u8, u8),
+    pub bg: (u8, u8, u8),
+}
+
 /// Workspace paint context.
 pub struct Paint {
     pub theme: Theme,
@@ -119,18 +125,21 @@ impl Paint {
 }
 
 impl Paint {
-    /// The chrome ground as literal rgb, for the one place that needs a
-    /// color rather than a `Style`: the terminal's own default background
-    /// (`term_guard::apply_window_background`).
+    /// The pane ink and chrome ground as literal rgb, for the one place that
+    /// needs colors rather than a `Style`: the terminal's own defaults
+    /// (`term_guard::apply_window_palette`).
     ///
-    /// `None` when color is off. Repainting the host terminal's background
+    /// `None` when color is off. Repainting the host terminal's defaults
     /// under `NO_COLOR` would be the one piece of color the workspace
     /// emitted anyway, and rule 11 has no exception for the frame.
-    pub fn chrome_ground_rgb(&self) -> Option<(u8, u8, u8)> {
+    pub fn host_palette_rgb(&self) -> Option<HostPalette> {
         if !self.colors_enabled {
             return None;
         }
-        Some(self.theme.resolve(tokens::CHROME_PANEL).rgb)
+        Some(HostPalette {
+            fg: self.theme.resolve(tokens::SURFACE_FG).rgb,
+            bg: self.theme.resolve(tokens::CHROME_PANEL).rgb,
+        })
     }
 }
 
@@ -431,5 +440,31 @@ mod tests {
         let color = Paint::for_test();
         assert_ne!(pane_border_focused(&color), pane_border(&color));
         assert_ne!(sidebar_row_active(&color), sidebar_row(&color));
+    }
+
+    #[test]
+    fn sorbet_gives_the_host_dark_ink_on_its_light_ground() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../resources/themes/sorbet.toml");
+        let (theme, warnings) = Theme::load(&path).expect("shipped sorbet theme");
+        assert!(warnings.is_empty(), "shipped theme warnings: {warnings:?}");
+        let paint = Paint {
+            theme,
+            truecolor: true,
+            colors_enabled: true,
+        };
+
+        assert_eq!(
+            paint.host_palette_rgb(),
+            Some(HostPalette {
+                fg: (0x3a, 0x2b, 0x26),
+                bg: (0xfb, 0xe7, 0xd8),
+            }),
+            "the host terminal must not keep light default ink on Sorbet's light chrome"
+        );
+        assert!(
+            Paint::without_color_for_test().host_palette_rgb().is_none(),
+            "NO_COLOR hands both host defaults back instead of emitting one colored half"
+        );
     }
 }

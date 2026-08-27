@@ -77,6 +77,7 @@ pub mod notify;
 pub mod ops;
 pub mod quote;
 pub mod session;
+pub mod sizing;
 pub mod snapshot;
 pub mod version;
 pub mod watcher;
@@ -92,8 +93,12 @@ pub use notify::Notification;
 pub use ops::{PaneDirection, SplitDirection};
 pub use quote::quote_arg;
 pub use session::{
-    active_pane, list_panes, list_sessions, list_window_memberships, list_windows, SessionRow,
-    WindowMembership, WindowPaneRow, WindowRow,
+    active_pane, current_session, list_panes, list_sessions, list_window_memberships, list_windows,
+    SessionRow, WindowMembership, WindowPaneRow, WindowRow,
+};
+pub use sizing::{
+    release_session_sizing, Captured, ClientIdentity, PriorWindowSize, ReleaseOutcome,
+    ReleasedWindow, Restored, PRIOR_WINDOW_SIZE_OPTION, WINDOW_DRIVER_OPTION,
 };
 pub use snapshot::{SnapshotPane, SnapshotSession, SnapshotWindow, WorkspaceSnapshot};
 pub use version::TmuxVersion;

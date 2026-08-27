@@ -48,6 +48,18 @@ pub struct WindowMembership {
 }
 
 /// List sessions on the server `socket` names (None = default server).
+/// The session the calling shell is sitting in, or `None` outside tmux.
+///
+/// `$TMUX` is the guard rather than the answer: it proves there is a server
+/// and a client to ask, and tmux itself resolves which session that client
+/// is currently showing, which is not derivable from the variable.
+pub fn current_session(socket: Option<&str>) -> Option<String> {
+    std::env::var_os("TMUX")?;
+    let out = run(socket, None, &["display-message", "-p", "#{session_name}"]).ok()?;
+    let name = out.trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
 pub fn list_sessions(socket: Option<&str>) -> Result<Vec<SessionRow>, TmuxError> {
     let out = run(
         socket,

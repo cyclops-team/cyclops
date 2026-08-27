@@ -54,12 +54,20 @@ Default bindings are prefix-first (`Ctrl+B`, same shape as tmux):
 | `Ctrl+B` `b` | Collapse or reopen the sidebar |
 | `Ctrl+B` `g` | Put the keyboard in the file panel; Esc gives it back |
 | `Ctrl+B` `s` | Send a message to an agent |
+| `Ctrl+B` `r` | Repaint the workspace surface |
 | `Ctrl+B` `?` | Open the keybinding reference, every active binding |
 
 Hiding the tab bar ships with no chord: the `Tab bar` row on the
 settings card's View section is the way, so a hidden strip is always
 something you chose. Bind `toggle_tab_bar` in `config.toml` if you want
 a key for it.
+
+`Ctrl+B` `r`, and the app menu's `Redraw` item, repaint the workspace's
+own chrome from scratch. It changes nothing else: no pane, no layout, no
+preference, no daemon state. It is deliberately not on a bare `Ctrl+L`,
+because that belongs to whatever program is focused in the pane and is
+how you redraw a garbled *pane*. This repairs a garbled *workspace*, and
+taking `Ctrl+L` would have removed the pane's own repair to provide it.
 
 Unbound keys, including modified terminal keys such as Claude Code's
 `Shift+Tab`, pass through to the focused pane. Bare arrow keys are part of

@@ -87,6 +87,8 @@ use crate::registry::{Adoption, WindowChrome};
 const OPT_ROLE: &str = "@cyclops_role";
 /// Per-pane option holding the state cell's words.
 const OPT_STATE: &str = "@cyclops_state";
+/// Per-pane option holding the unread message count.
+const OPT_UNREAD: &str = "@cyclops_unread";
 /// The pane option cyclops rewrites; snapshotted before the first write.
 const OPT_FORMAT: &str = "pane-border-format";
 /// The window option that decides whether a border carries text.
@@ -164,6 +166,7 @@ async fn read_scoped(
 ///
 /// Idempotent: it writes the same three values for the same inputs, so a
 /// repeated call after a reattach costs three commands and changes nothing.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply(
     client: &ControlClient,
     enabled: bool,
@@ -172,12 +175,18 @@ pub(crate) async fn apply(
     label: &str,
     state: AgentState,
     theme: &Theme,
+    unread: usize,
 ) -> Result<(), TmuxError> {
     if !enabled {
         return Ok(());
     }
     set_scoped(client, "-p", pane_id, OPT_ROLE, label).await?;
     set_scoped(client, "-p", pane_id, OPT_STATE, &state_words(state)).await?;
+    if unread > 0 {
+        set_scoped(client, "-p", pane_id, OPT_UNREAD, &unread.to_string()).await?;
+    } else {
+        unset_scoped(client, "-p", pane_id, OPT_UNREAD).await?;
+    }
     set_scoped(
         client,
         "-p",
@@ -187,6 +196,25 @@ pub(crate) async fn apply(
     )
     .await?;
     set_scoped(client, "-w", window_id, OPT_STATUS, STATUS_ON).await
+}
+
+/// Update only the unread count option on an adopted pane.
+///
+/// Idempotent: sets the option if unread > 0, unsets it if unread == 0.
+pub(crate) async fn update_unread(
+    client: &ControlClient,
+    enabled: bool,
+    pane_id: &str,
+    unread: usize,
+) -> Result<(), TmuxError> {
+    if !enabled {
+        return Ok(());
+    }
+    if unread > 0 {
+        set_scoped(client, "-p", pane_id, OPT_UNREAD, &unread.to_string()).await
+    } else {
+        unset_scoped(client, "-p", pane_id, OPT_UNREAD).await
+    }
 }
 
 /// Update only what a fused state change moves: the state words and the
@@ -232,6 +260,7 @@ pub(crate) async fn restore(
     }
     unset_scoped(client, "-p", &adoption.pane_id, OPT_ROLE).await?;
     unset_scoped(client, "-p", &adoption.pane_id, OPT_STATE).await?;
+    unset_scoped(client, "-p", &adoption.pane_id, OPT_UNREAD).await?;
     match &adoption.border_format {
         Some(prior) => set_scoped(client, "-p", &adoption.pane_id, OPT_FORMAT, prior).await?,
         None => unset_scoped(client, "-p", &adoption.pane_id, OPT_FORMAT).await?,
@@ -312,10 +341,11 @@ async fn unset_scoped(
 /// is dim like every other separator in the product.
 fn border_format(theme: &Theme, label: &str, state: AgentState) -> String {
     format!(
-        " #[fg={}]#{{{OPT_ROLE}}}#[fg={}] • #[fg={}]#{{{OPT_STATE}}}#[default] ",
+        " #[fg={}]#{{{OPT_ROLE}}}#[fg={}] • #[fg={}]#{{{OPT_STATE}}}#{{?#{{{OPT_UNREAD}}},#[fg={}] • ✉ #{{{OPT_UNREAD}}},}}#[default] ",
         style_color(theme.role(label)),
         style_color(theme.resolve(tokens::SURFACE_DIM)),
         style_color(theme.resolve(cyclops_theme::state_token(state))),
+        style_color(theme.resolve(tokens::SURFACE_ACCENT)),
     )
 }
 

@@ -1964,14 +1964,53 @@ fn status_result_with_refresh(
     let mailbox_routes = inner
         .mailbox
         .as_ref()
-        .and_then(|service| service.routes().ok())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|identity| StatusMailboxRoute {
-            recipient: identity.key,
-            label: identity.label,
+        .map(|service| {
+            let mut routes: Vec<StatusMailboxRoute> = service
+                .routes()
+                .ok()
+                .map(|routes| {
+                    routes
+                        .into_iter()
+                        .map(|identity| {
+                            let unread = service.pending_count(identity.key).ok().map(|c| c as u64);
+                            StatusMailboxRoute {
+                                recipient: identity.key,
+                                label: identity.label,
+                                unread,
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Ok(pending) = service.pending_recipients() {
+                for key in pending {
+                    if !routes.iter().any(|r| r.recipient == key) {
+                        let unread = service.pending_count(key).ok().map(|c| c as u64);
+                        if unread.unwrap_or(0) > 0 {
+                            let label = service
+                                .recipient_label(key)
+                                .ok()
+                                .flatten()
+                                .or_else(|| {
+                                    service
+                                        .identity_for_recipient(key)
+                                        .ok()
+                                        .flatten()
+                                        .map(|id| id.label)
+                                })
+                                .unwrap_or_else(|| key.to_string());
+                            routes.push(StatusMailboxRoute {
+                                recipient: key,
+                                label,
+                                unread,
+                            });
+                        }
+                    }
+                }
+            }
+            routes
         })
-        .collect();
+        .unwrap_or_default();
     let blocked_notifications = inner
         .mailbox
         .as_ref()
@@ -2048,6 +2087,13 @@ fn status_result_with_refresh(
                         ps.write_block = entry.and_then(|e| e.detection.write_block.clone());
                         ps.working_confirmed = (ps.state == cyclops_proto::AgentState::Working)
                             .then_some(entry.is_some_and(|e| e.working_confirmed));
+                        ps.unread = recipient.and_then(|recipient| {
+                            inner
+                                .mailbox
+                                .as_ref()
+                                .and_then(|m| m.pending_count(recipient).ok())
+                                .map(|c| c as u64)
+                        });
                         if let Some(entry) = entry {
                             ps.composer = entry.composer.state;
                             ps.composer_proof = entry.composer.proof;
@@ -2785,6 +2831,7 @@ mod tests {
                 crate::composer_recovery::RecoveryCoordinator::default(),
             ),
             mailbox_publication: StdMutex::new(()),
+            unread_projection_gate: tokio::sync::Mutex::new(()),
             mailbox_publish_pause: StdMutex::new(None),
             boot_id: "b-test".into(),
             started: Instant::now(),

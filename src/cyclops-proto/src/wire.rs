@@ -308,6 +308,8 @@ pub struct StatusResult {
 pub struct StatusMailboxRoute {
     pub recipient: crate::identity::RecipientKey,
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread: Option<u64>,
 }
 
 /// A duration in the roster's words: seconds under a minute, then
@@ -471,6 +473,9 @@ pub struct PaneStatus {
     /// ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_display_name: Option<String>,
+    /// Pending unread messages in this pane's durable mailbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread: Option<u64>,
 }
 
 /// Body-free mailbox state used by the composer status projection.

@@ -256,11 +256,9 @@ pub(crate) fn expected_notification_payload(
 /// awaits by construction.
 pub(crate) struct Engine {
     /// Legacy direct-delivery workers, keyed by exact watched pane route.
-    workers: StdMutex<HashMap<PaneKey, Arc<Worker>>>,
+    workers: StdMutex<HashMap<PaneKey, LegacyWorker>>,
     /// Active mailbox workers and their tasks, keyed by durable recipient.
     notification_workers: StdMutex<HashMap<RecipientKey, NotificationWorker>>,
-    /// Legacy worker tasks, aborted on daemon shutdown.
-    pub(crate) worker_tasks: StdMutex<Vec<JoinHandle<()>>>,
     /// Message ids ever issued or seen in the ledgers (unique per ledger).
     issued: StdMutex<HashSet<String>>,
     /// Per-delivery unique tmux buffer names.
@@ -335,7 +333,6 @@ impl Engine {
         Engine {
             workers: StdMutex::new(HashMap::new()),
             notification_workers: StdMutex::new(HashMap::new()),
-            worker_tasks: StdMutex::new(Vec::new()),
             issued: StdMutex::new(HashSet::new()),
             buffer_seq: AtomicU64::new(0),
             acks: StdMutex::new(HashMap::new()),
@@ -392,8 +389,8 @@ impl Engine {
         self.stopping.store(true, Ordering::SeqCst);
         self.paused.store(true, Ordering::SeqCst);
         self.descendant_stop.send_replace(true);
-        for worker in self.workers.lock().expect("workers lock").values() {
-            worker.notify.notify_waiters();
+        for entry in self.workers.lock().expect("workers lock").values() {
+            entry.worker.notify.notify_waiters();
         }
         for entry in self
             .notification_workers
@@ -498,11 +495,60 @@ impl Engine {
         owns_entry
     }
 
+    /// Run one synchronous queue action while this exact legacy worker is
+    /// published in the registry.
+    ///
+    /// Retirement takes the same registry lock before checking the worker
+    /// queue. Keeping lookup, creation, and queue mutation under that lock
+    /// means an idle retirement can never remove a worker between a producer
+    /// finding it and publishing the next handle.
+    fn with_legacy_worker<T, S, F>(&self, pane: PaneKey, spawn: S, action: F) -> Option<T>
+    where
+        S: FnOnce(Arc<Worker>) -> JoinHandle<()>,
+        F: FnOnce(&Arc<Worker>) -> T,
+    {
+        let mut entries = self.workers.lock().expect("workers lock");
+        if self.stopping.load(Ordering::SeqCst) {
+            return None;
+        }
+        if !entries.contains_key(&pane) {
+            let worker = Arc::new(Worker::new());
+            let task = spawn(Arc::clone(&worker));
+            entries.insert(pane.clone(), LegacyWorker { worker, task });
+        }
+        let worker = Arc::clone(&entries.get(&pane).expect("worker inserted above").worker);
+        Some(action(&worker))
+    }
+
+    /// Remove this exact legacy worker only while its FIFO is still empty.
+    fn retire_legacy_worker(&self, pane: &PaneKey, worker: &Arc<Worker>) -> bool {
+        let mut entries = self.workers.lock().expect("workers lock");
+        let Some(entry) = entries.get(pane) else {
+            return true;
+        };
+        if !Arc::ptr_eq(&entry.worker, worker) {
+            return true;
+        }
+        if !worker.is_idle() {
+            return false;
+        }
+        entries.remove(pane);
+        true
+    }
+
+    fn legacy_worker_is_current(&self, pane: &PaneKey, worker: &Arc<Worker>) -> bool {
+        self.workers
+            .lock()
+            .expect("workers lock")
+            .get(pane)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.worker, worker))
+    }
+
     /// Un-hold the pipeline and wake every worker.
     fn resume_workers(&self) {
         self.paused.store(false, Ordering::SeqCst);
-        for worker in self.workers.lock().expect("workers lock").values() {
-            worker.notify.notify_one();
+        for entry in self.workers.lock().expect("workers lock").values() {
+            entry.worker.notify.notify_one();
         }
         for entry in self
             .notification_workers
@@ -588,6 +634,25 @@ impl Engine {
         true
     }
 
+    /// Whether this exact worker still owns the recipient registry entry.
+    ///
+    /// A notification loop removes its entry before its one legitimate clean
+    /// return. The supervisor uses this exact pointer check to distinguish
+    /// that retirement from a child that vanished while its FIFO was still
+    /// published. A replacement worker for the same recipient is not this
+    /// worker and must not keep the old supervisor alive.
+    fn notification_worker_is_current(
+        &self,
+        recipient: RecipientKey,
+        worker: &Arc<Worker>,
+    ) -> bool {
+        self.notification_workers
+            .lock()
+            .expect("notification workers lock")
+            .get(&recipient)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.worker, worker))
+    }
+
     pub(crate) fn take_notification_worker_tasks(&self) -> Vec<JoinHandle<()>> {
         std::mem::take(
             &mut *self
@@ -601,8 +666,10 @@ impl Engine {
     }
 
     pub(crate) fn take_legacy_worker_tasks(&self) -> Vec<JoinHandle<()>> {
-        self.workers.lock().expect("workers lock").clear();
-        std::mem::take(&mut *self.worker_tasks.lock().expect("worker tasks lock"))
+        std::mem::take(&mut *self.workers.lock().expect("workers lock"))
+            .into_values()
+            .map(|entry| entry.task)
+            .collect()
     }
 
     /// Content-free faults for exact notification work that stopped in memory.
@@ -736,7 +803,13 @@ struct NotificationWorker {
     task: JoinHandle<()>,
 }
 
-/// Per-recipient FIFO worker. The task sleeps on `notify` when idle.
+struct LegacyWorker {
+    worker: Arc<Worker>,
+    task: JoinHandle<()>,
+}
+
+/// Per-recipient FIFO worker. Notification workers sleep on `notify`; legacy
+/// workers retire their registry entry once the FIFO becomes idle.
 struct Worker {
     state: StdMutex<WorkerState>,
     notify: Notify,
@@ -1962,11 +2035,12 @@ pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine
                     st.attempts = attempts;
                 }
                 inner.engine.track(&handle);
-                let Some(worker) = worker_for(inner, sess_idx, &pane_id) else {
+                let Some(()) = with_worker(inner, sess_idx, &pane_id, |worker| {
+                    worker.enqueue_back(handle);
+                    worker.notify.notify_one();
+                }) else {
                     continue;
                 };
-                worker.enqueue_back(handle);
-                worker.notify.notify_one();
                 requeued.push(format!("{id} -> {to}"));
                 continue;
             }
@@ -2313,7 +2387,26 @@ pub(crate) async fn msg_send(
                 let handle =
                     DeliveryHandle::new(&msg_id, name, pane_id, *session_idx, payload.clone());
                 inner.engine.track(&handle);
-                let Some(worker) = worker_for(inner, *session_idx, pane_id) else {
+                crate::sync_pane_unread(inner, pane_id).await;
+                let answers_now = gate_answers_now(inner, *session_idx, pane_id);
+                let hold = (!answers_now)
+                    .then(|| initial_hold(inner, *session_idx, pane_id).map(str::to_string))
+                    .flatten();
+                let Some((parked_hint, first_in_line)) =
+                    with_worker(inner, *session_idx, pane_id, |worker| {
+                        let parked_hint = worker.parked.lock().expect("parked lock").clone();
+                        if parked_hint.is_some() {
+                            return (parked_hint, false);
+                        }
+                        let first_in_line = worker.is_idle();
+                        if first_in_line {
+                            handle.set_hold(hold.as_deref());
+                        }
+                        worker.enqueue_back(Arc::clone(&handle));
+                        worker.notify.notify_one();
+                        (None, first_in_line)
+                    })
+                else {
                     advance(
                         inner,
                         &handle,
@@ -2323,7 +2416,6 @@ pub(crate) async fn msg_send(
                     handles.push(handle);
                     continue;
                 };
-                let parked_hint = worker.parked.lock().expect("parked lock").clone();
                 if let Some(hint) = parked_hint {
                     // Parked recipients never auto-retry; new sends park
                     // immediately with the reset hint.
@@ -2336,20 +2428,6 @@ pub(crate) async fn msg_send(
                             .note(hint),
                     );
                 } else {
-                    // Block for this receipt only when the worker starts on
-                    // it now AND the gate answers without waiting on anyone.
-                    let first_in_line = worker.is_idle();
-                    let answers_now = gate_answers_now(inner, *session_idx, pane_id);
-                    // The worker is woken asynchronously. Seed the head's
-                    // first hold disposition before enqueueing it, so a
-                    // receipt cannot race the worker between queue insertion
-                    // and its first gate evaluation and report `queued · 0
-                    // ahead` for a delivery already held on the target.
-                    if first_in_line && !answers_now {
-                        handle.set_hold(initial_hold(inner, *session_idx, pane_id));
-                    }
-                    worker.enqueue_back(Arc::clone(&handle));
-                    worker.notify.notify_one();
                     if first_in_line && answers_now {
                         blocking.push(Arc::clone(&handle));
                     }
@@ -2611,7 +2689,7 @@ fn receipt_of(inner: &Arc<Inner>, handle: &Arc<DeliveryHandle>) -> DeliveryRecei
         .lock()
         .expect("workers lock")
         .get(&PaneKey::new(handle.session_idx, &handle.pane_id))
-        .map(|w| w.position_of(handle));
+        .map(|entry| entry.worker.position_of(handle));
     // A prior job can finish between enqueue and this snapshot. If that
     // handoff makes this handle position zero, recover the current target
     // hold synchronously; followers never inherit the head's token.
@@ -2671,26 +2749,25 @@ fn expand_recipients(inner: &Arc<Inner>, to: &[String]) -> Result<Vec<String>, W
     Ok(names)
 }
 
-/// Get or spawn the FIFO worker owning one pane.
-fn worker_for(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) -> Option<Arc<Worker>> {
+/// Run one queue publication against the FIFO worker owning one pane.
+fn with_worker<T, F>(inner: &Arc<Inner>, session_idx: usize, pane_id: &str, action: F) -> Option<T>
+where
+    F: FnOnce(&Arc<Worker>) -> T,
+{
     let pane = PaneKey::new(session_idx, pane_id);
-    let mut workers = inner.engine.workers.lock().expect("workers lock");
-    if inner.engine.is_stopping() {
-        return None;
-    }
-    if let Some(w) = workers.get(&pane) {
-        return Some(Arc::clone(w));
-    }
-    let worker = Arc::new(Worker::new());
-    workers.insert(pane, Arc::clone(&worker));
-    let task = tokio::spawn(worker_supervisor(Arc::clone(inner), Arc::clone(&worker)));
-    inner
-        .engine
-        .worker_tasks
-        .lock()
-        .expect("worker tasks lock")
-        .push(task);
-    Some(worker)
+    let task_inner = Arc::clone(inner);
+    let task_pane = pane.clone();
+    inner.engine.with_legacy_worker(
+        pane,
+        move |worker| {
+            tokio::spawn(worker_supervisor(
+                task_inner,
+                task_pane,
+                Arc::clone(&worker),
+            ))
+        },
+        action,
+    )
 }
 
 /// Attach an already-queued mailbox notification to the pane's existing FIFO worker.
@@ -2804,19 +2881,40 @@ pub(crate) fn enqueue_notification_attempt(
 /// Observe every worker-loop exit without waiting for another enqueue.
 ///
 /// The loop child owns normal FIFO work. The supervisor owns its task and
-/// classifies a panic against the exact current handle before starting a new
-/// child. Dropping the supervisor aborts its child through `DeliveryTask`.
-async fn supervise_worker_task<S, R>(mut spawn: S, mut recover: R)
+/// classifies every unexpected exit against the exact current handle before
+/// starting a new child. A clean task return is not proof of success: only
+/// daemon stop, a visible worker fault, or exact notification-registry
+/// retirement is expected. Claim cancellation drains into that exact
+/// retirement. Quiesce parks the child and is not an exit. Dropping the
+/// supervisor aborts its child through `DeliveryTask`.
+async fn supervise_worker_task<S, R, E>(mut spawn: S, mut recover: R, mut expected_exit: E)
 where
     S: FnMut() -> JoinHandle<()>,
     R: FnMut() -> bool,
+    E: FnMut() -> bool,
 {
     loop {
         let mut child = DeliveryTask(spawn());
         match child.wait().await {
-            Ok(()) => return,
+            Ok(()) if expected_exit() => return,
+            Ok(()) => {
+                error!("delivery worker loop returned while it still owned its registry slot");
+                if !recover() {
+                    std::future::pending::<()>().await;
+                }
+            }
             Err(error) => {
-                error!(%error, "delivery worker loop failed");
+                let exit = if error.is_cancelled() {
+                    "cancelled"
+                } else if error.is_panic() {
+                    "panicked"
+                } else {
+                    "failed"
+                };
+                error!(%error, exit, "delivery worker loop failed");
+                if expected_exit() {
+                    return;
+                }
                 if !recover() {
                     std::future::pending::<()>().await;
                 }
@@ -2839,14 +2937,21 @@ fn recover_outer_worker(inner: &Arc<Inner>, worker: &Arc<Worker>) -> bool {
     }
 }
 
-async fn worker_supervisor(inner: Arc<Inner>, worker: Arc<Worker>) {
+async fn worker_supervisor(inner: Arc<Inner>, pane: PaneKey, worker: Arc<Worker>) {
     supervise_worker_task(
         || {
-            inner
-                .engine
-                .spawn_descendant_task(worker_loop(Arc::clone(&inner), Arc::clone(&worker)))
+            inner.engine.spawn_descendant_task(worker_loop(
+                Arc::clone(&inner),
+                pane.clone(),
+                Arc::clone(&worker),
+            ))
         },
         || recover_outer_worker(&inner, &worker),
+        || {
+            inner.engine.is_stopping()
+                || worker.is_faulted()
+                || !inner.engine.legacy_worker_is_current(&pane, &worker)
+        },
     )
     .await;
 }
@@ -2865,11 +2970,18 @@ async fn notification_worker_supervisor(
             ))
         },
         || recover_outer_worker(&inner, &worker),
+        || {
+            inner.engine.is_stopping()
+                || worker.is_faulted()
+                || !inner
+                    .engine
+                    .notification_worker_is_current(recipient, &worker)
+        },
     )
     .await;
 }
 
-async fn worker_loop(inner: Arc<Inner>, worker: Arc<Worker>) {
+async fn worker_loop(inner: Arc<Inner>, pane: PaneKey, worker: Arc<Worker>) {
     loop {
         // A quiesce holds the pipeline still: finish nothing new until
         // resume_workers notifies. Jobs stay queued (pre-paste, safe
@@ -2910,7 +3022,11 @@ async fn worker_loop(inner: Arc<Inner>, worker: Arc<Worker>) {
                     }
                 }
             }
-            None => worker.notify.notified().await,
+            None => {
+                if inner.engine.retire_legacy_worker(&pane, &worker) {
+                    return;
+                }
+            }
         }
     }
 }
@@ -3096,6 +3212,11 @@ fn recover_failed_job(
                         worker.set_fault(format!("direct settlement recovery failed: {error}"));
                         return false;
                     }
+                    let inner_clone = Arc::clone(inner);
+                    let recipient = notification.recipient();
+                    tokio::spawn(async move {
+                        crate::sync_recipient_unread(&inner_clone, recipient).await;
+                    });
                     if let Some(service) = &inner.mailbox {
                         if let Err(error) = crate::messaging::schedule_recipient(
                             inner,
@@ -6422,6 +6543,11 @@ fn record_notification_notified(
         Ok(_) => {
             if handle.notification_transport() == Some(NotificationTransport::DirectPayload) {
                 notification.record_delivered_direct()?;
+                let inner_clone = Arc::clone(inner);
+                let recipient = notification.recipient();
+                tokio::spawn(async move {
+                    crate::sync_recipient_unread(&inner_clone, recipient).await;
+                });
                 if let Some(service) = &inner.mailbox {
                     if let Err(error) = crate::messaging::schedule_recipient(
                         inner,
@@ -9479,6 +9605,7 @@ mod tests {
                     true
                 }
             },
+            || false,
         ));
 
         tokio::time::timeout(Duration::from_secs(1), restarted.notified())
@@ -9517,6 +9644,7 @@ mod tests {
                 })
             },
             || false,
+            || false,
         ));
 
         tokio::time::timeout(Duration::from_secs(1), started.notified())
@@ -9528,6 +9656,278 @@ mod tests {
             .await
             .expect("shutdown drain observes the child cancellation");
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unexpected_clean_worker_exit_recovers_without_another_enqueue() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let recoveries = Arc::new(AtomicUsize::new(0));
+        let restarted = Arc::new(Notify::new());
+        let task = tokio::spawn(supervise_worker_task(
+            {
+                let starts = Arc::clone(&starts);
+                let restarted = Arc::clone(&restarted);
+                move || {
+                    let run = starts.fetch_add(1, Ordering::SeqCst);
+                    let restarted = Arc::clone(&restarted);
+                    tokio::spawn(async move {
+                        if run == 0 {
+                            return;
+                        }
+                        restarted.notify_one();
+                        std::future::pending::<()>().await;
+                    })
+                }
+            },
+            {
+                let recoveries = Arc::clone(&recoveries);
+                move || {
+                    recoveries.fetch_add(1, Ordering::SeqCst);
+                    true
+                }
+            },
+            || false,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), restarted.notified())
+            .await
+            .expect("a clean return with a published worker starts its replacement");
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        assert_eq!(recoveries.load(Ordering::SeqCst), 1);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unexpected_worker_task_cancellation_recovers_without_new_traffic() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let recoveries = Arc::new(AtomicUsize::new(0));
+        let restarted = Arc::new(Notify::new());
+        let task = tokio::spawn(supervise_worker_task(
+            {
+                let starts = Arc::clone(&starts);
+                let restarted = Arc::clone(&restarted);
+                move || {
+                    let run = starts.fetch_add(1, Ordering::SeqCst);
+                    if run == 0 {
+                        let child = tokio::spawn(std::future::pending::<()>());
+                        child.abort();
+                        return child;
+                    }
+                    let restarted = Arc::clone(&restarted);
+                    tokio::spawn(async move {
+                        restarted.notify_one();
+                        std::future::pending::<()>().await;
+                    })
+                }
+            },
+            {
+                let recoveries = Arc::clone(&recoveries);
+                move || {
+                    recoveries.fetch_add(1, Ordering::SeqCst);
+                    true
+                }
+            },
+            || false,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), restarted.notified())
+            .await
+            .expect("an unexpected child cancellation starts its replacement");
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        assert_eq!(recoveries.load(Ordering::SeqCst), 1);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_shutdown_is_not_misclassified_as_a_worker_failure() {
+        let engine = Arc::new(Engine::new());
+        let started = Arc::new(Notify::new());
+        let recoveries = Arc::new(AtomicUsize::new(0));
+        let supervisor = tokio::spawn(supervise_worker_task(
+            {
+                let engine = Arc::clone(&engine);
+                let started = Arc::clone(&started);
+                move || {
+                    let started = Arc::clone(&started);
+                    engine.spawn_descendant_task(async move {
+                        started.notify_one();
+                        std::future::pending::<()>().await;
+                    })
+                }
+            },
+            {
+                let recoveries = Arc::clone(&recoveries);
+                move || {
+                    recoveries.fetch_add(1, Ordering::SeqCst);
+                    true
+                }
+            },
+            {
+                let engine = Arc::clone(&engine);
+                move || engine.is_stopping()
+            },
+        ));
+
+        started.notified().await;
+        engine.begin_stopping();
+        tokio::time::timeout(Duration::from_secs(1), supervisor)
+            .await
+            .expect("shutdown releases the supervisor")
+            .expect("supervisor exits cleanly");
+        assert_eq!(recoveries.load(Ordering::SeqCst), 0);
+        engine.wait_for_descendant_tasks().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn notification_supervisor_wiring_distinguishes_retirement_from_child_loss() {
+        // Normal retirement removes the exact registry entry before the child
+        // returns. Drive the production supervisor and predicate together: a
+        // wrong key or inverted current-worker check would recover this empty
+        // worker instead of accepting its retirement.
+        let retirement_root = NotificationScratch(cyclops_proto::scratch::scratch_dir(
+            "notification-supervisor-retirement",
+        ));
+        std::fs::create_dir_all(&retirement_root.0).unwrap();
+        let retirement_inner = unwritten_test_inner(&retirement_root.0);
+        let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let retired_recipient = churn_recipient(workspace, 910);
+        let retired_worker = Arc::new(Worker::new());
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let supervisor_inner = Arc::clone(&retirement_inner);
+        let supervisor_worker = Arc::clone(&retired_worker);
+        let task = tokio::spawn(async move {
+            let _ = start_rx.await;
+            notification_worker_supervisor(supervisor_inner, retired_recipient, supervisor_worker)
+                .await;
+            let _ = done_tx.send(());
+        });
+        retirement_inner
+            .engine
+            .notification_workers
+            .lock()
+            .expect("notification workers lock")
+            .insert(
+                retired_recipient,
+                NotificationWorker {
+                    worker: Arc::clone(&retired_worker),
+                    task,
+                },
+            );
+        start_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), done_rx)
+            .await
+            .expect("normal registry retirement releases the supervisor")
+            .expect("supervisor completion sender stayed open");
+        assert!(retirement_inner
+            .engine
+            .notification_workers
+            .lock()
+            .expect("notification workers lock")
+            .is_empty());
+        assert_eq!(
+            retired_worker
+                .state
+                .lock()
+                .expect("worker state lock")
+                .empty_restarts,
+            0,
+            "normal retirement must not be recovered as worker loss"
+        );
+
+        // Cancellation of a descendant while the exact registry entry is
+        // still published is unexpected. Keep a real queued notification
+        // parked behind quiesce, cancel only its child, and require the
+        // production supervisor to reconstruct that same durable attempt.
+        let (message_scratch, store, context, _handle, recipient) =
+            notification_fixture("notification-supervisor-child-loss");
+        let inner_root = NotificationScratch(cyclops_proto::scratch::scratch_dir(
+            "notification-supervisor-child-loss-inner",
+        ));
+        std::fs::create_dir_all(&inner_root.0).unwrap();
+        let inner = unwritten_test_inner(&inner_root.0);
+        inner.engine.paused.store(true, Ordering::SeqCst);
+        let attempt = context.attempt_id();
+        let handle =
+            enqueue_notification_attempt(&inner, 0, "%1", "reviewer", context.clone(), false)
+                .expect("production enqueue publishes the worker and supervisor");
+        let worker = inner
+            .engine
+            .notification_workers
+            .lock()
+            .expect("notification workers lock")
+            .get(&recipient)
+            .map(|entry| Arc::clone(&entry.worker))
+            .expect("recipient worker is registered");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while inner.engine.descendant_tasks.active.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the production supervisor spawned its child");
+        // Hold the durable projection while the first child observes the stop.
+        // Recovery increments its counter before reading that projection, so
+        // this gives the test a deterministic point to lower the global stop
+        // latch before the supervisor can spawn its replacement. Without this
+        // ordering, a slow runner can let the replacement inherit `true`,
+        // causing a second legitimate recovery and a BlockedPreWrite result.
+        tokio::task::block_in_place(|| {
+            let _projection = store.lock().expect("message store lock");
+            inner.engine.descendant_stop.send_replace(true);
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while handle.worker_recoveries.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the cancelled child reaches durable recovery"
+                );
+                std::thread::yield_now();
+            }
+            inner.engine.descendant_stop.send_replace(false);
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while inner
+                .engine
+                .notification_handle(attempt)
+                .is_none_or(|current| Arc::ptr_eq(&current, &handle))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unexpected child loss was classified without another enqueue");
+        assert_eq!(handle.worker_recoveries.load(Ordering::SeqCst), 1);
+        assert!(inner
+            .engine
+            .notification_worker_is_current(recipient, &worker));
+        assert!(!worker.is_faulted());
+        assert_eq!(context.current_record().unwrap().attempt_id, attempt);
+        assert_eq!(
+            context.current_record().unwrap().state,
+            NotificationState::Queued
+        );
+        assert_eq!(
+            inner
+                .engine
+                .notification_handle(attempt)
+                .and_then(|current| current.notification.as_ref().map(|n| n.attempt_id())),
+            Some(attempt),
+            "recovery must keep the same durable attempt identity"
+        );
+
+        inner.engine.begin_stopping();
+        for task in inner.engine.take_notification_worker_tasks() {
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("shutdown releases the production supervisor")
+                .expect("production supervisor exits cleanly");
+        }
+        inner.engine.wait_for_descendant_tasks().await;
+        drop(message_scratch);
     }
 
     #[tokio::test]
@@ -9625,10 +10025,12 @@ mod tests {
             let worker = engine
                 .enqueue_notification_worker(recipient, Arc::clone(&handle), |_| test_worker_task())
                 .expect("engine is running");
+            assert!(engine.notification_worker_is_current(recipient, &worker));
             let queued = worker.drain_pending();
             assert_eq!(queued.len(), 1);
             assert!(Arc::ptr_eq(&queued[0], &handle));
             assert!(engine.retire_notification_worker(recipient, &worker));
+            assert!(!engine.notification_worker_is_current(recipient, &worker));
             assert!(
                 engine
                     .notification_workers
@@ -9823,6 +10225,172 @@ mod tests {
             current_worker.drain_pending();
             assert!(engine.retire_notification_worker(recipient, &current_worker));
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn legacy_enqueue_and_idle_retirement_never_orphan_a_handle() {
+        let engine = Arc::new(Engine::new());
+
+        for ordinal in 0..256 {
+            let pane = PaneKey::new(ordinal, "%1");
+            let seed = DeliveryHandle::new(
+                &format!("m-legacy-seed-{ordinal}"),
+                "worker",
+                "%1",
+                ordinal,
+                "seed".into(),
+            );
+            let old_worker = engine
+                .with_legacy_worker(
+                    pane.clone(),
+                    {
+                        let engine = Arc::clone(&engine);
+                        move |_| engine.spawn_descendant_task(std::future::pending())
+                    },
+                    |worker| {
+                        worker.enqueue_back(Arc::clone(&seed));
+                        Arc::clone(worker)
+                    },
+                )
+                .expect("engine is running");
+            let queued = old_worker.drain_pending();
+            assert_eq!(queued.len(), 1);
+            assert!(Arc::ptr_eq(&queued[0], &seed));
+
+            let next = DeliveryHandle::new(
+                &format!("m-legacy-next-{ordinal}"),
+                "worker",
+                "%1",
+                ordinal,
+                "next".into(),
+            );
+            let start = Arc::new(Barrier::new(3));
+            let producer = tokio::task::spawn_blocking({
+                let engine = Arc::clone(&engine);
+                let pane = pane.clone();
+                let start = Arc::clone(&start);
+                let next = Arc::clone(&next);
+                move || {
+                    start.wait();
+                    let spawn_engine = Arc::clone(&engine);
+                    engine
+                        .with_legacy_worker(
+                            pane,
+                            move |_| spawn_engine.spawn_descendant_task(std::future::pending()),
+                            |worker| {
+                                worker.enqueue_back(next);
+                                Arc::clone(worker)
+                            },
+                        )
+                        .expect("engine is running")
+                }
+            });
+            let retirement = tokio::task::spawn_blocking({
+                let engine = Arc::clone(&engine);
+                let pane = pane.clone();
+                let start = Arc::clone(&start);
+                let old_worker = Arc::clone(&old_worker);
+                move || {
+                    start.wait();
+                    engine.retire_legacy_worker(&pane, &old_worker)
+                }
+            });
+            tokio::task::block_in_place(|| start.wait());
+
+            let producer_worker = producer.await.unwrap();
+            let retired = retirement.await.unwrap();
+            let current_worker = {
+                let entries = engine.workers.lock().expect("workers lock");
+                Arc::clone(&entries.get(&pane).expect("producer leaves a worker").worker)
+            };
+            assert!(Arc::ptr_eq(&current_worker, &producer_worker));
+            assert_eq!(
+                current_worker
+                    .state
+                    .lock()
+                    .expect("worker state lock")
+                    .queue
+                    .iter()
+                    .filter(|queued| Arc::ptr_eq(queued, &next))
+                    .count(),
+                1,
+                "concurrent legacy retirement orphaned or duplicated the enqueue"
+            );
+            if retired {
+                assert!(!Arc::ptr_eq(&current_worker, &old_worker));
+            } else {
+                assert!(Arc::ptr_eq(&current_worker, &old_worker));
+            }
+
+            current_worker.drain_pending();
+            assert!(engine.retire_legacy_worker(&pane, &current_worker));
+            assert!(!engine.legacy_worker_is_current(&pane, &current_worker));
+        }
+
+        engine.begin_stopping();
+        engine.wait_for_descendant_tasks().await;
+        assert!(engine.take_legacy_worker_tasks().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_legacy_worker_loop_retires_its_registry_entry_when_idle() {
+        let path = cyclops_proto::scratch::scratch_dir(&format!(
+            "legacy-worker-retirement-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let _scratch = NotificationScratch(path.clone());
+        let inner = unwritten_test_inner(&path);
+        let pane = PaneKey::new(0, "%1");
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let task_inner = Arc::clone(&inner);
+        let task_pane = pane.clone();
+
+        let worker = inner
+            .engine
+            .with_legacy_worker(
+                pane,
+                move |worker| {
+                    tokio::spawn(async move {
+                        worker_supervisor(task_inner, task_pane, worker).await;
+                        let _ = done_tx.send(());
+                    })
+                },
+                Arc::clone,
+            )
+            .expect("engine is running");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if inner
+                    .engine
+                    .workers
+                    .lock()
+                    .expect("workers lock")
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the idle loop removes its exact registry entry");
+        tokio::time::timeout(Duration::from_secs(1), done_rx)
+            .await
+            .expect("registry retirement releases the supervisor")
+            .expect("supervisor completion sender stayed open");
+        assert_eq!(
+            worker
+                .state
+                .lock()
+                .expect("worker state lock")
+                .empty_restarts,
+            0,
+            "normal retirement must not be recovered as worker loss"
+        );
+
+        inner.engine.begin_stopping();
+        inner.engine.wait_for_descendant_tasks().await;
+        assert!(inner.engine.take_legacy_worker_tasks().is_empty());
     }
 
     #[test]
@@ -11012,6 +11580,7 @@ composer_trailer_required_prefix = 1
                 crate::composer_recovery::RecoveryCoordinator::default(),
             ),
             mailbox_publication: StdMutex::new(()),
+            unread_projection_gate: tokio::sync::Mutex::new(()),
             mailbox_publish_pause: StdMutex::new(None),
             boot_id: "b-unwritten-test".into(),
             started: std::time::Instant::now(),

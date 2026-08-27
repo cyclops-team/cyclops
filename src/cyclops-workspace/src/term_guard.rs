@@ -37,48 +37,58 @@ pub fn apply_cursor_style(shape: CursorShape, blink: bool) {
     let _ = out.execute(style);
 }
 
-/// Paint the host terminal's own default background the theme's chrome
-/// color (OSC 11).
+/// Paint the host terminal's own default foreground and background with
+/// the theme's pane ink and chrome ground (OSC 10 and OSC 11).
 ///
 /// This is the only way to reach the band around the grid. A terminal
 /// reserves a few pixels of window padding and fills them with its default
 /// background, and no amount of cell painting touches it: the workspace
 /// already fills every cell it is given, so the strip an operator sees at
 /// the edges is outside the grid entirely. OSC 11 changes the color that
-/// strip is filled with, which is why it is here rather than in a painter.
+/// strip is filled with. OSC 10 keeps unstyled host text readable on that
+/// ground, including a shell revealed or opened while a light Cyclops theme
+/// is active. That is why the pair lives here rather than in a painter.
 ///
 /// Lives beside the guard for the same reason `apply_cursor_style` does:
 /// it changes terminal state that outlives the process unless something
 /// undoes it, and `restore` is what undoes it, on every exit path
-/// including a panic. Leaving a shell with the workspace's background
-/// would be a worse bug than the padding it fixes.
+/// including a panic. Leaving a shell with the workspace's palette would
+/// be a worse bug than the padding it fixes.
 ///
-/// Unsupported terminals ignore the sequence, so there is nothing to
+/// Unsupported terminals ignore the sequences, so there is nothing to
 /// detect and no fallback to write.
-pub fn apply_window_background(rgb: (u8, u8, u8)) {
-    let (r, g, b) = rgb;
+pub fn apply_window_palette(fg: (u8, u8, u8), bg: (u8, u8, u8)) {
     let mut out = io::stdout();
-    // ST rather than BEL: both terminate an OSC, and a stray BEL in a
-    // terminal that did not understand the sequence rings the bell.
-    let _ = write!(out, "\x1b]11;#{r:02x}{g:02x}{b:02x}\x1b\\");
+    write_window_palette(&mut out, fg, bg);
     let _ = out.flush();
 }
 
-/// Hand the terminal's default background back (OSC 111).
-fn reset_window_background(out: &mut impl Write) {
-    let _ = write!(out, "\x1b]111\x1b\\");
+fn write_window_palette(out: &mut impl Write, fg: (u8, u8, u8), bg: (u8, u8, u8)) {
+    let (fr, fg, fb) = fg;
+    let (br, bg, bb) = bg;
+    // ST rather than BEL: both terminate an OSC, and a stray BEL in a
+    // terminal that did not understand the sequence rings the bell.
+    let _ = write!(
+        out,
+        "\x1b]10;#{fr:02x}{fg:02x}{fb:02x}\x1b\\\x1b]11;#{br:02x}{bg:02x}{bb:02x}\x1b\\"
+    );
 }
 
-/// Hand the background back while the workspace keeps running.
+/// Hand the terminal's default foreground and background back (OSC 110/111).
+fn reset_window_palette(out: &mut impl Write) {
+    let _ = write!(out, "\x1b]110\x1b\\\x1b]111\x1b\\");
+}
+
+/// Hand the foreground and background back while the workspace keeps running.
 ///
 /// Focus left the workspace's tab. The operator is now looking at their
 /// own shell or another program in the same terminal window, and it
-/// should wear the terminal's own background, not the theme's. The same
+/// should wear the terminal's own defaults, not the theme's. The same
 /// escape `restore` sends on exit; focus return reapplies the theme
 /// through the ordinary draw path.
-pub fn yield_window_background() {
+pub fn yield_window_palette() {
     let mut out = io::stdout();
-    reset_window_background(&mut out);
+    reset_window_palette(&mut out);
     let _ = out.flush();
 }
 
@@ -96,8 +106,8 @@ impl TermGuard {
         out.execute(EnterAlternateScreen)?;
         let _ = out.execute(EnableMouseCapture);
         let _ = out.execute(EnableBracketedPaste);
-        // Focus reporting drives the window background: the theme's ground
-        // is only painted onto the terminal while the workspace is the
+        // Focus reporting drives the host palette: the theme's ink and
+        // ground are only handed to the terminal while the workspace is the
         // thing being looked at (app.rs, AppMsg::Focus).
         let _ = out.execute(EnableFocusChange);
         // The kitty keyboard protocol's disambiguate level, pushed blind
@@ -133,9 +143,9 @@ impl TermGuard {
         // own configured cursor back rather than the last pane's.
         let _ = out.execute(SetCursorStyle::DefaultUserShape);
         // Before leaving the alternate screen, so the shell underneath is
-        // revealed already wearing its own background rather than flashing
-        // the workspace's for a frame.
-        reset_window_background(&mut out);
+        // revealed already wearing its own foreground and background rather
+        // than flashing the workspace's palette for a frame.
+        reset_window_palette(&mut out);
         let _ = out.execute(LeaveAlternateScreen);
         let _ = disable_raw_mode();
         let _ = out.flush();
@@ -166,8 +176,8 @@ mod tests {
     use super::*;
     use std::io::IsTerminal;
 
-    /// The two escapes are the exact pair a terminal needs to change its
-    /// default background and hand it back.
+    /// The four escapes are the exact pairs a terminal needs to change its
+    /// default foreground/background and hand both back.
     ///
     /// Pinned as bytes because this is the one thing the workspace writes
     /// that outlives the process. A malformed set is a cosmetic bug; a
@@ -176,22 +186,21 @@ mod tests {
     /// that matters. ST terminates rather than BEL so a terminal that does
     /// not understand the sequence stays silent instead of ringing.
     #[test]
-    fn the_background_escapes_set_and_hand_back() {
+    fn the_palette_escapes_set_and_hand_back() {
         let mut out: Vec<u8> = Vec::new();
-        reset_window_background(&mut out);
+        reset_window_palette(&mut out);
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "\x1b]111\x1b\\",
-            "OSC 111 with an ST terminator is what returns the default"
+            "\x1b]110\x1b\\\x1b]111\x1b\\",
+            "OSC 110 and 111 with ST terminators return both defaults"
         );
 
-        // The setter writes to stdout, so its format is checked against the
-        // same construction rather than by capturing a real terminal.
-        let (r, g, b) = (0xfa_u8, 0xf6_u8, 0xe6_u8);
+        let mut out: Vec<u8> = Vec::new();
+        write_window_palette(&mut out, (0x3a, 0x2b, 0x26), (0xfa, 0xf6, 0xe6));
         assert_eq!(
-            format!("\x1b]11;#{r:02x}{g:02x}{b:02x}\x1b\\"),
-            "\x1b]11;#faf6e6\x1b\\",
-            "channels are two lowercase hex digits each, zero padded"
+            String::from_utf8(out).unwrap(),
+            "\x1b]10;#3a2b26\x1b\\\x1b]11;#faf6e6\x1b\\",
+            "foreground and background channels are lowercase, zero-padded hex"
         );
     }
 

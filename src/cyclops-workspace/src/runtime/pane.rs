@@ -263,6 +263,15 @@ impl PaneRuntime {
         self.term.grid().display_offset()
     }
 
+    /// Total history lines available behind the live viewport.
+    ///
+    /// Read from the engine beside [`Self::scrolled_back`] so the UI can
+    /// describe a position as part of the available range without caching a
+    /// second count that would drift as output arrives.
+    pub fn history_size(&self) -> usize {
+        self.term.grid().history_size()
+    }
+
     /// Visit every visible cell once, in row-major order.
     ///
     /// This is the production render path: one translation from engine

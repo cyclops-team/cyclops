@@ -66,6 +66,15 @@ pub enum BindingAction {
     /// Open the settings card (theme, view, sound) on its first section.
     /// No default chord: reached from the app menu, bindable via config.
     ShowSettings,
+    /// Repaint the whole workspace surface from scratch.
+    ///
+    /// Behind the prefix on purpose. A bare `Ctrl+L` is the focused
+    /// program's own clear-and-redraw and reaches it through the router's
+    /// passthrough, which is the remedy for a garbled PANE. This one
+    /// repairs the workspace's own chrome, which is a different surface
+    /// with a different cause, and stealing `Ctrl+L` would take the
+    /// pane's remedy away to fix the chrome's.
+    Redraw,
 }
 
 /// One human-readable row in the in-app keybinding reference.
@@ -231,6 +240,10 @@ pub fn default_bindings() -> HashMap<BindingAction, BindingChord> {
         (
             BindingAction::Compose,
             BindingChord::Prefix(KeyCode::Char('s')),
+        ),
+        (
+            BindingAction::Redraw,
+            BindingChord::Prefix(KeyCode::Char('r')),
         ),
     ])
 }
@@ -449,6 +462,7 @@ fn action_words(action: BindingAction) -> String {
         BindingAction::ShowKeybinds => "Keybinds".into(),
         BindingAction::Compose => "Send a message".into(),
         BindingAction::ShowSettings => "Settings".into(),
+        BindingAction::Redraw => "Redraw the workspace".into(),
     }
 }
 
@@ -486,6 +500,7 @@ fn help_rank(action: BindingAction) -> (u8, usize) {
         BindingAction::ToggleMotion => (49, 4),
         BindingAction::ToggleEventPanel => (50, 0),
         BindingAction::Compose => (50, 1),
+        BindingAction::Redraw => (50, 3),
         BindingAction::ShowKeybinds => (51, 0),
         BindingAction::ShowSettings => (52, 0),
         BindingAction::Detach => (53, 0),

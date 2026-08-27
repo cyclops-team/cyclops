@@ -1234,6 +1234,9 @@ pub fn menu_items(menu: &MenuState, checks: MenuChecks) -> Vec<MenuRow> {
                 BindingAction::ToggleMessages,
                 Some(checks.messages),
             ),
+            // A garbled frame is exactly when a chord is hardest to
+            // remember, so the repair has a row as well as `Ctrl+B r`.
+            (copy::MENU_REDRAW, BindingAction::Redraw, None),
             // Settings opens a card rather than flipping anything, so it
             // carries no check of its own; the card marks the theme, the
             // surfaces showing (its View section holds the tab strip's
@@ -1614,6 +1617,9 @@ mod tests {
                 // in `render/mod.rs` puts exactly that case here.
                 BindingAction::Compose,
                 BindingAction::ToggleMessages,
+                // The repaint has a chord, but a garbled frame is when a
+                // chord is hardest to remember, so it has a row too.
+                BindingAction::Redraw,
                 BindingAction::ShowSettings,
                 // The keybinding reference is its own card, and the
                 // first thing a new operator reaches for.

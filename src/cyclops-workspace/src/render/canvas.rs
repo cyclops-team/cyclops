@@ -449,12 +449,21 @@ fn paint_pane_slot(
     }
 }
 
-/// Lines a pane's viewport sits back from its live tail; 0 when the pane
-/// has no runtime yet.
-fn scroll_depth(runtimes: &RuntimeRegistry, slot: &PaneSlot) -> usize {
+/// Lines a pane's viewport sits back from its live tail and the total
+/// history available; both are 0 when the pane has no runtime yet.
+#[derive(Debug, Clone, Copy, Default)]
+struct ScrollDepth {
+    back: usize,
+    total: usize,
+}
+
+fn scroll_depth(runtimes: &RuntimeRegistry, slot: &PaneSlot) -> ScrollDepth {
     runtimes
         .get(&slot.pane_id)
-        .map_or(0, PaneRuntime::scrolled_back)
+        .map_or_else(ScrollDepth::default, |runtime| ScrollDepth {
+            back: runtime.scrolled_back(),
+            total: runtime.history_size(),
+        })
 }
 
 /// Paint one pane's border, its corner swap grip, optional named-agent
@@ -469,7 +478,7 @@ fn paint_pane_frame(
     buf: &mut Buffer,
     paint: &Paint,
     ctx: &mut WindowPaintCtx<'_>,
-    scrolled: usize,
+    scroll: ScrollDepth,
 ) {
     // The frame, not the content rect: a box grown out to the shared edge
     // must stay grabbable over the whole boundary it actually draws.
@@ -602,7 +611,7 @@ fn paint_pane_frame(
         bounds,
         control_left,
         title_left,
-        scrolled,
+        scroll,
         buf,
         border_style,
     );
@@ -729,7 +738,7 @@ fn pane_title_rect(
     (title_left < control_left).then(|| Rect::new(title_left, top, control_left - title_left, 1))
 }
 
-/// Paint the scrollback depth hint ("12 back") right-aligned against
+/// Paint the scrollback depth hint ("12/80 back") right-aligned against
 /// `control_left` on the top border. Returns the new left boundary for the
 /// title strip: the hint's own start while it shows, `control_left`
 /// untouched when the pane is at the tail or the border is too narrow.
@@ -738,14 +747,14 @@ fn paint_scroll_hint(
     bounds: Rect,
     control_left: u16,
     title_left: u16,
-    scrolled: usize,
+    scroll: ScrollDepth,
     buf: &mut Buffer,
     border_style: Style,
 ) -> u16 {
-    if scrolled == 0 {
+    if scroll.back == 0 {
         return control_left;
     }
-    let text = format!(" {scrolled} back ");
+    let text = format!(" {}/{} back ", scroll.back, scroll.total);
     let width = u16::try_from(text.chars().count()).unwrap_or(u16::MAX);
     let Some(x) = control_left.checked_sub(width).filter(|x| *x > title_left) else {
         return control_left;
@@ -1347,9 +1356,10 @@ mod tests {
             flatten(term.backend().buffer())
         };
 
+        let history = runtimes.get("%0").unwrap().history_size();
         assert!(
-            draw(&runtimes).contains("5 back"),
-            "a scrolled pane must say how far back it sits"
+            draw(&runtimes).contains(&format!("5/{history} back")),
+            "a scrolled pane must say where it sits in the available history"
         );
 
         // Back at the tail the hint is gone.
