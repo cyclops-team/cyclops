@@ -588,6 +588,25 @@ impl Engine {
         true
     }
 
+    /// Whether this exact worker still owns the recipient registry entry.
+    ///
+    /// A notification loop removes its entry before its one legitimate clean
+    /// return. The supervisor uses this exact pointer check to distinguish
+    /// that retirement from a child that vanished while its FIFO was still
+    /// published. A replacement worker for the same recipient is not this
+    /// worker and must not keep the old supervisor alive.
+    fn notification_worker_is_current(
+        &self,
+        recipient: RecipientKey,
+        worker: &Arc<Worker>,
+    ) -> bool {
+        self.notification_workers
+            .lock()
+            .expect("notification workers lock")
+            .get(&recipient)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.worker, worker))
+    }
+
     pub(crate) fn take_notification_worker_tasks(&self) -> Vec<JoinHandle<()>> {
         std::mem::take(
             &mut *self
@@ -2805,19 +2824,40 @@ pub(crate) fn enqueue_notification_attempt(
 /// Observe every worker-loop exit without waiting for another enqueue.
 ///
 /// The loop child owns normal FIFO work. The supervisor owns its task and
-/// classifies a panic against the exact current handle before starting a new
-/// child. Dropping the supervisor aborts its child through `DeliveryTask`.
-async fn supervise_worker_task<S, R>(mut spawn: S, mut recover: R)
+/// classifies every unexpected exit against the exact current handle before
+/// starting a new child. A clean task return is not proof of success: only
+/// daemon stop, a visible worker fault, or exact notification-registry
+/// retirement is expected. Claim cancellation drains into that exact
+/// retirement. Quiesce parks the child and is not an exit. Dropping the
+/// supervisor aborts its child through `DeliveryTask`.
+async fn supervise_worker_task<S, R, E>(mut spawn: S, mut recover: R, mut expected_exit: E)
 where
     S: FnMut() -> JoinHandle<()>,
     R: FnMut() -> bool,
+    E: FnMut() -> bool,
 {
     loop {
         let mut child = DeliveryTask(spawn());
         match child.wait().await {
-            Ok(()) => return,
+            Ok(()) if expected_exit() => return,
+            Ok(()) => {
+                error!("delivery worker loop returned while it still owned its registry slot");
+                if !recover() {
+                    std::future::pending::<()>().await;
+                }
+            }
             Err(error) => {
-                error!(%error, "delivery worker loop failed");
+                let exit = if error.is_cancelled() {
+                    "cancelled"
+                } else if error.is_panic() {
+                    "panicked"
+                } else {
+                    "failed"
+                };
+                error!(%error, exit, "delivery worker loop failed");
+                if expected_exit() {
+                    return;
+                }
                 if !recover() {
                     std::future::pending::<()>().await;
                 }
@@ -2848,6 +2888,7 @@ async fn worker_supervisor(inner: Arc<Inner>, worker: Arc<Worker>) {
                 .spawn_descendant_task(worker_loop(Arc::clone(&inner), Arc::clone(&worker)))
         },
         || recover_outer_worker(&inner, &worker),
+        || inner.engine.is_stopping() || worker.is_faulted(),
     )
     .await;
 }
@@ -2866,6 +2907,13 @@ async fn notification_worker_supervisor(
             ))
         },
         || recover_outer_worker(&inner, &worker),
+        || {
+            inner.engine.is_stopping()
+                || worker.is_faulted()
+                || !inner
+                    .engine
+                    .notification_worker_is_current(recipient, &worker)
+        },
     )
     .await;
 }
@@ -9490,6 +9538,7 @@ mod tests {
                     true
                 }
             },
+            || false,
         ));
 
         tokio::time::timeout(Duration::from_secs(1), restarted.notified())
@@ -9528,6 +9577,7 @@ mod tests {
                 })
             },
             || false,
+            || false,
         ));
 
         tokio::time::timeout(Duration::from_secs(1), started.notified())
@@ -9539,6 +9589,257 @@ mod tests {
             .await
             .expect("shutdown drain observes the child cancellation");
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unexpected_clean_worker_exit_recovers_without_another_enqueue() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let recoveries = Arc::new(AtomicUsize::new(0));
+        let restarted = Arc::new(Notify::new());
+        let task = tokio::spawn(supervise_worker_task(
+            {
+                let starts = Arc::clone(&starts);
+                let restarted = Arc::clone(&restarted);
+                move || {
+                    let run = starts.fetch_add(1, Ordering::SeqCst);
+                    let restarted = Arc::clone(&restarted);
+                    tokio::spawn(async move {
+                        if run == 0 {
+                            return;
+                        }
+                        restarted.notify_one();
+                        std::future::pending::<()>().await;
+                    })
+                }
+            },
+            {
+                let recoveries = Arc::clone(&recoveries);
+                move || {
+                    recoveries.fetch_add(1, Ordering::SeqCst);
+                    true
+                }
+            },
+            || false,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), restarted.notified())
+            .await
+            .expect("a clean return with a published worker starts its replacement");
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        assert_eq!(recoveries.load(Ordering::SeqCst), 1);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unexpected_worker_task_cancellation_recovers_without_new_traffic() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let recoveries = Arc::new(AtomicUsize::new(0));
+        let restarted = Arc::new(Notify::new());
+        let task = tokio::spawn(supervise_worker_task(
+            {
+                let starts = Arc::clone(&starts);
+                let restarted = Arc::clone(&restarted);
+                move || {
+                    let run = starts.fetch_add(1, Ordering::SeqCst);
+                    if run == 0 {
+                        let child = tokio::spawn(std::future::pending::<()>());
+                        child.abort();
+                        return child;
+                    }
+                    let restarted = Arc::clone(&restarted);
+                    tokio::spawn(async move {
+                        restarted.notify_one();
+                        std::future::pending::<()>().await;
+                    })
+                }
+            },
+            {
+                let recoveries = Arc::clone(&recoveries);
+                move || {
+                    recoveries.fetch_add(1, Ordering::SeqCst);
+                    true
+                }
+            },
+            || false,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), restarted.notified())
+            .await
+            .expect("an unexpected child cancellation starts its replacement");
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        assert_eq!(recoveries.load(Ordering::SeqCst), 1);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_shutdown_is_not_misclassified_as_a_worker_failure() {
+        let engine = Arc::new(Engine::new());
+        let started = Arc::new(Notify::new());
+        let recoveries = Arc::new(AtomicUsize::new(0));
+        let supervisor = tokio::spawn(supervise_worker_task(
+            {
+                let engine = Arc::clone(&engine);
+                let started = Arc::clone(&started);
+                move || {
+                    let started = Arc::clone(&started);
+                    engine.spawn_descendant_task(async move {
+                        started.notify_one();
+                        std::future::pending::<()>().await;
+                    })
+                }
+            },
+            {
+                let recoveries = Arc::clone(&recoveries);
+                move || {
+                    recoveries.fetch_add(1, Ordering::SeqCst);
+                    true
+                }
+            },
+            {
+                let engine = Arc::clone(&engine);
+                move || engine.is_stopping()
+            },
+        ));
+
+        started.notified().await;
+        engine.begin_stopping();
+        tokio::time::timeout(Duration::from_secs(1), supervisor)
+            .await
+            .expect("shutdown releases the supervisor")
+            .expect("supervisor exits cleanly");
+        assert_eq!(recoveries.load(Ordering::SeqCst), 0);
+        engine.wait_for_descendant_tasks().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn notification_supervisor_wiring_distinguishes_retirement_from_child_loss() {
+        // Normal retirement removes the exact registry entry before the child
+        // returns. Drive the production supervisor and predicate together: a
+        // wrong key or inverted current-worker check would recover this empty
+        // worker instead of accepting its retirement.
+        let retirement_root = NotificationScratch(cyclops_proto::scratch::scratch_dir(
+            "notification-supervisor-retirement",
+        ));
+        std::fs::create_dir_all(&retirement_root.0).unwrap();
+        let retirement_inner = unwritten_test_inner(&retirement_root.0);
+        let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+        let retired_recipient = churn_recipient(workspace, 910);
+        let retired_worker = Arc::new(Worker::new());
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let supervisor_inner = Arc::clone(&retirement_inner);
+        let supervisor_worker = Arc::clone(&retired_worker);
+        let task = tokio::spawn(async move {
+            let _ = start_rx.await;
+            notification_worker_supervisor(supervisor_inner, retired_recipient, supervisor_worker)
+                .await;
+            let _ = done_tx.send(());
+        });
+        retirement_inner
+            .engine
+            .notification_workers
+            .lock()
+            .expect("notification workers lock")
+            .insert(
+                retired_recipient,
+                NotificationWorker {
+                    worker: Arc::clone(&retired_worker),
+                    task,
+                },
+            );
+        start_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), done_rx)
+            .await
+            .expect("normal registry retirement releases the supervisor")
+            .expect("supervisor completion sender stayed open");
+        assert!(retirement_inner
+            .engine
+            .notification_workers
+            .lock()
+            .expect("notification workers lock")
+            .is_empty());
+        assert_eq!(
+            retired_worker
+                .state
+                .lock()
+                .expect("worker state lock")
+                .empty_restarts,
+            0,
+            "normal retirement must not be recovered as worker loss"
+        );
+
+        // Cancellation of a descendant while the exact registry entry is
+        // still published is unexpected. Keep a real queued notification
+        // parked behind quiesce, cancel only its child, and require the
+        // production supervisor to reconstruct that same durable attempt.
+        let (message_scratch, _store, context, _handle, recipient) =
+            notification_fixture("notification-supervisor-child-loss");
+        let inner_root = NotificationScratch(cyclops_proto::scratch::scratch_dir(
+            "notification-supervisor-child-loss-inner",
+        ));
+        std::fs::create_dir_all(&inner_root.0).unwrap();
+        let inner = unwritten_test_inner(&inner_root.0);
+        inner.engine.paused.store(true, Ordering::SeqCst);
+        let attempt = context.attempt_id();
+        let handle =
+            enqueue_notification_attempt(&inner, 0, "%1", "reviewer", context.clone(), false)
+                .expect("production enqueue publishes the worker and supervisor");
+        let worker = inner
+            .engine
+            .notification_workers
+            .lock()
+            .expect("notification workers lock")
+            .get(&recipient)
+            .map(|entry| Arc::clone(&entry.worker))
+            .expect("recipient worker is registered");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while inner.engine.descendant_tasks.active.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the production supervisor spawned its child");
+        inner.engine.descendant_stop.send_replace(true);
+        inner.engine.descendant_stop.send_replace(false);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.worker_recoveries.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unexpected child loss was classified without another enqueue");
+        assert_eq!(handle.worker_recoveries.load(Ordering::SeqCst), 1);
+        assert!(inner
+            .engine
+            .notification_worker_is_current(recipient, &worker));
+        assert!(!worker.is_faulted());
+        assert_eq!(context.current_record().unwrap().attempt_id, attempt);
+        assert_eq!(
+            context.current_record().unwrap().state,
+            NotificationState::Queued
+        );
+        assert_eq!(
+            inner
+                .engine
+                .notification_handle(attempt)
+                .and_then(|current| current.notification.as_ref().map(|n| n.attempt_id())),
+            Some(attempt),
+            "recovery must keep the same durable attempt identity"
+        );
+
+        inner.engine.begin_stopping();
+        for task in inner.engine.take_notification_worker_tasks() {
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("shutdown releases the production supervisor")
+                .expect("production supervisor exits cleanly");
+        }
+        inner.engine.wait_for_descendant_tasks().await;
+        drop(message_scratch);
     }
 
     #[tokio::test]
@@ -9636,10 +9937,12 @@ mod tests {
             let worker = engine
                 .enqueue_notification_worker(recipient, Arc::clone(&handle), |_| test_worker_task())
                 .expect("engine is running");
+            assert!(engine.notification_worker_is_current(recipient, &worker));
             let queued = worker.drain_pending();
             assert_eq!(queued.len(), 1);
             assert!(Arc::ptr_eq(&queued[0], &handle));
             assert!(engine.retire_notification_worker(recipient, &worker));
+            assert!(!engine.notification_worker_is_current(recipient, &worker));
             assert!(
                 engine
                     .notification_workers
