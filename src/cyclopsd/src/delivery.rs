@@ -3215,11 +3215,8 @@ fn recover_failed_job(
                         worker.set_fault(format!("direct settlement recovery failed: {error}"));
                         return false;
                     }
-                    let inner_clone = Arc::clone(inner);
                     let recipient = notification.recipient();
-                    tokio::spawn(async move {
-                        crate::sync_recipient_unread(&inner_clone, recipient).await;
-                    });
+                    crate::schedule_recipient_unread(inner, recipient);
                     if let Some(service) = &inner.mailbox {
                         if let Err(error) = crate::messaging::schedule_recipient(
                             inner,
@@ -6669,11 +6666,8 @@ fn record_notification_notified(
         Ok(_) => {
             if handle.notification_transport() == Some(NotificationTransport::DirectPayload) {
                 notification.record_delivered_direct()?;
-                let inner_clone = Arc::clone(inner);
                 let recipient = notification.recipient();
-                tokio::spawn(async move {
-                    crate::sync_recipient_unread(&inner_clone, recipient).await;
-                });
+                crate::schedule_recipient_unread(inner, recipient);
                 if let Some(service) = &inner.mailbox {
                     if let Err(error) = crate::messaging::schedule_recipient(
                         inner,
@@ -11707,6 +11701,10 @@ composer_trailer_required_prefix = 1
             ),
             mailbox_publication: StdMutex::new(()),
             unread_projection_gate: tokio::sync::Mutex::new(()),
+            unread_projection_pending: StdMutex::new(HashSet::new()),
+            unread_projection_wake: tokio::sync::Notify::new(),
+            unread_projection_stopping: std::sync::atomic::AtomicBool::new(false),
+            unread_projection_pause: StdMutex::new(None),
             mailbox_publish_pause: StdMutex::new(None),
             boot_id: "b-unwritten-test".into(),
             started: std::time::Instant::now(),
