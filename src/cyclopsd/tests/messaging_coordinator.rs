@@ -2453,7 +2453,7 @@ async fn typed_composer_hold_is_a_durable_prewrite_block_until_a_real_turn() {
     let row = snapshot["result"]["rows"]
         .as_array()
         .and_then(|rows| rows.iter().find(|row| row["message_id"] == message_id))
-        .expect("blocked mailbox row");
+        .unwrap_or_else(|| panic!("blocked mailbox row: {snapshot:#}"));
     assert_eq!(row["needs_action"], true, "{row}");
     assert_eq!(row["recipients"][0]["fifo_position"], 1, "{row}");
     assert_eq!(
