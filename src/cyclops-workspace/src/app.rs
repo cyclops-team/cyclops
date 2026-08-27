@@ -531,9 +531,9 @@ struct App {
     /// until the first visible cursor is drawn.
     cursor_style: Option<(crate::runtime::CursorShape, bool)>,
     term_size: (u16, u16),
-    /// Last canvas pushed to the windows this workspace owns. Avoids a
-    /// resize notification loop when expanded pane gutters are already at
-    /// their target geometry.
+    /// Last shared Messages-independent target pushed to the windows this
+    /// workspace owns. Avoids a resize notification loop when expanded pane
+    /// gutters are already at their target geometry.
     declared_client_size: Option<(u16, u16)>,
     /// Which sessions this workspace sizes, and which of their windows it
     /// has pinned. See [`WindowSizing`].
@@ -1224,11 +1224,9 @@ pub async fn run_async() -> i32 {
     // fight the declaration. `chrome_for` is the one geometry both read.
     model.sidebar_visible = prefs.sidebar_visible;
     model.messages_visible = prefs.messages_visible;
-    let boot_size = desired_tmux_size(Rect::new(0, 0, term_size.0, term_size.1), &model, &prefs);
-    let mut declared_client_size = None;
-    if declarable(boot_size) {
-        size_owned_windows(&sizing, &client, boot_size, &home).await;
-        declared_client_size = Some(boot_size);
+    let declared_client_size =
+        declare_initial_client_size(term_size, &model, &prefs, &sizing, &client, &home).await;
+    if declared_client_size.is_some() {
         // The resize can rebalance leaf dimensions. Re-list before
         // hydration rather than replaying captures into stale slots.
         if let Ok(resized) = fetch_workspace_model(&client, &session).await {
@@ -2473,6 +2471,27 @@ fn desired_tmux_size(area: Rect, model: &WorkspaceModel, prefs: &WorkspacePrefs)
     )
 }
 
+/// Perform the first shared tmux size declaration from persisted chrome.
+///
+/// Boot and its nested-tmux regression both enter through this seam, so the
+/// initial write cannot silently drift from the Messages-independent target
+/// used by every later [`resize_client`] call.
+async fn declare_initial_client_size(
+    term_size: (u16, u16),
+    model: &WorkspaceModel,
+    prefs: &WorkspacePrefs,
+    sizing: &WindowSizing,
+    client: &ControlClient,
+    home: &std::path::Path,
+) -> Option<(u16, u16)> {
+    let size = desired_tmux_size(Rect::new(0, 0, term_size.0, term_size.1), model, prefs);
+    if !declarable(size) {
+        return None;
+    }
+    size_owned_windows(sizing, client, size, home).await;
+    Some(size)
+}
+
 /// Whether the workspace may animate (`crate::animate`). Capability first,
 /// then intent: the first two are not preferences, they are "there is
 /// nothing to fade".
@@ -2634,8 +2653,9 @@ impl App {
     /// layout believes changed, so a collapsed sidebar or Messages pane can
     /// leave its own contents behind. Named rather than folded into
     /// `resize_client` because telling tmux a new size and repainting a
-    /// surface are different jobs, and one of the four topology mutations
-    /// does not resize at all.
+    /// surface are different jobs. Messages visibility and width mutations
+    /// change only local geometry, while shared-sizing mutations may also
+    /// call `resize_client`.
     pub(crate) fn layout_changed(&mut self) {
         self.repaint_requested = true;
     }
@@ -8928,10 +8948,12 @@ mod tests {
             model.active_tab(),
         );
         model.messages_visible = messages_visible;
-        // These are the production cold-boot calculation and write, after
-        // persisted visibility has been installed on the model.
-        let declared = desired_tmux_size(Rect::new(0, 0, 100, 30), &model, &prefs);
-        size_owned_windows(&sizing, &client, declared, &home).await;
+        // Enter through the exact production cold-boot calculation and
+        // write, after persisted visibility has been installed on the model.
+        let declared =
+            declare_initial_client_size((100, 30), &model, &prefs, &sizing, &client, &home)
+                .await
+                .expect("fixture has a declarable cold-boot target");
         let layout = nested_tmux_layout(&server, &window_id);
         client.shutdown().await;
         let _ = std::fs::remove_dir_all(home);
