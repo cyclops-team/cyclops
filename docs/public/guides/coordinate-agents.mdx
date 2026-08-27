@@ -28,6 +28,20 @@ cyclops inbox claim <message-id>
 cyclops reply <message-id> --body "Reviewed. One issue."
 ```
 
+The terminal wake stays deliberately short so Cyclops can prove its exact
+bytes across supported composers. The authenticated claim returns the rich
+envelope instead:
+
+```text
+[cyclops m-…] TO: reviewer  FROM: implementer  SUBJECT: Review the last commit
+<full durable body>
+Reply: cyclops reply m-… --body "..."
+[cyclops:end m-…]
+```
+
+The labels are the immutable presentation captured at acceptance time. A later
+pane rename changes neither the record nor this envelope.
+
 If claim-skill proof is absent, outdated, edited, unreadable, or changes before
 the write, Cyclops uses the visible full-payload compatibility path instead. It
 records that outcome as `delivered_direct`; the recipient does not claim that

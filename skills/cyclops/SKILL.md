@@ -179,14 +179,18 @@ and returns the immutable payload:
 
 ```
 $ cyclops inbox claim m-d7e4ba
-[cyclops m-d7e4ba] FROM: admin  SUBJECT: Review the rate limiter
+[cyclops m-d7e4ba] TO: reviewer  FROM: admin  SUBJECT: Review the rate limiter
 Please look at retry.rs before the next run.
 Reply: cyclops reply m-d7e4ba --body "..."
+[cyclops:end m-d7e4ba]
 ```
 
 A repeat claim returns the same payload and creates no second task. A claim
-proves retrieval, not completion. Reply using the id so the daemon derives the
-recipient, thread, and subject from the parent:
+proves retrieval, not completion. Treat `TO`, `FROM`, `SUBJECT`, and the final
+matching `[cyclops:end <id>]` as one framed envelope. Current daemons source the
+labels from the immutable acceptance record; do not reinterpret a later alias
+rename. Reply using the id so the daemon derives the recipient, thread, and
+subject from the parent:
 
 ```
 $ cyclops reply m-d7e4ba --body "Looked at retry.rs. Tests pass."

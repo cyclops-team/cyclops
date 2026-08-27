@@ -63,6 +63,11 @@ not completed live validation. It fails closed when exact evidence is missing;
 use `cyclops inbox next` or `cyclops inbox claim` over the socket. See
 [Recover a notification](/guides/recovery).
 
+An authenticated claim prints one framed message with immutable `TO`, `FROM`,
+and `SUBJECT` labels, the full durable body, an exact reply command, and a
+matching `[cyclops:end <message-id>]` marker. The short terminal wake remains
+body-free.
+
 ## 4. Check the roster
 
 From another terminal:

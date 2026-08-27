@@ -4319,11 +4319,18 @@ fn extract_message_metadata(line: &LedgerLine) -> Result<MessageMetadata, Mailbo
         .ok_or_else(|| MailboxError::MissingMetadata(line.id.clone()))
 }
 
-fn inbox_message(line: &LedgerLine) -> Result<InboxMessage, MailboxError> {
+fn inbox_message(line: &LedgerLine, claimant: RecipientKey) -> Result<InboxMessage, MailboxError> {
     let metadata = extract_message_metadata(line)?;
+    let recipient_label = metadata
+        .presentation
+        .recipient_labels
+        .iter()
+        .find(|presentation| presentation.recipient == claimant)
+        .map(|presentation| presentation.label.clone());
     Ok(InboxMessage {
         message_id: MessageId::new(&line.id)?,
         kind: line.kind,
+        recipient_label,
         sender: Some(metadata.sender),
         sender_label: metadata.presentation.sender_label,
         subject: line.subject.clone(),
@@ -6523,7 +6530,7 @@ impl MessageStore {
         let message = self
             .projection
             .get_message(&message_id)
-            .map(inbox_message)
+            .map(|line| inbox_message(line, claimant))
             .transpose()?
             .ok_or_else(|| MailboxError::MessageNotFound(message_id.clone()))?;
         let prior_claim_seq = self
@@ -11784,6 +11791,7 @@ mod tests {
                 panic!("first claim must append a claim fact");
             };
             assert_eq!(entry.message_id, original);
+            assert_eq!(message.recipient_label.as_deref(), Some("recipient-0"));
             assert_eq!(message.sender_label, "sender-label");
             assert_eq!(message.subject.as_deref(), Some("Task"));
             assert_eq!(message.body.as_deref(), Some("Review code"));
@@ -11795,6 +11803,7 @@ mod tests {
                 panic!("re-claim must return the existing claim");
             };
             assert_eq!(entry.message_id, original);
+            assert_eq!(message.recipient_label.as_deref(), Some("recipient-0"));
             assert_eq!(message.subject.as_deref(), Some("Task"));
             assert_eq!(message.body.as_deref(), Some("Review code"));
             assert_eq!(store.projection().last_sequence(), Some(2));
@@ -11810,8 +11819,33 @@ mod tests {
         else {
             panic!("claim state must survive restart");
         };
+        assert_eq!(message.recipient_label.as_deref(), Some("recipient-0"));
         assert_eq!(message.body.as_deref(), Some("Review code"));
         assert_eq!(reopened.projection().last_sequence(), Some(2));
+    }
+
+    #[test]
+    fn broadcast_claim_names_only_the_authenticated_recipient() {
+        let scratch = StoreScratch::new("broadcast-claim-recipient-label");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, admin, bob, carol) = test_context();
+        let message_id = MessageId::new("m-broadcast-claim").unwrap();
+        let mut store = MessageStore::open(&root, journal, workspace, "boot").unwrap();
+        store
+            .accept_at(
+                message_id.clone(),
+                draft(admin, vec![bob, carol], "Review together", None),
+                1,
+            )
+            .unwrap();
+
+        let ClaimOutcome::Claimed { message, .. } = store.claim_at(carol, message_id, 2).unwrap()
+        else {
+            panic!("the authenticated broadcast recipient must claim its own entry");
+        };
+        assert_eq!(message.recipient_label.as_deref(), Some("recipient-1"));
+        assert_eq!(message.sender_label, "sender-label");
     }
 
     #[test]

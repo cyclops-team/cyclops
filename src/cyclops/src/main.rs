@@ -2572,16 +2572,25 @@ fn print_skipped_oldest(skipped: Option<&cyclops_proto::MessageId>) {
 
 fn print_claim_payload(message: &cyclops_proto::InboxMessage) {
     let subject = message.subject.as_deref().unwrap_or("(no subject)");
-    println!(
-        "[cyclops {}] FROM: {}  SUBJECT: {}",
-        message.message_id, message.sender_label, subject
-    );
+    if let Some(recipient_label) = &message.recipient_label {
+        println!(
+            "[cyclops {}] TO: {}  FROM: {}  SUBJECT: {}",
+            message.message_id, recipient_label, message.sender_label, subject
+        );
+    } else {
+        // Older daemons do not carry the immutable recipient presentation.
+        println!(
+            "[cyclops {}] FROM: {}  SUBJECT: {}",
+            message.message_id, message.sender_label, subject
+        );
+    }
     if let Some(body) = &message.body {
         println!("{body}");
     }
     if message.kind != cyclops_proto::Kind::Fyi {
         println!("Reply: cyclops reply {} --body \"...\"", message.message_id);
     }
+    println!("[cyclops:end {}]", message.message_id);
 }
 
 fn cmd_reply(cli: &Cli, style: &Style, args: &ReplyArgs) -> i32 {

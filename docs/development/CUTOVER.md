@@ -30,9 +30,10 @@ refused. A one-line deprecation note prints to stderr once per day per user
 - Receipts: v1's `{"status":"SUBMITTED",...}` becomes the cyclops receipt
   (`msg_id`, `deliveries[].state`). Exit 0 still means delivered or
   queued; 1 means parked or needs attention; 2 means usage error.
-- The recipient sees one `[cyclops m-...] FROM: x  SUBJECT: y` header line
-  instead of v1's `SUBJECT:` and `FROM:` lines. Both fields are still
-  there; replying to the FROM label works unchanged.
+- The recipient claim prints one `[cyclops m-...] TO: z  FROM: x  SUBJECT: y`
+  header line and closes with `[cyclops:end m-...]`, instead of v1's separate
+  `SUBJECT:` and `FROM:` lines. All fields are still there; replying to the
+  FROM label works unchanged.
 - v1 stripped leading `SUBJECT:`/`FROM:`/`PANE:` lines from bodies;
   cyclops does not (the envelope cannot be forged; see
   [DELIVERY.md](DELIVERY.md)).
@@ -76,7 +77,8 @@ so the whole window is auditable afterward.
 - [ ] Routine message, the exact protocol line:
       `printf 'Body text only' | ~/.commPact/bin/commPact send claude --json --subject 'Review request' --body-file -`
       returns a delivered receipt and the claude pane shows the
-      `[cyclops m-...]` header with FROM and SUBJECT.
+      `[cyclops m-...]` claimed envelope with TO, FROM, SUBJECT, and its
+      matching `[cyclops:end m-...]` footer.
 - [ ] Reply flow: the recipient replies to the FROM label and the reply
       arrives as a structured message, no polling.
 - [ ] Assignment format (REQUEST/CONTEXT/DONE WHEN/STOP IF) and completion

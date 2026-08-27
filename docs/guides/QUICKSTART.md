@@ -218,17 +218,20 @@ $ cyclops inbox list
 m-be0129 implementer · Burst path fix, ready for review
 
 $ cyclops inbox claim m-be0129
-[cyclops m-be0129] FROM: implementer  SUBJECT: Burst path fix, ready for review
+[cyclops m-be0129] TO: reviewer  FROM: implementer  SUBJECT: Burst path fix, ready for review
 gateway.rs:120. Tests pass.
 Reply: cyclops reply m-be0129 --body "..."
+[cyclops:end m-be0129]
 
 $ cyclops reply m-be0129 --body "Approved. One nit in the retry path."
 accepted m-a94c10
 ```
 
 A claim is atomic and recipient-authenticated. Repeating it returns the same
-payload without creating a second task. A reply is the durable review verdict;
-pane state is not.
+payload without creating a second task. The frame uses the immutable labels
+recorded when the message was accepted, so a later alias rename cannot rewrite
+who the message addressed. A reply is the durable review verdict; pane state is
+not.
 
 From the reviewer pane, the thread reads back whole, oldest first. That caller
 may see the request body because it claimed the message and the reply body
