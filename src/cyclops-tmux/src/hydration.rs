@@ -178,14 +178,31 @@ impl ControlClient {
     }
 
     /// Declare this control client's size to tmux (`refresh-client -C`).
+    ///
+    /// This is a vote, not a command: tmux resolves it against every other
+    /// size-declared client under the window's `window-size` policy, and a
+    /// tty client cannot abstain from voting. The workspace does NOT size
+    /// windows this way, because whichever policy is in force some other
+    /// client can outvote it and reshape every pane in the session (F76).
+    /// Window sizing lives in [`crate::sizing`]; this stays because
+    /// declaring a size is a real tmux capability and fixtures need it.
     pub async fn set_client_size(&self, cols: u16, rows: u16) -> Result<(), TmuxError> {
         self.command(&format!("refresh-client -C {cols}x{rows}"))
             .await?;
         Ok(())
     }
 
-    /// Size `window_id` by the smallest size-declared client showing it
-    /// (`set-option -w window-size smallest`).
+    /// Put `window_id` on the `smallest` sizing policy.
+    ///
+    /// The workspace no longer does this: a policy is a rule for resolving
+    /// client votes, and `smallest` resolves them by letting the smallest
+    /// viewer win, so one 62x21 terminal collapsed a 176x47 session and
+    /// every agent pane in it (F76). Windows a workspace owns go on
+    /// `manual` through [`crate::sizing`] instead. This stays as a tmux
+    /// capability for fixtures that want a window to track its clients.
+    ///
+    /// The reasoning that led here, kept because it is still true about
+    /// `latest` and explains why the policy was changed twice:
     ///
     /// This replaces the earlier `latest` policy (R5), which held only while
     /// the declaring control client was the lone size authority. A control

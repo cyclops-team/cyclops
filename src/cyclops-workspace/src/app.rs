@@ -22,7 +22,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -30,6 +30,7 @@ use std::pin::Pin;
 use crossterm::event::{
     self, Event, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use cyclops_tmux::sizing::ClientIdentity;
 use cyclops_tmux::{
     ControlClient, ControlConfig, InputCapacity, Notification, NotificationReceiver, TmuxError,
 };
@@ -530,15 +531,13 @@ struct App {
     /// until the first visible cursor is drawn.
     cursor_style: Option<(crate::runtime::CursorShape, bool)>,
     term_size: (u16, u16),
-    /// Last size successfully declared by this control client. Avoids a
+    /// Last canvas pushed to the windows this workspace owns. Avoids a
     /// resize notification loop when expanded pane gutters are already at
     /// their target geometry.
     declared_client_size: Option<(u16, u16)>,
-    /// Window ids already pinned to `window-size smallest`
-    /// ([`pin_window_sizes`]), so reconciliation asks tmux once per window
-    /// rather than once per snapshot. Cleared on reconnect: a restarted
-    /// server can reuse ids for windows that were never pinned.
-    pinned_windows: HashSet<String>,
+    /// Which sessions this workspace sizes, and which of their windows it
+    /// has pinned. See [`WindowSizing`].
+    sizing: WindowSizing,
     needs_reconcile: bool,
     /// A structural notification changed visible pane dimensions. Hydration
     /// waits for the render deadline so resize bursts collapse to one set of
@@ -1201,10 +1200,19 @@ pub async fn run_async() -> i32 {
         }
     }
 
-    // Pin the sizing policy before declaring the canvas, so the declaration
-    // below is already the binding vote (see `set_window_size_smallest`).
-    let mut pinned_windows = HashSet::new();
-    pin_window_sizes(&client, &model.session.tabs, &mut pinned_windows, &home).await;
+    // Take ownership and record every window's original policy before any
+    // size is written, so the first thing this process does to a session is
+    // reversible.
+    let mut sizing = WindowSizing::default();
+    let following_at_boot = adopt_windows(
+        &mut sizing,
+        &client,
+        &model.session.session,
+        &model.session.tabs,
+        &home,
+    )
+    .await
+    .newly_following;
 
     // Declare terminal cells only after the split topology is known. tmux
     // gets pane content cells; two-cell separator bands remain UI chrome.
@@ -1220,25 +1228,21 @@ pub async fn run_async() -> i32 {
     let boot_size = crate::render::tmux_client_size(chrome_canvas, model.active_tab());
     let mut declared_client_size = None;
     if declarable(boot_size) {
-        match client.set_client_size(boot_size.0, boot_size.1).await {
-            Ok(()) => {
-                declared_client_size = Some(boot_size);
-                // The resize can rebalance leaf dimensions. Re-list before
-                // hydration rather than replaying captures into stale slots.
-                if let Ok(resized) = fetch_workspace_model(&client, &session).await {
-                    // A fresh snapshot knows nothing about UI-owned
-                    // preferences; re-carry visibility the same way
-                    // `install_reconciled_model` does for every later one.
-                    install_reconciled_model(
-                        &mut model,
-                        resized,
-                        prefs.sidebar_visible,
-                        prefs.messages_visible,
-                    );
-                    apply_workspace_order(&mut model, &prefs.workspace_order);
-                }
-            }
-            Err(error) => log_err(&home, &error),
+        size_owned_windows(&sizing, &client, boot_size, &home).await;
+        declared_client_size = Some(boot_size);
+        // The resize can rebalance leaf dimensions. Re-list before
+        // hydration rather than replaying captures into stale slots.
+        if let Ok(resized) = fetch_workspace_model(&client, &session).await {
+            // A fresh snapshot knows nothing about UI-owned preferences;
+            // re-carry visibility the same way `install_reconciled_model`
+            // does for every later one.
+            install_reconciled_model(
+                &mut model,
+                resized,
+                prefs.sidebar_visible,
+                prefs.messages_visible,
+            );
+            apply_workspace_order(&mut model, &prefs.workspace_order);
         }
     }
     let mut runtimes = RuntimeRegistry::default();
@@ -1315,7 +1319,7 @@ pub async fn run_async() -> i32 {
         cursor_style: None,
         term_size,
         declared_client_size,
-        pinned_windows,
+        sizing,
         needs_reconcile: false,
         needs_hydrate: false,
         paste_seq: 0,
@@ -1356,6 +1360,10 @@ pub async fn run_async() -> i32 {
     // contract wants (crate::event_record's doc).
     if let Some(warning) = crate::event_record::boot(&mut app.record, &mut app.intake, &app.home) {
         app.notice.show(warning, Instant::now());
+    }
+    if following_at_boot {
+        app.notice
+            .show(copy::SIZING_FOLLOWER.to_string(), Instant::now());
     }
 
     let mut debounce: Option<Instant> = None;
@@ -1670,6 +1678,11 @@ pub async fn run_async() -> i32 {
 
     drop(renderer);
     drop(guard);
+    // Before the link goes, hand back every window this workspace pinned.
+    // A manual size is window state and outlives the process that set it,
+    // so this is the difference between quitting and leaving the operator's
+    // sessions frozen at whatever size this workspace happened to be.
+    restore_owned_sizing(&mut app.sizing, &client, &app.home).await;
     client.shutdown().await;
     if detached {
         eprintln!("{}", copy::DETACHED);
@@ -1808,44 +1821,17 @@ fn spawn_notif_forwarder(
                 other => other,
             };
             let message = match notification {
-                Notification::LayoutChange { window, rest } => {
-                    let mut fields = rest.split_whitespace();
-                    let layout = fields.next().unwrap_or("").to_string();
-                    // rest is "layout visible-layout flags"; the flags field
-                    // carries the zoom marker.
-                    let flags = fields.nth(1).map(str::to_string);
-                    Some(AppMsg::LayoutChanged {
-                        window,
-                        layout,
-                        flags,
-                    })
-                }
-                Notification::WindowPaneChanged { window, pane } => {
-                    Some(AppMsg::ActivePaneChanged { window, pane })
-                }
-                Notification::SessionChanged { session, name } => {
-                    Some(AppMsg::SessionSwitched { session, name })
-                }
-                Notification::SessionRenamed { session, name } => {
-                    Some(AppMsg::SessionRenamed { session, name })
-                }
-                Notification::WindowAdd { .. }
-                | Notification::WindowClose { .. }
-                | Notification::WindowRenamed { .. }
-                | Notification::SessionsChanged => Some(AppMsg::Reconcile),
                 Notification::ContinuityLost => {
                     if !reconcile_control_ingress(&mut rx, &continuity_tx).await {
                         return;
                     }
                     None
                 }
-                Notification::Pause { pane } => Some(AppMsg::PanePaused { pane }),
-                Notification::Continue { pane } => Some(AppMsg::PaneContinued { pane }),
                 Notification::Exit { .. } => {
                     let _ = tmux_tx.send(AppMsg::LinkLost).await;
                     break;
                 }
-                _ => None,
+                other => structural_message(other),
             };
             if let Some(message) = message {
                 if !forward_notification_message(&tmux_tx, message).await {
@@ -1854,6 +1840,53 @@ fn spawn_notif_forwarder(
             }
         }
     });
+}
+
+/// The app message a structural notification becomes, or `None` when it
+/// carries nothing this loop acts on.
+///
+/// Free standing so the routing can be exercised directly. A notification
+/// that silently stops reaching the loop is invisible until a user notices
+/// the workspace ignoring something, and one of these arms is load bearing
+/// for a correctness property rather than for a redraw.
+fn structural_message(notification: Notification) -> Option<AppMsg> {
+    match notification {
+        Notification::LayoutChange { window, rest } => {
+            let mut fields = rest.split_whitespace();
+            let layout = fields.next().unwrap_or("").to_string();
+            // rest is "layout visible-layout flags"; the flags field
+            // carries the zoom marker.
+            let flags = fields.nth(1).map(str::to_string);
+            Some(AppMsg::LayoutChanged {
+                window,
+                layout,
+                flags,
+            })
+        }
+        Notification::WindowPaneChanged { window, pane } => {
+            Some(AppMsg::ActivePaneChanged { window, pane })
+        }
+        Notification::SessionChanged { session, name } => {
+            Some(AppMsg::SessionSwitched { session, name })
+        }
+        Notification::SessionRenamed { session, name } => {
+            Some(AppMsg::SessionRenamed { session, name })
+        }
+        Notification::WindowAdd { .. }
+        | Notification::WindowClose { .. }
+        | Notification::WindowRenamed { .. }
+        | Notification::SessionsChanged => Some(AppMsg::Reconcile),
+        // A client leaving is the edge that can make a sizing owner dead.
+        // Without this, a workspace following a session whose owner just
+        // quit would keep rendering inside a dead workspace's geometry
+        // until something unrelated happened to reconcile. The reconcile
+        // path is what re-reads the mark, finds it names a client the
+        // server no longer has, and takes the session over.
+        Notification::ClientDetached { .. } => Some(AppMsg::Reconcile),
+        Notification::Pause { pane } => Some(AppMsg::PanePaused { pane }),
+        Notification::Continue { pane } => Some(AppMsg::PaneContinued { pane }),
+        _ => None,
+    }
 }
 
 fn now_ms() -> u64 {
@@ -2378,7 +2411,12 @@ async fn handle_reconnect(
             *client = new_client;
             spawn_notif_forwarder(rx, sinks.tmux.clone(), sinks.continuity.clone());
             app.declared_client_size = None;
-            app.pinned_windows.clear();
+            // A reconnect is a different tmux client with a different
+            // identity, so every mark this workspace left names a client
+            // that no longer exists. Move them onto the new identity here,
+            // at the seam, rather than letting the sessions this process is
+            // not currently displaying sit pinned with nobody owning them.
+            rekey_ownership(&mut app.sizing, client, &app.home).await;
             resize_client(app, client).await;
             // The gap this flag exists for: %output missed while the link
             // was down, with no size change to mark any pane stale.
@@ -2716,6 +2754,422 @@ fn declarable(size: (u16, u16)) -> bool {
     size.0 >= MIN_DECLARABLE_SIZE.0 && size.1 >= MIN_DECLARABLE_SIZE.1
 }
 
+/// Which sessions this workspace sizes, and what it owes them back.
+///
+/// A window's size is its panes' size, so sizing is not a viewer's private
+/// business: it reshapes every agent running in that session. Exactly one
+/// workspace per session therefore writes sizes, and the rest render inside
+/// whatever it chose. `sizing.rs` holds the tmux side and the measurements
+/// behind it; this holds what one process remembers.
+///
+/// Ownership is per session and lasts for the life of the process, not for
+/// the life of a view. A workspace that navigates from a session keeps one
+/// connection and one identity, so it vanishes from that session's client
+/// list while remaining alive; re-electing on that would hand a session to
+/// whoever glanced at it next and would put its windows back while its
+/// owner was still using them.
+#[derive(Debug, Default)]
+struct WindowSizing {
+    /// This connection's identity, read once. A reconnect is a new client
+    /// and therefore a new identity, so this is dropped with the old link.
+    identity: Option<ClientIdentity>,
+    /// Sessions owned, each with what this workspace holds in it. Ordered
+    /// so a restore visits them the same way twice.
+    owned: BTreeMap<String, OwnedSession>,
+    /// Sessions found already owned by a live workspace. Kept so a follower
+    /// asks tmux once rather than on every reconcile.
+    following: BTreeSet<String>,
+}
+
+/// What this workspace holds in one session it owns.
+#[derive(Debug, Default)]
+struct OwnedSession {
+    /// Windows this workspace pinned, and therefore must put back.
+    pinned: BTreeSet<String>,
+    /// Windows carrying a record this version cannot read.
+    ///
+    /// Never pinned by this workspace and never changed by it, and yet the
+    /// reason the session stays owned. A window already on `manual` with an
+    /// unreadable record is exactly the state that cannot recover on its
+    /// own, and releasing the mark over it is what strands it: no policy
+    /// applies, no owner exists, and no later workspace can tell what it
+    /// was. Holding the mark keeps it visibly somebody's problem.
+    blocked: BTreeSet<String>,
+}
+
+impl OwnedSession {
+    /// Whether this session may be handed back. A window whose original is
+    /// unknowable is not a window that can be put back.
+    fn releasable(&self) -> bool {
+        self.blocked.is_empty()
+    }
+}
+
+impl WindowSizing {
+    fn owns(&self, session: &str) -> bool {
+        self.owned.contains_key(session)
+    }
+}
+
+/// This connection's identity, read once and remembered.
+async fn sizing_identity(
+    sizing: &mut WindowSizing,
+    client: &ControlClient,
+    home: &std::path::Path,
+) -> Option<ClientIdentity> {
+    if let Some(identity) = &sizing.identity {
+        return Some(identity.clone());
+    }
+    match client.client_identity().await {
+        Ok(identity) => {
+            sizing.identity = Some(identity.clone());
+            Some(identity)
+        }
+        Err(error) => {
+            log_err(home, &error);
+            None
+        }
+    }
+}
+
+/// Whether this workspace sizes `session`, claiming it when nobody live
+/// does.
+///
+/// Fails closed everywhere: an unreadable mark, an unreadable client list,
+/// or a lost race all answer false, and a workspace that answers false
+/// writes no sizes at all. The cost of a wrong false is that a session
+/// keeps the size it already had; the cost of a wrong true is two
+/// workspaces fighting over every pane in it.
+async fn owns_session(
+    sizing: &mut WindowSizing,
+    client: &ControlClient,
+    session: &str,
+    home: &std::path::Path,
+) -> bool {
+    if sizing.owns(session) {
+        return true;
+    }
+    let Some(identity) = sizing_identity(sizing, client, home).await else {
+        return false;
+    };
+    let marker = identity.marker();
+    let held = match client.window_driver(session).await {
+        Ok(held) => held,
+        Err(error) => {
+            log_err(home, &error);
+            return false;
+        }
+    };
+    let won = match held {
+        // Nobody has it. The claim is create-only, so a race is decided by
+        // tmux rather than by who read first.
+        None => client.claim_window_driver(session, &marker).await,
+        // Already ours: a reconcile after we claimed, not a new election.
+        Some(held) if held == marker => Ok(true),
+        Some(held) => {
+            // Server-wide, never this session's client list. An owner that
+            // navigated to another session is absent from this session's
+            // list while still alive and still sizing these windows
+            // (F76, M12); testing liveness there would steal the session
+            // out from under a live workspace.
+            let live = match client.server_client_markers().await {
+                Ok(live) => live,
+                Err(error) => {
+                    log_err(home, &error);
+                    return false;
+                }
+            };
+            if live.contains(&held) {
+                // A live owner. Follow it, and say so once.
+                sizing.following.insert(session.to_string());
+                return false;
+            }
+            client
+                .take_over_window_driver(session, &held, &marker)
+                .await
+        }
+    };
+    match won {
+        Ok(true) => {
+            sizing.following.remove(session);
+            sizing.owned.entry(session.to_string()).or_default();
+            true
+        }
+        Ok(false) => {
+            sizing.following.insert(session.to_string());
+            false
+        }
+        Err(error) => {
+            log_err(home, &error);
+            false
+        }
+    }
+}
+
+/// Record what each displayed window's sizing policy was, then take it off
+/// every policy so only this workspace moves it.
+///
+/// The order is the whole point and it is not an implementation detail: a
+/// capture without a pin restores to what is already there, while a pin
+/// without a capture loses the window's original policy permanently. A
+/// window that fails stays unowned so the next reconcile retries it.
+/// What one adoption pass changed, for the caller that has to react to it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Adopted {
+    /// This call was the one that found another workspace owns the session,
+    /// so exactly one notice is shown for it.
+    newly_following: bool,
+    /// At least one window was pinned that was not pinned before, so it is
+    /// carrying whatever size it had rather than this workspace's canvas.
+    took_a_window: bool,
+}
+
+/// Take ownership of a session's displayed windows: record what each one's
+/// sizing policy was, then take it off every policy so only this workspace
+/// moves it.
+async fn adopt_windows(
+    sizing: &mut WindowSizing,
+    client: &ControlClient,
+    session: &str,
+    tabs: &[TabModel],
+    home: &std::path::Path,
+) -> Adopted {
+    let followed_before = sizing.following.contains(session);
+    if !owns_session(sizing, client, session, home).await {
+        return Adopted {
+            newly_following: !followed_before && sizing.following.contains(session),
+            took_a_window: false,
+        };
+    }
+    // A window that has been closed is not owned any more, and there is
+    // nothing left to restore on it. Dropping it here keeps the exit path
+    // from asking tmux about windows that no longer exist. Re-adopting one
+    // that only looked absent is safe: the capture is create-only, so its
+    // original survives a second pass.
+    let displayed: BTreeSet<String> = tabs.iter().map(|tab| tab.window_id.clone()).collect();
+    if let Some(owned) = sizing.owned.get_mut(session) {
+        owned
+            .pinned
+            .retain(|window_id| displayed.contains(window_id));
+        owned
+            .blocked
+            .retain(|window_id| displayed.contains(window_id));
+    }
+    let owned = sizing.owned.entry(session.to_string()).or_default();
+    // Blocked windows are deliberately not excluded here. They are cheap to
+    // re-read, this workspace never pinned them, and if the record they
+    // carry is ever repaired the next pass adopts them properly instead of
+    // ignoring them for the life of the process.
+    let fresh: Vec<String> = unpinned_windows(tabs, &owned.pinned)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let mut took_a_window = false;
+    for window_id in fresh {
+        match client.capture_prior_window_size(&window_id).await {
+            Ok(cyclops_tmux::Captured::Record(_)) => {}
+            Ok(cyclops_tmux::Captured::Malformed) => {
+                // Not pinned, not written to, and not forgotten. Forgetting
+                // it is what used to release the session's mark over a
+                // window that was already pinned and unreadable, which is
+                // the one state nothing recovers from.
+                let owned = sizing.owned.entry(session.to_string()).or_default();
+                if owned.blocked.insert(window_id.clone()) {
+                    log_err(
+                        home,
+                        &format!(
+                            "{window_id}: sizing record unreadable, so this workspace will not \
+                             size it and will not release {session}. Inspect it with: tmux \
+                             show-options -w -t {window_id} @cyclops_prior_window_size"
+                        ),
+                    );
+                }
+                continue;
+            }
+            Err(error) => {
+                log_err(home, &error);
+                continue;
+            }
+        }
+        match client.pin_window_size_manual(&window_id).await {
+            Ok(()) => {
+                sizing
+                    .owned
+                    .entry(session.to_string())
+                    .or_default()
+                    .pinned
+                    .insert(window_id);
+                took_a_window = true;
+            }
+            Err(error) => log_err(home, &error),
+        }
+    }
+    Adopted {
+        newly_following: false,
+        took_a_window,
+    }
+}
+
+/// Push `size` to every window this workspace owns, in every session it
+/// owns.
+///
+/// Background sessions included: MEASURED (F76) that `resize-window` needs
+/// no attachment to the session it targets, so a session this workspace
+/// owns but is not currently showing still gets the canvas it will be
+/// displayed at, instead of being reshaped on the way back into view.
+async fn size_owned_windows(
+    sizing: &WindowSizing,
+    client: &ControlClient,
+    size: (u16, u16),
+    home: &std::path::Path,
+) {
+    for owned in sizing.owned.values() {
+        for window_id in &owned.pinned {
+            if let Err(error) = client.resize_window(window_id, size.0, size.1).await {
+                log_err(home, &error);
+            }
+        }
+    }
+}
+
+/// Put every window this workspace pinned back on the policy it was found
+/// with, then stop owning its sessions.
+///
+/// Restores before releasing, in that order: a marker cleared first would
+/// let another workspace claim the session and adopt windows that still
+/// carry this one's pin, which is how a `manual` nobody chose becomes
+/// permanent.
+async fn restore_owned_sizing(
+    sizing: &mut WindowSizing,
+    client: &ControlClient,
+    home: &std::path::Path,
+) {
+    let Some(marker) = sizing.identity.as_ref().map(ClientIdentity::marker) else {
+        // No identity means nothing can be proved to be ours, and putting
+        // windows back on a guess would undo whoever does own them.
+        sizing.owned.clear();
+        return;
+    };
+    for (session, owned) in std::mem::take(&mut sizing.owned) {
+        // Ownership is re-checked here, not assumed from the map. A
+        // workspace can lose a session between claiming it and quitting:
+        // its link dropped, a follower found the mark stale and took over,
+        // and that follower is now the one those windows belong to.
+        // Restoring them here would take a live workspace's session out
+        // from under it, so the exact marker has to still be this one's.
+        match client.window_driver(&session).await {
+            Ok(Some(held)) if held == marker => {}
+            Ok(_) => continue,
+            Err(error) => {
+                log_err(home, &error);
+                continue;
+            }
+        }
+        // Whether this session was fully handed back. It starts false when a
+        // window here carries a record nobody can read, since such a window
+        // was never pinned by this workspace and is exactly why the session
+        // may not be released.
+        let mut handed_back = owned.releasable();
+        for window_id in &owned.pinned {
+            match client.restore_window_size(window_id).await {
+                Ok(cyclops_tmux::Restored::Malformed) => {
+                    // The record of what this window was cannot be read, so
+                    // the original policy is unknowable. Nothing was
+                    // changed, and nothing here will change it: choosing a
+                    // policy would invent state the operator never set, and
+                    // clearing the record would destroy the only evidence
+                    // of what the window originally was. The window stays
+                    // pinned and this workspace stays its owner, which is
+                    // visibly wrong and fully recoverable.
+                    handed_back = false;
+                    log_err(
+                        home,
+                        &format!(
+                            "{window_id}: sizing record unreadable, so the original policy is \
+                             unknown. The window is left on manual and still owned. Inspect it \
+                             with: tmux show-options -w -t {window_id} @cyclops_prior_window_size"
+                        ),
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    // A restore that failed leaves the window exactly as
+                    // this workspace pinned it: on `manual`, with its record
+                    // still attached. Releasing the mark over that is the
+                    // same orphaning as the unreadable case, reached through
+                    // a transient tmux failure instead: no policy applies,
+                    // no client can resize it, and no owner is named for
+                    // anyone to blame. The link may be down or the command
+                    // may have timed out, and either way this session was
+                    // not handed back.
+                    handed_back = false;
+                    log_err(home, &error);
+                }
+            }
+        }
+        if !handed_back {
+            // Keeping the mark is the point: a pinned window with no owner
+            // is the one state nothing can recover from on its own.
+            continue;
+        }
+        if let Err(error) = client.release_window_driver(&session).await {
+            log_err(home, &error);
+        }
+    }
+}
+
+/// Move every session this workspace owns onto the identity of a new
+/// connection.
+///
+/// A reconnect replaces the tmux client, so `client_name:client_created`
+/// changes while the process lives on. The marks left behind name a client
+/// that no longer exists, which is exactly what a follower watches for, so
+/// this is a race with a real other party rather than bookkeeping: between
+/// the old client dying and this running, a follower may have taken a
+/// session legitimately.
+///
+/// Each session is therefore moved with one compare-and-set from the exact
+/// old marker to the exact new one, and ownership is kept only where that
+/// won. A session lost in the gap is dropped from the map entirely, so
+/// nothing here resizes it and the exit path will not put it back: it
+/// belongs to the workspace that won it.
+async fn rekey_ownership(
+    sizing: &mut WindowSizing,
+    client: &ControlClient,
+    home: &std::path::Path,
+) {
+    sizing.following.clear();
+    let Some(previous) = sizing.identity.take() else {
+        // Nothing was ever claimed under a proven identity.
+        sizing.owned.clear();
+        return;
+    };
+    let stale = previous.marker();
+    let Some(identity) = sizing_identity(sizing, client, home).await else {
+        // Without a new identity this workspace cannot prove it owns
+        // anything, so it claims nothing rather than writing sizes it
+        // cannot defend.
+        sizing.owned.clear();
+        return;
+    };
+    let marker = identity.marker();
+    for session in sizing.owned.keys().cloned().collect::<Vec<_>>() {
+        let kept = client
+            .take_over_window_driver(&session, &stale, &marker)
+            .await;
+        match kept {
+            Ok(true) => {}
+            Ok(false) => {
+                sizing.owned.remove(&session);
+            }
+            Err(error) => {
+                log_err(home, &error);
+                sizing.owned.remove(&session);
+            }
+        }
+    }
+}
+
 async fn resize_client(app: &mut App, client: &ControlClient) {
     let (w, h) = app.term_size;
     let size = crate::render::tmux_client_size(
@@ -2725,39 +3179,16 @@ async fn resize_client(app: &mut App, client: &ControlClient) {
     if !declarable(size) || app.declared_client_size == Some(size) {
         return;
     }
-    match client.set_client_size(size.0, size.1).await {
-        Ok(()) => app.declared_client_size = Some(size),
-        Err(error) => log_err(&app.home, &error),
-    }
+    size_owned_windows(&app.sizing, client, size, &app.home).await;
+    app.declared_client_size = Some(size);
 }
 
 /// The tab windows not yet pinned to the sizing policy, in tab order.
-fn unpinned_windows<'a>(tabs: &'a [TabModel], pinned: &HashSet<String>) -> Vec<&'a str> {
+fn unpinned_windows<'a>(tabs: &'a [TabModel], pinned: &BTreeSet<String>) -> Vec<&'a str> {
     tabs.iter()
         .filter(|tab| !pinned.contains(&tab.window_id))
         .map(|tab| tab.window_id.as_str())
         .collect()
-}
-
-/// Pin `window-size smallest` on every window of the displayed session,
-/// once per window id. Without the pin, tmux's default `latest` policy lets
-/// any other attached client out-size this one, laying panes out wider than
-/// the painted canvas (F48). A window that fails stays unpinned, so the
-/// next reconcile retries it.
-async fn pin_window_sizes(
-    client: &ControlClient,
-    tabs: &[TabModel],
-    pinned: &mut HashSet<String>,
-    home: &std::path::Path,
-) {
-    for window_id in unpinned_windows(tabs, pinned) {
-        match client.set_window_size_smallest(window_id).await {
-            Ok(()) => {
-                pinned.insert(window_id.to_string());
-            }
-            Err(error) => log_err(home, &error),
-        }
-    }
 }
 
 /// Apply a `%layout-change` notification directly. Returns false when the
@@ -5384,13 +5815,20 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
     // New windows arrive through this snapshot (new tab, session switch,
     // external new-window); pin them before sizing so no displayed window
     // ever lays out under another client's authority.
-    pin_window_sizes(
-        client,
-        &app.model.session.tabs,
-        &mut app.pinned_windows,
-        &app.home,
-    )
-    .await;
+    let session = app.model.session.session.clone();
+    let tabs = app.model.session.tabs.clone();
+    let adopted = adopt_windows(&mut app.sizing, client, &session, &tabs, &app.home).await;
+    if adopted.newly_following {
+        app.notice
+            .show(copy::SIZING_FOLLOWER.to_string(), Instant::now());
+    }
+    if adopted.took_a_window {
+        // A window pinned just now is holding whatever size it had before
+        // this workspace touched it, and the canvas may not have moved, so
+        // the unchanged-canvas guard in `resize_client` would skip it and
+        // leave a new tab laid out at the wrong size.
+        app.declared_client_size = None;
+    }
     resize_client(app, client).await;
     // Forced only when continuity was actually lost: a control-mode
     // reconnect missed %output while the layout stood still, so the size
@@ -6580,6 +7018,621 @@ mod tests {
     /// costs zero tmux calls and zero full repaints while it is moving,
     /// then exactly one of each at the size it ended on.
     ///
+    /// A restore that fails keeps the session too.
+    ///
+    /// The third door into the same forbidden state. The unreadable record
+    /// is handled, and the window this workspace never pinned is handled,
+    /// but a restore that simply errors, a dropped link, a timed-out
+    /// command, used to be logged and stepped over, and the mark was
+    /// released anyway. What that leaves is a window still on `manual`
+    /// with its record still attached and nobody named as its owner, which
+    /// is the same orphaning reached through a transient failure.
+    #[tokio::test]
+    async fn a_failed_restore_keeps_the_session_owned() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-failed-restore");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "120",
+            "-y",
+            "40",
+            "/bin/sh",
+        ]);
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-failed-restore-home");
+
+        let mut sizing = WindowSizing::default();
+        let tabs = one_pane_model().session.tabs;
+        adopt_windows(&mut sizing, &client, "s", &tabs, &home).await;
+        assert!(sizing.owns("s"));
+        let marker = sizing.identity.as_ref().expect("identity").marker();
+
+        // A record that reads correctly and cannot be applied: the encoding
+        // is exactly what this workspace writes, and the policy inside it is
+        // one tmux will reject. The restore therefore fails at the real
+        // write, on a link that is otherwise perfectly healthy, so the
+        // release below is a decision rather than a second casualty of a
+        // dead client.
+        server.run_ok(&[
+            "set-option",
+            "-w",
+            "-t",
+            "@0",
+            "@cyclops_prior_window_size",
+            "explicit:not-a-policy",
+        ]);
+
+        restore_owned_sizing(&mut sizing, &client, &home).await;
+
+        // The window really did stay pinned: this is the state the mark has
+        // to keep naming an owner for.
+        let policy = server.run(&["show-options", "-w", "-t", "@0", "-qv", "window-size"]);
+        assert_eq!(
+            String::from_utf8_lossy(&policy.stdout).trim(),
+            "manual",
+            "the fixture wants a window that failed to come off manual"
+        );
+        let mark = server.run(&["show-options", "-t", "s", "-qv", "@cyclops_window_driver"]);
+        assert_eq!(
+            String::from_utf8_lossy(&mark.stdout).trim(),
+            marker,
+            "the mark was released while a window could not be put back"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A window already carrying an unreadable record keeps its session
+    /// owned, even though this workspace never pinned it.
+    ///
+    /// This is the hole the first cut left, end to end. Adoption used to
+    /// treat an unreadable record as an error, log it, and move on, so the
+    /// window was never owned; quitting then found a session with nothing
+    /// to restore and released the mark. What was left behind was `manual`
+    /// plus an unreadable record plus no owner, which is the one state
+    /// nothing can recover from: no policy applies, no client can resize
+    /// it, and no later workspace can learn what it was.
+    #[tokio::test]
+    async fn a_window_with_an_unreadable_record_keeps_its_session_owned() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-pre-malformed");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "120",
+            "-y",
+            "40",
+            "/bin/sh",
+        ]);
+        // A dead workspace's leftovers: pinned, with a record nobody can
+        // read, and a mark naming a client that no longer exists.
+        let garbage = "written-by-something-else";
+        server.run_ok(&["set-option", "-w", "-t", "@0", "window-size", "manual"]);
+        server.run_ok(&[
+            "set-option",
+            "-w",
+            "-t",
+            "@0",
+            "@cyclops_prior_window_size",
+            garbage,
+        ]);
+        server.run_ok(&[
+            "set-option",
+            "-t",
+            "s",
+            "@cyclops_window_driver",
+            "client-999999:1700000000",
+        ]);
+
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-pre-malformed-home");
+
+        let mut sizing = WindowSizing::default();
+        let tabs = one_pane_model().session.tabs;
+        let adopted = adopt_windows(&mut sizing, &client, "s", &tabs, &home).await;
+
+        // It takes the session over from the dead owner, and it does not
+        // pin or claim to have taken the window.
+        assert!(sizing.owns("s"), "the stale session was not taken over");
+        assert!(
+            !adopted.took_a_window,
+            "an unreadable window was reported as taken"
+        );
+        let owned = sizing.owned.get("s").expect("owned session");
+        assert!(owned.pinned.is_empty(), "an unreadable window was pinned");
+        assert_eq!(
+            owned.blocked.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["@0"],
+            "the unreadable window was forgotten instead of blocking release"
+        );
+
+        let marker = sizing.identity.as_ref().expect("identity").marker();
+        restore_owned_sizing(&mut sizing, &client, &home).await;
+
+        // Everything the operator needs is still exactly where it was.
+        let policy = server.run(&["show-options", "-w", "-t", "@0", "-qv", "window-size"]);
+        assert_eq!(
+            String::from_utf8_lossy(&policy.stdout).trim(),
+            "manual",
+            "quitting moved the window off manual on a guess"
+        );
+        let record = server.run(&[
+            "show-options",
+            "-w",
+            "-t",
+            "@0",
+            "-qv",
+            "@cyclops_prior_window_size",
+        ]);
+        assert_eq!(
+            String::from_utf8_lossy(&record.stdout).trim(),
+            garbage,
+            "quitting destroyed the only evidence of the original"
+        );
+        let mark = server.run(&["show-options", "-t", "s", "-qv", "@cyclops_window_driver"]);
+        assert_eq!(
+            String::from_utf8_lossy(&mark.stdout).trim(),
+            marker,
+            "quitting released a session whose window is still pinned and unreadable"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// Quitting does not release a session it could not put back.
+    ///
+    /// If the record of what a window was cannot be read, the original is
+    /// unknowable, and the exit path must not paper over that. Releasing
+    /// the mark would leave a window pinned to `manual` with no owner,
+    /// which no client can resize and nothing repairs on its own. So the
+    /// mark stays, the pin stays, and the record stays as evidence.
+    #[tokio::test]
+    async fn quitting_keeps_a_session_whose_record_it_cannot_read() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-malformed-exit");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "120",
+            "-y",
+            "40",
+            "/bin/sh",
+        ]);
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-malformed-exit-home");
+
+        let mut sizing = WindowSizing::default();
+        let tabs = one_pane_model().session.tabs;
+        adopt_windows(&mut sizing, &client, "s", &tabs, &home).await;
+        assert!(sizing.owns("s"));
+        let marker = sizing.identity.as_ref().expect("identity").marker();
+
+        let garbage = "written-by-something-else";
+        server.run_ok(&[
+            "set-option",
+            "-w",
+            "-t",
+            "@0",
+            "@cyclops_prior_window_size",
+            garbage,
+        ]);
+
+        restore_owned_sizing(&mut sizing, &client, &home).await;
+
+        let policy = server.run(&["show-options", "-w", "-t", "@0", "-qv", "window-size"]);
+        assert_eq!(
+            String::from_utf8_lossy(&policy.stdout).trim(),
+            "manual",
+            "quitting moved the window off manual on a guess"
+        );
+        let record = server.run(&[
+            "show-options",
+            "-w",
+            "-t",
+            "@0",
+            "-qv",
+            "@cyclops_prior_window_size",
+        ]);
+        assert_eq!(
+            String::from_utf8_lossy(&record.stdout).trim(),
+            garbage,
+            "quitting destroyed the only evidence of the original"
+        );
+        let mark = server.run(&["show-options", "-t", "s", "-qv", "@cyclops_window_driver"]);
+        assert_eq!(
+            String::from_utf8_lossy(&mark.stdout).trim(),
+            marker,
+            "quitting released a session whose window is still pinned"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A client leaving has to reach the loop, because that is the only
+    /// edge that tells a follower its owner died.
+    ///
+    /// Nothing else in a quiet workspace would notice: no layout changed,
+    /// no window opened, no pane produced output. Without this arm a
+    /// follower renders inside a dead workspace's geometry indefinitely,
+    /// and the takeover that exists to fix that never runs.
+    #[test]
+    fn a_client_leaving_reaches_the_loop_so_a_dead_owner_can_be_replaced() {
+        assert!(matches!(
+            structural_message(cyclops_tmux::Notification::ClientDetached {
+                client: "client-1".into()
+            }),
+            Some(AppMsg::Reconcile)
+        ));
+    }
+
+    /// A workspace that navigated away is still alive, and a follower
+    /// arriving at the session it left must not treat it as dead.
+    ///
+    /// This is the failure the A to B to A test could not catch, because
+    /// that test had no rival in it. The owner claims A and navigates to B,
+    /// which takes it out of A's client list while leaving it running and
+    /// still sizing A's windows. A follower attaching to A then reads a
+    /// marker naming a client it cannot see in A, and if liveness were
+    /// asked of A's client list it would call that stale and steal the
+    /// session, putting two writers on the same windows. Liveness is a
+    /// question about the server, so it is asked of the server.
+    #[tokio::test]
+    async fn a_follower_cannot_steal_from_an_owner_that_navigated_away() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-navigated-owner");
+        for name in ["alpha", "beta"] {
+            server.run_ok(&[
+                "new-session",
+                "-d",
+                "-s",
+                name,
+                "-x",
+                "120",
+                "-y",
+                "40",
+                "/bin/sh",
+            ]);
+        }
+        let attach = |session: &str| {
+            ControlConfig::attach(session)
+                .on_socket(server.socket().to_string())
+                .with_config_file("/dev/null")
+        };
+        let home = cyclops_proto::scratch::scratch_dir("workspace-navigated-owner-home");
+
+        // The owner claims alpha, then navigates to beta and stays alive.
+        let (owner, _rx) = ControlClient::spawn(attach("alpha")).await.expect("owner");
+        let mut owner_sizing = WindowSizing::default();
+        assert!(owns_session(&mut owner_sizing, &owner, "alpha", &home).await);
+        let owner_marker = owner_sizing.identity.as_ref().expect("identity").marker();
+        owner
+            .command("switch-client -t 'beta'")
+            .await
+            .expect("navigate");
+
+        // The hazard, stated as a fact rather than assumed: alpha's own
+        // client list no longer names the owner, while the server does.
+        assert!(
+            !owner
+                .session_client_markers("alpha")
+                .await
+                .expect("alpha viewers")
+                .contains(&owner_marker),
+            "the fixture wants the owner displaying beta"
+        );
+        assert!(
+            owner
+                .server_client_markers()
+                .await
+                .expect("server clients")
+                .contains(&owner_marker),
+            "the owner must still be alive on the server"
+        );
+
+        // A second workspace arrives at alpha and asks whether it owns it.
+        let (rival, _rx2) = ControlClient::spawn(attach("alpha")).await.expect("rival");
+        let mut rival_sizing = WindowSizing::default();
+        let took = owns_session(&mut rival_sizing, &rival, "alpha", &home).await;
+        assert!(
+            !took,
+            "a follower stole a session from an owner that had merely navigated away"
+        );
+        assert!(!rival_sizing.owns("alpha"));
+        assert_eq!(
+            rival.window_driver("alpha").await.expect("readback"),
+            Some(owner_marker),
+            "alpha's owner was replaced by a workspace that only looked at it"
+        );
+        assert!(
+            rival_sizing.following.contains("alpha"),
+            "the follower did not record that it follows alpha"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A tab opened later is pinned AND reported, because pinning alone
+    /// leaves it holding whatever size it had.
+    ///
+    /// The canvas does not change when a tab opens, and `resize_client`
+    /// skips an unchanged canvas, so without the report a new tab would be
+    /// taken off every sizing policy and then never told what size to be.
+    /// The same pass must also stay quiet about windows it already owns,
+    /// since re-pinning every reconcile would be a write per snapshot.
+    #[tokio::test]
+    async fn adopting_reports_only_windows_it_actually_took() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-adopt-report");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "120",
+            "-y",
+            "40",
+            "/bin/sh",
+        ]);
+        // `s:` and not `s`: without the colon tmux reads the target as a
+        // WINDOW, resolves it to the session's current window, and tries to
+        // create at that index, which fails with "index 0 in use" depending
+        // on base-index and what is already there. The colon names the
+        // session and appends at the next free index. MEASURED: the bare
+        // form failed on CI's ubuntu and tmux-head runners while passing
+        // locally, which is what an ambiguous target looks like.
+        server.run_ok(&["new-window", "-t", "s:", "/bin/sh"]);
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-adopt-report-home");
+
+        let mut sizing = WindowSizing::default();
+        let boot_tabs = one_pane_model().session.tabs;
+        let first = adopt_windows(&mut sizing, &client, "s", &boot_tabs, &home).await;
+        assert_eq!(
+            first,
+            Adopted {
+                newly_following: false,
+                took_a_window: true
+            },
+            "the boot window was not reported as taken"
+        );
+
+        let again = adopt_windows(&mut sizing, &client, "s", &boot_tabs, &home).await;
+        assert_eq!(
+            again,
+            Adopted::default(),
+            "a window already owned was taken a second time"
+        );
+
+        // A tab opens. The canvas has not moved, so this report is the only
+        // thing that will cause the new window to be sized at all.
+        let mut two_tabs = boot_tabs.clone();
+        let mut second = two_tabs[0].clone();
+        second.window_id = "@1".into();
+        two_tabs.push(second);
+        let opened = adopt_windows(&mut sizing, &client, "s", &two_tabs, &home).await;
+        assert!(
+            opened.took_a_window,
+            "a tab opened later was pinned without being reported"
+        );
+        assert_eq!(
+            sizing.owned.get("s").map(|owned| owned.pinned.len()),
+            Some(2),
+            "the new tab was not recorded as owned"
+        );
+
+        // And a tab that closes stops being owned, so the exit path does
+        // not ask tmux about a window that is gone.
+        let closed = adopt_windows(&mut sizing, &client, "s", &boot_tabs, &home).await;
+        assert_eq!(closed, Adopted::default());
+        assert_eq!(
+            sizing.owned.get("s").map(|owned| owned.pinned.len()),
+            Some(1),
+            "a closed window stayed owned"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A reconnect is a new tmux client, so a workspace that owned sessions
+    /// under its old identity has to move them onto the new one or leave
+    /// them pinned with nobody owning them.
+    ///
+    /// The sessions this process is not currently displaying are the ones
+    /// that matter: nothing else in the loop revisits them, so a seam that
+    /// only re-elected the active session would strand the rest at `manual`
+    /// past this workspace's own exit.
+    #[tokio::test]
+    async fn a_reconnect_moves_every_owned_session_onto_the_new_identity() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-rekey");
+        for name in ["shown", "background"] {
+            server.run_ok(&[
+                "new-session",
+                "-d",
+                "-s",
+                name,
+                "-x",
+                "120",
+                "-y",
+                "40",
+                "/bin/sh",
+            ]);
+        }
+        let cfg = ControlConfig::attach("shown")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-rekey-home");
+        let (first, _rx) = ControlClient::spawn(cfg.clone()).await.expect("attach");
+
+        let mut sizing = WindowSizing::default();
+        for session in ["shown", "background"] {
+            assert!(
+                owns_session(&mut sizing, &first, session, &home).await,
+                "an unowned session must be claimable"
+            );
+            sizing
+                .owned
+                .entry(session.to_string())
+                .or_default()
+                .pinned
+                .insert("@0".to_string());
+        }
+        let old_marker = sizing.identity.as_ref().expect("identity").marker();
+
+        // The reconnect: the old client goes, a new one arrives, and the
+        // marks in tmux still name the client that just died.
+        first.shutdown().await;
+        let (second, _rx2) = ControlClient::spawn(cfg).await.expect("reattach");
+        rekey_ownership(&mut sizing, &second, &home).await;
+
+        let new_marker = sizing.identity.as_ref().expect("identity").marker();
+        assert_ne!(new_marker, old_marker, "a reconnect must change identity");
+        for session in ["shown", "background"] {
+            assert!(
+                sizing.owns(session),
+                "{session} was dropped by its own reconnect"
+            );
+            assert_eq!(
+                second.window_driver(session).await.expect("readback"),
+                Some(new_marker.clone()),
+                "{session} still names the dead client"
+            );
+        }
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A follower that legitimately takes a session during the reconnect
+    /// gap keeps it, and the reconnecting workspace neither resizes it nor
+    /// puts it back on its way out.
+    ///
+    /// The gap is real: between the old client dying and the new one
+    /// re-keying, the mark names a client that is genuinely gone, which is
+    /// exactly the condition a follower is entitled to act on. Losing that
+    /// race is not an error, and the losing workspace must behave as though
+    /// it never owned the session, because the winner is now using it.
+    #[tokio::test]
+    async fn a_follower_that_wins_the_reconnect_gap_keeps_the_session() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-rekey-lost");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "120",
+            "-y",
+            "40",
+            "/bin/sh",
+        ]);
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-rekey-lost-home");
+        let (first, _rx) = ControlClient::spawn(cfg.clone()).await.expect("attach");
+
+        let mut sizing = WindowSizing::default();
+        assert!(owns_session(&mut sizing, &first, "s", &home).await);
+        let tabs = one_pane_model().session.tabs;
+        adopt_windows(&mut sizing, &first, "s", &tabs, &home).await;
+        assert!(sizing.owns("s"));
+        let old_marker = sizing.identity.as_ref().expect("identity").marker();
+
+        // The link drops, and a second workspace finds the mark stale and
+        // takes the session while this one is away.
+        first.shutdown().await;
+        let (rival, _rx2) = ControlClient::spawn(cfg.clone()).await.expect("rival");
+        let rival_marker = rival.client_identity().await.expect("identity").marker();
+        assert!(
+            rival
+                .take_over_window_driver("s", &old_marker, &rival_marker)
+                .await
+                .expect("takeover"),
+            "a stale mark must be takeable"
+        );
+
+        // Now this workspace reconnects and tries to move its ownership.
+        let (second, _rx3) = ControlClient::spawn(cfg).await.expect("reattach");
+        rekey_ownership(&mut sizing, &second, &home).await;
+        assert!(
+            !sizing.owns("s"),
+            "the session was kept after losing it to a live workspace"
+        );
+        assert_eq!(
+            second.window_driver("s").await.expect("readback"),
+            Some(rival_marker.clone()),
+            "the reconnect stole the session back"
+        );
+
+        // And the exit path leaves the winner's session exactly as it is.
+        restore_owned_sizing(&mut sizing, &second, &home).await;
+        assert_eq!(
+            second.window_driver("s").await.expect("readback"),
+            Some(rival_marker),
+            "quitting released a session this workspace no longer owned"
+        );
+        let out = server.run(&["show-options", "-w", "-t", "@0", "-qv", "window-size"]);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "manual",
+            "quitting unpinned a window the winning workspace is using"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
     /// `declared_client_size` is the observable for the tmux call, because
     /// only a successful `resize_client` sets it.
     #[tokio::test]
@@ -6736,7 +7789,7 @@ mod tests {
             cursor_style: None,
             term_size: (40, 12),
             declared_client_size: None,
-            pinned_windows: HashSet::new(),
+            sizing: WindowSizing::default(),
             needs_reconcile: false,
             needs_hydrate: false,
             paste_seq: 0,
@@ -7762,7 +8815,7 @@ mod tests {
             zoomed: false,
         };
         let tabs = vec![tab("@0"), tab("@1")];
-        let mut pinned = HashSet::new();
+        let mut pinned = BTreeSet::new();
         assert_eq!(unpinned_windows(&tabs, &pinned), vec!["@0", "@1"]);
         // Only a recorded pin drops out; a window whose pin failed is not
         // recorded and stays eligible for the next reconcile.

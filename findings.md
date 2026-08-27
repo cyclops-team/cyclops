@@ -2011,3 +2011,110 @@ needs, clearing the host surface and resetting the diff baseline
 `app.rs::a_repaint_never_asks_the_terminal_where_the_cursor_is`, which counts
 `get_cursor_position` calls rather than asserting a spelling, so any future
 invalidation may change how it clears and may not start reading to do it.
+
+## F76. A window's size is its panes' size, so no viewer may vote on it
+
+MEASURED 2026-08-26 on isolated tmux servers, tmux 3.6a and next-3.8
+identical unless noted, every server torn down after.
+
+The workspace used to declare its canvas with `refresh-client -C` and let a
+`window-size` policy resolve the result. Every such policy resolves votes,
+and a tty client always votes: it has a size and cannot abstain. So under
+`smallest` one ordinary `tmux attach` from a 62x21 terminal took an elected
+owner's 176x47 window down to 62x19, and with it every agent pane in that
+session, reflowing each TUI and rewrapping its scrollback. Under `latest`
+the same hole runs the other way. This is Admin's measured 62x21 collapse,
+and no election among Cyclops clients can close it, because the client that
+causes it is not one of ours.
+
+| # | Fact |
+|---|---|
+| M1 | `refresh-client -C 80x24` from a control client shrinks the session it shows. |
+| M2 | A declaration cannot be withdrawn: `refresh-client -C 0x0` is refused. |
+| M3 | A declaration follows its client across `switch-client`. |
+| M4 | With no clients attached, a window keeps its last size. |
+| M5 | Two live declarers at 80x24 and 160x40 produce 80x24. |
+| M6 | Kill the 80x24 declarer while the 160x40 one survives and the window becomes 160x40: a dead client's vote is purged. |
+| M7 | A control client that never declares constrains nothing, including in a session it later switches to. |
+| M8 | For a control client with no tty, `list-clients` gives `name=[client-29090] pid=[29090]`: `client_name` IS the pid formatted. `client_created` is a per-connection epoch. |
+| M9 | Under `smallest`, an elected 176x47 owner's window collapsed to 62x19 when a 62x21 tty client attached. |
+| M10 | Under `manual` plus `resize-window -x 176 -y 47`, the window held 176x47 with that client attached and after it left. |
+| M11 | A control client attached only to session B resized session A's window, and both sizes survived that client's death. |
+| M12 | A client that claims session A and then runs `switch-client -t B` is **absent from `list-clients -t =A`** while still present in server-wide `list-clients`. Per-session client lists are not a liveness test. |
+
+M12 is the one that turns a design detail into a correctness rule. Whether
+an owner is alive is a question about the server, not about a session: a
+workspace that claims A and navigates to B is invisible in A's client list
+while still alive and still sizing A's windows, so a follower testing
+liveness there would call a live owner dead, take the session, and put two
+writers on the same windows. Liveness is asked of `list-clients` with no
+target.
+
+`window-size manual` plus `resize-window` has no vote to lose, so that is
+what the workspace uses. The cost is M11's second half: a manual size is
+window state and does not die with its owner, which is what the ownership
+marker and the per-window capture in `cyclops-tmux::sizing` exist to answer.
+By M7 the owner needs no second connection, and by M11 it can size the
+sessions it owns while displaying another one.
+
+Two traps found on the way, both worth keeping:
+
+- `show-options -w window-size` prints NOTHING when the value is inherited,
+  and the global default is `latest`, not `smallest`. Restoring a window by
+  setting a policy therefore leaves it carrying an explicit option it never
+  had, which silently stops it following later changes to the session or
+  global option. Inherited must be restored by unsetting.
+- The capture cannot live in the workspace. If it does, a crash loses it,
+  the next owner probes the window, sees the dead owner's `manual`, records
+  THAT as the original, and its clean exit makes the latch permanent. It
+  lives in a create-only window option so the first toucher's record of the
+  true original wins.
+
+Two consequences that are easy to get wrong and are pinned by tests:
+
+- A record that exists but cannot be read means the original policy is
+  unknowable, and the answer is to change nothing at all: not the pin, not
+  the record, and not the ownership mark. Guessing a policy invents state
+  the operator never set, and clearing the record destroys the only
+  evidence of what the window was. A window left pinned and still owned is
+  visibly wrong and fully recoverable; one silently returned to a policy
+  nobody chose is neither. The operator command refuses on the same
+  evidence, exits nonzero, and prints the exact tmux commands to inspect
+  and finish by hand.
+- `%client-detached` is the only edge that tells a follower its owner died.
+  A quiet workspace sees no layout change, no new window and no output, so
+  without routing that notification the takeover never runs.
+
+`cyclops sizing release` is the operator's way out when a workspace was
+killed hard and none is coming back to tidy up. It refuses more often than
+it acts, and every refusal changes nothing: it refuses while the marker
+names a client the server still has, because recovery is for an owner that
+is gone and a live one is still sizing that session; and it refuses on a
+record it cannot read. A window with no Cyclops record is left exactly as it
+is, `manual` included, because Cyclops did not put it there.
+
+One subtlety cost a full review round. Making *restore* non-destructive on a
+malformed record is not enough, because *adoption* reaches one first. Parsing
+the record during capture made a malformed one read as absent, the
+create-only write was then refused by tmux, the call errored, adoption
+logged and moved on, and the window was never owned at all. Quitting then
+found a session with nothing to restore and released the mark, leaving
+`manual` plus an unreadable record plus no owner: exactly the state the
+non-destructive restore existed to prevent, reached through the other door.
+A window whose record cannot be read is therefore tracked as owned but
+never pinned, which is what keeps the mark.
+
+There is a third door into the same state, and it is the cheapest to miss:
+a restore that simply *fails*. A dropped link or a rejected write leaves the
+window exactly as it was pinned, on `manual` with its record attached, and
+logging that and stepping over it released the mark anyway. Handing a
+session back is all-or-nothing: unless every window it pinned is actually
+back, the mark stays, because the alternative is a pinned window with no
+owner named for anyone to find.
+
+Rejected on the same evidence: an election under a voting policy (M9 defeats
+it), `client_name` as an identity (M8: it is the pid), and a `client-detached`
+hook to restore on death. The hook was measured working, and it does fire on
+SIGTERM, but its per-window restore list must be re-baked whenever a tab
+opens, it is itself state that outlives a crashed owner, and hook context
+exposes only `hook_client`, which by M8 is the weaker half of the key.

@@ -132,6 +132,7 @@ behind it. Otherwise, one page per question.
 | [history.md](docs/guides/history.md) | Reading the record, threads, paging |
 | [wait.md](docs/guides/wait.md) | Waiting on an agent, exit codes |
 | [panes.md](docs/guides/panes.md) | Naming, the roster, the tmux border |
+| [sizing.md](docs/guides/sizing.md) | Who sizes a session's windows, and `cyclops sizing release` |
 | [workspaces.md](docs/guides/workspaces.md) | Presets, save and restore, `cyclops start` |
 | [workspace-ui.md](docs/guides/workspace-ui.md) | The full-screen workspace (`cyclops`) |
 | [ui.md](docs/guides/ui.md) | The stream and Messages TUI (`cyclops watch`) |
