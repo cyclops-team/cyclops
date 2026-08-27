@@ -274,8 +274,6 @@ pub(crate) struct Inner {
     /// Test-only: make the next final pre-write process observation
     /// unavailable after the admitting capture has completed.
     pub(crate) fail_next_final_binding_observation: AtomicBool,
-    /// Test-only: make the next batch append on the workspace journal fail.
-    pub(crate) fail_next_batch_append: AtomicBool,
     /// Test-only: fail at the synchronous on_write boundary before record_writing.
     pub(crate) fail_pre_record_writing: AtomicBool,
     /// Last-active workspace/tab for the terminal workspace UI.
@@ -1327,6 +1325,7 @@ async fn observe_session_identity(
 
 /// A booted daemon. Dropping it does not stop the tasks; call
 /// [`Daemon::shutdown`] for a clean exit (detach watchers, remove socket).
+#[derive(Clone)]
 pub struct Daemon {
     inner: Arc<Inner>,
     stop: watch::Sender<bool>,
@@ -1850,9 +1849,32 @@ impl Daemon {
     /// Test-only seam: fail the next batch append on the workspace journal.
     #[doc(hidden)]
     pub fn fail_next_batch_append(&self) {
-        self.inner
-            .fail_next_batch_append
-            .store(true, Ordering::SeqCst);
+        if let Some(service) = self.inner.mailbox.as_ref() {
+            service
+                .store_handle()
+                .lock()
+                .expect("mailbox store lock")
+                .inject_next_batch_append_failure();
+        }
+    }
+
+    /// Test seam: inspect exact in-flight job owned by a mailbox notification worker
+    /// under the queue mutex boundary.
+    #[doc(hidden)]
+    pub fn mailbox_worker_current_for_test(
+        &self,
+        recipient_label: &str,
+    ) -> Option<(String, Option<NotificationAttemptId>)> {
+        let service = self.inner.mailbox.as_ref()?;
+        let id = service.identity_for_address(recipient_label).ok()?;
+        self.inner.engine.mailbox_worker_current_for_test(id.key)
+    }
+
+    /// Test seam: inspect exact in-flight job owned by a legacy worker
+    /// under the queue mutex boundary.
+    #[doc(hidden)]
+    pub fn legacy_worker_current_for_test(&self, pane_id: &str) -> Option<String> {
+        self.inner.engine.legacy_worker_current_for_test(pane_id)
     }
 
     /// Test-only seam: panic at the synchronous on_write boundary before record_writing.
@@ -2962,7 +2984,6 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         inject_pause: StdMutex::new(None),
         fail_chrome_restore: AtomicBool::new(false),
         fail_next_final_binding_observation: AtomicBool::new(false),
-        fail_next_batch_append: AtomicBool::new(false),
         fail_pre_record_writing: AtomicBool::new(false),
         workspace_ui: StdMutex::new(workspace_ui::WorkspaceUiState::default()),
         shutdown_request,
@@ -4999,7 +5020,6 @@ mod tests {
             inject_pause: StdMutex::new(None),
             fail_chrome_restore: AtomicBool::new(false),
             fail_next_final_binding_observation: AtomicBool::new(false),
-            fail_next_batch_append: AtomicBool::new(false),
             fail_pre_record_writing: AtomicBool::new(false),
             workspace_ui: StdMutex::new(workspace_ui::WorkspaceUiState::default()),
             shutdown_request: watch::channel(false).0,

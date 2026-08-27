@@ -760,6 +760,36 @@ impl Engine {
         }
     }
 
+    #[doc(hidden)]
+    pub(crate) fn mailbox_worker_current_for_test(
+        &self,
+        recipient: RecipientKey,
+    ) -> Option<(String, Option<NotificationAttemptId>)> {
+        let workers = self
+            .notification_workers
+            .lock()
+            .expect("notification workers lock");
+        let entry = workers.get(&recipient)?;
+        let state = entry.worker.state.lock().expect("worker state lock");
+        let current = state.current.as_ref()?;
+        let notif_attempt = current.notification.as_ref().map(|n| n.attempt_id());
+        Some((current.msg_id.clone(), notif_attempt))
+    }
+
+    #[doc(hidden)]
+    pub(crate) fn legacy_worker_current_for_test(&self, pane_id: &str) -> Option<String> {
+        let workers = self.workers.lock().expect("workers lock");
+        for (key, entry) in workers.iter() {
+            if key.pane_id == pane_id || workers.len() == 1 {
+                let state = entry.worker.state.lock().expect("worker state lock");
+                if let Some(current) = &state.current {
+                    return Some(current.msg_id.clone());
+                }
+            }
+        }
+        None
+    }
+
     /// Seed the issued-id set from a ledger so new ids stay unique per
     /// ledger across daemon restarts.
     pub(crate) fn preload_ids(&self, lines: &[LedgerLine]) {
@@ -5419,15 +5449,6 @@ fn notification_binding(
 /// Await the test-only injection pause, when one is installed. Production
 /// never installs one; this is a no-op there.
 pub(crate) async fn inject_pause(inner: &Arc<Inner>, phase: &'static str) {
-    if inner.fail_next_batch_append.swap(false, Ordering::SeqCst) {
-        if let Some(service) = &inner.mailbox {
-            service
-                .store_handle()
-                .lock()
-                .unwrap()
-                .inject_next_batch_append_failure();
-        }
-    }
     let hook = inner
         .inject_pause
         .lock()
@@ -11744,7 +11765,6 @@ composer_trailer_required_prefix = 1
             inject_pause: StdMutex::new(None),
             fail_chrome_restore: AtomicBool::new(false),
             fail_next_final_binding_observation: AtomicBool::new(false),
-            fail_next_batch_append: AtomicBool::new(false),
             fail_pre_record_writing: AtomicBool::new(false),
             workspace_ui: StdMutex::new(crate::workspace_ui::WorkspaceUiState::default()),
             shutdown_request: watch::channel(false).0,

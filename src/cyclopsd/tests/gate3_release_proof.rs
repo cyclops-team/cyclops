@@ -227,6 +227,7 @@ async fn multi_alarm_clear_is_one_fact_after_complete_validation() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // Gap 2: Exact in-flight attempt is exposed under queue mutex (Mailbox + Legacy)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -290,7 +291,7 @@ async fn in_flight_attempt_is_exposed_under_queue_mutex() {
             .expect("mailbox delivery reached write boundary")
             .expect("pause channel stayed open");
 
-        // Query quiesce under the mutex boundary
+        // 1. Query quiesce under the mutex boundary
         let quiesced = rig
             .ctl
             .request("daemon.quiesce", json!({"timeout_ms": 100}))
@@ -312,7 +313,17 @@ async fn in_flight_attempt_is_exposed_under_queue_mutex() {
         );
         let expected_msg_id = in_flight_str.split(" -> ").next().unwrap();
 
-        // Also assert snapshot under the same queue mutex exposes the exact attempt and state
+        // 2. Query worker registry and WorkerState.current directly under the queue mutex
+        let (current_msg_id, current_attempt_id) = rig
+            .daemon
+            .mailbox_worker_current_for_test("worker")
+            .expect("mailbox worker must own exact in-flight attempt under queue mutex");
+        assert_eq!(
+            current_msg_id, expected_msg_id,
+            "worker current job msg_id must match"
+        );
+
+        // 3. Query messages snapshot under mutex
         let snapshot = rig
             .daemon
             .messages_snapshot_for_test("admin", 10)
@@ -330,7 +341,10 @@ async fn in_flight_attempt_is_exposed_under_queue_mutex() {
             "notification must be in in-flight state: {:?}",
             recip.notification.state
         );
-        assert!(recip.notification.attempt_id.is_some());
+        assert_eq!(
+            current_attempt_id, recip.notification.attempt_id,
+            "worker current job attempt_id must match snapshot attempt_id"
+        );
 
         // Release pause and finish
         hold.add_permits(1);
@@ -369,19 +383,18 @@ async fn in_flight_attempt_is_exposed_under_queue_mutex() {
             })
         });
 
-        let socket = rig.daemon.socket_path();
+        let daemon = rig.daemon.clone();
         let send_task = tokio::spawn(async move {
-            let mut client = TestClient::connect(&socket).await;
-            client
-                .request(
-                    "msg.send",
-                    json!({
-                        "from": "admin",
+            daemon
+                .deliver_payload(
+                    "admin",
+                    serde_json::from_value::<MsgSendParams>(json!({
                         "to": ["legacy_worker"],
                         "subject": "Legacy hold",
                         "body": "Legacy payload",
                         "client_key": "legacy-in-flight"
-                    }),
+                    }))
+                    .unwrap(),
                 )
                 .await
         });
@@ -391,7 +404,7 @@ async fn in_flight_attempt_is_exposed_under_queue_mutex() {
             .expect("legacy delivery reached write boundary")
             .expect("pause channel stayed open");
 
-        // Query quiesce under the mutex boundary for legacy worker
+        // 1. Query quiesce under the mutex boundary for legacy worker
         let quiesced = rig
             .ctl
             .request("daemon.quiesce", json!({"timeout_ms": 100}))
@@ -414,11 +427,22 @@ async fn in_flight_attempt_is_exposed_under_queue_mutex() {
             in_flight_str.ends_with(" -> legacy_worker"),
             "in_flight must name target legacy worker: {in_flight_str}"
         );
+        let expected_legacy_id = in_flight_str.split(" -> ").next().unwrap();
+
+        // 2. Query legacy worker registry and WorkerState.current directly under the queue mutex
+        let current_legacy_msg_id = rig
+            .daemon
+            .legacy_worker_current_for_test(&pane)
+            .expect("legacy worker must own exact in-flight job under queue mutex");
+        assert_eq!(
+            current_legacy_msg_id, expected_legacy_id,
+            "legacy worker current job must match in-flight handle"
+        );
 
         // Release pause and finish
         hold.add_permits(1);
-        let send_res = send_task.await.unwrap();
-        assert!(send_res["result"]["msg_id"].is_string());
+        let send_res = send_task.await.unwrap().expect("deliver payload success");
+        assert_eq!(send_res["msg_id"], expected_legacy_id);
 
         rig.shutdown().await;
     }
@@ -447,50 +471,80 @@ async fn recovery_failure_visibly_faults_and_never_silently_restarts() {
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
 
-    // Arm the append failure on the daemon so when recovery tries to persist the pre-write failure,
-    // the store fails the append, forcing Worker::set_fault and halting the supervisor permanently.
-    rig.daemon.fail_next_batch_append();
+    // Pause once at pre_submit (when state is Staged), signal the test,
+    // have the test arm the next journal append immediately, then release into panic.
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
 
     rig.daemon.set_inject_pause(move |current| {
+        let entered_tx = entered_tx.clone();
+        let release_rx = Arc::clone(&release_rx);
         Box::pin(async move {
-            if current == "pre_paste" {
-                panic!("injected supervised child crash at pre_paste");
+            if current == "pre_submit" {
+                let _ = entered_tx.send(());
+                let rx = release_rx.lock().await.take();
+                if let Some(rx) = rx {
+                    let _ = rx.await;
+                }
+                panic!("injected supervised child crash at pre_submit");
             }
         })
     });
 
-    let sent = rig
-        .daemon
-        .msg_send(
-            "admin",
-            serde_json::from_value::<MsgSendParams>(json!({
-                "to": ["worker"],
-                "subject": "Crash test",
-                "body": "Payload to crash",
-                "client_key": "crash-job"
-            }))
-            .unwrap(),
-        )
+    let socket = rig.daemon.socket_path();
+    let send_task = tokio::spawn(async move {
+        let mut client = TestClient::connect(&socket).await;
+        client
+            .request(
+                "msg.send",
+                json!({
+                    "from": "admin",
+                    "to": ["worker"],
+                    "subject": "Crash test",
+                    "body": "Payload to crash",
+                    "client_key": "crash-job"
+                }),
+            )
+            .await
+    });
+
+    // Wait until delivery reaches pre_submit (current state is Staged)
+    tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
         .await
-        .unwrap();
+        .expect("reached pre_submit")
+        .expect("channel open");
 
-    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    // Arm the next batch append failure directly on the store while delivery is paused in Staged
+    rig.daemon.fail_next_batch_append();
 
-    // Wait until daemon status reflects the worker fault in diagnostics
+    // Release pause into panic: child crashes, supervisor catches it, recover_failed_job tries to
+    // record attention in journal, store append fails, recover_failed_job returns false, and
+    // supervisor sets Worker::set_fault("notification recovery failed: ...").
+    let _ = release_tx.send(());
+    let _ = send_task.await;
+
+    // Wait until daemon status reflects the worker fault with exact code notification_recovery_storage_failed
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut found_diagnostic = false;
+    let mut fault_msg_id = String::new();
+    let mut fault_attempt_id = String::new();
     while Instant::now() < deadline {
         let status = rig.ctl.request("status", json!({})).await;
         if let Some(diagnostics) = status["result"]["diagnostics"].as_array() {
-            if let Some(diag) = diagnostics.iter().find(|d| d["message_id"] == message_id) {
-                assert!(
-                    diag["code"] == "notification_recovery_storage_failed"
-                        || diag["code"] == "notification_prewrite_storage_failed"
-                        || diag["code"] == "notification_worker_failed",
-                    "unexpected diagnostic code: {diag}"
+            if let Some(diag) = diagnostics
+                .iter()
+                .find(|d| d["recipient_label"] == "worker")
+            {
+                assert_eq!(
+                    diag["code"], "notification_recovery_storage_failed",
+                    "diagnostic code must be exact"
                 );
                 assert_eq!(diag["recipient_label"], "worker");
+                assert_eq!(diag["pane_id"], pane);
                 assert!(diag["notification_attempt"].is_string());
+                fault_msg_id = diag["message_id"].as_str().unwrap().to_string();
+                fault_attempt_id = diag["notification_attempt"].as_str().unwrap().to_string();
                 found_diagnostic = true;
                 break;
             }
@@ -499,10 +553,10 @@ async fn recovery_failure_visibly_faults_and_never_silently_restarts() {
     }
     assert!(
         found_diagnostic,
-        "status diagnostics must contain visible worker fault for message {message_id}"
+        "status diagnostics must contain visible worker fault for recipient worker"
     );
 
-    // Prove that subsequent jobs never restart or execute under the faulted worker
+    // Send follower message to the same worker
     let send2 = rig
         .daemon
         .msg_send(
@@ -519,6 +573,12 @@ async fn recovery_failure_visibly_faults_and_never_silently_restarts() {
         .unwrap();
     let msg2_id = send2["msg_id"].as_str().unwrap();
 
+    // Trigger a later pane/route edge
+    rig.tmux
+        .run_ok(&["select-pane", "-t", &pane, "-T", "idle_new_edge"]);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Assert follower remains NotStarted
     let snapshot = rig
         .daemon
         .messages_snapshot_for_test("admin", 10)
@@ -531,7 +591,33 @@ async fn recovery_failure_visibly_faults_and_never_silently_restarts() {
     assert_eq!(
         row2.recipients[0].notification.state,
         cyclops_proto::MessageNotificationState::NotStarted,
-        "second message must not start under permanently faulted worker"
+        "follower must remain NotStarted under permanently faulted worker"
+    );
+
+    // Assert diagnostic persists
+    let status_after = rig.ctl.request("status", json!({})).await;
+    let diags_after = status_after["result"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics array");
+    assert!(
+        diags_after
+            .iter()
+            .any(|d| d["code"] == "notification_recovery_storage_failed"
+                && d["message_id"] == fault_msg_id
+                && d["notification_attempt"] == fault_attempt_id),
+        "diagnostic must persist across subsequent route edges: {diags_after:?}"
+    );
+
+    // Assert no follower bytes or doorbell markers ever reach the pane history
+    let history = String::from_utf8_lossy(
+        &rig.tmux
+            .run(&["capture-pane", "-p", "-S", "-", "-t", &pane])
+            .stdout,
+    )
+    .to_string();
+    assert!(
+        !history.contains(msg2_id),
+        "no follower bytes or markers may reach the pane: {history}"
     );
 
     rig.shutdown().await;
@@ -607,6 +693,25 @@ async fn composer_barrier_cannot_leak_between_write_boundary_and_durable_transit
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    // Collect every notification fact attempt_id for first message and assert one unique id across crash/recovery
+    let lines = workspace_lines(&rig);
+    let mut first_attempt_ids = std::collections::HashSet::new();
+    for line in &lines {
+        if line.id == first_id {
+            if let Some(data) = &line.data {
+                if let Some(attempt) = data.get("attempt_id").and_then(|a| a.as_str()) {
+                    first_attempt_ids.insert(attempt.to_string());
+                }
+            }
+        }
+    }
+    assert_eq!(
+        first_attempt_ids.len(),
+        1,
+        "all notification facts for first message must share one unique attempt_id: {first_attempt_ids:?}"
+    );
+    let first_attempt_id = first_attempt_ids.into_iter().next().unwrap();
+
     // Now send a follower message to prove the composer barrier was not leaked
     let send2 = rig
         .daemon
@@ -652,6 +757,89 @@ async fn composer_barrier_cannot_leak_between_write_boundary_and_durable_transit
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
+    // Verify journal transitions for first_id: exactly one writing, one staged, one submitted
+    let writing_count = lines
+        .iter()
+        .filter(|l| {
+            l.id == first_id
+                && l.data
+                    .as_ref()
+                    .is_some_and(|d| d.get("state") == Some(&json!("writing")))
+        })
+        .count();
+    assert_eq!(
+        writing_count, 1,
+        "exactly one writing transition in journal"
+    );
+    let staged_count = lines
+        .iter()
+        .filter(|l| {
+            l.id == first_id
+                && l.data
+                    .as_ref()
+                    .is_some_and(|d| d.get("state") == Some(&json!("staged")))
+        })
+        .count();
+    assert_eq!(staged_count, 1, "exactly one staged transition in journal");
+    let submitted_count = lines
+        .iter()
+        .filter(|l| {
+            l.id == first_id
+                && l.data
+                    .as_ref()
+                    .is_some_and(|d| d.get("state") == Some(&json!("submitted")))
+        })
+        .count();
+    assert_eq!(
+        submitted_count, 1,
+        "exactly one submitted transition in journal"
+    );
+
+    // Follower marker also appears in journal with unique attempt_id
+    let lines_after = workspace_lines(&rig);
+    let mut second_attempt_ids = std::collections::HashSet::new();
+    for line in &lines_after {
+        if line.id == second_id {
+            if let Some(data) = &line.data {
+                if let Some(attempt) = data.get("attempt_id").and_then(|a| a.as_str()) {
+                    second_attempt_ids.insert(attempt.to_string());
+                }
+            }
+        }
+    }
+    assert_eq!(second_attempt_ids.len(), 1);
+    let second_attempt_id = second_attempt_ids.into_iter().next().unwrap();
+    let second_attempt = cyclops_proto::NotificationAttemptId::parse(&second_attempt_id)
+        .expect("parse second attempt id");
+    let second_locator = cyclops_proto::notification_attempt_claim_locator(second_attempt);
+
+    // Capture full pane history to assert exact doorbell markers and executions
+    let history = String::from_utf8_lossy(
+        &rig.tmux
+            .run(&["capture-pane", "-p", "-S", "-", "-t", &pane])
+            .stdout,
+    )
+    .to_string();
+
+    let first_attempt = cyclops_proto::NotificationAttemptId::parse(&first_attempt_id)
+        .expect("parse first attempt id");
+    let first_locator = cyclops_proto::notification_attempt_claim_locator(first_attempt);
+
+    // Assert both doorbells were delivered and executed exactly once in the pane
+    assert!(
+        history.contains(first_locator.as_str()),
+        "first doorbell marker must appear in pane history: {history}"
+    );
+    assert!(
+        history.contains(second_locator.as_str()),
+        "second doorbell marker must appear in pane history: {history}"
+    );
+    assert_eq!(
+        history.matches("FAKETUI-WORKING").count(),
+        2,
+        "exact two submits must execute across the two messages: {history}"
+    );
 
     rig.shutdown().await;
 }
