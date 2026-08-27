@@ -2521,6 +2521,44 @@ mod tests {
     }
 
     #[test]
+    fn exact_revalidation_rejects_each_identity_or_metadata_change() {
+        let original = InspectedEntry {
+            path: PathBuf::from("/tmp/cyclops-cleanup-entry"),
+            kind: cyclops_state::InspectedKind::RegularFile,
+            mode: 0o600,
+            uid: 501,
+            links: 1,
+            size: 64,
+            device: 7,
+            inode: 11,
+            unsafe_reason: None,
+        };
+        assert!(same_exact(&original, &original));
+
+        type EntryMutation = (&'static str, fn(&mut InspectedEntry));
+        let mutations: [EntryMutation; 7] = [
+            ("kind", |entry| {
+                entry.kind = cyclops_state::InspectedKind::Directory;
+            }),
+            ("device", |entry| entry.device += 1),
+            ("inode", |entry| entry.inode += 1),
+            ("owner", |entry| entry.uid += 1),
+            ("mode", |entry| entry.mode ^= 0o100),
+            ("link count", |entry| entry.links += 1),
+            ("size", |entry| entry.size += 1),
+        ];
+
+        for (field, mutate) in mutations {
+            let mut changed = original.clone();
+            mutate(&mut changed);
+            assert!(
+                !same_exact(&original, &changed),
+                "exact cleanup revalidation ignored a changed {field}"
+            );
+        }
+    }
+
+    #[test]
     fn operational_update_scratch_requires_its_exact_marker_and_lease() {
         let temp = private_temp();
         let nonce = "0123456789abcdef0123456789abcdef";
