@@ -589,6 +589,9 @@ pub struct RecipientEntry {
     pub wake: WakeWord,
     pub cause: Option<String>,
     pub fifo_position: Option<u64>,
+    /// When this recipient-specific mailbox/wake projection last changed.
+    /// Attention decay follows the hold, not the older message envelope.
+    pub updated_at: u64,
     pub is_attention: bool,
     pub is_selected: bool,
     pub target: QueueTarget,
@@ -651,6 +654,7 @@ impl TimelineItem {
                 wake: row.wake,
                 cause: cause_str,
                 fifo_position: row.fifo_position,
+                updated_at: row.updated_at,
                 is_attention: row.needs_human(),
                 is_selected: is_sel,
                 target: row.target.clone(),
@@ -674,9 +678,23 @@ impl TimelineItem {
                 let is_broadcast = row.recipient_count > 1 || row.kind == Kind::Fyi;
 
                 let (authorized_body, thread_history) = if let Some(d) = detail {
+                    let loaded = d.loaded();
                     if d.target().target.message_id == row.message_id {
-                        let loaded = d.loaded();
-                        (loaded.body.clone(), loaded.thread.clone())
+                        let row_msg_ids: std::collections::HashSet<&str> =
+                            rows.iter().map(|r| r.message_id.as_str()).collect();
+                        let filtered_history: Vec<ThreadEntry> = loaded
+                            .thread
+                            .iter()
+                            .filter(|e| !row_msg_ids.contains(e.message_id.as_str()))
+                            .cloned()
+                            .collect();
+                        (loaded.body.clone(), filtered_history)
+                    } else if let Some(entry) = loaded
+                        .thread
+                        .iter()
+                        .find(|e| e.message_id == row.message_id.as_str())
+                    {
+                        (entry.body.clone(), Vec::new())
                     } else {
                         (None, Vec::new())
                     }
@@ -731,6 +749,45 @@ pub fn format_time(ts_ms: u64, now_ms: Option<u64>) -> String {
         }
     }
     format!("{ts_ms}ms")
+}
+
+/// How long an unresolved hold keeps its full attention voice.
+///
+/// Past this it is still shown and still exactly as accurate; it just
+/// stops competing with what happened seconds ago. Nothing is hidden and
+/// no word changes, only the ink: a four-hour-old attempt that shouts as
+/// loudly as a fresh one teaches an operator to ignore the colour, which
+/// costs the fresh one its meaning.
+const HELD_LOUD_MS: u64 = 15 * 60 * 1000;
+
+/// Attention ink while a hold is fresh, dim once it is old news.
+///
+/// With no clock the hold keeps its full voice: a renderer that cannot
+/// tell how old something is must not quietly decide it is stale.
+fn held_ink(ts: u64, now_ms: Option<u64>) -> ChatInk {
+    match now_ms {
+        Some(now) if now.saturating_sub(ts) > HELD_LOUD_MS => ChatInk::Dim,
+        _ => ChatInk::Attention,
+    }
+}
+
+/// The hold phrase for one recipient: the exact cause, plus its queue
+/// position when that is what an operator needs to act. Byte-identical
+/// to what the daemon proved; this only chooses where it sits.
+fn held_words(r: &RecipientEntry, status_label: &str, behind: usize) -> String {
+    let cause_desc = r.cause.as_deref().unwrap_or(status_label);
+    if r.mailbox == MailboxWord::Pending && r.fifo_position == Some(1) {
+        if behind > 0 {
+            format!("head · held: {cause_desc} · {behind} behind")
+        } else {
+            format!("head · held: {cause_desc}")
+        }
+    } else {
+        match r.fifo_position {
+            Some(pos) => format!("held: {cause_desc} · pos {pos}"),
+            None => format!("held: {cause_desc}"),
+        }
+    }
 }
 
 /// First timeline line, centered on the selected recipient when possible.
@@ -1038,7 +1095,7 @@ pub fn render_chat_lines(
                         format!(" ! [held: {cause_desc}]")
                     };
                     let mut line = ChatLine::new(ChatLineKind::Status);
-                    line.push(line3, ChatInk::Attention);
+                    line.push(line3, held_ink(r.updated_at, now_ms));
                     timeline.push(line.fitted(width));
                 }
             }
@@ -1114,8 +1171,30 @@ pub fn render_chat_lines(
             }
 
             // If message body is authorized, expose it; otherwise show metadata subject
-            let words = item.authorized_body.as_deref().or(item.subject.as_deref());
-            if let Some(words) = words {
+            if let Some(ref body) = item.authorized_body {
+                let show_subject = item.reply_to.is_none()
+                    && item
+                        .subject
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .is_some_and(|s| s != "Direct Message" && !body.starts_with(s));
+                if show_subject {
+                    if let Some(ref subj) = item.subject {
+                        for row in wrap_words(subj, body_width) {
+                            let mut line = ChatLine::new(ChatLineKind::Message);
+                            line.push("   ", ChatInk::Text);
+                            line.push(row, ChatInk::Role(item.sender_label.clone()));
+                            timeline.push(line.fitted(width));
+                        }
+                    }
+                }
+                for row in wrap_words(body, body_width) {
+                    let mut line = ChatLine::new(ChatLineKind::Message);
+                    line.push("   ", ChatInk::Text);
+                    line.push(row, ChatInk::Text);
+                    timeline.push(line.fitted(width));
+                }
+            } else if let Some(words) = item.subject.as_deref() {
                 for row in wrap_words(words, body_width) {
                     let mut line = ChatLine::new(ChatLineKind::Message);
                     line.push("   ", ChatInk::Text);
@@ -1141,31 +1220,20 @@ pub fn render_chat_lines(
                 line.push(status_label, ink);
                 line.push(" · ", ChatInk::Dim);
                 line.push(short_id(&item.message_id), ChatInk::Dim);
+                // The hold rides the status line it qualifies instead of
+                // claiming a row of its own. Same words, same causes, one
+                // line: a message used to spend two rows on transport for
+                // every one row of what it said.
+                if r.is_attention || r.cause.is_some() {
+                    line.push(" · ", ChatInk::Dim);
+                    line.push(
+                        held_words(r, status_label, pending_behind(r)),
+                        held_ink(r.updated_at, now_ms),
+                    );
+                }
                 timeline.push(line.fitted(width));
                 if r.is_selected {
                     selected_anchor_line = Some(timeline.len().saturating_sub(1));
-                }
-                if r.is_attention || r.cause.is_some() {
-                    let is_head = r.mailbox == MailboxWord::Pending && r.fifo_position == Some(1);
-                    let cause_desc = r.cause.as_deref().unwrap_or(status_label);
-                    let held = if is_head {
-                        let behind = pending_behind(r);
-                        let behind_desc = if behind > 0 {
-                            format!(" · {behind} behind")
-                        } else {
-                            String::new()
-                        };
-                        format!("   ! head · held: {cause_desc}{behind_desc}")
-                    } else {
-                        let pos_desc = r
-                            .fifo_position
-                            .map(|pos| format!(" · pos {pos}"))
-                            .unwrap_or_default();
-                        format!("   ! held: {cause_desc}{pos_desc}")
-                    };
-                    let mut line = ChatLine::new(ChatLineKind::Status);
-                    line.push(held, ChatInk::Attention);
-                    timeline.push(line.fitted(width));
                 }
             }
             timeline.push(plain(ChatLineKind::Blank, "", width));
@@ -2201,6 +2269,242 @@ mod tests {
         assert!(
             header.contains("refresh failed · Ctrl+R to retry"),
             "header must surface the link failure hint: {header}"
+        );
+    }
+
+    /// The point of the collapse: a hold no longer buys its own row.
+    ///
+    /// Before this, one message spent two rows on transport state for
+    /// every one row of what it actually said, and the screenshot that
+    /// prompted the change was a wall of `! held:` with the subjects
+    /// lost between them. The words are unchanged and still exact; they
+    /// ride the status line they qualify.
+    #[test]
+    fn a_hold_rides_the_status_line_instead_of_taking_its_own_row() {
+        let mut queue = make_test_queue();
+        let r1 = RecipientKey::parse(
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1",
+        )
+        .unwrap();
+        let m1 = MessageId::parse("m-0000000000000001").unwrap();
+        let row = QueueRow {
+            target: QueueTarget::new(m1.clone(), r1),
+            message_id: m1,
+            recipient: r1,
+            recipient_label: "held-agent".into(),
+            sender: r1,
+            sender_label: "operator".into(),
+            subject: Some("Subject that must not be crowded out".into()),
+            mailbox: MailboxWord::Claimed,
+            wake: WakeWord::NeedsAttention,
+            cause: Some(NotificationAttentionCause::VerifyFailed),
+            fifo_position: None,
+            needs_action: false,
+            seq: 10,
+            updated_at: 1_000_000,
+            direction: Direction::Inbound,
+            ..Default::default()
+        };
+        queue.replace(Snapshot {
+            watermark: 10,
+            rows: vec![row],
+        });
+
+        let reg = AvatarRegistry::default();
+        let lines = render_chat_lines(&queue, ChatRenderContext::new(&reg).at(1_010_000), 80, 15);
+
+        let carrying: Vec<&ChatLine> = lines
+            .iter()
+            .filter(|l| {
+                l.spans
+                    .iter()
+                    .any(|s| s.text.contains("held: verify failed"))
+            })
+            .collect();
+        assert_eq!(
+            carrying.len(),
+            1,
+            "the cause must appear exactly once, not on a row of its own as well"
+        );
+        let text: String = carrying[0].spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(
+            text.contains("m-0000") && text.contains("held: verify failed"),
+            "the hold must sit on the same line as the delivery status it qualifies: {text}"
+        );
+    }
+
+    /// Decay is about attention, never about truth.
+    ///
+    /// A four-hour-old unresolved attempt rendered as loudly as one from
+    /// fifteen seconds ago teaches an operator to ignore the colour, and
+    /// then the fresh one means nothing. The words never change; only
+    /// the ink does, and with no clock at all it stays loud.
+    #[test]
+    fn an_old_hold_keeps_its_words_and_loses_only_its_voice() {
+        let fresh = 1_000_000u64;
+        assert_eq!(
+            held_ink(fresh, Some(fresh + HELD_LOUD_MS)),
+            ChatInk::Attention,
+            "a hold inside the loud window keeps full attention"
+        );
+        assert_eq!(
+            held_ink(fresh, Some(fresh + HELD_LOUD_MS + 1)),
+            ChatInk::Dim,
+            "one millisecond past the window it stops competing"
+        );
+        assert_eq!(
+            held_ink(fresh, None),
+            ChatInk::Attention,
+            "with no clock a renderer must not decide something is stale"
+        );
+    }
+
+    #[test]
+    fn attention_decay_follows_the_wake_update_not_message_age() {
+        let now = 10_000_000u64;
+        let mut row = QueueRow {
+            subject: Some("Old message with a fresh failure".into()),
+            mailbox: MailboxWord::Claimed,
+            wake: WakeWord::NeedsAttention,
+            cause: Some(NotificationAttentionCause::VerifyFailed),
+            ts: now.saturating_sub(4 * HELD_LOUD_MS),
+            updated_at: now - 1,
+            seq: 10,
+            ..Default::default()
+        };
+
+        let mut queue = make_test_queue();
+        queue.replace(Snapshot {
+            watermark: 10,
+            rows: vec![row.clone()],
+        });
+        let reg = AvatarRegistry::default();
+        let lines = render_chat_lines(&queue, ChatRenderContext::new(&reg).at(now), 100, 15);
+        let fresh_hold = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.text.contains("held: verify failed"))
+            .expect("fresh wake failure remains visible");
+        assert_eq!(
+            fresh_hold.ink,
+            ChatInk::Attention,
+            "an old message's newly changed wake must not start dim"
+        );
+
+        row.updated_at = now.saturating_sub(HELD_LOUD_MS + 1);
+        queue.replace(Snapshot {
+            watermark: 11,
+            rows: vec![row],
+        });
+        let lines = render_chat_lines(&queue, ChatRenderContext::new(&reg).at(now), 100, 15);
+        let old_hold = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.text.contains("held: verify failed"))
+            .expect("old wake failure keeps its exact words");
+        assert_eq!(old_hold.ink, ChatInk::Dim);
+
+        let narrow_lines = render_chat_lines(&queue, ChatRenderContext::new(&reg).at(now), 23, 15);
+        let narrow_hold = narrow_lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.text.contains("held: verify failed"))
+            .expect("ultra-narrow mode keeps the old wake failure visible");
+        assert_eq!(
+            narrow_hold.ink,
+            ChatInk::Dim,
+            "ultra-narrow and normal layouts must use the same decay clock"
+        );
+    }
+
+    #[test]
+    fn authorized_bodies_widen_across_thread_and_render_multiline() {
+        let mut queue = make_test_queue();
+        let r1 = RecipientKey::parse(
+            "agent:00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002/%1",
+        )
+        .unwrap();
+        let m1 = MessageId::parse("m-0000000000000001").unwrap();
+        let m2 = MessageId::parse("m-0000000000000002").unwrap();
+
+        let row1 = QueueRow {
+            target: QueueTarget::new(m1.clone(), r1),
+            message_id: m1.clone(),
+            recipient: r1,
+            recipient_label: "reviewer".into(),
+            sender: r1,
+            sender_label: "coder".into(),
+            subject: Some("Review implementation".into()),
+            mailbox: MailboxWord::Claimed,
+            wake: WakeWord::Submitted,
+            seq: 10,
+            updated_at: 1_000_000,
+            direction: Direction::Inbound,
+            ..Default::default()
+        };
+        let row2 = QueueRow {
+            target: QueueTarget::new(m2.clone(), r1),
+            message_id: m2.clone(),
+            recipient: r1,
+            recipient_label: "coder".into(),
+            sender: r1,
+            sender_label: "reviewer".into(),
+            subject: Some("Re: Review implementation".into()),
+            mailbox: MailboxWord::Claimed,
+            wake: WakeWord::Submitted,
+            seq: 11,
+            updated_at: 1_001_000,
+            direction: Direction::Inbound,
+            ..Default::default()
+        };
+
+        queue.replace(Snapshot {
+            watermark: 11,
+            rows: vec![row1.clone(), row2.clone()],
+        });
+
+        // Detail is opened on row2, but its loaded thread contains row1's body!
+        let mut detail = Detail::open(&row2, 11);
+        detail.loaded_ok(crate::detail::Loaded {
+            body: Some("Looks great, approved with one nit.\nPlease check line 42.".into()),
+            body_authorized: true,
+            thread: vec![ThreadEntry {
+                message_id: m1.to_string(),
+                sender_label: "coder".into(),
+                subject: Some("Review implementation".into()),
+                body: Some("Line 1 of implementation\nLine 2 of implementation".into()),
+                ts: 1_000_000,
+            }],
+            ..Default::default()
+        });
+
+        let reg = AvatarRegistry::default();
+        let lines = render_chat(
+            &queue,
+            ChatRenderContext::new(&reg)
+                .with_detail(&detail)
+                .at(1_010_000),
+            80,
+            25,
+        );
+
+        let text = lines.join("\n");
+        // Both row1 (from thread entry) and row2 (from loaded body) must render their multi-line bodies!
+        assert!(
+            text.contains("Line 1 of implementation"),
+            "row 1 body from thread entry must be rendered: {text}"
+        );
+        assert!(
+            text.contains("Line 2 of implementation"),
+            "row 1 line 2 must be rendered: {text}"
+        );
+        assert!(
+            text.contains("Looks great, approved with one nit."),
+            "row 2 body must be rendered: {text}"
+        );
+        assert!(
+            text.contains("Please check line 42."),
+            "row 2 line 2 must be rendered: {text}"
         );
     }
 }
