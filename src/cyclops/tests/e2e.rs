@@ -120,6 +120,19 @@ fn run_cyclops(home: &Path, args: &[&str]) -> Output {
     run_cyclops_io(home, &[], args, None)
 }
 
+fn run_send_result(tag: &str, result: Value, args: &[&str]) -> Output {
+    let home = scratch_home(tag);
+    serve_once(&home, hello(1), move |req| {
+        (
+            vec![json!({"id": req["id"], "result": result}).to_string()],
+            false,
+        )
+    });
+    let output = run_cyclops(&home, args);
+    let _ = fs::remove_dir_all(&home);
+    output
+}
+
 /// Copy the built client into an isolated executable pair.
 ///
 /// The daemon stand-in is never started by the restart refusal test. It only
@@ -1975,6 +1988,346 @@ fn mailbox_attention_with_required_wake_exits_one_in_plain_and_json() {
     );
     assert!(machine.stderr.is_empty());
     let _ = fs::remove_dir_all(&json_home);
+}
+
+#[test]
+fn require_wake_checks_every_mailbox_notification_state_in_plain_and_json() {
+    for (index, (state, expected_exit)) in [
+        ("not_started", 1),
+        ("queued", 1),
+        ("gating", 1),
+        ("writing", 1),
+        ("staged", 1),
+        ("submitted", 0),
+        ("notified", 0),
+        ("attention_required", 1),
+        ("superseded", 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let result = json!({
+            "msg_id": "m-mailbox-state",
+            "seq": 1,
+            "inserted": true,
+            "deliveries": [{
+                "to": "reviewer",
+                "state": "queued",
+                "notification_state": state
+            }]
+        });
+
+        let plain = run_send_result(
+            &format!("rw-{index}-p"),
+            result.clone(),
+            &["send", "reviewer", "--subject", "state", "--require-wake"],
+        );
+        assert_eq!(plain.status.code(), Some(expected_exit), "{state} plain");
+
+        let machine = run_send_result(
+            &format!("rw-{index}-j"),
+            result.clone(),
+            &[
+                "send",
+                "reviewer",
+                "--subject",
+                "state",
+                "--require-wake",
+                "--json",
+            ],
+        );
+        assert_eq!(machine.status.code(), Some(expected_exit), "{state} JSON");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&machine.stdout).unwrap(),
+            result,
+            "{state} JSON passthrough"
+        );
+
+        let default_plain = run_send_result(
+            &format!("rw-{index}-dp"),
+            result.clone(),
+            &["send", "reviewer", "--subject", "state"],
+        );
+        assert!(default_plain.status.success(), "{state} default plain");
+
+        let default_json = run_send_result(
+            &format!("rw-{index}-dj"),
+            result,
+            &["send", "reviewer", "--subject", "state", "--json"],
+        );
+        assert!(default_json.status.success(), "{state} default JSON");
+    }
+}
+
+#[test]
+fn require_wake_accepts_proven_legacy_direct_delivery_states() {
+    for (index, state) in ["submitted", "delivered_verified", "delivered_unverified"]
+        .into_iter()
+        .enumerate()
+    {
+        let result = json!({
+            "msg_id": "m-legacy-direct",
+            "seq": 1,
+            "deliveries": [{"to": "reviewer", "state": state}]
+        });
+        for (mode, json_flag) in [("p", false), ("j", true)] {
+            let mut args = vec!["send", "reviewer", "--subject", "legacy", "--require-wake"];
+            if json_flag {
+                args.push("--json");
+            }
+            let output =
+                run_send_result(&format!("rw-legacy-{index}-{mode}"), result.clone(), &args);
+            assert!(
+                output.status.success(),
+                "{state} {mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+#[test]
+fn require_wake_fails_closed_for_missing_unknown_and_broadcast_receipts() {
+    for (index, result) in [
+        json!({
+            "msg_id": "m-missing-notification",
+            "seq": 1,
+            "deliveries": [{"to": "reviewer", "state": "queued"}]
+        }),
+        json!({
+            "msg_id": "m-unknown-notification",
+            "seq": 1,
+            "deliveries": [{
+                "to": "reviewer",
+                "state": "queued",
+                "notification_state": "from_next_year"
+            }]
+        }),
+        json!({
+            "msg_id": "m-unknown-delivery",
+            "seq": 1,
+            "deliveries": [{
+                "to": "reviewer",
+                "state": "from_next_year",
+                "notification_state": "submitted"
+            }]
+        }),
+        json!({
+            "msg_id": "m-missing-delivery",
+            "seq": 1,
+            "deliveries": [{"to": "reviewer", "notification_state": "submitted"}]
+        }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (mode, json_flag) in [("p", false), ("j", true)] {
+            let mut args = vec!["send", "reviewer", "--subject", "unknown", "--require-wake"];
+            if json_flag {
+                args.push("--json");
+            }
+            let output =
+                run_send_result(&format!("rw-closed-{index}-{mode}"), result.clone(), &args);
+            assert_eq!(output.status.code(), Some(1), "case {index} {mode}");
+        }
+    }
+
+    let all_proven = json!({
+        "msg_id": "m-broadcast-proven",
+        "seq": 1,
+        "deliveries": [
+            {"to": "reviewer", "state": "queued", "notification_state": "submitted"},
+            {"to": "implementer", "state": "queued", "notification_state": "notified"}
+        ]
+    });
+    let proven = run_send_result(
+        "rw-broadcast-ok",
+        all_proven,
+        &[
+            "send",
+            "reviewer",
+            "--to",
+            "implementer",
+            "--subject",
+            "broadcast",
+            "--require-wake",
+        ],
+    );
+    assert!(proven.status.success());
+
+    let one_unproven = json!({
+        "msg_id": "m-broadcast-unproven",
+        "seq": 1,
+        "deliveries": [
+            {"to": "reviewer", "state": "queued", "notification_state": "submitted"},
+            {"to": "implementer", "state": "queued", "notification_state": "staged"}
+        ]
+    });
+    let unproven = run_send_result(
+        "rw-broadcast-bad",
+        one_unproven,
+        &[
+            "send",
+            "reviewer",
+            "--to",
+            "implementer",
+            "--subject",
+            "broadcast",
+            "--require-wake",
+            "--json",
+        ],
+    );
+    assert_eq!(unproven.status.code(), Some(1));
+}
+
+#[test]
+fn default_send_accepts_a_future_receipt_state_with_an_honest_plain_warning() {
+    let result = json!({
+        "msg_id": "m-future-send",
+        "seq": 2,
+        "inserted": true,
+        "deliveries": [{"to": "reviewer", "state": "from_next_year"}]
+    });
+
+    let plain = run_send_result(
+        "rw-future-send-plain",
+        result.clone(),
+        &["send", "reviewer", "--subject", "future"],
+    );
+    assert!(
+        plain.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&plain.stdout),
+        "accepted m-future-send\nwake receipt state is unknown to this client\n"
+    );
+
+    let machine = run_send_result(
+        "rw-future-send-json",
+        result.clone(),
+        &["send", "reviewer", "--subject", "future", "--json"],
+    );
+    assert!(machine.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&machine.stdout).unwrap(),
+        result
+    );
+}
+
+#[test]
+fn default_send_rejects_the_same_incomplete_acceptance_envelope_in_plain_and_json() {
+    let plain = run_send_result(
+        "rw-empty-send-plain",
+        json!({}),
+        &["send", "reviewer", "--subject", "incomplete"],
+    );
+    assert_eq!(plain.status.code(), Some(1));
+    assert!(plain.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&plain.stderr).contains("doesn't understand"));
+
+    let machine = run_send_result(
+        "rw-empty-send-json",
+        json!({}),
+        &["send", "reviewer", "--subject", "incomplete", "--json"],
+    );
+    assert_eq!(machine.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&machine.stdout), "{}\n");
+    assert!(machine.stderr.is_empty());
+}
+
+#[test]
+fn default_send_rejects_a_zero_sequence_in_plain_and_json() {
+    let result = json!({
+        "msg_id": "m-zero-seq",
+        "seq": 0,
+        "deliveries": []
+    });
+
+    let plain = run_send_result(
+        "rw-zero-seq-send-plain",
+        result.clone(),
+        &["send", "reviewer", "--subject", "invalid sequence"],
+    );
+    assert_eq!(plain.status.code(), Some(1));
+    assert!(plain.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&plain.stderr).contains("doesn't understand"));
+
+    let machine = run_send_result(
+        "rw-zero-seq-send-json",
+        result.clone(),
+        &[
+            "send",
+            "reviewer",
+            "--subject",
+            "invalid sequence",
+            "--json",
+        ],
+    );
+    assert_eq!(machine.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&machine.stdout).unwrap(),
+        result
+    );
+    assert!(machine.stderr.is_empty());
+}
+
+#[test]
+fn default_reply_accepts_a_future_receipt_state_with_the_same_plain_warning() {
+    let result = json!({
+        "msg_id": "m-future-reply",
+        "seq": 3,
+        "inserted": false,
+        "deliveries": [{"to": "implementer", "state": "from_next_year"}]
+    });
+
+    let plain = run_send_result(
+        "rw-future-reply-plain",
+        result.clone(),
+        &["reply", "m-parent", "--body", "future"],
+    );
+    assert!(
+        plain.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&plain.stdout),
+        "already accepted m-future-reply\nwake receipt state is unknown to this client\n"
+    );
+
+    let machine = run_send_result(
+        "rw-future-reply-json",
+        result.clone(),
+        &["reply", "m-parent", "--body", "future", "--json"],
+    );
+    assert!(machine.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&machine.stdout).unwrap(),
+        result
+    );
+}
+
+#[test]
+fn default_reply_rejects_the_same_incomplete_acceptance_envelope_in_plain_and_json() {
+    let plain = run_send_result(
+        "rw-empty-reply-plain",
+        json!({}),
+        &["reply", "m-parent", "--body", "incomplete"],
+    );
+    assert_eq!(plain.status.code(), Some(1));
+    assert!(plain.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&plain.stderr).contains("doesn't understand"));
+
+    let machine = run_send_result(
+        "rw-empty-reply-json",
+        json!({}),
+        &["reply", "m-parent", "--body", "incomplete", "--json"],
+    );
+    assert_eq!(machine.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&machine.stdout), "{}\n");
+    assert!(machine.stderr.is_empty());
 }
 
 /// A send to a pane nothing detects, in the shape the daemon answers

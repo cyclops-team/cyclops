@@ -502,8 +502,10 @@ struct SendArgs {
     /// Sender-scoped idempotency key for exact retries.
     #[arg(long)]
     client_key: Option<String>,
-    /// Exit nonzero when the durable message was accepted but its optional
-    /// terminal wake needs operator attention.
+    /// Exit 0 only when every recipient's current receipt proves wake
+    /// submitted or notified, or an equivalent legacy direct-delivery
+    /// boundary. Uses the bounded daemon receipt without waiting again;
+    /// nonzero does not undo durable acceptance.
     #[arg(long)]
     require_wake: bool,
     /// Message id this replies to. Recipient and subject come from the referenced message.
@@ -1754,8 +1756,25 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
         println!("{result}");
         return receipts_exit_json(&result, args.require_wake);
     }
+    let acceptance = match message_acceptance(&result) {
+        Some(acceptance) => acceptance,
+        None => {
+            eprintln!("{}", copy::UNREADABLE_ANSWER);
+            return 1;
+        }
+    };
     let receipt: MsgSendResult = match serde_json::from_value(result) {
         Ok(receipt) => receipt,
+        Err(_) if !args.require_wake => {
+            let verb = if acceptance.inserted.unwrap_or(true) {
+                "accepted"
+            } else {
+                "already accepted"
+            };
+            println!("{verb} {}", style.accent(acceptance.msg_id.as_str()));
+            println!("{}", copy::UNKNOWN_WAKE_RECEIPT);
+            return 0;
+        }
         Err(_) => {
             eprintln!("{}", copy::UNREADABLE_ANSWER);
             return 1;
@@ -2622,17 +2641,36 @@ fn cmd_reply(cli: &Cli, style: &Style, args: &ReplyArgs) -> i32 {
         client_key: args.client_key.clone(),
     })
     .expect("msg.reply params serialize");
-    let result: MsgSendResult = match ask(
-        &mut c,
-        "msg.reply",
-        params,
-        cli.json,
-        None,
-        serde_json::from_value,
-    ) {
-        Ok(Some(result)) => result,
-        Ok(None) => return 0,
-        Err(code) => return code,
+    let result = match c.request("msg.reply", params) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("{}", copy::client_error(&error, None));
+            return 1;
+        }
+    };
+    if cli.json {
+        println!("{result}");
+        return i32::from(message_acceptance(&result).is_none());
+    }
+    let acceptance = match message_acceptance(&result) {
+        Some(acceptance) => acceptance,
+        None => {
+            eprintln!("{}", copy::UNREADABLE_ANSWER);
+            return 1;
+        }
+    };
+    let result: MsgSendResult = match serde_json::from_value(result) {
+        Ok(result) => result,
+        Err(_) => {
+            let verb = if acceptance.inserted.unwrap_or(true) {
+                "accepted"
+            } else {
+                "already accepted"
+            };
+            println!("{verb} {}", style.accent(acceptance.msg_id.as_str()));
+            println!("{}", copy::UNKNOWN_WAKE_RECEIPT);
+            return 0;
+        }
     };
     let verb = if result.inserted.unwrap_or(true) {
         "accepted"
@@ -3155,44 +3193,69 @@ fn read_body_file(path: &str) -> Result<String, String> {
     }
 }
 
+struct MessageAcceptance {
+    msg_id: cyclops_proto::MessageId,
+    inserted: Option<bool>,
+}
+
+/// Decode only the fields that prove the daemon accepted a durable message.
+/// Delivery receipts remain a separate compatibility boundary.
+fn message_acceptance(value: &Value) -> Option<MessageAcceptance> {
+    let object = value.as_object()?;
+    let msg_id = cyclops_proto::MessageId::new(object.get("msg_id")?.as_str()?).ok()?;
+    if object.get("seq")?.as_u64()? == 0 {
+        return None;
+    }
+    object.get("deliveries")?.as_array()?;
+    let inserted = match object.get("inserted") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(inserted)) => Some(*inserted),
+        Some(_) => return None,
+    };
+    Some(MessageAcceptance { msg_id, inserted })
+}
+
 /// Durable acceptance is the default success contract. Scripts that also
 /// require the optional pane wake ask for that stronger contract explicitly.
 fn receipts_exit(ds: &[DeliveryReceipt], require_wake: bool) -> i32 {
     i32::from(
-        require_wake
-            && ds.iter().any(|d| {
-                d.pre_write_cause.is_some()
-                    || d.wake_block.is_some()
-                    || d.notification_state == Some(MessageNotificationState::AttentionRequired)
-                    || delivery_needs_human(d.state)
-            }),
+        require_wake && (ds.is_empty() || ds.iter().any(|receipt| !receipt_proves_wake(receipt))),
     )
 }
 
-/// The same rule read tolerantly off the raw result for --json
-/// passthrough: a state name from a newer daemon does not decode, and an
-/// exit code is not the place to fail on that.
+fn receipt_proves_wake(receipt: &DeliveryReceipt) -> bool {
+    if receipt.pre_write_cause.is_some()
+        || receipt.wake_block.is_some()
+        || delivery_needs_human(receipt.state)
+    {
+        return false;
+    }
+
+    match receipt.notification_state {
+        Some(MessageNotificationState::Submitted | MessageNotificationState::Notified) => true,
+        Some(_) => false,
+        None => matches!(
+            receipt.state,
+            DeliveryState::Submitted
+                | DeliveryState::DeliveredVerified
+                | DeliveryState::DeliveredUnverified
+        ),
+    }
+}
+
+/// JSON output remains an untouched daemon response. Strong wake evaluation
+/// decodes that response into the same receipt type as plain output and fails
+/// closed when a required field or state is not understood.
 fn receipts_exit_json(v: &Value, require_wake: bool) -> i32 {
+    if message_acceptance(v).is_none() {
+        return 1;
+    }
     if !require_wake {
         return 0;
     }
-    let bad = v
-        .get("deliveries")
-        .and_then(Value::as_array)
-        .is_some_and(|a| {
-            a.iter().any(|d| {
-                d.get("pre_write_cause")
-                    .is_some_and(|cause| !cause.is_null())
-                    || d.get("wake_block").is_some_and(|block| !block.is_null())
-                    || serde_json::from_value::<MessageNotificationState>(
-                        d["notification_state"].clone(),
-                    )
-                    .is_ok_and(|state| state == MessageNotificationState::AttentionRequired)
-                    || serde_json::from_value::<DeliveryState>(d["state"].clone())
-                        .is_ok_and(delivery_needs_human)
-            })
-        });
-    i32::from(bad)
+    serde_json::from_value::<MsgSendResult>(v.clone())
+        .map(|result| receipts_exit(&result.deliveries, true))
+        .unwrap_or(1)
 }
 
 fn cmd_watch_json(c: &mut Client, cli: &Cli, style: &Style, kinds: &[String]) -> i32 {
@@ -3399,6 +3462,24 @@ mod tests {
         let help = error.to_string();
         assert!(!help.contains("--wait"), "{help}");
         assert!(!help.contains("--timeout"), "{help}");
+    }
+
+    #[test]
+    fn send_help_states_the_bounded_require_wake_contract() {
+        let error = match Cli::try_parse_from(["cyclops", "send", "--help"]) {
+            Ok(_) => panic!("send --help returned a command instead of help"),
+            Err(error) => error,
+        };
+        let help = error.to_string();
+        for words in [
+            "every recipient's current receipt",
+            "submitted or notified",
+            "legacy direct-delivery",
+            "without waiting again",
+            "does not undo durable acceptance",
+        ] {
+            assert!(help.contains(words), "missing {words:?} in {help}");
+        }
     }
 
     #[test]
@@ -4096,113 +4177,187 @@ mod tests {
         }
     }
 
-    /// `--require-wake` asks the exit code to answer the same question as the
-    /// eye. Both paths are checked against every state, and the --json path
-    /// against the same states as the daemon spells them.
     #[test]
-    fn the_exit_code_branches_exactly_where_the_rule_does() {
-        use DeliveryState::*;
-        for state in [
-            Queued,
-            Gating,
-            Pasting,
-            Staged,
-            Submitted,
-            DeliveredVerified,
-            DeliveredUnverified,
-            RetryQueued,
-            AttentionRequired,
-            ParkedBlockedQuota,
+    fn require_wake_accepts_only_mailbox_submit_success_states() {
+        use MessageNotificationState::*;
+
+        for (state, expected_exit) in [
+            (NotStarted, 1),
+            (Queued, 1),
+            (Gating, 1),
+            (Writing, 1),
+            (Staged, 1),
+            (Submitted, 0),
+            (Notified, 0),
+            (AttentionRequired, 1),
+            (Superseded, 1),
         ] {
-            let want = i32::from(delivery_needs_human(state));
-            assert_eq!(receipts_exit(&[receipt(state)], true), want, "{state:?}");
-            let wire = serde_json::to_value(state).expect("a state serializes");
-            assert_eq!(
-                receipts_exit_json(
-                    &json!({"deliveries": [{"to": "reviewer", "state": wire}]}),
-                    true,
-                ),
-                want,
-                "{state:?} through --json"
-            );
+            let mut mailbox = receipt(DeliveryState::Queued);
+            mailbox.notification_state = Some(state);
+            assert_eq!(receipts_exit(&[mailbox], true), expected_exit, "{state:?}");
         }
-        // One bad recipient in a broadcast is enough.
-        assert_eq!(
-            receipts_exit(
-                &[receipt(DeliveredVerified), receipt(ParkedBlockedQuota)],
-                true,
-            ),
-            1
-        );
-        let mut wake_blocked = receipt(Queued);
-        wake_blocked.wake_block = Some(cyclops_proto::MessageWakeBlock::EnqueueRefused);
-        assert_eq!(receipts_exit(&[wake_blocked], true), 1);
-        assert_eq!(
-            receipts_exit_json(
-                &json!({
-                    "deliveries": [{"state": "queued", "wake_block": "enqueue_refused"}]
-                }),
-                true
-            ),
-            1
-        );
-        let mut pre_write_blocked = receipt(Queued);
-        pre_write_blocked.pre_write_cause =
-            Some(cyclops_proto::NotificationPreWriteCause::BindingUnprovable);
-        assert_eq!(receipts_exit(&[pre_write_blocked], true), 1);
-        assert_eq!(
-            receipts_exit_json(
-                &json!({
-                    "deliveries": [{
-                        "state": "queued",
-                        "pre_write_cause": "binding_unprovable"
-                    }]
-                }),
-                true
-            ),
-            1
-        );
-        // Real mailbox receipts keep the compatibility delivery state queued
-        // and carry the authoritative wake state separately. A fabricated
-        // legacy AttentionRequired state would not gate this contract.
-        let mut mailbox_attention = receipt(Queued);
-        mailbox_attention.notification_state = Some(MessageNotificationState::AttentionRequired);
-        assert_eq!(receipts_exit(&[mailbox_attention], true), 1);
-        assert_eq!(
-            receipts_exit_json(
-                &json!({
-                    "deliveries": [{
-                        "state": "queued",
-                        "notification_state": "attention_required",
-                        "quota_state": "held"
-                    }]
-                }),
-                true
-            ),
-            1
-        );
-        // A state this build does not know is not an error to report on:
-        // the protocol is tolerant, and an exit code is a bad place to
-        // fail. Neither is a missing deliveries array.
-        assert_eq!(
-            receipts_exit_json(&json!({"deliveries": [{"state": "from_next_year"}]}), true,),
-            0
-        );
-        assert_eq!(receipts_exit_json(&json!({}), true), 0);
     }
 
     #[test]
-    fn accepted_send_defaults_to_success_and_can_require_a_healthy_wake() {
+    fn require_wake_json_matches_typed_receipts_and_fails_closed() {
+        use MessageNotificationState::*;
+
+        for state in [
+            NotStarted,
+            Queued,
+            Gating,
+            Writing,
+            Staged,
+            Submitted,
+            Notified,
+            AttentionRequired,
+            Superseded,
+        ] {
+            let mut mailbox = receipt(DeliveryState::Queued);
+            mailbox.notification_state = Some(state);
+            let expected = receipts_exit(&[mailbox], true);
+            assert_eq!(
+                receipts_exit_json(
+                    &json!({
+                        "msg_id": "m-1",
+                        "seq": 1,
+                        "deliveries": [{
+                            "to": "reviewer",
+                            "state": "queued",
+                            "notification_state": serde_json::to_value(state).unwrap()
+                        }]
+                    }),
+                    true,
+                ),
+                expected,
+                "{state:?}"
+            );
+        }
+
+        for result in [
+            json!({
+                "msg_id": "m-1",
+                "seq": 1,
+                "deliveries": [{
+                    "to": "reviewer",
+                    "state": "queued",
+                    "notification_state": "from_next_year"
+                }]
+            }),
+            json!({
+                "msg_id": "m-1",
+                "seq": 1,
+                "deliveries": [{"to": "reviewer", "state": "from_next_year"}]
+            }),
+            json!({"msg_id": "m-1", "seq": 1}),
+            json!({"msg_id": "m-1", "seq": 1, "deliveries": []}),
+        ] {
+            assert_eq!(receipts_exit_json(&result, true), 1, "{result}");
+        }
+        assert_eq!(receipts_exit(&[], true), 1);
+    }
+
+    #[test]
+    fn require_wake_accepts_only_proven_legacy_direct_states() {
+        use DeliveryState::*;
+        for (state, expected_exit) in [
+            (Queued, 1),
+            (Gating, 1),
+            (Pasting, 1),
+            (Staged, 1),
+            (Submitted, 0),
+            (DeliveredVerified, 0),
+            (DeliveredUnverified, 0),
+            (RetryQueued, 1),
+            (AttentionRequired, 1),
+            (ParkedBlockedQuota, 1),
+        ] {
+            assert_eq!(
+                receipts_exit(&[receipt(state)], true),
+                expected_exit,
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn require_wake_rejects_blocks_and_unproven_broadcast_recipients() {
+        let mut submitted = receipt(DeliveryState::Queued);
+        submitted.notification_state = Some(MessageNotificationState::Submitted);
+        let notified = DeliveryReceipt {
+            notification_state: Some(MessageNotificationState::Notified),
+            ..submitted.clone()
+        };
+        assert_eq!(receipts_exit(&[submitted.clone(), notified], true), 0);
+
+        let queued = receipt(DeliveryState::Queued);
+        assert_eq!(receipts_exit(&[submitted.clone(), queued.clone()], true), 1);
+
+        let mut wake_blocked = submitted.clone();
+        wake_blocked.wake_block = Some(cyclops_proto::MessageWakeBlock::EnqueueRefused);
+        assert_eq!(receipts_exit(&[wake_blocked], true), 1);
+
+        let mut pre_write_blocked = submitted.clone();
+        pre_write_blocked.pre_write_cause =
+            Some(cyclops_proto::NotificationPreWriteCause::BindingUnprovable);
+        assert_eq!(receipts_exit(&[pre_write_blocked], true), 1);
+
+        let mut human_required = submitted;
+        human_required.state = DeliveryState::AttentionRequired;
+        assert_eq!(receipts_exit(&[human_required], true), 1);
+    }
+
+    #[test]
+    fn accepted_send_defaults_to_success_for_any_current_wake_receipt() {
         let mut blocked = receipt(DeliveryState::Queued);
         blocked.wake_block = Some(cyclops_proto::MessageWakeBlock::EnqueueRefused);
 
         assert_eq!(receipts_exit(&[blocked.clone()], false), 0);
         assert_eq!(receipts_exit(&[blocked], true), 1);
-        let raw = json!({
-            "deliveries": [{"state": "queued", "wake_block": "enqueue_refused"}]
+        for raw in [
+            json!({
+                "msg_id": "m-blocked",
+                "seq": 1,
+                "deliveries": [{
+                    "to": "reviewer",
+                    "state": "queued",
+                    "wake_block": "enqueue_refused"
+                }]
+            }),
+            json!({
+                "msg_id": "m-future",
+                "seq": 2,
+                "deliveries": [{"to": "reviewer", "state": "from_next_year"}]
+            }),
+        ] {
+            assert_eq!(receipts_exit_json(&raw, false), 0, "{raw}");
+        }
+        assert_eq!(receipts_exit_json(&json!({}), false), 1);
+    }
+
+    #[test]
+    fn default_acceptance_envelope_validates_only_durable_acceptance_fields() {
+        let future_receipt = json!({
+            "msg_id": "m-future",
+            "seq": 1,
+            "inserted": false,
+            "deliveries": [{"to": "reviewer", "state": "from_next_year"}]
         });
-        assert_eq!(receipts_exit_json(&raw, false), 0);
-        assert_eq!(receipts_exit_json(&raw, true), 1);
+        let acceptance = message_acceptance(&future_receipt).expect("valid acceptance");
+        assert_eq!(acceptance.msg_id.as_str(), "m-future");
+        assert_eq!(acceptance.inserted, Some(false));
+
+        for invalid in [
+            json!({}),
+            json!({"msg_id": "future", "seq": 1, "deliveries": []}),
+            json!({"msg_id": "m-future", "seq": 0, "deliveries": []}),
+            json!({"msg_id": "m-future", "seq": "1", "deliveries": []}),
+            json!({"msg_id": "m-future", "seq": 1}),
+            json!({"msg_id": "m-future", "seq": 1, "deliveries": {}}),
+        ] {
+            assert!(message_acceptance(&invalid).is_none(), "{invalid}");
+            assert_eq!(receipts_exit_json(&invalid, false), 1, "{invalid}");
+        }
     }
 
     /// A watched roster for the scoping rule: session names, each with

@@ -393,6 +393,15 @@ sender-scoped `client_key` resolves to an existing exact request. Each
 `position`, when present, is the number of older pending entries in that
 recipient's FIFO.
 
+Default CLI send and reply validate this acceptance envelope independently of
+the closed receipt enums: `msg_id` must be a valid message id, `seq` must be a
+positive journal sequence, and `deliveries` must be an array. Once those fields
+prove acceptance, a receipt state added by a newer daemon still exits 0. Plain
+output prints the acceptance and an unknown-wake-receipt compatibility warning;
+JSON preserves the raw response. An invalid or incomplete acceptance envelope
+exits 1 in both modes. `--require-wake` instead requires full receipt decoding
+under the stronger rule below.
+
 `DeliveryReceipt.wake_block` is an optional `MessageWakeBlock`. It is present
 when the recipient FIFO head has no live notification owner and is absent for
 a worker-owned head or an ordinary item queued behind that head. It does not
@@ -409,6 +418,16 @@ recipient, message, and attempt projection. The event is only an invalidation;
 the projection supplies the receipt. The shared observation deadline changes
 no state. A message queued behind an older head reports `not_started` and its
 position, with neither the head's `wake_block` nor its `pre_write_cause`.
+
+The CLI's `--require-wake` flag evaluates this one bounded current response; it
+adds no protocol field, polling, or second wait. Exit 0 requires every mailbox
+receipt to carry `notification_state: "submitted"` or `"notified"`. When
+`notification_state` is absent on a supported legacy direct-delivery receipt,
+`state: "submitted"`, `"delivered_verified"`, or `"delivered_unverified"`
+is equivalent proof. Any other notification state, `pre_write_cause`,
+`wake_block`, a delivery state that requires human action, or a missing or
+unknown state exits 1. The message is already durably accepted, so that exit
+must not trigger an unkeyed resend.
 
 For a non-admin recipient, the daemon selects one transport at the terminal
 write boundary. An exact installed claim skill selects the content-free
@@ -700,7 +719,9 @@ new snapshot.
 
 `msg.reply` takes `message_id`, `body`, and optional `client_key`. The daemon
 derives the sole recipient, thread root, and `Re: ` subject from the visible
-parent. The `reply_to` field on `msg.send` uses the same validation.
+parent. The `reply_to` field on `msg.send` uses the same validation. The default
+CLI reply exits 0 after this response proves durable acceptance; it does not
+infer task completion or require terminal wake proof.
 
 `admin` is a first-class durable mailbox recipient, not a pane. An agent may
 send or reply to admin. Admin messages create no notification attempt and no

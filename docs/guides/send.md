@@ -45,9 +45,18 @@ A durable failure before terminal bytes reports `wake blocked before write
 names the failed write-boundary proof, while the second names why no scheduler
 worker owns the wake. The plain and JSON commands still exit 0 because the
 message remains durably accepted and claimable. Add `--require-wake` when a
-script must exit 1 for either field or for another wake state that needs
-operator attention. Inspect the named cause before requeueing; a retry without
-changed evidence cannot clear a terminal pre-write block.
+script needs every recipient's current receipt to prove that the wake reached
+`submitted` or `notified`. A legacy direct-delivery receipt without
+`notification_state` may instead prove `submitted`, `delivered_verified`, or
+`delivered_unverified`. Every other wake state, a missing or unknown state,
+`pre_write_cause`, `wake_block`, or a delivery that needs human action exits 1.
+
+`--require-wake` evaluates the daemon's bounded current receipt. It does not
+poll or add a second wait. A nonzero result does not undo durable acceptance,
+so inspect the message before taking action and never use an unkeyed resend as
+recovery. Reuse the same explicit client key only for an intended exact retry.
+Inspect a named block before requeueing; unchanged evidence cannot clear a
+terminal pre-write block.
 
 A position such as `2 ahead` is the recipient mailbox's FIFO position. The
 daemon never bypasses an older pending message. When the oldest pending
@@ -57,6 +66,13 @@ the head message id, its cause, and how many wait behind it, and every
 follower cell reads `N ahead · behind <id> (<cause>)`. The held-queue line
 names next actions for the exact cause. It does not treat alarm clearance or
 payload retrieval alone as proof that a post-write composer barrier retired.
+
+The default CLI validates durable acceptance from the response's message id,
+positive journal sequence, and deliveries array before interpreting the wake
+receipts. A receipt state added by a newer daemon therefore still exits 0
+after valid acceptance. Plain output prints the accepted message id and warns
+that the wake receipt state is unknown to this client; JSON preserves the raw
+response. An incomplete acceptance envelope exits 1 in both modes.
 
 The body and wake use different paths. Doorbell mode never pastes the message
 body. A terminal wake stages one `inbox claim` command, while a pull client may
@@ -206,7 +222,8 @@ append-only.
 
 Prefer `cyclops reply <id>` to `cyclops send --subject "ignored" --reply-to <id>`.
 Both use the same daemon validation. Neither accepts a recipient because the
-daemon derives the exact route and subject from the referenced message.
+daemon derives the exact route and subject from the referenced message. The
+default reply command exits 0 after durable acceptance, like a default send.
 
 ## Attention and operator recovery
 
@@ -297,13 +314,14 @@ the `msg.send` mailbox contract.
 
 ## Exit and waiting semantics
 
-- `0`: the message was accepted, or the idempotency key named an existing
-  accepted message
+- `0`: the send or reply was accepted, or the idempotency key named an existing
+  accepted message; a default command does not require terminal wake proof
 - `1`: no success response was received; with `--require-wake`, it can also
-  mean the message was accepted but its optional terminal wake needs operator
-  attention. Inspect current state before retrying. Reuse the same explicit
-  client key for any exact retry because a response can be lost after durable
-  acceptance
+  mean the message was accepted but at least one current receipt did not prove
+  a submitted or notified wake. This is a bounded evaluation, not another
+  wait. Inspect current state and do not issue an unkeyed resend. Reuse the same
+  explicit client key only for an intended exact retry because a response can
+  be lost after durable acceptance
 - `2`: local command usage was invalid
 
 `cyclops send` does not wait for task completion. `cyclops wait <target>
