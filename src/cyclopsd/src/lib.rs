@@ -1901,6 +1901,12 @@ impl Daemon {
         *self.inner.fail_pre_record_writing.lock().unwrap() = Some(attempt);
     }
 
+    /// Test-only seam: read the current armed fail_pre_record_writing target attempt.
+    #[doc(hidden)]
+    pub fn fail_pre_record_writing_target_for_test(&self) -> Option<NotificationAttemptId> {
+        *self.inner.fail_pre_record_writing.lock().unwrap()
+    }
+
     /// Adopt a pane under a label, or un-adopt it. `target` is a pane id or
     /// an existing label; `label: None` clears.
     pub async fn label_pane(

@@ -485,16 +485,19 @@ async fn supervised_child_recovery_failure_visibly_faults_and_never_restarts() {
     }
 
     let manifest = recovery_manifest();
-    let mut rig = Rig::new(
+    let sw = composer_pane();
+    let mut rig = Rig::new_multi(
         "gate3-recovery-failure-fault",
         &manifest,
-        &composer_pane(),
+        &[("s0", &sw), ("s1", &sw)],
         "receipt_block_ms = 500\n",
     )
     .await;
 
-    let pane = rig.pane_ids().await[0].clone();
+    let pane = rig.pane_ids_session(0).await[0].clone();
+    let pane_unrelated = rig.pane_ids_session(1).await[0].clone();
     rig.label(&pane, "worker").await;
+    rig.label(&pane_unrelated, "worker_unrelated").await;
 
     // Pause once at pre_submit (when state is Staged), signal the test,
     // arm the exact recovery append failure, then release into panic.
@@ -551,15 +554,41 @@ async fn supervised_child_recovery_failure_visibly_faults_and_never_restarts() {
     rig.daemon.fail_notification_recovery_append(target_attempt);
 
     // ── Non-Target Append Targeting Proof ──
-    // Prove that arming the fault for `target_attempt` does NOT fail an unrelated / non-target operation.
-    let preview_res = rig
-        .ctl
-        .request("alarm.preview", json!({"older_than_ms": 0}))
-        .await;
+    // Prove that arming the fault for `target_attempt` does NOT fail an unrelated / non-target notification append.
+    let unrelated_send = rig
+        .daemon
+        .msg_send(
+            "admin",
+            serde_json::from_value::<MsgSendParams>(json!({
+                "to": ["worker_unrelated"],
+                "subject": "Unrelated notification append",
+                "body": "Unrelated payload",
+                "client_key": "unrelated-append-job"
+            }))
+            .unwrap(),
+        )
+        .await
+        .expect("non-target notification append must succeed while target recovery fault is armed");
+    let unrelated_id = unrelated_send["msg_id"].as_str().unwrap().to_string();
+
+    // Verify unrelated append committed to journal with its own distinct attempt id
+    let lines = workspace_lines(&rig);
+    let unrelated_lines: Vec<_> = lines.iter().filter(|l| l.id == unrelated_id).collect();
     assert!(
-        preview_res["error"].is_null(),
-        "non-target operations must succeed while fault is armed for target_attempt: {preview_res}"
+        !unrelated_lines.is_empty(),
+        "unrelated message must have journal entries"
     );
+    for line in &unrelated_lines {
+        if let Some(data) = &line.data {
+            if let Some(attempt_str) = data.get("attempt_id").and_then(|a| a.as_str()) {
+                assert_ne!(
+                    attempt_str,
+                    target_attempt.to_string(),
+                    "unrelated notification attempt must differ from target_attempt"
+                );
+            }
+        }
+    }
 
     // Release pause into panic: child crashes, supervisor catches it, recover_failed_job tries to
     // record attention in journal for target_attempt, store append fails, recover_failed_job returns false,
@@ -743,6 +772,97 @@ async fn composer_barrier_cannot_leak_between_write_boundary_and_durable_transit
             // Clear the pause hook so recovery retry and subsequent messages proceed unpaused
             rig.daemon.clear_inject_pause();
 
+            // ── Concurrent Unrelated Message Non-Interference Proof ──
+            // WHILE target_attempt is still paused, send an active message to `worker_unrelated`.
+            // Proves that arming `target_attempt` cannot be consumed by or interfere with a concurrent
+            // unrelated mailbox attempt executing while the seam is armed.
+            let unrelated_send = rig
+                .daemon
+                .msg_send(
+                    "admin",
+                    serde_json::from_value::<MsgSendParams>(json!({
+                        "to": ["worker_unrelated"],
+                        "subject": "Unrelated message",
+                        "body": "Unrelated payload",
+                        "client_key": "unrelated-msg"
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .expect("unrelated message must deliver cleanly while target attempt is paused and armed");
+            let unrelated_id = unrelated_send["msg_id"].as_str().unwrap().to_string();
+
+            // Assert unrelated registry ownership and transitions
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let snap = rig
+                    .daemon
+                    .messages_snapshot_for_test("admin", 10)
+                    .expect("snapshot");
+                if let Some(unrelated_row) = snap
+                    .rows
+                    .iter()
+                    .find(|r| r.message_id.as_str() == unrelated_id)
+                {
+                    if unrelated_row.recipients[0].notification.state
+                        == cyclops_proto::MessageNotificationState::Notified
+                    {
+                        break;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "unrelated message did not reach notified"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            // Assert unrelated attempt != target_attempt
+            let lines = workspace_lines(&rig);
+            let mut unrelated_attempt_id = String::new();
+            for line in lines.iter().filter(|l| l.id == unrelated_id) {
+                if let Some(data) = &line.data {
+                    if let Some(attempt_str) = data.get("attempt_id").and_then(|a| a.as_str()) {
+                        assert_ne!(
+                            attempt_str,
+                            target_attempt.to_string(),
+                            "unrelated attempt must differ from target_attempt"
+                        );
+                        unrelated_attempt_id = attempt_str.to_string();
+                    }
+                }
+            }
+            assert!(
+                !unrelated_attempt_id.is_empty(),
+                "unrelated attempt id must be present in journal"
+            );
+            let unrelated_attempt = NotificationAttemptId::parse(&unrelated_attempt_id)
+                .expect("parse unrelated attempt id");
+            let unrelated_locator =
+                cyclops_proto::notification_attempt_claim_locator(unrelated_attempt);
+
+            // Assert exactly one execution on unrelated pane p1
+            let p1_out = rig
+                .tmux
+                .run(&["capture-pane", "-p", "-S", "-", "-t", &p1]);
+            let p1_content = String::from_utf8_lossy(&p1_out.stdout);
+            assert!(
+                p1_content.contains(unrelated_locator.as_str()),
+                "unrelated doorbell locator must appear on p1: {p1_content}"
+            );
+            assert_eq!(
+                p1_content.matches("FAKETUI-WORKING").count(),
+                1,
+                "unrelated pane must execute exactly once: {p1_content}"
+            );
+
+            // Assert that the fault remains armed for target_attempt and was NOT consumed by the unrelated message
+            assert_eq!(
+                rig.daemon.fail_pre_record_writing_target_for_test(),
+                Some(target_attempt),
+                "fault must remain armed exclusively for target_attempt"
+            );
+
             // Release target worker into execution (will trigger fail_pre_record_writing on target_attempt)
             release_tx.send(true).expect("release target worker");
             target_attempt
@@ -750,24 +870,6 @@ async fn composer_barrier_cannot_leak_between_write_boundary_and_durable_transit
     );
     let send1 = send_res.unwrap();
     let first_id = send1["msg_id"].as_str().unwrap().to_string();
-
-    // ── Concurrent Unrelated Message Non-Interference Proof ──
-    // Send a message to `worker_unrelated` to prove that arming `target_attempt` cannot be consumed
-    // by or interfere with a concurrent unrelated mailbox attempt.
-    let _unrelated_send = rig
-        .daemon
-        .msg_send(
-            "admin",
-            serde_json::from_value::<MsgSendParams>(json!({
-                "to": ["worker_unrelated"],
-                "subject": "Unrelated message",
-                "body": "Unrelated payload",
-                "client_key": "unrelated-msg"
-            }))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
     // Because the worker exited before the first durable transition, UnwrittenHold dropped and rolled back
     // the in-memory hold. recover_failed_job requeued the same attempt cleanly.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -791,6 +893,13 @@ async fn composer_barrier_cannot_leak_between_write_boundary_and_durable_transit
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
+    // Assert that target_attempt execution consumed and cleared the armed fault
+    assert_eq!(
+        rig.daemon.fail_pre_record_writing_target_for_test(),
+        None,
+        "fault must be cleared after target_attempt executes"
+    );
 
     // Collect every notification fact attempt_id for first message and assert one unique id across crash/recovery
     let lines = workspace_lines(&rig);
