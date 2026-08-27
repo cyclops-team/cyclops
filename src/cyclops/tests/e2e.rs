@@ -1092,6 +1092,7 @@ fn inbox_next_subscribes_before_listing_and_claims_after_one_event() {
                                 "session_instance_id": "00000000-0000-4000-8000-000000000002",
                                 "pane_id": "%9"
                             },
+                            "recipient_label": "codey-test",
                             "sender_label": "gemini-test",
                             "subject": "Startup retrospective",
                             "body": "The socket path breaks the circular wait.",
@@ -1126,9 +1127,10 @@ fn inbox_next_subscribes_before_listing_and_claims_after_one_event() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "[cyclops m-live-use] FROM: gemini-test  SUBJECT: Startup retrospective\n\
+        "[cyclops m-live-use] TO: codey-test  FROM: gemini-test  SUBJECT: Startup retrospective\n\
          The socket path breaks the circular wait.\n\
-         Reply: cyclops reply m-live-use --body \"...\"\n"
+         Reply: cyclops reply m-live-use --body \"...\"\n\
+         [cyclops:end m-live-use]\n"
     );
     assert!(out.stderr.is_empty());
     let _ = fs::remove_dir_all(&home);
@@ -1249,10 +1251,12 @@ fn inbox_next_relists_when_the_selected_message_was_superseded() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains("[cyclops m-new]"),
-        "stdout: {}",
-        String::from_utf8_lossy(&out.stdout)
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[cyclops m-new] FROM: gemini-test  SUBJECT: Replacement request\n\
+         Use the replacement.\n\
+         Reply: cyclops reply m-new --body \"...\"\n\
+         [cyclops:end m-new]\n"
     );
     let _ = fs::remove_dir_all(&home);
 }

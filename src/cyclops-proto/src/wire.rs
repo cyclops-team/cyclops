@@ -1234,6 +1234,10 @@ pub struct InboxClaimResult {
 pub struct InboxMessage {
     pub message_id: crate::mailbox::MessageId,
     pub kind: crate::ledger::Kind,
+    /// Immutable recipient label captured when the message was accepted.
+    /// Older daemons omit it, so clients must tolerate its absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient_label: Option<String>,
     /// Authoritative endpoint. Older daemons omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender: Option<crate::identity::RecipientKey>,
@@ -2389,6 +2393,32 @@ mod tests {
         assert_eq!(
             MessageNotificationState::from(crate::NotificationState::WithdrawnByOperator),
             MessageNotificationState::NotStarted
+        );
+    }
+
+    #[test]
+    fn inbox_message_recipient_label_is_additive() {
+        let legacy: InboxMessage = serde_json::from_value(serde_json::json!({
+            "message_id": "m-legacy",
+            "kind": "msg",
+            "sender_label": "sender",
+            "thread_root": "m-legacy"
+        }))
+        .unwrap();
+        assert_eq!(legacy.recipient_label, None);
+
+        let current = InboxMessage {
+            recipient_label: Some("reviewer".into()),
+            ..legacy
+        };
+        let wire = serde_json::to_value(&current).unwrap();
+        assert_eq!(wire["recipient_label"], "reviewer");
+        assert_eq!(
+            serde_json::from_value::<InboxMessage>(wire)
+                .unwrap()
+                .recipient_label
+                .as_deref(),
+            Some("reviewer")
         );
     }
 

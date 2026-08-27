@@ -696,8 +696,9 @@ stop_composer reviewer "$N2"
 agent_command reviewer "$N2" "inbox list --plain"
 check "inbox list exposes metadata" "^$REVIEW_ID implementer · Release notes review\$"
 agent_command reviewer "$N2" "inbox claim $REVIEW_LOCATOR --plain"
-check "the displayed locator fetches the original envelope" "^\[cyclops $REVIEW_ID\] FROM: implementer  SUBJECT: Release notes review\$"
+check "the displayed locator fetches the original envelope" "^\[cyclops $REVIEW_ID\] TO: reviewer  FROM: implementer  SUBJECT: Release notes review\$"
 check "the displayed locator fetches the body" '^Check the mailbox contract\.$'
+check "the displayed locator closes the exact envelope" "^\[cyclops:end $REVIEW_ID\]\$"
 agent_command reviewer "$N2" "inbox claim $REVIEW_LOCATOR --plain"
 check "the same locator repeat returns the same payload" '^Check the mailbox contract\.$'
 agent_command reviewer "$N2" "inbox claim $REVIEW_ID --plain"

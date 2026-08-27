@@ -578,10 +578,19 @@ mailbox entry, and returns the immutable payload:
 <- {"id":6,"result":{"disposition":"claimed","message":{
     "body":"gateway.rs:120 drops the burst path","kind":"msg",
     "message_id":"m-7fe0df",
+    "recipient_label":"reviewer",
     "sender":{"kind":"admin","workspace_id":"2863a6ef-0f58-46ad-a87d-7b4157ba8e6a"},
     "sender_label":"admin",
     "subject":"Review the rate limiter","thread_root":"m-7fe0df"}}}
 ```
+
+`recipient_label` is the immutable label paired with the authenticated
+claimant when the message was accepted. It is additive and optional because
+older daemons omit it. Plain clients use it to frame the claimed payload as
+`TO`, `FROM`, and `SUBJECT`, followed by the authenticated body, the reply
+instruction when applicable, and `[cyclops:end <message-id>]`. When an older
+daemon omits it, clients retain the legacy header rather than inventing a
+recipient.
 
 A fresh claim of a message that is not the caller's oldest pending one also
 returns the additive optional `skipped_oldest`: the oldest pending message id

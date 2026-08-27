@@ -127,15 +127,19 @@ Claim exactly the named message to fetch its immutable payload:
 
 ```console
 $ cyclops inbox claim m-3f9c2a
-[cyclops m-3f9c2a] FROM: admin  SUBJECT: Review the rate limiter
+[cyclops m-3f9c2a] TO: reviewer  FROM: admin  SUBJECT: Review the rate limiter
 gateway.rs:120
 Reply: cyclops reply m-3f9c2a --body "..."
+[cyclops:end m-3f9c2a]
 ```
 
 A claim is authenticated to the recipient mailbox. In plain output, repeating
 the claim returns the same payload. In JSON, the repeated result has
 `disposition: "already_claimed"`. It does not create a second task. A claim
-proves payload retrieval, not task completion or terminal submission. If a
+prints immutable acceptance-time `TO`, `FROM`, and `SUBJECT` labels around the
+authenticated body, then closes the envelope with the same message id. Older
+daemons omit `TO`; current clients retain the legacy header in that case. A
+claim proves payload retrieval, not task completion or terminal submission. If a
 claim races a doorbell already staged in the composer, Cyclops must either
 submit a previously reserved terminal key or re-prove and clear that exact
 doorbell. The claim alone never settles staged bytes.
