@@ -2313,6 +2313,7 @@ pub(crate) async fn msg_send(
                 let handle =
                     DeliveryHandle::new(&msg_id, name, pane_id, *session_idx, payload.clone());
                 inner.engine.track(&handle);
+                crate::sync_pane_unread(inner, pane_id).await;
                 let Some(worker) = worker_for(inner, *session_idx, pane_id) else {
                     advance(
                         inner,
@@ -3096,6 +3097,11 @@ fn recover_failed_job(
                         worker.set_fault(format!("direct settlement recovery failed: {error}"));
                         return false;
                     }
+                    let inner_clone = Arc::clone(inner);
+                    let recipient = notification.recipient();
+                    tokio::spawn(async move {
+                        crate::sync_recipient_unread(&inner_clone, recipient).await;
+                    });
                     if let Some(service) = &inner.mailbox {
                         if let Err(error) = crate::messaging::schedule_recipient(
                             inner,
@@ -6422,6 +6428,11 @@ fn record_notification_notified(
         Ok(_) => {
             if handle.notification_transport() == Some(NotificationTransport::DirectPayload) {
                 notification.record_delivered_direct()?;
+                let inner_clone = Arc::clone(inner);
+                let recipient = notification.recipient();
+                tokio::spawn(async move {
+                    crate::sync_recipient_unread(&inner_clone, recipient).await;
+                });
                 if let Some(service) = &inner.mailbox {
                     if let Err(error) = crate::messaging::schedule_recipient(
                         inner,
@@ -11012,6 +11023,7 @@ composer_trailer_required_prefix = 1
                 crate::composer_recovery::RecoveryCoordinator::default(),
             ),
             mailbox_publication: StdMutex::new(()),
+            unread_projection_gate: tokio::sync::Mutex::new(()),
             mailbox_publish_pause: StdMutex::new(None),
             boot_id: "b-unwritten-test".into(),
             started: std::time::Instant::now(),

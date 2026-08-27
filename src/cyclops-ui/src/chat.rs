@@ -1958,6 +1958,7 @@ mod tests {
         let live_routes = vec![cyclops_proto::StatusMailboxRoute {
             recipient: r_different_session,
             label: "claude".into(),
+            unread: None,
         }];
 
         let result = mode.revalidate_routes(&live_routes);

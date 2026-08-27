@@ -691,6 +691,9 @@ async fn finish_acceptance(
     let schedule = schedule_accepted_notifications(&accepted, |recipient| {
         schedule_recipient(inner, service, recipient)
     });
+    for recipient in &accepted.recipient_keys {
+        crate::sync_recipient_unread(inner, *recipient).await;
+    }
     let deadline = Instant::now() + Duration::from_millis(inner.cfg.receipt_block_ms);
     let dispositions = observe_first_durable_dispositions(
         service,
@@ -864,6 +867,10 @@ fn finish_claim(
             error!(%claimant, %error, "cannot schedule mailbox notification after claim");
         }
     }
+    let inner_clone = Arc::clone(inner);
+    tokio::spawn(async move {
+        crate::sync_recipient_unread(&inner_clone, claimant).await;
+    });
     Ok(outcome)
 }
 
@@ -975,6 +982,10 @@ pub(crate) fn requeue(
         if let Err(error) = schedule_recipient(inner, service, recipient) {
             error!(%recipient, %error, "cannot schedule requeued mailbox notification");
         }
+        let inner_clone = Arc::clone(inner);
+        tokio::spawn(async move {
+            crate::sync_recipient_unread(&inner_clone, recipient).await;
+        });
     }
     Ok(!records.is_empty())
 }
@@ -998,6 +1009,10 @@ pub(crate) fn withdraw_notification(
     if let Err(error) = schedule_recipient(inner, service, recipient) {
         error!(%recipient, %error, "cannot schedule mailbox notification after withdrawal");
     }
+    let inner_clone = Arc::clone(inner);
+    tokio::spawn(async move {
+        crate::sync_recipient_unread(&inner_clone, recipient).await;
+    });
     Ok(NotificationWithdrawResult {
         attempt_id,
         message_id: record.message_id,

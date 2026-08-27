@@ -3614,6 +3614,27 @@ impl MailboxProjection {
             .unwrap_or(0)
     }
 
+    pub fn recipient_label(&self, recipient: RecipientKey) -> Option<String> {
+        let entries = self.mailboxes.get(&recipient)?;
+        for entry in entries.values().rev() {
+            if let Some(message) = self.messages.get(&entry.message_id) {
+                if let Ok(metadata) = extract_message_metadata(message) {
+                    if let Ok((_, recipient_labels)) =
+                        presentation_labels(&metadata.recipients, &metadata.presentation)
+                    {
+                        if let Some(pos) = metadata.recipients.iter().position(|k| *k == recipient)
+                        {
+                            if let Some(label) = recipient_labels.get(pos) {
+                                return Some(label.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// List mailbox metadata and immutable display labels without message bodies.
     pub fn list_mailbox(
         &self,
@@ -4681,6 +4702,13 @@ impl MailboxService {
 
     pub fn pending_count(&self, recipient: RecipientKey) -> Result<usize, MailboxServiceError> {
         Ok(self.store()?.projection().pending_count(recipient))
+    }
+
+    pub fn recipient_label(
+        &self,
+        recipient: RecipientKey,
+    ) -> Result<Option<String>, MailboxServiceError> {
+        Ok(self.store()?.projection().recipient_label(recipient))
     }
 
     pub(crate) fn pending_recipients(&self) -> Result<Vec<RecipientKey>, MailboxServiceError> {

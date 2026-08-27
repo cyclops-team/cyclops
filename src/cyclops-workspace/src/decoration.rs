@@ -301,6 +301,7 @@ mod tests {
             notification_state: None,
             message_state: None,
             next_action: None,
+            unread: None,
         }
     }
 
