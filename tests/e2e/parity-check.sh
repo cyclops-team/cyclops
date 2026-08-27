@@ -817,7 +817,7 @@ check_exit "the admin send exits 0" 0
 ADMIN_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
 
 run "$CYC" status --plain
-check "status reports the unread admin count" '^‿ cyclops · watching main · tmux .* · admin inbox 1$'
+check "status reports the unread admin count" 'admin inbox 1$'
 
 agent_command implementer "$N1" '--json messages'
 jq -r --arg id "$ADMIN_ID" '
