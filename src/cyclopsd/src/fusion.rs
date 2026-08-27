@@ -10133,7 +10133,7 @@ regex = ['^IDLE']
             inject_pause: StdMutex::new(None),
             fail_chrome_restore: std::sync::atomic::AtomicBool::new(false),
             fail_next_final_binding_observation: std::sync::atomic::AtomicBool::new(false),
-            fail_pre_record_writing: std::sync::atomic::AtomicBool::new(false),
+            fail_pre_record_writing: std::sync::Mutex::new(None),
             workspace_ui: StdMutex::new(crate::workspace_ui::WorkspaceUiState::default()),
             shutdown_request: tokio::sync::watch::channel(false).0,
             stop,

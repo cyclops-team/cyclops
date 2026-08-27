@@ -826,6 +826,16 @@ impl Rig {
         Rig::new_multi_inner(tag, manifest, &[("main", pane_cmd)], cfg_extra, false).await
     }
 
+    /// Boot multiple sessions without installed mailbox capability evidence.
+    pub async fn new_multi_without_mailbox_capability(
+        tag: &str,
+        manifest: &str,
+        sessions: &[(&str, &str)],
+        cfg_extra: &str,
+    ) -> Rig {
+        Rig::new_multi_inner(tag, manifest, sessions, cfg_extra, false).await
+    }
+
     /// Boot with several watched sessions, each with one starting pane.
     pub async fn new_multi(
         tag: &str,
