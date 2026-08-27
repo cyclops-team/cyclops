@@ -2839,6 +2839,29 @@ fn screen_rule_matches(
     }
 }
 
+/// Find the highest-priority composer-semantic rule that matches this
+/// capture, independently of the runtime screen winner.
+///
+/// A working/status rule commonly outranks the rule that describes the
+/// composer row. The runtime winner must therefore not be treated as the
+/// only source of composer evidence: it can say `working` while a lower
+/// priority rule positively says that the input region is clean (or that it
+/// contains human input). Rules are already sorted by priority, so the first
+/// matching semantic rule is the same deterministic choice the manifest
+/// evaluator makes, just over the semantic subset.
+fn screen_composer_semantic_esc(
+    m: &Manifest,
+    screen: &str,
+    screen_esc: Option<&str>,
+) -> Option<ComposerSemantic> {
+    let (non_empty, non_empty_esc) = screen_regions(screen, screen_esc);
+    m.rules
+        .iter()
+        .filter(|rule| rule.region != Region::PaneTitle && rule.composer_semantic.is_some())
+        .find(|rule| screen_rule_matches(rule, &non_empty, non_empty_esc.as_deref()))
+        .and_then(|rule| rule.composer_semantic)
+}
+
 /// Does the selected screen winner certify an idle-class state? Only the
 /// rule the screen tier actually selected may do so, and only when the
 /// manifest marks it `lifecycle_evidence`: a composer row measured mid-turn
@@ -3969,6 +3992,14 @@ async fn recompute_pane_with_evidence(
             idle_confirmed,
             ts,
         );
+        // Runtime state and composer shape are separate observations. A
+        // higher-priority working/status rule can win the screen tier while
+        // a lower-priority composer rule still proves the input region clean
+        // (or proves human input). Keep that semantic result instead of
+        // inheriting only the runtime winner's optional annotation.
+        if let Some(screen) = screen.as_deref() {
+            det.composer_semantic = screen_composer_semantic_esc(m, screen, screen_esc.as_deref());
+        }
         // No prior to fall back on and the screen sensor errored: the rule
         // set was never fully consulted, and the record must not claim it
         // was (GOALS: the record never lies).
@@ -9488,6 +9519,49 @@ line_regex = ['^\s*›']
 
         assert!(m.has_escaped_rules());
         assert!(!manifest().has_escaped_rules());
+    }
+
+    const WORKING_WITH_COMPOSER_FIXTURE: &str = r#"
+[agent]
+id = "working-composer"
+display_name = "Working composer fixture"
+process_names = ["fixture"]
+
+[[rule]]
+id = "screen_working"
+state = "working"
+priority = 1200
+region = "bottom_non_empty_lines(6)"
+contains = ["Working"]
+
+[[rule]]
+id = "composer_empty"
+state = "idle"
+composer_semantic = "clean"
+priority = 900
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^\s*›\s*$']
+"#;
+
+    /// Runtime and composer evidence have independent winners. The working
+    /// status row deliberately outranks the composer row, but the latter still
+    /// has to be surfaced so the write-readiness rule can make its narrow,
+    /// positive decision during a running turn.
+    #[test]
+    fn a_lower_priority_composer_rule_is_preserved_under_a_working_winner() {
+        let m = Manifest::parse(
+            WORKING_WITH_COMPOSER_FIXTURE,
+            Path::new("working-with-composer.toml"),
+        )
+        .unwrap();
+        let screen = "• Working (5s)\n› \nfixture output";
+        let winner = screen_winner(&m, screen).expect("working status should win runtime fusion");
+        assert_eq!(winner.id, "screen_working");
+        assert_eq!(winner.state, AgentState::Working);
+        assert_eq!(
+            screen_composer_semantic_esc(&m, screen, None),
+            Some(ComposerSemantic::Clean)
+        );
     }
 
     #[test]

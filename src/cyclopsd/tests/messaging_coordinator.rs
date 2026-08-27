@@ -7,8 +7,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{
-    composer_pane, faketui_path, hold_script, swallowing_animated_composer_pane, tmux_available,
-    wait_pane_state, Rig, CAT_MANIFEST, HOOK_MANIFEST, LIVENESS_MANIFEST, MODAL_MANIFEST,
+    composer_pane, faketui_path, hold_script, manual_lifecycle_composer_pane,
+    swallowing_animated_composer_pane, tmux_available, wait_pane_state, Rig, CAT_MANIFEST,
+    HOOK_MANIFEST, LIVENESS_MANIFEST, MODAL_MANIFEST,
 };
 use cyclops_proto::{
     Kind, LedgerLine, MessageId, MsgSendParams, NotificationAttemptId, NotificationState,
@@ -3183,6 +3184,58 @@ async fn a_user_prompt_submit_records_liveness_but_stays_working_until_a_termina
     // so the hook-derived idle keeps its own named write block; write
     // readiness after a turn is the manifest's contract, not this one.
     wait_pane_state(&mut rig, "idle").await;
+
+    rig.daemon.shutdown().await;
+}
+
+/// A working pane may accept a notification only when a fresh screen capture
+/// positively proves that its composer is clean. Runtime `Working` is not a
+/// blanket refusal, and it is not permission: an ambiguous or missing
+/// composer proof still follows the fail-closed path.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_working_pane_with_a_proven_clean_composer_accepts_a_notification() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "workspace-working-clean-composer",
+        LIVENESS_MANIFEST,
+        &manual_lifecycle_composer_pane(),
+        "delivery_retry_max = 0\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+
+    let start = report_hook(&rig, "SessionStart", 1, json!({"session_id": "session-1"})).await;
+    assert_eq!(start["applied"], true, "{start}");
+    wait_for_pane_write_block(&mut rig, &pane, None).await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    // The fixture keeps its clean prompt visible while exposing a distinct
+    // Working row. The screen semantic is therefore positive even though
+    // the runtime winner is Working.
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "C-t"]);
+    wait_pane_state(&mut rig, "working").await;
+    wait_for_pane_write_block(&mut rig, &pane, None).await;
+
+    let sent = send_workspace_message(
+        &rig,
+        "working-clean-composer",
+        "Working clean composer",
+        "private body",
+    )
+    .await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::Writing).await;
+    assert!(
+        rig.tmux
+            .capture(&pane)
+            .contains(&compact_doorbell(&rig, &message_id)),
+        "working pane with a clean composer must receive the doorbell"
+    );
 
     rig.daemon.shutdown().await;
 }
