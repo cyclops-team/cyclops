@@ -228,6 +228,14 @@ pub(crate) struct PaneEnds {
     manifest: String,
     /// The turn an active hold is waiting on. Never evicted.
     pinned: Option<TurnKey>,
+    /// The pinned turn whose missing or mismatched end has already raised
+    /// its one operator diagnostic.
+    ///
+    /// One slot, not a growing history: only one turn may own the pane's
+    /// composer barrier, and changing that owner resets the allowance.
+    /// Keeping it beside `pinned` makes the bound use the identical pane,
+    /// process-generation, manifest, and turn identity as end matching.
+    diagnosed_missing_end: Option<TurnKey>,
     /// Ends seen but not yet consumed, oldest first.
     seen: std::collections::VecDeque<TurnKey>,
     /// Has this store ever discarded an end to stay bounded?
@@ -261,6 +269,7 @@ impl PaneEnds {
             agent,
             manifest: manifest.to_string(),
             pinned: None,
+            diagnosed_missing_end: None,
             seen: std::collections::VecDeque::new(),
             lost: false,
         });
@@ -270,6 +279,7 @@ impl PaneEnds {
             entry.agent = agent;
             entry.manifest = manifest.to_string();
             entry.pinned = None;
+            entry.diagnosed_missing_end = None;
             entry.seen.clear();
             // A new binding starts with no history and no doubt about it.
             entry.lost = false;
@@ -328,9 +338,37 @@ impl PaneEnds {
             Some(_) => true,
             None => {
                 entry.pinned = Some(turn.clone());
+                entry.diagnosed_missing_end = None;
                 true
             }
         }
+    }
+
+    /// Reserve the one missing-end diagnostic for this exact pinned turn.
+    ///
+    /// The caller decides whether the visual frame proves the turn ended;
+    /// this store only makes that conclusion one-shot under the same exact
+    /// identity that matches lifecycle ends. A replacement occupant or a
+    /// different turn cannot spend this turn's allowance.
+    pub(crate) fn reserve_missing_end_diagnostic(
+        map: &mut Ends,
+        pane: &crate::PaneKey,
+        agent: crate::identity::ProcId,
+        manifest: &str,
+        turn: &TurnKey,
+    ) -> bool {
+        let Some(entry) = map.get_mut(pane) else {
+            return false;
+        };
+        if entry.agent != agent
+            || entry.manifest != manifest
+            || entry.pinned.as_ref() != Some(turn)
+            || entry.diagnosed_missing_end.as_ref() == Some(turn)
+        {
+            return false;
+        }
+        entry.diagnosed_missing_end = Some(turn.clone());
+        true
     }
 
     /// Is this exact turn's end stored for this exact binding?
@@ -373,6 +411,7 @@ impl PaneEnds {
         };
         e.seen.remove(pos);
         e.pinned = None;
+        e.diagnosed_missing_end = None;
         true
     }
 
@@ -419,6 +458,7 @@ impl PaneEnds {
             return false;
         }
         e.pinned = None;
+        e.diagnosed_missing_end = None;
         if let Some(pos) = e.seen.iter().position(|k| k == turn) {
             e.seen.remove(pos);
         }
