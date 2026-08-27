@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # The five CI gates, one command, cheapest first.
 #
 # `./scripts/check.sh` is the full pre-push pass; `./scripts/check.sh
