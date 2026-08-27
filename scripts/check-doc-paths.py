@@ -62,7 +62,7 @@ SKIP_RULES = [
 ]
 
 # Two that no rule can express, because they are real paths in a tree this
-# repo is not. Both are v1, quoted by the cutover and history pages, and
+# repo is not. Both are v1, quoted by history pages, and
 # both are correct where they appear.
 #
 # Two more that are not paths in ANY tree: the manifest/theme runtime
@@ -73,7 +73,7 @@ SKIP_RULES = [
 # code span here always strips a leading `./`, so the checkable candidate
 # is the bare word.
 LITERAL_SKIPS = {
-    "bin/commPact": "a path in the v1 tree, quoted by docs/development/CUTOVER.md",
+    "bin/commPact": "a path in the predecessor v1 tree, quoted as history in BENCHMARKS.md",
     "versions/2.1.220": "a v1 release directory, quoted as history",
     "manifests": "the daemon's cwd-relative fallback directory name, not a path this repo ships",
     "themes": "the theme engine's cwd-relative fallback directory name, not a path this repo ships",

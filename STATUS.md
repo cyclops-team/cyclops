@@ -1,9 +1,8 @@
 # Status
 
-Updated 2026-08-26. Cyclops is pre-release software at version `0.1.0`.
+Updated 2026-08-27. Cyclops is pre-release software at version `0.1.0`.
 The Rust implementation on `main` is the current product; the shell/Python
-implementation remains available as the read-only `v1` branch and
-`v1-final` tag.
+implementation remains available as the read-only `v1-final` tag.
 
 ## Built
 
@@ -62,8 +61,8 @@ python3 scripts/check-doc-paths.py
 ```
 
 CI runs those checks on Linux and macOS, reruns the suite with relocated
-scratch storage, exercises the v1 compatibility shim, verifies the installer
-with `./tests/e2e/parity-check.sh --with-installer`, and builds and checks the
+scratch storage, verifies the installer with
+`./tests/e2e/parity-check.sh --with-installer`, and builds and checks the
 website. An advisory job also tests against tmux built from its current
 development branch.
 
@@ -81,8 +80,9 @@ whenever coverage grows.
   until at least one pane has a Cyclops name.
 - Pipe orchestration and automatic attention routing are not built. There is
   no `cyclops pipe` subcommand; Clap rejects that spelling as unrecognized.
-- Existing v1 state is not migrated automatically. Use
-  [the cutover runbook](docs/development/CUTOVER.md) if you still run v1.
+- Existing v1 state is not migrated automatically. The v1 line is formally
+  unsupported; the predecessor implementation is preserved read-only at tag
+  `v1-final`.
 - Hook-backed verification requires wiring the generated hook into the
   vendor CLI; without it, delivery can still finish with screen evidence and
   an explicitly unverified receipt.

@@ -447,7 +447,6 @@ cargo install cargo-nextest --locked --version 0.9.100
 cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
 cargo test -p cyclopsd --all-targets --no-fail-fast
 cargo test --workspace --doc
-python3 scripts/commpact-shim/test_shim.py
 ./tests/e2e/parity-check.sh
 ```
 

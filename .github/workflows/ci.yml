@@ -61,12 +61,6 @@ jobs:
           cargo test -p cyclopsd --all-targets --no-fail-fast || status=$?
           cargo test --workspace --doc || status=$?
           exit "$status"
-      # The commPact shim is bash + python, invisible to nextest; its
-      # suite reuses the cyclops debug binary the tests above just built.
-      # Runs even when tests failed, for the same reason.
-      - name: commPact shim tests
-        if: ${{ !cancelled() }}
-        run: python3 scripts/commpact-shim/test_shim.py
       # A path in a doc is checkable. Before this, ARCHITECTURE.md pointed
       # newcomers at files that were not in the repo, and thirty-one source
       # paths were missing their source-directory prefix. --selftest first, so a
@@ -98,7 +92,6 @@ jobs:
           cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast || status=$?
           cargo test -p cyclopsd --all-targets --no-fail-fast || status=$?
           cargo test --workspace --doc || status=$?
-          python3 scripts/commpact-shim/test_shim.py || status=$?
           exit "$status"
 
   # The installer is what a stranger runs first, so it gets its own gate:

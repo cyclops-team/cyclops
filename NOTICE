@@ -6,8 +6,8 @@ License in `LICENSE`.
 The previous implementation, Cyclops v1, was a shell and Python toolkit
 built around `bin/commPact`, adapted from the upstream tmux coordination
 tooling at github.com/ShawnPana/smux (MIT). The complete upstream MIT text
-is retained in `LICENSE`. v1 remains available read-only at branch `v1`
-and tag `v1-final`.
+is retained in `LICENSE`. v1 remains available read-only at tag
+`v1-final`.
 
 Provenance recorded at the time of adaptation
 ---------------------------------------------

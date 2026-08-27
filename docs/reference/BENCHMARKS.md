@@ -110,7 +110,7 @@ connection per watched session, an append-only NDJSON ledger records every
 message and state change, and delivery ends in a named state with a receipt
 that says how it was verified.
 
-commPact v1 is the previous implementation, read-only at branch `v1` and tag
+commPact v1 is the previous implementation, read-only at tag
 `v1-final`. It is a shell toolkit: `bin/commPact` at 890 lines plus nine
 sibling scripts, 86,101 bytes across that tree's bin directory in total.
 There is no daemon. Every verb is a process that starts, shells out to tmux

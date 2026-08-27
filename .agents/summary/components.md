@@ -221,7 +221,7 @@ contract).
 | `resources/hooks/` | Vendor hook config templates per CLI (agy, claude, codex, cursor) rendered by `cyclops hooks install` / wiring |
 | `skills/cyclops/` | Agent-facing `SKILL.md` for messaging via the cyclops CLI (confirm flags with `cyclops --help` on the machine) |
 | `demos/` | Seven runnable end-to-end scripts on isolated tmux servers (`m0`–`m5`); `tests/e2e/parity-check.sh` is the CI gate that asserts docs and binaries agree |
-| `scripts/` | `install.sh` (POSIX source installer: builds, places binaries, edits profile with backup, `--uninstall` restores; can pass `--wire-hooks` via setup), `check-doc-paths.py` (doc-path + orphan gate), `commpact-shim/` (v1 compatibility shim + tests) |
+| `scripts/` | `install.sh` (POSIX source installer: builds, places binaries, edits profile with backup, `--uninstall` restores; can pass `--wire-hooks` via setup), `check-doc-paths.py` (doc-path + orphan gate) |
 | `tests/` | Test-only tmux rig in `testrig/`; parity, soak, vocabulary, and probe machinery in `e2e/` |
 | `SECURITY.md` | Private vulnerability reporting instructions |
 | `DEMO_DAY_CHECKLIST.md` | Working checklist for the public launch pass |

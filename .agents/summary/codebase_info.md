@@ -23,7 +23,7 @@ needs a human.
 |---|---|---|
 | Rust (edition 2021) | `src/` — the product | Cargo workspace, resolver 2, all crates version 0.1.0. Stable toolchain; no `rustfmt.toml`, `clippy.toml`, or `deny.toml` (defaults are the standard). Cloud VMs may need rustup stable ≥1.85 for lockfile/`edition2024` dependency crates — see `AGENTS.md` Custom Instructions |
 | TypeScript / Svelte 5 | `website/` | SvelteKit 2 marketing site for usecyclops.dev. Excluded from the Cargo workspace and checked by its own CI job |
-| Python 3 | `scripts/check-doc-paths.py`, `scripts/commpact-shim/`, `tests/e2e/` | Doc-path gate, v1 compatibility shim tests, soak + probe harness |
+| Python 3 | `scripts/check-doc-paths.py`, `tests/e2e/` | Doc-path gate, soak + probe harness |
 | POSIX shell | `demos/`, `scripts/install.sh`, `tests/e2e/lib/lib.sh`, `resources/hooks/` | Runnable narrative demos, source installer, shared test machinery, vendor hook templates |
 
 ## Repository layout
@@ -44,7 +44,7 @@ cyclops/
 ├── docs/                 # guides/, reference/, development/, public/ (published)
 ├── website/              # SvelteKit landing page (outside the workspace)
 ├── demos/                # narrative isolated-tmux demos (not CI gates)
-├── scripts/              # install.sh, check-doc-paths.py, commpact-shim/
+├── scripts/              # install.sh, check-doc-paths.py
 ├── .github/workflows/    # ci.yml (the only workflow)
 ├── README.md             # user front door; output blocks CI-verified
 ├── CONTRIBUTING.md       # development loop, demos, the gates a change must pass
@@ -84,10 +84,9 @@ cyclops/
 
 MIT (`LICENSE`); upstream attribution for the v1 lineage in `NOTICE`.
 This tree is a Rust rewrite. The previous shell/Python implementation lives on
-branch `v1` (tag `v1-final`). The usecyclops.dev one-line installer builds the
-current Rust implementation from `main`; `docs/development/CUTOVER.md` is the
-optional v1 migration runbook. Security reports: `SECURITY.md` (private
-vulnerability reporting).
+at the read-only tag `v1-final` as unsupported predecessor reference. The
+usecyclops.dev one-line installer builds the current Rust implementation from
+`main`. Security reports: `SECURITY.md` (private vulnerability reporting).
 
 ## Version status
 
