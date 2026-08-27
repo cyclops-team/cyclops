@@ -500,7 +500,7 @@ no-follow ownership checks. It never accepts an arbitrary path and never
 touches message journals. Before the first deletion, Cyclops durably writes an
 owner-only checkpoint and locks the cleanup journal. Each execution then
 appends one content-free `completed` or `interrupted` fact to
-`operations/cleanup.ndjson`. The next applied cleanup recovers a pending
+`~/.cyclops/operations/cleanup.ndjson`. The next applied cleanup recovers a pending
 checkpoint exactly once, and a torn final journal record is discarded before
 replay. Invalid complete records stop cleanup before deletion instead of hiding
 journal damage.

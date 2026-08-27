@@ -432,12 +432,7 @@ pub(crate) async fn dispatch(
                 && !matches!(&req.params, Value::Object(fields) if fields.is_empty())
             {
                 return (
-                    Response::err(
-                        id,
-                        "bad_request",
-                        "health.snapshot accepts no parameters",
-                        None,
-                    ),
+                    Response::err(id, "bad_request", "health.snapshot accepts no parameters"),
                     None,
                 );
             }
@@ -4794,7 +4789,7 @@ mod tests {
         let result = resp.result.expect("health snapshot answers");
         assert_eq!(result["boot_id"], "b-test");
         assert_eq!(result["sessions"], json!([]));
-        assert_eq!(result["open_deliveries"], json!([]));
+        assert!(result.get("open_deliveries").is_none());
     }
 
     #[test]

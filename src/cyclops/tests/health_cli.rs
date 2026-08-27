@@ -3,7 +3,7 @@
 use std::fs;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::fs::{symlink, PermissionsExt as _};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -78,6 +78,34 @@ fn parse(output: &Output) -> Value {
     })
 }
 
+fn answer_health_snapshot(stream: UnixStream) {
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+        .unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut request = String::new();
+    assert!(reader.read_line(&mut request).unwrap() > 0);
+    let request: Value = serde_json::from_str(request.trim()).unwrap();
+    assert_eq!(request["method"], "health.snapshot");
+    assert_eq!(request["params"], json!({}));
+    writeln!(
+        reader.get_mut(),
+        "{}",
+        json!({
+            "id": request["id"],
+            "result": {
+                "daemon_version": "0.1.0",
+                "proto": 1,
+                "boot_id": "health-boot",
+                "uptime_ms": 123,
+                "tmux_version": "3.6a",
+                "sessions": [],
+            }
+        })
+    )
+    .unwrap();
+}
+
 #[test]
 fn health_works_with_no_daemon_and_does_not_create_state() {
     let (_temp, home, user, runtime_temp) = scratch("cyclops-health-absent");
@@ -88,11 +116,10 @@ fn health_works_with_no_daemon_and_does_not_create_state() {
     before.sort();
     let output = run_health(&home, &user, &runtime_temp, "");
     let report = parse(&output);
-    assert_eq!(
-        output.status.success(),
-        report["client"]["selected_daemon_ready"] == true,
-        "{output:?}"
-    );
+    // Process inventory is intentionally host-wide: another same-user daemon
+    // may make the overall report unhealthy even though this isolated state
+    // root has no daemon. This test owns the offline/read-only facts below,
+    // while exit semantics and duplicate-daemon reporting have focused tests.
     assert_eq!(report["daemon"]["running"], false);
     assert_eq!(report["state"]["present"], false);
     assert_eq!(report["state"]["root"], home.display().to_string());
@@ -409,7 +436,7 @@ fn health_reports_each_update_scratch_marker_and_lease() {
 }
 
 #[test]
-fn health_reports_hello_identity_without_sending_a_refresh_request() {
+fn health_reports_hello_identity_with_one_read_only_snapshot_request() {
     let (_temp, home, user, runtime_temp) = scratch("cyclops-health-daemon");
     let (client, daemon) = paired_client(&user.join("bin"));
     fs::create_dir(&home).unwrap();
@@ -433,26 +460,26 @@ fn health_reports_hello_identity_without_sending_a_refresh_request() {
             })
         )
         .unwrap();
-        writer
-            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
-            .unwrap();
-        let mut reader = BufReader::new(writer);
-        let mut request = String::new();
-        assert_eq!(reader.read_line(&mut request).unwrap(), 0);
-        assert!(
-            request.is_empty(),
-            "health sent an RPC request: {request:?}"
-        );
+        answer_health_snapshot(writer);
     });
 
     let output = run_health_binary(&client, &home, &user, &runtime_temp, "");
     server.join().unwrap();
     let report = parse(&output);
-    assert_eq!(
-        output.status.success(),
-        report["client"]["selected_daemon_ready"] == true,
-        "{output:?}"
-    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    for code in [
+        "daemon_process_inventory_unproven",
+        "workspace_mapping_unproven",
+    ] {
+        assert!(
+            report["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|issue| issue["code"] == code),
+            "{report}"
+        );
+    }
     assert_eq!(report["daemon"]["state"], "running");
     assert_eq!(report["daemon"]["running"], true);
     assert_eq!(report["daemon"]["authenticated_socket"], true);
@@ -460,7 +487,7 @@ fn health_reports_hello_identity_without_sending_a_refresh_request() {
     assert_eq!(report["daemon"]["process"]["state"], "proven");
     assert_eq!(report["daemon"]["process"]["birth"], 818221);
     assert_eq!(report["daemon"]["boot_id"], "health-boot");
-    assert_eq!(report["daemon"]["uptime_ms"], Value::Null);
+    assert_eq!(report["daemon"]["uptime_ms"], 123);
     assert_eq!(report["daemon"]["client_build_matches"], true);
     assert_eq!(report["daemon"]["executable"]["state"], "proven");
     assert_eq!(report["daemon"]["executable"]["path"], expected_daemon);
@@ -489,16 +516,7 @@ fn health_refuses_a_non_absolute_hello_executable() {
             })
         )
         .unwrap();
-        writer
-            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
-            .unwrap();
-        let mut reader = BufReader::new(writer);
-        let mut request = String::new();
-        assert_eq!(reader.read_line(&mut request).unwrap(), 0);
-        assert!(
-            request.is_empty(),
-            "health sent an RPC request: {request:?}"
-        );
+        answer_health_snapshot(writer);
     });
 
     let output = run_health_binary(&client, &home, &user, &runtime_temp, "");

@@ -324,8 +324,7 @@ An earlier focused pass does not substitute for the frozen run.
   and works with the daemon stopped.
 - Health reports every installed binary found on PATH, daemon version, setup,
   hooks, manifests, skills, permissions, journals, caches, logs, update scratch,
-  durable workspace and session mappings, stale session configuration,
-  duplicate daemon and watcher evidence, and rollback state.
+  and rollback state.
 - Update uses randomized owner-only scratch with an ownership marker and a
   kernel-held lease.
 - One canonical cache is shared by update and cleanup. Legacy caches are named
@@ -333,15 +332,8 @@ An earlier focused pass does not substitute for the frozen run.
 - Candidate binaries prove version identity and journal replay before install.
 - Installation replaces the CLI and daemon as one recoverable pair and retains
   one known-good pair.
-- The selected-pair record binds content-free install-time replay evidence to
-  the exact client and daemon hashes. Health reports that historical evidence
-  separately from current replay readiness.
-- The updater lease excludes concurrent mutation. Process-crash recovery at
-  each filesystem commit boundary removes only validated residue and never
-  exposes a split client and daemon pair.
 - Cleanup is dry-run by default, accepts asset classes rather than arbitrary
-  paths, revalidates every target, never touches durable journals, and records
-  each executed cleanup as one append-only content-free state fact.
+  paths, revalidates every target, and never touches durable journals.
 - Cleanup never kills processes. Update and rollback may stop only the exact
   daemon instance they authenticated and own.
 - Logs use bounded writers. Linked files, unsafe ownership, changed inodes, and

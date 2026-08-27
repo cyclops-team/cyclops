@@ -1764,7 +1764,7 @@ fn decode_selection(id: &str, body: &[u8]) -> Result<Selection, String> {
         .get("schema")
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| "selected pair descriptor has no schema".to_string())?;
-    if !matches!(schema, 1 | 2 | 3) {
+    if !matches!(schema, 1..=3) {
         return Err("selected pair descriptor has an unsupported schema".to_string());
     }
     let active = value
@@ -3671,12 +3671,12 @@ mod tests {
         rows
     }
 
-    fn replay_failure_pair(path: &Path, hello: &str, cli: &[u8]) {
+    fn replay_failure_pair(path: &Path, build: &str, hello: &str, cli: &[u8]) {
         directory(path);
         write_new(&path.join("cyclops"), cli, 0o755).unwrap();
         let hello = serde_json::to_string(hello).unwrap();
         let script = format!(
-            "#!/usr/bin/env python3\nimport os, socket, time\nhome = os.environ['CYCLOPS_HOME']\npath = os.path.join(home, '{}')\ntry:\n    os.unlink(path)\nexcept FileNotFoundError:\n    pass\ns = socket.socket(socket.AF_UNIX)\ns.bind(path)\nwith open(os.path.join(home, 'probe.pid'), 'w') as f:\n    f.write(str(os.getpid()))\ns.listen(1)\nc, _ = s.accept()\nc.sendall(({} + '\\n').encode())\nc.close()\ntime.sleep(60)\n",
+            "#!/usr/bin/env python3\nimport os, socket, sys, time\nif len(sys.argv) > 1 and sys.argv[1] == '--version':\n    print('cyclopsd 0.1.0 ({build})')\n    sys.exit(0)\nhome = os.environ['CYCLOPS_HOME']\npath = os.path.join(home, '{}')\ntry:\n    os.unlink(path)\nexcept FileNotFoundError:\n    pass\ns = socket.socket(socket.AF_UNIX)\ns.bind(path)\nwith open(os.path.join(home, 'probe.pid'), 'w') as f:\n    f.write(str(os.getpid()))\ns.listen(1)\nc, _ = s.accept()\nc.sendall(({} + '\\n').encode())\nc.close()\ntime.sleep(60)\n",
             cyclops_proto::SOCK_NAME,
             hello
         );
@@ -3711,7 +3711,12 @@ mod tests {
     fn malformed_replay_hello_reaps_the_private_daemon() {
         let scratch = Scratch::create().unwrap();
         let pair = scratch.path().join("pair");
-        replay_failure_pair(&pair, "{malformed", b"#!/bin/sh\nexit 1\n");
+        replay_failure_pair(
+            &pair,
+            "build",
+            "{malformed",
+            b"#!/bin/sh\n[ \"$1\" = \"--version\" ] && { echo 'cyclops 0.1.0 (build)'; exit 0; }\nexit 1\n",
+        );
         let error =
             prove_candidate_replay(&pair, &scratch.path().join("absent"), &scratch).unwrap_err();
         assert!(
@@ -3725,7 +3730,12 @@ mod tests {
     fn failed_candidate_cli_identity_reaps_the_private_daemon() {
         let scratch = Scratch::create().unwrap();
         let pair = scratch.path().join("pair");
-        replay_failure_pair(&pair, &valid_probe_hello("build"), b"#!/bin/sh\nexit 1\n");
+        let marker = scratch.path().join("r/probe.pid");
+        let cli = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n    [ -f '{}' ] && exit 1\n    echo 'cyclops 0.1.0 (build)'\n    exit 0\nfi\nexit 1\n",
+            marker.display()
+        );
+        replay_failure_pair(&pair, "build", &valid_probe_hello("build"), cli.as_bytes());
         let error =
             prove_candidate_replay(&pair, &scratch.path().join("absent"), &scratch).unwrap_err();
         assert!(
@@ -3741,6 +3751,7 @@ mod tests {
         let pair = scratch.path().join("pair");
         replay_failure_pair(
             &pair,
+            "build",
             &valid_probe_hello("build"),
             b"#!/bin/sh\n[ \"$1\" = \"--version\" ] && { echo 'cyclops 0.1.0 (build)'; exit 0; }\nexit 1\n",
         );
@@ -4475,16 +4486,27 @@ sys.exit(43)"#,
             .write_all(b"# changed\n")
             .unwrap();
         let error = installed_pair_descriptor(&prefix).unwrap_err();
-        assert!(error.contains("changed after its install proof"), "{error}");
+        assert!(matches!(&error, InstalledPairInspectionError::Invalid(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("changed after its install proof"),
+            "{error}"
+        );
 
         std::fs::write(&pair_path, std::fs::read(source.join("cyclops")).unwrap()).unwrap();
         let mut descriptor: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&descriptor_path).unwrap()).unwrap();
         descriptor["known_good_proof"] = serde_json::Value::Null;
         std::fs::write(&descriptor_path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
-        assert!(installed_pair_descriptor(&prefix)
-            .unwrap_err()
-            .contains("missing a recorded build identity"));
+        let error = installed_pair_descriptor(&prefix).unwrap_err();
+        assert!(matches!(&error, InstalledPairInspectionError::Invalid(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("missing a recorded build identity"),
+            "{error}"
+        );
     }
 
     #[test]

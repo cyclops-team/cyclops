@@ -657,13 +657,13 @@ impl CleanupRecorder {
 
         if let Some(checkpoint) = read_cleanup_checkpoint(&root)? {
             match checkpoint {
-                CleanupCheckpoint::Clear { schema } if schema == 1 => {}
+                CleanupCheckpoint::Clear { schema: 1 } => {}
                 CleanupCheckpoint::Pending {
-                    schema,
+                    schema: 1,
                     operation_id,
                     ts,
                     classes,
-                } if schema == 1 => {
+                } => {
                     validate_operation_id(&operation_id)?;
                     validate_class_names(&classes)?;
                     let fact = CleanupFact {

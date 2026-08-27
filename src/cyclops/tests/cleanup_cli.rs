@@ -4,10 +4,11 @@ use std::process::Command;
 
 fn command(temp: &tempfile::TempDir) -> Command {
     fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let temp = fs::canonicalize(temp.path()).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_cyclops"));
     command
-        .env("TMPDIR", temp.path())
-        .env("CYCLOPS_HOME", temp.path().join("state"));
+        .env("TMPDIR", &temp)
+        .env("CYCLOPS_HOME", temp.join("state"));
     command
 }
 

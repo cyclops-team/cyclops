@@ -2553,6 +2553,13 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
 
+    fn private_scratch() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("cyc-health-")
+            .tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap())
+            .unwrap()
+    }
+
     fn binaries_with_public_selector(public: bool) -> BinaryReport {
         BinaryReport {
             selected_client: PathBuf::from("/prefix/.cyclops-pairs/pairs/pair.a/cyclops"),
@@ -2680,7 +2687,7 @@ mod tests {
 
     #[test]
     fn operational_health_compares_runtime_and_durable_session_identity() {
-        let scratch = tempfile::tempdir().unwrap();
+        let scratch = private_scratch();
         let home = scratch.path().join("state");
         let root = cyclops_state::StateRoot::open_or_create(&home).unwrap();
         let workspace: WorkspaceId = "11111111-1111-4111-8111-111111111111".parse().unwrap();
@@ -2742,7 +2749,7 @@ mod tests {
 
     #[test]
     fn stopped_health_keeps_durable_identity_visible_without_inventing_runtime_state() {
-        let scratch = tempfile::tempdir().unwrap();
+        let scratch = private_scratch();
         let home = scratch.path().join("state");
         let root = cyclops_state::StateRoot::open_or_create(&home).unwrap();
         let workspace: WorkspaceId = "11111111-1111-4111-8111-111111111111".parse().unwrap();
@@ -2783,7 +2790,7 @@ mod tests {
 
     #[test]
     fn malformed_workspace_identity_is_invalid_even_with_the_daemon_stopped() {
-        let scratch = tempfile::tempdir().unwrap();
+        let scratch = private_scratch();
         let home = scratch.path().join("state");
         let root = cyclops_state::StateRoot::open_or_create(&home).unwrap();
         root.replace_file(Path::new("identity/workspace-id"), b"not-a-workspace\n")
