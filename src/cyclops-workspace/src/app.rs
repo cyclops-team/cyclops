@@ -144,10 +144,10 @@ enum AppMsg {
         mouse: MouseEvent,
     },
     /// The terminal's focus moved onto (`true`) or off (`false`) the
-    /// workspace's tab. Drives the window background only: the theme's
-    /// ground is painted onto the terminal while the workspace is looked
-    /// at and handed back the moment it is not, so a shell in another tab
-    /// of the same window never wears the workspace's color.
+    /// workspace's tab. Drives the host palette only: the theme's ink and
+    /// ground are handed to the terminal while the workspace is looked at
+    /// and both defaults return the moment it is not, so a shell in another
+    /// tab of the same window never wears the workspace's colors.
     Focus(bool),
     OutputBatch(Vec<(String, Vec<u8>)>),
     Redraw,
@@ -261,6 +261,16 @@ struct MessagesDraftIdentity {
     caller: cyclops_proto::RecipientKey,
     body: String,
     client_key: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostPaletteState {
+    /// Nothing has been emitted since this process acquired or regained the surface.
+    Unknown,
+    /// The terminal owns both defaults (OSC 110/111 was emitted).
+    Defaults,
+    /// Cyclops owns both defaults with this exact theme pair.
+    Theme(crate::theme::HostPalette),
 }
 
 impl MessagesDraftIdentity {
@@ -407,12 +417,12 @@ struct App {
     theme_restore: Option<cyclops_theme::Theme>,
     link_state: LinkState,
     paused_panes: HashSet<String>,
-    /// The chrome ground last handed to the terminal as its own default
-    /// background. Compared each frame so the escape goes out on a theme
+    /// The foreground/background pair last handed to the host terminal.
+    /// Compared each frame so an escape goes out on ownership or theme
     /// change and on no other frame.
-    window_bg: Option<(u8, u8, u8)>,
+    window_palette: HostPaletteState,
     /// Whether the terminal's focus is on the workspace. While it is not,
-    /// the draw path leaves the terminal's own background alone
+    /// the draw path leaves the terminal's own palette alone
     /// (`AppMsg::Focus` hands it back), so a frame drawn for pane output
     /// arriving in an unfocused tab cannot re-paint the operator's
     /// terminal behind their back. Starts `true`: focus reporting only
@@ -1261,7 +1271,7 @@ pub async fn run_async() -> i32 {
         link_state: LinkState::Live,
         paused_panes: HashSet::new(),
         minimized: std::collections::HashMap::new(),
-        window_bg: None,
+        window_palette: HostPaletteState::Unknown,
         window_focused: true,
         select_all: crate::input::SelectAll::default(),
         reconnect_attempt: 0,
@@ -3133,7 +3143,7 @@ async fn handle_app_msg(
                 // Forget what the terminal was last told so the next draw
                 // re-emits the theme's ground even though it has not
                 // changed since focus left.
-                app.window_bg = None;
+                app.window_palette = HostPaletteState::Unknown;
                 // Another program owned this surface while focus was away
                 // and may have written over it.
                 app.repaint_requested = true;
@@ -3142,8 +3152,8 @@ async fn handle_app_msg(
                 // Immediately, not on a frame: an unfocused workspace may
                 // not draw again until something happens in it, and the
                 // operator is looking at their own shell right now.
-                crate::term_guard::yield_window_background();
-                app.window_bg = None;
+                crate::term_guard::yield_window_palette();
+                app.window_palette = HostPaletteState::Defaults;
                 // The button, if held, is let go somewhere this app will
                 // never hear about.
                 if settle_lost_release(app, client).await {
@@ -5884,22 +5894,30 @@ fn draw<B: Backend>(
     // read per frame is cheap, it cannot desynchronise from what the menu
     // just wrote, and it also covers a `config.toml` edited under a
     // running workspace.
-    // Repaint the host terminal's own background when the theme's ground
-    // changes, which is what fills the window padding around the grid.
+    // Repaint the host terminal's defaults when the theme's ink or ground
+    // changes. The ground fills the window padding around the grid; the ink
+    // keeps unstyled host text readable against it.
     // Here rather than at each theme site because the paint changes through
     // three of them: boot, the ThemeWatch reload, and the picker's live
     // preview. One comparison catches all three and emits nothing on the
     // frames between.
     // Only while focus is here: a frame drawn for output arriving in an
     // unfocused tab must not restyle the terminal the operator is using
-    // for something else (`AppMsg::Focus` hands the color back on leave
-    // and clears `window_bg` so return reapplies it).
-    let ground = app.paint.chrome_ground_rgb();
-    if app.window_focused && ground != app.window_bg {
-        if let Some(rgb) = ground {
-            crate::term_guard::apply_window_background(rgb);
+    // for something else (`AppMsg::Focus` hands both defaults back on leave
+    // and clears `window_palette` so return reapplies it).
+    let palette = app
+        .paint
+        .host_palette_rgb()
+        .map_or(HostPaletteState::Defaults, HostPaletteState::Theme);
+    if app.window_focused && palette != app.window_palette {
+        match palette {
+            HostPaletteState::Theme(palette) => {
+                crate::term_guard::apply_window_palette(palette.fg, palette.bg);
+            }
+            HostPaletteState::Defaults => crate::term_guard::yield_window_palette(),
+            HostPaletteState::Unknown => unreachable!("desired palette is always known"),
         }
-        app.window_bg = ground;
+        app.window_palette = palette;
     }
     motion.set_preference(app.prefs.motion, motion_capable(&app.paint));
     motion.observe(observed(app), now);
@@ -6685,7 +6703,7 @@ mod tests {
             link_state: LinkState::Live,
             paused_panes: HashSet::new(),
             minimized: std::collections::HashMap::new(),
-            window_bg: None,
+            window_palette: HostPaletteState::Unknown,
             window_focused: true,
             select_all: crate::input::SelectAll::default(),
             reconnect_attempt: 0,
