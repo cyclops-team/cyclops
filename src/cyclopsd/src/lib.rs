@@ -274,6 +274,10 @@ pub(crate) struct Inner {
     /// Test-only: make the next final pre-write process observation
     /// unavailable after the admitting capture has completed.
     pub(crate) fail_next_final_binding_observation: AtomicBool,
+    /// Test-only: make the next batch append on the workspace journal fail.
+    pub(crate) fail_next_batch_append: AtomicBool,
+    /// Test-only: fail at the synchronous on_write boundary before record_writing.
+    pub(crate) fail_pre_record_writing: AtomicBool,
     /// Last-active workspace/tab for the terminal workspace UI.
     pub(crate) workspace_ui: StdMutex<workspace_ui::WorkspaceUiState>,
     /// Self-shutdown request sent only after a successful daemon.shutdown
@@ -1843,6 +1847,22 @@ impl Daemon {
             .store(true, Ordering::SeqCst);
     }
 
+    /// Test-only seam: fail the next batch append on the workspace journal.
+    #[doc(hidden)]
+    pub fn fail_next_batch_append(&self) {
+        self.inner
+            .fail_next_batch_append
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// Test-only seam: panic at the synchronous on_write boundary before record_writing.
+    #[doc(hidden)]
+    pub fn fail_pre_record_writing(&self) {
+        self.inner
+            .fail_pre_record_writing
+            .store(true, Ordering::SeqCst);
+    }
+
     /// Adopt a pane under a label, or un-adopt it. `target` is a pane id or
     /// an existing label; `label: None` clears.
     pub async fn label_pane(
@@ -2942,6 +2962,8 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         inject_pause: StdMutex::new(None),
         fail_chrome_restore: AtomicBool::new(false),
         fail_next_final_binding_observation: AtomicBool::new(false),
+        fail_next_batch_append: AtomicBool::new(false),
+        fail_pre_record_writing: AtomicBool::new(false),
         workspace_ui: StdMutex::new(workspace_ui::WorkspaceUiState::default()),
         shutdown_request,
         stop: stop_rx,
@@ -4977,6 +4999,8 @@ mod tests {
             inject_pause: StdMutex::new(None),
             fail_chrome_restore: AtomicBool::new(false),
             fail_next_final_binding_observation: AtomicBool::new(false),
+            fail_next_batch_append: AtomicBool::new(false),
+            fail_pre_record_writing: AtomicBool::new(false),
             workspace_ui: StdMutex::new(workspace_ui::WorkspaceUiState::default()),
             shutdown_request: watch::channel(false).0,
             stop: watch::channel(false).1,

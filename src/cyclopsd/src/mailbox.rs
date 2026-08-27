@@ -4393,7 +4393,6 @@ fn validate_display_label(kind: &str, label: &str) -> Result<(), MailboxError> {
 pub struct MessageStore {
     writer: LedgerWriter,
     projection: MailboxProjection,
-    #[cfg(test)]
     fail_next_batch_append: bool,
     #[cfg(test)]
     fail_claimed_staged_clear_appends: usize,
@@ -6270,7 +6269,6 @@ impl MessageStore {
         Ok(Self {
             writer,
             projection,
-            #[cfg(test)]
             fail_next_batch_append: false,
             #[cfg(test)]
             fail_claimed_staged_clear_appends: 0,
@@ -6289,8 +6287,7 @@ impl MessageStore {
         self.writer.path()
     }
 
-    #[cfg(test)]
-    fn inject_next_batch_append_failure(&mut self) {
+    pub(crate) fn inject_next_batch_append_failure(&mut self) {
         self.fail_next_batch_append = true;
     }
 
@@ -7019,7 +7016,6 @@ impl MessageStore {
         };
 
         let prepared = self.projection.prepare_line(&line)?;
-        #[cfg(test)]
         if std::mem::take(&mut self.fail_next_batch_append) {
             return Err(LedgerError::Io {
                 path: self.writer.path().to_path_buf(),
@@ -7376,6 +7372,13 @@ impl MessageStore {
             data: Some(serde_json::to_value(fact)?),
         };
         let prepared = self.projection.prepare_line(&line)?;
+        if std::mem::take(&mut self.fail_next_batch_append) {
+            return Err(LedgerError::Io {
+                path: self.writer.path().to_path_buf(),
+                source: std::io::Error::other("injected workspace journal append failure"),
+            }
+            .into());
+        }
         let persisted = self.writer.append(line)?;
         self.projection.commit_line(persisted, prepared);
         Ok(self

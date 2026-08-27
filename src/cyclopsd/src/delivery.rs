@@ -4385,6 +4385,11 @@ async fn attempt_delivery(
             };
             latch_hold(inner, handle, &proven)?;
             let mut unwritten_hold = UnwrittenHold::new(inner, handle, &proven);
+            if inner.fail_pre_record_writing.swap(false, Ordering::SeqCst) {
+                panic!(
+                    "worker exit at synchronous on_write boundary before first durable transition"
+                );
+            }
             if let (Some(notification), Some((pane_root, leader, agent))) =
                 (&handle.notification, notification_binding)
             {
@@ -5414,6 +5419,15 @@ fn notification_binding(
 /// Await the test-only injection pause, when one is installed. Production
 /// never installs one; this is a no-op there.
 pub(crate) async fn inject_pause(inner: &Arc<Inner>, phase: &'static str) {
+    if inner.fail_next_batch_append.swap(false, Ordering::SeqCst) {
+        if let Some(service) = &inner.mailbox {
+            service
+                .store_handle()
+                .lock()
+                .unwrap()
+                .inject_next_batch_append_failure();
+        }
+    }
     let hook = inner
         .inject_pause
         .lock()
@@ -11730,6 +11744,8 @@ composer_trailer_required_prefix = 1
             inject_pause: StdMutex::new(None),
             fail_chrome_restore: AtomicBool::new(false),
             fail_next_final_binding_observation: AtomicBool::new(false),
+            fail_next_batch_append: AtomicBool::new(false),
+            fail_pre_record_writing: AtomicBool::new(false),
             workspace_ui: StdMutex::new(crate::workspace_ui::WorkspaceUiState::default()),
             shutdown_request: watch::channel(false).0,
             stop: watch::channel(false).1,
