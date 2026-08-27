@@ -1168,16 +1168,12 @@ pub fn render_chat_lines(
 
             // If message body is authorized, expose it; otherwise show metadata subject
             if let Some(ref body) = item.authorized_body {
-                let show_subject = item
-                    .subject
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .is_some_and(|s| {
-                        s != "Direct Message"
-                            && s != "(none)"
-                            && !s.starts_with("Re: ")
-                            && !body.starts_with(s)
-                    });
+                let show_subject = item.reply_to.is_none()
+                    && item
+                        .subject
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .is_some_and(|s| s != "Direct Message" && !body.starts_with(s));
                 if show_subject {
                     if let Some(ref subj) = item.subject {
                         for row in wrap_words(subj, body_width) {
