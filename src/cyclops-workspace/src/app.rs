@@ -1658,13 +1658,6 @@ fn refresh_theme_watch(app: &mut App, watch: &mut cyclops_theme::ThemeWatch) {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ForwardOutcome {
-    Sent,
-    Reconciled,
-    Closed,
-}
-
 async fn reconcile_control_ingress(
     rx: &mut NotificationReceiver,
     continuity_tx: &mpsc::Sender<ControlContinuityBarrier>,
@@ -1695,23 +1688,8 @@ async fn reconcile_control_ingress(
     }
 }
 
-async fn forward_notification_message(
-    rx: &mut NotificationReceiver,
-    tmux_tx: &mpsc::Sender<AppMsg>,
-    continuity_tx: &mpsc::Sender<ControlContinuityBarrier>,
-    message: AppMsg,
-) -> ForwardOutcome {
-    match tmux_tx.try_send(message) {
-        Ok(()) => ForwardOutcome::Sent,
-        Err(mpsc::error::TrySendError::Closed(_)) => ForwardOutcome::Closed,
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            if reconcile_control_ingress(rx, continuity_tx).await {
-                ForwardOutcome::Reconciled
-            } else {
-                ForwardOutcome::Closed
-            }
-        }
-    }
+async fn forward_notification_message(tmux_tx: &mpsc::Sender<AppMsg>, message: AppMsg) -> bool {
+    tmux_tx.send(message).await.is_ok()
 }
 
 fn spawn_notif_forwarder(
@@ -1737,17 +1715,13 @@ fn spawn_notif_forwarder(
                 | Notification::ExtendedOutput { pane, data, .. } => {
                     if data.len() > OUTPUT_BATCH_MAX_BYTES {
                         for chunk in data.chunks(OUTPUT_BATCH_MAX_BYTES) {
-                            match forward_notification_message(
-                                &mut rx,
+                            if !forward_notification_message(
                                 &tmux_tx,
-                                &continuity_tx,
                                 AppMsg::OutputBatch(vec![(pane.clone(), chunk.to_vec())]),
                             )
                             .await
                             {
-                                ForwardOutcome::Sent => {}
-                                ForwardOutcome::Reconciled => break,
-                                ForwardOutcome::Closed => return,
+                                return;
                             }
                         }
                         continue;
@@ -1780,16 +1754,8 @@ fn spawn_notif_forwarder(
                         }
                         continue;
                     }
-                    match forward_notification_message(
-                        &mut rx,
-                        &tmux_tx,
-                        &continuity_tx,
-                        AppMsg::OutputBatch(output),
-                    )
-                    .await
-                    {
-                        ForwardOutcome::Sent | ForwardOutcome::Reconciled => {}
-                        ForwardOutcome::Closed => return,
+                    if !forward_notification_message(&tmux_tx, AppMsg::OutputBatch(output)).await {
+                        return;
                     }
                     continue;
                 }
@@ -1836,10 +1802,8 @@ fn spawn_notif_forwarder(
                 _ => None,
             };
             if let Some(message) = message {
-                match forward_notification_message(&mut rx, &tmux_tx, &continuity_tx, message).await
-                {
-                    ForwardOutcome::Sent | ForwardOutcome::Reconciled => {}
-                    ForwardOutcome::Closed => return,
+                if !forward_notification_message(&tmux_tx, message).await {
+                    return;
                 }
             }
         }
@@ -8111,34 +8075,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_full_app_hop_raises_the_same_priority_barrier() {
-        let (notification_tx, notification_rx) = mpsc::channel(1);
+    async fn a_full_app_hop_awaits_capacity_deterministically_and_preserves_order() {
         let (tmux_tx, mut tmux_rx) = mpsc::channel(1);
         tmux_tx
-            .try_send(AppMsg::Redraw)
-            .expect("fill the ordinary app hop");
-        let (continuity_tx, mut continuity_rx) = mpsc::channel(1);
-        spawn_notif_forwarder(
-            NotificationReceiver::from_bounded(notification_rx),
-            tmux_tx,
-            continuity_tx,
-        );
-        notification_tx
-            .send(Notification::SessionsChanged)
-            .await
-            .expect("control notification enters its own hop");
+            .try_send(AppMsg::OutputBatch(vec![("%0".into(), b"first".to_vec())]))
+            .expect("fill the cap-1 app queue");
 
-        let barrier = continuity_rx
-            .recv()
-            .await
-            .expect("second-hop loss bypasses the saturated lane");
-        assert!(matches!(tmux_rx.try_recv(), Ok(AppMsg::Redraw)));
-        assert!(tmux_rx.try_recv().is_err());
-        barrier
-            .repair
-            .send(true)
-            .expect("app confirms authoritative snapshot");
-        assert!(barrier.cutover.await.expect("source answers cutover"));
+        let second_bytes = b"second".to_vec();
+        let send_fut = forward_notification_message(
+            &tmux_tx,
+            AppMsg::OutputBatch(vec![("%0".into(), second_bytes.clone())]),
+        );
+        tokio::pin!(send_fut);
+
+        // Biased select proves send_fut is Pending while queue is full.
+        tokio::select! {
+            biased;
+            _ = &mut send_fut => panic!("send_fut completed while app queue was full"),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        // Drain the first message from the cap-1 app queue.
+        let Some(AppMsg::OutputBatch(first)) = tmux_rx.recv().await else {
+            panic!("expected OutputBatch for first message");
+        };
+        assert_eq!(first, vec![("%0".into(), b"first".to_vec())]);
+
+        // Awaiting future succeeds now that capacity opened.
+        assert!(
+            send_fut.await,
+            "send unblocks and succeeds once capacity opens"
+        );
+
+        // Second message arrives byte-identical with order preserved.
+        let Some(AppMsg::OutputBatch(second)) = tmux_rx.recv().await else {
+            panic!("expected OutputBatch for second message");
+        };
+        assert_eq!(second, vec![("%0".into(), second_bytes)]);
     }
 
     #[tokio::test]
