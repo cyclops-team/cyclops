@@ -2,9 +2,9 @@
 //!
 //! The outer server supplies the tty that runs bare `cyclops`; the target
 //! server holds the nested pane grid the workspace adopts and resizes. This
-//! crosses the public binary entrypoint and `cyclops_workspace::run_async`,
-//! so a boot-only drift around later sizing helpers cannot hide behind a
-//! unit test of those helpers.
+//! crosses the public binary entrypoint and `cyclops_workspace::run_async`.
+//! A target-side tmux hook records the first resize, so a later reconcile
+//! cannot repair a bad boot declaration before the assertion observes it.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -72,6 +72,16 @@ fn window_size(server: &TmuxServer) -> (u16, u16) {
     (cols, rows)
 }
 
+fn first_resize(server: &TmuxServer) -> Option<(u16, u16)> {
+    let output = server.run(&["show-options", "-gv", "@cyclops_test_first_resize"]);
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut fields = text.split_whitespace();
+    Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+}
+
 fn alternate_on(server: &TmuxServer, pane: &str) -> bool {
     let output = server.run(&["display-message", "-p", "-t", pane, "#{alternate_on}"]);
     String::from_utf8_lossy(&output.stdout).trim() == "1"
@@ -107,6 +117,16 @@ fn persisted_open_messages_uses_collapsed_rail_size_through_real_boot() {
         .run_ok(&["split-window", "-h", "-l", "30", "-t", "demo", "/bin/sh"]);
     rig.target()
         .run_ok(&["split-window", "-v", "-l", "5", "-t", "demo", "/bin/sh"]);
+    // Preserve the first target-side resize as immutable server state. A
+    // process-level test that polls only the final size can miss a wrong boot
+    // declaration when the normal reconcile loop repairs it milliseconds
+    // later.
+    rig.target().run_ok(&[
+        "set-hook",
+        "-g",
+        "after-resize-window",
+        "if-shell -F '#{@cyclops_test_first_resize}' '' \"run-shell \\\"tmux set-option -g @cyclops_test_first_resize '#{window_width} #{window_height}'\\\"\"",
+    ]);
 
     std::fs::write(
         home.join("config.toml"),
@@ -159,7 +179,7 @@ fn persisted_open_messages_uses_collapsed_rail_size_through_real_boot() {
         screen.contains('╭') || screen.contains('╔')
     });
     wait_until("the production cold-boot resize", || {
-        window_size(rig.target()) != (100, 30)
+        first_resize(rig.target()).is_some()
     });
     let screen = rig.outer().capture(&host_pane);
     assert!(
@@ -167,9 +187,14 @@ fn persisted_open_messages_uses_collapsed_rail_size_through_real_boot() {
         "the persisted-open Messages pane did not paint:\n{screen}"
     );
     assert_eq!(
+        first_resize(rig.target()),
+        Some((95, 26)),
+        "the first real run_async resize used the local Messages paint canvas"
+    );
+    assert_eq!(
         window_size(rig.target()),
         (95, 26),
-        "real run_async boot sized tmux from the local Messages paint canvas"
+        "the live workspace converged on the same shared tmux geometry"
     );
 
     rig.outer()
