@@ -4730,6 +4730,27 @@ impl MailboxService {
         Ok(recipients)
     }
 
+    /// The notification queue skips an operator-withdrawn wake while keeping
+    /// its mailbox entry pending and pullable. Every notification scheduler
+    /// path must make that same choice, otherwise a withdrawn head can hide a
+    /// later blocked attempt forever.
+    fn first_actionable_pending_message_id(
+        store: &MessageStore,
+        recipient: RecipientKey,
+    ) -> Option<MessageId> {
+        store
+            .projection()
+            .get_pending(recipient)
+            .iter()
+            .find(|entry| {
+                store
+                    .projection()
+                    .notification(recipient, &entry.message_id)
+                    .is_none_or(|record| record.state != NotificationState::WithdrawnByOperator)
+            })
+            .map(|entry| entry.message_id.clone())
+    }
+
     /// Queue or resume the oldest pending notification for one recipient.
     ///
     /// This method owns the atomic mailbox decision so concurrent sends
@@ -4761,17 +4782,7 @@ impl MailboxService {
             return Ok(Some(record));
         }
         loop {
-            let Some(message_id) = store
-                .projection()
-                .get_pending(recipient)
-                .into_iter()
-                .find(|entry| {
-                    store
-                        .projection()
-                        .notification(recipient, &entry.message_id)
-                        .is_none_or(|record| record.state != NotificationState::WithdrawnByOperator)
-                })
-                .map(|entry| entry.message_id.clone())
+            let Some(message_id) = Self::first_actionable_pending_message_id(&store, recipient)
             else {
                 return Ok(None);
             };
@@ -4843,12 +4854,7 @@ impl MailboxService {
                 }));
             }
         }
-        let Some(message_id) = store
-            .projection()
-            .get_pending(recipient)
-            .first()
-            .map(|entry| entry.message_id.clone())
-        else {
+        let Some(message_id) = Self::first_actionable_pending_message_id(&store, recipient) else {
             return Ok(None);
         };
         let Some(record) = store.projection().notification(recipient, &message_id) else {
@@ -4876,17 +4882,12 @@ impl MailboxService {
             return Ok(false);
         }
         let store = self.store()?;
-        let Some(message_id) = store
-            .projection()
-            .get_pending(recipient)
-            .first()
-            .map(|entry| &entry.message_id)
-        else {
+        let Some(message_id) = Self::first_actionable_pending_message_id(&store, recipient) else {
             return Ok(false);
         };
         Ok(store
             .projection()
-            .notification(recipient, message_id)
+            .notification(recipient, &message_id)
             .and_then(notification_pre_write_width_block)
             .is_some())
     }
@@ -4909,12 +4910,7 @@ impl MailboxService {
             return Ok(None);
         }
         let mut store = self.store()?;
-        let Some(message_id) = store
-            .projection()
-            .get_pending(recipient)
-            .first()
-            .map(|entry| entry.message_id.clone())
-        else {
+        let Some(message_id) = Self::first_actionable_pending_message_id(&store, recipient) else {
             return Ok(None);
         };
         let Some(current) = store

@@ -270,6 +270,8 @@ fn cached_entry_is_write_ready(
 /// This is only a receipt-latency hint. The delivery worker still performs
 /// every route, process, manifest, and terminal binding proof. A stale hint
 /// can make the caller wait to its cap, but can never authorize a write.
+/// `idle_with_input` is also immediately decidable: it is a conclusive
+/// pre-write refusal, not permission to type.
 fn cached_route_can_decide_now(inner: &Inner, route: &NotificationRoute) -> bool {
     if route.row.in_mode {
         return false;
@@ -283,7 +285,8 @@ fn cached_route_can_decide_now(inner: &Inner, route: &NotificationRoute) -> bool
             !entry.in_mode
                 && !entry.detection.stale
                 && !entry.detection.disagreement
-                && entry.detection.write_ready
+                && (entry.detection.write_ready
+                    || entry.detection.state == cyclops_proto::AgentState::IdleWithInput)
         })
 }
 

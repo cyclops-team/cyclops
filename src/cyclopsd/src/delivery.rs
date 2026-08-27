@@ -5889,7 +5889,15 @@ async fn gate(
             }
         }
 
-        let hold = if let Some(cause) = forced_hold.take() {
+        // `initial_hold` is only a receipt seed. For a notification that
+        // starts while a human draft is visible, take the fresh gate path so
+        // it can record the exact durable `composer_hold` refusal below;
+        // carrying the cached `idle_with_input` value straight into the wait
+        // loop would make that refusal invisible until another pane event.
+        let initial_hold = forced_hold
+            .take()
+            .filter(|cause| !(handle.notification.is_some() && cause == "idle_with_input"));
+        let hold = if let Some(cause) = initial_hold {
             Some(cause)
         } else {
             match &watcher {
@@ -6144,6 +6152,38 @@ async fn gate(
                                             observation: Box::new(observation),
                                         };
                                     }
+                                    // A staged composer hold is an exact, durable
+                                    // pre-write refusal. The daemon has observed
+                                    // input it must not type over, so persist the
+                                    // block now instead of leaving the notification
+                                    // in an in-memory gate wait until a later turn.
+                                    (false, Some("composer_hold"))
+                                        if handle.notification.is_some() =>
+                                    {
+                                        let Some(mut observation) = composer_semantic_observation(
+                                            inner,
+                                            handle,
+                                            &row,
+                                            &manifest_id,
+                                        ) else {
+                                            return GateOutcome::BlockedPreWrite {
+                                                cause: NotificationPreWriteCause::BindingUnprovable,
+                                                observation: Box::new(
+                                                    binding_unprovable_observation(
+                                                        inner,
+                                                        handle,
+                                                        row.pane_pid,
+                                                        &manifest_id,
+                                                    ),
+                                                ),
+                                            };
+                                        };
+                                        observation.write_block = Some("composer_hold".to_string());
+                                        return GateOutcome::BlockedPreWrite {
+                                            cause: NotificationPreWriteCause::WriteReadinessChanged,
+                                            observation: Box::new(observation),
+                                        };
+                                    }
                                     (false, reason) => Some(format!(
                                         "not_write_ready:{}",
                                         reason.unwrap_or("unstamped")
@@ -6242,7 +6282,34 @@ async fn gate(
                                 }
                             }
                             AgentState::Working => Some("working".to_string()),
-                            // Human typing always wins.
+                            // Human typing always wins. A notification has
+                            // reached a conclusive pre-write refusal: publish
+                            // it durably now, rather than waiting in memory
+                            // for a turn that may never occur (for example a
+                            // local slash command).
+                            AgentState::IdleWithInput if handle.notification.is_some() => {
+                                let Some(mut observation) = composer_semantic_observation(
+                                    inner,
+                                    handle,
+                                    &row,
+                                    &manifest_id,
+                                ) else {
+                                    return GateOutcome::BlockedPreWrite {
+                                        cause: NotificationPreWriteCause::BindingUnprovable,
+                                        observation: Box::new(binding_unprovable_observation(
+                                            inner,
+                                            handle,
+                                            row.pane_pid,
+                                            &manifest_id,
+                                        )),
+                                    };
+                                };
+                                observation.write_block = Some("composer_hold".to_string());
+                                return GateOutcome::BlockedPreWrite {
+                                    cause: NotificationPreWriteCause::WriteReadinessChanged,
+                                    observation: Box::new(observation),
+                                };
+                            }
                             AgentState::IdleWithInput => Some("idle_with_input".to_string()),
                             AgentState::Unknown => Some("unknown".to_string()),
                         }
