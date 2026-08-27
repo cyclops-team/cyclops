@@ -1,9 +1,10 @@
 //! Parse tmux `window_layout` strings into a split tree.
 //!
 //! Layout leaves carry the pane's numeric id (the `N` of `%N`) and its
-//! cell-exact geometry inside the window. The workspace keeps every leaf at
-//! that exact size while expanding separator bands into UI-owned chrome, so
-//! the grid a pane runtime holds still maps 1:1 onto screen cells.
+//! cell-exact geometry inside the window. At the driver's extent the
+//! workspace preserves that geometry while expanding separator bands into
+//! UI-owned chrome. A smaller follower canvas proportionally fits the pane
+//! cards, but each visible runtime cell still maps 1:1 onto a screen cell.
 
 use ratatui::layout::Rect;
 use thiserror::Error;
@@ -33,6 +34,9 @@ impl PaneGaps {
             SplitDir::Horizontal => self.columns,
             SplitDir::Vertical => self.rows,
         }
+        // Sibling frames paint immediately outside their content rects. A
+        // zero-cell seam lets either frame overwrite the other's content.
+        .max(1)
     }
 }
 
@@ -437,17 +441,23 @@ pub fn layout_pane_slots(node: &ResolvedLayout, canvas: Rect, focused_pane: &str
 }
 
 /// Screen geometry with an explicit chrome band between sibling panes.
-/// Leaf rectangles keep their exact tmux dimensions; only separator bands
-/// expand, so a child TUI still maps one runtime cell to one screen cell.
+///
+/// At the tmux window's size, leaf rectangles keep their exact tmux
+/// dimensions. When this client's local canvas is smaller, the pane cards
+/// keep the same proportions and clip each runtime as a 1:1 viewport. No
+/// runtime cell is scaled, and no local fit changes the shared tmux window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayoutGeometry {
     pub slots: Vec<PaneSlot>,
     pub dividers: Vec<DividerSeg>,
 }
 
-/// Expand tmux's separator cells to `gap` screen cells without scaling pane
-/// content. Nested splits may leave quiet chrome beside a less-deep sibling;
-/// that is preferable to stretching or cropping the sibling's terminal.
+/// Expand tmux's separator cells to `gap` screen cells and fit pane cards
+/// inside `canvas` without scaling pane content. Nested splits may leave
+/// quiet chrome beside a less-deep sibling. A canvas smaller than the tmux
+/// layout proportionally shrinks each card and shows a 1:1 leading viewport
+/// of its runtime, so a sizing follower can reserve local chrome without
+/// resizing the shared window or hiding a trailing pane.
 pub fn layout_geometry(
     node: &ResolvedLayout,
     canvas: Rect,
@@ -458,14 +468,20 @@ pub fn layout_geometry(
         slots: Vec::new(),
         dividers: Vec::new(),
     };
-    collect_geometry(
-        node,
-        (canvas.x, canvas.y),
-        canvas,
-        focused_pane,
-        gaps,
-        &mut geometry,
+    let source = transformed_size(node, gaps);
+    let fitted = Rect::new(
+        canvas.x,
+        canvas.y,
+        source.0.min(canvas.width),
+        source.1.min(canvas.height),
     );
+    collect_geometry(node, fitted, focused_pane, gaps, &mut geometry);
+    if fitted.width < source.0 || fitted.height < source.1 {
+        // Pointer deltas are local cells, while divider actions resize tmux
+        // in source cells. A fitted card has no exact 1:1 resize seam, so it
+        // must not advertise one until the full source geometry returns.
+        geometry.dividers.clear();
+    }
     geometry
 }
 
@@ -511,8 +527,7 @@ fn transformed_size(node: &ResolvedLayout, gaps: PaneGaps) -> (u16, u16) {
 
 fn collect_geometry(
     node: &ResolvedLayout,
-    origin: (u16, u16),
-    bounds: Rect,
+    area: Rect,
     focused: &str,
     gaps: PaneGaps,
     geometry: &mut LayoutGeometry,
@@ -524,7 +539,13 @@ fn collect_geometry(
             height,
             ..
         } => {
-            if let Some(rect) = clip_rect(Rect::new(origin.0, origin.1, *width, *height), bounds) {
+            let rect = Rect::new(
+                area.x,
+                area.y,
+                (*width).min(area.width),
+                (*height).min(area.height),
+            );
+            if rect.width > 0 && rect.height > 0 {
                 geometry.slots.push(PaneSlot {
                     pane_id: pane_id.clone(),
                     rect,
@@ -533,37 +554,74 @@ fn collect_geometry(
             }
         }
         ResolvedLayout::Split { dir, children, .. } => {
-            let (width, height) = transformed_size(node, gaps);
-            let gap = gaps.for_split(*dir);
-            let mut cursor = origin;
+            let source_sizes: Vec<_> = children
+                .iter()
+                .map(|child| transformed_size(child, gaps))
+                .collect();
+            let wanted: Vec<_> = source_sizes
+                .iter()
+                .map(|size| match dir {
+                    SplitDir::Horizontal => size.0,
+                    SplitDir::Vertical => size.1,
+                })
+                .collect();
+            let available = match dir {
+                SplitDir::Horizontal => area.width,
+                SplitDir::Vertical => area.height,
+            };
+            let focused_child = children
+                .iter()
+                .position(|child| layout_contains_pane(child, focused));
+            let (lengths, gap) =
+                fit_split_lengths(&wanted, available, gaps.for_split(*dir), focused_child);
+            let mut cursor = (area.x, area.y);
             for (index, child) in children.iter().enumerate() {
-                let child_size = transformed_size(child, gaps);
-                collect_geometry(child, cursor, bounds, focused, gaps, geometry);
+                let child_area = match dir {
+                    SplitDir::Horizontal => Rect::new(
+                        cursor.0,
+                        area.y,
+                        lengths[index],
+                        source_sizes[index].1.min(area.height),
+                    ),
+                    SplitDir::Vertical => Rect::new(
+                        area.x,
+                        cursor.1,
+                        source_sizes[index].0.min(area.width),
+                        lengths[index],
+                    ),
+                };
+                collect_geometry(child, child_area, focused, gaps, geometry);
                 if index + 1 < children.len() {
                     let divider = match dir {
-                        SplitDir::Horizontal => {
-                            Rect::new(cursor.0.saturating_add(child_size.0), origin.1, gap, height)
-                        }
-                        SplitDir::Vertical => {
-                            Rect::new(origin.0, cursor.1.saturating_add(child_size.1), width, gap)
-                        }
+                        SplitDir::Horizontal => Rect::new(
+                            cursor.0.saturating_add(lengths[index]),
+                            area.y,
+                            gap,
+                            area.height,
+                        ),
+                        SplitDir::Vertical => Rect::new(
+                            area.x,
+                            cursor.1.saturating_add(lengths[index]),
+                            area.width,
+                            gap,
+                        ),
                     };
-                    if let (Some(rect), Some(pane_id)) =
-                        (clip_rect(divider, bounds), trailing_leaf(child, *dir))
-                    {
-                        geometry.dividers.push(DividerSeg {
-                            rect,
-                            dir: *dir,
-                            pane_id,
-                        });
+                    if divider.width > 0 && divider.height > 0 {
+                        if let Some(pane_id) = trailing_leaf(child, *dir) {
+                            geometry.dividers.push(DividerSeg {
+                                rect: divider,
+                                dir: *dir,
+                                pane_id,
+                            });
+                        }
                     }
                 }
                 match dir {
                     SplitDir::Horizontal => {
-                        cursor.0 = cursor.0.saturating_add(child_size.0).saturating_add(gap)
+                        cursor.0 = cursor.0.saturating_add(lengths[index]).saturating_add(gap)
                     }
                     SplitDir::Vertical => {
-                        cursor.1 = cursor.1.saturating_add(child_size.1).saturating_add(gap)
+                        cursor.1 = cursor.1.saturating_add(lengths[index]).saturating_add(gap)
                     }
                 }
             }
@@ -571,18 +629,88 @@ fn collect_geometry(
     }
 }
 
-fn clip_rect(rect: Rect, bounds: Rect) -> Option<Rect> {
-    let left = rect.x.max(bounds.x);
-    let top = rect.y.max(bounds.y);
-    let right = rect
-        .x
-        .saturating_add(rect.width)
-        .min(bounds.x.saturating_add(bounds.width));
-    let bottom = rect
-        .y
-        .saturating_add(rect.height)
-        .min(bounds.y.saturating_add(bounds.height));
-    (right > left && bottom > top).then(|| Rect::new(left, top, right - left, bottom - top))
+/// Fit sibling lengths to one local axis:
+///
+/// 1. Return full-size layouts byte-for-byte.
+/// 2. Reserve one content cell and one separating border cell per sibling
+///    when they fit.
+/// 3. Below that safe floor, collapse every nonfocused branch and give the
+///    focused branch the whole axis so sibling frames cannot erase its last
+///    visible runtime cell.
+/// 4. Otherwise use largest-remainder apportionment so rounding cannot strand
+///    cells.
+fn fit_split_lengths(
+    wanted: &[u16],
+    available: u16,
+    wanted_gap: u16,
+    focused: Option<usize>,
+) -> (Vec<u16>, u16) {
+    if wanted.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let count = u16::try_from(wanted.len()).unwrap_or(u16::MAX);
+    let divider_count = count.saturating_sub(1);
+    let visible_floor = count.saturating_add(divider_count);
+    if available < visible_floor {
+        // There is not enough room for one content cell per branch plus a
+        // separating border cell. Keeping zero-gap siblings would let a
+        // frame erase the neighbouring runtime, so collapse every branch
+        // except the one carrying focus and give that survivor the axis.
+        let mut fitted = vec![0u16; wanted.len()];
+        let survivor = focused.filter(|index| *index < fitted.len()).unwrap_or(0);
+        fitted[survivor] = available;
+        return (fitted, 0);
+    }
+    let gap = available
+        .saturating_sub(count)
+        .checked_div(divider_count)
+        .map_or(0, |maximum| wanted_gap.min(maximum));
+    let content = available.saturating_sub(gap.saturating_mul(divider_count));
+    let wanted_total = wanted.iter().copied().fold(0u16, u16::saturating_add);
+    if wanted_total <= content {
+        return (wanted.to_vec(), gap);
+    }
+
+    let mut fitted = vec![0u16; wanted.len()];
+    let mut floor_left = content.min(count);
+    if let Some(index) = focused.filter(|index| *index < fitted.len()) {
+        fitted[index] = 1;
+        floor_left = floor_left.saturating_sub(1);
+    }
+    for (index, length) in fitted.iter_mut().enumerate() {
+        if floor_left == 0 {
+            break;
+        }
+        if Some(index) != focused {
+            *length = 1;
+            floor_left -= 1;
+        }
+    }
+
+    let floor = fitted.iter().copied().fold(0u16, u16::saturating_add);
+    let remaining = content.saturating_sub(floor);
+    if remaining == 0 || wanted_total == 0 {
+        return (fitted, gap);
+    }
+
+    let denominator = u32::from(wanted_total);
+    let mut remainders = Vec::with_capacity(wanted.len());
+    let mut distributed = 0u16;
+    for (index, wanted) in wanted.iter().copied().enumerate() {
+        let numerator = u32::from(remaining) * u32::from(wanted);
+        let share = u16::try_from(numerator / denominator).unwrap_or(u16::MAX);
+        fitted[index] = fitted[index].saturating_add(share);
+        distributed = distributed.saturating_add(share);
+        remainders.push((numerator % denominator, index));
+    }
+    remainders.sort_unstable_by(|a, b| b.cmp(a));
+    for (_, index) in remainders
+        .into_iter()
+        .take(usize::from(remaining.saturating_sub(distributed)))
+    {
+        fitted[index] = fitted[index].saturating_add(1);
+    }
+    (fitted, gap)
 }
 
 #[cfg(test)]
@@ -860,6 +988,63 @@ mod tests {
         let canvas = Rect::new(0, 0, 150, 45);
         let slots = layout_pane_slots(&resolved, canvas, "%0");
         assert_eq!(slots[1].rect, Rect::new(91, 0, 59, 45));
+    }
+
+    /// A workspace client may have less local canvas than the tmux window
+    /// driver without owning the right to resize that shared window. The
+    /// local pane cards still have to fit the canvas: clipping the old
+    /// window coordinates hides the trailing pane, which is exactly the
+    /// pane an operator can be focused in when the Messages pane opens.
+    #[test]
+    fn a_compressed_canvas_reflows_the_grid_and_keeps_the_focused_pane_visible() {
+        let node = parse_layout("dd63,90x20,0,0{60x20,0,0,0,29x20,61,0,1}").unwrap();
+        let resolved = resolve_layout(&node, &[]).unwrap();
+        let gaps = PaneGaps {
+            columns: 2,
+            rows: 2,
+        };
+
+        // At the tmux driver's full extent the render geometry is unchanged.
+        let full = layout_geometry(&resolved, Rect::new(0, 0, 91, 20), "%1", gaps);
+        assert_eq!(full.slots[0].rect, Rect::new(0, 0, 60, 20));
+        assert_eq!(full.slots[1].rect, Rect::new(62, 0, 29, 20));
+
+        // The Messages pane reserves local width. Both cards must reflow
+        // into what remains, preserving the tmux split proportion to
+        // rounding.
+        let compressed = layout_geometry(&resolved, Rect::new(0, 0, 69, 20), "%1", gaps);
+        assert_eq!(compressed.slots.len(), 2, "no pane may disappear");
+        let left = compressed
+            .slots
+            .iter()
+            .find(|slot| slot.pane_id == "%0")
+            .expect("left pane");
+        let right = compressed
+            .slots
+            .iter()
+            .find(|slot| slot.pane_id == "%1")
+            .expect("focused right pane");
+        assert_eq!(left.rect.right() + gaps.columns, right.rect.x);
+        assert_eq!(right.rect.right(), 69);
+        assert!(right.focused);
+        assert!(
+            (i32::from(right.rect.width) * 60 - i32::from(left.rect.width) * 29).abs() <= 60,
+            "the split drifted instead of shrinking proportionally: left {}, right {}",
+            left.rect.width,
+            right.rect.width
+        );
+
+        // Below the width at which every old coordinate fits, the selected
+        // pane remains a real, focusable rectangle rather than falling off
+        // the clipped right edge.
+        let narrow = layout_geometry(&resolved, Rect::new(0, 0, 33, 20), "%1", gaps);
+        assert!(
+            narrow
+                .slots
+                .iter()
+                .any(|slot| slot.pane_id == "%1" && slot.focused && slot.rect.width > 0),
+            "the focused pane vanished at narrow width"
+        );
     }
 
     #[test]

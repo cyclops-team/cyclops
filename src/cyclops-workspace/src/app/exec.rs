@@ -269,6 +269,9 @@ pub(super) async fn execute(
         Action::ToggleMessages => {
             app.model.messages_visible = !app.model.messages_visible;
             app.prefs.messages_visible = app.model.messages_visible;
+            // The Messages pane consumes only this viewer's canvas. Opening
+            // or closing it must not resize the shared tmux window, whether
+            // this workspace owns that window or follows another owner.
             app.layout_changed();
             if app.model.messages_visible {
                 app.messages_focused = true;
@@ -276,7 +279,6 @@ pub(super) async fn execute(
             } else {
                 app.messages_focused = false;
             }
-            super::resize_client(app, client).await;
             Ok(Outcome {
                 persist: true,
                 ..Outcome::default()
@@ -297,7 +299,7 @@ pub(super) async fn execute(
                 cyclops_ui::ChatAction::Retry => (KeyCode::Char('r'), KeyModifiers::CONTROL),
             };
             // Clicking a verb in the strip is also a statement about where
-            // the operator is working, so the drawer takes focus first for
+            // the operator is working, so the Messages pane takes focus first for
             // the verbs that read the selection.
             app.messages_focused = true;
             super::handle_messages_key(app, KeyEvent::new(code, modifiers)).await?;
@@ -1549,6 +1551,34 @@ mod tests {
             .collect()
     }
 
+    fn window_layout(server: &TmuxServer, target: &str) -> String {
+        let out = server.run(&["display-message", "-p", "-t", target, "#{window_layout}"]);
+        assert!(
+            out.status.success(),
+            "read {target} layout: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn active_pane_id(server: &TmuxServer, target: &str) -> String {
+        let out = server.run(&[
+            "list-panes",
+            "-t",
+            target,
+            "-f",
+            "#{pane_active}",
+            "-F",
+            "#{pane_id}",
+        ]);
+        assert!(
+            out.status.success(),
+            "read {target} active pane: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
     /// `(pane_id, pane_left)` per pane, enough to prove a swap exchanged
     /// two side-by-side panes' slots.
     fn pane_positions(server: &TmuxServer, target: &str) -> Vec<(String, String)> {
@@ -2465,29 +2495,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn toggle_messages_persists_visibility_and_redecares_client_size() {
-        use cyclops_testrig::{tmux_available, TmuxServer};
-
+    async fn toggle_messages_persists_visibility_without_reshaping_nested_tmux_layout() {
         if !tmux_available() {
             return;
         }
         let server = TmuxServer::new("exec-toggle-messages");
-        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
-        let pane = pane_ids(&server, "s")[0].clone();
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-x",
+            "100",
+            "-y",
+            "30",
+            "-s",
+            "s",
+            "/bin/sh",
+        ]);
+        server.run_ok(&["split-window", "-h", "-l", "30", "-t", "s", "/bin/sh"]);
+        server.run_ok(&["split-window", "-v", "-l", "5", "-t", "s", "/bin/sh"]);
+
         let client = rig_client(&server, "s").await;
         let home = scratch_home("exec-toggle-messages-home");
-        let mut app = test_app(one_tab_model("s", "@0", &pane, "$0"), home.clone());
+        let window_id = window_ids(&server, "s")[0].clone();
+        let before = window_layout(&server, &window_id);
+        let node = crate::layout::parse_layout(&before).expect("parse nested tmux layout");
+        let layout = crate::layout::resolve_layout(&node, &pane_ids(&server, "s"))
+            .expect("resolve nested tmux panes");
+        let active_pane = active_pane_id(&server, "s");
+        let model = WorkspaceModel {
+            workspaces: vec![WorkspaceRow {
+                session_id: "$0".to_string(),
+                name: "s".to_string(),
+                tab_count: 1,
+                window_ids: vec![window_id.clone()],
+            }],
+            active_workspace: 0,
+            session: SessionModel {
+                session: "s".to_string(),
+                tabs: vec![TabModel {
+                    window_id: window_id.clone(),
+                    name: "1".to_string(),
+                    layout,
+                    active_pane,
+                    zoomed: false,
+                }],
+                active_tab: 0,
+            },
+            sidebar_visible: false,
+            messages_visible: false,
+        };
+        let mut app = test_app(model, home.clone());
+        app.term_size = (100, 30);
+        app.prefs.sidebar_visible = false;
+        let adopted = crate::app::adopt_windows(
+            &mut app.sizing,
+            &client,
+            "s",
+            &app.model.session.tabs,
+            &home,
+        )
+        .await;
+        assert!(adopted.took_a_window, "test app must own the nested window");
         assert!(!app.model.messages_visible, "the default is collapsed");
 
         let outcome = execute(&mut app, &client, Action::ToggleMessages)
             .await
-            .expect("open messages drawer");
+            .expect("open Messages pane");
         assert!(outcome.persist, "the new visibility belongs on disk");
         assert!(app.model.messages_visible);
         assert!(app.prefs.messages_visible, "prefs mirror the model");
-        let opened = app
-            .declared_client_size
-            .expect("opening messages drawer re-declares the client size");
+        assert!(
+            app.messages_focused,
+            "opening gives the Messages pane focus"
+        );
+        let after_open = window_layout(&server, &window_id);
+        let declared_after_open = app.declared_client_size;
 
         crate::persist::save_prefs(&home, &app.prefs).expect("save prefs");
         assert!(
@@ -2497,16 +2579,27 @@ mod tests {
 
         let outcome = execute(&mut app, &client, Action::ToggleMessages)
             .await
-            .expect("collapse messages drawer");
+            .expect("close Messages pane");
         assert!(outcome.persist);
         assert!(!app.model.messages_visible);
         assert!(!app.prefs.messages_visible);
-        let collapsed = app
-            .declared_client_size
-            .expect("collapsing messages drawer re-declares the client size");
-        assert_ne!(
-            opened, collapsed,
-            "the canvas must resize when messages drawer collapses"
+        assert!(!app.messages_focused, "closing clears Messages pane focus");
+        let after_close = window_layout(&server, &window_id);
+        assert_eq!(
+            declared_after_open, None,
+            "opening Messages must not declare a new tmux client size"
+        );
+        assert_eq!(
+            app.declared_client_size, None,
+            "closing Messages must not declare a new tmux client size"
+        );
+        assert_eq!(
+            after_open, before,
+            "opening the local Messages pane must not reshape shared tmux panes"
+        );
+        assert_eq!(
+            after_close, before,
+            "closing the local Messages pane must restore local width without reshaping tmux"
         );
 
         let _ = std::fs::remove_dir_all(&home);

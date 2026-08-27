@@ -99,13 +99,13 @@ pub enum HitTarget {
     /// panel's outer edge, and on the one-column rail a collapse leaves
     /// behind. One target for both, because it is one control.
     SidebarToggle,
-    /// The chevron that collapses or reopens the right-edge messages drawer:
+    /// The chevron that collapses or reopens the right-edge Messages pane:
     /// on the open panel's inner divider edge, and on the one-column rail
     /// a collapse leaves behind.
     MessagesToggle,
-    /// Resize handle for the right-edge messages drawer.
+    /// Resize handle for the right-edge Messages pane.
     MessagesDivider,
-    /// One verb in the drawer's action strip. The strip prints the same
+    /// One verb in the Messages pane's action strip. The strip prints the same
     /// words a keyboard user reads, so a pointer gets the same verbs
     /// instead of a hint it cannot act on.
     MessagesAction(cyclops_ui::ChatAction),
@@ -315,7 +315,7 @@ pub fn motion_touches_hover_button(
                     | HitTarget::SidebarDivider
                     | HitTarget::MessagesToggle
                     | HitTarget::MessagesDivider
-                    // The drawer's footer buttons fill under the pointer
+                    // The Messages pane's footer buttons fill under the pointer
                     // the way the tab strip's `+` does.
                     | HitTarget::MessagesAction(_)
                     | HitTarget::FileRow { .. }

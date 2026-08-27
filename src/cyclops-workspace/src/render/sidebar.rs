@@ -17,7 +17,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 
 use cyclops_ui::Record;
 
@@ -441,8 +441,9 @@ pub fn paint_sidebar_rail(
     );
 }
 
-/// Render the messages surface on the right edge: the left-edge divider and collapse
-/// chevron, and the messages queue or open detail.
+/// Render the Messages pane on the right edge. Its left border remains the
+/// resize divider and collapse control, while the complete frame makes the
+/// peer region it owns unambiguous beside the agent grid.
 pub fn paint_messages(
     queue: &cyclops_ui::HumanQueue,
     detail: Option<&cyclops_ui::Detail>,
@@ -452,6 +453,7 @@ pub fn paint_messages(
     pane_manifests: Option<&HashMap<String, String>>,
     status: Option<&str>,
     retry_available: bool,
+    focused: bool,
     area: Rect,
     buf: &mut Buffer,
     paint: &Paint,
@@ -462,8 +464,21 @@ pub fn paint_messages(
         return;
     }
     buf.set_style(area, theme::chrome_panel(paint));
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(if focused {
+            BorderType::Double
+        } else {
+            BorderType::Rounded
+        })
+        .border_style(if focused {
+            theme::pane_border_focused(paint)
+        } else {
+            theme::pane_border(paint)
+        })
+        .render(area, buf);
 
-    // The left edge of the right messages panel is the divider/toggle
+    // The left edge of the Messages pane is the divider/toggle.
     let edge = Rect::new(area.x, area.y, 1, area.height);
     let grab = Rect::new(edge.x, edge.y, 1, edge.height);
     hits.push(grab, HitTarget::MessagesDivider);
@@ -479,8 +494,8 @@ pub fn paint_messages(
         hover,
     );
 
-    let content_w = area.width.saturating_sub(1) as usize;
-    let content_h = area.height as usize;
+    let content_w = area.width.saturating_sub(2) as usize;
+    let content_h = area.height.saturating_sub(2) as usize;
     if content_w == 0 || content_h == 0 {
         return;
     }
@@ -506,9 +521,9 @@ pub fn paint_messages(
     );
     let content_rect = Rect::new(
         area.x + 1,
-        area.y,
-        area.width.saturating_sub(1),
-        area.height,
+        area.y + 1,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
     );
     let pointed = |rect: Rect| {
         hover.is_some_and(|(col, row)| {
@@ -553,9 +568,9 @@ pub fn paint_messages(
     }
 }
 
-/// The workspace palette for one drawer ink. The renderer named what the
-/// run is; this is the one place that decides what that looks like, on the
-/// drawer's own panel ground.
+/// The workspace palette for one Messages pane ink. The renderer named what
+/// the run is; this is the one place that decides what that looks like on
+/// the pane's own ground.
 fn chat_ink_style(paint: &Paint, ink: &cyclops_ui::ChatInk) -> Style {
     use cyclops_ui::ChatInk;
     let panel = theme::chrome_panel(paint);
@@ -575,7 +590,7 @@ fn chat_ink_style(paint: &Paint, ink: &cyclops_ui::ChatInk) -> Style {
     }
 }
 
-/// Render the rail a collapsed messages drawer leaves behind on the right edge.
+/// Render the rail a collapsed Messages pane leaves on the right edge.
 pub fn paint_messages_rail(
     area: Rect,
     buf: &mut Buffer,
@@ -599,7 +614,7 @@ pub fn paint_messages_rail(
     );
 }
 
-/// Paint the hover / drag indicator on the messages drawer resize handle.
+/// Paint the hover / drag indicator on the Messages pane resize handle.
 pub fn paint_messages_resize_feedback(
     buf: &mut Buffer,
     divider: Rect,
@@ -3457,7 +3472,7 @@ mod tests {
         let queue = cyclops_ui::HumanQueue::new();
         let registry = cyclops_ui::AvatarRegistry::default();
         paint_messages(
-            &queue, None, None, &registry, None, None, None, false, area, &mut buf, &paint,
+            &queue, None, None, &registry, None, None, None, false, false, area, &mut buf, &paint,
             &mut hits, None,
         );
 
@@ -3504,8 +3519,8 @@ mod tests {
                 let mut buf = Buffer::empty(area);
                 let mut hits = HitMap::default();
                 paint_messages(
-                    &queue, None, None, &registry, None, None, None, false, area, &mut buf, &paint,
-                    &mut hits, None,
+                    &queue, None, None, &registry, None, None, None, false, false, area, &mut buf,
+                    &paint, &mut hits, None,
                 );
                 matches!(hits.hit(x, y), Some(HitTarget::MessagesAction(found)) if *found == action)
             })
@@ -3515,8 +3530,8 @@ mod tests {
             let mut buf = Buffer::empty(area);
             let mut hits = HitMap::default();
             paint_messages(
-                &queue, None, None, &registry, None, None, None, false, area, &mut buf, &paint,
-                &mut hits, hover,
+                &queue, None, None, &registry, None, None, None, false, false, area, &mut buf,
+                &paint, &mut hits, hover,
             );
             buf
         };
@@ -3539,10 +3554,10 @@ mod tests {
         assert_ne!(beside.bg, hover.bg.unwrap(), "the fill stops at the button");
     }
 
-    /// A name in the drawer is painted in the agent's role color, the one
-    /// its sidebar row and pane border already use.
+    /// A name in the Messages pane is painted in the agent's role color,
+    /// the one its sidebar row and pane border already use.
     #[test]
-    fn an_agent_name_in_the_drawer_takes_its_role_color() {
+    fn an_agent_name_in_the_messages_pane_takes_its_role_color() {
         use cyclops_proto::{Kind, MessageId, RecipientKey};
         use cyclops_ui::{
             Direction, MailboxWord, QueueRow, QueueTarget, Scope, Snapshot, WakeWord,
@@ -3588,7 +3603,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         let mut hits = HitMap::default();
         paint_messages(
-            &queue, None, None, &registry, None, None, None, false, area, &mut buf, &paint,
+            &queue, None, None, &registry, None, None, None, false, false, area, &mut buf, &paint,
             &mut hits, None,
         );
         let row_text = |y: u16| -> String {
@@ -3600,7 +3615,10 @@ mod tests {
             .find(|&y| row_text(y).contains("claudex"))
             .expect("the heading names the sender");
         let text = row_text(y);
-        let name_col = area.x + text.find("claudex").unwrap() as u16;
+        let column_of = |needle: &str| {
+            area.x + Span::raw(&text[..text.find(needle).expect("label in row")]).width() as u16
+        };
+        let name_col = column_of("claudex");
         assert_eq!(
             buf.cell((name_col, y)).unwrap().fg,
             paint.role("claudex").fg.unwrap(),
@@ -3612,7 +3630,7 @@ mod tests {
             paint.role("claudex").fg.unwrap(),
             "the avatar chip is grounded in the same color"
         );
-        let codey_col = area.x + text.find("codey").unwrap() as u16;
+        let codey_col = column_of("codey");
         assert_eq!(
             buf.cell((codey_col, y)).unwrap().fg,
             paint.role("codey").fg.unwrap(),
@@ -3621,7 +3639,7 @@ mod tests {
     }
 
     #[test]
-    fn the_collapsed_messages_rail_answers_the_mouse_and_reopens_the_drawer() {
+    fn the_collapsed_messages_rail_answers_the_mouse_and_reopens_the_pane() {
         let area = Rect::new(199, 0, 1, 50);
         let mut buf = Buffer::empty(area);
         let mut hits = HitMap::default();
@@ -3642,12 +3660,12 @@ mod tests {
         assert_eq!(
             buf[(199, area.height / 2)].symbol(),
             MESSAGES_EXPAND,
-            "collapsed, the chevron points left to open the messages drawer"
+            "collapsed, the chevron points left to open the Messages pane"
         );
     }
 
     #[test]
-    fn the_open_messages_drawer_carves_divider_and_collapse_chevron() {
+    fn the_open_messages_pane_carves_divider_and_collapse_chevron() {
         let area = Rect::new(170, 0, 30, 50);
         let mut buf = Buffer::empty(area);
         let mut hits = HitMap::default();
@@ -3661,6 +3679,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
             area,
             &mut buf,
@@ -3687,7 +3706,7 @@ mod tests {
         assert_eq!(
             buf[(170, area.height / 2)].symbol(),
             MESSAGES_COLLAPSE,
-            "open, the chevron points right to collapse the messages drawer"
+            "open, the chevron points right to collapse the Messages pane"
         );
     }
 }

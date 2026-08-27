@@ -508,7 +508,7 @@ struct App {
     /// The shared Cyclops watch Messages model (HumanQueue).
     messages_queue: cyclops_ui::HumanQueue,
     /// Authenticated mailbox identity that produced the current snapshot.
-    /// Absent means the Messages surface is read-only.
+    /// Absent means the Messages pane is read-only.
     messages_caller: Option<cyclops_proto::RecipientKey>,
     /// Open message detail view when an operator opens a message.
     messages_detail: Option<cyclops_ui::Detail>,
@@ -531,9 +531,9 @@ struct App {
     /// until the first visible cursor is drawn.
     cursor_style: Option<(crate::runtime::CursorShape, bool)>,
     term_size: (u16, u16),
-    /// Last canvas pushed to the windows this workspace owns. Avoids a
-    /// resize notification loop when expanded pane gutters are already at
-    /// their target geometry.
+    /// Last shared Messages-independent target pushed to the windows this
+    /// workspace owns. Avoids a resize notification loop when expanded pane
+    /// gutters are already at their target geometry.
     declared_client_size: Option<(u16, u16)>,
     /// Which sessions this workspace sizes, and which of their windows it
     /// has pinned. See [`WindowSizing`].
@@ -565,17 +565,18 @@ struct App {
     /// the frame the renderer thinks it wrote. Drained by [`RenderOwner`]
     /// before its next frame, which then repaints every cell.
     pub(crate) repaint_requested: bool,
-    /// Whether the Messages drawer has active keyboard focus.
+    /// Whether the Messages pane has active keyboard focus.
     messages_focused: bool,
-    /// Whether the drawer shows only the active workspace's session. The
-    /// filter itself is re-derived from the live pane table every frame
+    /// Whether the Messages pane shows only the active workspace's session.
+    /// The filter itself is re-derived from the live pane table every frame
     /// (`sync_messages_session_filter`); this is the operator's choice.
     messages_session_scoped: bool,
-    /// Refresh gate and connection lifecycle for the Messages drawer.
+    /// Refresh gate and connection lifecycle for the Messages pane.
     messages_gate: cyclops_ui::RefreshGate,
     /// Exact failure from the last whole-snapshot RPC. Kept until another
-    /// request starts or a current snapshot lands so the drawer never hides
-    /// an authentication, routing, or transport failure behind `refresh failed`.
+    /// request starts or a current snapshot lands so the Messages pane never
+    /// hides an authentication, routing, or transport failure behind
+    /// `refresh failed`.
     messages_refresh_error: Option<String>,
     /// Async worker for Messages composer sends.
     messages_send_tx: Option<std::sync::mpsc::SyncSender<MessagesSendTask>>,
@@ -1223,13 +1224,9 @@ pub async fn run_async() -> i32 {
     // fight the declaration. `chrome_for` is the one geometry both read.
     model.sidebar_visible = prefs.sidebar_visible;
     model.messages_visible = prefs.messages_visible;
-    let chrome_canvas =
-        chrome_for(Rect::new(0, 0, term_size.0, term_size.1), &model, &prefs).canvas;
-    let boot_size = crate::render::tmux_client_size(chrome_canvas, model.active_tab());
-    let mut declared_client_size = None;
-    if declarable(boot_size) {
-        size_owned_windows(&sizing, &client, boot_size, &home).await;
-        declared_client_size = Some(boot_size);
+    let declared_client_size =
+        declare_initial_client_size(term_size, &model, &prefs, &sizing, &client, &home).await;
+    if declared_client_size.is_some() {
         // The resize can rebalance leaf dimensions. Re-list before
         // hydration rather than replaying captures into stale slots.
         if let Ok(resized) = fetch_workspace_model(&client, &session).await {
@@ -2466,6 +2463,35 @@ fn chrome_for(
     )
 }
 
+/// Shared tmux target for boot and every later size declaration.
+fn desired_tmux_size(area: Rect, model: &WorkspaceModel, prefs: &WorkspacePrefs) -> (u16, u16) {
+    crate::render::tmux_client_size(
+        chrome_for(area, model, prefs).tmux_sizing_canvas(),
+        model.active_tab(),
+    )
+}
+
+/// Perform the first shared tmux size declaration from persisted chrome.
+///
+/// Boot and its nested-tmux regression both enter through this seam, so the
+/// initial write cannot silently drift from the Messages-independent target
+/// used by every later [`resize_client`] call.
+async fn declare_initial_client_size(
+    term_size: (u16, u16),
+    model: &WorkspaceModel,
+    prefs: &WorkspacePrefs,
+    sizing: &WindowSizing,
+    client: &ControlClient,
+    home: &std::path::Path,
+) -> Option<(u16, u16)> {
+    let size = desired_tmux_size(Rect::new(0, 0, term_size.0, term_size.1), model, prefs);
+    if !declarable(size) {
+        return None;
+    }
+    size_owned_windows(sizing, client, size, home).await;
+    Some(size)
+}
+
 /// Whether the workspace may animate (`crate::animate`). Capability first,
 /// then intent: the first two are not preferences, they are "there is
 /// nothing to fade".
@@ -2624,11 +2650,12 @@ impl App {
     ///
     /// The cells the previous layout occupied still hold its glyphs until
     /// something writes them, and a diff frame writes only what the new
-    /// layout believes changed, so a collapsed sidebar or drawer can leave
-    /// its own contents behind. Named rather than folded into
+    /// layout believes changed, so a collapsed sidebar or Messages pane can
+    /// leave its own contents behind. Named rather than folded into
     /// `resize_client` because telling tmux a new size and repainting a
-    /// surface are different jobs, and one of the four topology mutations
-    /// does not resize at all.
+    /// surface are different jobs. Messages visibility and width mutations
+    /// change only local geometry, while shared-sizing mutations may also
+    /// call `resize_client`.
     pub(crate) fn layout_changed(&mut self) {
         self.repaint_requested = true;
     }
@@ -3172,10 +3199,7 @@ async fn rekey_ownership(
 
 async fn resize_client(app: &mut App, client: &ControlClient) {
     let (w, h) = app.term_size;
-    let size = crate::render::tmux_client_size(
-        app.chrome(Rect::new(0, 0, w, h)).canvas,
-        app.model.active_tab(),
-    );
+    let size = desired_tmux_size(Rect::new(0, 0, w, h), &app.model, &app.prefs);
     if !declarable(size) || app.declared_client_size == Some(size) {
         return;
     }
@@ -3525,7 +3549,8 @@ fn request_messages_snapshot(app: &mut App) {
     }
 }
 
-/// Pump the Messages drawer refresh gate, issuing a snapshot fetch if one is owed and none in flight.
+/// Pump the Messages pane refresh gate, issuing a snapshot fetch if one is
+/// owed and none is in flight.
 fn pump_messages_refresh(app: &mut App) {
     if !app.model.messages_visible {
         return;
@@ -4089,7 +4114,7 @@ mod compose_send_tests {
 /// happened to land on the right one.
 ///
 /// Nothing is applied here. A divider already applied every step it made
-/// while the button was held; the sidebar and drawer widths a drag
+/// while the button was held; the sidebar and Messages pane widths a drag
 /// previewed stay where the operator left them and are saved, as a release
 /// would have saved them; a selection ends where it stood and is copied,
 /// the same as a release over the pane. Returns whether anything was
@@ -4100,13 +4125,19 @@ async fn settle_lost_release(app: &mut App, client: &ControlClient) -> bool {
         settled = true;
         if drag.is_active() {
             match drag.target {
-                DragTarget::Sidebar | DragTarget::Messages => {
+                DragTarget::Sidebar => {
                     app.save_prefs_or_log();
                     // Same commit as a release the app actually saw, so
                     // the same topology epoch: the panel is keeping the
                     // width the preview left it at.
                     app.layout_changed();
                     resize_client(app, client).await;
+                }
+                DragTarget::Messages => {
+                    app.save_prefs_or_log();
+                    // The Messages pane width is local chrome. Settling its
+                    // preview must not resize the shared tmux window.
+                    app.layout_changed();
                 }
                 DragTarget::SidebarSplit => {
                     app.save_prefs_or_log();
@@ -4778,8 +4809,9 @@ async fn handle_mouse(
                 app.prefs.messages_width =
                     crate::render::messages_width_for_column(col, app.term_size.0);
                 app.save_prefs_or_log();
+                // The Messages pane width changes only this viewer's local
+                // canvas; tmux pane geometry stays byte-for-byte unchanged.
                 app.layout_changed();
-                resize_client(app, client).await;
             }
             let split_drag = app.drag.as_ref().is_some_and(|drag| {
                 drag.is_active() && matches!(&drag.target, DragTarget::SidebarSplit)
@@ -4954,7 +4986,7 @@ async fn handle_files_key(
     }
 }
 
-/// Keys the messages drawer and group-chat composer take while active.
+/// Keys the Messages pane and group-chat composer take while active.
 async fn handle_messages_key(
     app: &mut App,
     key: KeyEvent,
@@ -5122,8 +5154,8 @@ async fn handle_messages_key(
                     .show("Refused: no reachable mailbox routes", Instant::now());
                 return Ok(Some(InputOutcome::Redraw));
             }
-            // `@all` means everyone the drawer is showing: narrowed to one
-            // session, an announcement stays inside that session.
+            // `@all` means everyone the Messages pane is showing: narrowed
+            // to one session, an announcement stays inside that session.
             let session = app.messages_queue.session_filter();
             let recipients: Vec<(cyclops_proto::RecipientKey, String)> = routes
                 .iter()
@@ -5185,14 +5217,14 @@ async fn handle_messages_key(
     Ok(None)
 }
 
-/// The session filter the drawer should apply right now: the active
+/// The session filter the Messages pane should apply right now: the active
 /// workspace's name and the panes linked into its windows, or none when the
 /// operator asked for every session.
 ///
-/// Derived, never stored: panes join and leave a session while the drawer
-/// is open, and a stored pane set would go stale the moment one did. The
-/// queue ignores a filter equal to its current one, so deriving it every
-/// frame costs a small set build and no view rebuild.
+/// Derived, never stored: tmux panes join and leave a session while the
+/// Messages pane is open, and a stored pane set would go stale the moment
+/// one did. The queue ignores a filter equal to its current one, so deriving
+/// it every frame costs a small set build and no view rebuild.
 fn messages_session_filter(app: &App) -> Option<cyclops_ui::SessionFilter> {
     if !app.messages_session_scoped {
         return None;
@@ -6387,8 +6419,8 @@ fn draw<B: Backend>(
     motion.set_preference(app.prefs.motion, motion_capable(&app.paint));
     motion.observe(observed(app), now);
     app.hit_map.clear();
-    // Before the frame, not during it: the drawer's session filter follows
-    // the live pane table, and the queue takes it by value.
+    // Before the frame, not during it: the Messages pane's session filter
+    // follows the live pane table, and the queue takes it by value.
     sync_messages_session_filter(app);
     let mut shown_cursor: Option<crate::render::HostCursor> = None;
     // The whole call, write and flush included: what the slow-terminal
@@ -6456,6 +6488,7 @@ fn draw<B: Backend>(
                     Some(&pane_manifests),
                     link_status,
                     app.messages_refresh_error.is_some(),
+                    app.messages_focused,
                     messages,
                     f.buffer_mut(),
                     &app.paint,
@@ -7871,6 +7904,54 @@ mod tests {
         }
     }
 
+    fn messages_pane_model() -> WorkspaceModel {
+        let tab = crate::model::TabModel {
+            window_id: "@0".into(),
+            name: "1".into(),
+            layout: crate::layout::ResolvedLayout::Split {
+                dir: crate::layout::SplitDir::Horizontal,
+                x: 0,
+                y: 0,
+                width: 90,
+                height: 20,
+                children: vec![
+                    crate::layout::ResolvedLayout::Leaf {
+                        pane_id: "%0".into(),
+                        x: 0,
+                        y: 0,
+                        width: 60,
+                        height: 20,
+                    },
+                    crate::layout::ResolvedLayout::Leaf {
+                        pane_id: "%1".into(),
+                        x: 61,
+                        y: 0,
+                        width: 29,
+                        height: 20,
+                    },
+                ],
+            },
+            active_pane: "%1".into(),
+            zoomed: false,
+        };
+        WorkspaceModel {
+            workspaces: vec![crate::model::WorkspaceRow {
+                session_id: "$0".into(),
+                name: "s".into(),
+                tab_count: 1,
+                window_ids: vec!["@0".into()],
+            }],
+            active_workspace: 0,
+            session: crate::model::SessionModel {
+                session: "s".into(),
+                tabs: vec![tab],
+                active_tab: 0,
+            },
+            sidebar_visible: false,
+            messages_visible: false,
+        }
+    }
+
     #[test]
     fn any_pane_input_attempt_returns_the_viewport_to_its_live_tail() {
         let home = cyclops_proto::scratch::scratch_dir("workspace-input-snaps-tail");
@@ -8195,7 +8276,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ctrl_r_retries_a_failed_snapshot_without_drawer_focus() {
+    async fn ctrl_r_retries_a_failed_snapshot_without_messages_pane_focus() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let home = cyclops_proto::scratch::scratch_dir("workspace-messages-retry");
@@ -8226,7 +8307,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clicking_the_messages_chevron_collapses_the_drawer() {
+    async fn clicking_the_messages_chevron_collapses_the_messages_pane() {
         use cyclops_testrig::{tmux_available, TmuxServer};
         use cyclops_tmux::{ControlClient, ControlConfig};
         use ratatui::backend::TestBackend;
@@ -8290,7 +8371,7 @@ mod tests {
     /// Every chrome topology change must ask for a repaint. A diff frame
     /// writes only what the new layout believes changed, so a surface that
     /// vanished leaves its own glyphs behind: the sidebar's rows, the
-    /// drawer's messages, the tab strip. This is the epoch that was
+    /// Messages pane's rows, the tab strip. This is the epoch that was
     /// missing when the owner first landed.
     #[tokio::test]
     async fn every_layout_topology_change_requests_one_repaint() {
@@ -8646,12 +8727,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(home);
     }
 
-    /// The drawer's own no-stale-glyph equality, the mirror of the
-    /// sidebar's. A vanished drawer owns columns on the other edge, and a
-    /// diff frame has no reason to rewrite them.
+    /// The Messages pane's own no-stale-glyph equality, the mirror of the
+    /// sidebar's. A collapsed Messages pane gives columns back on the other
+    /// edge, and a diff frame has no reason to rewrite them.
     #[test]
-    fn collapsing_the_drawer_leaves_no_cell_of_it_behind() {
-        let home = cyclops_proto::scratch::scratch_dir("workspace-collapse-drawer");
+    fn collapsing_the_messages_pane_leaves_no_cell_of_it_behind() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-collapse-messages-pane");
         let mut motion = Motion::new(false);
         let mut collapsed = test_app(one_pane_model(), home.clone());
         collapsed.term_size = (100, 24);
@@ -8668,7 +8749,7 @@ mod tests {
         );
         renderer
             .frame(&mut collapsed, &mut motion, Instant::now())
-            .expect("frame with the drawer");
+            .expect("frame with the Messages pane");
         collapsed.model.messages_visible = false;
         collapsed.layout_changed();
         renderer
@@ -8681,9 +8762,457 @@ mod tests {
         assert_eq!(
             renderer.terminal.backend().inner.buffer(),
             &clean_frame(&mut clean, 100, 24),
-            "the collapsed frame kept cells the drawer had drawn"
+            "the collapsed frame kept cells the Messages pane had drawn"
         );
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// The Messages pane owns a bordered region beside the agent grid.
+    /// Opening it reflows both agent cards into the remaining canvas, and
+    /// closing it reclaims that reserved width and restores the prior grid.
+    /// A narrow client must keep the selected trailing pane on screen even
+    /// when it cannot resize the shared tmux window.
+    #[test]
+    fn messages_pane_is_bordered_and_never_hides_the_selected_agent() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-messages-pane");
+        let mut app = test_app(messages_pane_model(), home.clone());
+        app.term_size = (96, 24);
+
+        let _closed = clean_frame(&mut app, 96, 24);
+        let closed_left = app
+            .hit_map
+            .pane_geometry("%0")
+            .expect("closed left pane")
+            .inner;
+        let closed_right = app
+            .hit_map
+            .pane_geometry("%1")
+            .expect("closed selected pane")
+            .inner;
+
+        app.model.messages_visible = true;
+        app.messages_focused = true;
+        app.layout_changed();
+        let opened = clean_frame(&mut app, 96, 24);
+        let messages = app
+            .chrome(Rect::new(0, 0, 96, 24))
+            .messages
+            .expect("Messages pane rectangle");
+        let opened_left = app
+            .hit_map
+            .pane_geometry("%0")
+            .expect("open left pane")
+            .inner;
+        let opened_right = app
+            .hit_map
+            .pane_geometry("%1")
+            .expect("open selected pane")
+            .inner;
+        assert!(opened_left.right() <= messages.x);
+        assert!(opened_right.right() <= messages.x);
+        assert!(opened_left.width < closed_left.width);
+        assert!(opened_right.width < closed_right.width);
+        assert!(
+            (i32::from(opened_right.width) * 60 - i32::from(opened_left.width) * 29).abs() <= 60,
+            "both cards must reflow, not clip only the trailing card"
+        );
+        assert_eq!(opened[(messages.x, messages.y)].symbol(), "╔");
+        assert_eq!(opened[(messages.right() - 1, messages.y)].symbol(), "╗");
+        assert_eq!(opened[(messages.x, messages.bottom() - 1)].symbol(), "╚");
+        assert_eq!(
+            opened[(messages.right() - 1, messages.bottom() - 1)].symbol(),
+            "╝"
+        );
+
+        app.model.messages_visible = false;
+        app.messages_focused = false;
+        app.layout_changed();
+        let _closed_again = clean_frame(&mut app, 96, 24);
+        assert_eq!(
+            app.hit_map
+                .pane_geometry("%0")
+                .expect("restored left pane")
+                .inner,
+            closed_left
+        );
+        assert_eq!(
+            app.hit_map
+                .pane_geometry("%1")
+                .expect("restored selected pane")
+                .inner,
+            closed_right
+        );
+
+        app.model.messages_visible = true;
+        app.messages_focused = true;
+        app.term_size = (60, 24);
+        app.layout_changed();
+        let _narrow = clean_frame(&mut app, 60, 24);
+        assert!(
+            app.hit_map.pane_geometry("%1").is_some(),
+            "narrow Messages view hid the selected agent"
+        );
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    fn nested_tmux_model(
+        server: &cyclops_testrig::TmuxServer,
+        session: &str,
+    ) -> (WorkspaceModel, String) {
+        let output = server.run(&["list-windows", "-t", session, "-F", "#{window_id}"]);
+        let window_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let source = nested_tmux_layout(server, &window_id);
+        let node = crate::layout::parse_layout(&source).expect("parse nested layout");
+        let layout = crate::layout::resolve_layout(&node, &[]).expect("resolve nested layout");
+        let output = server.run(&[
+            "list-panes",
+            "-t",
+            session,
+            "-f",
+            "#{pane_active}",
+            "-F",
+            "#{pane_id}",
+        ]);
+        let active_pane = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let mut model = messages_pane_model();
+        model.session.session = session.into();
+        model.session.tabs[0].window_id = window_id.clone();
+        model.session.tabs[0].layout = layout;
+        model.session.tabs[0].active_pane = active_pane;
+        model.workspaces[0].name = session.into();
+        model.workspaces[0].window_ids = vec![window_id.clone()];
+        (model, window_id)
+    }
+
+    fn nested_tmux_layout(server: &cyclops_testrig::TmuxServer, window_id: &str) -> String {
+        let output = server.run(&["display-message", "-p", "-t", window_id, "#{window_layout}"]);
+        assert!(
+            output.status.success(),
+            "read nested layout: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn start_nested_tmux(server: &cyclops_testrig::TmuxServer, session: &str) {
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-x",
+            "100",
+            "-y",
+            "30",
+            "-s",
+            session,
+            "/bin/sh",
+        ]);
+        server.run_ok(&["split-window", "-h", "-l", "30", "-t", session, "/bin/sh"]);
+        server.run_ok(&["split-window", "-v", "-l", "5", "-t", session, "/bin/sh"]);
+    }
+
+    async fn persisted_boot_sizing_observation(
+        tag: &str,
+        messages_visible: bool,
+    ) -> ((u16, u16), String, (u16, u16)) {
+        use cyclops_testrig::TmuxServer;
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        let server = TmuxServer::new(tag);
+        start_nested_tmux(&server, "s");
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let (mut model, window_id) = nested_tmux_model(&server, "s");
+        model.sidebar_visible = false;
+        model.messages_visible = messages_visible;
+        let prefs = WorkspacePrefs {
+            sidebar_visible: false,
+            messages_visible,
+            ..WorkspacePrefs::default()
+        };
+        let home = cyclops_proto::scratch::scratch_dir(tag);
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create scratch home");
+        let mut sizing = WindowSizing::default();
+        let adopted = adopt_windows(&mut sizing, &client, "s", &model.session.tabs, &home).await;
+        assert!(adopted.took_a_window, "boot fixture must own its window");
+
+        // The collapsed Messages rail is the reference geometry regardless
+        // of persisted visibility. Derive it independently from the paint
+        // canvas so a helper that also adds back the rail cannot self-verify.
+        model.messages_visible = false;
+        let collapsed_rail_target = crate::render::tmux_client_size(
+            chrome_for(Rect::new(0, 0, 100, 30), &model, &prefs).canvas,
+            model.active_tab(),
+        );
+        model.messages_visible = messages_visible;
+        // Enter through the exact production cold-boot calculation and
+        // write, after persisted visibility has been installed on the model.
+        let declared =
+            declare_initial_client_size((100, 30), &model, &prefs, &sizing, &client, &home)
+                .await
+                .expect("fixture has a declarable cold-boot target");
+        let layout = nested_tmux_layout(&server, &window_id);
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+        (declared, layout, collapsed_rail_target)
+    }
+
+    #[tokio::test]
+    async fn persisted_open_cold_boot_sizes_nested_tmux_like_messages_closed() {
+        if !cyclops_testrig::tmux_available() {
+            return;
+        }
+        let closed = persisted_boot_sizing_observation("boot-messages-closed", false).await;
+        let open = persisted_boot_sizing_observation("boot-messages-open", true).await;
+        assert_eq!(
+            closed.0, closed.2,
+            "cold boot added back the collapsed Messages rail"
+        );
+        assert_eq!(
+            open.0, open.2,
+            "persisted-open cold boot did not use collapsed-rail geometry"
+        );
+        assert_eq!(
+            open.0, closed.0,
+            "persisted Messages visibility changed the cold-boot tmux target"
+        );
+        assert_eq!(
+            open.1, closed.1,
+            "persisted-open cold boot rebalanced the nested tmux layout"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_with_open_resized_messages_keeps_nested_tmux_layout() {
+        use cyclops_testrig::TmuxServer;
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !cyclops_testrig::tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("reconcile-open-messages");
+        start_nested_tmux(&server, "s");
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let (mut model, window_id) = nested_tmux_model(&server, "s");
+        model.sidebar_visible = false;
+        model.messages_visible = false;
+        let home = cyclops_proto::scratch::scratch_dir("reconcile-open-messages-home");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create scratch home");
+        let mut app = test_app(model, home.clone());
+        app.term_size = (100, 30);
+        app.prefs.sidebar_visible = false;
+        app.prefs.messages_visible = false;
+
+        reconcile(&mut app, &client)
+            .await
+            .expect("closed reconcile");
+        let closed_size = app.declared_client_size.expect("closed size declared");
+        let closed_layout = nested_tmux_layout(&server, &window_id);
+
+        app.prefs.messages_visible = true;
+        app.prefs.messages_width = 41;
+        // Reconnect clears this cache before its generic reconcile. Force
+        // that lifecycle path so equality cannot pass only by skipping it.
+        app.declared_client_size = None;
+        reconcile(&mut app, &client)
+            .await
+            .expect("open Messages reconcile");
+        assert!(app.model.messages_visible);
+        assert_eq!(
+            app.declared_client_size,
+            Some(closed_size),
+            "changed local Messages width changed the generic tmux target"
+        );
+        assert_eq!(
+            nested_tmux_layout(&server, &window_id),
+            closed_layout,
+            "generic reconcile rebalanced nested tmux for local Messages chrome"
+        );
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    async fn nested_layout_after_messages_width_drag(
+        lost_release: bool,
+    ) -> (String, String, Option<(u16, u16)>, u16, u16) {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        assert!(tmux_available(), "tmux checked by the calling test");
+        let tag = if lost_release {
+            "app-messages-drag-lost"
+        } else {
+            "app-messages-drag-up"
+        };
+        let server = TmuxServer::new(tag);
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-x",
+            "100",
+            "-y",
+            "30",
+            "-s",
+            "s",
+            "/bin/sh",
+        ]);
+        server.run_ok(&["split-window", "-h", "-l", "30", "-t", "s", "/bin/sh"]);
+        server.run_ok(&["split-window", "-v", "-l", "5", "-t", "s", "/bin/sh"]);
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+
+        let output = server.run(&["list-windows", "-t", "s", "-F", "#{window_id}"]);
+        let window_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let read_layout = || {
+            let output = server.run(&[
+                "display-message",
+                "-p",
+                "-t",
+                &window_id,
+                "#{window_layout}",
+            ]);
+            assert!(
+                output.status.success(),
+                "read nested layout: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let source = read_layout();
+        let node = crate::layout::parse_layout(&source).expect("parse nested layout");
+        let layout = crate::layout::resolve_layout(&node, &[]).expect("resolve nested layout");
+        let output = server.run(&[
+            "list-panes",
+            "-t",
+            "s",
+            "-f",
+            "#{pane_active}",
+            "-F",
+            "#{pane_id}",
+        ]);
+        let active_pane = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let mut model = messages_pane_model();
+        model.session.session = "s".into();
+        model.session.tabs[0].window_id = window_id.clone();
+        model.session.tabs[0].layout = layout;
+        model.session.tabs[0].active_pane = active_pane;
+        model.workspaces[0].name = "s".into();
+        model.workspaces[0].window_ids = vec![window_id.clone()];
+        model.messages_visible = true;
+
+        let home = cyclops_proto::scratch::scratch_dir(tag);
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create scratch home");
+        let mut app = test_app(model, home.clone());
+        app.term_size = (100, 30);
+        app.prefs.sidebar_visible = false;
+        app.prefs.messages_visible = true;
+        let adopted = adopt_windows(
+            &mut app.sizing,
+            &client,
+            "s",
+            &app.model.session.tabs,
+            &home,
+        )
+        .await;
+        assert!(adopted.took_a_window, "test app must own the nested window");
+        let before = read_layout();
+
+        let _frame = clean_frame(&mut app, 100, 30);
+        let (divider_col, divider_row) = (0..100u16)
+            .flat_map(|column| (0..30u16).map(move |row| (column, row)))
+            .find(|&(column, row)| {
+                matches!(
+                    app.hit_map.hit(column, row),
+                    Some(HitTarget::MessagesDivider)
+                )
+            })
+            .expect("painted Messages pane divider");
+        let width_before = app.prefs.messages_width;
+        let dragged_col = divider_col.saturating_sub(8);
+        let mut detached = false;
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                divider_col,
+                divider_row,
+            ),
+            &mut detached,
+        )
+        .await
+        .expect("start Messages pane width drag");
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(
+                MouseEventKind::Drag(MouseButton::Left),
+                dragged_col,
+                divider_row,
+            ),
+            &mut detached,
+        )
+        .await
+        .expect("preview Messages pane width");
+        let final_kind = if lost_release {
+            MouseEventKind::Moved
+        } else {
+            MouseEventKind::Up(MouseButton::Left)
+        };
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(final_kind, dragged_col, divider_row),
+            &mut detached,
+        )
+        .await
+        .expect("settle Messages pane width drag");
+
+        let result = (
+            before,
+            read_layout(),
+            app.declared_client_size,
+            width_before,
+            app.prefs.messages_width,
+        );
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+        result
+    }
+
+    #[tokio::test]
+    async fn messages_width_drag_release_paths_never_reshape_nested_tmux_layout() {
+        if !cyclops_testrig::tmux_available() {
+            return;
+        }
+        for lost_release in [false, true] {
+            let (before, after, declared, width_before, width_after) =
+                nested_layout_after_messages_width_drag(lost_release).await;
+            assert_ne!(
+                width_after, width_before,
+                "fixture must commit a different local Messages pane width"
+            );
+            assert_eq!(
+                declared, None,
+                "Messages pane width settlement must not declare a tmux size"
+            );
+            assert_eq!(
+                after, before,
+                "Messages pane width settlement reshaped the shared nested layout; \
+                 lost_release={lost_release}"
+            );
+        }
     }
 
     /// A cancelled chrome drag snaps the panel back to the width it had at
@@ -10475,77 +11004,97 @@ mod tests {
         assert_eq!(reconnect.socket_name, boot.socket_name);
     }
 
-    /// Boot declares a canvas and the first frame paints one; they must be
-    /// the same canvas for every combination of the two chrome edges an
-    /// operator can put away. A disagreement here is the bug class of
-    /// 626ec09, panels painted for the wrong terminal, and it is only
-    /// impossible while boot and `App::chrome` read the SAME persisted
-    /// flags, which is what this walks.
+    /// Boot sizing and the first frame must derive from the same chrome for
+    /// every persisted visibility combination. The paint canvas may be
+    /// narrower while Messages is open, but the shared target must remain
+    /// the collapsed-rail geometry returned by `desired_tmux_size`.
     #[test]
     fn boot_declares_the_geometry_the_first_frame_paints_for_every_chrome_combination() {
         let area = Rect::new(0, 0, 200, 50);
         for sidebar_visible in [true, false] {
             for tab_bar_visible in [true, false] {
-                let prefs = WorkspacePrefs {
-                    sidebar_visible,
-                    tab_bar_visible,
-                    ..WorkspacePrefs::default()
-                };
-                let what = format!("sidebar {sidebar_visible}, tab bar {tab_bar_visible}");
+                let mut messages_independent_size = None;
+                for messages_visible in [true, false] {
+                    let prefs = WorkspacePrefs {
+                        sidebar_visible,
+                        tab_bar_visible,
+                        messages_visible,
+                        ..WorkspacePrefs::default()
+                    };
+                    let what = format!(
+                        "sidebar {sidebar_visible}, tab bar {tab_bar_visible}, \
+                         Messages {messages_visible}"
+                    );
 
-                // What `run_async` does before it declares: the persisted
-                // visibility lands on the model, then boot sizes from it.
-                let mut model = one_pane_model();
-                model.sidebar_visible = prefs.sidebar_visible;
-                let boot = chrome_for(area, &model, &prefs);
-                let declared = crate::render::tmux_client_size(boot.canvas, model.active_tab());
+                    // What `run_async` does before it declares: persisted
+                    // visibility lands on the model, then boot sizes from it.
+                    let mut model = one_pane_model();
+                    model.sidebar_visible = prefs.sidebar_visible;
+                    model.messages_visible = prefs.messages_visible;
+                    let boot = chrome_for(area, &model, &prefs);
+                    let declared = desired_tmux_size(area, &model, &prefs);
+                    if let Some(expected) = messages_independent_size {
+                        assert_eq!(
+                            declared, expected,
+                            "{what}: Messages visibility changed the shared tmux target"
+                        );
+                    } else {
+                        messages_independent_size = Some(declared);
+                    }
 
-                let mut app = test_app(
-                    model,
-                    cyclops_proto::scratch::scratch_dir("app-boot-chrome"),
-                );
-                app.prefs = prefs;
-                let painted = app.chrome(area);
+                    let mut app = test_app(
+                        model,
+                        cyclops_proto::scratch::scratch_dir("app-boot-chrome"),
+                    );
+                    app.prefs = prefs;
+                    let painted = app.chrome(area);
 
-                assert_eq!(painted, boot, "{what}: the first frame moved the chrome");
-                assert_eq!(
-                    crate::render::tmux_client_size(painted.canvas, app.model.active_tab()),
-                    declared,
-                    "{what}: the first frame must paint the canvas boot declared"
-                );
+                    assert_eq!(painted, boot, "{what}: the first frame moved the chrome");
+                    assert_eq!(
+                        desired_tmux_size(area, &app.model, &app.prefs),
+                        declared,
+                        "{what}: boot and runtime sizing geometry drifted"
+                    );
 
-                // And each flag really does change the geometry, or the
-                // agreement above would be agreement about nothing. The
-                // default prefs width (`WorkspacePrefs::default()`) is no
-                // longer clamped up to the minimum — the minimum is a drag
-                // floor now, well below the default — so the expected edge
-                // is the default width the fresh prefs above actually carry.
-                let expected_left = if sidebar_visible {
-                    crate::render::SIDEBAR_DEFAULT_WIDTH
-                } else {
-                    1
-                };
-                assert_eq!(painted.canvas.x, expected_left, "{what}: canvas left edge");
-                assert_eq!(
-                    painted.sidebar.is_some(),
-                    sidebar_visible,
-                    "{what}: the panel"
-                );
-                assert_eq!(
-                    painted.rail.is_some(),
-                    !sidebar_visible,
-                    "{what}: collapsing leaves a rail, never nothing"
-                );
-                assert_eq!(
-                    painted.tab_bar.height,
-                    u16::from(tab_bar_visible),
-                    "{what}: the strip's row"
-                );
-                assert_eq!(
-                    painted.canvas.y,
-                    u16::from(tab_bar_visible),
-                    "{what}: the canvas takes the row the strip does not"
-                );
+                    // And each flag really does change paint geometry, or
+                    // the agreement above would be agreement about nothing.
+                    let expected_left = if sidebar_visible {
+                        crate::render::SIDEBAR_DEFAULT_WIDTH
+                    } else {
+                        1
+                    };
+                    assert_eq!(painted.canvas.x, expected_left, "{what}: canvas left edge");
+                    assert_eq!(
+                        painted.sidebar.is_some(),
+                        sidebar_visible,
+                        "{what}: sidebar"
+                    );
+                    assert_eq!(
+                        painted.rail.is_some(),
+                        !sidebar_visible,
+                        "{what}: collapsing leaves a rail, never nothing"
+                    );
+                    assert_eq!(
+                        painted.messages.is_some(),
+                        messages_visible,
+                        "{what}: Messages"
+                    );
+                    assert_eq!(
+                        painted.messages_rail.is_some(),
+                        !messages_visible,
+                        "{what}: closed Messages leaves its rail"
+                    );
+                    assert_eq!(
+                        painted.tab_bar.height,
+                        u16::from(tab_bar_visible),
+                        "{what}: the strip's row"
+                    );
+                    assert_eq!(
+                        painted.canvas.y,
+                        u16::from(tab_bar_visible),
+                        "{what}: the canvas takes the row the strip does not"
+                    );
+                }
             }
         }
     }
