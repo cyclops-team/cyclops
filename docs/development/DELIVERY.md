@@ -201,6 +201,17 @@ A delivery held in gating longer than `gate_hold_notify_ms` (config,
 default 120000) pings the admin once (action_required) so a wedged hold is
 visible; the hold itself keeps waiting on events, never on a timer.
 
+An operator may opt into one stale unclaimed-doorbell reminder with
+`unclaimed_reminder_ms`. It is disabled when absent or zero. The one-shot
+deadline can reopen only the exact pending `notified` doorbell after its prior
+composer barrier retires. The durable attempt records that its single
+allowance was spent before the ordinary notification worker runs again. The
+worker then performs the same binding, composer, verification, and receipt
+checks as the original write. A claim, withdrawal, replacement, or already
+spent allowance makes the callback obsolete without terminal IO. The reminder
+fact and repeated doorbell are content-free and retain the original attempt
+locator.
+
 ### Inject (amendments b, e)
 
 1. `load-buffer` from a temp file into buffer `cyc-<bootpid>-<seq>` (unique

@@ -285,6 +285,7 @@ ack_timeout_ms = 1500        # hook ACK window after a notification or legacy te
 delivery_retry_max = 1       # retries only when no notification or legacy payload bytes reached the pane
 receipt_block_ms = 2500      # cap for observing an immediately decidable receipt
 gate_hold_notify_ms = 120000 # one admin ping when a worker is held this long
+unclaimed_reminder_ms = 0    # disabled; positive arms one bounded reminder per unclaimed attempt
 ```
 
 Standard `cyclops send` acceptance is durable before notification scheduling.
@@ -302,6 +303,14 @@ or ACK failure may follow bytes that reached the pane, so the attempt ends in
 `attention_required` with an exact cause and is never written again
 automatically. Inspect before taking a recovery action. The durable mailbox
 message remains available for an exact claim throughout.
+
+`unclaimed_reminder_ms` is disabled when absent or zero. A positive value arms
+one content-free reminder after a doorbell remains unclaimed for that long.
+The reminder reuses the exact attempt locator and the ordinary composer gate:
+Working with positive clean-composer proof may write, while human input or
+ambiguous composer evidence still refuses. Claim, withdrawal, or replacement
+makes the timer obsolete without terminal IO. One durable allowance prevents a
+restart or duplicate timer from writing more than one reminder.
 
 Unknown keys warn and are ignored. The file is data; nothing in it executes.
 
