@@ -5841,11 +5841,32 @@ impl<B: Backend> RenderOwner<B> {
     }
 
     /// The two writes one frame makes, in order. The epoch clears only
-    /// once it has actually been delivered, so a clear that failed is
-    /// still pending for the next frame.
+    /// once it has actually been delivered, so an invalidation that failed
+    /// is still pending for the next frame.
+    ///
+    /// Invalidating through `resize` rather than the obvious
+    /// `Terminal::clear` is the load-bearing detail here, and it is a
+    /// measured one. Ratatui answers `clear` by first calling
+    /// `Backend::get_cursor_position`, which the crossterm backend serves
+    /// by writing `ESC[6n` and then BLOCKING the caller on stdin until the
+    /// terminal answers. This workspace already owns stdin in its own
+    /// event reader, and both sides take crossterm's one internal reader.
+    /// The reader is always polling, so it consumes the reply as an event
+    /// and the query waits out its full timeout, and since a failed frame
+    /// re-arms the epoch the next frame asks again: 2s per attempt, with
+    /// the pane in the alternate screen showing nothing. MEASURED on tmux
+    /// 3.4, 3.6a and next-3.8 alike (F75): the terminal-restoration e2e
+    /// burned its whole 15s budget on every one of them.
+    ///
+    /// A repaint therefore never reads from the terminal. Resizing to the
+    /// size the terminal already has reaches both effects a repaint needs
+    /// through writes alone: `clear_viewport` clears the host surface and
+    /// resets the diff baseline, so the frame below writes every cell.
+    /// `size` is an ioctl, not a query on the wire.
     fn paint(&mut self, app: &mut App, motion: &mut Motion, now: Instant) -> Result<(), B::Error> {
         if self.repaint_pending {
-            self.terminal.clear()?;
+            let area = self.terminal.size()?.into();
+            self.terminal.resize(area)?;
             self.repaint_pending = false;
         }
         draw(&mut self.terminal, app, motion, now)
@@ -6244,6 +6265,11 @@ mod tests {
         /// observable that separates a repaint from a diff: an epoch
         /// rewrites the surface, an unchanged frame writes nothing.
         cells_written: usize,
+        /// How many times this backend was asked where the cursor is. On
+        /// the real crossterm backend that question is a blocking read on
+        /// stdin, which this workspace cannot answer while its own event
+        /// reader owns stdin, so the contract is that it is never asked.
+        cursor_queries: usize,
     }
 
     /// `TestBackend` cannot fail, so a wrapper is the only way to exercise
@@ -6269,9 +6295,7 @@ mod tests {
             self.inner.show_cursor().map_err(|e| match e {})
         }
         fn get_cursor_position(&mut self) -> io::Result<ratatui::layout::Position> {
-            if std::mem::take(&mut self.fail_next_clear) {
-                return Err(io::Error::other("host clear failed"));
-            }
+            self.cursor_queries += 1;
             self.inner.get_cursor_position().map_err(|e| match e {})
         }
         fn set_cursor_position<P: Into<ratatui::layout::Position>>(
@@ -6286,6 +6310,9 @@ mod tests {
             self.inner.clear().map_err(|e| match e {})
         }
         fn clear_region(&mut self, region: ratatui::backend::ClearType) -> io::Result<()> {
+            if std::mem::take(&mut self.fail_next_clear) {
+                return Err(io::Error::other("host clear failed"));
+            }
             self.inner.clear_region(region).map_err(|e| match e {})
         }
         fn size(&self) -> io::Result<ratatui::layout::Size> {
@@ -6309,6 +6336,7 @@ mod tests {
             fail_next_flush: true,
             fail_next_clear: false,
             cells_written: 0,
+            cursor_queries: 0,
         };
         let mut renderer = RenderOwner::new(Terminal::new(backend).expect("terminal"));
         let mut app = test_app(
@@ -6353,6 +6381,7 @@ mod tests {
                 fail_next_flush: false,
                 fail_next_clear: true,
                 cells_written: 0,
+                cursor_queries: 0,
             })
             .expect("terminal"),
         );
@@ -6377,7 +6406,7 @@ mod tests {
         let first = renderer.frame(&mut app, &mut motion, Instant::now());
         assert!(
             first.is_err(),
-            "the backend was told to fail inside terminal.clear()"
+            "the backend was told to fail inside the invalidation"
         );
         assert!(
             renderer.repaint_pending,
@@ -6399,6 +6428,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(home);
     }
 
+    /// A repaint may not ask the terminal a question.
+    ///
+    /// `Terminal::clear` is the call this renderer is supposed to want,
+    /// and it is the one it must not make: ratatui serves it by first
+    /// calling `Backend::get_cursor_position`, which crossterm answers by
+    /// writing `ESC[6n` and blocking on stdin for the reply. The workspace
+    /// runs its own always-polling reader on stdin, so the reply is
+    /// consumed as an event and the query waits out its timeout instead of
+    /// repairing anything. MEASURED on tmux 3.4, 3.6a and next-3.8 alike
+    /// (F75): the terminal-restoration e2e burned its whole 15s budget on
+    /// every one of them, and this test is the cheap guard that does not
+    /// need a tmux server to catch it.
+    ///
+    /// This pins the property rather than the spelling. Any future
+    /// invalidation is free to change how it clears, and is not free to
+    /// start reading from the terminal to do it.
+    #[test]
+    fn a_repaint_never_asks_the_terminal_where_the_cursor_is() {
+        let mut renderer = RenderOwner::new(
+            Terminal::new(FlakyBackend {
+                inner: ratatui::backend::TestBackend::new(60, 20),
+                fail_next_flush: false,
+                fail_next_clear: false,
+                cells_written: 0,
+                cursor_queries: 0,
+            })
+            .expect("terminal"),
+        );
+        let home = cyclops_proto::scratch::scratch_dir("render-owner-no-cursor-query");
+        let mut app = test_app(one_pane_model(), home.clone());
+        let mut motion = Motion::new(false);
+
+        // The boot epoch: the one that hung, and the one every session
+        // pays before the user sees anything at all.
+        assert!(renderer.repaint_pending, "boot has no baseline");
+        renderer
+            .frame(&mut app, &mut motion, Instant::now())
+            .expect("the boot frame paints");
+        assert_eq!(
+            renderer.terminal.backend().cursor_queries,
+            0,
+            "the boot repaint queried the terminal for the cursor position"
+        );
+
+        // And every later epoch: a resize settling, a reconnect, a focus
+        // regain, `Ctrl+B r`. They all arrive through this one flag.
+        app.repaint_requested = true;
+        renderer
+            .frame(&mut app, &mut motion, Instant::now())
+            .expect("the requested repaint paints");
+        assert!(
+            !renderer.repaint_pending,
+            "the requested epoch was not spent"
+        );
+        assert_eq!(
+            renderer.terminal.backend().cursor_queries,
+            0,
+            "a requested repaint queried the terminal for the cursor position"
+        );
+
+        // A plain diff frame has no excuse either.
+        renderer
+            .frame(&mut app, &mut motion, Instant::now())
+            .expect("the ordinary frame paints");
+        assert_eq!(
+            renderer.terminal.backend().cursor_queries,
+            0,
+            "an ordinary frame queried the terminal for the cursor position"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
     /// Anything may ask for a repaint through `App`, and the renderer
     /// drains that request exactly once.
     #[test]
@@ -6409,6 +6510,7 @@ mod tests {
                 fail_next_flush: false,
                 fail_next_clear: false,
                 cells_written: 0,
+                cursor_queries: 0,
             })
             .expect("terminal"),
         );
@@ -7165,6 +7267,7 @@ mod tests {
                 fail_next_flush: false,
                 fail_next_clear: false,
                 cells_written: 0,
+                cursor_queries: 0,
             })
             .expect("terminal"),
         );
@@ -7191,6 +7294,7 @@ mod tests {
                 fail_next_flush: false,
                 fail_next_clear: false,
                 cells_written: 0,
+                cursor_queries: 0,
             })
             .expect("terminal"),
         );
@@ -7275,6 +7379,7 @@ mod tests {
                 fail_next_flush: false,
                 fail_next_clear: false,
                 cells_written: 0,
+                cursor_queries: 0,
             })
             .expect("terminal"),
         );
@@ -7353,6 +7458,7 @@ mod tests {
                 fail_next_flush: false,
                 fail_next_clear: false,
                 cells_written: 0,
+                cursor_queries: 0,
             })
             .expect("terminal"),
         );
@@ -7466,6 +7572,7 @@ mod tests {
                 fail_next_flush: false,
                 fail_next_clear: false,
                 cells_written: 0,
+                cursor_queries: 0,
             })
             .expect("terminal"),
         );
@@ -7580,6 +7687,7 @@ mod tests {
                 fail_next_flush: false,
                 fail_next_clear: false,
                 cells_written: 0,
+                cursor_queries: 0,
             })
             .expect("terminal"),
         );
@@ -7603,6 +7711,7 @@ mod tests {
                 fail_next_flush: false,
                 fail_next_clear: false,
                 cells_written: 0,
+                cursor_queries: 0,
             })
             .expect("terminal"),
         );
