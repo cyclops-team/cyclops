@@ -257,6 +257,7 @@ fn cached_entry_is_write_ready(
     pane_in_mode: bool,
     expected: &crate::fusion::Binding,
 ) -> bool {
+    // This trusts the stamped write verdict; its composer proof already adjudicates sensor disagreement.
     !pane_in_mode
         && entry.detection.write_ready
         && !entry.detection.stale
@@ -283,6 +284,9 @@ fn cached_route_can_decide_now(inner: &Inner, route: &NotificationRoute) -> bool
         .is_some_and(|entry| {
             !entry.in_mode
                 && !entry.detection.stale
+                // A disagreement means the picture is not settled enough for an early receipt,
+                // even when the stamped write verdict has independently proved a clean composer.
+                && !entry.detection.disagreement
                 && (entry.detection.write_ready
                     || entry.detection.state == cyclops_proto::AgentState::IdleWithInput)
         })
