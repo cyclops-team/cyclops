@@ -58,6 +58,16 @@ impl Rig {
             .map(|l| l.trim().parse().expect("pane width"))
             .collect()
     }
+
+    fn pane_heights(&self, session: &str) -> Vec<u16> {
+        let out = self
+            .server
+            .run(&["list-panes", "-t", session, "-F", "#{pane_height}"]);
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().parse().expect("pane height"))
+            .collect()
+    }
 }
 
 /// Canvas cells always equal laid-out window cells, from attach through
@@ -179,4 +189,135 @@ async fn no_other_client_can_move_an_owned_window() {
     assert_eq!(rig.window_size("geo2"), (176, 47));
 
     workspace.shutdown().await;
+}
+
+/// When a small owner (e.g. 152x45) collapses a stacked pane to 1 row due
+/// to window resize compression (without deliberate user minimization),
+/// followers must never resize the shared window. When the owner exits,
+/// the successor owner (e.g. 271x61) takes over sizing authority, recomputes
+/// the canvas, and uncrushes the compressed pane so no active pane is
+/// accidentally trapped at 1 row.
+#[tokio::test]
+async fn successor_owner_recomputes_full_canvas_and_uncrushes_compressed_panes() {
+    let Some(rig) = Rig::new("geometry-uncrush") else {
+        return;
+    };
+    rig.session("geo3");
+    // Split vertically so we have two stacked panes in @0
+    rig.server.run_ok(&["split-window", "-v", "-t", "geo3"]);
+
+    // Owner A attaches, captures prior window size, pins manual, and claims driver
+    let (owner, _n1) = ControlClient::spawn(rig.config("geo3"))
+        .await
+        .expect("owner attach");
+    owner
+        .capture_prior_window_size("@0")
+        .await
+        .expect("capture");
+    owner.pin_window_size_manual("@0").await.expect("pin");
+
+    // Owner A shrinks window height down to 10 rows, crushing the bottom pane to 1 row
+    owner.resize_window("@0", 152, 10).await.expect("shrink");
+    rig.server.run_ok(&["resize-pane", "-t", "%1", "-y", "1"]);
+    assert_eq!(rig.window_size("geo3"), (152, 10));
+    assert_eq!(
+        rig.pane_heights("geo3"),
+        vec![8, 1],
+        "bottom pane is compressed down to 1 row"
+    );
+
+    // Follower B attaches with a large 271x61 terminal
+    let (follower, _n2) = ControlClient::spawn(rig.config("geo3"))
+        .await
+        .expect("follower attach");
+    follower
+        .set_client_size(240, 58)
+        .await
+        .expect("follower declare");
+
+    // Invariant: Follower must NOT resize the shared window while owner is live
+    assert_eq!(
+        rig.window_size("geo3"),
+        (152, 10),
+        "follower must never resize the shared window while owner is live"
+    );
+    assert_eq!(rig.pane_heights("geo3"), vec![8, 1]);
+
+    // Owner A drops / exits
+    owner.shutdown().await;
+
+    // Follower B adopts @0, takes over driver, and resizes window to full 240x58 canvas
+    follower
+        .resize_window("@0", 240, 58)
+        .await
+        .expect("successor resize");
+    assert_eq!(rig.window_size("geo3"), (240, 58));
+
+    // When successor recomputes layout, the compressed pane (without deliberate minimization provenance)
+    // must NOT remain trapped at 1 row!
+    let heights = rig.pane_heights("geo3");
+    assert!(
+        heights[1] >= 5,
+        "compressed stacked pane must be uncrushed upon authority transfer, got heights: {heights:?}"
+    );
+
+    follower.shutdown().await;
+}
+
+/// A deliberately minimized pane records provenance in the tmux pane option.
+/// When authority transfers to a successor owner, the pane remains minimized
+/// at 1 row, and its restore provenance is preserved.
+#[tokio::test]
+async fn deliberate_minimization_provenance_survives_authority_transfer() {
+    let Some(rig) = Rig::new("geometry-min-prov") else {
+        return;
+    };
+    rig.session("geo4");
+    rig.server.run_ok(&["split-window", "-v", "-t", "geo4"]);
+
+    let (owner, _n1) = ControlClient::spawn(rig.config("geo4"))
+        .await
+        .expect("owner attach");
+    owner
+        .capture_prior_window_size("@0")
+        .await
+        .expect("capture");
+    owner.pin_window_size_manual("@0").await.expect("pin");
+    owner.resize_window("@0", 176, 47).await.expect("size");
+
+    // Deliberately minimize pane %1, recording pre-minimize height (e.g. 23) in pane option
+    rig.server.run_ok(&[
+        "set-option",
+        "-p",
+        "-t",
+        "%1",
+        "@cyclops_pane_minimized",
+        "23",
+    ]);
+    rig.server.run_ok(&["resize-pane", "-t", "%1", "-y", "1"]);
+    assert_eq!(rig.pane_heights("geo4"), vec![45, 1]);
+
+    // Owner exits
+    owner.shutdown().await;
+
+    // Follower takes over and resizes window to larger canvas
+    let (successor, _n2) = ControlClient::spawn(rig.config("geo4"))
+        .await
+        .expect("successor attach");
+    successor
+        .resize_window("@0", 240, 58)
+        .await
+        .expect("successor resize");
+
+    // Provenance is preserved on the pane
+    let out = rig
+        .server
+        .run(&["show-options", "-p", "-t", "%1", "@cyclops_pane_minimized"]);
+    let prov = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        prov.contains("23"),
+        "minimization provenance must be retained: {prov}"
+    );
+
+    successor.shutdown().await;
 }

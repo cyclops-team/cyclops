@@ -82,6 +82,12 @@ fn session_model_from_snapshot(
 
 fn build_tab(window: &SnapshotWindow) -> Result<TabModel, TmuxError> {
     let known: Vec<String> = window.panes.iter().map(|p| p.id.clone()).collect();
+    let mut minimized = std::collections::HashMap::new();
+    for pane in &window.panes {
+        if let Some(was) = pane.minimized {
+            minimized.insert(pane.id.clone(), was);
+        }
+    }
     let layout_node = parse_layout(&window.layout)
         .map_err(|e| TmuxError::Protocol(format!("layout parse: {e}")))?;
     let active_pane = window
@@ -118,6 +124,7 @@ fn build_tab(window: &SnapshotWindow) -> Result<TabModel, TmuxError> {
         layout,
         active_pane,
         zoomed: window.zoomed,
+        minimized,
     })
 }
 
@@ -489,6 +496,7 @@ mod tests {
             },
             active_pane: "%0".to_string(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
         };
 
         let mut registry = RuntimeRegistry::default();
@@ -545,6 +553,7 @@ mod tests {
             },
             active_pane: "%0".to_string(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
         };
 
         let mut registry = RuntimeRegistry::default();
@@ -630,6 +639,7 @@ mod tests {
             },
             active_pane: "%0".to_string(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
         };
 
         let mut registry = RuntimeRegistry::default();

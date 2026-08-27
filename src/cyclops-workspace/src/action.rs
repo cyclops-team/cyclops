@@ -1057,6 +1057,7 @@ mod tests {
             },
             active_pane: "%0".into(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
         }
     }
 

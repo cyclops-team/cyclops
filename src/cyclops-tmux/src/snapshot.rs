@@ -53,6 +53,8 @@ pub struct SnapshotPane {
     pub active: bool,
     pub width: u32,
     pub height: u32,
+    /// Recorded pre-minimize height if deliberately minimized by operator.
+    pub minimized: Option<u16>,
 }
 
 /// One window in a [`SnapshotSession`], with its panes in pane-index order.
@@ -101,10 +103,10 @@ pub struct WorkspaceSnapshot {
 /// `window_name` in `crate::session::list_windows` and `crate::watcher`'s
 /// `PANE_FORMAT`) lands inside the name instead of corrupting the fields
 /// after it — there are none after it.
-const SNAPSHOT_PANE_FORMAT: &str = "#{session_id}\t#{session_attached}\t#{window_id}\t#{window_index}\t#{window_active}\t#{window_zoomed_flag}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_width}\t#{pane_height}\t#{window_layout}\t#{window_name}";
+const SNAPSHOT_PANE_FORMAT: &str = "#{session_id}\t#{session_attached}\t#{window_id}\t#{window_index}\t#{window_active}\t#{window_zoomed_flag}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_width}\t#{pane_height}\t#{@cyclops_pane_minimized}\t#{window_layout}\t#{window_name}";
 
 /// Number of tab-separated fields in [`SNAPSHOT_PANE_FORMAT`].
-const SNAPSHOT_PANE_FIELDS: usize = 13;
+const SNAPSHOT_PANE_FIELDS: usize = 14;
 
 /// `list-sessions` format for names only. `session_id` and `session_attached`
 /// already travel on every `SNAPSHOT_PANE_FORMAT` line; this command exists
@@ -169,6 +171,7 @@ impl ControlClient {
                 active: raw.pane_active,
                 width: raw.pane_width,
                 height: raw.pane_height,
+                minimized: raw.pane_minimized,
             });
         }
 
@@ -222,6 +225,7 @@ struct RawPaneLine {
     pane_active: bool,
     pane_width: u32,
     pane_height: u32,
+    pane_minimized: Option<u16>,
     window_layout: String,
     window_name: String,
 }
@@ -244,6 +248,12 @@ fn parse_pane_line(line: &str) -> Result<RawPaneLine, TmuxError> {
     let pane_active = next()? == "1";
     let pane_width = parse_u32(next()?, "pane_width")?;
     let pane_height = parse_u32(next()?, "pane_height")?;
+    let pane_minimized_raw = next()?;
+    let pane_minimized = if pane_minimized_raw.is_empty() {
+        None
+    } else {
+        pane_minimized_raw.parse::<u16>().ok()
+    };
     let window_layout = next()?.to_string();
     let window_name = next()?.to_string();
     Ok(RawPaneLine {
@@ -258,6 +268,7 @@ fn parse_pane_line(line: &str) -> Result<RawPaneLine, TmuxError> {
         pane_active,
         pane_width,
         pane_height,
+        pane_minimized,
         window_layout,
         window_name,
     })
@@ -301,7 +312,7 @@ mod tests {
 
     #[test]
     fn pane_line_parses_and_keeps_a_tab_inside_the_trailing_window_name() {
-        let line = "$0\t1\t@1\t2\t1\t0\t%3\t1\t1\t80\t24\t8205,80x24,0,0{...}\tname\twith\ttabs";
+        let line = "$0\t1\t@1\t2\t1\t0\t%3\t1\t1\t80\t24\t\t8205,80x24,0,0{...}\tname\twith\ttabs";
         let raw = parse_pane_line(line).expect("parses");
         assert_eq!(raw.session_id, "$0");
         assert!(raw.session_attached);
@@ -314,11 +325,16 @@ mod tests {
         assert!(raw.pane_active);
         assert_eq!(raw.pane_width, 80);
         assert_eq!(raw.pane_height, 24);
+        assert_eq!(raw.pane_minimized, None);
         assert_eq!(raw.window_layout, "8205,80x24,0,0{...}");
-        // The trailing field swallows every tab after the 12th: a window
+        // The trailing field swallows every tab after the 13th: a window
         // name that happens to contain literal tabs still parses whole
         // instead of corrupting fields that do not exist after it.
         assert_eq!(raw.window_name, "name\twith\ttabs");
+
+        let line_min = "$0\t1\t@1\t2\t1\t0\t%3\t1\t1\t80\t24\t23\t8205,80x24,0,0{...}\tname";
+        let raw_min = parse_pane_line(line_min).expect("parses with minimized");
+        assert_eq!(raw_min.pane_minimized, Some(23));
     }
 
     #[test]

@@ -1261,6 +1261,7 @@ pub async fn run_async() -> i32 {
         .get(model.active_workspace)
         .map(|workspace| HashSet::from([workspace.session_id.clone()]))
         .unwrap_or_default();
+    let minimized = model.active_tab().minimized.clone();
     let mut app = App {
         model,
         runtimes,
@@ -1271,7 +1272,7 @@ pub async fn run_async() -> i32 {
         theme_restore: None,
         link_state: LinkState::Live,
         paused_panes: HashSet::new(),
-        minimized: std::collections::HashMap::new(),
+        minimized,
         window_palette: HostPaletteState::Unknown,
         window_focused: true,
         select_all: crate::input::SelectAll::default(),
@@ -3205,6 +3206,20 @@ async fn resize_client(app: &mut App, client: &ControlClient) {
     }
     size_owned_windows(&app.sizing, client, size, &app.home).await;
     app.declared_client_size = Some(size);
+    uncrush_compressed_panes(app, client).await;
+}
+
+/// If a stacked pane was crushed down to <= 1 row during small window geometry
+/// and lacks deliberate minimization provenance, uncrush it so it does not
+/// remain trapped at 1 row after authority transfer.
+async fn uncrush_compressed_panes(app: &App, client: &ControlClient) {
+    let tab = app.model.active_tab();
+    let slots = crate::model::visible_pane_dims(tab);
+    for (pane_id, _cols, rows) in slots {
+        if rows <= crate::render::MINIMIZED_ROWS && !app.minimized.contains_key(&pane_id) {
+            let _ = client.resize_pane_height(&pane_id, 5).await;
+        }
+    }
 }
 
 /// The tab windows not yet pinned to the sizing policy, in tab order.
@@ -5847,6 +5862,7 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
         app.prefs.sidebar_visible,
         app.prefs.messages_visible,
     );
+    app.minimized = app.model.active_tab().minimized.clone();
     // An authoritative replacement: panes may have appeared, closed,
     // moved window, or changed proportion since the frame on screen.
     app.layout_changed();
@@ -7885,6 +7901,7 @@ mod tests {
             },
             active_pane: "%0".into(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
         };
         WorkspaceModel {
             workspaces: vec![crate::model::WorkspaceRow {
@@ -9365,6 +9382,7 @@ mod tests {
             },
             active_pane: "%0".into(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
         };
         let tabs = vec![tab("@0"), tab("@1")];
         let mut pinned = BTreeSet::new();
@@ -11206,6 +11224,7 @@ mod tests {
             },
             active_pane: "%0".into(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
         };
         let model = WorkspaceModel {
             workspaces: vec![row("$a", "a"), row("$b", "b"), row("$c", "c")],
@@ -11273,6 +11292,7 @@ mod tests {
             },
             active_pane: pane.into(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
         };
         let mut current = WorkspaceModel {
             workspaces: vec![],
@@ -11318,6 +11338,7 @@ mod tests {
             },
             active_pane: "%1".into(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
         };
         let row = |id: &str, name: &str| crate::model::WorkspaceRow {
             session_id: id.into(),
@@ -11488,6 +11509,7 @@ mod tests {
             },
             active_pane: "%0".into(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
         };
         let model = WorkspaceModel {
             workspaces: vec![row("$a", "a"), row("$b", "b"), row("$c", "c")],
@@ -11627,6 +11649,7 @@ mod tests {
                     },
                     active_pane: dragged.clone(),
                     zoomed: false,
+                    minimized: std::collections::HashMap::new(),
                 }],
                 active_tab: 0,
             },
@@ -11726,6 +11749,7 @@ mod tests {
                     },
                     active_pane: bottom.into(),
                     zoomed: false,
+                    minimized: std::collections::HashMap::new(),
                 }],
                 active_tab: 0,
             },

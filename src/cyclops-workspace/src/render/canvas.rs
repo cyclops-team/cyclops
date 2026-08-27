@@ -2544,6 +2544,7 @@ mod tests {
             layout: resolve_layout(&node, &[]).unwrap(),
             active_pane: "%0".into(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
         };
         let mut decoration = DecorationSnapshot {
             online: true,
@@ -2644,6 +2645,7 @@ mod tests {
             layout: resolve_layout(&node, &[]).unwrap(),
             active_pane: "%0".into(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
         };
         let mut decoration = DecorationSnapshot {
             online: true,
@@ -2699,6 +2701,7 @@ mod tests {
             layout: resolve_layout(&node, &[]).unwrap(),
             active_pane: "%0".into(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
         };
         let mut decoration = DecorationSnapshot {
             online: true,
@@ -2855,6 +2858,7 @@ mod tests {
             layout: perf_row_layout(n, leaf_w, leaf_h),
             active_pane: "%0".to_string(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
         }
     }
 

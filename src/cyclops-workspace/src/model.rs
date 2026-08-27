@@ -15,6 +15,7 @@ pub struct TabModel {
     pub layout: ResolvedLayout,
     pub active_pane: String,
     pub zoomed: bool,
+    pub minimized: HashMap<String, u16>,
 }
 
 /// Live runtimes for panes on the visible tab only.
@@ -76,8 +77,9 @@ impl SessionModel {
                 width: 0,
                 height: 0,
             },
-            active_pane: String::new(),
+            active_pane: "%0".to_string(),
             zoomed: false,
+            minimized: HashMap::new(),
         });
         self.tabs
             .get(self.active_tab)

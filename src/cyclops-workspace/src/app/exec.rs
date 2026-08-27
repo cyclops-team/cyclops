@@ -341,35 +341,50 @@ pub(super) async fn execute(
             })
         }
         Action::ToggleMinimizePane { pane_id } => {
-            // The height to go back to is the height it has right now, read
-            // from the frame that is on screen. tmux is the authority on
-            // pane geometry and the render follows it 1:1, so the painted
-            // height IS the tmux height.
             match app.minimized.remove(&pane_id) {
                 Some(rows) => {
-                    client.resize_pane_height(&pane_id, rows).await?;
+                    let restore_rows = if rows <= crate::render::MINIMIZED_ROWS {
+                        10
+                    } else {
+                        rows
+                    };
+                    let _ = client
+                        .command(&format!(
+                            "set-option -p -t {} -u @cyclops_pane_minimized",
+                            cyclops_tmux::quote_arg(&pane_id)
+                        ))
+                        .await;
+                    client.resize_pane_height(&pane_id, restore_rows).await?;
                 }
                 None => {
                     let Some(geometry) = app.hit_map.pane_geometry(&pane_id) else {
-                        // Nothing painted it this frame, so there is no
-                        // height to remember and nothing to collapse.
                         return Ok(Outcome::default());
                     };
                     let was = geometry.inner.height;
-                    // A pane already at the floor has nothing to give, and
-                    // recording that as its restore height would make the
-                    // restore a no-op forever after.
                     if was <= crate::render::MINIMIZED_ROWS {
-                        return Ok(Outcome::default());
+                        // Compressed pane without provenance: restore deterministically
+                        let _ = client
+                            .command(&format!(
+                                "set-option -p -t {} -u @cyclops_pane_minimized",
+                                cyclops_tmux::quote_arg(&pane_id)
+                            ))
+                            .await;
+                        client.resize_pane_height(&pane_id, 10).await?;
+                    } else {
+                        app.minimized.insert(pane_id.clone(), was);
+                        let _ = client
+                            .command(&format!(
+                                "set-option -p -t {} @cyclops_pane_minimized {}",
+                                cyclops_tmux::quote_arg(&pane_id),
+                                was
+                            ))
+                            .await;
+                        client
+                            .resize_pane_height(&pane_id, crate::render::MINIMIZED_ROWS)
+                            .await?;
                     }
-                    app.minimized.insert(pane_id.clone(), was);
-                    client
-                        .resize_pane_height(&pane_id, crate::render::MINIMIZED_ROWS)
-                        .await?;
                 }
             }
-            // tmux moved the layout, so the model has to be re-read before
-            // the next frame paints panes at the old geometry.
             Ok(Outcome {
                 reconcile: true,
                 ..Outcome::default()
@@ -1425,6 +1440,7 @@ mod tests {
             layout,
             active_pane: pane_id.to_string(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
         };
         WorkspaceModel {
             workspaces: vec![WorkspaceRow {
@@ -1624,6 +1640,7 @@ mod tests {
             },
             active_pane: pane_id.to_string(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
         }
     }
 

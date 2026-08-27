@@ -988,6 +988,7 @@ pub(crate) mod test_support {
             layout,
             active_pane: "%0".to_string(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
         }
     }
 
@@ -1002,6 +1003,7 @@ pub(crate) mod test_support {
             layout,
             active_pane: "%0".to_string(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
         }
     }
 
