@@ -93,3 +93,60 @@ async fn session_removal_does_not_report_a_server_wide_moved_pane_as_gone() {
     );
     w.shutdown().await;
 }
+
+/// Gate 1: a client detaching and reattaching must not duplicate live rows.
+///
+/// A reattach makes tmux resend the session's structural picture, and the
+/// watcher reconciles against `list-panes` when it does. If reconciliation
+/// appended instead of merging, every reattach would grow the table by a
+/// whole session while every pane id stayed valid, so the duplicates would
+/// look like real panes to everything downstream: the roster, delivery
+/// routing, and the FIFO all key on that table.
+#[tokio::test]
+async fn detach_and_reattach_do_not_duplicate_live_rows() {
+    let Some(srv) = TestServer::new("events-reattach") else {
+        return;
+    };
+    srv.new_session("reattach");
+    srv.tmux_ok(&["split-window", "-t", "reattach", "/bin/sh"]);
+
+    let w = SessionWatcher::connect(srv.config("reattach"))
+        .await
+        .expect("connect");
+    common::eventually("the watcher sees both panes", || w.snapshot().len() == 2).await;
+    let before: Vec<String> = sorted_pane_ids(&w);
+
+    // A ControlClient IS a real tmux client, so spawn/shutdown is a genuine
+    // attach/detach pair rather than a simulation of one.
+    for round in 0..2 {
+        let (client, _notif) = cyclops_tmux::ControlClient::spawn(srv.config("reattach"))
+            .await
+            .unwrap_or_else(|error| panic!("round {round} attach: {error}"));
+        client.shutdown().await;
+    }
+
+    common::eventually("the table settles after reattach", || {
+        w.snapshot().len() == 2
+    })
+    .await;
+
+    let after = sorted_pane_ids(&w);
+    assert_eq!(
+        after, before,
+        "detach and reattach changed the live pane set"
+    );
+    let mut unique = after.clone();
+    unique.dedup();
+    assert_eq!(unique, after, "a pane id appears twice in the live table");
+    for id in &after {
+        assert!(w.pane(id).is_some(), "{id} is listed but not addressable");
+    }
+
+    w.shutdown().await;
+}
+
+fn sorted_pane_ids(w: &SessionWatcher) -> Vec<String> {
+    let mut ids: Vec<String> = w.snapshot().iter().map(|r| r.pane_id.clone()).collect();
+    ids.sort();
+    ids
+}
