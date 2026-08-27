@@ -589,6 +589,9 @@ pub struct RecipientEntry {
     pub wake: WakeWord,
     pub cause: Option<String>,
     pub fifo_position: Option<u64>,
+    /// When this recipient-specific mailbox/wake projection last changed.
+    /// Attention decay follows the hold, not the older message envelope.
+    pub updated_at: u64,
     pub is_attention: bool,
     pub is_selected: bool,
     pub target: QueueTarget,
@@ -651,6 +654,7 @@ impl TimelineItem {
                 wake: row.wake,
                 cause: cause_str,
                 fifo_position: row.fifo_position,
+                updated_at: row.updated_at,
                 is_attention: row.needs_human(),
                 is_selected: is_sel,
                 target: row.target.clone(),
@@ -1224,7 +1228,7 @@ pub fn render_chat_lines(
                     line.push(" · ", ChatInk::Dim);
                     line.push(
                         held_words(r, status_label, pending_behind(r)),
-                        held_ink(item.ts, now_ms),
+                        held_ink(r.updated_at, now_ms),
                     );
                 }
                 timeline.push(line.fitted(width));
@@ -2353,6 +2357,52 @@ mod tests {
             ChatInk::Attention,
             "with no clock a renderer must not decide something is stale"
         );
+    }
+
+    #[test]
+    fn attention_decay_follows_the_wake_update_not_message_age() {
+        let now = 10_000_000u64;
+        let mut row = QueueRow {
+            subject: Some("Old message with a fresh failure".into()),
+            mailbox: MailboxWord::Claimed,
+            wake: WakeWord::NeedsAttention,
+            cause: Some(NotificationAttentionCause::VerifyFailed),
+            ts: now.saturating_sub(4 * HELD_LOUD_MS),
+            updated_at: now - 1,
+            seq: 10,
+            ..Default::default()
+        };
+
+        let mut queue = make_test_queue();
+        queue.replace(Snapshot {
+            watermark: 10,
+            rows: vec![row.clone()],
+        });
+        let reg = AvatarRegistry::default();
+        let lines = render_chat_lines(&queue, ChatRenderContext::new(&reg).at(now), 100, 15);
+        let fresh_hold = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.text.contains("held: verify failed"))
+            .expect("fresh wake failure remains visible");
+        assert_eq!(
+            fresh_hold.ink,
+            ChatInk::Attention,
+            "an old message's newly changed wake must not start dim"
+        );
+
+        row.updated_at = now.saturating_sub(HELD_LOUD_MS + 1);
+        queue.replace(Snapshot {
+            watermark: 11,
+            rows: vec![row],
+        });
+        let lines = render_chat_lines(&queue, ChatRenderContext::new(&reg).at(now), 100, 15);
+        let old_hold = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.text.contains("held: verify failed"))
+            .expect("old wake failure keeps its exact words");
+        assert_eq!(old_hold.ink, ChatInk::Dim);
     }
 
     #[test]
