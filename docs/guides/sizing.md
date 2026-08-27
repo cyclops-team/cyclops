@@ -1,8 +1,8 @@
 # Window sizing, and how to hand it back
 
 A Cyclops workspace decides how big the tmux windows it shows are. It has
-to: it draws a sidebar, a tab strip and a drawer around real panes, and the
-panes and the chrome must agree on one geometry.
+to: it draws a sidebar, a tab strip and a Messages pane beside real panes,
+and the panes and the chrome must agree on one geometry.
 
 A window's size is also its panes' size, so this is not a private rendering
 decision. Change it and every agent running in that session reflows.
@@ -16,6 +16,29 @@ puts every one of them back exactly as it found them.
 
 One workspace per session does this. A second workspace on the same session
 follows the first one's geometry and says so once, rather than fighting it.
+
+## Local chrome on a follower
+
+The Messages pane owns a bordered region beside the agent grid. It never
+overlays an agent pane. Opening it reduces only this client's local canvas;
+a sizing follower does not resize the shared tmux window to make room.
+Instead, the follower proportionally fits the agent card rectangles into the
+smaller canvas and shows each runtime as a 1:1 leading viewport. The runtime
+cells are clipped, never scaled.
+
+Closing the Messages pane returns the width it reserved, apart from its
+one-column reopen rail, and restores the exact pre-open local grid. It does
+not expand that grid beyond the current tmux source. If the terminal is wider
+than the source, any remaining far-right space belongs to the shared sizing
+state and is resolved by the sizing owner or a later authority takeover, not
+by a follower changing the window.
+
+While cards are locally fitted, their divider seams are not resize handles:
+a local pointer delta is no longer the same number of tmux source cells. The
+Messages pane width handle remains active because it changes local chrome,
+not tmux geometry. At an extreme width or height where sibling content and a
+separating border cannot all fit, nonfocused branches collapse so the focused
+pane retains visible content and a paintable card.
 
 **Why not let tmux decide.** Every `window-size` policy resolves votes
 between attached clients, and a terminal always votes. Under `smallest` one

@@ -441,9 +441,9 @@ pub fn paint_sidebar_rail(
     );
 }
 
-/// Render Messages as a pane-framed peer on the right edge: its left border
-/// remains the resize divider and collapse control, while the other three
-/// borders make the space it owns unambiguous beside the agent grid.
+/// Render the Messages pane on the right edge. Its left border remains the
+/// resize divider and collapse control, while the complete frame makes the
+/// peer region it owns unambiguous beside the agent grid.
 pub fn paint_messages(
     queue: &cyclops_ui::HumanQueue,
     detail: Option<&cyclops_ui::Detail>,
@@ -478,7 +478,7 @@ pub fn paint_messages(
         })
         .render(area, buf);
 
-    // The left edge of the right messages panel is the divider/toggle
+    // The left edge of the Messages pane is the divider/toggle.
     let edge = Rect::new(area.x, area.y, 1, area.height);
     let grab = Rect::new(edge.x, edge.y, 1, edge.height);
     hits.push(grab, HitTarget::MessagesDivider);
@@ -568,9 +568,9 @@ pub fn paint_messages(
     }
 }
 
-/// The workspace palette for one drawer ink. The renderer named what the
-/// run is; this is the one place that decides what that looks like, on the
-/// drawer's own panel ground.
+/// The workspace palette for one Messages pane ink. The renderer named what
+/// the run is; this is the one place that decides what that looks like on
+/// the pane's own ground.
 fn chat_ink_style(paint: &Paint, ink: &cyclops_ui::ChatInk) -> Style {
     use cyclops_ui::ChatInk;
     let panel = theme::chrome_panel(paint);
@@ -590,7 +590,7 @@ fn chat_ink_style(paint: &Paint, ink: &cyclops_ui::ChatInk) -> Style {
     }
 }
 
-/// Render the rail a collapsed messages drawer leaves behind on the right edge.
+/// Render the rail a collapsed Messages pane leaves on the right edge.
 pub fn paint_messages_rail(
     area: Rect,
     buf: &mut Buffer,
@@ -614,7 +614,7 @@ pub fn paint_messages_rail(
     );
 }
 
-/// Paint the hover / drag indicator on the messages drawer resize handle.
+/// Paint the hover / drag indicator on the Messages pane resize handle.
 pub fn paint_messages_resize_feedback(
     buf: &mut Buffer,
     divider: Rect,
@@ -3554,10 +3554,10 @@ mod tests {
         assert_ne!(beside.bg, hover.bg.unwrap(), "the fill stops at the button");
     }
 
-    /// A name in the drawer is painted in the agent's role color, the one
-    /// its sidebar row and pane border already use.
+    /// A name in the Messages pane is painted in the agent's role color,
+    /// the one its sidebar row and pane border already use.
     #[test]
-    fn an_agent_name_in_the_drawer_takes_its_role_color() {
+    fn an_agent_name_in_the_messages_pane_takes_its_role_color() {
         use cyclops_proto::{Kind, MessageId, RecipientKey};
         use cyclops_ui::{
             Direction, MailboxWord, QueueRow, QueueTarget, Scope, Snapshot, WakeWord,
@@ -3639,7 +3639,7 @@ mod tests {
     }
 
     #[test]
-    fn the_collapsed_messages_rail_answers_the_mouse_and_reopens_the_drawer() {
+    fn the_collapsed_messages_rail_answers_the_mouse_and_reopens_the_pane() {
         let area = Rect::new(199, 0, 1, 50);
         let mut buf = Buffer::empty(area);
         let mut hits = HitMap::default();
@@ -3660,12 +3660,12 @@ mod tests {
         assert_eq!(
             buf[(199, area.height / 2)].symbol(),
             MESSAGES_EXPAND,
-            "collapsed, the chevron points left to open the messages drawer"
+            "collapsed, the chevron points left to open the Messages pane"
         );
     }
 
     #[test]
-    fn the_open_messages_drawer_carves_divider_and_collapse_chevron() {
+    fn the_open_messages_pane_carves_divider_and_collapse_chevron() {
         let area = Rect::new(170, 0, 30, 50);
         let mut buf = Buffer::empty(area);
         let mut hits = HitMap::default();
@@ -3706,7 +3706,7 @@ mod tests {
         assert_eq!(
             buf[(170, area.height / 2)].symbol(),
             MESSAGES_COLLAPSE,
-            "open, the chevron points right to collapse the messages drawer"
+            "open, the chevron points right to collapse the Messages pane"
         );
     }
 }

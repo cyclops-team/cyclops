@@ -1060,6 +1060,139 @@ mod tests {
         }
     }
 
+    fn paint_exhausted_layout(
+        source: &str,
+        focused: &str,
+        marker: u8,
+        width: u16,
+        height: u16,
+    ) -> (Buffer, HitMap) {
+        let node = parse_layout(source).expect("valid exhausted-layout fixture");
+        let layout = resolve_layout(&node, &[]).expect("resolved exhausted-layout fixture");
+        let tab = TabModel {
+            window_id: "@0".into(),
+            name: "main".into(),
+            layout,
+            active_pane: focused.into(),
+            zoomed: false,
+        };
+        let mut runtimes = RuntimeRegistry::default();
+        let mut runtime = crate::runtime::PaneRuntime::new(5, 5);
+        runtime.feed(&[marker]);
+        runtimes.insert(focused.into(), runtime);
+
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut hits = HitMap::default();
+        term.draw(|frame| {
+            let paused = std::collections::HashSet::new();
+            let decoration = DecorationSnapshot::default();
+            let mut ctx = ctx_defaults(&mut hits, &paused, &decoration);
+            paint_window(
+                &tab,
+                &runtimes,
+                frame.area(),
+                frame.buffer_mut(),
+                &Paint::for_test(),
+                &mut ctx,
+            );
+        })
+        .unwrap();
+        (term.backend().buffer().clone(), hits)
+    }
+
+    fn assert_focused_card_survives(
+        buffer: &Buffer,
+        hits: &HitMap,
+        focused: &str,
+        marker: &str,
+        collapsed: &[&str],
+    ) {
+        let body = hits
+            .pane_geometry(focused)
+            .expect("focused pane remains paintable")
+            .inner;
+        assert_eq!(
+            buffer[(body.x, body.y)].symbol(),
+            marker,
+            "a sibling frame erased the focused pane's only visible cell"
+        );
+        assert_eq!(
+            buffer[(body.x - 1, body.y - 1)].symbol(),
+            "╔",
+            "focused card keeps its top-left border"
+        );
+        assert_eq!(
+            buffer[(body.right(), body.bottom())].symbol(),
+            "╝",
+            "focused card keeps its bottom-right border"
+        );
+        for pane_id in collapsed {
+            assert!(
+                hits.pane_geometry(pane_id).is_none(),
+                "exhausted local space must collapse nonfocused {pane_id}"
+            );
+        }
+    }
+
+    /// Two side-by-side content cells cannot also host the border between
+    /// them. The nonfocused pane must collapse before its frame can erase
+    /// the focused pane's sole visible runtime cell.
+    #[test]
+    fn exhausted_width_keeps_one_focused_card_paintable() {
+        let (buffer, hits) =
+            paint_exhausted_layout("8b16,5x5,0,0{2x5,0,0,0,2x5,3,0,1}", "%1", b'H', 4, 5);
+        assert_focused_card_survives(&buffer, &hits, "%1", "H", &["%0"]);
+    }
+
+    /// The same exhaustion is possible in rows. A horizontal frame may
+    /// never consume the one row retained for the selected runtime.
+    #[test]
+    fn exhausted_height_keeps_one_focused_card_paintable() {
+        let (buffer, hits) =
+            paint_exhausted_layout("8b16,5x5,0,0[5x2,0,0,0,5x2,0,3,1]", "%1", b'V', 5, 4);
+        assert_focused_card_survives(&buffer, &hits, "%1", "V", &["%0"]);
+    }
+
+    /// Focus must survive exhaustion at every ancestor, not just one split.
+    /// Here the selected bottom-right pane is behind a width collapse and a
+    /// height collapse; both nonfocused branches must yield before painting.
+    #[test]
+    fn nested_exhausted_axes_keep_the_deep_focused_card_paintable() {
+        let (buffer, hits) = paint_exhausted_layout(
+            "8b16,5x5,0,0{2x5,0,0,0,2x5,3,0[2x2,3,0,1,2x2,3,3,2]}",
+            "%2",
+            b'N',
+            4,
+            4,
+        );
+        assert_focused_card_survives(&buffer, &hits, "%2", "N", &["%0", "%1"]);
+    }
+
+    /// A divider drag is expressed in local cells, while tmux resizes its
+    /// source layout in source cells. Those units are identical only when
+    /// the local cards are not fitted, so a compressed seam must not claim
+    /// to be a resize handle.
+    #[test]
+    fn fitted_layout_disables_divider_drag_but_full_size_keeps_it() {
+        let source = "8b16,5x5,0,0{2x5,0,0,0,2x5,3,0,1}";
+        let (_full_buffer, full_hits) = paint_exhausted_layout(source, "%1", b'F', 8, 7);
+        let (_fitted_buffer, fitted_hits) = paint_exhausted_layout(source, "%1", b'F', 7, 7);
+        let contains_divider = |hits: &HitMap, width: u16, height: u16| {
+            (0..height).any(|y| {
+                (0..width).any(|x| matches!(hits.hit(x, y), Some(HitTarget::Divider { .. })))
+            })
+        };
+
+        assert!(
+            contains_divider(&full_hits, 8, 7),
+            "source-size pane seams remain draggable"
+        );
+        assert!(
+            !contains_divider(&fitted_hits, 7, 7),
+            "a locally fitted seam must not resize tmux in mismatched units"
+        );
+    }
+
     #[test]
     fn pane_cells_paint_on_test_backend() {
         let mut rt = crate::runtime::PaneRuntime::new(5, 2);

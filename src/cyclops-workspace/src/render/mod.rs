@@ -23,7 +23,7 @@
 //!    single glyph that says which way the click moves things, with a hit
 //!    target as large as that chrome allows and a fill under the mouse
 //!    (`theme::add_button` / `add_button_hover`). The tab strip's `+`, the
-//!    sidebar footer's `+`, the sidebar chevron, and the messages drawer's
+//!    sidebar footer's `+`, the sidebar chevron, and the Messages pane's
 //!    footer buttons are all this.
 //! 2. When a surface is put away it has no chrome left to host its own
 //!    switch, so the app menu carries it, and the app menu stays
@@ -99,16 +99,15 @@ const SIDEBAR_MAX_WIDTH: u16 = 42;
 /// every column the panel gave up except this one.
 pub(crate) const SIDEBAR_RAIL_WIDTH: u16 = 1;
 
-/// Geometry constants for the mirrored right-edge messages drawer.
+/// Geometry constants for the right-edge Messages pane.
 pub(crate) const MESSAGES_MIN_WIDTH: u16 = 14;
 pub(crate) const MESSAGES_DEFAULT_WIDTH: u16 = 24;
 pub(crate) const MESSAGES_RAIL_WIDTH: u16 = 1;
-/// The drawer carries whole conversations, not a list of names, so how wide
-/// it should be is the operator's judgement and not a number chosen here: a
-/// fixed ceiling truncated headers and the action strip mid-word on a wide
-/// terminal, with no way to widen past it. The only thing this side still
-/// owes the operator is that the panes it overlays stay usable, so the
-/// bound is what the canvas needs rather than what the drawer may have.
+/// The Messages pane carries whole conversations, not a list of names, so
+/// how wide it should be is the operator's judgement and not a number chosen
+/// here: a fixed ceiling truncated headers and the action strip mid-word on
+/// a wide terminal, with no way to widen past it. The pane owns a peer region
+/// beside the agent canvas, and this lower bound keeps that canvas usable.
 pub(crate) const MAIN_MIN_WIDTH: u16 = 20;
 
 /// Chrome rectangles for one frame. `sidebar` and `rail` are mutually
@@ -124,10 +123,10 @@ pub struct ChromeAreas {
     pub messages_rail: Option<Rect>,
 }
 
-/// Split one frame into the sidebar (or its rail), right messages drawer (or
-/// its rail), tab bar, and pane canvas: the top-level chrome composition
-/// every painted surface below sits inside. `app` decides visibility and width;
-/// this only turns those decisions into rectangles.
+/// Split one frame into the sidebar (or its rail), Messages pane (or its
+/// rail), tab bar, and agent pane canvas: the top-level chrome composition
+/// every painted surface below sits inside. `app` decides visibility and
+/// width; this only turns those decisions into rectangles.
 pub fn chrome_areas_for(
     area: Rect,
     sidebar_visible: bool,
@@ -216,9 +215,9 @@ pub fn clamp_sidebar_width(requested: u16, terminal_width: u16) -> u16 {
     requested.clamp(min, max)
 }
 
-/// Bound a requested messages drawer width to what leaves the pane canvas
-/// usable. The operator decides how wide the conversation is; this only
-/// keeps the canvas from disappearing behind it.
+/// Bound a requested Messages pane width to what leaves the agent pane
+/// canvas usable. The operator decides how wide the conversation is; this
+/// keeps both peer regions present.
 pub fn clamp_messages_width(requested: u16, terminal_width: u16) -> u16 {
     let max = terminal_width.saturating_sub(MAIN_MIN_WIDTH).max(1);
     let min = MESSAGES_MIN_WIDTH.min(max);
@@ -231,8 +230,8 @@ pub fn sidebar_width_for_column(column: u16, terminal_width: u16) -> u16 {
     clamp_sidebar_width(column, terminal_width)
 }
 
-/// The messages drawer width a live drag from the right edge to `column`
-/// would commit.
+/// The Messages pane width a live drag from the right edge to `column` would
+/// commit.
 pub fn messages_width_for_column(column: u16, terminal_width: u16) -> u16 {
     let width_from_right = terminal_width.saturating_sub(column);
     clamp_messages_width(width_from_right, terminal_width)
@@ -245,7 +244,7 @@ pub fn sidebar_width_on_cancel(drag: &DragState, terminal_width: u16) -> Option<
         .then(|| sidebar_width_for_column(drag.start.0, terminal_width))
 }
 
-/// The width to restore when a messages-drawer drag is cancelled.
+/// The width to restore when a Messages pane drag is cancelled.
 pub fn messages_width_on_cancel(drag: &DragState, terminal_width: u16) -> Option<u16> {
     matches!(&drag.target, DragTarget::Messages)
         .then(|| messages_width_for_column(drag.start.0, terminal_width))
@@ -1013,17 +1012,17 @@ mod tests {
     use super::*;
 
     /// How wide the conversation should be is the operator's call. The
-    /// only bound left is the canvas the drawer overlays, which is why a
-    /// drag past the old forty-two column ceiling now widens the drawer
+    /// only bound left is the canvas beside the Messages pane, which is why
+    /// a drag past the old forty-two column ceiling now widens the pane
     /// instead of stopping at a number chosen here.
     #[test]
-    fn the_messages_drawer_is_as_wide_as_the_operator_drags_it() {
+    fn the_messages_pane_is_as_wide_as_the_operator_drags_it() {
         assert_eq!(clamp_messages_width(80, 200), 80);
         assert_eq!(clamp_messages_width(120, 200), 120);
         assert_eq!(
             clamp_messages_width(400, 200),
             200 - MAIN_MIN_WIDTH,
-            "the canvas keeps its minimum, and nothing narrower bounds the drawer"
+            "the canvas keeps its minimum, and nothing narrower bounds the Messages pane"
         );
         assert_eq!(clamp_messages_width(1, 200), MESSAGES_MIN_WIDTH);
         // A drag from a column near the left edge of a wide terminal is
@@ -1034,12 +1033,12 @@ mod tests {
     #[test]
     fn a_narrow_terminal_keeps_the_main_canvas_minimum() {
         for terminal_width in 21..=33 {
-            let drawer = clamp_messages_width(u16::MAX, terminal_width);
+            let messages_pane = clamp_messages_width(u16::MAX, terminal_width);
             assert_eq!(
-                terminal_width - drawer,
+                terminal_width - messages_pane,
                 MAIN_MIN_WIDTH,
                 "terminal width {terminal_width} left only {} canvas columns",
-                terminal_width - drawer
+                terminal_width - messages_pane
             );
         }
     }
@@ -1072,7 +1071,7 @@ mod tests {
         assert_eq!(
             areas.messages_rail,
             Some(Rect::new(199, 0, 1, 50)),
-            "collapsed messages drawer leaves one rail column on the right"
+            "collapsed Messages pane leaves one rail column on the right"
         );
         assert_eq!(
             areas.tab_bar,
@@ -1096,9 +1095,9 @@ mod tests {
         assert_eq!(areas.canvas, Rect::new(1, 1, 198, 49));
     }
 
-    /// An open right messages drawer carves width from the right edge.
+    /// An open Messages pane carves its peer region from the right edge.
     #[test]
-    fn an_open_messages_drawer_carves_width_from_the_right() {
+    fn an_open_messages_pane_carves_width_from_the_right() {
         let areas = chrome_areas_for(
             Rect::new(0, 0, 200, 50),
             false,

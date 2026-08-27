@@ -52,6 +52,7 @@ Default bindings are prefix-first (`Ctrl+B`, same shape as tmux):
 | `Ctrl+B` `[` / `]` | Previous / next session |
 | `Ctrl+B` `W` / `K` | Rename / close session |
 | `Ctrl+B` `b` | Collapse or reopen the sidebar |
+| `Ctrl+B` `M` | Collapse or reopen the Messages pane |
 | `Ctrl+B` `g` | Put the keyboard in the file panel; Esc gives it back |
 | `Ctrl+B` `s` | Send a message to an agent |
 | `Ctrl+B` `r` | Repaint the workspace surface |
@@ -170,6 +171,29 @@ Pane content still maps one terminal cell to one tmux cell. The gutter is
 removed from the client size reported to tmux; it never scales or covers a
 pane grid. See [themes.md](themes.md) for the `chrome.text`,
 `chrome.panel`, and `chrome.raised` colors.
+
+## Messages pane
+
+The right-edge Messages pane is a full bordered region beside the agent
+grid, not paint laid over an agent pane. Open or close it with `Ctrl+B` `M`
+or its chevron. Opening it reserves its width before the agent cards are
+laid out; closing it returns that width, apart from the one-column reopen
+rail, and restores the exact grid that was visible before it opened. If that
+grid was already narrower than the terminal because another workspace owns
+the shared tmux geometry, closing Messages does not stretch it past the tmux
+source.
+
+The Messages pane uses the same card language as agent panes: a complete
+muted border at rest and a double accent border while it has keyboard focus.
+Its queue selection, detail scroll, composer, scopes, and shortcuts keep
+their state as the pane opens, closes, or changes width.
+
+When local chrome leaves less room than the current tmux source, Cyclops fits
+the agent card rectangles proportionally into the remaining canvas. Runtime
+cells are still a 1:1 leading viewport; they are never scaled, and the
+follower never resizes the shared tmux window. Pane-divider dragging is
+disabled during that fitted view because local and tmux cell distances no
+longer match. The Messages pane's own width handle remains active.
 
 ## Mouse
 

@@ -565,17 +565,18 @@ struct App {
     /// the frame the renderer thinks it wrote. Drained by [`RenderOwner`]
     /// before its next frame, which then repaints every cell.
     pub(crate) repaint_requested: bool,
-    /// Whether the Messages drawer has active keyboard focus.
+    /// Whether the Messages pane has active keyboard focus.
     messages_focused: bool,
-    /// Whether the drawer shows only the active workspace's session. The
-    /// filter itself is re-derived from the live pane table every frame
+    /// Whether the Messages pane shows only the active workspace's session.
+    /// The filter itself is re-derived from the live pane table every frame
     /// (`sync_messages_session_filter`); this is the operator's choice.
     messages_session_scoped: bool,
-    /// Refresh gate and connection lifecycle for the Messages drawer.
+    /// Refresh gate and connection lifecycle for the Messages pane.
     messages_gate: cyclops_ui::RefreshGate,
     /// Exact failure from the last whole-snapshot RPC. Kept until another
-    /// request starts or a current snapshot lands so the drawer never hides
-    /// an authentication, routing, or transport failure behind `refresh failed`.
+    /// request starts or a current snapshot lands so the Messages pane never
+    /// hides an authentication, routing, or transport failure behind
+    /// `refresh failed`.
     messages_refresh_error: Option<String>,
     /// Async worker for Messages composer sends.
     messages_send_tx: Option<std::sync::mpsc::SyncSender<MessagesSendTask>>,
@@ -2624,8 +2625,8 @@ impl App {
     ///
     /// The cells the previous layout occupied still hold its glyphs until
     /// something writes them, and a diff frame writes only what the new
-    /// layout believes changed, so a collapsed sidebar or drawer can leave
-    /// its own contents behind. Named rather than folded into
+    /// layout believes changed, so a collapsed sidebar or Messages pane can
+    /// leave its own contents behind. Named rather than folded into
     /// `resize_client` because telling tmux a new size and repainting a
     /// surface are different jobs, and one of the four topology mutations
     /// does not resize at all.
@@ -3525,7 +3526,8 @@ fn request_messages_snapshot(app: &mut App) {
     }
 }
 
-/// Pump the Messages drawer refresh gate, issuing a snapshot fetch if one is owed and none in flight.
+/// Pump the Messages pane refresh gate, issuing a snapshot fetch if one is
+/// owed and none is in flight.
 fn pump_messages_refresh(app: &mut App) {
     if !app.model.messages_visible {
         return;
@@ -4089,7 +4091,7 @@ mod compose_send_tests {
 /// happened to land on the right one.
 ///
 /// Nothing is applied here. A divider already applied every step it made
-/// while the button was held; the sidebar and drawer widths a drag
+/// while the button was held; the sidebar and Messages pane widths a drag
 /// previewed stay where the operator left them and are saved, as a release
 /// would have saved them; a selection ends where it stood and is copied,
 /// the same as a release over the pane. Returns whether anything was
@@ -4954,7 +4956,7 @@ async fn handle_files_key(
     }
 }
 
-/// Keys the messages drawer and group-chat composer take while active.
+/// Keys the Messages pane and group-chat composer take while active.
 async fn handle_messages_key(
     app: &mut App,
     key: KeyEvent,
@@ -5122,8 +5124,8 @@ async fn handle_messages_key(
                     .show("Refused: no reachable mailbox routes", Instant::now());
                 return Ok(Some(InputOutcome::Redraw));
             }
-            // `@all` means everyone the drawer is showing: narrowed to one
-            // session, an announcement stays inside that session.
+            // `@all` means everyone the Messages pane is showing: narrowed
+            // to one session, an announcement stays inside that session.
             let session = app.messages_queue.session_filter();
             let recipients: Vec<(cyclops_proto::RecipientKey, String)> = routes
                 .iter()
@@ -5185,14 +5187,14 @@ async fn handle_messages_key(
     Ok(None)
 }
 
-/// The session filter the drawer should apply right now: the active
+/// The session filter the Messages pane should apply right now: the active
 /// workspace's name and the panes linked into its windows, or none when the
 /// operator asked for every session.
 ///
-/// Derived, never stored: panes join and leave a session while the drawer
-/// is open, and a stored pane set would go stale the moment one did. The
-/// queue ignores a filter equal to its current one, so deriving it every
-/// frame costs a small set build and no view rebuild.
+/// Derived, never stored: tmux panes join and leave a session while the
+/// Messages pane is open, and a stored pane set would go stale the moment
+/// one did. The queue ignores a filter equal to its current one, so deriving
+/// it every frame costs a small set build and no view rebuild.
 fn messages_session_filter(app: &App) -> Option<cyclops_ui::SessionFilter> {
     if !app.messages_session_scoped {
         return None;
@@ -6387,8 +6389,8 @@ fn draw<B: Backend>(
     motion.set_preference(app.prefs.motion, motion_capable(&app.paint));
     motion.observe(observed(app), now);
     app.hit_map.clear();
-    // Before the frame, not during it: the drawer's session filter follows
-    // the live pane table, and the queue takes it by value.
+    // Before the frame, not during it: the Messages pane's session filter
+    // follows the live pane table, and the queue takes it by value.
     sync_messages_session_filter(app);
     let mut shown_cursor: Option<crate::render::HostCursor> = None;
     // The whole call, write and flush included: what the slow-terminal
@@ -8339,7 +8341,7 @@ mod tests {
     /// Every chrome topology change must ask for a repaint. A diff frame
     /// writes only what the new layout believes changed, so a surface that
     /// vanished leaves its own glyphs behind: the sidebar's rows, the
-    /// drawer's messages, the tab strip. This is the epoch that was
+    /// Messages pane's rows, the tab strip. This is the epoch that was
     /// missing when the owner first landed.
     #[tokio::test]
     async fn every_layout_topology_change_requests_one_repaint() {
@@ -8695,11 +8697,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(home);
     }
 
-    /// The drawer's own no-stale-glyph equality, the mirror of the
-    /// sidebar's. A vanished drawer owns columns on the other edge, and a
-    /// diff frame has no reason to rewrite them.
+    /// The Messages pane's own no-stale-glyph equality, the mirror of the
+    /// sidebar's. A collapsed Messages pane gives columns back on the other
+    /// edge, and a diff frame has no reason to rewrite them.
     #[test]
-    fn collapsing_the_drawer_leaves_no_cell_of_it_behind() {
+    fn collapsing_the_messages_pane_leaves_no_cell_of_it_behind() {
         let home = cyclops_proto::scratch::scratch_dir("workspace-collapse-drawer");
         let mut motion = Motion::new(false);
         let mut collapsed = test_app(one_pane_model(), home.clone());
@@ -8717,7 +8719,7 @@ mod tests {
         );
         renderer
             .frame(&mut collapsed, &mut motion, Instant::now())
-            .expect("frame with the drawer");
+            .expect("frame with the Messages pane");
         collapsed.model.messages_visible = false;
         collapsed.layout_changed();
         renderer
@@ -8730,18 +8732,18 @@ mod tests {
         assert_eq!(
             renderer.terminal.backend().inner.buffer(),
             &clean_frame(&mut clean, 100, 24),
-            "the collapsed frame kept cells the drawer had drawn"
+            "the collapsed frame kept cells the Messages pane had drawn"
         );
         let _ = std::fs::remove_dir_all(home);
     }
 
-    /// Messages is a peer surface, not paint placed over the pane grid.
-    /// Opening it reserves one bordered rectangle, reflows both agent cards
-    /// into the remaining canvas, and closing it restores the same grid.
+    /// The Messages pane owns a bordered region beside the agent grid.
+    /// Opening it reflows both agent cards into the remaining canvas, and
+    /// closing it reclaims that reserved width and restores the prior grid.
     /// A narrow client must keep the selected trailing pane on screen even
     /// when it cannot resize the shared tmux window.
     #[test]
-    fn messages_is_a_bordered_peer_that_never_hides_the_selected_agent() {
+    fn messages_pane_is_bordered_and_never_hides_the_selected_agent() {
         let home = cyclops_proto::scratch::scratch_dir("workspace-messages-peer");
         let mut app = test_app(messages_peer_model(), home.clone());
         app.term_size = (96, 24);
@@ -8765,7 +8767,7 @@ mod tests {
         let messages = app
             .chrome(Rect::new(0, 0, 96, 24))
             .messages
-            .expect("Messages peer rectangle");
+            .expect("Messages pane rectangle");
         let opened_left = app
             .hit_map
             .pane_geometry("%0")

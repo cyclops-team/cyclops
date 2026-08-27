@@ -34,6 +34,9 @@ impl PaneGaps {
             SplitDir::Horizontal => self.columns,
             SplitDir::Vertical => self.rows,
         }
+        // Sibling frames paint immediately outside their content rects. A
+        // zero-cell seam lets either frame overwrite the other's content.
+        .max(1)
     }
 }
 
@@ -473,6 +476,12 @@ pub fn layout_geometry(
         source.1.min(canvas.height),
     );
     collect_geometry(node, fitted, focused_pane, gaps, &mut geometry);
+    if fitted.width < source.0 || fitted.height < source.1 {
+        // Pointer deltas are local cells, while divider actions resize tmux
+        // in source cells. A fitted card has no exact 1:1 resize seam, so it
+        // must not advertise one until the full source geometry returns.
+        geometry.dividers.clear();
+    }
     geometry
 }
 
@@ -622,10 +631,10 @@ fn collect_geometry(
 
 /// Fit sibling lengths to one local axis. Full-size layouts are returned
 /// byte-for-byte; compressed layouts use largest-remainder apportionment so
-/// rounding cannot strand cells. One cell per child is reserved when it
-/// fits. Below even that floor, the branch containing focus gets the first
-/// cell, which is the narrow-width guarantee that selected panes do not
-/// disappear behind local chrome.
+/// rounding cannot strand cells. One content cell and one separating border
+/// cell per sibling are reserved when they fit. Below that safe floor, every
+/// nonfocused branch collapses and the focused branch receives the whole
+/// axis, so sibling frames cannot erase its last visible runtime cell.
 fn fit_split_lengths(
     wanted: &[u16],
     available: u16,
@@ -637,6 +646,17 @@ fn fit_split_lengths(
     }
     let count = u16::try_from(wanted.len()).unwrap_or(u16::MAX);
     let divider_count = count.saturating_sub(1);
+    let visible_floor = count.saturating_add(divider_count);
+    if available < visible_floor {
+        // There is not enough room for one content cell per branch plus a
+        // separating border cell. Keeping zero-gap siblings would let a
+        // frame erase the neighbouring runtime, so collapse every branch
+        // except the one carrying focus and give that survivor the axis.
+        let mut fitted = vec![0u16; wanted.len()];
+        let survivor = focused.filter(|index| *index < fitted.len()).unwrap_or(0);
+        fitted[survivor] = available;
+        return (fitted, 0);
+    }
     let gap = available
         .saturating_sub(count)
         .checked_div(divider_count)
@@ -970,7 +990,7 @@ mod tests {
     /// driver without owning the right to resize that shared window. The
     /// local pane cards still have to fit the canvas: clipping the old
     /// window coordinates hides the trailing pane, which is exactly the
-    /// pane an operator can be focused in when Messages opens beside it.
+    /// pane an operator can be focused in when the Messages pane opens.
     #[test]
     fn a_compressed_canvas_reflows_the_grid_and_keeps_the_focused_pane_visible() {
         let node = parse_layout("dd63,90x20,0,0{60x20,0,0,0,29x20,61,0,1}").unwrap();
@@ -985,8 +1005,9 @@ mod tests {
         assert_eq!(full.slots[0].rect, Rect::new(0, 0, 60, 20));
         assert_eq!(full.slots[1].rect, Rect::new(62, 0, 29, 20));
 
-        // Messages reserves local width. Both cards must reflow into what
-        // remains, preserving the tmux split proportion to rounding.
+        // The Messages pane reserves local width. Both cards must reflow
+        // into what remains, preserving the tmux split proportion to
+        // rounding.
         let compressed = layout_geometry(&resolved, Rect::new(0, 0, 69, 20), "%1", gaps);
         assert_eq!(compressed.slots.len(), 2, "no pane may disappear");
         let left = compressed
