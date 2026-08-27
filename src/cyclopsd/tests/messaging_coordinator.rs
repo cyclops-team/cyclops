@@ -2540,21 +2540,19 @@ async fn typed_composer_hold_is_a_durable_prewrite_block_until_a_real_turn() {
     .await;
     let third_id = third["msg_id"].as_str().unwrap().to_string();
     assert!(notification_attempts(&rig, &third_id).is_empty());
-    let withdrawn = rig
-        .ctl
-        .request(
-            "notification.withdraw",
-            json!({
-                "attempt_id": second_data["attempt_id"],
-                "recipient": row["recipients"][0]["recipient"],
-            }),
-        )
-        .await;
-    assert!(withdrawn["error"].is_null(), "{withdrawn}");
-    assert_eq!(
-        withdrawn["result"]["disposition"], "withdrawn",
-        "{withdrawn}"
-    );
+    let withdrawn = serde_json::to_value(
+        rig.daemon
+            .withdraw_notification_for_test(
+                "admin",
+                serde_json::from_value(row["recipients"][0]["recipient"].clone())
+                    .expect("blocked recipient key"),
+                serde_json::from_value(second_data["attempt_id"].clone())
+                    .expect("blocked attempt id"),
+            )
+            .expect("admin notification withdrawal"),
+    )
+    .expect("withdrawal result serializes");
+    assert_eq!(withdrawn["disposition"], "withdrawn", "{withdrawn}");
     wait_for_notification_state(&mut rig, &third_id, NotificationState::BlockedPreWrite).await;
     let after_withdrawal = json!({
         "result": serde_json::to_value(
