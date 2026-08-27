@@ -130,12 +130,6 @@ pub const MENU_SWAP_DOWN: &str = "Swap down";
 
 pub const MENU_CLOSE_PANE: &str = "Close pane";
 
-pub const MENU_NEW_TAB: &str = "New tab";
-
-pub const MENU_NEW_WORKSPACE: &str = "New session";
-
-pub const MENU_TOGGLE_EVENTS: &str = "Event stream";
-
 pub const MENU_TOGGLE_MESSAGES: &str = "Messages";
 /// The composer, in the menu because the `@` button that opens it lives
 /// in the sidebar footer, and a collapsed sidebar has no footer to click.
@@ -148,13 +142,13 @@ pub const BINDING_TOGGLE_MESSAGES: &str = "Toggle messages";
 /// theme, so it reads under `NO_COLOR` (rule 11).
 pub const MENU_CHECK: &str = "✓";
 
-pub const MENU_TAB_BAR: &str = "Tab bar";
-/// The only visible switch for chrome fades (`crate::animate`).
-pub const MENU_MOTION: &str = "Motion";
-
 /// Opens the settings dialog: the theme picker, the sound switch, and
 /// the keybinding reference.
 pub const MENU_SETTINGS: &str = "Settings";
+
+/// The keybinding reference, a card of its own beside Settings; this
+/// row opens it the way `Ctrl+B ?` does.
+pub const MENU_KEYBINDS: &str = "Keybinds";
 
 pub const MENU_DETACH: &str = "Detach";
 
@@ -171,11 +165,33 @@ pub const SETTINGS_TITLE: &str = "Settings";
 /// The settings dialog's section chips, in the order Tab walks them.
 pub const SETTINGS_SECTION_THEME: &str = "Theme";
 
+pub const SETTINGS_SECTION_VIEW: &str = "View";
+
 pub const SETTINGS_SECTION_SOUND: &str = "Sound";
 
-pub const SETTINGS_SECTION_KEYBINDS: &str = "Keybinds";
+pub const KEYBINDS_TITLE: &str = "Keybinds";
+
+/// The keybinds card's one muted line: how to move, since nothing on
+/// it is chosen and the list is longer than the card.
+pub const KEYBINDS_HINT: &str = "Scroll with ↑/↓, PgUp/PgDn, or the mouse wheel.";
 
 pub const THEMES_HINT: &str = "Pick with ↑/↓, Tab switches section, Enter applies everywhere.";
+
+/// The view section's rows: the surfaces the app menu used to switch.
+/// Named for the thing, not the verb, as they were on the menu.
+pub const VIEW_TAB_BAR: &str = "Tab bar";
+
+pub const VIEW_FILES: &str = "Files";
+
+/// One muted line under each view row: what the surface is, in the
+/// fewest words that place it on screen. Never a second sentence.
+pub const VIEW_TAB_BAR_NOTE: &str = "The row of tabs above the panes.";
+
+pub const VIEW_FILES_NOTE: &str = "A file browser at the foot of the sidebar.";
+
+/// The view section's footer: its rows do not wait for Apply the way
+/// the sections beside it do, and this is where that is said.
+pub const VIEW_HINT: &str = "Enter or a click flips a row. Changes take effect at once.";
 
 /// The sound section's two rows. "Sound notifs" rather than "Sounds":
 /// the switch is about being told, not about the workspace making noise.
@@ -291,10 +307,6 @@ pub fn compose_unknown(to: &str, cause: &str) -> String {
 /// The panel's name before it knows which folder it is looking at. Once it
 /// does, the folder's own name takes this row.
 pub const FILES_TITLE: &str = "Files";
-
-/// The app menu's switch for the panel. Named for the thing, not the
-/// verb, like every other toggle on that menu.
-pub const MENU_FILES: &str = "Files";
 
 /// No folder yet. The panel roots itself on the focused pane's directory,
 /// which takes one tmux round trip after launch, so this shows for a beat

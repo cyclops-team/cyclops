@@ -87,7 +87,7 @@ use crossterm::event::MouseButton;
 use cyclops_tmux::{PaneDirection, SplitDirection};
 
 use crate::bindings::BindingAction;
-use crate::dialog::{Dialog, SettingsSection};
+use crate::dialog::{Dialog, SettingsSection, ViewRow};
 use crate::drag::DragTarget;
 use crate::input::mouse::{HitTarget, MenuState};
 use crate::layout::SplitDir;
@@ -322,11 +322,14 @@ pub enum Action {
     /// Open the settings card on one of its sections. Carries no other
     /// target: the theme listing is read from the themes directory at
     /// execution time, so a file added or removed between the click and
-    /// the open cannot show a stale row, the sound switch is read from
-    /// prefs, and the keybinds section is generated from the active map.
+    /// the open cannot show a stale row, and the sound switch and the
+    /// view switches are read from prefs.
     ShowSettings {
         section: SettingsSection,
     },
+    /// Open the keybinding reference, a card of its own, from the
+    /// router's live map.
+    ShowKeybinds,
     /// Switch to a theme by name, exactly what `cyclops theme <name>`
     /// does: write the config key and nudge the daemon, whose theme event
     /// repaints this workspace through the existing hot-reload watch.
@@ -472,9 +475,7 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
         BindingAction::ToggleTabBar => Some(Action::ToggleTabBar),
         BindingAction::ToggleMotion => Some(Action::ToggleMotion),
         BindingAction::ToggleEventPanel => Some(Action::ToggleEventPanel),
-        BindingAction::ShowKeybinds => Some(Action::ShowSettings {
-            section: SettingsSection::Keybinds,
-        }),
+        BindingAction::ShowKeybinds => Some(Action::ShowKeybinds),
         BindingAction::ShowSettings => Some(Action::ShowSettings {
             section: SettingsSection::Theme,
         }),
@@ -655,7 +656,7 @@ pub fn route_dialog_confirm(dialog: &Dialog) -> Option<Action> {
         }),
         // Enter applies the row the arrows are on, in the section that is
         // showing. An empty theme listing has nothing to apply, so Enter
-        // dismisses like the keybinds section.
+        // dismisses like the keybinds card.
         Dialog::Settings {
             section: SettingsSection::Theme,
             themes,
@@ -664,6 +665,21 @@ pub fn route_dialog_confirm(dialog: &Dialog) -> Option<Action> {
             .names
             .get(themes.selected)
             .map(|name| Action::ApplyTheme { name: name.clone() }),
+        // The view section's Enter flips the surface under the cursor,
+        // at once and without closing the card: these are the app menu's
+        // old toggles, and a switch that waited for Apply would be the
+        // only one in the workspace that did. The card stays because the
+        // action leaves the dialog alone; `exec::sync_view_switches`
+        // moves the check.
+        Dialog::Settings {
+            section: SettingsSection::View,
+            view,
+            ..
+        } => match view.selected_row() {
+            Some(ViewRow::TabBar) => Some(Action::ToggleTabBar),
+            Some(ViewRow::Files) => Some(Action::ToggleFiles),
+            None => None,
+        },
         // The sound section's Enter reads the checks, not the cursor:
         // landing on rows moved them, and both groups are saved at once.
         Dialog::Settings {
@@ -675,10 +691,7 @@ pub fn route_dialog_confirm(dialog: &Dialog) -> Option<Action> {
             cue: sound.checked_sound().map(String::from),
         }),
         // Read-only: nothing to confirm. Enter just dismisses the card.
-        Dialog::Settings {
-            section: SettingsSection::Keybinds,
-            ..
-        } => None,
+        Dialog::Keybinds { .. } => None,
     }
 }
 
@@ -1574,22 +1587,31 @@ mod tests {
         );
     }
 
-    /// Nothing on the keybinds section is chosen, so its Enter has no
+    /// Nothing on the keybinds card is chosen, so its Enter has no
     /// action and the card closes the way an empty theme list's does.
     #[test]
-    fn the_keybinds_section_confirms_to_no_action() {
-        let dialog = Dialog::Settings {
-            section: SettingsSection::Keybinds,
-            themes: crate::dialog::ThemePicker {
-                names: vec!["dark".into()],
-                selected: 0,
-                active: Some(0),
-                notice: None,
-            },
-            sound: crate::dialog::SoundPicker::new(true, vec!["system".into()], "system"),
-            keybinds: crate::dialog::KeybindSheet::default(),
+    fn the_keybinds_card_confirms_to_no_action() {
+        let dialog = Dialog::Keybinds {
+            scroll: 3,
+            rows: vec![crate::bindings::BindingHelp {
+                keys: "Ctrl+B ?".into(),
+                action: "Keybinds".into(),
+            }],
         };
         assert_eq!(route_dialog_confirm(&dialog), None);
+    }
+
+    /// The view section's Enter is the app menu's old toggle: it names
+    /// the surface under the cursor and nothing else, so the card can
+    /// stay open while the surface flips.
+    #[test]
+    fn the_view_section_confirms_to_the_switch_under_the_cursor() {
+        let mut dialog = settings(SettingsSection::View, Vec::new(), 0);
+        assert_eq!(route_dialog_confirm(&dialog), Some(Action::ToggleTabBar));
+        if let Dialog::Settings { view, .. } = &mut dialog {
+            view.selected = 1;
+        }
+        assert_eq!(route_dialog_confirm(&dialog), Some(Action::ToggleFiles));
     }
 
     #[test]
@@ -1604,19 +1626,22 @@ mod tests {
                 section: SettingsSection::Theme
             })
         );
-        // The keybinding reference is the same card, open on its own
-        // section, so `Ctrl+B ?` still lands on the bindings.
+        // The keybinding reference is its own card, and `Ctrl+B ?` opens
+        // it directly.
         assert_eq!(
             route_binding(BindingAction::ShowKeybinds, &c),
-            Some(Action::ShowSettings {
-                section: SettingsSection::Keybinds
-            })
+            Some(Action::ShowKeybinds)
         );
         assert_eq!(
             route_menu_item(&MenuState::AppMenu, BindingAction::ShowSettings, &c),
             Some(Action::ShowSettings {
                 section: SettingsSection::Theme
             })
+        );
+        // The menu's Keybinds row is the chord's twin: the same card.
+        assert_eq!(
+            route_menu_item(&MenuState::AppMenu, BindingAction::ShowKeybinds, &c),
+            Some(Action::ShowKeybinds)
         );
     }
 
@@ -1629,6 +1654,7 @@ mod tests {
                 active: Some(0),
                 notice: None,
             },
+            view: crate::dialog::ViewSwitches::new(true, false),
             sound: crate::dialog::SoundPicker {
                 selected: sound_selected,
                 on: false,
@@ -1636,7 +1662,6 @@ mod tests {
                 active_sound: Some(0),
                 previewed: None,
             },
-            keybinds: crate::dialog::KeybindSheet::default(),
         }
     }
 

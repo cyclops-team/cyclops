@@ -34,7 +34,7 @@ use crate::copy;
 use crate::daemon;
 use crate::decoration::{self, DecorationSnapshot};
 use crate::dialog::{
-    Composed, Dialog, KeybindSheet, SettingsSection, SoundPicker, SoundRow, ThemePicker,
+    Composed, Dialog, SettingsSection, SoundPicker, SoundRow, ThemePicker, ViewSwitches,
 };
 use crate::naming;
 use crate::persist::SidebarTab;
@@ -291,6 +291,7 @@ pub(super) async fn execute(
             // said otherwise.
             app.prefs.tab_bar_visible = !app.prefs.tab_bar_visible;
             super::resize_client(app, client).await;
+            sync_view_switches(app);
             Ok(Outcome {
                 persist: true,
                 ..Outcome::default()
@@ -307,6 +308,7 @@ pub(super) async fn execute(
             };
             // No `resize_client`: the seam is inside the sidebar, so no
             // column changed hands and no pane reflows.
+            sync_view_switches(app);
             Ok(Outcome {
                 persist: true,
                 ..Outcome::default()
@@ -449,17 +451,21 @@ pub(super) async fn execute(
                     active,
                     notice: None,
                 },
+                view: ViewSwitches::new(app.prefs.tab_bar_visible, app.prefs.files_rows > 0),
                 sound: SoundPicker::new(
                     app.prefs.sound_notifs,
                     crate::sound::choices(&app.home),
                     &app.prefs.sound,
                 ),
-                // From the router's live map, not from documentation, so
-                // a rebinding in config.toml is what the sheet teaches.
-                keybinds: KeybindSheet {
-                    scroll: 0,
-                    rows: app.router.help(),
-                },
+            });
+            Ok(Outcome::default())
+        }
+        Action::ShowKeybinds => {
+            // From the router's live map, not from documentation, so a
+            // rebinding in config.toml is what the card teaches.
+            app.open_dialog(Dialog::Keybinds {
+                scroll: 0,
+                rows: app.router.help(),
             });
             Ok(Outcome::default())
         }
@@ -1099,6 +1105,19 @@ fn theme_rows(home: &Path) -> (Vec<String>, Option<usize>) {
         .iter()
         .position(|(_, path)| active.as_deref() == Some(path.as_path()));
     (rows.into_iter().map(|(name, _)| name).collect(), active)
+}
+
+/// Mirror the surfaces' visibility into the settings card's view section
+/// while it is open. Its rows flip the prefs at once and read them back
+/// from here, so a chord that hides the tab bar while the card is up
+/// moves the check too, and the card never says a surface is showing
+/// that is not. A no-op with no card open.
+pub(super) fn sync_view_switches(app: &mut App) {
+    let (tab_bar, files) = (app.prefs.tab_bar_visible, app.prefs.files_rows > 0);
+    if let Some(Dialog::Settings { view, .. }) = app.dialog.as_mut() {
+        view.tab_bar = tab_bar;
+        view.files = files;
+    }
 }
 
 /// The cursor landed on a settings row, by arrows, wheel, or a click
@@ -1875,6 +1894,99 @@ mod tests {
     /// between them would land here as a declared size that does not move
     /// with the bar. Tab count never enters into it: this workspace has one
     /// tab throughout and keeps its strip.
+    /// The settings card's view rows flip their surface at once and
+    /// stay open: the check follows the pref, whichever way the pref
+    /// was flipped, so the card never says a surface is showing that
+    /// is not.
+    #[tokio::test]
+    async fn a_view_row_flips_its_surface_and_the_card_reads_it_back() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-view-row");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        let pane = pane_ids(&server, "s")[0].clone();
+        let client = rig_client(&server, "s").await;
+        let home = scratch_home("exec-view-row-home");
+        let mut app = test_app(one_tab_model("s", "@0", &pane, "$0"), home.clone());
+        assert!(app.prefs.files_rows > 0, "the panel shows by default");
+
+        execute(
+            &mut app,
+            &client,
+            Action::ShowSettings {
+                section: SettingsSection::View,
+            },
+        )
+        .await
+        .expect("open the card");
+        let view = |app: &App| match app.dialog.as_ref() {
+            Some(Dialog::Settings { view, .. }) => *view,
+            other => panic!("the card is open: {other:?}"),
+        };
+        assert!(view(&app).files, "opens reading the panel as shown");
+
+        if let Some(open) = app.dialog.as_mut() {
+            crate::dialog::select_settings_row(open, 1);
+        }
+        let action = crate::action::route_dialog_confirm(app.dialog.as_ref().unwrap())
+            .expect("Enter on the Files row names its switch");
+        let outcome = execute(&mut app, &client, action)
+            .await
+            .expect("flip the panel");
+        assert!(outcome.persist, "the new visibility belongs on disk");
+        assert_eq!(app.prefs.files_rows, 0, "the panel is put away");
+        assert!(!view(&app).files, "and the row's check went with it");
+        assert_eq!(view(&app).selected, 1, "the cursor stayed on its row");
+
+        // Flipped from anywhere else while the card is up, the check
+        // still follows.
+        execute(&mut app, &client, Action::ToggleFiles)
+            .await
+            .expect("flip it back by chord");
+        assert!(app.prefs.files_rows > 0);
+        assert!(view(&app).files, "the card reads the pref, not its memory");
+
+        let _ = std::fs::remove_dir_all(&home);
+        client.shutdown().await;
+    }
+
+    /// The keybinds card opens on the router's live map, scrolled to the
+    /// top: what the card teaches is what is bound, not what was written
+    /// down.
+    #[tokio::test]
+    async fn show_keybinds_opens_its_own_card_on_the_active_map() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-show-keybinds");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        let pane = pane_ids(&server, "s")[0].clone();
+        let client = rig_client(&server, "s").await;
+        let home = scratch_home("exec-show-keybinds-home");
+        let mut app = test_app(one_tab_model("s", "@0", &pane, "$0"), home.clone());
+
+        let outcome = execute(&mut app, &client, Action::ShowKeybinds)
+            .await
+            .expect("open the card");
+        assert!(!outcome.persist && !outcome.reconcile);
+        match &app.dialog {
+            Some(Dialog::Keybinds { scroll, rows }) => {
+                assert_eq!(*scroll, 0, "opens at the top");
+                assert_eq!(*rows, app.router.help(), "the active map, as rows");
+                assert!(!rows.is_empty());
+            }
+            other => panic!("the keybinds card is open: {other:?}"),
+        }
+        assert!(
+            app.theme_restore.is_none(),
+            "no theme is previewed, so there is nothing to put back"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+        client.shutdown().await;
+    }
+
     #[tokio::test]
     async fn toggling_the_tab_bar_persists_and_redeclares_the_client_size() {
         if !tmux_available() {
@@ -1920,8 +2032,8 @@ mod tests {
             "a workspace quit with the strip hidden must reopen hidden"
         );
 
-        // And back: the app menu item is the visible way here, and it puts
-        // the row and the `+` back exactly where they were.
+        // And back: the settings card's View row is the visible way here,
+        // and it puts the row and the `+` back exactly where they were.
         let outcome = execute(&mut app, &client, Action::ToggleTabBar)
             .await
             .expect("show the strip");
@@ -2474,8 +2586,8 @@ mod tests {
                 active,
                 notice: None,
             },
+            view: ViewSwitches::new(true, true),
             sound: SoundPicker::new(false, vec!["system".into()], "system"),
-            keybinds: KeybindSheet::default(),
         }
     }
 
@@ -2521,15 +2633,14 @@ mod tests {
             Some(Dialog::Settings {
                 section,
                 themes,
+                view,
                 sound,
-                keybinds,
             }) => {
                 assert_eq!(*section, SettingsSection::Theme, "opens on themes");
-                assert_eq!(keybinds.scroll, 0);
                 assert_eq!(
-                    keybinds.rows,
-                    app.router.help(),
-                    "the keybinds section is the active map, as rows"
+                    *view,
+                    ViewSwitches::new(true, true),
+                    "reads the surfaces as shown, cursor on the first row"
                 );
                 assert_eq!(themes.names, vec!["dark".to_string()]);
                 assert_eq!(themes.selected, 0, "the arrows start on the active row");
@@ -2781,8 +2892,8 @@ mod tests {
                 active: None,
                 notice: None,
             },
+            view: ViewSwitches::new(true, true),
             sound: SoundPicker::new(false, vec!["system".into()], "system"),
-            keybinds: KeybindSheet::default(),
         });
         preview_selected_theme(&mut app);
         assert_ne!(app.paint.theme.resolve(dim).rgb, original, "browsed");
@@ -2834,8 +2945,8 @@ mod tests {
                 active: None,
                 notice: None,
             },
+            view: ViewSwitches::new(true, true),
             sound: SoundPicker::new(false, vec!["system".into()], "system"),
-            keybinds: KeybindSheet::default(),
         });
 
         if let Some(open) = app.dialog.as_mut() {
@@ -2881,12 +2992,12 @@ mod tests {
                 active: None,
                 notice: None,
             },
+            view: ViewSwitches::new(true, true),
             sound: SoundPicker::new(
                 true,
                 vec!["bow-ripple".into(), "system".into()],
                 "bow-ripple",
             ),
-            keybinds: KeybindSheet::default(),
         });
 
         let outcome = execute(

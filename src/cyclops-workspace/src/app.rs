@@ -3720,13 +3720,10 @@ async fn handle_mouse(
             let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
             let max_scroll = keybind_scroll_limit(app);
             // A picker notch moves the selection one row; the keybinds
-            // section's moves its viewport three. The dialog says which
-            // list the wheel is over.
-            if let Some(open @ Dialog::Settings { .. }) = app.dialog.as_mut() {
-                let rows = dialog::settings_wheel_rows(open);
-                let delta = if up { -rows } else { rows };
-                dialog::move_settings_selection(open, delta, max_scroll);
-            }
+            // card's moves its viewport three. The dialog says which list
+            // the wheel is over.
+            let rows = app.dialog.as_ref().map_or(1, dialog::dialog_wheel_rows);
+            scroll_dialog(app, if up { -rows } else { rows }, max_scroll);
             // Same landing the arrow keys make: a theme goes live for the
             // next render, a sound row takes the check.
             exec::settings_cursor_moved(app, false);
@@ -3763,7 +3760,19 @@ async fn handle_mouse(
                         if let Some(open) = app.dialog.as_mut() {
                             dialog::select_settings_row(open, index);
                         }
-                        exec::settings_cursor_moved(app, true);
+                        // A view row is a switch, not a preview: the click
+                        // that lands on it flips it, exactly as Enter would.
+                        if matches!(
+                            app.dialog,
+                            Some(Dialog::Settings {
+                                section: dialog::SettingsSection::View,
+                                ..
+                            })
+                        ) {
+                            dialog_confirm(app, client).await?;
+                        } else {
+                            exec::settings_cursor_moved(app, true);
+                        }
                     }
                     _ => {}
                 }
@@ -5146,7 +5155,7 @@ async fn follow_workspace_folder(
 /// Apply the open dialog's action (Enter or its confirm button).
 /// Route the open dialog's confirmation to a terminal [`Action`] and run it
 /// through the executor. A dialog whose buffer resolves to nothing (a blank
-/// rename, or the settings card on its read-only keybinds section) still
+/// rename, or the read-only keybinds card) still
 /// dismisses on Enter — it just does so here instead of inside an executor
 /// arm, since there is no action to hand it.
 async fn dialog_confirm(
@@ -5231,17 +5240,31 @@ async fn paste_into_focused_pane(
     Ok(())
 }
 
-/// How far the settings card's keybinds section can scroll on this
-/// terminal: its rows past the list the card has room for. Zero for
-/// every other dialog, and for no dialog.
+/// How far the keybinds card can scroll on this terminal: its rows past
+/// the list the card has room for. Zero for every other dialog, and for
+/// no dialog.
 fn keybind_scroll_limit(app: &App) -> u16 {
-    let Some(dialog) = app.dialog.as_ref() else {
+    let Some(Dialog::Keybinds { rows, .. }) = app.dialog.as_ref() else {
         return 0;
     };
-    crate::render::settings_keybind_max_scroll(
-        dialog,
+    crate::render::keybind_max_scroll(
+        rows.len(),
         Rect::new(0, 0, app.term_size.0, app.term_size.1),
     )
+}
+
+/// Move whichever list an open dialog scrolls `delta` rows: the keybinds
+/// card's viewport within `max_scroll`, or the settings card's cursor.
+/// One place, so the key path and the wheel path cannot disagree about
+/// which list they are on.
+fn scroll_dialog(app: &mut App, delta: i16, max_scroll: u16) {
+    match app.dialog.as_mut() {
+        Some(Dialog::Keybinds { scroll, .. }) => {
+            *scroll = dialog::move_keybind_scroll(*scroll, delta, max_scroll);
+        }
+        Some(open @ Dialog::Settings { .. }) => dialog::move_settings_selection(open, delta),
+        _ => {}
+    }
 }
 
 /// Install one decoration snapshot: the offline bookkeeping and the
@@ -5628,9 +5651,7 @@ async fn handle_dialog_key(
             }
         }
         DialogKeyAction::Scroll(delta) => {
-            if let Some(open) = app.dialog.as_mut() {
-                dialog::move_settings_selection(open, delta, max_scroll);
-            }
+            scroll_dialog(app, delta, max_scroll);
             // The row the arrows land on goes live, or takes the check,
             // for the next render (a no-op for every other dialog).
             exec::settings_cursor_moved(app, false);
@@ -5642,8 +5663,14 @@ async fn handle_dialog_key(
         }
         DialogKeyAction::ScrollStart | DialogKeyAction::ScrollEnd => {
             let to_end = action == DialogKeyAction::ScrollEnd;
-            if let Some(open) = app.dialog.as_mut() {
-                dialog::jump_settings_selection(open, to_end, max_scroll);
+            match app.dialog.as_mut() {
+                Some(Dialog::Keybinds { scroll, .. }) => {
+                    *scroll = if to_end { max_scroll } else { 0 };
+                }
+                Some(open @ Dialog::Settings { .. }) => {
+                    dialog::jump_settings_selection(open, to_end);
+                }
+                _ => {}
             }
             exec::settings_cursor_moved(app, false);
         }
@@ -5858,11 +5885,7 @@ fn draw<B: Backend>(
                 &mut app.hit_map,
                 app.hover,
                 crate::render::MenuChecks {
-                    tab_bar: app.prefs.tab_bar_visible,
-                    motion: app.prefs.motion,
-                    stream: app.sidebar_tab == crate::persist::SidebarTab::Stream,
                     messages: app.model.messages_visible,
-                    files: app.prefs.files_rows > 0,
                 },
             );
             if let Some(dialog) = &app.dialog {
@@ -7909,8 +7932,8 @@ mod tests {
                 active: None,
                 notice: None,
             },
+            view: dialog::ViewSwitches::new(true, true),
             sound: dialog::SoundPicker::new(false, vec!["system".into()], "system"),
-            keybinds: dialog::KeybindSheet::default(),
         });
         exec::preview_selected_theme(&mut app);
         assert_ne!(app.paint.theme.resolve(dim).rgb, original, "previewed");
@@ -7966,8 +7989,8 @@ mod tests {
                 active: Some(0),
                 notice: None,
             },
+            view: dialog::ViewSwitches::new(true, true),
             sound: dialog::SoundPicker::new(false, vec!["system".into()], "system"),
-            keybinds: dialog::KeybindSheet::default(),
         });
         exec::preview_selected_theme(&mut app);
         assert_eq!(app.paint.theme.resolve(dim).rgb, (0x22, 0x22, 0x22));
