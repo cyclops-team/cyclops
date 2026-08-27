@@ -7775,7 +7775,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// Gate 1: a durable reply routes to the ORIGINAL endpoint after the
     /// recipient's alias is renamed.
     ///
@@ -7880,6 +7879,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn committed_mailbox_facts_publish_once_in_workspace_sequence_order() {
         let scratch = StoreScratch::new("change-events");
         let root = scratch.root();

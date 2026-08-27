@@ -699,6 +699,57 @@ mod tests {
             .expect("live pane binding")
     }
 
+    /// Gate 2: a missing or mismatched lifecycle end holds and emits
+    /// EXACTLY ONE bounded diagnostic.
+    ///
+    /// The bound is not a timer or a counter, it is set membership keyed on
+    /// the exact binding, so the three ways this could go wrong are all one
+    /// question: does a second reservation for the same binding succeed.
+    ///
+    /// The two suppressions matter as much as the count. An end edge that
+    /// DID arrive is not a missing end, and a pane whose occupant was
+    /// replaced is not the pane the delivery was about, so neither may
+    /// spend the one diagnostic.
+    #[test]
+    fn a_missing_lifecycle_end_notifies_exactly_once() {
+        let liveness = HookLiveness::new();
+        let route = pane("%1");
+        open(&liveness, &route);
+        let bound = binding(&liveness, &route, proc(100), "test");
+
+        assert!(
+            liveness.reserve_f1_if_no_edges(&bound),
+            "the first missing end must be reportable"
+        );
+        assert!(
+            !liveness.reserve_f1_if_no_edges(&bound),
+            "the same binding reported a second diagnostic"
+        );
+
+        // An end edge that arrived is not a missing end.
+        let with_edges = pane("%2");
+        open(&liveness, &with_edges);
+        let edged = binding(&liveness, &with_edges, proc(200), "test");
+        let _ = liveness.bind_diagnostic(&with_edges, "Stop", 1_000, proc(200), "test");
+        assert!(
+            !liveness.reserve_f1_if_no_edges(&edged),
+            "a pane that produced a hook edge is not a missing end"
+        );
+
+        // A replaced occupant is not the pane the delivery was about. The
+        // binding is captured before the swap, exactly as the delayed task
+        // holds it, so this is the stale-task case and not a fresh read.
+        let swapped = pane("%3");
+        open(&liveness, &swapped);
+        let stale = binding(&liveness, &swapped, proc(300), "test");
+        liveness.close(&swapped);
+        open(&liveness, &swapped);
+        assert!(
+            !liveness.reserve_f1_if_no_edges(&stale),
+            "a diagnostic settled against a replaced occupant"
+        );
+    }
+
     #[test]
     fn liveness_records_and_forgets() {
         let l = HookLiveness::new();
