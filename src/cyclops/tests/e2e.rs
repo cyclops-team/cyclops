@@ -2180,6 +2180,156 @@ fn require_wake_fails_closed_for_missing_unknown_and_broadcast_receipts() {
     assert_eq!(unproven.status.code(), Some(1));
 }
 
+#[test]
+fn default_send_accepts_a_future_receipt_state_with_an_honest_plain_warning() {
+    let result = json!({
+        "msg_id": "m-future-send",
+        "seq": 2,
+        "inserted": true,
+        "deliveries": [{"to": "reviewer", "state": "from_next_year"}]
+    });
+
+    let plain = run_send_result(
+        "rw-future-send-plain",
+        result.clone(),
+        &["send", "reviewer", "--subject", "future"],
+    );
+    assert!(
+        plain.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&plain.stdout),
+        "accepted m-future-send\nwake receipt state is unknown to this client\n"
+    );
+
+    let machine = run_send_result(
+        "rw-future-send-json",
+        result.clone(),
+        &["send", "reviewer", "--subject", "future", "--json"],
+    );
+    assert!(machine.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&machine.stdout).unwrap(),
+        result
+    );
+}
+
+#[test]
+fn default_send_rejects_the_same_incomplete_acceptance_envelope_in_plain_and_json() {
+    let plain = run_send_result(
+        "rw-empty-send-plain",
+        json!({}),
+        &["send", "reviewer", "--subject", "incomplete"],
+    );
+    assert_eq!(plain.status.code(), Some(1));
+    assert!(plain.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&plain.stderr).contains("doesn't understand"));
+
+    let machine = run_send_result(
+        "rw-empty-send-json",
+        json!({}),
+        &["send", "reviewer", "--subject", "incomplete", "--json"],
+    );
+    assert_eq!(machine.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&machine.stdout), "{}\n");
+    assert!(machine.stderr.is_empty());
+}
+
+#[test]
+fn default_send_rejects_a_zero_sequence_in_plain_and_json() {
+    let result = json!({
+        "msg_id": "m-zero-seq",
+        "seq": 0,
+        "deliveries": []
+    });
+
+    let plain = run_send_result(
+        "rw-zero-seq-send-plain",
+        result.clone(),
+        &["send", "reviewer", "--subject", "invalid sequence"],
+    );
+    assert_eq!(plain.status.code(), Some(1));
+    assert!(plain.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&plain.stderr).contains("doesn't understand"));
+
+    let machine = run_send_result(
+        "rw-zero-seq-send-json",
+        result.clone(),
+        &[
+            "send",
+            "reviewer",
+            "--subject",
+            "invalid sequence",
+            "--json",
+        ],
+    );
+    assert_eq!(machine.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&machine.stdout).unwrap(),
+        result
+    );
+    assert!(machine.stderr.is_empty());
+}
+
+#[test]
+fn default_reply_accepts_a_future_receipt_state_with_the_same_plain_warning() {
+    let result = json!({
+        "msg_id": "m-future-reply",
+        "seq": 3,
+        "inserted": false,
+        "deliveries": [{"to": "implementer", "state": "from_next_year"}]
+    });
+
+    let plain = run_send_result(
+        "rw-future-reply-plain",
+        result.clone(),
+        &["reply", "m-parent", "--body", "future"],
+    );
+    assert!(
+        plain.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&plain.stdout),
+        "already accepted m-future-reply\nwake receipt state is unknown to this client\n"
+    );
+
+    let machine = run_send_result(
+        "rw-future-reply-json",
+        result.clone(),
+        &["reply", "m-parent", "--body", "future", "--json"],
+    );
+    assert!(machine.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&machine.stdout).unwrap(),
+        result
+    );
+}
+
+#[test]
+fn default_reply_rejects_the_same_incomplete_acceptance_envelope_in_plain_and_json() {
+    let plain = run_send_result(
+        "rw-empty-reply-plain",
+        json!({}),
+        &["reply", "m-parent", "--body", "incomplete"],
+    );
+    assert_eq!(plain.status.code(), Some(1));
+    assert!(plain.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&plain.stderr).contains("doesn't understand"));
+
+    let machine = run_send_result(
+        "rw-empty-reply-json",
+        json!({}),
+        &["reply", "m-parent", "--body", "incomplete", "--json"],
+    );
+    assert_eq!(machine.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&machine.stdout), "{}\n");
+    assert!(machine.stderr.is_empty());
+}
+
 /// A send to a pane nothing detects, in the shape the daemon answers
 /// with: the gate's machine cause plus the pane as data. The badge words
 /// the cause and names the pane, the follow-up says the message did not

@@ -269,6 +269,7 @@ pub fn body_file_unreadable(path: &str, cause: &str) -> String {
 
 pub const UNREADABLE_ANSWER: &str =
     "cyclops answered in a shape this client doesn't understand. The daemon and CLI are probably far apart in version; update the older one.";
+pub const UNKNOWN_WAKE_RECEIPT: &str = "wake receipt state is unknown to this client";
 
 pub fn broken(cause: &str) -> String {
     format!(

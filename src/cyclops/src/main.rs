@@ -1756,8 +1756,25 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
         println!("{result}");
         return receipts_exit_json(&result, args.require_wake);
     }
+    let acceptance = match message_acceptance(&result) {
+        Some(acceptance) => acceptance,
+        None => {
+            eprintln!("{}", copy::UNREADABLE_ANSWER);
+            return 1;
+        }
+    };
     let receipt: MsgSendResult = match serde_json::from_value(result) {
         Ok(receipt) => receipt,
+        Err(_) if !args.require_wake => {
+            let verb = if acceptance.inserted.unwrap_or(true) {
+                "accepted"
+            } else {
+                "already accepted"
+            };
+            println!("{verb} {}", style.accent(acceptance.msg_id.as_str()));
+            println!("{}", copy::UNKNOWN_WAKE_RECEIPT);
+            return 0;
+        }
         Err(_) => {
             eprintln!("{}", copy::UNREADABLE_ANSWER);
             return 1;
@@ -2624,17 +2641,36 @@ fn cmd_reply(cli: &Cli, style: &Style, args: &ReplyArgs) -> i32 {
         client_key: args.client_key.clone(),
     })
     .expect("msg.reply params serialize");
-    let result: MsgSendResult = match ask(
-        &mut c,
-        "msg.reply",
-        params,
-        cli.json,
-        None,
-        serde_json::from_value,
-    ) {
-        Ok(Some(result)) => result,
-        Ok(None) => return 0,
-        Err(code) => return code,
+    let result = match c.request("msg.reply", params) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("{}", copy::client_error(&error, None));
+            return 1;
+        }
+    };
+    if cli.json {
+        println!("{result}");
+        return i32::from(message_acceptance(&result).is_none());
+    }
+    let acceptance = match message_acceptance(&result) {
+        Some(acceptance) => acceptance,
+        None => {
+            eprintln!("{}", copy::UNREADABLE_ANSWER);
+            return 1;
+        }
+    };
+    let result: MsgSendResult = match serde_json::from_value(result) {
+        Ok(result) => result,
+        Err(_) => {
+            let verb = if acceptance.inserted.unwrap_or(true) {
+                "accepted"
+            } else {
+                "already accepted"
+            };
+            println!("{verb} {}", style.accent(acceptance.msg_id.as_str()));
+            println!("{}", copy::UNKNOWN_WAKE_RECEIPT);
+            return 0;
+        }
     };
     let verb = if result.inserted.unwrap_or(true) {
         "accepted"
@@ -3157,6 +3193,28 @@ fn read_body_file(path: &str) -> Result<String, String> {
     }
 }
 
+struct MessageAcceptance {
+    msg_id: cyclops_proto::MessageId,
+    inserted: Option<bool>,
+}
+
+/// Decode only the fields that prove the daemon accepted a durable message.
+/// Delivery receipts remain a separate compatibility boundary.
+fn message_acceptance(value: &Value) -> Option<MessageAcceptance> {
+    let object = value.as_object()?;
+    let msg_id = cyclops_proto::MessageId::new(object.get("msg_id")?.as_str()?).ok()?;
+    if object.get("seq")?.as_u64()? == 0 {
+        return None;
+    }
+    object.get("deliveries")?.as_array()?;
+    let inserted = match object.get("inserted") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(inserted)) => Some(*inserted),
+        Some(_) => return None,
+    };
+    Some(MessageAcceptance { msg_id, inserted })
+}
+
 /// Durable acceptance is the default success contract. Scripts that also
 /// require the optional pane wake ask for that stronger contract explicitly.
 fn receipts_exit(ds: &[DeliveryReceipt], require_wake: bool) -> i32 {
@@ -3189,6 +3247,9 @@ fn receipt_proves_wake(receipt: &DeliveryReceipt) -> bool {
 /// decodes that response into the same receipt type as plain output and fails
 /// closed when a required field or state is not understood.
 fn receipts_exit_json(v: &Value, require_wake: bool) -> i32 {
+    if message_acceptance(v).is_none() {
+        return 1;
+    }
     if !require_wake {
         return 0;
     }
@@ -4255,12 +4316,47 @@ mod tests {
         assert_eq!(receipts_exit(&[blocked], true), 1);
         for raw in [
             json!({
-                "deliveries": [{"state": "queued", "wake_block": "enqueue_refused"}]
+                "msg_id": "m-blocked",
+                "seq": 1,
+                "deliveries": [{
+                    "to": "reviewer",
+                    "state": "queued",
+                    "wake_block": "enqueue_refused"
+                }]
             }),
-            json!({"deliveries": [{"state": "from_next_year"}]}),
-            json!({}),
+            json!({
+                "msg_id": "m-future",
+                "seq": 2,
+                "deliveries": [{"to": "reviewer", "state": "from_next_year"}]
+            }),
         ] {
             assert_eq!(receipts_exit_json(&raw, false), 0, "{raw}");
+        }
+        assert_eq!(receipts_exit_json(&json!({}), false), 1);
+    }
+
+    #[test]
+    fn default_acceptance_envelope_validates_only_durable_acceptance_fields() {
+        let future_receipt = json!({
+            "msg_id": "m-future",
+            "seq": 1,
+            "inserted": false,
+            "deliveries": [{"to": "reviewer", "state": "from_next_year"}]
+        });
+        let acceptance = message_acceptance(&future_receipt).expect("valid acceptance");
+        assert_eq!(acceptance.msg_id.as_str(), "m-future");
+        assert_eq!(acceptance.inserted, Some(false));
+
+        for invalid in [
+            json!({}),
+            json!({"msg_id": "future", "seq": 1, "deliveries": []}),
+            json!({"msg_id": "m-future", "seq": 0, "deliveries": []}),
+            json!({"msg_id": "m-future", "seq": "1", "deliveries": []}),
+            json!({"msg_id": "m-future", "seq": 1}),
+            json!({"msg_id": "m-future", "seq": 1, "deliveries": {}}),
+        ] {
+            assert!(message_acceptance(&invalid).is_none(), "{invalid}");
+            assert_eq!(receipts_exit_json(&invalid, false), 1, "{invalid}");
         }
     }
 

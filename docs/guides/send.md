@@ -67,6 +67,13 @@ follower cell reads `N ahead · behind <id> (<cause>)`. The held-queue line
 names next actions for the exact cause. It does not treat alarm clearance or
 payload retrieval alone as proof that a post-write composer barrier retired.
 
+The default CLI validates durable acceptance from the response's message id,
+positive journal sequence, and deliveries array before interpreting the wake
+receipts. A receipt state added by a newer daemon therefore still exits 0
+after valid acceptance. Plain output prints the accepted message id and warns
+that the wake receipt state is unknown to this client; JSON preserves the raw
+response. An incomplete acceptance envelope exits 1 in both modes.
+
 The body and wake use different paths. Doorbell mode never pastes the message
 body. A terminal wake stages one `inbox claim` command, while a pull client may
 claim the same message through the authenticated socket without changing the

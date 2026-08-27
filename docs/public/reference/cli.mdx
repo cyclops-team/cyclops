@@ -60,7 +60,12 @@ message and never use an unkeyed resend as recovery.
 
 A successful default send or reply proves durable acceptance, not recipient
 claim or task completion, and exits 0. If the response is lost, inspect current
-state and retry only with the same explicit client key.
+state and retry only with the same explicit client key. The client first
+validates the response's message id, positive journal sequence, and deliveries
+array. A wake receipt state added by a newer daemon does not erase that proof:
+plain output prints acceptance with a compatibility warning, while JSON
+preserves the raw response. An incomplete acceptance envelope exits 1 in both
+modes.
 
 ## Caller identity and administrator commands
 

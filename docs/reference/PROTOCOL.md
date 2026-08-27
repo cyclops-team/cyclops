@@ -393,6 +393,15 @@ sender-scoped `client_key` resolves to an existing exact request. Each
 `position`, when present, is the number of older pending entries in that
 recipient's FIFO.
 
+Default CLI send and reply validate this acceptance envelope independently of
+the closed receipt enums: `msg_id` must be a valid message id, `seq` must be a
+positive journal sequence, and `deliveries` must be an array. Once those fields
+prove acceptance, a receipt state added by a newer daemon still exits 0. Plain
+output prints the acceptance and an unknown-wake-receipt compatibility warning;
+JSON preserves the raw response. An invalid or incomplete acceptance envelope
+exits 1 in both modes. `--require-wake` instead requires full receipt decoding
+under the stronger rule below.
+
 `DeliveryReceipt.wake_block` is an optional `MessageWakeBlock`. It is present
 when the recipient FIFO head has no live notification owner and is absent for
 a worker-owned head or an ordinary item queued behind that head. It does not
