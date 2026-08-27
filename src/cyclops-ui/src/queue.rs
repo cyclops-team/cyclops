@@ -622,6 +622,20 @@ impl HumanQueue {
         self.view = view;
     }
 
+    /// Count how many pending mailbox rows in the active session filter
+    /// are hidden because the current scope does not admit them.
+    pub fn hidden_pending(&self) -> usize {
+        if self.scope == Scope::All {
+            return 0;
+        }
+        let in_view = self
+            .view
+            .iter()
+            .filter(|&&i| self.rows[i].mailbox == MailboxWord::Pending)
+            .count();
+        self.counts.pending.saturating_sub(in_view)
+    }
+
     /// Move the cursor to one position in the view, id and index together.
     fn place(&mut self, at: Option<usize>) {
         self.cursor = at.filter(|&i| i < self.view.len());
@@ -885,13 +899,20 @@ pub fn render_with_status(
         return out;
     }
 
+    let hidden = queue.hidden_pending();
+    let scope_hint = if hidden > 0 {
+        " · press s for all"
+    } else {
+        ""
+    };
     out.push(fit(
         &format!(
-            "Messages  {}  {} shown  {} pending  {} attention",
+            "Messages  {}  {} shown  {} pending  {} attention{}",
             queue.scope().word(),
             counts.visible,
             counts.pending,
-            counts.attention
+            counts.attention,
+            scope_hint,
         ),
         width,
     ));
@@ -968,6 +989,12 @@ pub fn render_with_status(
 
     let body_rows = height.saturating_sub(3 + usize::from(status.is_some()));
     let selected = queue.selected().map(|r| r.target.clone());
+    if queue.visible().count() == 0 && hidden > 0 {
+        out.push(fit(
+            &format!("  ! {} pending hidden by scope · press s for all", hidden),
+            width,
+        ));
+    }
     for row in queue
         .visible()
         .skip(viewport_top(queue, body_rows))

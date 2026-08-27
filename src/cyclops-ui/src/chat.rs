@@ -891,6 +891,7 @@ pub fn render_chat_lines(
     };
 
     // 1. Header line
+    let hidden = queue.hidden_pending();
     let status_hint = status.unwrap_or("");
     let mut header = ChatLine::new(ChatLineKind::Header);
     if width >= 30 {
@@ -903,10 +904,15 @@ pub fn render_chat_lines(
         if !status_hint.is_empty() {
             header.push(status_hint, hint_ink(status_hint));
         } else {
+            let scope_hint = if hidden > 0 {
+                " · press s for all"
+            } else {
+                ""
+            };
             header.push(
                 format!(
-                    "{} shown · {} pend · {} attn",
-                    counts.visible, counts.pending, counts.attention
+                    "{} shown · {} pend · {} attn{}",
+                    counts.visible, counts.pending, counts.attention, scope_hint
                 ),
                 ChatInk::Dim,
             );
@@ -948,6 +954,15 @@ pub fn render_chat_lines(
 
     let mut timeline: Vec<ChatLine> = Vec::new();
     let mut selected_anchor_line: Option<usize> = None;
+    if items.is_empty() && hidden > 0 {
+        let mut notice = ChatLine::new(ChatLineKind::Status);
+        notice.push(
+            format!("  ! {} pending hidden by scope · press s for all", hidden),
+            ChatInk::Attention,
+        );
+        timeline.push(plain(ChatLineKind::Blank, "", width));
+        timeline.push(notice.fitted(width));
+    }
     let pending_behind = |entry: &RecipientEntry| {
         visible_rows
             .iter()
