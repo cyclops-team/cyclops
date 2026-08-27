@@ -142,7 +142,8 @@ async fn multi_session_paging_is_gapless_and_refuses_the_raw_seq_cursor() {
     // Tail: newest limit, no u64 cursor, a composite cursor instead.
     let resp = rig.ctl.request("msg.history", json!({"limit": 2})).await;
     assert!(resp["error"].is_null(), "{resp}");
-    assert_eq!(line_ids(&resp), sent[3..].to_vec(), "{resp}");
+    let tail = line_ids(&resp);
+    assert_eq!(tail.len(), 2, "{resp}");
     assert!(resp["result"]["next_cursor"].is_null(), "{resp}");
     assert!(resp["result"]["next_cursor2"].is_string(), "{resp}");
 
@@ -151,6 +152,7 @@ async fn multi_session_paging_is_gapless_and_refuses_the_raw_seq_cursor() {
     // Before the fix the equivalent seq walk skipped whichever session's
     // lines hid behind the other's seqs.
     let mut walked: Vec<String> = Vec::new();
+    let mut walked_keys: Vec<(u64, u64, String)> = Vec::new();
     let mut cursor2 = json!("");
     loop {
         let resp = rig
@@ -158,16 +160,47 @@ async fn multi_session_paging_is_gapless_and_refuses_the_raw_seq_cursor() {
             .request("msg.history", json!({"limit": 2, "cursor2": cursor2}))
             .await;
         assert!(resp["error"].is_null(), "{resp}");
+        let lines = resp["result"]["lines"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no lines in {resp}"));
         let ids = line_ids(&resp);
         if ids.is_empty() {
             assert!(resp["result"]["next_cursor2"].is_null(), "{resp}");
             break;
         }
+        walked_keys.extend(lines.iter().map(|line| {
+            (
+                line["ts"].as_u64().expect("history line timestamp"),
+                line["seq"].as_u64().expect("history line sequence"),
+                line["id"].as_str().expect("history line id").to_string(),
+            )
+        }));
         walked.extend(ids);
         cursor2 = resp["result"]["next_cursor2"].clone();
         assert!(cursor2.is_string(), "{resp}");
     }
-    assert_eq!(walked, sent, "gapless, dupe-free walk over both sessions");
+    // The two journals have independent seqs and can receive messages in
+    // the same millisecond. History's documented merged order is therefore
+    // its deterministic cross-file comparator, not the order these send
+    // calls returned. Check the actual contract: every message appears once,
+    // and the limited tail is exactly the suffix of that same complete walk.
+    let mut expected_ids = sent;
+    expected_ids.sort();
+    let mut walked_ids = walked.clone();
+    walked_ids.sort();
+    assert_eq!(
+        walked_ids, expected_ids,
+        "gapless, dupe-free walk over both sessions"
+    );
+    assert_eq!(
+        tail,
+        walked[walked.len().saturating_sub(2)..],
+        "the merged tail is the suffix of the same composite walk"
+    );
+    assert!(
+        walked_keys.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the composite walk must keep the public merge order: {walked_keys:?}"
+    );
     rig.shutdown().await;
 }
 
