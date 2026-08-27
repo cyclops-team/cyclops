@@ -771,8 +771,7 @@ impl Detection {
                 .any(|reading| reading.sensor == Sensor::Screen && reading.state == AgentState::Working)
             && self.readings.iter().all(|reading| {
                 reading.state == AgentState::Working
-                    || (reading.sensor == Sensor::Screen
-                        && matches!(reading.state, AgentState::Idle | AgentState::IdleWithInput))
+                    || (reading.sensor == Sensor::Screen && reading.state == AgentState::Idle)
             });
         if self.disagreement && !working_composer_proven {
             return Err("sensor_disagreement");
