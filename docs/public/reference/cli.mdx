@@ -49,11 +49,18 @@ cyclops send --all --subject "Standup in 5" --fyi
 `--reply-to` links a reply, and `--all` broadcasts to every adopted agent.
 Name `admin` explicitly to send to the durable operator inbox. By default a
 durably accepted send exits 0 even when its optional terminal wake needs
-attention. Add `--require-wake` when a script also requires a healthy wake.
+attention. Add `--require-wake` when every recipient must currently prove a
+mailbox wake at `submitted` or `notified`. A legacy direct-delivery receipt may
+instead prove `submitted`, `delivered_verified`, or `delivered_unverified`.
+Earlier, blocked, human-required, missing, and unknown states exit 1.
 
-A successful send proves durable acceptance, not recipient claim or task
-completion. If the response is lost, inspect current state and retry only with
-the same explicit client key.
+The flag evaluates the daemon's one bounded current receipt. It does not poll
+or wait again. Exit 1 does not revoke durable acceptance, so inspect the
+message and never use an unkeyed resend as recovery.
+
+A successful default send or reply proves durable acceptance, not recipient
+claim or task completion, and exits 0. If the response is lost, inspect current
+state and retry only with the same explicit client key.
 
 ## Caller identity and administrator commands
 
@@ -94,8 +101,9 @@ and documentation should use `watch`.
 - `0`: the command succeeded; for sends, the message was accepted or an exact
   client-key retry found the existing message.
 - `1`: no successful response. With `send --require-wake`, it can instead mean
-  the message is durable while its optional terminal wake needs attention. A
-  send may also already be durable if its response was lost.
+  the message is durable while at least one recipient lacks current proof of a
+  submitted or notified wake. It does not authorize an unkeyed resend. A send
+  may also already be durable if its response was lost.
 - `2`: usage error, or `wait` timed out.
 - `3`: the waited-on pane died or changed occupant.
 

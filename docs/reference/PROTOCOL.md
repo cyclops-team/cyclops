@@ -410,6 +410,16 @@ the projection supplies the receipt. The shared observation deadline changes
 no state. A message queued behind an older head reports `not_started` and its
 position, with neither the head's `wake_block` nor its `pre_write_cause`.
 
+The CLI's `--require-wake` flag evaluates this one bounded current response; it
+adds no protocol field, polling, or second wait. Exit 0 requires every mailbox
+receipt to carry `notification_state: "submitted"` or `"notified"`. When
+`notification_state` is absent on a supported legacy direct-delivery receipt,
+`state: "submitted"`, `"delivered_verified"`, or `"delivered_unverified"`
+is equivalent proof. Any other notification state, `pre_write_cause`,
+`wake_block`, a delivery state that requires human action, or a missing or
+unknown state exits 1. The message is already durably accepted, so that exit
+must not trigger an unkeyed resend.
+
 For a non-admin recipient, the daemon selects one transport at the terminal
 write boundary. An exact installed claim skill selects the content-free
 doorbell:
@@ -700,7 +710,9 @@ new snapshot.
 
 `msg.reply` takes `message_id`, `body`, and optional `client_key`. The daemon
 derives the sole recipient, thread root, and `Re: ` subject from the visible
-parent. The `reply_to` field on `msg.send` uses the same validation.
+parent. The `reply_to` field on `msg.send` uses the same validation. The default
+CLI reply exits 0 after this response proves durable acceptance; it does not
+infer task completion or require terminal wake proof.
 
 `admin` is a first-class durable mailbox recipient, not a pane. An agent may
 send or reply to admin. Admin messages create no notification attempt and no
