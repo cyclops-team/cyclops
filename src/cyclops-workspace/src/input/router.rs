@@ -101,6 +101,39 @@ impl Router {
 
 #[cfg(test)]
 mod tests {
+
+    /// The proof that the workspace's own repaint did not steal the
+    /// program's clear-and-redraw. A garbled PANE is repaired by the
+    /// program that owns it, which every shell and agent binds to a bare
+    /// Ctrl+L, and a garbled workspace CHROME is repaired by `Ctrl+B r`.
+    /// Two surfaces, two causes, two keys, and the pane keeps its one.
+    #[test]
+    fn bare_ctrl_l_still_reaches_the_pane_and_the_prefix_owns_redraw() {
+        let mut router = Router::new(crate::bindings::default_bindings());
+
+        let ctrl_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert!(
+            matches!(router.route(ctrl_l), RouterResult::PassThrough(key) if key == ctrl_l),
+            "a bare Ctrl+L must be forwarded to the focused program untouched"
+        );
+
+        assert!(matches!(
+            router.route(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+            RouterResult::PrefixArmed
+        ));
+        assert_eq!(
+            router.route(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            RouterResult::Action(BindingAction::Redraw)
+        );
+
+        // And the prefix did not leave anything armed that would swallow
+        // the next Ctrl+L.
+        assert!(
+            matches!(router.route(ctrl_l), RouterResult::PassThrough(key) if key == ctrl_l),
+            "the repaint chord must not change what a later Ctrl+L does"
+        );
+    }
+
     use super::*;
     use crate::bindings::default_bindings;
 

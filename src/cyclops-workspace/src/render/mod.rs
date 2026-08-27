@@ -1212,6 +1212,58 @@ mod tests {
         assert_eq!(blend(&plain, Style::new(), Style::new(), 0.5), Style::new());
     }
 
+    /// A glyph that cannot fit whole must not be written at all, and
+    /// nothing may be written outside the bounds it was given. A wide
+    /// glyph occupies two cells, so cutting one in half would either
+    /// corrupt the neighbouring surface or leave a spacer cell that the
+    /// next diff has no reason to repair. Combining marks ride the glyph
+    /// they follow and must not be counted, or the budget drifts and the
+    /// text runs long.
+    #[test]
+    fn a_clipped_wide_or_combining_glyph_never_writes_outside_its_bounds() {
+        let area = Rect::new(0, 0, 12, 3);
+        // The surface under test is the left half; the right half stands
+        // in for whatever else owns those cells.
+        let bounds = Rect::new(0, 1, 6, 1);
+        for text in [
+            "漢字漢字漢字漢字",
+            "e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}e\u{0301}",
+            "a漢b字c漢d字",
+        ] {
+            let mut buf = Buffer::empty(area);
+            overlay_text_ellipsized(&mut buf, bounds, bounds.x, bounds.y, text, Style::new());
+
+            for x in bounds.x + bounds.width..area.width {
+                assert_eq!(
+                    buf.cell((x, bounds.y)).unwrap().symbol(),
+                    " ",
+                    "{text:?} wrote past its bounds at column {x}"
+                );
+            }
+            for y in [0u16, 2] {
+                for x in 0..area.width {
+                    assert_eq!(
+                        buf.cell((x, y)).unwrap().symbol(),
+                        " ",
+                        "{text:?} wrote into row {y}, which it was not given"
+                    );
+                }
+            }
+            // Truncation ends in the ellipsis rather than half a glyph.
+            // Measuring the row's own width back would double-count the
+            // spacer cell a wide glyph occupies, so the readable property
+            // is that the cut is marked and every cell outside the bounds
+            // is untouched, which the assertions above pin.
+            let written: String = (bounds.x..bounds.x + bounds.width)
+                .map(|x| buf.cell((x, bounds.y)).unwrap().symbol().to_string())
+                .collect();
+            assert!(
+                written.contains('\u{2026}'),
+                "{text:?} was cut without an ellipsis: {written:?}"
+            );
+        }
+    }
+
     /// `overlay_text_ellipsized`'s own contract, apart from any caller: a
     /// fit paints exactly as given, an overflow keeps whole chars up to the
     /// budget and ends in `…`, a one-column budget is the ellipsis by

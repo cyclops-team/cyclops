@@ -75,6 +75,7 @@ than a measurement.
 | F66 | The isolated soak detected staged representations and cleared them in 100 trials each for Codex, Claude, and Antigravity; Cursor was unavailable | evidence |
 | F67 | A one-line doorbell must fit the narrow lane because application wrapping is not exact composer evidence | binds |
 | F68 | Codex 0.149.1 colors the prompt glyph separately and may leave its status trailer unstyled under `NO_COLOR` | binds, partial evidence |
+| F75 | A repaint must not query cursor position while the workspace event reader owns stdin | binds |
 
 ## F13. refresh-client -B subscriptions work in control mode on tmux 3.6a (MEASURED)
 
@@ -1956,3 +1957,57 @@ patterns, and the escaped suffix accepts one or two trailer rows before its
 end anchor. The daemon reads manifests once at boot, so an
 installed copy under `$CYCLOPS_HOME/manifests` needs a daemon restart to
 take effect.
+
+## F75. A ratatui repaint reads stdin, and a TUI that owns stdin never gets the answer
+
+MEASURED 2026-08-26 on `cyclops-workspace`'s
+`quitting_leaves_the_alternate_screen_and_returns_to_a_shell_prompt`, which
+waits 15 s for the workspace's first frame to reach the pane.
+
+`Terminal::clear` is not a write. In `ratatui-core 0.1.2`, the terminal
+buffer implementation at lines 147-152 answers it by first calling
+`Backend::get_cursor_position`; `ratatui-crossterm 0.1.2` at lines 302-306
+forwards that to `crossterm::cursor::position`; and the Unix cursor
+implementation in `crossterm 0.29.0` at lines 32-55 writes `ESC[6n`, then blocks
+the calling thread in `poll_internal(2000 ms)` waiting for the terminal's
+reply to arrive on stdin, and returns an error when it does not.
+
+The workspace already owns stdin in its own crossterm event reader, and both
+sides take crossterm's one internal reader. The reader is always polling, so
+it consumes the reply as an event and the query waits out its full timeout.
+The first frame is a repaint by construction, so this lands on boot, before
+the user has seen anything, and because a failed frame re-arms the epoch by
+design, the next frame queries again: 2 s per attempt, forever, with the
+pane in the alternate screen showing nothing.
+
+Measured with the same commit and binaries, tmux the only variable:
+
+| tmux | invalidation | result |
+|---|---|---|
+| 3.4 (ubuntu CI) | `Terminal::clear` | FAILS at 15.16 s |
+| 3.6a (local) | `Terminal::clear` | FAILS at 15.19 s |
+| next-3.8 (local build) | `Terminal::clear` | FAILS at 15.19 s |
+| macOS CI | `Terminal::clear` | FAILS at 15.30 s |
+| next-3.8 (local build) | `size` + same-size `resize` | passes in 2.03 s |
+
+The tmux version is not the variable and this was never tmux-HEAD-specific:
+every pinned job failed it too. Two traps produced the opposite impression
+and are the durable part of this finding:
+
+1. **The test self-skips and reports `ok`.** With no `target/debug/cyclops`
+   and `target/debug/cyclopsd` built, it prints `skipping: ... are not
+   built` and passes. A `cargo test` run with `CARGO_TARGET_DIR` pointed
+   elsewhere therefore proves nothing about this test, and a local "passes
+   on 3.6a" can be a skip rather than a pass. Build the binaries into the
+   worktree's own `target/debug` before believing either answer.
+2. **The advisory job reported first**, so the first framing was
+   tmux-HEAD's. It was the same defect the pinned matrix caught minutes
+   later.
+
+Fix: a repaint must never read from the terminal. `size` is an ioctl, and
+`resize` to the size the terminal already has reaches both effects a repaint
+needs, clearing the host surface and resetting the diff baseline
+(`clear_viewport`), through writes alone. Pinned by
+`app.rs::a_repaint_never_asks_the_terminal_where_the_cursor_is`, which counts
+`get_cursor_position` calls rather than asserting a spelling, so any future
+invalidation may change how it clears and may not start reading to do it.

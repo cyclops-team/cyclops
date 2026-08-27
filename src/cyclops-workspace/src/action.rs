@@ -179,6 +179,10 @@ pub enum Action {
     /// Open the composer. Carries no target: the recipient is typed as
     /// part of the message, so nothing has to be resolved to open it.
     RequestCompose,
+    /// Repaint the whole workspace surface. Owns no application state: it
+    /// only tells the renderer its remembered frame is not what the user
+    /// is looking at.
+    RequestRedraw,
     /// Send one addressed message, exactly as `cyclops send` would.
     ///
     /// The send is slow by design (the daemon holds the answer for the
@@ -418,6 +422,7 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
         // No target to resolve: the recipient is typed into the composer,
         // not taken from whatever pane happens to be focused.
         BindingAction::Compose => Some(Action::RequestCompose),
+        BindingAction::Redraw => Some(Action::RequestRedraw),
         BindingAction::ToggleFiles => Some(Action::ToggleFiles),
         BindingAction::FocusFiles => Some(Action::FocusFiles),
         BindingAction::SwapPaneLeft => Some(Action::SwapPaneDirection(PaneDirection::Left)),
