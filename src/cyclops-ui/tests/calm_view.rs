@@ -244,7 +244,7 @@ impl Vocabulary {
         );
         // The frame puts a two-column marker in front of every stream row;
         // `Entry::lines` renders the row without it.
-        let held = format!("  {}", held.lines(&Theme::none(), false).remove(0));
+        let held = format!("  {}", held.lines(&Theme::none()).remove(0));
         let (_, held) = split_row(&held).expect("the hold renders a name and a cell");
         Vocabulary {
             agent: every_agent_state

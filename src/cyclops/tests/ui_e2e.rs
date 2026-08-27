@@ -218,14 +218,11 @@ fn ui_plain_admin_stream_is_calm_and_ends_honestly() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // Both msg lines carry a body, so each hangs its first body line at
-    // the content column (10 columns, under the clock gutter). The
-    // backfill message's second body line stays off the stream. The eye
-    // line names its item: plain mode has no header to point at.
+    // Resting stream rows are body-free even when the legacy ledger lines
+    // carry content. The eye line names its item: plain mode has no header
+    // to point at.
     let expected = "12:04:31  codex → admin  build done\n\
-                    \x20         ci is green on main\n\
                     12:04:40  reviewer → admin  need a decision\n\
-                    \x20         the retry budget is spent\n\
                     12:04:42  reviewer  ⚠ needs attention · no pane with that name\n\
                     eye opening · 1 needs attention · reviewer  ⚠ needs attention\n";
     assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
@@ -245,9 +242,8 @@ fn ui_plain_firehose_shows_everything_once() {
     assert_eq!(out.status.code(), Some(1));
     // Backfill first (the admin msg AND the agent-to-agent msg), then the
     // live events in arrival order; the live duplicate of ledger seq 2
-    // printed once, from the backfill. Messages with a body hang their
-    // first body line; "review this" (no body) and "agent chatter"
-    // (empty body) stay one line each.
+    // printed once, from the backfill. Every resting message remains one
+    // body-free line, whatever the old ledger or event carried.
     //
     // The eye line is asserted apart from the stream. It prints once per
     // batch of messages the loop folds together, and how many live events
@@ -263,10 +259,8 @@ fn ui_plain_firehose_shows_everything_once() {
     let stream: Vec<&str> = stdout.lines().filter(|l| *l != eye).collect();
     let expected = vec![
         "12:04:31  codex → admin  build done",
-        "          ci is green on main",
         "12:04:32  codex → reviewer  review this",
         "12:04:40  reviewer → admin  need a decision",
-        "          the retry budget is spent",
         "12:04:41  codex → reviewer  agent chatter",
         "12:04:42  reviewer  ⚠ needs attention · no pane with that name",
         "12:04:43  reviewer  ● working",
@@ -292,9 +286,8 @@ fn ui_plain_filter_narrows_the_firehose() {
     // Only codex-sent messages pass; the delivery, the admin msg from
     // reviewer, and the state line drop. The eye still reports, because
     // attention is about the system, not the filter. The one surviving
-    // body line follows its message through the filter.
+    // body remains behind the authorized detail boundary.
     let expected = "12:04:31  codex → admin  build done\n\
-                    \x20         ci is green on main\n\
                     12:04:32  codex → reviewer  review this\n\
                     12:04:41  codex → reviewer  agent chatter\n\
                     eye opening · 1 needs attention · reviewer  ⚠ needs attention\n";

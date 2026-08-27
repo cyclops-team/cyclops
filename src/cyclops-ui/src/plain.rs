@@ -207,16 +207,15 @@ fn live(app: &mut App, e: Entry, out: &mut impl Write) {
     }
 }
 
-/// Plain mode is the screen-reader view, so it carries what the sighted
-/// comfortable density carries: the entry line, plus the message body's
-/// first line hanging at the content column. Never less.
+/// Plain mode is the screen-reader view, so it carries the same body-free
+/// entry line as the sighted view. Authorized bodies live in explicit detail.
 fn print_line(app: &App, e: &Entry, out: &mut impl Write) {
     // The same admission the full UI's window applies, asked of the same
     // app: this mode prints one line at a time and has no frame to
     // reconcile, so a line it prints is a line it can never take back.
     let admitted = app.admits_in_view(e) && app.filter.matches(e);
     if admitted {
-        for line in e.lines(&app.theme, true) {
+        for line in e.lines(&app.theme) {
             let _ = writeln!(out, "{line}");
         }
     }
@@ -309,7 +308,7 @@ mod tests {
         );
     }
 
-    fn msg(from: &str, to: &[&str], subject: &str, body: Option<&str>) -> Entry {
+    fn msg(from: &str, to: &[&str], subject: &str) -> Entry {
         Entry {
             uid: 0,
             ts: 43_471_000,
@@ -320,7 +319,6 @@ mod tests {
                 to: to.iter().map(|t| t.to_string()).collect(),
                 endpoints: None,
                 subject: subject.into(),
-                body: body.map(String::from),
                 fyi: false,
             },
         }
@@ -486,29 +484,21 @@ mod tests {
         );
     }
 
-    /// --plain is the screen-reader mode, so it must never carry less
-    /// than the sighted view: the body line prints, hanging at the same
-    /// content column the TUI uses.
+    /// --plain and the sighted stream share one body-free resting row.
+    /// Message content appears only after an authorized detail request.
     #[test]
-    fn plain_prints_the_body_line_like_comfortable_density() {
+    fn plain_stream_rows_are_body_free() {
         let mut app = App::new(Theme::none(), View::Firehose, Filter::default());
         let mut out = Vec::new();
         live(
             &mut app,
-            msg(
-                "codex",
-                &["reviewer"],
-                "Review the rate limiter",
-                Some("gateway.rs:120 drops the burst path\nsecond line stays off"),
-            ),
+            msg("codex", &["reviewer"], "Review the rate limiter"),
             &mut out,
         );
-        // A message with no body is still one line.
-        live(&mut app, msg("codex", &["admin"], "done", None), &mut out);
+        live(&mut app, msg("codex", &["admin"], "done"), &mut out);
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "12:04:31  codex → reviewer  Review the rate limiter\n\
-             \x20         gateway.rs:120 drops the burst path\n\
              12:04:31  codex → admin  done\n"
         );
     }

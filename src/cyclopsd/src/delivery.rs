@@ -2333,6 +2333,9 @@ pub(crate) async fn msg_send(
         }
     }
     let seq = first_seq.unwrap_or(0);
+    // The session ledger owns the legacy payload. The push is a resting-row
+    // edge shared by every subscriber, so it carries metadata only; authorized
+    // body reads go through msg.history/msg.thread instead.
     inner.emit(
         "msg",
         json!({
@@ -2340,7 +2343,6 @@ pub(crate) async fn msg_send(
             "from": from,
             "to": names,
             "subject": params.subject,
-            "body": params.body,
             "fyi": params.fyi,
             "reply_to": params.reply_to,
         }),

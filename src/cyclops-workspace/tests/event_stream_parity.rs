@@ -33,7 +33,6 @@ fn msg(ts: u64, seq: Option<u64>, from: &str, to: &[&str], subject: &str) -> Ent
             to: to.iter().map(|t| t.to_string()).collect(),
             endpoints: None,
             subject: subject.into(),
-            body: None,
             fyi: false,
         },
     }
@@ -176,7 +175,7 @@ fn cyclops_watch_rows(record: &Record) -> Vec<String> {
     let plain = Theme::none();
     record
         .admitted_entries()
-        .flat_map(|e| e.lines(&plain, true))
+        .flat_map(|e| e.lines(&plain))
         .collect()
 }
 

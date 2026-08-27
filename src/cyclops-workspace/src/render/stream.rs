@@ -45,7 +45,7 @@ pub fn event_stream_rows(record: &Record) -> Vec<EventRow<'_>> {
         .admitted_entries()
         .map(|entry| EventRow {
             entry,
-            lines: entry.lines(&plain, true),
+            lines: entry.lines(&plain),
         })
         .collect()
 }
@@ -293,7 +293,6 @@ mod tests {
                 to: vec!["admin".into()],
                 endpoints: None,
                 subject: "ping".into(),
-                body: None,
                 fyi: false,
             },
         });

@@ -431,13 +431,8 @@ fn empty_state(app: &App) -> String {
 /// Lines one entry occupies at the current density, spacer included when a
 /// newer entry follows. Counted without building strings: the window is
 /// chosen arithmetically, then only visible entries are formatted.
-fn block_len(e: &Entry, comfortable: bool, spacer_below: bool) -> usize {
-    let body = comfortable && has_body(e);
-    1 + usize::from(body) + usize::from(comfortable && spacer_below)
-}
-
-fn has_body(e: &Entry) -> bool {
-    matches!(&e.kind, crate::stream::EntryKind::Msg { body: Some(_), .. })
+fn block_len(comfortable: bool, spacer_below: bool) -> usize {
+    1 + usize::from(comfortable && spacer_below)
 }
 
 /// The stream window, exactly `sh` rows, plus the top anchor to store.
@@ -461,7 +456,7 @@ fn stream_rows(
 
     // Choose the window: (start index, lines to cut from the top block).
     let (start, cut_top) = if app.pinned {
-        window_ending_at(list, list.len() - 1, sh, comfortable)
+        window_ending_at(list.len() - 1, sh, comfortable)
     } else {
         let sel_pos = app
             .selected
@@ -473,14 +468,14 @@ fn stream_rows(
         match anchor {
             // Anchor gone (evicted or filtered out): selection sits at the
             // window bottom.
-            None => window_ending_at(list, sel_pos, sh, comfortable),
+            None => window_ending_at(sel_pos, sh, comfortable),
             Some(top) if sel_pos < top => (sel_pos, 0),
             Some(top) => {
                 // Selection below the window? Slide down just enough.
                 if fits(list, top, sel_pos, sh, comfortable) {
                     (top, 0)
                 } else {
-                    window_ending_at(list, sel_pos, sh, comfortable)
+                    window_ending_at(sel_pos, sh, comfortable)
                 }
             }
         }
@@ -503,7 +498,7 @@ fn stream_rows(
         } else {
             "  ".to_string()
         };
-        for (n, line) in e.lines(theme, comfortable).into_iter().enumerate() {
+        for (n, line) in e.lines(theme).into_iter().enumerate() {
             if n == 0 {
                 rows.push(format!("{marker}{line}"));
             } else {
@@ -530,12 +525,12 @@ fn stream_rows(
 
 /// Walk backward from `end` until `sh` lines are covered. Returns the
 /// first entry index and how many of its lines scroll off the top.
-fn window_ending_at(list: &[&Entry], end: usize, sh: usize, comfortable: bool) -> (usize, usize) {
+fn window_ending_at(end: usize, sh: usize, comfortable: bool) -> (usize, usize) {
     let mut needed = sh;
     let mut idx = end + 1;
     while idx > 0 && needed > 0 {
         idx -= 1;
-        let n = block_len(list[idx], comfortable, idx < end);
+        let n = block_len(comfortable, idx < end);
         if n >= needed {
             return (idx, n - needed);
         }
@@ -547,8 +542,8 @@ fn window_ending_at(list: &[&Entry], end: usize, sh: usize, comfortable: bool) -
 /// Do the blocks from `top` through `sel` fit in `sh` lines?
 fn fits(list: &[&Entry], top: usize, sel: usize, sh: usize, comfortable: bool) -> bool {
     let mut total = 0;
-    for (idx, e) in list.iter().enumerate().take(sel + 1).skip(top) {
-        total += block_len(e, comfortable, idx < sel);
+    for (idx, _) in list.iter().enumerate().take(sel + 1).skip(top) {
+        total += block_len(comfortable, idx < sel);
         if total > sh {
             return false;
         }
@@ -574,7 +569,7 @@ mod tests {
         )
     }
 
-    fn msg(ts: u64, from: &str, to: &[&str], subject: &str, body: Option<&str>) -> Entry {
+    fn msg(ts: u64, from: &str, to: &[&str], subject: &str) -> Entry {
         Entry {
             uid: 0,
             ts,
@@ -585,7 +580,6 @@ mod tests {
                 to: to.iter().map(|t| t.to_string()).collect(),
                 endpoints: None,
                 subject: subject.into(),
-                body: body.map(String::from),
                 fyi: false,
             },
         }
@@ -598,7 +592,6 @@ mod tests {
             "codex",
             &["reviewer"],
             "Review the rate limiter",
-            Some("gateway.rs:120 drops the burst path"),
         ));
         a.live(Entry {
             uid: 0,
@@ -639,11 +632,11 @@ mod tests {
             "◑ 1 cyclops · firehose · 1 needs attention".to_string(),
             String::new(),
             "  12:04:31  codex → reviewer  Review the rate limiter".to_string(),
-            "            gateway.rs:120 drops the burst path".to_string(),
             String::new(),
             "  12:04:32  reviewer  ✔ delivered · verified".to_string(),
             String::new(),
             "  12:04:40  reviewer  ⚠ blocked_permission".to_string(),
+            String::new(),
             String::new(),
             String::new(),
             String::new(),
@@ -704,13 +697,7 @@ mod tests {
         let mut a = App::new(Theme::none(), View::Firehose, Filter::default());
         a.handle_key(Key::Char('c')); // compact: one line per entry
         for i in 0..50 {
-            a.live(msg(
-                1000 * i,
-                "codex",
-                &["reviewer"],
-                &format!("m{i}"),
-                None,
-            ));
+            a.live(msg(1000 * i, "codex", &["reviewer"], &format!("m{i}")));
         }
         let got = build(&mut a, 80, 8);
         // Stream area is 5 rows: the last five messages, tail at bottom.
@@ -723,26 +710,14 @@ mod tests {
         let mut a = App::new(Theme::none(), View::Firehose, Filter::default());
         a.handle_key(Key::Char('c'));
         for i in 0..20 {
-            a.live(msg(
-                1000 * i,
-                "codex",
-                &["reviewer"],
-                &format!("m{i}"),
-                None,
-            ));
+            a.live(msg(1000 * i, "codex", &["reviewer"], &format!("m{i}")));
         }
         // Scroll up once: selection m18, anchor stored on first build.
         a.handle_key(Key::Up);
         let before = build(&mut a, 80, 8);
         // New arrivals must not move the viewport.
         for i in 20..30 {
-            a.live(msg(
-                1000 * i,
-                "codex",
-                &["reviewer"],
-                &format!("m{i}"),
-                None,
-            ));
+            a.live(msg(1000 * i, "codex", &["reviewer"], &format!("m{i}")));
         }
         let after = build(&mut a, 80, 8);
         assert_eq!(before[2..7], after[2..7], "viewport moved on arrival");

@@ -70,7 +70,10 @@ async fn selftest_verifies_with_simulated_hook_edge() {
             .await;
         let msg_id = msg["data"]["id"].as_str().expect("msg id").to_string();
         assert_eq!(msg["data"]["fyi"], true, "self-test is flagged fyi");
-        assert_eq!(msg["data"]["body"], "Reply not needed.", "{msg}");
+        assert!(
+            msg["data"].get("body").is_none(),
+            "shared message events stay body-free: {msg}"
+        );
         ev.wait_event(Duration::from_secs(8), |e| {
             e["event"] == "delivery-state"
                 && e["data"]["id"] == msg_id.as_str()

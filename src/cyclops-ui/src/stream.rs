@@ -158,7 +158,6 @@ pub enum EntryKind {
         /// workspace snapshot. Legacy ledger and event rows have labels only.
         endpoints: Option<MessageEndpoints>,
         subject: String,
-        body: Option<String>,
         fyi: bool,
     },
     Delivery {
@@ -343,7 +342,6 @@ impl Entry {
                 to: vec_of(d, "to"),
                 endpoints: None,
                 subject: str_of(d, "subject"),
-                body: opt_str(d, "body").filter(|b| !b.is_empty()),
                 fyi: d.get("fyi").and_then(Value::as_bool).unwrap_or(false),
             },
             "delivery-state" => delivery_kind(d),
@@ -390,7 +388,6 @@ impl Entry {
                 to: line.to.clone(),
                 endpoints: None,
                 subject: line.subject.clone().unwrap_or_default(),
-                body: line.body.clone().filter(|b| !b.is_empty()),
                 fyi: line.kind == Kind::Fyi,
             },
             Kind::State => {
@@ -1712,7 +1709,6 @@ mod tests {
                 to: to.iter().map(|t| t.to_string()).collect(),
                 endpoints: None,
                 subject: subject.into(),
-                body: None,
                 fyi: false,
             },
         }
@@ -2052,6 +2048,42 @@ mod tests {
                 ..
             } if to == "implementer" && *got == ping_recipient
         ));
+    }
+
+    #[test]
+    fn resting_stream_rows_ignore_message_bodies_from_old_inputs() {
+        let event = ev(
+            "msg",
+            json!({
+                "id": "m-event",
+                "from": "codex",
+                "to": ["reviewer"],
+                "subject": "Review",
+                "body": "event-private-body"
+            }),
+        );
+        let event_entry = Entry::from_event(&event, 0);
+        let event_lines = event_entry.lines(&crate::theme::Theme::none());
+        assert_eq!(event_lines.len(), 1, "resting rows have no body preview");
+        assert!(!event_lines.join("\n").contains("event-private-body"));
+
+        let ledger: LedgerLine = serde_json::from_value(json!({
+            "seq": 7,
+            "boot_id": "b",
+            "id": "m-ledger",
+            "ts": 1000,
+            "kind": "msg",
+            "from": "codex",
+            "to": ["reviewer"],
+            "subject": "Review",
+            "body": "ledger-private-body",
+            "deliveries": []
+        }))
+        .unwrap();
+        let ledger_entry = Entry::from_ledger(&ledger).unwrap();
+        let ledger_lines = ledger_entry.lines(&crate::theme::Theme::none());
+        assert_eq!(ledger_lines.len(), 1, "replayed rows have no body preview");
+        assert!(!ledger_lines.join("\n").contains("ledger-private-body"));
     }
 
     /// The daemon stamps every delivery, gate, msg and notify event with

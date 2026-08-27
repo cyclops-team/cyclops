@@ -173,7 +173,7 @@ mod tests {
         let plain = cyclops_ui::Theme::none();
         record
             .admitted_entries()
-            .flat_map(|e| e.lines(&plain, true))
+            .flat_map(|e| e.lines(&plain))
             .collect()
     }
 

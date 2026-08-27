@@ -208,7 +208,6 @@ fn stream_entry(row: &MessageSnapshotRow) -> Entry {
                 recipients,
             }),
             subject: row.subject.clone().unwrap_or_default(),
-            body: None,
             fyi: row.kind == cyclops_proto::Kind::Fyi,
         },
     }

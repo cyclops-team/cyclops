@@ -320,7 +320,6 @@ fn a_late_source_removal_keeps_the_transferred_pane_focusable() {
             to: vec!["admin".into()],
             endpoints: None,
             subject: "route check".into(),
-            body: None,
             fyi: false,
         },
     });
