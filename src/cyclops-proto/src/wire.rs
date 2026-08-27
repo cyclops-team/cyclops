@@ -415,6 +415,18 @@ pub struct PaneStatus {
     pub write_ready: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_block: Option<String>,
+    /// Why this pane reads `unknown`, and absent for every other state.
+    ///
+    /// Daemon-owned. No surface may reconstruct it from manifests, from the
+    /// `state` label, or from its own heuristics: two surfaces inferring
+    /// separately is how `status` and the detection view come to tell one
+    /// operator two different stories about one pane. The canonical next
+    /// action for it lives with the reason in `cyclops-proto`.
+    ///
+    /// Absent from an older daemon that never computed one, which is not
+    /// the same as a pane having no reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown_reason: Option<crate::UnknownReason>,
     /// Content class from the daemon's current composer observation.
     #[serde(default)]
     pub composer: ComposerState,

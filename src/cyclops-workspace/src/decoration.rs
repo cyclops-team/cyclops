@@ -302,6 +302,7 @@ mod tests {
             message_state: None,
             next_action: None,
             unread: None,
+            unknown_reason: None,
         }
     }
 

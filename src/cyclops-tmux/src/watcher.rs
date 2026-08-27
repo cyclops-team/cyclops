@@ -151,6 +151,7 @@ impl PaneRow {
             hooks_verified: None,
             manifest_display_name: None,
             unread: None,
+            unknown_reason: None,
         }
     }
 }

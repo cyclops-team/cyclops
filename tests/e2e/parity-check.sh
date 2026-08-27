@@ -975,8 +975,8 @@ printf '\n$ cyclops status\n'
 duo "$CYC" status --plain > "$OUT" 2>&1
 cat "$OUT"
 check "an unknown pane is on the grid"    '\? unknown'
-check "and the grid says why"             'panes read unknown: none of agy, claude, codex, cursor matches what is running there'
-check "and what to do about it"           'Pin one: cyclops name .* --manifest <id>'
+check "and the grid says why"             'read unknown: unsupported_vendor'
+check "and what to do about it"           'Teach cyclops this program with a manifest'
 
 # Teaching cyclops the CLI in those panes is one file in the home
 # directory the daemon already reads (docs/reference/MANIFESTS.md).

@@ -1224,6 +1224,7 @@ mod tests {
                 readings: Vec::new(),
                 disagreement: false,
                 decided_by: "fixture".into(),
+                unknown_reason: None,
                 stale: false,
                 write_ready: true,
                 write_block: None,

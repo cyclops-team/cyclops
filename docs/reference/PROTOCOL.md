@@ -276,6 +276,33 @@ sensor to report, the same `idle` state would have come back with
 title says the turn ended, and only a measured screen rule can prove the
 composer is empty or contains a vendor ghost suggestion that is safe to replace.
 
+`unknown_reason` is present only when `state` is `unknown`, and it is the
+daemon's answer rather than each client's. `unknown` is the one state that
+is not a statement about the agent: it says Cyclops could not read one, so
+the reason and the remedy travel with it. It appears on `pane.read`
+detection and on every `status` pane, from the same cached verdict, so two
+surfaces cannot tell one operator two different stories about one pane. A
+client must not reconstruct it from manifests, from the `state` label, or
+from its own heuristics.
+
+The set is closed at the producer and open at the reader. These are the
+values a client may receive:
+
+| Value | Meaning |
+|---|---|
+| `lifecycle_incomplete` | The matched manifest does not declare both turn roles, so no sequence of events could complete a turn. Messaging, unread and claim are unaffected. |
+| `no_current_boot_edge` | The manifest declares turn events and none has been observed for the exact current binding since the daemon started. |
+| `binding_unproven` | The pane's occupant could not be proven, so no evidence can be attributed to it. |
+| `unsupported_vendor` | Nothing running in the pane matches a manifest Cyclops has. |
+| `integration_not_installed` | The vendor supports a lifecycle integration and it is not installed. |
+| `integration_outdated` | An installed integration is at a version this daemon cannot use. |
+
+A daemon emits only reasons it can evidence, so a value in that table may
+never appear from a given build; absence of a reason is not absence of a
+cause. A client that receives a value it does not recognise must render it
+as itself and must not treat it as any known reason. Reasons are added over
+time and an unrecognised one is never an error.
+
 `decided_by` names the manifest rule that won. `readings` is what each
 sensor saw, one per sensor that read anything (`title`, `screen`, `hook`).
 `disagreement` is true when sensors contradicted each other. An authenticated

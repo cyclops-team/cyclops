@@ -251,6 +251,57 @@ impl HookLiveness {
             .is_some_and(|edges| !edges.is_empty())
     }
 
+    /// Whether any of `lifecycle` has been observed for this exact binding
+    /// since the daemon started.
+    ///
+    /// Three records here look like they answer this and two of them do
+    /// not, so the distinction is worth stating once.
+    ///
+    /// `seen_any` is every raw hook: a Notification, a StopFailure or a
+    /// PermissionRequest all make it true, and none of them is a turn edge.
+    /// Answering "has a turn been reported" with it lets an ACK-only or
+    /// attention-only pane look like a pane that has been reporting turns.
+    ///
+    /// `seen_admitting_edge` is the injection-safety subset, published only
+    /// after the manifest declared the event and any start it carries was
+    /// installed. It answers whether a WRITE may be authorised. Explaining
+    /// runtime with it would couple the explanation to the terminal-write
+    /// gate, which is exactly the coupling the runtime work is removing,
+    /// and it would drop events like AGY's PreInvocation.
+    ///
+    /// This one intersects the durable diagnostic edges with the event
+    /// names the manifest actually declares as lifecycle roles. No
+    /// admission concept, no new state, and nothing but turn edges.
+    pub(crate) fn seen_declared_lifecycle(
+        &self,
+        pane: &PaneKey,
+        current_agent: crate::identity::ProcId,
+        manifest: &str,
+        lifecycle: &[&str],
+    ) -> bool {
+        if lifecycle.is_empty() {
+            return false;
+        }
+        let Some(binding) = self.binding(pane, current_agent, manifest) else {
+            return false;
+        };
+        self.state
+            .lock()
+            .expect("hook liveness lock")
+            .edges
+            .get(&binding)
+            .is_some_and(|edges| {
+                // The edge map is keyed by the NORMALIZED event name while a
+                // manifest declares the vendor's raw spelling, so the
+                // comparison has to normalize too. The normalizer is shared
+                // with the parser on purpose: two copies would be two
+                // definitions of "the same event".
+                lifecycle
+                    .iter()
+                    .any(|event| edges.contains_key(&crate::ack::normalize_event(event)))
+            })
+    }
+
     /// Last-seen unix ms per normalized event, with the raw spelling.
     /// Empty when the recorded edges belong to another process or manifest.
     fn snapshot(
