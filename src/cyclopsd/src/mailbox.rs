@@ -75,6 +75,11 @@ pub struct ReplyDraft {
     pub body: Option<String>,
     pub client_key: Option<String>,
     pub sender_label: String,
+    /// The destination's label AS IT IS NOW, resolved from the directory
+    /// against the durable destination key. A reply is a new message and
+    /// presents a current name; the parent keeps its historical sender
+    /// label in its own fact, which this never rewrites.
+    pub recipient_label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -597,7 +602,6 @@ fn route_evidence_is_later(
 
 struct ReplyDerivation {
     recipient: RecipientKey,
-    recipient_label: String,
     thread_root: MessageId,
     subject: Option<String>,
 }
@@ -4245,7 +4249,6 @@ impl MailboxProjection {
         }
         Ok(ReplyDerivation {
             recipient: parent_metadata.sender,
-            recipient_label: parent_metadata.presentation.sender_label,
             thread_root: parent_metadata.thread_root,
             subject: reply_subject(parent.subject.as_deref()),
         })
@@ -5336,9 +5339,9 @@ impl MailboxService {
             .projection()
             .derive_reply(sender.key, &reference)?
             .recipient;
-        if directory.identity_for_recipient(recipient).is_none() {
+        let Some(destination) = directory.identity_for_recipient(recipient) else {
             return Err(MailboxDirectoryError::UnknownRecipient(recipient.to_string()).into());
-        }
+        };
         let accepted = store.reply(
             mint_message_id(),
             ReplyDraft {
@@ -5347,6 +5350,7 @@ impl MailboxService {
                 body: (!body.is_empty()).then_some(body),
                 client_key,
                 sender_label: sender.label,
+                recipient_label: destination.label,
             },
         )?;
         if accepted.inserted {
@@ -6363,7 +6367,7 @@ impl MessageStore {
                 sender_label: draft.sender_label,
                 recipient_labels: vec![cyclops_proto::RecipientPresentation {
                     recipient: derived.recipient,
-                    label: derived.recipient_label,
+                    label: draft.recipient_label,
                 }],
             },
         };
@@ -7775,6 +7779,131 @@ mod tests {
         );
     }
 
+    /// Gate 1: a durable reply routes to the ORIGINAL endpoint after the
+    /// recipient's alias is renamed.
+    ///
+    /// `reply` derives its recipient from the referenced message's sender
+    /// KEY, which is workspace plus session instance plus pane id and
+    /// carries no label. A rename replaces a directory entry, never a key,
+    /// so routing cannot follow it.
+    ///
+    /// The trap this pins is the one a label-based route would fall into:
+    /// after the rename a DIFFERENT identity wears the sender's old label,
+    /// so a reply resolved by name would land on the impostor.
+    #[test]
+    fn a_reply_routes_to_the_original_endpoint_after_an_alias_rename() {
+        let scratch = StoreScratch::new("reply-after-rename");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, _admin, bob, carol) = test_context();
+
+        let before = MailboxDirectory::new(
+            workspace,
+            [
+                MailboxIdentity {
+                    key: bob,
+                    label: "reviewer".into(),
+                },
+                MailboxIdentity {
+                    key: carol,
+                    label: "observer".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let store = MessageStore::open(&root, journal, workspace, "boot").unwrap();
+        let (sender, _) = broadcast::channel(64);
+        let service = MailboxService::new_with_events(before, store, sender);
+
+        let parent = service
+            .send(
+                MailboxIdentity {
+                    key: bob,
+                    label: "reviewer".into(),
+                },
+                mailbox_send("observer", "Question", "Body"),
+            )
+            .unwrap();
+
+        // The rename, and the trap: bob takes a new label and carol takes
+        // bob's old one, so "reviewer" now names a different endpoint.
+        service
+            .replace_directory(
+                MailboxDirectory::new(
+                    workspace,
+                    [
+                        MailboxIdentity {
+                            key: bob,
+                            label: "lead".into(),
+                        },
+                        MailboxIdentity {
+                            key: carol,
+                            label: "reviewer".into(),
+                        },
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let reply = service
+            .reply(
+                MailboxIdentity {
+                    key: carol,
+                    label: "reviewer".into(),
+                },
+                parent.message_id.clone(),
+                "Answer".into(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            reply.recipient_keys,
+            vec![bob],
+            "the reply left the original endpoint after the rename"
+        );
+        assert_ne!(
+            reply.recipient_keys,
+            vec![carol],
+            "the reply followed the old label to its new owner"
+        );
+        // The presented name is the destination's CURRENT one. Rendering
+        // the parent's historical label would print "reviewer", which now
+        // names carol, so the row would route to bob while naming someone
+        // else. The parent keeps its own historical label in its own fact.
+        assert_eq!(
+            reply.recipients,
+            vec!["lead".to_string()],
+            "the reply presented a stale label for the durable destination"
+        );
+
+        // The presentation is DURABLE: it is stamped into the ledger line
+        // at acceptance, not re-derived on read. Replay it from the journal
+        // under a fresh boot and the name must be the same one, so a later
+        // rename cannot retroactively move it either way. The live service
+        // holds the journal writer, so it goes first.
+        let reply_id = reply.message_id.clone();
+        drop(reply);
+        drop(service);
+        let replayed = MessageStore::open(&root, journal, workspace, "boot-replay").unwrap();
+        let replayed_reply = replayed
+            .projection()
+            .get_message(&reply_id)
+            .expect("the reply survives replay");
+        assert_eq!(
+            replayed_reply.to,
+            vec!["lead".to_string()],
+            "replay re-derived the label instead of reading the recorded fact"
+        );
+        let replayed_metadata = extract_message_metadata(replayed_reply).unwrap();
+        assert_eq!(
+            replayed_metadata.recipients,
+            vec![bob],
+            "replay lost the durable destination key"
+        );
+    }
+
     #[test]
     fn committed_mailbox_facts_publish_once_in_workspace_sequence_order() {
         let scratch = StoreScratch::new("change-events");
@@ -8591,7 +8720,12 @@ mod tests {
             .get_message(&admin_reply.message_id)
             .unwrap();
         let admin_reply_metadata = extract_message_metadata(admin_reply_message).unwrap();
-        assert_eq!(admin_reply_message.to, ["reviewer"]);
+        // A reply is a NEW message and presents the destination's current
+        // name. Rendering the parent's historical "reviewer" here would
+        // address a label the directory has since moved, so the row would
+        // route to bob while naming somebody else. The parent's own fact
+        // keeps its historical label; this rewrites nothing.
+        assert_eq!(admin_reply_message.to, ["implementer"]);
         assert_eq!(admin_reply_metadata.recipients, [bob]);
         drop(store);
 
@@ -10409,6 +10543,7 @@ mod tests {
             body: Some(body.into()),
             client_key: None,
             sender_label: "reply-sender".into(),
+            recipient_label: "reply-recipient".into(),
         }
     }
 

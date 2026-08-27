@@ -28,7 +28,7 @@ use cyclops_manifest::{
 use cyclops_proto::{
     AgentState, ComposerHold, ComposerProof, ComposerSemantic, ComposerState, Detection,
     NotificationAttemptId, NotificationAttentionCause, NotificationRouteEvidenceId,
-    NotificationState, ProcessInstanceId, RecipientKey, Sensor, SensorReading,
+    NotificationState, NotifyLevel, ProcessInstanceId, RecipientKey, Sensor, SensorReading,
 };
 #[cfg(test)]
 use cyclops_proto::{NotificationTransport, DOORBELL_FORMAT_COMPACT_CLAIM};
@@ -3029,7 +3029,7 @@ fn settle_turn(
     turn: Option<&turnkey::TurnKey>,
     hold: ComposerHold,
     det: &Detection,
-) -> (ComposerHold, bool) {
+) -> (ComposerHold, bool, bool) {
     let ended = turn.map(|t| {
         turnkey::PaneEnds::holds(
             ends,
@@ -3069,7 +3069,44 @@ fn settle_turn(
             }
             _ => false,
         };
-    (next, stranded)
+    // A long-running turn still has a live Working reading. This is the
+    // narrower failure shape: the same fresh visual frame proves the turn
+    // has stopped and the composer is clean, yet the exact lifecycle lane
+    // has no end for the pinned turn. That positive state discriminator
+    // needs no timeout and cannot cry wolf on a legitimately long turn.
+    let missing_end_diagnostic = ended == Some(false)
+        && matches!(next, ComposerHold::TurnStarted { .. })
+        && !det.stale
+        && det.state == AgentState::Idle
+        && det.reads(Sensor::Screen, AgentState::Idle)
+        && det.turn_running_at().is_none()
+        && det.screen_proves_write_safe_composer()
+        && match (turn, agent, manifest) {
+            (Some(turn), Some(agent), Some(manifest)) => {
+                turnkey::PaneEnds::reserve_missing_end_diagnostic(ends, pane, agent, manifest, turn)
+            }
+            _ => false,
+        };
+    (next, stranded, missing_end_diagnostic)
+}
+
+/// Publish the one content-free operator warning reserved by `settle_turn`.
+///
+/// Reservation happens under the turn-end lock; journal and event IO happen
+/// only after both lifecycle and detection locks are released.
+fn notify_missing_lifecycle_end(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) {
+    let target = inner
+        .label_for_route(session_idx, pane_id)
+        .unwrap_or_else(|| pane_id.to_string());
+    crate::delivery::admin_notify(
+        inner,
+        NotifyLevel::ActionRequired,
+        &format!("{target}: matching lifecycle end missing"),
+        "A fresh screen shows the turn stopped and the composer clean, but no matching lifecycle end was recorded for the same process generation and turn. Terminal writes remain blocked; inspect the vendor hook configuration and lifecycle event payload.",
+        None,
+        Some(session_idx),
+        crate::delivery::About::pane(pane_id),
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4252,7 +4289,15 @@ async fn recompute_pane_with_evidence(
     let working_confirmed =
         working_is_confirmed(inner, &route, &detection, admitted, manifest_id.as_deref());
 
-    let (prior, prior_ready, now_key, detection, probe_quota_reset, composer_changed) = {
+    let (
+        prior,
+        prior_ready,
+        now_key,
+        detection,
+        probe_quota_reset,
+        composer_changed,
+        missing_end_diagnostic,
+    ) = {
         let mut map = inner.detections.lock().expect("detections lock");
         if matches!(
             recovery_action.as_ref(),
@@ -4330,21 +4375,23 @@ async fn recompute_pane_with_evidence(
         // publishes, so liveness and status keep moving; only the write
         // answer becomes a refusal.
         let frozen = unobservable.then_some(prior_entry).flatten().cloned();
-        let (hold, stranded, final_turn, final_owner) = match &frozen {
+        let (hold, stranded, final_turn, final_owner, missing_end_diagnostic) = match &frozen {
             Some(entry) => (
                 entry.hold,
                 false,
                 entry.turn.clone(),
                 entry.hold_owner.clone(),
+                false,
             ),
             None if recovered_hold.is_some() => (
                 recovered_hold.expect("guarded recovered hold"),
                 false,
                 turn,
                 hold_owner,
+                false,
             ),
             None => {
-                let (hold, stranded) = settle_turn(
+                let (hold, stranded, missing_end_diagnostic) = settle_turn(
                     &mut inner.turn_ends.lock().expect("turn ends lock"),
                     &route,
                     admitted,
@@ -4359,7 +4406,13 @@ async fn recompute_pane_with_evidence(
                 let final_owner = (hold != ComposerHold::Clear)
                     .then_some(hold_owner)
                     .flatten();
-                (hold, stranded, final_turn, final_owner)
+                (
+                    hold,
+                    stranded,
+                    final_turn,
+                    final_owner,
+                    missing_end_diagnostic,
+                )
             }
         };
         // Stamped BEFORE it is cached, because the cache is what the gate
@@ -4489,9 +4542,13 @@ async fn recompute_pane_with_evidence(
                 detection,
                 probe_quota_reset,
                 composer_changed,
+                missing_end_diagnostic,
             )
         }
     };
+    if missing_end_diagnostic {
+        notify_missing_lifecycle_end(inner, session_idx, pane_id);
+    }
     // A readiness change under an UNCHANGED runtime state is still news
     // for anyone gating on it. The hold lifting is the case that matters:
     // the pane reads idle before and after, so no state edge exists, and
@@ -6724,6 +6781,183 @@ contains = ["working"]
         assert!(held(&ends), "the screen lane consumes nothing");
     }
 
+    /// Gate 2: visual completion without this turn's exact lifecycle end
+    /// holds and emits one bounded, content-free diagnostic.
+    ///
+    /// No duration threshold is involved. A legitimate long turn still has
+    /// a live Working reading, so only the positive contradiction qualifies:
+    /// the same fresh frame says no turn is running and proves the composer
+    /// clean while the exact end is absent. Reservation is on the pinned
+    /// pane, process generation, manifest, and TurnKey.
+    #[test]
+    fn a_missing_or_mismatched_end_emits_one_bounded_diagnostic() {
+        let screen = |state, semantic| Detection {
+            state,
+            readings: vec![SensorReading {
+                sensor: Sensor::Screen,
+                state,
+                rule: if state == AgentState::Working {
+                    "working"
+                } else {
+                    "composer_empty"
+                }
+                .into(),
+                ts: 9,
+            }],
+            disagreement: false,
+            decided_by: "fixture".into(),
+            unknown_reason: None,
+            stale: false,
+            write_ready: false,
+            write_block: None,
+            composer_semantic: semantic,
+        };
+        let working = screen(AgentState::Working, None);
+        let clean = screen(AgentState::Idle, Some(ComposerSemantic::Clean));
+        let permission = screen(AgentState::BlockedPermission, Some(ComposerSemantic::Clean));
+        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+        let replacement = crate::identity::ProcId { pid: 71, birth: 4 };
+        let turn = turnkey::TurnKey::for_test(&["session", "turn-1"]);
+        let other = turnkey::TurnKey::for_test(&["session", "turn-2"]);
+        let started = ComposerHold::TurnStarted { since_ms: 5 };
+        let inner = inner_with(BTreeMap::new());
+        let mut events = inner.events.subscribe();
+        let armed = || {
+            let mut ends = turnkey::Ends::new();
+            assert!(turnkey::PaneEnds::pin(
+                &mut ends,
+                &pane(),
+                agent,
+                "codex",
+                &turn,
+            ));
+            ends
+        };
+
+        let mut ends = armed();
+        assert!(
+            !settle_turn(
+                &mut ends,
+                &pane(),
+                Some(agent),
+                Some("codex"),
+                Some(&turn),
+                started,
+                &working,
+            )
+            .2,
+            "a legitimately running turn raised a missing-end diagnostic"
+        );
+        let mut awaiting_permission = armed();
+        assert!(
+            !settle_turn(
+                &mut awaiting_permission,
+                &pane(),
+                Some(agent),
+                Some("codex"),
+                Some(&turn),
+                started,
+                &permission,
+            )
+            .2,
+            "a turn awaiting permission was misread as visually complete"
+        );
+
+        let first = settle_turn(
+            &mut ends,
+            &pane(),
+            Some(agent),
+            Some("codex"),
+            Some(&turn),
+            started,
+            &clean,
+        );
+        assert_eq!(first.0, started, "a missing end released the barrier");
+        assert!(first.2, "the visually complete turn raised no diagnostic");
+        if first.2 {
+            notify_missing_lifecycle_end(&inner, 0, "%1");
+        }
+        let repeated = settle_turn(
+            &mut ends,
+            &pane(),
+            Some(agent),
+            Some("codex"),
+            Some(&turn),
+            started,
+            &clean,
+        );
+        assert!(
+            !repeated.2,
+            "the same exact turn raised a second diagnostic"
+        );
+        if repeated.2 {
+            notify_missing_lifecycle_end(&inner, 0, "%1");
+        }
+
+        // A different turn's end is still missing evidence for this turn,
+        // and receives the same one-shot treatment.
+        let mut mismatched = armed();
+        turnkey::PaneEnds::record(&mut mismatched, &pane(), agent, "codex", other);
+        assert!(
+            settle_turn(
+                &mut mismatched,
+                &pane(),
+                Some(agent),
+                Some("codex"),
+                Some(&turn),
+                started,
+                &clean,
+            )
+            .2,
+            "a mismatched end raised no diagnostic"
+        );
+
+        // A replacement cannot spend the predecessor's allowance.
+        let mut replaced = armed();
+        assert!(
+            !settle_turn(
+                &mut replaced,
+                &pane(),
+                Some(replacement),
+                Some("codex"),
+                Some(&turn),
+                started,
+                &clean,
+            )
+            .2,
+            "a replacement generation spent the predecessor's diagnostic"
+        );
+
+        // The exact end releases and never warns.
+        let mut exact = armed();
+        turnkey::PaneEnds::record(&mut exact, &pane(), agent, "codex", turn.clone());
+        let settled = settle_turn(
+            &mut exact,
+            &pane(),
+            Some(agent),
+            Some("codex"),
+            Some(&turn),
+            started,
+            &clean,
+        );
+        assert_eq!(settled.0, ComposerHold::Clear);
+        assert!(!settled.2, "a matching end raised a diagnostic");
+
+        // The reserved diagnostic is the only one emitted, and it carries
+        // no turn key or terminal content.
+        let event = events.try_recv().expect("diagnostic event");
+        assert_eq!(event.event, "admin-notify");
+        assert_eq!(event.data["pane_id"], "%1");
+        assert_eq!(event.data["level"], "action_required");
+        let rendered = event.data.to_string();
+        assert!(!rendered.contains("turn-1"));
+        assert!(!rendered.contains("session"));
+        assert!(
+            events.try_recv().is_err(),
+            "a second diagnostic was emitted"
+        );
+    }
+
     /// A hold waiting on evidence the store threw away says so.
     ///
     /// An end can arrive before the start it belongs to, and nothing
@@ -6798,7 +7032,10 @@ contains = ["working"]
             "codex",
             &early
         ));
-        assert_eq!(step(&mut ends, "codex", &early, started), (started, true));
+        assert_eq!(
+            step(&mut ends, "codex", &early, started),
+            (started, true, true)
+        );
 
         // An unrelated overflow does not stop a turn whose own end IS
         // present from releasing normally.
@@ -6814,7 +7051,7 @@ contains = ["working"]
         ));
         assert_eq!(
             step(&mut ends, "codex", &live, started),
-            (ComposerHold::Clear, false),
+            (ComposerHold::Clear, false, false),
             "a present end releases, whatever else the store lost"
         );
 
@@ -6828,7 +7065,10 @@ contains = ["working"]
             "claude",
             &early
         ));
-        assert_eq!(step(&mut ends, "claude", &early, started), (started, false));
+        assert_eq!(
+            step(&mut ends, "claude", &early, started),
+            (started, false, true)
+        );
     }
 
     /// A turn the hold stopped waiting on must not stay pinned.
@@ -9731,7 +9971,7 @@ regex = ['^IDLE']
             &turn
         ));
 
-        let (hold, stranded) = settle_turn(
+        let (hold, stranded, missing_end_diagnostic) = settle_turn(
             &mut inner.turn_ends.lock().unwrap(),
             &pane(),
             Some(agent),
@@ -9742,6 +9982,7 @@ regex = ['^IDLE']
         );
         assert_eq!(hold, ComposerHold::Clear);
         assert!(!stranded);
+        assert!(!missing_end_diagnostic);
         assert!(!turnkey::PaneEnds::holds(
             &inner.turn_ends.lock().unwrap(),
             &pane(),

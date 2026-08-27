@@ -228,6 +228,14 @@ pub(crate) struct PaneEnds {
     manifest: String,
     /// The turn an active hold is waiting on. Never evicted.
     pinned: Option<TurnKey>,
+    /// The pinned turn whose missing or mismatched end has already raised
+    /// its one operator diagnostic.
+    ///
+    /// One slot, not a growing history: only one turn may own the pane's
+    /// composer barrier, and changing that owner resets the allowance.
+    /// Keeping it beside `pinned` makes the bound use the identical pane,
+    /// process-generation, manifest, and turn identity as end matching.
+    diagnosed_missing_end: Option<TurnKey>,
     /// Ends seen but not yet consumed, oldest first.
     seen: std::collections::VecDeque<TurnKey>,
     /// Has this store ever discarded an end to stay bounded?
@@ -261,6 +269,7 @@ impl PaneEnds {
             agent,
             manifest: manifest.to_string(),
             pinned: None,
+            diagnosed_missing_end: None,
             seen: std::collections::VecDeque::new(),
             lost: false,
         });
@@ -270,6 +279,7 @@ impl PaneEnds {
             entry.agent = agent;
             entry.manifest = manifest.to_string();
             entry.pinned = None;
+            entry.diagnosed_missing_end = None;
             entry.seen.clear();
             // A new binding starts with no history and no doubt about it.
             entry.lost = false;
@@ -328,9 +338,37 @@ impl PaneEnds {
             Some(_) => true,
             None => {
                 entry.pinned = Some(turn.clone());
+                entry.diagnosed_missing_end = None;
                 true
             }
         }
+    }
+
+    /// Reserve the one missing-end diagnostic for this exact pinned turn.
+    ///
+    /// The caller decides whether the visual frame proves the turn ended;
+    /// this store only makes that conclusion one-shot under the same exact
+    /// identity that matches lifecycle ends. A replacement occupant or a
+    /// different turn cannot spend this turn's allowance.
+    pub(crate) fn reserve_missing_end_diagnostic(
+        map: &mut Ends,
+        pane: &crate::PaneKey,
+        agent: crate::identity::ProcId,
+        manifest: &str,
+        turn: &TurnKey,
+    ) -> bool {
+        let Some(entry) = map.get_mut(pane) else {
+            return false;
+        };
+        if entry.agent != agent
+            || entry.manifest != manifest
+            || entry.pinned.as_ref() != Some(turn)
+            || entry.diagnosed_missing_end.as_ref() == Some(turn)
+        {
+            return false;
+        }
+        entry.diagnosed_missing_end = Some(turn.clone());
+        true
     }
 
     /// Is this exact turn's end stored for this exact binding?
@@ -373,6 +411,7 @@ impl PaneEnds {
         };
         e.seen.remove(pos);
         e.pinned = None;
+        e.diagnosed_missing_end = None;
         true
     }
 
@@ -419,6 +458,7 @@ impl PaneEnds {
             return false;
         }
         e.pinned = None;
+        e.diagnosed_missing_end = None;
         if let Some(pos) = e.seen.iter().position(|k| k == turn) {
             e.seen.remove(pos);
         }
@@ -449,6 +489,102 @@ mod store_tests {
 
     fn key(v: &str) -> TurnKey {
         TurnKey(vec![KeyField::Text(v.to_string())])
+    }
+
+    /// A clean screen releases a composer barrier only when the stored
+    /// end NAMES this turn. A missing end, a wrong key, and a wrong
+    /// process generation each hold it.
+    ///
+    /// This is the exact-lane half of Gate 2. The screen lane releases on
+    /// an idle reading, so if the key comparison were loose the barrier
+    /// would release on the first clean frame after ANY end, and a Cyclops
+    /// write would land on a turn that never finished. The fresh clean
+    /// screen is supplied in every case here precisely so that the key,
+    /// and nothing else, is what decides.
+    #[test]
+    fn a_clean_screen_releases_the_barrier_only_on_this_turns_own_end() {
+        let agent = proc(100);
+        let other_generation = proc(200);
+        let m = "t";
+        let this_turn = key("turn-1");
+
+        // A fresh clean screen: idle, screen-proven clean composer, no
+        // sensor reading a turn as running.
+        let clean = clean_idle_detection();
+        assert!(
+            clean.screen_proves_write_safe_composer(),
+            "the fixture must supply the clean frame the release waits on"
+        );
+
+        let started = cyclops_proto::ComposerHold::TurnStarted { since_ms: 7 };
+
+        // (a) An authenticated start with NO end at all.
+        let mut ends = Ends::new();
+        let ended = PaneEnds::holds(&ends, &pane(), agent, m, &this_turn);
+        assert!(!ended, "no end was recorded");
+        assert_eq!(
+            started.advance(&clean, Some(ended)),
+            started,
+            "a clean frame released a barrier whose turn never ended"
+        );
+
+        // (b) An end that names a DIFFERENT turn.
+        PaneEnds::record(&mut ends, &pane(), agent, m, key("turn-2"));
+        let ended = PaneEnds::holds(&ends, &pane(), agent, m, &this_turn);
+        assert!(!ended, "a different turn's end must not match");
+        assert_eq!(
+            started.advance(&clean, Some(ended)),
+            started,
+            "another turn's end released this barrier"
+        );
+
+        // (b2) The right key under a REPLACED process generation.
+        let mut swapped = Ends::new();
+        PaneEnds::record(
+            &mut swapped,
+            &pane(),
+            other_generation,
+            m,
+            this_turn.clone(),
+        );
+        let ended = PaneEnds::holds(&swapped, &pane(), agent, m, &this_turn);
+        assert!(!ended, "a replacement generation's end must not match");
+        assert_eq!(
+            started.advance(&clean, Some(ended)),
+            started,
+            "a replaced occupant's end released the predecessor's barrier"
+        );
+
+        // The contrast that makes the three above meaningful: this turn's
+        // own end, under the same clean frame, DOES release.
+        let mut exact = Ends::new();
+        PaneEnds::record(&mut exact, &pane(), agent, m, this_turn.clone());
+        let ended = PaneEnds::holds(&exact, &pane(), agent, m, &this_turn);
+        assert!(ended, "this turn's own end must match");
+        assert_eq!(
+            started.advance(&clean, Some(ended)),
+            cyclops_proto::ComposerHold::Clear,
+            "the exact end plus a clean frame must release"
+        );
+    }
+
+    fn clean_idle_detection() -> cyclops_proto::Detection {
+        cyclops_proto::Detection {
+            state: cyclops_proto::AgentState::Idle,
+            readings: vec![cyclops_proto::SensorReading {
+                sensor: cyclops_proto::Sensor::Screen,
+                state: cyclops_proto::AgentState::Idle,
+                rule: "composer_empty".into(),
+                ts: 1,
+            }],
+            disagreement: false,
+            decided_by: "composer_empty".into(),
+            unknown_reason: None,
+            stale: false,
+            write_ready: true,
+            write_block: None,
+            composer_semantic: Some(cyclops_proto::ComposerSemantic::Clean),
+        }
     }
 
     /// The turn a hold is ACTIVELY waiting on outlives a flood of later

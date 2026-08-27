@@ -235,6 +235,15 @@ uses this only for the exact interruption suffix left after a human cancels a
 command approval, paired with its dim ghost composer and ordered below the
 live Working rule.
 
+An exact composer barrier never treats a clean frame as the missing end. When
+a fresh idle screen proves that no turn is running and the composer is clean,
+but the pinned turn has no matching end for the same process generation and
+manifest, the barrier stays held and Cyclops emits one content-free
+action-required diagnostic. The one-shot reservation uses the same pane,
+process generation, manifest, and turn key as end matching. Repeated redraws
+cannot duplicate it, and a replacement occupant cannot spend the predecessor's
+allowance.
+
 ### Receipt tiers
 
 - Tier 1 (claude, codex, cursor): the manifest `hooks.ack` event arrives via
