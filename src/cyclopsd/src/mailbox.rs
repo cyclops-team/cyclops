@@ -3299,6 +3299,20 @@ impl MailboxProjection {
         self.notifications.get(&(recipient, message_id.clone()))
     }
 
+    /// A withdrawn wake leaves its mailbox entry pending and pullable, but it
+    /// no longer occupies notification FIFO. Scheduler selection and every
+    /// notification-facing FIFO position use this same predicate so an
+    /// operator never sees a queue position that disagrees with what will
+    /// actually be notified next.
+    fn notification_withdrawn_by_operator(
+        &self,
+        recipient: RecipientKey,
+        message_id: &MessageId,
+    ) -> bool {
+        self.notification(recipient, message_id)
+            .is_some_and(|record| record.state == NotificationState::WithdrawnByOperator)
+    }
+
     /// Full post-write records whose composer barriers remain active.
     pub(crate) fn active_notification_barriers(&self) -> Vec<NotificationRecord> {
         let mut records: Vec<_> = self
@@ -3806,7 +3820,9 @@ impl MailboxProjection {
         for (recipient, entries) in &self.mailboxes {
             let mut position = 0_u64;
             for entry in entries.values() {
-                if entry.state.is_pending() {
+                if entry.state.is_pending()
+                    && !self.notification_withdrawn_by_operator(*recipient, &entry.message_id)
+                {
                     position += 1;
                     fifo_positions.insert((*recipient, entry.message_id.clone()), position);
                 }
@@ -4115,7 +4131,9 @@ impl MailboxProjection {
             };
             let mut position = 0_u64;
             for entry in entries.values() {
-                if !entry.state.is_pending() {
+                if !entry.state.is_pending()
+                    || self.notification_withdrawn_by_operator(recipient, &entry.message_id)
+                {
                     continue;
                 }
                 position += 1;
@@ -4743,10 +4761,9 @@ impl MailboxService {
             .get_pending(recipient)
             .iter()
             .find(|entry| {
-                store
+                !store
                     .projection()
-                    .notification(recipient, &entry.message_id)
-                    .is_none_or(|record| record.state != NotificationState::WithdrawnByOperator)
+                    .notification_withdrawn_by_operator(recipient, &entry.message_id)
             })
             .map(|entry| entry.message_id.clone())
     }
@@ -5006,6 +5023,11 @@ impl MailboxService {
                 let pending = store.projection().get_pending(recipient);
                 let position_ahead = pending
                     .iter()
+                    .filter(|entry| {
+                        !store
+                            .projection()
+                            .notification_withdrawn_by_operator(recipient, &entry.message_id)
+                    })
                     .position(|entry| &entry.message_id == message_id)
                     .and_then(|position| u32::try_from(position).ok());
                 let record = store.projection().notification(recipient, message_id);
@@ -9643,6 +9665,32 @@ mod tests {
             .unwrap()
             .recipients[0];
         assert!(!first_recipient.can_withdraw_notification);
+        assert_eq!(
+            first_recipient.fifo_position, None,
+            "the still-pending, withdrawn mailbox entry is pullable but no longer a notification FIFO item"
+        );
+        let second_recipient = &snapshot
+            .rows
+            .iter()
+            .find(|row| row.message_id == second.message_id)
+            .unwrap()
+            .recipients[0];
+        assert_eq!(
+            second_recipient.fifo_position,
+            Some(1),
+            "the next actionable wake is first after the withdrawn head"
+        );
+        let first_disposition = service.message_dispositions(&first.message_id).unwrap();
+        assert_eq!(
+            first_disposition[0].position_ahead, None,
+            "a withdrawn wake has no notification queue position"
+        );
+        let second_disposition = service.message_dispositions(&second.message_id).unwrap();
+        assert_eq!(
+            second_disposition[0].position_ahead,
+            Some(0),
+            "sender receipts count only actionable wakes ahead"
+        );
         let status_blocked = service.blocked_notification_snapshot(now_ms(), 32).unwrap();
         assert_eq!(status_blocked.total, 0);
         assert!(status_blocked.rows.is_empty());

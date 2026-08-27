@@ -2550,6 +2550,34 @@ async fn typed_composer_hold_is_a_durable_prewrite_block_until_a_real_turn() {
         second_row["recipients"][0]["notification"]["operator_withdrawn"],
         true
     );
+    assert!(
+        second_row["recipients"][0]["fifo_position"].is_null(),
+        "a wake withdrawn by the operator remains pullable but no longer occupies notification FIFO: {second_row}"
+    );
+    let third_row = after_withdrawal["result"]["rows"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|candidate| candidate["message_id"] == third_id)
+        })
+        .expect("the actionable successor remains visible");
+    assert_eq!(
+        third_row["recipients"][0]["fifo_position"],
+        1,
+        "the scheduler skips a withdrawn wake, so the next actionable notification is first: {third_row}"
+    );
+    let status_after_withdrawal = rig.ctl.request("status", json!({})).await;
+    let third_status = status_after_withdrawal["result"]["blocked_notifications"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|candidate| candidate["message_id"] == third_id)
+        })
+        .expect("the successor's durable pre-write block is visible in status");
+    assert_eq!(
+        third_status["recipient"]["fifo_position"], 1,
+        "status uses the same actionable notification FIFO as Messages: {third_status}"
+    );
 
     // A ghost redraw alone cannot clear the durable block.
     rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
