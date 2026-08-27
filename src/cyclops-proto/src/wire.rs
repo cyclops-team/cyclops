@@ -126,7 +126,7 @@ pub struct MessagesChangedData {
 // Method params and results. Methods use dot notation: "ping", "status",
 // "msg.send", "msg.history", "msg.thread", "agent.wait", "agent.state.report",
 // "pane.read", "events.subscribe", "admin.notify", "hooks.verify",
-// "hooks.selftest", "theme.reload", "daemon.quiesce".
+// "hooks.selftest", "theme.reload", "daemon.quiesce", "health.snapshot".
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,6 +248,12 @@ pub struct StatusResult {
     pub boot_id: String,
     pub uptime_ms: u64,
     pub tmux_version: String,
+    /// Durable identity of the state root serving this answer.
+    ///
+    /// Health uses this instead of inferring a workspace from display labels
+    /// or pane ids. Old daemons omit it, which is reported as unproven.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<crate::identity::WorkspaceId>,
     pub sessions: Vec<SessionStatus>,
     /// Current display routes for durable mailboxes.
     ///
@@ -387,6 +393,12 @@ pub struct SessionStatus {
     pub name: String,
     /// True while the control-mode connection to this session is up.
     pub attached: bool,
+    /// Exact durable assignment for this live tmux session.
+    ///
+    /// The binding is absent while the live session cannot be identified or
+    /// when the answer came from a daemon that predates durable identities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<crate::identity::SessionIdentityBinding>,
     pub panes: Vec<PaneStatus>,
 }
 

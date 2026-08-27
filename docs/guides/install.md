@@ -475,6 +475,42 @@ Use it when `/private/tmp` is not writable, and when you want to check
 that nothing has hardcoded a path: a relocated run on macOS takes the same
 code path Linux does. CI runs both.
 
+## Inspect health and cleanup candidates
+
+`cyclops health` is read-only. It reports the selected client and daemon pair,
+the authenticated running daemon, same-user daemon process inventory, durable
+workspace and session mappings, configured and detached sessions, duplicate
+watcher slots, setup files, state permissions, caches, logs, and rollback
+proof. JSON callers receive the same facts under `operational` and `rollback`.
+Health reports install-time replay evidence separately from current replay
+readiness. `attested_snapshot` means the exact selected binary pair booted a
+private state snapshot whose content-free identity is stored in the selection
+record. `current replay unproven` is still expected during ordinary health
+inspection. Cyclops proves the current journals again immediately before an
+operator requests rollback.
+
+```bash
+cyclops health
+cyclops --json health
+```
+
+Cleanup accepts only named rebuildable asset classes. The default is a dry run;
+`--apply` removes only candidates that still pass the descriptor-relative,
+no-follow ownership checks. It never accepts an arbitrary path and never
+touches message journals. Before the first deletion, Cyclops durably writes an
+owner-only checkpoint and locks the cleanup journal. Each execution then
+appends one content-free `completed` or `interrupted` fact to
+`~/.cyclops/operations/cleanup.ndjson`. The next applied cleanup recovers a pending
+checkpoint exactly once, and a torn final journal record is discarded before
+replay. Invalid complete records stop cleanup before deletion instead of hiding
+journal damage.
+
+```bash
+cyclops cleanup build-cache
+cyclops cleanup build-cache --apply
+cyclops cleanup update-scratch --apply
+```
+
 ## Update
 
 ```bash
@@ -496,9 +532,17 @@ cyclops 0.1.0 (1e16081)
 Behind a newer commit, updating clones the repository and builds a candidate
 pair. The candidate CLI and daemon must report one build, then the candidate
 daemon must replay a private copy of the current journals before either
-installed selector changes. Durable records and operator-edited setup files in
-your home are preserved. Known unedited shipped themes, manifests, hook
-artifacts, and skills may advance with the installed release.
+installed selector changes. A running daemon is authenticated, quiesced, and
+stopped before that copy is taken, then restarted on the old pair if replay
+fails. Durable records and operator-edited setup files in your home are
+preserved. Known unedited shipped themes, manifests, hook artifacts, and skills
+may advance with the installed release.
+
+The selected-pair record stores a content-free replay attestation bound to the
+exact client and daemon hashes plus the private snapshot identity. Older
+selection schemas remain readable and report replay as unproven. The
+attestation records installation evidence only. It never replaces the current
+journal replay performed by rollback.
 
 ```
   activated matched pair 1e16081
@@ -514,6 +558,12 @@ the freshly installed one answering `--version` for itself. Each release is a
 directory containing the matched pair. The public commands pass through one
 `active` selector, so there is no moment where a new CLI names an old daemon.
 The previous matched pair remains as `known-good`.
+
+The pair-store lease admits one updater. A concurrent updater exits before it
+can stage, select, or repair files. If an updater process stops at a filesystem
+commit boundary, the next update removes only validated temporary selectors
+and unselected residues, repairs managed public links, and then continues. The
+public client and daemon always resolve through the same selected pair.
 
 If a daemon was running, update restarts that exact selected generation on the
 new pair. If no daemon was running, update leaves it stopped; the next
@@ -551,11 +601,13 @@ To restore the retained pair explicitly:
 cyclops update --rollback
 ```
 
-Rollback validates the retained pair and proves it can replay a private copy
-of the current journals before changing the selector. It does not copy
+Rollback validates the retained pair, quiesces and stops the authenticated
+daemon, then proves the retained pair can replay a private copy of the stable
+current journals before changing the selector. A failed proof restarts the
+unchanged active pair. Rollback does not copy
 binaries, rewrite journals, restore earlier configuration, or promise
-compatibility beyond that replay proof. A running daemon is quiesced and
-restarted on the retained pair. A stopped daemon stays stopped.
+compatibility beyond that replay proof. A running daemon restarts on the
+retained pair after the selector changes. A stopped daemon stays stopped.
 After a legacy first migration, rollback becomes available after the next
 matched update because no unproven legacy pair is advertised as known-good.
 

@@ -316,9 +316,11 @@ mod tests {
             boot_id: "b".into(),
             uptime_ms: 1,
             tmux_version: "3.6".into(),
+            workspace_id: None,
             sessions: vec![SessionStatus {
                 name: "main".into(),
                 attached: true,
+                identity: None,
                 panes,
             }],
             mailbox_routes: Vec::new(),

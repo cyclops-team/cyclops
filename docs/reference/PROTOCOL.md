@@ -100,6 +100,7 @@ alphabet.
 |---|---|
 | `ping` | Liveness and round trip |
 | `status` | Every watched session and pane, with fused state |
+| `health.snapshot` | Last committed daemon status without pane capture or state mutation |
 | `pane.read` | A pane's screen, its recent output, or the detection view |
 | `pane.label` | Give a pane a name, or take it back |
 | `session.watch` | Start watching a tmux session the daemon was not booted with |
@@ -139,7 +140,12 @@ alphabet.
     "daemon_process":{"pid":8123,"birth":981221},"pid":8123,
     "manifests":{"dir":"/private/tmp/cyclops-wire.l3llB0/home/manifests","ids":["demo"]},
     "admin_unread":0,"blocked_notifications_total":0,
-    "proto":1,"sessions":[{"attached":true,"name":"main","panes":[
+    "proto":1,"workspace_id":"2863a6ef-0f58-46ad-a87d-7b4157ba8e6a",
+    "sessions":[{"attached":true,"name":"main",
+      "identity":{"live_session_key":{"workspace_id":"2863a6ef-0f58-46ad-a87d-7b4157ba8e6a",
+        "os_boot_id":"boot-a","tmux_server":{"pid":7001,"birth":188221},
+        "tmux_session_id":"$1"},
+        "session_instance_id":"a0e630f6-96d6-4050-9cf2-e158f43ab723"},"panes":[
       {"agent":"implementer","current_command":"bash","dead":false,"height":11,
        "hooks_verified":false,"in_mode":false,"manifest":"demo","pane_id":"%0",
        "composer":"composer_clean","composer_proof":"manifest_rule","state":"idle",
@@ -168,6 +174,12 @@ unique `notification_attempt`, and `composer_candidates`. The latter preserves
 the number of durable barriers when no single attempt can be selected safely.
 `notification_state`, `message_state`, and `next_action` remain body-free.
 `submitting` is a durable submit intent, not proof that a terminal key was sent.
+
+`workspace_id` names the exact state domain serving the answer. Each session's
+optional `identity` is the durable live-session binding used for mailbox
+routing. Absence means the daemon cannot prove the mapping or predates this
+field. Health compares these runtime facts with the owner-only identity records;
+it does not infer identity from a display label or pane number.
 
 Status refreshes live panes concurrently under one request-wide budget. A pane
 that does not finish within that budget reports runtime `unknown`, refuses
@@ -219,6 +231,14 @@ administrator's durable inbox. Older daemons omit it and clients read zero.
 `blocked_notifications` is a bounded body-free sample of pre-write failures.
 `blocked_notifications_total` is the complete count, so omitted sample rows are
 visible without making normal status output grow with the journal.
+
+### health.snapshot
+
+`health.snapshot` accepts no parameters. It returns the same `StatusResult`
+shape as `status`, but reads only the daemon's last committed projection. It
+does not capture panes, recompute detection, append facts, acknowledge
+delivery, or schedule work. Operational diagnostics use this method so health
+inspection remains read-only.
 
 ### daemon.quiesce
 

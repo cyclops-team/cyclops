@@ -36,6 +36,10 @@ use crate::copy;
 use crate::hash::fnv64;
 use crate::render;
 use crate::style::Style;
+use cyclops_state::{
+    DirectoryInspection, InspectedEntry, InspectedKind, InspectionLimits, LinkInspection,
+    StateInspector,
+};
 
 /// The installer's defaults (scripts/install.sh:26-27), restated because
 /// the binary cannot read that file at runtime: change them together.
@@ -273,7 +277,7 @@ impl Drop for Scratch {
     }
 }
 
-fn random_hex() -> Result<String, String> {
+pub(crate) fn random_hex() -> Result<String, String> {
     let mut bytes = [0_u8; 16];
     File::open("/dev/urandom")
         .and_then(|mut file| file.read_exact(&mut bytes))
@@ -355,6 +359,51 @@ const PAIR_DESCRIPTOR: &str = "state.json";
 const PAIR_OWNER: &str = ".owner";
 const PAIR_LEASE: &str = ".lease";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpdateBoundary {
+    PairStoreRootCreated,
+    PairStoreOwnerWritten,
+    PairStoreLeaseCreated,
+    PairStorePairsCreated,
+    PairStoreSelectionsCreated,
+    PairDirectoryCreated,
+    ClientCopied,
+    DaemonCopied,
+    PairPublished,
+    SelectionDirectoryCreated,
+    ClientSelectionLinked,
+    DaemonSelectionLinked,
+    SelectionDescriptorWritten,
+    SelectionPublished,
+    SelectorTemporaryCreated,
+    SelectorCommitted,
+    SelectorPublished,
+    PublicDaemonTemporaryCreated,
+    PublicDaemonCommitted,
+    PublicDaemonPublished,
+    PublicClientTemporaryCreated,
+    PublicClientCommitted,
+    PublicClientPublished,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CRASH_AT_UPDATE_BOUNDARY: std::cell::Cell<Option<UpdateBoundary>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+fn crossed_update_boundary(boundary: UpdateBoundary) {
+    #[cfg(test)]
+    CRASH_AT_UPDATE_BOUNDARY.with(|selected| {
+        if selected.get() == Some(boundary) {
+            std::panic::panic_any(boundary);
+        }
+    });
+    #[cfg(not(test))]
+    let _ = boundary;
+}
+
 struct PairStore {
     prefix: PathBuf,
     root: PathBuf,
@@ -379,6 +428,8 @@ struct Selection {
     legacy_active: bool,
     active_proof: Option<PairProof>,
     known_good_proof: Option<PairProof>,
+    active_replay: Option<ReplayAttestation>,
+    known_good_replay: Option<ReplayAttestation>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -388,6 +439,16 @@ struct PairProof {
     cyclopsd_sha256: String,
 }
 
+/// Durable evidence that one exact pair booted one private state snapshot.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ReplayAttestation {
+    schema: u32,
+    pair: PairProof,
+    snapshot_sha256: String,
+    snapshot_entries: u64,
+    snapshot_bytes: u64,
+}
+
 /// Read-only rollback proof consumed by health reporting.
 #[derive(Debug)]
 pub(crate) struct InstalledPairDescriptor {
@@ -395,67 +456,362 @@ pub(crate) struct InstalledPairDescriptor {
     pub(crate) active_pair: PathBuf,
     pub(crate) known_good_pair: PathBuf,
     pub(crate) active_identity: Option<String>,
-    pub(crate) known_good_identity: String,
+    pub(crate) known_good_identity: Option<String>,
     pub(crate) active_build: Option<String>,
-    pub(crate) known_good_build: String,
+    pub(crate) known_good_build: Option<String>,
+    pub(crate) active_replay_attested: bool,
+    pub(crate) known_good_replay_attested: bool,
+    pub(crate) known_good_replay_snapshot: Option<String>,
+    pub(crate) proof_unproven: bool,
     pub(crate) rollback_safe: bool,
 }
 
-/// Inspect the selected pair under the same kernel lease update uses.
+#[derive(Debug)]
+pub(crate) enum InstalledPairInspectionError {
+    ConcurrentChange(String),
+    Invalid(String),
+}
+
+impl From<String> for InstalledPairInspectionError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+impl std::fmt::Display for InstalledPairInspectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConcurrentChange(message) | Self::Invalid(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum PairStoreOpenError {
+    UpdateActive(String),
+    Invalid(String),
+}
+
+impl From<String> for PairStoreOpenError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+impl std::fmt::Display for PairStoreOpenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UpdateActive(message) | Self::Invalid(message) => formatter.write_str(message),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_PAIR_INSPECTION_RECHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn before_pair_inspection_recheck() {
+    BEFORE_PAIR_INSPECTION_RECHECK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn before_pair_inspection_recheck() {}
+
+/// Inspect one immutable selected-pair snapshot without taking the updater lease.
 pub(crate) fn installed_pair_descriptor(
     prefix: &Path,
-) -> Result<Option<InstalledPairDescriptor>, String> {
-    let Some(store) = PairStore::open_existing(prefix)? else {
+) -> Result<Option<InstalledPairDescriptor>, InstalledPairInspectionError> {
+    let root = prefix.join(PAIR_ROOT);
+    let Some(inspector) = StateInspector::open_existing(&root)
+        .map_err(|error| InstalledPairInspectionError::Invalid(error.to_string()))?
+    else {
         return Ok(None);
     };
-    let selection = store
-        .selection_descriptor()?
-        .ok_or_else(|| "the managed pair store has no active selector".to_string())?;
-    let active_pair = store.root.join(&selection.active);
-    let known_good_pair = store.root.join(&selection.known_good);
+    let selector = inspector
+        .read_link(Path::new(ACTIVE_SELECTOR), 512)
+        .map_err(|error| InstalledPairInspectionError::Invalid(error.to_string()))?
+        .ok_or_else(|| {
+            InstalledPairInspectionError::Invalid(
+                "the managed pair store has no active selector".to_string(),
+            )
+        })?;
+    let result = inspect_installed_pair_snapshot(&inspector, &selector);
+    before_pair_inspection_recheck();
+    let root_matches = inspector.path_matches_held_root().unwrap_or(false);
+    let selector_matches = inspector
+        .read_link(Path::new(ACTIVE_SELECTOR), 512)
+        .ok()
+        .flatten()
+        .as_ref()
+        == Some(&selector);
+    if !root_matches || !selector_matches {
+        return Err(InstalledPairInspectionError::ConcurrentChange(
+            "the managed pair selection changed during health inspection".to_string(),
+        ));
+    }
+    result
+        .map(Some)
+        .map_err(InstalledPairInspectionError::Invalid)
+}
+
+fn inspect_installed_pair_snapshot(
+    inspector: &StateInspector,
+    selector: &LinkInspection,
+) -> Result<InstalledPairDescriptor, String> {
+    require_inspected_directory(inspector.root(), 0o700, "pair store")?;
+    let owner = inspector
+        .read_file(Path::new(PAIR_OWNER), 64)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the pair store has no ownership marker".to_string())?;
+    require_inspected_regular(&owner.entry, 0o600, "pair owner marker")?;
+    let owner = std::str::from_utf8(&owner.bytes)
+        .map_err(|_| "the pair owner marker is not UTF-8".to_string())?;
+    if owner != unsafe { libc::geteuid() }.to_string() {
+        return Err("pair store ownership marker does not match this user".to_string());
+    }
+    let lease = inspector
+        .read_file(Path::new(PAIR_LEASE), 1)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the pair store has no updater lease file".to_string())?;
+    require_inspected_regular(&lease.entry, 0o600, "pair updater lease")?;
+
+    let target = selector
+        .target
+        .to_str()
+        .ok_or_else(|| "the active selector is not UTF-8".to_string())?;
+    validate_selection_target(target)?;
+    let selection_directory = inspector
+        .inspect_directory(Path::new(target), InspectionLimits::default())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the active selection directory is missing".to_string())?;
+    require_selection_snapshot_layout(&selection_directory)?;
+    let descriptor_relative = Path::new(target).join(PAIR_DESCRIPTOR);
+    let descriptor = inspector
+        .read_file(&descriptor_relative, 1024 * 1024)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "the selected pair descriptor is missing".to_string())?;
+    require_inspected_regular(&descriptor.entry, 0o600, "selected pair descriptor")?;
+    if descriptor.truncated {
+        return Err("the selected pair descriptor exceeds its read bound".to_string());
+    }
+    let selection = decode_selection(target, &descriptor.bytes)?;
+    for name in ["cyclops", "cyclopsd"] {
+        let selected = inspector
+            .read_link(&Path::new(target).join(name), 512)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("selected {name} link is missing"))?;
+        let expected = PathBuf::from("../..").join(&selection.active).join(name);
+        if selected.target != expected {
+            return Err(format!("selected {name} does not name the active pair"));
+        }
+    }
+
+    let active_pair = inspector.path().join(&selection.active);
+    let known_good_pair = inspector.path().join(&selection.known_good);
     let active_proof = selection.active_proof.clone();
-    let known_good_proof = selection.known_good_proof.clone().ok_or_else(|| {
-        "the selected pair predates recorded build identity; run one update before trusting rollback"
-            .to_string()
-    })?;
-    if !selection.legacy_active && active_proof.is_none() {
-        return Err(
-            "the active pair does not record its build identity; rollback is unproven".to_string(),
-        );
-    }
+    let known_good_proof = selection.known_good_proof.clone();
+    let proof_unproven =
+        known_good_proof.is_none() || (!selection.legacy_active && active_proof.is_none());
     if let Some(proof) = active_proof.as_ref() {
-        verify_recorded_pair(&active_pair, proof)?;
+        verify_recorded_pair_snapshot(inspector, &selection.active, proof)?;
     }
-    verify_recorded_pair(&known_good_pair, &known_good_proof)?;
+    if let Some(proof) = known_good_proof.as_ref() {
+        verify_recorded_pair_snapshot(inspector, &selection.known_good, proof)?;
+    }
+    if let Some(attestation) = selection.active_replay.as_ref() {
+        let proof = active_proof.as_ref().ok_or_else(|| {
+            "the active replay attestation has no recorded pair identity".to_string()
+        })?;
+        verify_replay_attestation(attestation, proof)?;
+    }
+    if let Some(attestation) = selection.known_good_replay.as_ref() {
+        let proof = known_good_proof.as_ref().ok_or_else(|| {
+            "the known-good replay attestation has no recorded pair identity".to_string()
+        })?;
+        verify_replay_attestation(attestation, proof)?;
+    }
     let active_identity = active_proof.as_ref().map(|proof| proof.identity.clone());
-    let known_good_identity = known_good_proof.identity;
+    let known_good_identity = known_good_proof.map(|proof| proof.identity);
     let active_build = active_identity.as_deref().map(identity_build).transpose()?;
-    let known_good_build = identity_build(&known_good_identity)?;
-    Ok(Some(InstalledPairDescriptor {
-        selection: store.root.join(&selection.id),
+    let known_good_build = known_good_identity
+        .as_deref()
+        .map(identity_build)
+        .transpose()?;
+    inspector
+        .inspect_bound_directory(&selection_directory.directory, InspectionLimits::default())
+        .map_err(|error| error.to_string())?;
+    Ok(InstalledPairDescriptor {
+        selection: inspector.path().join(&selection.id),
         active_pair,
         known_good_pair,
         active_identity,
         known_good_identity,
         active_build,
         known_good_build,
-        rollback_safe: !selection.legacy_active && selection.active != selection.known_good,
-    }))
+        active_replay_attested: selection.active_replay.is_some(),
+        known_good_replay_attested: selection.known_good_replay.is_some(),
+        known_good_replay_snapshot: selection
+            .known_good_replay
+            .map(|attestation| attestation.snapshot_sha256),
+        proof_unproven,
+        rollback_safe: !proof_unproven
+            && !selection.legacy_active
+            && selection.active != selection.known_good,
+    })
+}
+
+fn require_selection_snapshot_layout(snapshot: &DirectoryInspection) -> Result<(), String> {
+    require_inspected_directory(&snapshot.directory, 0o700, "selection directory")?;
+    if snapshot.truncated || snapshot.entries.len() != 3 {
+        return Err("the selected pair directory has unexpected entries".to_string());
+    }
+    for name in ["cyclops", "cyclopsd", PAIR_DESCRIPTOR] {
+        if !snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.path.file_name() == Some(std::ffi::OsStr::new(name)))
+        {
+            return Err(format!("the selected pair directory is missing {name}"));
+        }
+    }
+    Ok(())
+}
+
+fn verify_recorded_pair_snapshot(
+    inspector: &StateInspector,
+    target: &str,
+    proof: &PairProof,
+) -> Result<(), String> {
+    validate_pair_target(target)?;
+    let snapshot = inspector
+        .inspect_directory(Path::new(target), InspectionLimits::default())
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "selected pair {} is missing",
+                inspector.path().join(target).display()
+            )
+        })?;
+    require_inspected_directory(&snapshot.directory, 0o700, "selected pair")?;
+    if snapshot.truncated || snapshot.entries.len() != 2 {
+        return Err(format!(
+            "selected pair {} has unexpected entries",
+            inspector.path().join(target).display()
+        ));
+    }
+    let mut digests = Vec::with_capacity(2);
+    for name in ["cyclops", "cyclopsd"] {
+        let expected = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.path.file_name() == Some(std::ffi::OsStr::new(name)))
+            .ok_or_else(|| format!("selected pair is missing {name}"))?;
+        require_inspected_executable(expected, name)?;
+        let relative = Path::new(target).join(name);
+        let (observed, digest) = inspector
+            .inspect_file_with(&relative, MAX_PAIR_BINARY_BYTES, |file| {
+                let mut hasher = Sha256::new();
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    let read = file.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..read]);
+                }
+                Ok(format!("{:x}", hasher.finalize()))
+            })
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("selected pair is missing {name}"))?;
+        if &observed != expected {
+            return Err(format!("selected pair {name} changed during inspection"));
+        }
+        digests.push(digest);
+    }
+    inspector
+        .inspect_bound_directory(&snapshot.directory, InspectionLimits::default())
+        .map_err(|error| error.to_string())?;
+    if digests[0] != proof.cyclops_sha256 || digests[1] != proof.cyclopsd_sha256 {
+        return Err(format!(
+            "selected pair {} changed after its install proof was recorded",
+            inspector.path().join(target).display()
+        ));
+    }
+    identity_build(&proof.identity)?;
+    Ok(())
+}
+
+fn require_inspected_directory(
+    entry: &InspectedEntry,
+    mode: u32,
+    kind: &str,
+) -> Result<(), String> {
+    if entry.kind != InspectedKind::Directory
+        || entry.uid != unsafe { libc::geteuid() }
+        || entry.mode & 0o777 != mode
+    {
+        return Err(format!(
+            "{} is not an owner-only {kind}",
+            entry.path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn require_inspected_regular(entry: &InspectedEntry, mode: u32, kind: &str) -> Result<(), String> {
+    if entry.kind != InspectedKind::RegularFile
+        || entry.uid != unsafe { libc::geteuid() }
+        || entry.links != 1
+        || entry.mode & 0o777 != mode
+    {
+        return Err(format!(
+            "{} is not one owner-controlled {kind}",
+            entry.path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn require_inspected_executable(entry: &InspectedEntry, name: &str) -> Result<(), String> {
+    if entry.kind != InspectedKind::RegularFile
+        || entry.uid != unsafe { libc::geteuid() }
+        || entry.links != 1
+        || entry.mode & 0o100 == 0
+        || entry.mode & 0o022 != 0
+    {
+        return Err(format!(
+            "{} is not one owner-controlled executable {name}",
+            entry.path.display()
+        ));
+    }
+    Ok(())
 }
 
 impl PairStore {
     fn open(prefix: &Path) -> Result<Self, String> {
-        Self::open_inner(prefix, true)?.ok_or_else(|| "pair store was not created".to_string())
+        Self::open_inner(prefix, true)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "pair store was not created".to_string())
     }
 
-    fn open_existing(prefix: &Path) -> Result<Option<Self>, String> {
+    fn open_existing(prefix: &Path) -> Result<Option<Self>, PairStoreOpenError> {
         Self::open_inner(prefix, false)
     }
 
-    fn open_inner(prefix: &Path, create: bool) -> Result<Option<Self>, String> {
+    fn open_inner(prefix: &Path, create: bool) -> Result<Option<Self>, PairStoreOpenError> {
         let prefix = std::fs::canonicalize(prefix)
             .map_err(|error| format!("resolve install prefix {}: {error}", prefix.display()))?;
         let root = prefix.join(PAIR_ROOT);
+        let mut root_created = false;
         match std::fs::symlink_metadata(&root) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create => {
@@ -467,23 +823,48 @@ impl PairStore {
                 builder
                     .create(&root)
                     .map_err(|error| format!("create pair store {}: {error}", root.display()))?;
-                write_new(
-                    &root.join(PAIR_OWNER),
-                    unsafe { libc::geteuid() }.to_string().as_bytes(),
-                    0o600,
-                )?;
+                root_created = true;
+                sync_directory(&prefix)?;
+                crossed_update_boundary(UpdateBoundary::PairStoreRootCreated);
             }
-            Err(error) => return Err(format!("inspect pair store {}: {error}", root.display())),
+            Err(error) => {
+                return Err(format!("inspect pair store {}: {error}", root.display()).into())
+            }
         }
         require_owner_directory(&root)?;
         let owner_marker = root.join(PAIR_OWNER);
+        if create
+            && std::fs::symlink_metadata(&owner_marker)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            if !read_directory(&root, "unfinished pair store")?.is_empty() {
+                return Err("an unfinished pair store has unexpected entries"
+                    .to_string()
+                    .into());
+            }
+            write_new(
+                &owner_marker,
+                unsafe { libc::geteuid() }.to_string().as_bytes(),
+                0o600,
+            )?;
+            sync_directory(&root)?;
+            crossed_update_boundary(UpdateBoundary::PairStoreOwnerWritten);
+        } else if root_created {
+            return Err("new pair store did not create its owner marker"
+                .to_string()
+                .into());
+        }
         require_owner_regular_file(&owner_marker, 0o600)?;
         let owner = std::fs::read_to_string(&owner_marker)
             .map_err(|error| format!("read pair owner marker: {error}"))?;
         if owner != unsafe { libc::geteuid() }.to_string() {
-            return Err("pair store ownership marker does not match this user".to_string());
+            return Err("pair store ownership marker does not match this user"
+                .to_string()
+                .into());
         }
         let lease_path = root.join(PAIR_LEASE);
+        let lease_missing = std::fs::symlink_metadata(&lease_path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
         let lease = OpenOptions::new()
             .read(true)
             .write(true)
@@ -493,11 +874,15 @@ impl PairStore {
             .open(&lease_path)
             .map_err(|error| format!("open pair update lease: {error}"))?;
         require_owner_regular_file(&lease_path, 0o600)?;
+        if lease_missing {
+            sync_directory(&root)?;
+            crossed_update_boundary(UpdateBoundary::PairStoreLeaseCreated);
+        }
         if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(format!(
+            return Err(PairStoreOpenError::UpdateActive(format!(
                 "another Cyclops update holds the pair store lease: {}",
                 std::io::Error::last_os_error()
-            ));
+            )));
         }
         let lease = ExclusiveLease(lease);
         let lease_metadata = lease
@@ -519,10 +904,16 @@ impl PairStore {
                         directory.display()
                     )
                 })?;
+                sync_directory(&root)?;
+                crossed_update_boundary(if name == PAIRS_DIR {
+                    UpdateBoundary::PairStorePairsCreated
+                } else {
+                    UpdateBoundary::PairStoreSelectionsCreated
+                });
             }
             require_owner_directory(&directory)?;
         }
-        Ok(Some(Self {
+        let store = Self {
             prefix,
             root,
             root_device: root_metadata.dev(),
@@ -532,7 +923,120 @@ impl PairStore {
             lease_device: lease_metadata.dev(),
             lease_inode: lease_metadata.ino(),
             _lease: lease,
-        }))
+        };
+        if create {
+            store.recover_interrupted_update()?;
+        }
+        Ok(Some(store))
+    }
+
+    /// Finish or remove only validated residue from an interrupted update.
+    fn recover_interrupted_update(&self) -> Result<(), String> {
+        self.require_root()?;
+        self.remove_temporary_selectors()?;
+        let selected = self.selection()?;
+        if selected.is_some() {
+            self.repair_public_links()?;
+        }
+        let active = selected.as_ref().map(|selection| selection.active.as_str());
+        let known_good = selected
+            .as_ref()
+            .map(|selection| selection.known_good.as_str());
+        let selected_id = selected.as_ref().map(|selection| selection.id.as_str());
+
+        for entry in read_directory(&self.root.join(SELECTIONS_DIR), "selection store")? {
+            let name = entry.file_name();
+            if !valid_random_name(&name, "selection.") {
+                return Err(format!(
+                    "invalid selection directory {}",
+                    entry.path().display()
+                ));
+            }
+            let target = format!("{SELECTIONS_DIR}/{}", name.to_string_lossy());
+            if selected_id != Some(target.as_str()) {
+                remove_selection_residue_directory(&entry.path())?;
+            }
+        }
+        for entry in read_directory(&self.root.join(PAIRS_DIR), "pair store")? {
+            let name = entry.file_name();
+            if !valid_random_name(&name, "pair.") {
+                return Err(format!("invalid pair directory {}", entry.path().display()));
+            }
+            let target = format!("{PAIRS_DIR}/{}", name.to_string_lossy());
+            if active != Some(target.as_str()) && known_good != Some(target.as_str()) {
+                remove_pair_residue_directory(&entry.path())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_temporary_selectors(&self) -> Result<(), String> {
+        for entry in read_directory(&self.root, "pair store")? {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(nonce) = name.strip_prefix(".active.") else {
+                continue;
+            };
+            if nonce.len() != 32 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(format!(
+                    "invalid temporary selector {}",
+                    entry.path().display()
+                ));
+            }
+            let metadata = std::fs::symlink_metadata(entry.path())
+                .map_err(|error| format!("inspect temporary selector: {error}"))?;
+            if !metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "temporary selector {} is not a symlink",
+                    entry.path().display()
+                ));
+            }
+            let target = std::fs::read_link(entry.path())
+                .map_err(|error| format!("read temporary selector: {error}"))?;
+            let target = target
+                .to_str()
+                .ok_or_else(|| "temporary selector target is not UTF-8".to_string())?;
+            validate_selection_target(target)?;
+            std::fs::remove_file(entry.path())
+                .map_err(|error| format!("remove temporary selector: {error}"))?;
+        }
+        for binary in ["cyclopsd", "cyclops"] {
+            let prefix = format!(".{binary}.");
+            for entry in read_directory(&self.prefix, "install prefix")? {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                let Some(nonce) = name.strip_prefix(&prefix) else {
+                    continue;
+                };
+                if nonce.len() != 32 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(format!(
+                        "invalid temporary public selector {}",
+                        entry.path().display()
+                    ));
+                }
+                let metadata = std::fs::symlink_metadata(entry.path())
+                    .map_err(|error| format!("inspect temporary public selector: {error}"))?;
+                let expected = PathBuf::from(PAIR_ROOT).join(ACTIVE_SELECTOR).join(binary);
+                if !metadata.file_type().is_symlink()
+                    || std::fs::read_link(entry.path())
+                        .map_err(|error| format!("read temporary public selector: {error}"))?
+                        != expected
+                {
+                    return Err(format!(
+                        "temporary public selector {} is not managed",
+                        entry.path().display()
+                    ));
+                }
+                std::fs::remove_file(entry.path())
+                    .map_err(|error| format!("remove temporary public selector: {error}"))?;
+            }
+        }
+        sync_directory(&self.root)?;
+        sync_directory(&self.prefix)
     }
 
     fn require_root(&self) -> Result<(), String> {
@@ -568,12 +1072,21 @@ impl PairStore {
         builder
             .create(&destination)
             .map_err(|error| format!("create staged pair: {error}"))?;
+        crossed_update_boundary(UpdateBoundary::PairDirectoryCreated);
         let staged = (|| {
             for name in ["cyclops", "cyclopsd"] {
                 copy_executable(&source.join(name), &destination.join(name))?;
+                crossed_update_boundary(if name == "cyclops" {
+                    UpdateBoundary::ClientCopied
+                } else {
+                    UpdateBoundary::DaemonCopied
+                });
             }
             prove_pair(&destination)?;
-            sync_directory(&destination)
+            sync_directory(&destination)?;
+            sync_directory(&self.root.join(PAIRS_DIR))?;
+            crossed_update_boundary(UpdateBoundary::PairPublished);
+            Ok(())
         })();
         match staged {
             Ok(()) => Ok(format!("{PAIRS_DIR}/{pair_id}")),
@@ -595,11 +1108,20 @@ impl PairStore {
         builder
             .create(&destination)
             .map_err(|error| format!("create legacy migration pair: {error}"))?;
+        crossed_update_boundary(UpdateBoundary::PairDirectoryCreated);
         let staged = (|| {
             for name in ["cyclops", "cyclopsd"] {
                 copy_executable(&source.join(name), &destination.join(name))?;
+                crossed_update_boundary(if name == "cyclops" {
+                    UpdateBoundary::ClientCopied
+                } else {
+                    UpdateBoundary::DaemonCopied
+                });
             }
-            sync_directory(&destination)
+            sync_directory(&destination)?;
+            sync_directory(&self.root.join(PAIRS_DIR))?;
+            crossed_update_boundary(UpdateBoundary::PairPublished);
+            Ok(())
         })();
         match staged {
             Ok(()) => Ok(format!("{PAIRS_DIR}/{pair_id}")),
@@ -680,28 +1202,44 @@ impl PairStore {
         }
     }
 
-    fn activate(&self, candidate: &str) -> Result<Option<Selection>, String> {
+    fn activate(
+        &self,
+        candidate: &str,
+        replay: ReplayAttestation,
+    ) -> Result<Option<Selection>, String> {
         self.require_root()?;
-        self.require_pair(candidate)?;
+        let candidate_proof = self.pair_proof(candidate)?;
+        verify_replay_attestation(&replay, &candidate_proof)?;
         let previous = self.selection()?;
-        if previous
-            .as_ref()
-            .is_some_and(|value| value.active == candidate)
-        {
+        if previous.as_ref().is_some_and(|value| {
+            value.active == candidate && value.active_replay == Some(replay.clone())
+        }) {
             self.require_public_links()?;
             return Ok(previous);
         }
-        let known_good = previous
+        let (known_good, known_good_replay) = previous
             .as_ref()
             .map(|value| {
                 if value.legacy_active {
-                    value.known_good.as_str()
+                    (
+                        value.known_good.clone(),
+                        if value.known_good == candidate {
+                            Some(replay.clone())
+                        } else {
+                            value.known_good_replay.clone()
+                        },
+                    )
                 } else {
-                    value.active.as_str()
+                    (value.active.clone(), value.active_replay.clone())
                 }
             })
-            .unwrap_or(candidate);
-        let selection = self.prepare_selection(candidate, known_good)?;
+            .unwrap_or_else(|| (candidate.to_string(), Some(replay.clone())));
+        let selection = self.prepare_selection_with_replays(
+            candidate,
+            &known_good,
+            Some(replay),
+            known_good_replay,
+        )?;
         self.select(&selection)?;
         if previous.is_none() {
             self.replace_public_link("cyclopsd")?;
@@ -712,9 +1250,22 @@ impl PairStore {
         Ok(previous)
     }
 
-    fn rollback(&self) -> Result<(Selection, Selection), String> {
+    fn rollback(
+        &self,
+        restored_replay: ReplayAttestation,
+    ) -> Result<(Selection, Selection), String> {
         let current = self.rollback_selection()?;
-        let restored = self.prepare_selection(&current.known_good, &current.active)?;
+        let known_good_proof = current
+            .known_good_proof
+            .as_ref()
+            .ok_or_else(|| "the known-good pair has no recorded identity".to_string())?;
+        verify_replay_attestation(&restored_replay, known_good_proof)?;
+        let restored = self.prepare_selection_with_replays(
+            &current.known_good,
+            &current.active,
+            Some(restored_replay),
+            current.active_replay.clone(),
+        )?;
         self.select(&restored)?;
         Ok((current, restored))
     }
@@ -934,13 +1485,33 @@ impl PairStore {
             .join(format!(".{ACTIVE_SELECTOR}.{}", random_hex()?));
         std::os::unix::fs::symlink(&selection.id, &temporary)
             .map_err(|error| format!("create selector {}: {error}", temporary.display()))?;
+        crossed_update_boundary(UpdateBoundary::SelectorTemporaryCreated);
         std::fs::rename(&temporary, self.root.join(ACTIVE_SELECTOR))
             .map_err(|error| format!("activate pair selector: {error}"))?;
-        sync_directory(&self.root)
+        crossed_update_boundary(UpdateBoundary::SelectorCommitted);
+        sync_directory(&self.root)?;
+        crossed_update_boundary(UpdateBoundary::SelectorPublished);
+        Ok(())
     }
 
     fn prepare_selection(&self, active: &str, known_good: &str) -> Result<Selection, String> {
-        self.prepare_selection_with_trust(active, known_good, false)
+        self.prepare_selection_with_trust(active, known_good, false, None, None)
+    }
+
+    fn prepare_selection_with_replays(
+        &self,
+        active: &str,
+        known_good: &str,
+        active_replay: Option<ReplayAttestation>,
+        known_good_replay: Option<ReplayAttestation>,
+    ) -> Result<Selection, String> {
+        self.prepare_selection_with_trust(
+            active,
+            known_good,
+            false,
+            active_replay,
+            known_good_replay,
+        )
     }
 
     fn prepare_legacy_selection(
@@ -948,7 +1519,7 @@ impl PairStore {
         active: &str,
         known_good: &str,
     ) -> Result<Selection, String> {
-        self.prepare_selection_with_trust(active, known_good, true)
+        self.prepare_selection_with_trust(active, known_good, true, None, None)
     }
 
     fn prepare_selection_with_trust(
@@ -956,6 +1527,8 @@ impl PairStore {
         active: &str,
         known_good: &str,
         legacy_active: bool,
+        active_replay: Option<ReplayAttestation>,
+        known_good_replay: Option<ReplayAttestation>,
     ) -> Result<Selection, String> {
         self.require_root()?;
         let active_proof = if legacy_active {
@@ -966,6 +1539,20 @@ impl PairStore {
             Some(self.pair_proof(active)?)
         };
         let known_good_proof = Some(self.pair_proof(known_good)?);
+        if let Some(attestation) = active_replay.as_ref() {
+            let proof = active_proof
+                .as_ref()
+                .ok_or_else(|| "a legacy active pair cannot carry replay evidence".to_string())?;
+            verify_replay_attestation(attestation, proof)?;
+        }
+        if let Some(attestation) = known_good_replay.as_ref() {
+            verify_replay_attestation(
+                attestation,
+                known_good_proof
+                    .as_ref()
+                    .expect("known-good proof is always recorded"),
+            )?;
+        }
         let id = format!("{SELECTIONS_DIR}/selection.{}", random_hex()?);
         let directory = self.root.join(&id);
         let mut builder = std::fs::DirBuilder::new();
@@ -973,6 +1560,7 @@ impl PairStore {
         builder
             .create(&directory)
             .map_err(|error| format!("create selection record: {error}"))?;
+        crossed_update_boundary(UpdateBoundary::SelectionDirectoryCreated);
         let selection = Selection {
             id,
             active: active.to_string(),
@@ -980,23 +1568,35 @@ impl PairStore {
             legacy_active,
             active_proof,
             known_good_proof,
+            active_replay,
+            known_good_replay,
         };
         for name in ["cyclops", "cyclopsd"] {
             let target = PathBuf::from("../..").join(active).join(name);
             std::os::unix::fs::symlink(target, directory.join(name))
                 .map_err(|error| format!("write selection binary {name}: {error}"))?;
+            crossed_update_boundary(if name == "cyclops" {
+                UpdateBoundary::ClientSelectionLinked
+            } else {
+                UpdateBoundary::DaemonSelectionLinked
+            });
         }
         let body = serde_json::to_vec_pretty(&serde_json::json!({
-            "schema": 2,
+            "schema": 3,
             "active": active,
             "known_good": known_good,
             "legacy_active": legacy_active,
             "active_proof": selection.active_proof.as_ref(),
             "known_good_proof": selection.known_good_proof.as_ref(),
+            "active_replay": selection.active_replay.as_ref(),
+            "known_good_replay": selection.known_good_replay.as_ref(),
         }))
         .map_err(|error| format!("encode pair descriptor: {error}"))?;
         write_new(&directory.join(PAIR_DESCRIPTOR), &body, 0o600)?;
+        crossed_update_boundary(UpdateBoundary::SelectionDescriptorWritten);
         sync_directory(&directory)?;
+        sync_directory(&self.root.join(SELECTIONS_DIR))?;
+        crossed_update_boundary(UpdateBoundary::SelectionPublished);
         self.require_selection(&selection)?;
         Ok(selection)
     }
@@ -1010,57 +1610,14 @@ impl PairStore {
         require_owner_regular_file(&descriptor, 0o600)?;
         let body = std::fs::read(&descriptor)
             .map_err(|error| format!("read selected pair descriptor: {error}"))?;
-        let value: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|error| format!("decode selected pair descriptor: {error}"))?;
-        let schema = value
-            .get("schema")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| "selected pair descriptor has no schema".to_string())?;
-        if !matches!(schema, 1 | 2) {
-            return Err("selected pair descriptor has an unsupported schema".to_string());
-        }
-        let active = value
-            .get("active")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "selected pair descriptor has no active pair".to_string())?;
-        let known_good = value
-            .get("known_good")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "selected pair descriptor has no known-good pair".to_string())?;
-        let legacy_active = value
-            .get("legacy_active")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let active_proof = value
-            .get("active_proof")
-            .filter(|value| !value.is_null())
-            .map(|value| serde_json::from_value::<PairProof>(value.clone()))
-            .transpose()
-            .map_err(|error| format!("decode active pair proof: {error}"))?;
-        let known_good_proof = value
-            .get("known_good_proof")
-            .filter(|value| !value.is_null())
-            .map(|value| serde_json::from_value::<PairProof>(value.clone()))
-            .transpose()
-            .map_err(|error| format!("decode known-good pair proof: {error}"))?;
-        if schema == 2 && (known_good_proof.is_none() || (!legacy_active && active_proof.is_none()))
-        {
-            return Err(
-                "selected pair descriptor is missing a recorded build identity".to_string(),
-            );
-        }
-        Ok(Selection {
-            id: id.to_string(),
-            active: active.to_string(),
-            known_good: known_good.to_string(),
-            legacy_active,
-            active_proof,
-            known_good_proof,
-        })
+        decode_selection(id, &body)
     }
 
     fn require_selection(&self, selection: &Selection) -> Result<(), String> {
         self.require_selection_layout(selection)?;
+        if selection.legacy_active && selection.active_replay.is_some() {
+            return Err("a legacy active pair cannot carry replay evidence".to_string());
+        }
         if !selection.legacy_active {
             let proof = self.pair_proof(&selection.active)?;
             if selection
@@ -1070,6 +1627,9 @@ impl PairStore {
             {
                 return Err("active pair identity does not match its selection record".to_string());
             }
+            if let Some(attestation) = selection.active_replay.as_ref() {
+                verify_replay_attestation(attestation, &proof)?;
+            }
         }
         let proof = self.pair_proof(&selection.known_good)?;
         if selection
@@ -1078,6 +1638,9 @@ impl PairStore {
             .is_some_and(|recorded| recorded != &proof)
         {
             return Err("known-good pair identity does not match its selection record".to_string());
+        }
+        if let Some(attestation) = selection.known_good_replay.as_ref() {
+            verify_replay_attestation(attestation, &proof)?;
         }
         Ok(())
     }
@@ -1120,9 +1683,25 @@ impl PairStore {
         let target = PathBuf::from(PAIR_ROOT).join(ACTIVE_SELECTOR).join(name);
         std::os::unix::fs::symlink(&target, &temporary)
             .map_err(|error| format!("create public {name} selector: {error}"))?;
+        crossed_update_boundary(if name == "cyclopsd" {
+            UpdateBoundary::PublicDaemonTemporaryCreated
+        } else {
+            UpdateBoundary::PublicClientTemporaryCreated
+        });
         std::fs::rename(&temporary, self.prefix.join(name))
             .map_err(|error| format!("publish {name}: {error}"))?;
-        sync_directory(&self.prefix)
+        crossed_update_boundary(if name == "cyclopsd" {
+            UpdateBoundary::PublicDaemonCommitted
+        } else {
+            UpdateBoundary::PublicClientCommitted
+        });
+        sync_directory(&self.prefix)?;
+        crossed_update_boundary(if name == "cyclopsd" {
+            UpdateBoundary::PublicDaemonPublished
+        } else {
+            UpdateBoundary::PublicClientPublished
+        });
+        Ok(())
     }
 
     fn require_public_links(&self) -> Result<(), String> {
@@ -1176,6 +1755,67 @@ impl PairStore {
         }
         self.require_public_links()
     }
+}
+
+fn decode_selection(id: &str, body: &[u8]) -> Result<Selection, String> {
+    let value: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|error| format!("decode selected pair descriptor: {error}"))?;
+    let schema = value
+        .get("schema")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "selected pair descriptor has no schema".to_string())?;
+    if !matches!(schema, 1..=3) {
+        return Err("selected pair descriptor has an unsupported schema".to_string());
+    }
+    let active = value
+        .get("active")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "selected pair descriptor has no active pair".to_string())?;
+    let known_good = value
+        .get("known_good")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "selected pair descriptor has no known-good pair".to_string())?;
+    let legacy_active = value
+        .get("legacy_active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let active_proof = value
+        .get("active_proof")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value::<PairProof>(value.clone()))
+        .transpose()
+        .map_err(|error| format!("decode active pair proof: {error}"))?;
+    let known_good_proof = value
+        .get("known_good_proof")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value::<PairProof>(value.clone()))
+        .transpose()
+        .map_err(|error| format!("decode known-good pair proof: {error}"))?;
+    let active_replay = value
+        .get("active_replay")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value::<ReplayAttestation>(value.clone()))
+        .transpose()
+        .map_err(|error| format!("decode active replay attestation: {error}"))?;
+    let known_good_replay = value
+        .get("known_good_replay")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value::<ReplayAttestation>(value.clone()))
+        .transpose()
+        .map_err(|error| format!("decode known-good replay attestation: {error}"))?;
+    if schema >= 2 && (known_good_proof.is_none() || (!legacy_active && active_proof.is_none())) {
+        return Err("selected pair descriptor is missing a recorded build identity".to_string());
+    }
+    Ok(Selection {
+        id: id.to_string(),
+        active: active.to_string(),
+        known_good: known_good.to_string(),
+        legacy_active,
+        active_proof,
+        known_good_proof,
+        active_replay,
+        known_good_replay,
+    })
 }
 
 fn validate_pair_target(target: &str) -> Result<(), String> {
@@ -1429,16 +2069,42 @@ fn validate_selection_directory(directory: &Path) -> Result<(), String> {
 
 fn remove_selection_directory(directory: &Path) -> Result<(), String> {
     validate_selection_directory(directory)?;
-    for name in ["cyclops", "cyclopsd"] {
-        let path = directory.join(name);
-        std::fs::remove_file(&path)
-            .map_err(|error| format!("remove stale selection {}: {error}", path.display()))?;
+    remove_selection_residue_directory(directory)
+}
+
+fn remove_selection_residue_directory(directory: &Path) -> Result<(), String> {
+    require_owner_directory(directory)?;
+    let entries = read_directory(directory, "selection residue")?;
+    for entry in &entries {
+        let name = entry.file_name();
+        if name == std::ffi::OsStr::new("cyclops") || name == std::ffi::OsStr::new("cyclopsd") {
+            let metadata = std::fs::symlink_metadata(entry.path())
+                .map_err(|error| format!("inspect selection residue: {error}"))?;
+            if !metadata.file_type().is_symlink() {
+                return Err(format!(
+                    "selection residue {} is not a symlink",
+                    entry.path().display()
+                ));
+            }
+        } else if name == std::ffi::OsStr::new(PAIR_DESCRIPTOR) {
+            require_owner_regular_file(&entry.path(), 0o600)?;
+        } else {
+            return Err(format!(
+                "selection residue contains unmanaged entry {}",
+                entry.path().display()
+            ));
+        }
     }
-    let descriptor = directory.join(PAIR_DESCRIPTOR);
-    std::fs::remove_file(&descriptor)
-        .map_err(|error| format!("remove stale selection descriptor: {error}"))?;
+    for entry in entries {
+        std::fs::remove_file(entry.path())
+            .map_err(|error| format!("remove selection residue: {error}"))?;
+    }
+    let parent = directory
+        .parent()
+        .ok_or_else(|| "selection residue has no parent directory".to_string())?;
     std::fs::remove_dir(directory)
-        .map_err(|error| format!("remove stale selection directory: {error}"))
+        .map_err(|error| format!("remove selection residue directory: {error}"))?;
+    sync_directory(parent)
 }
 
 fn copy_executable(source: &Path, destination: &Path) -> Result<(), String> {
@@ -1506,6 +2172,32 @@ fn verify_recorded_pair(directory: &Path, proof: &PairProof) -> Result<(), Strin
         ));
     }
     identity_build(&proof.identity)?;
+    Ok(())
+}
+
+fn verify_replay_attestation(
+    attestation: &ReplayAttestation,
+    proof: &PairProof,
+) -> Result<(), String> {
+    if attestation.schema != 1 {
+        return Err("replay attestation has an unsupported schema".to_string());
+    }
+    if &attestation.pair != proof {
+        return Err("replay attestation does not name the recorded pair".to_string());
+    }
+    if attestation.snapshot_sha256.len() != 64
+        || !attestation
+            .snapshot_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("replay attestation has an invalid snapshot identity".to_string());
+    }
+    if attestation.snapshot_entries > MAX_REPLAY_ENTRIES as u64
+        || attestation.snapshot_bytes > MAX_REPLAY_TOTAL_BYTES
+    {
+        return Err("replay attestation exceeds the replay snapshot bounds".to_string());
+    }
     Ok(())
 }
 
@@ -1692,7 +2384,8 @@ fn prove_candidate_replay(
     pair: &Path,
     source_home: &Path,
     scratch: &Scratch,
-) -> Result<String, String> {
+) -> Result<ReplayAttestation, String> {
+    let pair_proof = prove_pair(pair)?;
     let probe_home = scratch.path().join("r");
     if source_home.exists() {
         copy_replay_state(source_home, &probe_home)?;
@@ -1704,6 +2397,7 @@ fn prove_candidate_replay(
             .map_err(|error| format!("create replay home: {error}"))?;
     }
     isolate_probe_config(&probe_home)?;
+    let snapshot = replay_snapshot_identity(&probe_home)?;
     let log_path = scratch.path().join("candidate-replay.log");
     let stdout = OpenOptions::new()
         .write(true)
@@ -1769,7 +2463,15 @@ fn prove_candidate_replay(
     if !status.success() {
         return Err(format!("candidate replay daemon stopped with {status}"));
     }
-    Ok(build)
+    let attestation = ReplayAttestation {
+        schema: 1,
+        pair: pair_proof,
+        snapshot_sha256: snapshot.sha256,
+        snapshot_entries: snapshot.entries,
+        snapshot_bytes: snapshot.bytes,
+    };
+    verify_replay_attestation(&attestation, &attestation.pair)?;
+    Ok(attestation)
 }
 
 /// Reap a private replay daemon on every return path.
@@ -1833,6 +2535,127 @@ fn copy_replay_state(source: &Path, destination: &Path) -> Result<(), String> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(format!("inspect replay state {}: {error}", child.display())),
         }
+    }
+    Ok(())
+}
+
+struct ReplaySnapshotIdentity {
+    sha256: String,
+    entries: u64,
+    bytes: u64,
+}
+
+/// Hash the exact private boot inputs without retaining names or contents.
+fn replay_snapshot_identity(root: &Path) -> Result<ReplaySnapshotIdentity, String> {
+    require_owner_directory(root)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"cyclops-replay-snapshot-v1\0");
+    let mut entries = 0_u64;
+    let mut bytes = 0_u64;
+    hash_replay_tree(root, Path::new(""), &mut hasher, &mut entries, &mut bytes)?;
+    Ok(ReplaySnapshotIdentity {
+        sha256: format!("{:x}", hasher.finalize()),
+        entries,
+        bytes,
+    })
+}
+
+fn hash_replay_tree(
+    directory: &Path,
+    relative: &Path,
+    hasher: &mut Sha256,
+    entries: &mut u64,
+    bytes: &mut u64,
+) -> Result<(), String> {
+    require_owner_directory(directory)?;
+    let mut children = read_directory(directory, "replay snapshot")?;
+    children.sort_by(|left, right| {
+        left.file_name()
+            .as_bytes()
+            .cmp(right.file_name().as_bytes())
+    });
+    for child in children {
+        *entries = entries
+            .checked_add(1)
+            .ok_or_else(|| "replay snapshot entry count overflowed".to_string())?;
+        if *entries > MAX_REPLAY_ENTRIES as u64 {
+            return Err("state snapshot exceeds replay probe bounds".to_string());
+        }
+        let child_relative = relative.join(child.file_name());
+        let path_bytes = child_relative.as_os_str().as_bytes();
+        let metadata = std::fs::symlink_metadata(child.path())
+            .map_err(|error| format!("inspect replay snapshot entry: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "state snapshot refuses symlink {}",
+                child.path().display()
+            ));
+        }
+        if metadata.is_dir() {
+            hash_field(hasher, b"d");
+            hash_field(hasher, path_bytes);
+            hash_replay_tree(&child.path(), &child_relative, hasher, entries, bytes)?;
+            continue;
+        }
+        if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(format!(
+                "state snapshot refuses linked or special file {}",
+                child.path().display()
+            ));
+        }
+        require_unlinked_regular_file(&child.path())?;
+        if metadata.len() > MAX_REPLAY_FILE_BYTES {
+            return Err(format!(
+                "replay file {} exceeds the {} byte bound",
+                child.path().display(),
+                MAX_REPLAY_FILE_BYTES
+            ));
+        }
+        *bytes = bytes
+            .checked_add(metadata.len())
+            .ok_or_else(|| "replay snapshot byte count overflowed".to_string())?;
+        if *bytes > MAX_REPLAY_TOTAL_BYTES {
+            return Err(format!(
+                "replay state exceeds the {} byte total bound",
+                MAX_REPLAY_TOTAL_BYTES
+            ));
+        }
+        hash_field(hasher, b"f");
+        hash_field(hasher, path_bytes);
+        hash_field(hasher, &metadata.len().to_be_bytes());
+        hash_regular_file(&child.path(), hasher)?;
+    }
+    Ok(())
+}
+
+fn hash_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+fn hash_regular_file(path: &Path, hasher: &mut Sha256) -> Result<(), String> {
+    let before = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect {}: {error}", path.display()))?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("open {}: {error}", path.display()))?;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let after = file
+        .metadata()
+        .map_err(|error| format!("recheck {}: {error}", path.display()))?;
+    if !metadata_unchanged(&before, &after) {
+        return Err(format!("{} changed while it was hashed", path.display()));
     }
     Ok(())
 }
@@ -2282,6 +3105,18 @@ fn validate_uninstall_pair(prefix: &Path) -> Result<PathBuf, String> {
     Ok(daemon)
 }
 
+fn restart_pre_activation_pair(
+    store: &PairStore,
+    prefix: &Path,
+    selected: Option<&Selection>,
+) -> Result<(), String> {
+    if selected.is_some() {
+        start_and_prove_selected(store)
+    } else {
+        start_pair_daemon(&prefix.join("cyclopsd"))
+    }
+}
+
 fn run_install_pair(source: &Path, prefix: &Path, style: &Style) -> i32 {
     let scratch = match Scratch::create() {
         Ok(scratch) => scratch,
@@ -2308,14 +3143,6 @@ fn run_install_pair(source: &Path, prefix: &Path, style: &Style) -> i32 {
         Ok(pair) => pair,
         Err(error) => {
             eprintln!("install failed: {error}");
-            return 1;
-        }
-    };
-    let build = match prove_candidate_replay(&pair, &cyclops_proto::cyclops_home(), &scratch) {
-        Ok(build) => build,
-        Err(error) => {
-            let _ = store.discard(&candidate);
-            eprintln!("install failed: candidate replay proof failed: {error}");
             return 1;
         }
     };
@@ -2352,12 +3179,39 @@ fn run_install_pair(source: &Path, prefix: &Path, style: &Style) -> i32 {
             return 1;
         }
     };
+    let replay = match prove_candidate_replay(&pair, &cyclops_proto::cyclops_home(), &scratch) {
+        Ok(replay) => replay,
+        Err(error) => {
+            if stopped.is_some() {
+                if let Err(restart_error) =
+                    restart_pre_activation_pair(&store, prefix, before_migration.as_ref())
+                {
+                    eprintln!("  previous daemon restart failed: {restart_error}");
+                }
+            }
+            let _ = store.discard(&candidate);
+            eprintln!("install failed: candidate replay proof failed: {error}");
+            return 1;
+        }
+    };
+    let build = match identity_build(&replay.pair.identity) {
+        Ok(build) => build,
+        Err(error) => {
+            if stopped.is_some() {
+                if let Err(restart_error) =
+                    restart_pre_activation_pair(&store, prefix, before_migration.as_ref())
+                {
+                    eprintln!("  previous daemon restart failed: {restart_error}");
+                }
+            }
+            let _ = store.discard(&candidate);
+            eprintln!("install failed: candidate replay proof failed: {error}");
+            return 1;
+        }
+    };
     if let Err(error) = store.migrate_direct_pair(&candidate) {
         if stopped.is_some() {
-            let restart = match before_migration.as_ref() {
-                Some(_) => start_and_prove_selected(&store),
-                None => start_pair_daemon(&prefix.join("cyclopsd")),
-            };
+            let restart = restart_pre_activation_pair(&store, prefix, before_migration.as_ref());
             if let Err(restart_error) = restart {
                 eprintln!("  previous daemon restart failed: {restart_error}");
             }
@@ -2369,12 +3223,19 @@ fn run_install_pair(source: &Path, prefix: &Path, style: &Style) -> i32 {
     let previous = match store.selection() {
         Ok(previous) => previous,
         Err(error) => {
+            if stopped.is_some() {
+                if let Err(restart_error) =
+                    restart_pre_activation_pair(&store, prefix, before_migration.as_ref())
+                {
+                    eprintln!("  previous daemon restart failed: {restart_error}");
+                }
+            }
             let _ = store.discard(&candidate);
             eprintln!("install failed: {error}");
             return 1;
         }
     };
-    if let Err(error) = store.activate(&candidate) {
+    if let Err(error) = store.activate(&candidate, replay) {
         if let Some(previous) = previous.as_ref() {
             let _ = store.restore_selection(previous);
         }
@@ -2429,14 +3290,14 @@ fn run_install_pair(source: &Path, prefix: &Path, style: &Style) -> i32 {
     0
 }
 
-/// Prove the selected known-good pair can replay current daemon inputs before
-/// any daemon stop or selector change. The pair-store lease keeps this
-/// selection stable until rollback either commits or returns.
+/// Prove the selected known-good pair can replay the quiesced daemon inputs
+/// before any selector change. The pair-store lease keeps this selection
+/// stable until rollback either commits or returns.
 fn prove_selected_rollback_replay(
     store: &PairStore,
     source_home: &Path,
     scratch: &Scratch,
-) -> Result<String, String> {
+) -> Result<ReplayAttestation, String> {
     let selection = store.rollback_selection()?;
     let proof = selection.known_good_proof.as_ref().ok_or_else(|| {
         "the known-good pair has no recorded build identity; run one update before rollback"
@@ -2445,14 +3306,15 @@ fn prove_selected_rollback_replay(
     let pair = store.pair_path(&selection.known_good)?;
     verify_recorded_pair(&pair, proof)?;
     let expected_build = identity_build(&proof.identity)?;
-    let replayed_build = prove_candidate_replay(&pair, source_home, scratch)
+    let replay = prove_candidate_replay(&pair, source_home, scratch)
         .map_err(|error| format!("known-good journal replay failed: {error}"))?;
+    let replayed_build = identity_build(&replay.pair.identity)?;
     if replayed_build != expected_build {
         return Err(format!(
             "known-good replay reported build {replayed_build}, expected {expected_build}"
         ));
     }
-    Ok(replayed_build)
+    Ok(replay)
 }
 
 fn run_rollback(style: &Style) -> i32 {
@@ -2474,12 +3336,6 @@ fn run_rollback(style: &Style) -> i32 {
             return 1;
         }
     };
-    if let Err(error) =
-        prove_selected_rollback_replay(&store, &cyclops_proto::cyclops_home(), &scratch)
-    {
-        eprintln!("rollback failed: {error}");
-        return 1;
-    }
     let selected_daemon = match store.active_binary("cyclopsd") {
         Ok(daemon) => daemon,
         Err(error) => {
@@ -2494,7 +3350,20 @@ fn run_rollback(style: &Style) -> i32 {
             return 1;
         }
     };
-    let (prior, restored) = match store.rollback() {
+    let replay =
+        match prove_selected_rollback_replay(&store, &cyclops_proto::cyclops_home(), &scratch) {
+            Ok(replay) => replay,
+            Err(error) => {
+                if stopped.is_some() {
+                    if let Err(restart_error) = start_and_prove_selected(&store) {
+                        eprintln!("  previous daemon restart failed: {restart_error}");
+                    }
+                }
+                eprintln!("rollback failed: {error}");
+                return 1;
+            }
+        };
+    let (prior, restored) = match store.rollback(replay) {
         Ok(swapped) => swapped,
         Err(error) => {
             if stopped.is_some() {
@@ -2725,12 +3594,89 @@ mod tests {
         path
     }
 
-    fn replay_failure_pair(path: &Path, hello: &str, cli: &[u8]) {
+    fn recorded_replay(store: &PairStore, pair: &str, nonce: u8) -> ReplayAttestation {
+        ReplayAttestation {
+            schema: 1,
+            pair: store.pair_proof(pair).unwrap(),
+            snapshot_sha256: format!("{nonce:064x}"),
+            snapshot_entries: u64::from(nonce),
+            snapshot_bytes: u64::from(nonce),
+        }
+    }
+
+    fn crash_at(boundary: UpdateBoundary, operation: impl FnOnce()) {
+        CRASH_AT_UPDATE_BOUNDARY.with(|selected| selected.set(Some(boundary)));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
+        CRASH_AT_UPDATE_BOUNDARY.with(|selected| selected.set(None));
+        let payload = outcome.expect_err("the selected update boundary was not reached");
+        assert_eq!(payload.downcast_ref::<UpdateBoundary>(), Some(&boundary));
+    }
+
+    fn assert_selected_pair_is_matched(store: &PairStore, allowed_builds: &[&str]) {
+        let selection = store.selection().unwrap().unwrap();
+        let client = store.active_binary("cyclops").unwrap();
+        let daemon = store.active_binary("cyclopsd").unwrap();
+        assert_eq!(client.parent(), daemon.parent());
+        let client_build = candidate_build(&client).unwrap();
+        let daemon_build = candidate_build(&daemon).unwrap();
+        assert_eq!(client_build, daemon_build);
+        assert!(allowed_builds.contains(&client_build.as_str()));
+        assert_eq!(
+            std::fs::read_link(store.prefix.join("cyclops")).unwrap(),
+            PathBuf::from(PAIR_ROOT)
+                .join(ACTIVE_SELECTOR)
+                .join("cyclops")
+        );
+        assert_eq!(
+            std::fs::read_link(store.prefix.join("cyclopsd")).unwrap(),
+            PathBuf::from(PAIR_ROOT)
+                .join(ACTIVE_SELECTOR)
+                .join("cyclopsd")
+        );
+        assert!(store.root.join(selection.active).is_dir());
+        assert!(store.root.join(selection.known_good).is_dir());
+    }
+
+    fn tree_signature(path: &Path) -> Vec<(PathBuf, u8, Vec<u8>)> {
+        fn walk(root: &Path, path: &Path, rows: &mut Vec<(PathBuf, u8, Vec<u8>)>) {
+            let mut entries = std::fs::read_dir(path)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                let metadata = std::fs::symlink_metadata(entry.path()).unwrap();
+                let relative = entry.path().strip_prefix(root).unwrap().to_path_buf();
+                if metadata.file_type().is_symlink() {
+                    rows.push((
+                        relative,
+                        b'l',
+                        std::fs::read_link(entry.path())
+                            .unwrap()
+                            .as_os_str()
+                            .as_bytes()
+                            .to_vec(),
+                    ));
+                } else if metadata.is_dir() {
+                    rows.push((relative, b'd', Vec::new()));
+                    walk(root, &entry.path(), rows);
+                } else {
+                    rows.push((relative, b'f', std::fs::read(entry.path()).unwrap()));
+                }
+            }
+        }
+
+        let mut rows = Vec::new();
+        walk(path, path, &mut rows);
+        rows
+    }
+
+    fn replay_failure_pair(path: &Path, build: &str, hello: &str, cli: &[u8]) {
         directory(path);
         write_new(&path.join("cyclops"), cli, 0o755).unwrap();
         let hello = serde_json::to_string(hello).unwrap();
         let script = format!(
-            "#!/usr/bin/env python3\nimport os, socket, time\nhome = os.environ['CYCLOPS_HOME']\npath = os.path.join(home, '{}')\ntry:\n    os.unlink(path)\nexcept FileNotFoundError:\n    pass\ns = socket.socket(socket.AF_UNIX)\ns.bind(path)\nwith open(os.path.join(home, 'probe.pid'), 'w') as f:\n    f.write(str(os.getpid()))\ns.listen(1)\nc, _ = s.accept()\nc.sendall(({} + '\\n').encode())\nc.close()\ntime.sleep(60)\n",
+            "#!/usr/bin/env python3\nimport os, socket, sys, time\nif len(sys.argv) > 1 and sys.argv[1] == '--version':\n    print('cyclopsd 0.1.0 ({build})')\n    sys.exit(0)\nhome = os.environ['CYCLOPS_HOME']\npath = os.path.join(home, '{}')\ntry:\n    os.unlink(path)\nexcept FileNotFoundError:\n    pass\ns = socket.socket(socket.AF_UNIX)\ns.bind(path)\nwith open(os.path.join(home, 'probe.pid'), 'w') as f:\n    f.write(str(os.getpid()))\ns.listen(1)\nc, _ = s.accept()\nc.sendall(({} + '\\n').encode())\nc.close()\ntime.sleep(60)\n",
             cyclops_proto::SOCK_NAME,
             hello
         );
@@ -2765,7 +3711,12 @@ mod tests {
     fn malformed_replay_hello_reaps_the_private_daemon() {
         let scratch = Scratch::create().unwrap();
         let pair = scratch.path().join("pair");
-        replay_failure_pair(&pair, "{malformed", b"#!/bin/sh\nexit 1\n");
+        replay_failure_pair(
+            &pair,
+            "build",
+            "{malformed",
+            b"#!/bin/sh\n[ \"$1\" = \"--version\" ] && { echo 'cyclops 0.1.0 (build)'; exit 0; }\nexit 1\n",
+        );
         let error =
             prove_candidate_replay(&pair, &scratch.path().join("absent"), &scratch).unwrap_err();
         assert!(
@@ -2779,7 +3730,12 @@ mod tests {
     fn failed_candidate_cli_identity_reaps_the_private_daemon() {
         let scratch = Scratch::create().unwrap();
         let pair = scratch.path().join("pair");
-        replay_failure_pair(&pair, &valid_probe_hello("build"), b"#!/bin/sh\nexit 1\n");
+        let marker = scratch.path().join("r/probe.pid");
+        let cli = format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n    [ -f '{}' ] && exit 1\n    echo 'cyclops 0.1.0 (build)'\n    exit 0\nfi\nexit 1\n",
+            marker.display()
+        );
+        replay_failure_pair(&pair, "build", &valid_probe_hello("build"), cli.as_bytes());
         let error =
             prove_candidate_replay(&pair, &scratch.path().join("absent"), &scratch).unwrap_err();
         assert!(
@@ -2795,6 +3751,7 @@ mod tests {
         let pair = scratch.path().join("pair");
         replay_failure_pair(
             &pair,
+            "build",
             &valid_probe_hello("build"),
             b"#!/bin/sh\n[ \"$1\" = \"--version\" ] && { echo 'cyclops 0.1.0 (build)'; exit 0; }\nexit 1\n",
         );
@@ -2942,7 +3899,8 @@ sys.exit(43)"#,
         let source = scratch.path().join("candidate");
         pair_source(&source, "build");
         let candidate = store.stage(&source).unwrap();
-        assert!(store.activate(&candidate).unwrap().is_none());
+        let replay = recorded_replay(&store, &candidate, 1);
+        assert!(store.activate(&candidate, replay).unwrap().is_none());
         store.prune().unwrap();
 
         assert!(!empty.exists());
@@ -3075,12 +4033,17 @@ sys.exit(43)"#,
         assert_eq!(old.active, old.known_good);
         store.require_public_links().unwrap();
 
-        assert_eq!(store.activate(&candidate).unwrap(), Some(old.clone()));
+        let candidate_replay = recorded_replay(&store, &candidate, 2);
+        assert_eq!(
+            store.activate(&candidate, candidate_replay).unwrap(),
+            Some(old.clone())
+        );
         let active = store.selection().unwrap().unwrap();
         assert_eq!(active.active, candidate);
         assert_eq!(active.known_good, old.active);
 
-        let (prior, restored) = store.rollback().unwrap();
+        let rollback_replay = recorded_replay(&store, &active.known_good, 3);
+        let (prior, restored) = store.rollback(rollback_replay).unwrap();
         assert_eq!(prior, active);
         assert_eq!(restored.active, old.active);
         assert_eq!(restored.known_good, candidate);
@@ -3099,11 +4062,15 @@ sys.exit(43)"#,
         pair_source(&new_source, "new-build");
         let old = store.stage(&old_source).unwrap();
         let new = store.stage(&new_source).unwrap();
-        let old_selection = store.prepare_selection(&old, &old).unwrap();
+        let old_replay = recorded_replay(&store, &old, 7);
+        let old_selection = store
+            .prepare_selection_with_replays(&old, &old, Some(old_replay.clone()), Some(old_replay))
+            .unwrap();
         store.select(&old_selection).unwrap();
         store.replace_public_link("cyclopsd").unwrap();
         store.replace_public_link("cyclops").unwrap();
-        store.activate(&new).unwrap();
+        let replay = recorded_replay(&store, &new, 4);
+        store.activate(&new, replay).unwrap();
         let before = store.selection().unwrap().unwrap();
 
         let home = scratch.path().join("current-home");
@@ -3145,11 +4112,220 @@ sys.exit(43)"#,
         assert_eq!(std::fs::read(prefix.join("cyclops")).unwrap(), old_cli);
         assert_eq!(std::fs::read(prefix.join("cyclopsd")).unwrap(), old_daemon);
 
-        store.activate(&candidate).unwrap();
+        let replay = recorded_replay(&store, &candidate, 5);
+        store.activate(&candidate, replay).unwrap();
         let active = store.selection().unwrap().unwrap();
         assert!(!active.legacy_active);
         assert_eq!(active.active, candidate);
         assert_eq!(active.known_good, candidate);
+    }
+
+    #[test]
+    fn every_pair_commit_boundary_recovers_to_one_matched_pair() {
+        let boundaries = [
+            UpdateBoundary::PairDirectoryCreated,
+            UpdateBoundary::ClientCopied,
+            UpdateBoundary::DaemonCopied,
+            UpdateBoundary::PairPublished,
+            UpdateBoundary::SelectionDirectoryCreated,
+            UpdateBoundary::ClientSelectionLinked,
+            UpdateBoundary::DaemonSelectionLinked,
+            UpdateBoundary::SelectionDescriptorWritten,
+            UpdateBoundary::SelectionPublished,
+            UpdateBoundary::SelectorTemporaryCreated,
+            UpdateBoundary::SelectorCommitted,
+            UpdateBoundary::SelectorPublished,
+        ];
+        for boundary in boundaries {
+            let scratch = Scratch::create().unwrap();
+            let prefix = scratch.path().join("bin");
+            let old_source = scratch.path().join("old");
+            let new_source = scratch.path().join("new");
+            let journal = scratch.path().join("journal.ndjson");
+            directory(&prefix);
+            pair_source(&old_source, "old-build");
+            pair_source(&new_source, "new-build");
+            write_new(&journal, b"durable-journal\n", 0o600).unwrap();
+            let journal_before = std::fs::symlink_metadata(&journal).unwrap();
+
+            let store = PairStore::open(&prefix).unwrap();
+            let old = store.stage(&old_source).unwrap();
+            let old_replay = recorded_replay(&store, &old, 10);
+            let selected = store
+                .prepare_selection_with_replays(
+                    &old,
+                    &old,
+                    Some(old_replay.clone()),
+                    Some(old_replay),
+                )
+                .unwrap();
+            store.select(&selected).unwrap();
+            store.replace_public_link("cyclopsd").unwrap();
+            store.replace_public_link("cyclops").unwrap();
+
+            if matches!(
+                boundary,
+                UpdateBoundary::PairDirectoryCreated
+                    | UpdateBoundary::ClientCopied
+                    | UpdateBoundary::DaemonCopied
+                    | UpdateBoundary::PairPublished
+            ) {
+                crash_at(boundary, || {
+                    let _ = store.stage(&new_source);
+                });
+            } else {
+                let candidate = store.stage(&new_source).unwrap();
+                let replay = recorded_replay(&store, &candidate, 11);
+                crash_at(boundary, || {
+                    let _ = store.activate(&candidate, replay);
+                });
+            }
+            drop(store);
+
+            let recovered = PairStore::open(&prefix).unwrap();
+            assert_selected_pair_is_matched(&recovered, &["old-build", "new-build"]);
+            assert_eq!(std::fs::read(&journal).unwrap(), b"durable-journal\n");
+            let journal_after = std::fs::symlink_metadata(&journal).unwrap();
+            assert_eq!(journal_after.ino(), journal_before.ino());
+            assert_eq!(
+                journal_after.permissions().mode(),
+                journal_before.permissions().mode()
+            );
+        }
+    }
+
+    #[test]
+    fn every_pair_store_initialization_boundary_recovers_on_the_next_open() {
+        for boundary in [
+            UpdateBoundary::PairStoreRootCreated,
+            UpdateBoundary::PairStoreOwnerWritten,
+            UpdateBoundary::PairStoreLeaseCreated,
+            UpdateBoundary::PairStorePairsCreated,
+            UpdateBoundary::PairStoreSelectionsCreated,
+        ] {
+            let scratch = Scratch::create().unwrap();
+            let prefix = scratch.path().join("bin");
+            directory(&prefix);
+
+            crash_at(boundary, || {
+                let _ = PairStore::open(&prefix);
+            });
+
+            let recovered = PairStore::open(&prefix).unwrap();
+            recovered.require_root().unwrap();
+            require_exact_entries(
+                &recovered.root,
+                &[PAIR_OWNER, PAIR_LEASE, PAIRS_DIR, SELECTIONS_DIR],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn production_pair_changes_stop_the_daemon_before_replay_snapshot() {
+        let source = include_str!("update.rs");
+        for (function, stop_call, replay_call) in [
+            (
+                "fn run_install_pair(",
+                "let stop_result =",
+                "prove_candidate_replay(&pair",
+            ),
+            (
+                "fn run_rollback(",
+                "stop_selected_for_pair_change(&selected_daemon)",
+                "prove_selected_rollback_replay(&store",
+            ),
+        ] {
+            let body = source
+                .split_once(function)
+                .expect("production pair-change function")
+                .1
+                .split_once("\n}\n")
+                .expect("production pair-change body")
+                .0;
+            let stopped = body.find(stop_call).expect("exact daemon stop");
+            let replayed = body.find(replay_call).expect("private replay proof");
+            assert!(
+                stopped < replayed,
+                "{function} copied live journals before stopping the daemon"
+            );
+        }
+    }
+
+    #[test]
+    fn install_restarts_the_unchanged_pair_if_post_replay_selection_fails() {
+        let source = include_str!("update.rs");
+        let selection_failure = source
+            .split_once("    let previous = match store.selection() {")
+            .expect("post-replay selection read")
+            .1
+            .split_once("    if let Err(error) = store.activate")
+            .expect("activation follows selection read")
+            .0;
+
+        assert!(selection_failure.contains("restart_pre_activation_pair("));
+        assert!(selection_failure.contains("before_migration.as_ref()"));
+    }
+
+    #[test]
+    fn every_public_pair_replacement_boundary_repairs_without_a_split_pair() {
+        for boundary in [
+            UpdateBoundary::PublicDaemonTemporaryCreated,
+            UpdateBoundary::PublicDaemonCommitted,
+            UpdateBoundary::PublicDaemonPublished,
+            UpdateBoundary::PublicClientTemporaryCreated,
+            UpdateBoundary::PublicClientCommitted,
+            UpdateBoundary::PublicClientPublished,
+        ] {
+            let scratch = Scratch::create().unwrap();
+            let prefix = scratch.path().join("bin");
+            let candidate_source = scratch.path().join("candidate");
+            directory(&prefix);
+            pair_source(&prefix, "old-build");
+            pair_source(&candidate_source, "new-build");
+            let store = PairStore::open(&prefix).unwrap();
+            let candidate = store.stage(&candidate_source).unwrap();
+
+            crash_at(boundary, || {
+                let _ = store.migrate_direct_pair(&candidate);
+            });
+            drop(store);
+
+            let recovered = PairStore::open(&prefix).unwrap();
+            assert_selected_pair_is_matched(&recovered, &["old-build"]);
+            assert!(read_directory(&prefix, "install prefix")
+                .unwrap()
+                .iter()
+                .all(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    !name.starts_with(".cyclops.") && !name.starts_with(".cyclopsd.")
+                }));
+        }
+    }
+
+    #[test]
+    fn a_concurrent_updater_is_refused_before_any_store_mutation() {
+        let scratch = Scratch::create().unwrap();
+        let prefix = scratch.path().join("bin");
+        let source = scratch.path().join("source");
+        directory(&prefix);
+        pair_source(&source, "build");
+        let store = PairStore::open(&prefix).unwrap();
+        let pair = store.stage(&source).unwrap();
+        let replay = recorded_replay(&store, &pair, 12);
+        store.activate(&pair, replay).unwrap();
+        let before = tree_signature(&prefix);
+
+        let error = PairStore::open(&prefix)
+            .err()
+            .expect("a concurrent updater must be refused");
+        assert!(error.contains("another Cyclops update"), "{error}");
+        assert_eq!(tree_signature(&prefix), before);
+
+        drop(store);
+        let reopened = PairStore::open(&prefix).unwrap();
+        assert_selected_pair_is_matched(&reopened, &["build"]);
     }
 
     #[test]
@@ -3187,12 +4363,15 @@ sys.exit(43)"#,
         pair_source_with_execution_probe(&new_source, "new-build", &new_probe);
         let old = store.stage(&old_source).unwrap();
         let new = store.stage(&new_source).unwrap();
-        let old_selection = store.prepare_selection(&old, &old).unwrap();
+        let old_replay = recorded_replay(&store, &old, 7);
+        let old_selection = store
+            .prepare_selection_with_replays(&old, &old, Some(old_replay.clone()), Some(old_replay))
+            .unwrap();
         store.select(&old_selection).unwrap();
         store.replace_public_link("cyclopsd").unwrap();
         store.replace_public_link("cyclops").unwrap();
-        store.activate(&new).unwrap();
-        drop(store);
+        let replay = recorded_replay(&store, &new, 6);
+        store.activate(&new, replay).unwrap();
         std::fs::remove_file(&old_probe).unwrap();
         std::fs::remove_file(&new_probe).unwrap();
 
@@ -3202,9 +4381,19 @@ sys.exit(43)"#,
             descriptor.active_identity.as_deref(),
             Some("0.1.0 (new-build)")
         );
-        assert_eq!(descriptor.known_good_identity, "0.1.0 (old-build)");
+        assert_eq!(
+            descriptor.known_good_identity.as_deref(),
+            Some("0.1.0 (old-build)")
+        );
         assert_eq!(descriptor.active_build.as_deref(), Some("new-build"));
-        assert_eq!(descriptor.known_good_build, "old-build");
+        assert_eq!(descriptor.known_good_build.as_deref(), Some("old-build"));
+        assert!(descriptor.active_replay_attested);
+        assert!(descriptor.known_good_replay_attested);
+        let old_snapshot = format!("{:064x}", 7_u8);
+        assert_eq!(
+            descriptor.known_good_replay_snapshot.as_deref().unwrap(),
+            old_snapshot.as_str()
+        );
         assert!(descriptor.selection.is_dir());
         assert!(descriptor.active_pair.is_dir());
         assert!(descriptor.known_good_pair.is_dir());
@@ -3213,6 +4402,66 @@ sys.exit(43)"#,
             "health proof executed the known-good pair"
         );
         assert!(!new_probe.exists(), "health proof executed the active pair");
+        drop(store);
+    }
+
+    #[test]
+    fn selector_change_during_read_only_inspection_is_typed_as_concurrent() {
+        let scratch = Scratch::create().unwrap();
+        let prefix = scratch.path().join("bin");
+        let source = scratch.path().join("candidate");
+        directory(&prefix);
+        pair_source(&source, "build");
+        let store = PairStore::open(&prefix).unwrap();
+        let pair = store.stage(&source).unwrap();
+        let replay = recorded_replay(&store, &pair, 9);
+        let first = store
+            .prepare_selection_with_replays(
+                &pair,
+                &pair,
+                Some(replay.clone()),
+                Some(replay.clone()),
+            )
+            .unwrap();
+        let second = store
+            .prepare_selection_with_replays(&pair, &pair, Some(replay.clone()), Some(replay))
+            .unwrap();
+        store.select(&first).unwrap();
+        store.replace_public_link("cyclopsd").unwrap();
+        store.replace_public_link("cyclops").unwrap();
+        let root = store.root.clone();
+        let next = second.id.clone();
+        drop(store);
+
+        BEFORE_PAIR_INSPECTION_RECHECK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let temporary = root.join(".active.health-race");
+                std::os::unix::fs::symlink(next, &temporary).unwrap();
+                std::fs::rename(temporary, root.join(ACTIVE_SELECTOR)).unwrap();
+            }));
+        });
+        let error = installed_pair_descriptor(&prefix).unwrap_err();
+
+        assert!(matches!(
+            error,
+            InstalledPairInspectionError::ConcurrentChange(_)
+        ));
+    }
+
+    #[test]
+    fn health_pair_inspection_does_not_open_or_lock_the_updater_lease() {
+        let source = include_str!("update.rs");
+        let body = source
+            .split_once("pub(crate) fn installed_pair_descriptor(")
+            .expect("health pair inspector")
+            .1
+            .split_once("\n}\n\nfn inspect_installed_pair_snapshot")
+            .expect("health pair inspector body")
+            .0;
+
+        assert!(!body.contains("PairStore::open_existing"));
+        assert!(!body.contains("LOCK_EX"));
+        assert!(!body.contains("flock"));
     }
 
     #[test]
@@ -3237,16 +4486,119 @@ sys.exit(43)"#,
             .write_all(b"# changed\n")
             .unwrap();
         let error = installed_pair_descriptor(&prefix).unwrap_err();
-        assert!(error.contains("changed after its install proof"), "{error}");
+        assert!(matches!(&error, InstalledPairInspectionError::Invalid(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("changed after its install proof"),
+            "{error}"
+        );
 
         std::fs::write(&pair_path, std::fs::read(source.join("cyclops")).unwrap()).unwrap();
         let mut descriptor: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&descriptor_path).unwrap()).unwrap();
         descriptor["known_good_proof"] = serde_json::Value::Null;
         std::fs::write(&descriptor_path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
-        assert!(installed_pair_descriptor(&prefix)
-            .unwrap_err()
-            .contains("missing a recorded build identity"));
+        let error = installed_pair_descriptor(&prefix).unwrap_err();
+        assert!(matches!(&error, InstalledPairInspectionError::Invalid(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("missing a recorded build identity"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn schema_two_selection_remains_readable_without_replay_evidence() {
+        let scratch = Scratch::create().unwrap();
+        let prefix = scratch.path().join("bin");
+        let source = scratch.path().join("candidate");
+        directory(&prefix);
+        pair_source(&source, "build");
+        let store = PairStore::open(&prefix).unwrap();
+        let pair = store.stage(&source).unwrap();
+        let replay = recorded_replay(&store, &pair, 13);
+        let selection = store
+            .prepare_selection_with_replays(&pair, &pair, Some(replay.clone()), Some(replay))
+            .unwrap();
+        store.select(&selection).unwrap();
+        store.replace_public_link("cyclopsd").unwrap();
+        store.replace_public_link("cyclops").unwrap();
+        let descriptor_path = store.root.join(&selection.id).join(PAIR_DESCRIPTOR);
+        let mut descriptor: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&descriptor_path).unwrap()).unwrap();
+        descriptor["schema"] = serde_json::json!(2);
+        descriptor.as_object_mut().unwrap().remove("active_replay");
+        descriptor
+            .as_object_mut()
+            .unwrap()
+            .remove("known_good_replay");
+        std::fs::write(&descriptor_path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+
+        let previous = store.selection().unwrap().unwrap();
+        assert_eq!(previous.active, pair);
+        assert_eq!(previous.active_replay, None);
+        assert_eq!(previous.known_good_replay, None);
+    }
+
+    #[test]
+    fn schema_one_selection_is_reported_as_unproven_instead_of_invalid() {
+        let scratch = Scratch::create().unwrap();
+        let prefix = scratch.path().join("bin");
+        let source = scratch.path().join("candidate");
+        directory(&prefix);
+        pair_source(&source, "build");
+        let store = PairStore::open(&prefix).unwrap();
+        let pair = store.stage(&source).unwrap();
+        let replay = recorded_replay(&store, &pair, 16);
+        let selection = store
+            .prepare_selection_with_replays(&pair, &pair, Some(replay.clone()), Some(replay))
+            .unwrap();
+        store.select(&selection).unwrap();
+        store.replace_public_link("cyclopsd").unwrap();
+        store.replace_public_link("cyclops").unwrap();
+        let descriptor_path = store.root.join(&selection.id).join(PAIR_DESCRIPTOR);
+        let mut descriptor: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&descriptor_path).unwrap()).unwrap();
+        descriptor["schema"] = serde_json::json!(1);
+        for field in [
+            "active_proof",
+            "known_good_proof",
+            "active_replay",
+            "known_good_replay",
+        ] {
+            descriptor.as_object_mut().unwrap().remove(field);
+        }
+        std::fs::write(&descriptor_path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+        drop(store);
+
+        let inspected = installed_pair_descriptor(&prefix).unwrap().unwrap();
+
+        assert!(inspected.proof_unproven);
+        assert!(!inspected.rollback_safe);
+        assert_eq!(inspected.active_identity, None);
+        assert_eq!(inspected.known_good_identity, None);
+    }
+
+    #[test]
+    fn replay_attestation_is_bound_to_pair_digests_and_snapshot_identity() {
+        let scratch = Scratch::create().unwrap();
+        let prefix = scratch.path().join("bin");
+        let source = scratch.path().join("candidate");
+        directory(&prefix);
+        pair_source(&source, "build");
+        let store = PairStore::open(&prefix).unwrap();
+        let pair = store.stage(&source).unwrap();
+        let mut replay = recorded_replay(&store, &pair, 14);
+        replay.pair.cyclops_sha256 = "0".repeat(64);
+        let error = store.activate(&pair, replay).unwrap_err();
+        assert!(error.contains("does not name the recorded pair"), "{error}");
+
+        let mut replay = recorded_replay(&store, &pair, 15);
+        replay.snapshot_sha256 = "not-a-digest".to_string();
+        let error = store.activate(&pair, replay).unwrap_err();
+        assert!(error.contains("invalid snapshot identity"), "{error}");
     }
 
     #[test]
