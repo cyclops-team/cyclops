@@ -1443,7 +1443,7 @@ mod tests {
             link_state: LinkState::Live,
             paused_panes: HashSet::new(),
             minimized: std::collections::HashMap::new(),
-            window_bg: None,
+            window_palette: crate::app::HostPaletteState::Unknown,
             window_focused: true,
             select_all: crate::input::SelectAll::default(),
             reconnect_attempt: 0,
