@@ -257,10 +257,10 @@ fn cached_entry_is_write_ready(
     pane_in_mode: bool,
     expected: &crate::fusion::Binding,
 ) -> bool {
+    // This trusts the stamped write verdict; its composer proof already adjudicates sensor disagreement.
     !pane_in_mode
         && entry.detection.write_ready
         && !entry.detection.stale
-        && !entry.detection.disagreement
         && !entry.in_mode
         && entry.binding.as_ref() == Some(expected)
 }
@@ -284,6 +284,8 @@ fn cached_route_can_decide_now(inner: &Inner, route: &NotificationRoute) -> bool
         .is_some_and(|entry| {
             !entry.in_mode
                 && !entry.detection.stale
+                // A disagreement means the picture is not settled enough for an early receipt,
+                // even when the stamped write verdict has independently proved a clean composer.
                 && !entry.detection.disagreement
                 && (entry.detection.write_ready
                     || entry.detection.state == cyclops_proto::AgentState::IdleWithInput)
@@ -1252,6 +1254,56 @@ mod tests {
             !cached_entry_is_write_ready(&entry, false, &binding(201)),
             "a reused leader pid with a new generation cannot inherit readiness"
         );
+    }
+
+    #[test]
+    fn cached_working_readiness_keeps_a_stamped_composer_proof() {
+        let original = binding(200);
+        let mut entry = crate::DetEntry {
+            detection: cyclops_proto::Detection {
+                state: cyclops_proto::AgentState::Working,
+                readings: vec![
+                    cyclops_proto::SensorReading {
+                        sensor: cyclops_proto::Sensor::Screen,
+                        state: cyclops_proto::AgentState::Idle,
+                        rule: "composer_empty".into(),
+                        ts: 1,
+                    },
+                    cyclops_proto::SensorReading {
+                        sensor: cyclops_proto::Sensor::Title,
+                        state: cyclops_proto::AgentState::Working,
+                        rule: "title_working".into(),
+                        ts: 1,
+                    },
+                ],
+                disagreement: true,
+                decided_by: "title_working".into(),
+                unknown_reason: None,
+                stale: false,
+                write_ready: true,
+                write_block: None,
+                composer_semantic: Some(cyclops_proto::ComposerSemantic::Clean),
+            },
+            binding: Some(original.clone()),
+            manifest: Some("claude".into()),
+            occupant: Some(20),
+            agent: Some(original.agent),
+            in_mode: false,
+            quota_screen_clear: true,
+            hold: cyclops_proto::ComposerHold::Clear,
+            turn: None,
+            hold_owner: None,
+            composer: crate::ComposerProjection::default(),
+            working_confirmed: false,
+            since: std::time::Instant::now(),
+        };
+
+        assert!(
+            cached_entry_is_write_ready(&entry, false, &original),
+            "a stamped Working + clean-composer verdict remains usable from the cache"
+        );
+        entry.detection.stale = true;
+        assert!(!cached_entry_is_write_ready(&entry, false, &original));
     }
 
     #[test]

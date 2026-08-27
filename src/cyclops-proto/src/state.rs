@@ -485,8 +485,10 @@ pub struct Detection {
     /// Why a write is refused, content-free, absent when it is allowed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_block: Option<String>,
-    /// Vendor-measured meaning of the current screen rule's composer shape.
-    /// None means the rule made no composer claim and never implies clean.
+    /// Vendor-measured meaning of the matching screen evidence's composer
+    /// shape. This may come from a lower-priority composer rule while a
+    /// higher-priority screen rule owns the runtime verdict. None means no
+    /// matching rule made a composer claim and never implies clean.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composer_semantic: Option<ComposerSemantic>,
     /// Why the state is `unknown`, absent for every other state and absent
@@ -714,15 +716,15 @@ impl Detection {
     ///
     /// The one definition of that evidence, used by the readiness rule
     /// and by the hold that releases on it. A title or a hook reports a
-    /// turn boundary, which is a different fact.
+    /// turn boundary, which is a different fact. The screen reading need
+    /// not be the runtime winner: during a visibly running turn, a
+    /// lower-priority composer rule can prove the input region clean while a
+    /// higher-priority screen rule proves that generation is still running.
     pub fn screen_proves_write_safe_composer(&self) -> bool {
         matches!(
             self.composer_semantic,
             Some(ComposerSemantic::Clean | ComposerSemantic::GhostSuggestion)
-        ) && self
-            .readings
-            .iter()
-            .any(|r| r.sensor == Sensor::Screen && r.state == AgentState::Idle)
+        ) && self.readings.iter().any(|r| r.sensor == Sensor::Screen)
     }
 
     fn with_write_block(mut self) -> Detection {
@@ -747,22 +749,38 @@ impl Detection {
     /// an authoritative refusal with a cheerful one. Fusion stamps the
     /// final verdict onto the Detection; everyone else reads that.
     fn base_write_ready(&self) -> Result<(), &'static str> {
-        if self.state != AgentState::Idle {
-            return Err("not_idle");
-        }
         // A retained verdict is doubt wearing the last known answer: the
         // capture that was supposed to look at the composer failed.
         if self.stale {
             return Err("stale_screen_evidence");
         }
-        if self.disagreement {
+        // A running turn may still have a clean composer. In that one
+        // deliberate shape, a Working reading and a composer-screen reading
+        // are complementary facts rather than a safety disagreement. Every
+        // other disagreement remains fail-closed.
+        let working_composer_proven = self.state == AgentState::Working
+            && self.screen_proves_write_safe_composer()
+            // A hook or title can lead a turn before the screen has shown
+            // any current work.  The clean composer must be observed in the
+            // same visual frame as a live screen Working reading; otherwise
+            // a stale idle prompt left over from the pre-output gap would
+            // authorize a mid-turn write.
+            && self
+                .readings
+                .iter()
+                .any(|reading| reading.sensor == Sensor::Screen && reading.state == AgentState::Working)
+            && self.readings.iter().all(|reading| {
+                reading.state == AgentState::Working
+                    || (reading.sensor == Sensor::Screen && reading.state == AgentState::Idle)
+            });
+        if self.disagreement && !working_composer_proven {
             return Err("sensor_disagreement");
         }
         // A hook edge reports that generation stopped. It cannot see the
         // composer, so when fusion had to fall back to one because the
         // screen rules resolved to nothing, there is no clean-input
         // evidence at all: that is the shape a long staged payload makes.
-        if self.decided_by.starts_with("hook:") {
+        if self.state == AgentState::Idle && self.decided_by.starts_with("hook:") {
             return Err("hook_derived_idle");
         }
         // Only the screen sensor can see a composer. A title or hook edge
@@ -775,17 +793,30 @@ impl Detection {
         if !self.screen_proves_write_safe_composer() {
             return Err("no_write_safe_composer_evidence");
         }
-        let conflict = self.readings.iter().any(|r| {
+        // Working is the one non-idle runtime state admitted by the rule
+        // above. Every other non-idle verdict remains a refusal even if a
+        // malformed fixture happens to pair it with a clean-looking screen
+        // reading; dead, unknown, modal, permission, quota, and typed-input
+        // states must never become write-ready through a lower-priority
+        // composer rule.
+        let conflict = matches!(
+            self.state,
+            AgentState::Unknown
+                | AgentState::IdleWithInput
+                | AgentState::BlockedModal
+                | AgentState::BlockedPermission
+                | AgentState::BlockedQuota
+                | AgentState::Dead
+        ) || self.readings.iter().any(|r| {
             matches!(
                 r.state,
-                AgentState::Working
-                    | AgentState::IdleWithInput
+                AgentState::IdleWithInput
                     | AgentState::BlockedModal
                     | AgentState::BlockedPermission
                     | AgentState::BlockedQuota
                     | AgentState::Unknown
-            )
-        });
+            ) || (r.state == AgentState::Working && !working_composer_proven)
+        }) || (self.state == AgentState::Working && !working_composer_proven);
         if conflict {
             return Err("conflicting_evidence");
         }
@@ -952,7 +983,68 @@ mod write_ready_tests {
             vec![reading(Sensor::Screen, AgentState::IdleWithInput)],
             false,
         );
-        assert_eq!(d.base_write_ready(), Err("not_idle"));
+        assert_eq!(d.base_write_ready(), Err("no_write_safe_composer_evidence"));
+    }
+
+    #[test]
+    fn working_with_a_proven_clean_composer_is_write_ready() {
+        let mut d = det(
+            AgentState::Working,
+            vec![
+                reading(Sensor::Screen, AgentState::Working),
+                reading(Sensor::Title, AgentState::Working),
+            ],
+            true,
+        );
+        d.composer_semantic = Some(ComposerSemantic::Clean);
+        assert_eq!(d.base_write_ready(), Ok(()));
+    }
+
+    #[test]
+    fn working_without_positive_clean_composer_evidence_stays_fail_closed() {
+        for (semantic, readings, disagreement) in [
+            (
+                None,
+                vec![reading(Sensor::Title, AgentState::Working)],
+                false,
+            ),
+            (
+                Some(ComposerSemantic::HumanInput),
+                vec![
+                    reading(Sensor::Screen, AgentState::IdleWithInput),
+                    reading(Sensor::Title, AgentState::Working),
+                ],
+                true,
+            ),
+            (
+                Some(ComposerSemantic::Ambiguous),
+                vec![
+                    reading(Sensor::Screen, AgentState::Idle),
+                    reading(Sensor::Title, AgentState::Working),
+                ],
+                true,
+            ),
+            (
+                Some(ComposerSemantic::Clean),
+                vec![
+                    reading(Sensor::Screen, AgentState::Idle),
+                    reading(Sensor::Title, AgentState::Working),
+                ],
+                true,
+            ),
+        ] {
+            let mut d = det(AgentState::Working, readings, disagreement);
+            d.composer_semantic = semantic;
+            assert_eq!(
+                d.base_write_ready(),
+                Err(if disagreement {
+                    "sensor_disagreement"
+                } else {
+                    "no_write_safe_composer_evidence"
+                }),
+                "{semantic:?}"
+            );
+        }
     }
 
     /// The one shape that admits a write: the sensor that sees the

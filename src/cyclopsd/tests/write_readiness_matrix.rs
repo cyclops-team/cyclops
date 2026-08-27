@@ -6,9 +6,11 @@
 //!
 //! This is a deterministic protocol and manifest fixture test, not a live
 //! runtime gate: it verifies that only a genuinely clean idle composer with
-//! matching screen evidence can produce `write_ready == true`, while non-idle
-//! states, drafts, active turns, modals, permission prompts, quota exhaustion,
-//! unknown titles, dead processes, and sensor disagreements reliably hold or refuse.
+//! matching screen evidence can produce `write_ready == true`. A working
+//! state may also be admitted when an independent clean-composer rule matches;
+//! missing or ambiguous composer evidence, drafts, modals, permission prompts,
+//! quota exhaustion, unknown titles, dead processes, and sensor disagreements
+//! reliably hold or refuse.
 
 use std::path::Path;
 
@@ -106,9 +108,13 @@ fn claude_deterministic_safety_matrix_9_states() {
         false,
     );
     assert!(!det.write_ready, "staged draft must refuse write");
-    assert_eq!(det.write_block.as_deref(), Some("not_idle"));
+    assert_eq!(
+        det.write_block.as_deref(),
+        Some("no_write_safe_composer_evidence")
+    );
 
-    // 3. Working (generation turn active via spinner status) -> write_ready == false
+    // 3. Working (generation turn active via spinner status) with no separate
+    // clean-composer match -> write_ready == false
     let working_screen = "Thinking\n────────────────────────────────────────\n· Kneading… (5s · 1.2k tokens)\n❯ \n────────────────────────────────────────";
     let working_esc = "Thinking\n────────────────────────────────────────\n\u{1b}[38;5;215m·\u{1b}[39m \u{1b}[38;5;215mKneading… \u{1b}[38;5;246m(5s · 1.2k tokens)\n\u{1b}[39m❯\u{a0}\n────────────────────────────────────────";
     let eval = manifest
@@ -123,7 +129,10 @@ fn claude_deterministic_safety_matrix_9_states() {
         false,
         false,
     );
-    assert!(!det.write_ready, "working agent must refuse write");
+    assert!(
+        !det.write_ready,
+        "working without composer proof must refuse write"
+    );
 
     // 4. BlockedModal (trust dialog) -> write_ready == false
     let trust_dialog = "Quick safety check: Is this a project you created or one you trust?\n1. Yes, I trust this folder\n2. No, exit\nEnter to confirm";
@@ -234,7 +243,8 @@ fn codex_deterministic_safety_matrix_9_states() {
     );
     assert!(!det.write_ready, "staged draft must refuse write");
 
-    // 3. Working (generation turn active) -> write_ready == false
+    // 3. Working (generation turn active) with no separate composer proof
+    // -> write_ready == false
     let working_screen = "• Working (5s • esc to interrupt)\n› Ask Codex\ngpt-5.6-sol";
     let eval = manifest.evaluate("Working", working_screen).unwrap();
     assert_eq!(eval.state, AgentState::Working);
@@ -246,7 +256,10 @@ fn codex_deterministic_safety_matrix_9_states() {
         false,
         false,
     );
-    assert!(!det.write_ready, "working turn must refuse write");
+    assert!(
+        !det.write_ready,
+        "working without composer proof must refuse write"
+    );
 
     // 4. BlockedModal (approval / confirmation modal) -> write_ready == false
     let det = fuse_detection(
@@ -344,9 +357,13 @@ fn agy_deterministic_safety_matrix_9_states() {
         false,
     );
     assert!(!det.write_ready, "staged draft must refuse write");
-    assert_eq!(det.write_block.as_deref(), Some("not_idle"));
+    assert_eq!(
+        det.write_block.as_deref(),
+        Some("no_write_safe_composer_evidence")
+    );
 
-    // 3. Working (generation turn active via braille spinner) -> write_ready == false
+    // 3. Working (generation turn active via braille spinner) with no
+    // separate composer proof -> write_ready == false
     let working_screen = "mac\n────────────────\n⣷ Generating...\n>\n────────────────";
     let eval = manifest.evaluate("mac", working_screen).unwrap();
     assert_eq!(eval.state, AgentState::Working);
@@ -358,7 +375,10 @@ fn agy_deterministic_safety_matrix_9_states() {
         false,
         false,
     );
-    assert!(!det.write_ready, "working turn must refuse write");
+    assert!(
+        !det.write_ready,
+        "working without composer proof must refuse write"
+    );
 
     // 4. BlockedModal (feedback survey modal) -> write_ready == false
     let survey_screen = "How's the CLI experience so far?\n[1] Good  [2] Fine  [3] Bad  [0] Skip";
@@ -479,7 +499,8 @@ fn cursor_offline_fixture_validation_unavailable_live_gate() {
     );
     assert!(!det.write_ready, "staged draft must refuse write");
 
-    // 3. Working (agent actively generating) -> write_ready == false
+    // 3. Working (agent actively generating) with no separate composer proof
+    // -> write_ready == false
     let working_screen = "Generating response...\nctrl+c to stop\n────────────────\nCursor 0.45";
     let eval = manifest.evaluate("Cursor Agent", working_screen).unwrap();
     assert_eq!(eval.state, AgentState::Working);
@@ -491,7 +512,10 @@ fn cursor_offline_fixture_validation_unavailable_live_gate() {
         false,
         false,
     );
-    assert!(!det.write_ready, "working cursor must refuse write");
+    assert!(
+        !det.write_ready,
+        "working without composer proof must refuse write"
+    );
 
     // 4. BlockedModal (trust dialog with active selection marker) -> write_ready == false
     let trust_dialog =

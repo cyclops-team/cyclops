@@ -244,7 +244,8 @@ flowchart TD
     s7 -->|blocked_quota| park["park: quota never auto-retries"]
     s7 -->|"modal or permission, the rule auto-dismisses<br/>and declines remain"| decline["send that rule's decline keys,<br/>then re-read the screen"]
     s7 -->|"modal or permission, otherwise:<br/>hold on the rule id, admin pinged once"| hold
-    s7 -->|working| hold
+    s7 -->|"working + live screen + clean composer proof"| s8
+    s7 -->|"working without proof"| hold
     s7 -->|"idle_with_input: human typing wins"| hold
     s7 -->|unknown| hold
     decline --> s1

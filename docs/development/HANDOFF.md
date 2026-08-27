@@ -227,7 +227,7 @@ tells you where to look:
 | Cause | It means | Look at |
 |---|---|---|
 | `no_such_pane`, `pane_dead`, `session_detached` | The target is not there | The pane table: `cyclops status` |
-| `pane_in_mode`, `working`, `idle_with_input`, `blocked:<rule id>`, `blocked_quota` | The gate is holding on purpose | Fusion: is the state right? `cyclops read <pane>` |
+| `pane_in_mode`, `working` without positive composer proof, `idle_with_input`, `blocked:<rule id>`, `blocked_quota` | The gate is holding on purpose | Fusion: is the state right and, for a working pane, is its composer proven clean? `cyclops read <pane>` |
 | `no_manifest` | Nothing bound to the pane | The manifest's `process_names` versus what the pane is actually running |
 | `paste_failed` | The paste command's reply was lost or failed after tmux may have applied it | Inspect the named pane and composer before resending |
 | `verify_failed` | Paste readback is inconclusive; the payload may have landed | Inspect the manifest's `verify_pattern` and the named pane before resending |

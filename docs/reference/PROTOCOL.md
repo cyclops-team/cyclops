@@ -319,15 +319,17 @@ Two additive fields carry the authorization answer, which is a different
 question from the runtime state. `stale` is true when this verdict is a
 retained earlier one, kept because the sensor read that should have
 refreshed it failed; the state may still be the best guess available, but
-nothing in it was observed just now. `write_ready` is always present and answers it
-directly; `write_block` is absent when a terminal write into the composer
-is allowed right now, and otherwise carries the content-free reason it is
-not (`not_idle`,
-`stale_screen_evidence`, `sensor_disagreement`, `no_write_safe_composer_evidence`,
-`conflicting_evidence`). An agent can be `idle` and still carry a
-`write_block`: idleness says no turn is running, while write-readiness
-says the composer was proven empty just now. Delivery gates on the second
-answer, never the first.
+nothing in it was observed just now. `write_ready` is always present and
+answers it directly; `write_block` is absent when a terminal write into the
+composer is allowed right now, and otherwise carries the content-free reason
+it is not (`stale_screen_evidence`, `sensor_disagreement`,
+`no_write_safe_composer_evidence`, `conflicting_evidence`). A working pane may
+be write-ready only when the same fresh capture contains a live screen
+`working` reading, positively proves a clean or ghost composer, and has no
+conflicting state; runtime `working` alone never authorizes a write. An agent
+can be `idle` and still carry a `write_block`:
+idleness says no turn is running, while write-readiness says the composer was
+proven empty just now. Delivery gates on the second answer, never the first.
 
 A `detection` read is not free and not passive: it forces the full sensor
 set, which means a `capture-pane` the daemon would otherwise have skipped.

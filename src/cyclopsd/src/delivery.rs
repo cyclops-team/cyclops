@@ -2554,7 +2554,8 @@ pub(crate) async fn msg_send(
 /// cannot read. Reporting that one "queued · 0 ahead" and exiting 0 told the
 /// sender their message was on its way to a pane it could never reach.
 ///
-/// Everything else holds: a working pane, a human mid-keystroke, a modal
+/// Everything else holds: a working pane without positive composer proof, a
+/// human mid-keystroke, a modal
 /// waiting on a person. Those senders get their queue position now rather
 /// than a 2.5s wait for a badge that is not coming, which is the property
 /// docs/guides/send.md promises for a busy target.
@@ -5848,7 +5849,7 @@ enum GateOutcome {
 }
 
 /// The delivery gate, in spec order: pane resolution and liveness, mode,
-/// fused state (quota park, modal decline-or-hold, working hold,
+/// fused state (quota park, modal decline-or-hold, working composer proof,
 /// idle_with_input hold, idle proceed). Event-driven: holds wake on fused
 /// state changes, pane field changes, and session reattach. The recompute
 /// that admits a delivery runs immediately before pasting, so the gate
@@ -5894,9 +5895,16 @@ async fn gate(
         // it can record the exact durable `composer_hold` refusal below;
         // carrying the cached `idle_with_input` value straight into the wait
         // loop would make that refusal invisible until another pane event.
-        let initial_hold = forced_hold
-            .take()
-            .filter(|cause| !(handle.notification.is_some() && cause == "idle_with_input"));
+        let initial_hold = forced_hold.take().filter(|cause| {
+            // A cached `Working` verdict is only a receipt hint. Workspace
+            // notifications must take the fresh capture path so a clean
+            // composer can admit a doorbell during the turn. Likewise a
+            // cached draft must be re-read so the durable composer hold is
+            // recorded immediately. Direct deliveries retain their legacy
+            // cached-hold behaviour.
+            !(handle.notification.is_some()
+                && matches!(cause.as_str(), "idle_with_input" | "working"))
+        });
         let hold = if let Some(cause) = initial_hold {
             Some(cause)
         } else {
@@ -6281,7 +6289,56 @@ async fn gate(
                                     }
                                 }
                             }
-                            AgentState::Working => Some("working".to_string()),
+                            AgentState::Working => {
+                                // Runtime state is not permission to write,
+                                // but it is not an automatic refusal either.
+                                // A visibly working pane may expose an
+                                // independent, positive composer proof (for
+                                // example a clean queue prompt); only that
+                                // stamped readiness can admit the doorbell.
+                                // A hook/title-only working hint, or missing
+                                // and ambiguous proof, remains fail-closed.
+                                if !det.write_ready {
+                                    Some(
+                                        det.write_block
+                                            .clone()
+                                            .unwrap_or_else(|| "working".to_string()),
+                                    )
+                                } else {
+                                    match fusion::foreground_pid_checked(row.pane_pid) {
+                                        None if handle.notification.is_some()
+                                            && last_hold.as_deref() == Some(OBSERVATION_HOLD) =>
+                                        {
+                                            return GateOutcome::BlockedPreWrite {
+                                                cause: NotificationPreWriteCause::BindingUnprovable,
+                                                observation: Box::new(
+                                                    binding_unprovable_observation(
+                                                        inner,
+                                                        handle,
+                                                        row.pane_pid,
+                                                        &manifest_id,
+                                                    ),
+                                                ),
+                                            };
+                                        }
+                                        None => Some(OBSERVATION_HOLD.to_string()),
+                                        Some(pane_pid) => {
+                                            gate_line(
+                                                inner,
+                                                handle,
+                                                "proceed",
+                                                Some(&det.decided_by),
+                                                None,
+                                            );
+                                            return GateOutcome::Proceed {
+                                                manifest_id,
+                                                pane_pid,
+                                                regate_evidence_changed,
+                                            };
+                                        }
+                                    }
+                                }
+                            }
                             // Human typing always wins. A notification has
                             // reached a conclusive pre-write refusal: publish
                             // it durably now, rather than waiting in memory

@@ -149,8 +149,12 @@ timer. In order:
      aborts back to the gate loop (gate line: decline_aborted, cause
      modal_changed). Rules without auto_dismiss (trust, permission
      prompts) hold in gating and admin.notify action_required.
-   - `working`: hold in gating; the turn-end state change re-triggers
-     (GOALS: queued lands within 1s of turn end).
+   - `working`: take a fresh screen capture. If that capture contains a live
+     screen `working` reading and a composer rule positively proves `clean` or
+     `ghost_suggestion`, with no conflicting evidence, the doorbell may
+     proceed while the turn runs; otherwise hold in gating. A later
+     pane/readiness event re-triggers the hold (GOALS: queued lands within 1s
+     of turn end).
    - `idle_with_input` (human typing, human always wins): hold in gating,
      re-check on the pane's next state change.
    - `idle`: proceed only on a positive write-readiness stamp. A refusal
