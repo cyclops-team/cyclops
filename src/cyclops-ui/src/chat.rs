@@ -1095,7 +1095,7 @@ pub fn render_chat_lines(
                         format!(" ! [held: {cause_desc}]")
                     };
                     let mut line = ChatLine::new(ChatLineKind::Status);
-                    line.push(line3, ChatInk::Attention);
+                    line.push(line3, held_ink(r.updated_at, now_ms));
                     timeline.push(line.fitted(width));
                 }
             }
@@ -2403,6 +2403,18 @@ mod tests {
             .find(|span| span.text.contains("held: verify failed"))
             .expect("old wake failure keeps its exact words");
         assert_eq!(old_hold.ink, ChatInk::Dim);
+
+        let narrow_lines = render_chat_lines(&queue, ChatRenderContext::new(&reg).at(now), 23, 15);
+        let narrow_hold = narrow_lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.text.contains("held: verify failed"))
+            .expect("ultra-narrow mode keeps the old wake failure visible");
+        assert_eq!(
+            narrow_hold.ink,
+            ChatInk::Dim,
+            "ultra-narrow and normal layouts must use the same decay clock"
+        );
     }
 
     #[test]
