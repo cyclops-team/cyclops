@@ -87,9 +87,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use cyclops_ledger::LedgerWriter;
 use cyclops_manifest::Manifest;
 use cyclops_proto::{
-    AdminNotifyParams, AgentState, Detection, Event, Kind, LedgerLine, MessageId, MsgSendParams,
-    NotificationRouteEvidenceId, ProcessInstanceId, RecipientKey, SessionIdentityBinding,
-    SessionInstanceId, StateReportParams, TmuxPaneId, TmuxSessionId, WireError, WorkspaceId,
+    AdminNotifyParams, AgentState, Detection, Event, Kind, LedgerLine, MessageId,
+    MessagesSnapshotResult, MsgSendParams, NotificationRouteEvidenceId, ProcessInstanceId,
+    RecipientKey, SessionIdentityBinding, SessionInstanceId, StateReportParams, TmuxPaneId,
+    TmuxSessionId, WireError, WorkspaceId,
 };
 use cyclops_state::{RepairSummary, StateRoot};
 use cyclops_tmux::{
@@ -1514,6 +1515,33 @@ impl Daemon {
         messaging::claim(&self.inner, service, claimant.key, message_id)
             .map_err(server::mailbox_service_error)?;
         Ok(())
+    }
+
+    /// Test seam for a body-free mailbox snapshot with an already-resolved
+    /// caller.
+    ///
+    /// Socket authentication has separate process-tree coverage. Integration
+    /// rigs run from whichever shell starts `cargo test`; if that shell name
+    /// happens to match the fixture manifest, its socket peer has no unique
+    /// mailbox identity. Delivery tests use this seam for the same reason
+    /// they use [`Daemon::msg_send`] and [`Daemon::claim_message_for_test`].
+    #[doc(hidden)]
+    pub fn messages_snapshot_for_test(
+        &self,
+        caller: &str,
+        recent_settled: u32,
+    ) -> Result<MessagesSnapshotResult, WireError> {
+        let service = self.inner.mailbox.as_ref().ok_or_else(|| WireError {
+            code: "mailbox_unavailable".to_string(),
+            message: "durable workspace identity is not connected".to_string(),
+            data: None,
+        })?;
+        let caller = service
+            .identity_for_address(caller)
+            .map_err(server::mailbox_service_error)?;
+        service
+            .messages_snapshot(caller.key, recent_settled)
+            .map_err(server::mailbox_service_error)
     }
 
     /// Legacy in-process delivery seam used by transport tests and embedders.

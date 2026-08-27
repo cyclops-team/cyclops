@@ -2449,7 +2449,19 @@ async fn typed_composer_hold_is_a_durable_prewrite_block_until_a_real_turn() {
     }
     assert!(!pane_history(&rig, &pane).contains("[cyclops"));
 
-    let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
+    // This fixture matches `bash`/`sh`; a socket client inherits the shell
+    // that starts cargo and therefore has no stable mailbox identity on
+    // every runner. Socket identity is covered separately. This delivery
+    // test uses the same resolved-admin seam as its send and claim setup to
+    // assert the public projection deterministically.
+    let snapshot = json!({
+        "result": serde_json::to_value(
+            rig.daemon
+                .messages_snapshot_for_test("admin", 20)
+                .expect("admin messages snapshot"),
+        )
+        .expect("messages snapshot serializes")
+    });
     let row = snapshot["result"]["rows"]
         .as_array()
         .and_then(|rows| rows.iter().find(|row| row["message_id"] == message_id))
@@ -2486,7 +2498,14 @@ async fn typed_composer_hold_is_a_durable_prewrite_block_until_a_real_turn() {
     rig.daemon
         .claim_message_for_test("worker", &message_id)
         .expect("a held message remains claimable");
-    let claimed = rig.ctl.request("messages.snapshot", json!({})).await;
+    let claimed = json!({
+        "result": serde_json::to_value(
+            rig.daemon
+                .messages_snapshot_for_test("admin", 20)
+                .expect("admin messages snapshot after claim"),
+        )
+        .expect("messages snapshot serializes")
+    });
     let claimed_row = claimed["result"]["rows"]
         .as_array()
         .and_then(|rows| rows.iter().find(|row| row["message_id"] == message_id))
@@ -2537,7 +2556,14 @@ async fn typed_composer_hold_is_a_durable_prewrite_block_until_a_real_turn() {
         "{withdrawn}"
     );
     wait_for_notification_state(&mut rig, &third_id, NotificationState::BlockedPreWrite).await;
-    let after_withdrawal = rig.ctl.request("messages.snapshot", json!({})).await;
+    let after_withdrawal = json!({
+        "result": serde_json::to_value(
+            rig.daemon
+                .messages_snapshot_for_test("admin", 20)
+                .expect("admin messages snapshot after withdrawal"),
+        )
+        .expect("messages snapshot serializes")
+    });
     let second_row = after_withdrawal["result"]["rows"]
         .as_array()
         .and_then(|rows| {
