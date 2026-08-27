@@ -90,7 +90,10 @@ Terminal writing requires all of the following at the write boundary:
 - the same manifest
 - a current, positive clean-composer reading
 - no pane mode
-- no live working, blocked, input-present, or conflicting sensor reading
+- no blocked, input-present, or conflicting sensor reading
+- if runtime is `working`, the same fresh capture must also contain a live
+  screen `working` reading and an independent clean or ghost composer proof;
+  runtime `working` alone never authorizes a write
 - a structural proof that the exact staged notification is complete
 
 A lifecycle hook reports a runtime edge. It never proves that the composer is
@@ -159,22 +162,25 @@ snapshots, and action results have separate capacity and coalescing policies. A
 slow daemon or event burst cannot grow memory without bound or make keypresses
 wait behind history.
 
-## Release-blocking Codex 0.149.1 incident
+## Release-blocking working-pane pre-write incident
 
 A reported Codex 0.149.1 failure repeatedly records a safe visual gate followed
 by `binding_unprovable`, leaves the notification at the head of the recipient
 FIFO, and gives the sender no surface-level explanation beyond durable
-acceptance. The report is release-blocking, but its manifest-change hypothesis
-is not accepted without reproduction. The observed sequence points to a
-pre-write binding failure and must be traced to the exact write boundary before
-any terminal rule changes.
+acceptance. That version is a measured incident fixture, not a version-specific
+implementation target: the same write-boundary contract applies to every
+supported CLI. The report is release-blocking, but its manifest-change
+hypothesis is not accepted without reproduction. The observed sequence points
+to a pre-write binding failure and must be traced to the exact write boundary
+before any terminal rule changes.
 
 The correction has four parts:
 
-1. Reproduce fresh and resumed Codex 0.149.1 process trees and screen
-   representations. Capture identity, ancestry, manifest, route, rule winners,
-   readiness, write boundary, and hook behavior without recording terminal
-   content in journals.
+1. Reproduce fresh and resumed supported-CLI process trees and screen
+   representations. Keep the Codex 0.149.1 capture as historical evidence, but
+   do not make it the only supported version. Capture identity, ancestry,
+   manifest, route, rule winners, readiness, write boundary, and hook behavior
+   without recording terminal content in journals.
 2. Bound repeated identical pre-write failure by an explicit route-evidence
    identity. Synthetic post-block reconciliation reuses the recorded identity.
    Each watcher, process, or adoption source mints one identity before recompute,
@@ -197,9 +203,10 @@ The correction has four parts:
 
 The sender and every operator surface must distinguish durable acceptance from
 `wake blocked before write: binding_unprovable`. The incident closes only when
-fresh and resumed Codex 0.149.1 sessions either complete the normal notification,
-claim, and reply path, or stop once in the visible blocked state without writing
-terminal bytes.
+fresh and resumed supported-CLI sessions either complete the normal
+notification, claim, and reply path, or stop once in the visible blocked state
+without writing terminal bytes. The original Codex 0.149.1 run remains a
+regression fixture within that broader contract.
 
 ## Release gates
 
@@ -339,10 +346,11 @@ An earlier focused pass does not substitute for the frozen run.
 - Current-version live fixtures cover every supported vendor for idle, working,
   long staged input, modal state, quota state, raw wrap, and collapsed chip where
   the representation exists.
-- Codex 0.149.1 evidence covers clean idle, ghost suggestion, typed text, slash
-  command, working, tool execution, approval, raw and collapsed staging,
-  submission, hook receipt, claim, reply, restart, and both fresh and resumed
-  process structures.
+- The original Codex 0.149.1 evidence covers clean idle, ghost suggestion,
+  typed text, slash command, working, tool execution, approval, raw and
+  collapsed staging, submission, hook receipt, claim, reply, restart, and both
+  fresh and resumed process structures; current-version fixtures cover every
+  supported vendor without treating that one version as a family guarantee.
 - Missing vendor software is an explicit release limitation or an administrator
   decision, not fixture evidence presented as a live pass.
 - Deterministic process, lifecycle, queue, restart, permissions, symlink,
@@ -357,7 +365,7 @@ An earlier focused pass does not substitute for the frozen run.
 
 Parallel work is safe only where ownership does not overlap.
 
-1. Close the Codex 0.149.1 pre-write rebound, then complete worker supervision
+1. Close the working-pane pre-write rebound, then complete worker supervision
    and atomic alarm clearance in the same queue-recovery group.
 2. Complete daemon-owned wait detail, durable watch binding, and honest wait CLI
    wording.

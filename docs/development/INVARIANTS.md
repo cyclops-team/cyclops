@@ -426,8 +426,10 @@ glyph, the glyph or the word is doing too little.
 ## 12. Runtime idleness never implies terminal write-readiness
 
 **A composer write requires current positive clean-input evidence from the
-admitted pane, and no conflicting working, blocked, modal, pane-mode,
-unknown, or input-present evidence. Hook-derived idle alone never
+admitted pane, and no conflicting blocked, modal, pane-mode, unknown, or
+input-present evidence. A running turn may write only when the same fresh
+capture contains a live screen `Working` reading plus an independent clean or
+ghost composer proof. Hook-derived idle or Working without that proof never
 authorizes a write.**
 
 What breaks: the same damage as rule 3, reached from the opposite
@@ -468,8 +470,10 @@ An unkeyed prompt hook cannot claim an exact lifecycle. Claude's
 lifecycle-capable visual Working frame confirms that the exact staged
 notification entered a turn. Fresh visual evidence owns the return to idle.
 Cyclops never assigns a later `Stop` to that prompt by arrival order or time.
-Permission, modal, and quota screens remain authoritative blocked states. None
-of these runtime rules weaken the clean-composer requirement above.
+Permission, modal, and quota screens remain authoritative blocked states. A
+live Working reading with no complementary clean-composer proof remains held;
+the positive Working-plus-proof shape is the only runtime exception. None of
+these runtime rules weaken the clean-composer requirement above.
 
 One clean frame is not clean evidence either, once text has been seen in
 the composer. A screen rule reads one frame, and a pane holding somebody's
@@ -485,7 +489,8 @@ The release reads the EVIDENCE, not the fused winner. The winner is one
 state chosen by priority, so a pane can win `idle` off a composer rule
 while the title or a hook still reports the turn that is running;
 releasing on that is the same false-idle class from the other direction.
-Any live reading of `working` keeps the hold. A receipt carrying a
+Any live reading of `working` without the complementary live screen and
+independent clean-composer proof keeps the hold. A receipt carrying a
 manifest-declared TurnKey moves that hold onto the exact lifecycle. Only
 an end carrying the same key can release it, and release still waits for a
 current clean screen. Arrival order and retained hook state do not
