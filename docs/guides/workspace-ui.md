@@ -3,8 +3,9 @@
 Bare `cyclops` on a TTY opens the full-screen terminal workspace: a
 project sidebar, a tab bar, and a live pane canvas fed by tmux control
 mode. The tab bar shows by default however many tabs the workspace has,
-because the `+` that makes the next tab lives there; the app menu's
-`Tab bar` item is what puts it away and brings it back. The sidebar is
+because the `+` that makes the next tab lives there; the `Tab bar` row
+on the settings card's View section is what puts it away and brings it
+back. The sidebar is
 the one side panel: the workspace and agent tree, over a file tree of
 what is on disk. It collapses out of the way with `Ctrl+B` `b` or with
 the `◂` chevron on its outer edge, leaving a one-column rail whose `▸`
@@ -54,11 +55,12 @@ Default bindings are prefix-first (`Ctrl+B`, same shape as tmux):
 | `Ctrl+B` `g` | Put the keyboard in the file panel; Esc gives it back |
 | `Ctrl+B` `s` | Send a message to an agent |
 | `Ctrl+B` `r` | Repaint the workspace surface |
-| `Ctrl+B` `?` | Open Settings on its Keybinds section, the reference to every active binding |
+| `Ctrl+B` `?` | Open the keybinding reference, every active binding |
 
-Hiding the tab bar ships with no chord: the app menu's `Tab bar` item is
-the way, so a hidden strip is always something you chose. Bind
-`toggle_tab_bar` in `config.toml` if you want a key for it.
+Hiding the tab bar ships with no chord: the `Tab bar` row on the
+settings card's View section is the way, so a hidden strip is always
+something you chose. Bind `toggle_tab_bar` in `config.toml` if you want
+a key for it.
 
 `Ctrl+B` `r`, and the app menu's `Redraw` item, repaint the workspace's
 own chrome from scratch. It changes nothing else: no pane, no layout, no
@@ -193,9 +195,9 @@ focusing the pane first and do not cover the child terminal's first row.
 The sidebar is two panels in one column: who is running, above, and what
 is on disk, below. A dashed rule separates them; drag it to give
 either half more rows, and drag it all the way to the footer to close the
-file panel and hand the whole column back to the session tree. The app
-menu's `Files` item is the way back, and the only way back, because a
-closed panel leaves no rule to grab.
+file panel and hand the whole column back to the session tree. The
+`Files` row on the settings card's View section is the way back, and
+the only way back, because a closed panel leaves no rule to grab.
 
 The panel is two browsers behind one header. The agent browser follows
 the focused agent: switch panes or let the agent `cd` and within a second
@@ -276,15 +278,23 @@ showing section's list (a click on a row puts the cursor there;
 moves too). Landing on a row checks it: the `✓` (the same one the app
 menu's toggles wear) moves to the row, showing what `Enter` would save,
 and nothing is saved yet. `Enter` (or the `Apply` button) saves what is
-checked and closes; `Esc` closes and forgets it. The card is one size
-for every section: it is sized for the longest list, so switching
-sections never resizes it.
+checked and closes; `Esc` closes and forgets it. (The View section is
+the exception: its rows are switches, and flip at once.) The card is
+one size for every section: it is sized for the longest list, so
+switching sections never resizes it.
 
 - **Theme** lists every loadable theme, the same rows `cyclops theme`
   prints. Landing on a theme checks it and previews it over the live
   workspace; `Enter` applies it exactly like `cyclops theme <name>` (the
   config key is written and cyclopsd repaints pane borders), and `Esc`
   puts the previous theme back. See [themes.md](themes.md).
+- **View** lists the surfaces you can put away, `Tab bar` and `Files`,
+  each with a muted line under it saying what it is. A row wears the
+  `✓` while its surface is showing. These do not wait for `Apply`:
+  `Enter` on a row, or a click on it, flips the surface at once, the
+  card stays open, and the check follows (a chord that flips the same
+  surface while the card is up moves it too). `Esc` closes the card.
+  Both persist, as `[workspace] tab_bar_visible` and `files_rows`.
 - **Sound** opens with what it is for, then the switch, `Sound notifs:
   on` or `off`, saved under `[workspace] sound_notifs` (off by default),
   and under a `Sounds` heading the sounds to choose from. On, the workspace plays the chosen sound when an agent
@@ -311,19 +321,19 @@ sections never resizes it.
   sound at all falls back to the terminal bell, which many terminals
   ship with the sound turned off.
 
-- **Keybinds** is the keybinding reference: every active binding, chord
-  and action, generated from the bindings actually in force rather than
-  from documentation, so a rebinding in `config.toml` is what it shows.
-  It reads only; the list scrolls (`↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End`,
-  or the wheel, three rows a notch), and the count at the bottom right
-  says which rows are showing. `Enter` and `Esc` both close it; there is
-  nothing on it to apply. `Ctrl+B` `?` opens the card on this section
-  directly.
-
 `show_settings` is the binding name; `show_themes`, from when the card
 was only a theme picker, still works in an existing config.
-`show_keybinds` (`Ctrl+B` `?` by default) opens the same card on its
-Keybinds section.
+
+## Keybinds
+
+The app menu's `Keybinds` item, or `Ctrl+B` `?` (`show_keybinds`), opens
+the keybinding reference as a card of its own: every active binding,
+chord and action, generated from the bindings actually in force rather
+than from documentation, so a rebinding in `config.toml` is what it
+shows. It reads only; the list scrolls (`↑`/`↓`, `PgUp`/`PgDn`,
+`Home`/`End`, or the wheel, three rows a notch), and the count at the
+bottom right says which rows are showing. `Enter` and `Esc` both close
+it; there is nothing on it to apply.
 
 ## Motion
 
@@ -334,18 +344,20 @@ a slide reads as a shear, so only color travels, and the glyphs and words
 are at their final value on the first frame: a fade never delays the
 arrival of information.
 
-The app menu's `Motion` item is the switch, and the choice persists under
-`[workspace] motion`. Motion also turns itself off where it cannot look
+`[workspace] motion = false` in `config.toml` is the switch (there is no
+item for it in the workspace; bind `toggle_motion` if you want a key),
+and the choice persists there. Motion also turns itself off where it cannot look
 right: under `NO_COLOR`, on a terminal without truecolor (an interpolated
 color would band across four or five entries of the 256-cube), and on a
 terminal that writes frames slower than the workspace draws them.
 `CYCLOPS_MOTION=0` forces it off for one run.
 
-Hide the tab strip from the app menu's `Tab bar` item, and bring it back
-the same way. That item is the only visible switch, which is why the
-menu has to stay reachable from the collapsed rail. Hiding gives the
-strip's row to the pane canvas and re-declares the client size, exactly
-like a sidebar collapse.
+Hide the tab strip from the `Tab bar` row on the settings card's View
+section, and bring it back the same way. That row is the only visible
+switch, which is why the app menu (and its `Settings` item) has to stay
+reachable from the collapsed rail. Hiding gives the strip's row to the
+pane canvas and re-declares the client size, exactly like a sidebar
+collapse.
 
 The filled `+` in the tab strip opens the new-tab dialog, whether the
 workspace has one tab or ten. Type a name and use
@@ -389,8 +401,8 @@ right-click, not a list position and not whichever item later becomes
 active. Menus highlight the row under the pointer. The `☰ menu` button at
 the sidebar's bottom opens the application menu. The matching `+` at the
 bottom-right creates a workspace from the focused pane's folder. The
-keybinding reference is the settings card's Keybinds section (see
-[Settings](#settings)).
+keybinding reference is the menu's `Keybinds` item (see
+[Keybinds](#keybinds)).
 
 Wheel over a pane scrolls its history; new output never pulls a scrolled
 viewport back to the tail. Drag a gutter to resize, drag a tab onto another

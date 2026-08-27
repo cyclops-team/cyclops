@@ -61,8 +61,19 @@ pub enum Dialog {
     Settings {
         section: SettingsSection,
         themes: ThemePicker,
+        view: ViewSwitches,
         sound: SoundPicker,
-        keybinds: KeybindSheet,
+    },
+    /// The keybinding reference: every active binding, read-only, behind
+    /// a viewport. A card of its own beside the settings card: nothing on
+    /// it is chosen, so it has no Apply and shares nothing with the
+    /// sections that do. Enter closes it like Esc.
+    Keybinds {
+        /// The first row showing.
+        scroll: u16,
+        /// Every active binding, generated from the router's map rather
+        /// than written down, so a rebinding in config.toml shows here.
+        rows: Vec<BindingHelp>,
     },
 }
 
@@ -70,22 +81,22 @@ pub enum Dialog {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
     Theme,
+    View,
     Sound,
-    Keybinds,
 }
 
 impl SettingsSection {
     pub const ALL: [SettingsSection; 3] = [
         SettingsSection::Theme,
+        SettingsSection::View,
         SettingsSection::Sound,
-        SettingsSection::Keybinds,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             SettingsSection::Theme => copy::SETTINGS_SECTION_THEME,
+            SettingsSection::View => copy::SETTINGS_SECTION_VIEW,
             SettingsSection::Sound => copy::SETTINGS_SECTION_SOUND,
-            SettingsSection::Keybinds => copy::SETTINGS_SECTION_KEYBINDS,
         }
     }
 
@@ -113,16 +124,64 @@ pub struct ThemePicker {
     pub notice: Option<String>,
 }
 
-/// The keybinds section: the active bindings as a read-only reference.
-/// A viewport rather than a cursor, since there is nothing on a row to
-/// choose, and nothing for Enter to apply: it closes the card.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct KeybindSheet {
-    /// The first row showing.
-    pub scroll: u16,
-    /// Every active binding, generated from the router's map rather
-    /// than written down, so a rebinding in config.toml shows here.
-    pub rows: Vec<BindingHelp>,
+/// The view section: the chrome an operator can put away, one row per
+/// surface. Unlike the pickers beside it, nothing here waits for Enter
+/// to save: a row flips its surface the moment it is chosen (Enter or a
+/// click), the way the app menu's toggles did before they moved here,
+/// and the checks read back what the workspace is showing right now
+/// (`exec::sync_view_switches` keeps them honest while the card is up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewSwitches {
+    /// The row the arrow keys are on.
+    pub selected: usize,
+    /// Whether the tab strip shows (`WorkspacePrefs::tab_bar_visible`).
+    pub tab_bar: bool,
+    /// Whether the sidebar's file panel shows (`files_rows > 0`).
+    pub files: bool,
+}
+
+/// One row of the view section, by the surface it switches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewRow {
+    TabBar,
+    Files,
+}
+
+impl ViewSwitches {
+    /// The rows, in list order.
+    pub const ROWS: [ViewRow; 2] = [ViewRow::TabBar, ViewRow::Files];
+
+    /// Opens on the first row, reading the surfaces as they are.
+    pub fn new(tab_bar: bool, files: bool) -> Self {
+        ViewSwitches {
+            selected: 0,
+            tab_bar,
+            files,
+        }
+    }
+
+    /// How many rows the arrows can land on.
+    pub fn len(&self) -> usize {
+        Self::ROWS.len()
+    }
+
+    pub fn row(&self, index: usize) -> Option<ViewRow> {
+        Self::ROWS.get(index).copied()
+    }
+
+    /// What Enter would flip: the row the cursor is on.
+    pub fn selected_row(&self) -> Option<ViewRow> {
+        self.row(self.selected)
+    }
+
+    /// Whether row `index` wears a check: its surface is showing.
+    pub fn is_checked(&self, index: usize) -> bool {
+        match self.row(index) {
+            Some(ViewRow::TabBar) => self.tab_bar,
+            Some(ViewRow::Files) => self.files,
+            None => false,
+        }
+    }
 }
 
 /// The sound section as one list the arrows walk: the switch's two rows
@@ -326,14 +385,26 @@ pub enum DialogKeyAction {
 
 /// Resolve dialog keys without mutating application state. Every modal
 /// confirms on Enter and cancels on Escape, so one key means the same thing
-/// in every dialog. The settings card's read-only keybinds section has
-/// nothing to confirm, so its Enter dismisses the card
-/// (`action::route_dialog_confirm` says so; the key is the same here).
+/// in every dialog. The read-only keybinds card has nothing to confirm, so
+/// its Enter dismisses it (`action::route_dialog_confirm` agrees; the key
+/// is read as a cancel here so the close path is one path).
 pub fn dialog_key_action(dialog: &Dialog, key: &KeyEvent) -> DialogKeyAction {
-    // The settings card scrolls a selection (or, on its keybinds section,
-    // a viewport), and takes the paging keys for both. Tab is the one key
-    // it has that no other dialog does: none of them takes a literal tab,
-    // so nothing is lost by claiming it here.
+    if matches!(dialog, Dialog::Keybinds { .. }) {
+        return match key.code {
+            KeyCode::Esc | KeyCode::Enter => DialogKeyAction::Cancel,
+            KeyCode::Up => DialogKeyAction::Scroll(-1),
+            KeyCode::Down => DialogKeyAction::Scroll(1),
+            KeyCode::PageUp => DialogKeyAction::Scroll(-8),
+            KeyCode::PageDown => DialogKeyAction::Scroll(8),
+            KeyCode::Home => DialogKeyAction::ScrollStart,
+            KeyCode::End => DialogKeyAction::ScrollEnd,
+            _ => DialogKeyAction::Ignore,
+        };
+    }
+    // The settings card scrolls a selection, not a viewport, and unlike
+    // the keybinds card its Enter has something to confirm. Tab is the one
+    // key it has that no other dialog does: none of them takes a literal
+    // tab, so nothing is lost by claiming it here.
     if matches!(dialog, Dialog::Settings { .. }) {
         return match key.code {
             KeyCode::Esc => DialogKeyAction::Cancel,
@@ -561,7 +632,7 @@ pub fn parse_compose(input: &str) -> Result<Composed, &'static str> {
 }
 
 /// Resolve a [`DialogKeyAction::Scroll`] delta against the keybinds
-/// section's bound: moves immediately, and never past either end.
+/// card's bound: moves immediately, and never past either end.
 pub fn move_keybind_scroll(current: u16, delta: i16, max: u16) -> u16 {
     if delta.is_negative() {
         current.saturating_sub(delta.unsigned_abs()).min(max)
@@ -585,18 +656,15 @@ pub fn move_selection(current: usize, delta: i16, len: usize) -> usize {
     }
 }
 
-/// Move the settings card's selection `delta` rows, in whichever section
-/// is showing: the cursor in a picking section, the viewport in the
-/// keybinds section, whose bound `keybind_max` is (the render knows how
-/// many rows the card has room for; `render::settings_keybind_max_scroll`
-/// answers). The one place that knows which list the arrows are on, so
+/// Move the settings card's cursor `delta` rows in whichever section is
+/// showing. The one place that knows which list the arrows are on, so
 /// the key path and the wheel path cannot disagree about it.
-pub fn move_settings_selection(dialog: &mut Dialog, delta: i16, keybind_max: u16) {
+pub fn move_settings_selection(dialog: &mut Dialog, delta: i16) {
     let Dialog::Settings {
         section,
         themes,
+        view,
         sound,
-        keybinds,
     } = dialog
     else {
         return;
@@ -605,23 +673,22 @@ pub fn move_settings_selection(dialog: &mut Dialog, delta: i16, keybind_max: u16
         SettingsSection::Theme => {
             themes.selected = move_selection(themes.selected, delta, themes.names.len());
         }
+        SettingsSection::View => {
+            view.selected = move_selection(view.selected, delta, view.len());
+        }
         SettingsSection::Sound => {
             sound.selected = move_selection(sound.selected, delta, sound.len());
-        }
-        SettingsSection::Keybinds => {
-            keybinds.scroll = move_keybind_scroll(keybinds.scroll, delta, keybind_max);
         }
     }
 }
 
-/// Home and End: the showing section's first row, or its last (the
-/// keybinds section's last viewport, `keybind_max`).
-pub fn jump_settings_selection(dialog: &mut Dialog, to_end: bool, keybind_max: u16) {
+/// Home and End: the showing section's first row, or its last.
+pub fn jump_settings_selection(dialog: &mut Dialog, to_end: bool) {
     let Dialog::Settings {
         section,
         themes,
+        view,
         sound,
-        keybinds,
     } = dialog
     else {
         return;
@@ -629,31 +696,28 @@ pub fn jump_settings_selection(dialog: &mut Dialog, to_end: bool, keybind_max: u
     let last = |len: usize| if to_end { len.saturating_sub(1) } else { 0 };
     match section {
         SettingsSection::Theme => themes.selected = last(themes.names.len()),
+        SettingsSection::View => view.selected = last(view.len()),
         SettingsSection::Sound => sound.selected = last(sound.len()),
-        SettingsSection::Keybinds => keybinds.scroll = if to_end { keybind_max } else { 0 },
     }
 }
 
-/// How many rows one wheel notch moves in the showing section: a
-/// picker's notch moves the selection one row, the keybinds section's
-/// moves its viewport three, the way a wheel over any list of text does.
-pub fn settings_wheel_rows(dialog: &Dialog) -> i16 {
+/// How many rows one wheel notch moves in an open dialog: a picker's
+/// notch moves the selection one row, the keybinds card's moves its
+/// viewport three, the way a wheel over any list of text does.
+pub fn dialog_wheel_rows(dialog: &Dialog) -> i16 {
     match dialog {
-        Dialog::Settings {
-            section: SettingsSection::Keybinds,
-            ..
-        } => 3,
+        Dialog::Keybinds { .. } => 3,
         _ => 1,
     }
 }
 
 /// Put the showing section's cursor on row `index` (a click). A row the
-/// list does not have leaves the cursor where it was; the keybinds
-/// section has no cursor to put anywhere.
+/// list does not have leaves the cursor where it was.
 pub fn select_settings_row(dialog: &mut Dialog, index: usize) {
     let Dialog::Settings {
         section,
         themes,
+        view,
         sound,
         ..
     } = dialog
@@ -662,6 +726,7 @@ pub fn select_settings_row(dialog: &mut Dialog, index: usize) {
     };
     match section {
         SettingsSection::Theme if index < themes.names.len() => themes.selected = index,
+        SettingsSection::View if index < view.len() => view.selected = index,
         SettingsSection::Sound if index < sound.len() => sound.selected = index,
         _ => {}
     }
@@ -787,20 +852,24 @@ mod tests {
                 active: Some(0),
                 notice: None,
             },
+            view: ViewSwitches::new(true, true),
             sound: SoundPicker::new(
                 false,
                 vec!["bow-ripple".into(), "system".into()],
                 "bow-ripple",
             ),
-            keybinds: KeybindSheet {
-                scroll: 0,
-                rows: (0..20)
-                    .map(|index| BindingHelp {
-                        keys: format!("Ctrl+B {index}"),
-                        action: format!("Action {index}"),
-                    })
-                    .collect(),
-            },
+        }
+    }
+
+    fn keybinds() -> Dialog {
+        Dialog::Keybinds {
+            scroll: 0,
+            rows: (0..20)
+                .map(|index| BindingHelp {
+                    keys: format!("Ctrl+B {index}"),
+                    action: format!("Action {index}"),
+                })
+                .collect(),
         }
     }
 
@@ -871,7 +940,16 @@ mod tests {
         select_settings_row(&mut dialog, 7);
         switch_settings_section(&mut dialog, 1);
         select_settings_row(&mut dialog, 1);
-        let Dialog::Settings { themes, sound, .. } = &dialog else {
+        select_settings_row(&mut dialog, 2);
+        switch_settings_section(&mut dialog, 1);
+        select_settings_row(&mut dialog, 1);
+        let Dialog::Settings {
+            themes,
+            view,
+            sound,
+            ..
+        } = &dialog
+        else {
             unreachable!()
         };
         assert_eq!(
@@ -879,10 +957,28 @@ mod tests {
             "the theme click landed; the far one did not"
         );
         assert_eq!(
+            view.selected, 1,
+            "the view click landed; the far one did not"
+        );
+        assert_eq!(view.selected_row(), Some(ViewRow::Files));
+        assert_eq!(
             sound.selected, 1,
             "the sound click landed in its own section"
         );
         assert_eq!(sound.selected_row(), Some(SoundRow::Switch(false)));
+    }
+
+    /// The view section's rows are switches, not choices: each wears
+    /// its check when its surface is showing, independent of the
+    /// cursor, and there is nothing to preview or save on landing.
+    #[test]
+    fn the_view_switches_check_what_is_showing() {
+        let view = ViewSwitches::new(true, false);
+        assert_eq!(view.selected_row(), Some(ViewRow::TabBar));
+        assert!(view.is_checked(0), "the tab bar is showing");
+        assert!(!view.is_checked(1), "the file panel is not");
+        assert!(!view.is_checked(2), "no row past the last");
+        assert_eq!(view.len(), ViewSwitches::ROWS.len());
     }
 
     /// One list, two groups: the arrows walk from the switch onto the
@@ -949,33 +1045,33 @@ mod tests {
     #[test]
     fn sections_wrap_and_keep_their_own_selection() {
         let mut dialog = settings(SettingsSection::Theme);
-        move_settings_selection(&mut dialog, 1, 0);
+        move_settings_selection(&mut dialog, 1);
         switch_settings_section(&mut dialog, 1);
-        move_settings_selection(&mut dialog, -1, 0);
+        move_settings_selection(&mut dialog, 1);
         switch_settings_section(&mut dialog, 1);
-        move_settings_selection(&mut dialog, 2, 10);
+        move_settings_selection(&mut dialog, -1);
         switch_settings_section(&mut dialog, 1);
         let Dialog::Settings {
             section,
             themes,
+            view,
             sound,
-            keybinds,
         } = &dialog
         else {
             unreachable!()
         };
         assert_eq!(*section, SettingsSection::Theme, "Tab past the last wraps");
         assert_eq!(themes.selected, 1, "the theme cursor survived the trip");
+        assert_eq!(view.selected, 1, "the view cursor moved on its own");
         assert_eq!(sound.selected, 0, "the sound cursor moved on its own");
         assert_eq!(sound.selected_row(), Some(SoundRow::Switch(true)));
-        assert_eq!(keybinds.scroll, 2, "the keybinds viewport moved on its own");
 
         let mut back = settings(SettingsSection::Theme);
         switch_settings_section(&mut back, -1);
         assert!(matches!(
             back,
             Dialog::Settings {
-                section: SettingsSection::Keybinds,
+                section: SettingsSection::Sound,
                 ..
             }
         ));
@@ -989,46 +1085,67 @@ mod tests {
         ));
     }
 
-    /// The keybinds section is a viewport: the arrows and the wheel move
-    /// it within the bound the render hands over, Home and End jump to
-    /// its ends, and a click names no row on it. The same keys in a
-    /// picking section move its cursor to the ends.
+    /// The keybinds card is a viewport, not a picker: a wheel notch
+    /// scrolls text, Enter closes it like Esc since nothing on it is
+    /// chosen, the paging keys are its scroll keys, and the settings
+    /// card's helpers leave it alone. Home and End in a picking section
+    /// move its cursor to the ends.
     #[test]
-    fn the_keybinds_section_scrolls_a_viewport_within_its_bound() {
-        let mut dialog = settings(SettingsSection::Keybinds);
+    fn the_keybinds_card_is_a_viewport_and_confirms_nothing() {
+        let card = keybinds();
+        assert_eq!(dialog_wheel_rows(&card), 3, "a wheel notch scrolls text");
         assert_eq!(
-            settings_wheel_rows(&dialog),
-            3,
-            "a wheel notch scrolls text"
-        );
-        assert_eq!(
-            settings_wheel_rows(&settings(SettingsSection::Sound)),
+            dialog_wheel_rows(&settings(SettingsSection::Sound)),
             1,
             "a wheel notch moves a picker one row"
         );
-        move_settings_selection(&mut dialog, 8, 7);
-        let scroll = |dialog: &Dialog| match dialog {
-            Dialog::Settings { keybinds, .. } => keybinds.scroll,
-            _ => unreachable!(),
-        };
-        assert_eq!(scroll(&dialog), 7, "never past the bound");
-        move_settings_selection(&mut dialog, -1, 7);
-        assert_eq!(scroll(&dialog), 6, "and moves immediately back");
-        jump_settings_selection(&mut dialog, false, 7);
-        assert_eq!(scroll(&dialog), 0);
-        jump_settings_selection(&mut dialog, true, 7);
-        assert_eq!(scroll(&dialog), 7);
-        select_settings_row(&mut dialog, 3);
-        assert_eq!(scroll(&dialog), 7, "a click names no row");
+        let key = |code: KeyCode| KeyEvent::new(code, KeyModifiers::NONE);
+        assert_eq!(
+            dialog_key_action(&card, &key(KeyCode::Enter)),
+            DialogKeyAction::Cancel,
+            "Enter closes: there is nothing to confirm"
+        );
+        assert_eq!(
+            dialog_key_action(&card, &key(KeyCode::Esc)),
+            DialogKeyAction::Cancel
+        );
+        assert_eq!(
+            dialog_key_action(&card, &key(KeyCode::PageDown)),
+            DialogKeyAction::Scroll(8)
+        );
+        assert_eq!(
+            dialog_key_action(&card, &key(KeyCode::End)),
+            DialogKeyAction::ScrollEnd
+        );
+        assert_eq!(
+            dialog_key_action(&card, &key(KeyCode::Tab)),
+            DialogKeyAction::Ignore,
+            "no sections to walk"
+        );
+        let mut untouched = keybinds();
+        move_settings_selection(&mut untouched, 3);
+        jump_settings_selection(&mut untouched, true);
+        select_settings_row(&mut untouched, 3);
+        switch_settings_section(&mut untouched, 1);
+        assert_eq!(untouched, card, "the settings helpers are no-ops on it");
 
         let mut picker = settings(SettingsSection::Theme);
-        jump_settings_selection(&mut picker, true, 0);
+        jump_settings_selection(&mut picker, true);
         switch_settings_section(&mut picker, 1);
-        jump_settings_selection(&mut picker, true, 0);
-        let Dialog::Settings { themes, sound, .. } = &picker else {
+        jump_settings_selection(&mut picker, true);
+        switch_settings_section(&mut picker, 1);
+        jump_settings_selection(&mut picker, true);
+        let Dialog::Settings {
+            themes,
+            view,
+            sound,
+            ..
+        } = &picker
+        else {
             unreachable!()
         };
         assert_eq!(themes.selected, 1, "End is the last theme");
+        assert_eq!(view.selected, view.len() - 1, "End is the last view row");
         assert_eq!(sound.selected, sound.len() - 1, "End is the last sound");
     }
 

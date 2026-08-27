@@ -21,7 +21,7 @@ reads `cyclopsd offline` until one is running.
 - **Sidebar** (left): a session tree of workspaces and agents, over a file
   browser. Drag the dashed rule between them to resize either half.
 - **Tab bar** (top): one tab per tmux window, plus `+` for the next one.
-  Hide it from the app menu's `Tab bar` item.
+  Hide it from the `Tab bar` row on the settings card's View section.
 - **Pane canvas**: the live tmux panes, one terminal cell to one tmux
   cell, each with its own border. The workspace also paints the terminal's
   own background in the theme's color while it has focus, handing it back
@@ -56,7 +56,7 @@ Bindings are prefix-first, `Ctrl+B` then a key, tmux's own shape.
 | `Ctrl+B` `b` | Collapse or reopen the sidebar |
 | `Ctrl+B` `g` | Put the keyboard in the file panel; Esc gives it back |
 | `Ctrl+B` `s` | Send a message to an agent |
-| `Ctrl+B` `?` | Open Settings on its Keybinds section, the reference to every active binding |
+| `Ctrl+B` `?` | Open the keybinding reference, every active binding |
 
 Unbound keys, including modified keys like Claude Code's `Shift+Tab` and
 bare arrow keys, pass through to the focused pane. `Ctrl+B` `w` (or the

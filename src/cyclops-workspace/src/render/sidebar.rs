@@ -1163,7 +1163,7 @@ fn paint_footer(
     } else if clipped > 0 {
         // The body stops at the footer and does not scroll, so without
         // this a workspace below the fold looks like one that does not
-        // exist. Same job as the keybinds section's "1–12 / 20".
+        // exist. Same job as the keybinds card's "1–12 / 20".
         Some(format!("+{clipped} more"))
     } else {
         None

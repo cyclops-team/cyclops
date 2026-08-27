@@ -61,9 +61,7 @@ pub use canvas::{
 /// needs them: every caller that spends these cells is inside `canvas`.
 #[cfg(test)]
 pub use canvas::{PANE_GAPS, PANE_MARGIN};
-pub use overlay::{
-    clamp_dialog_offset, paint_dialog, paint_menu, settings_keybind_max_scroll, MenuChecks,
-};
+pub use overlay::{clamp_dialog_offset, keybind_max_scroll, paint_dialog, paint_menu, MenuChecks};
 pub use sidebar::{
     paint_messages, paint_messages_rail, paint_messages_resize_feedback, paint_sidebar,
     paint_sidebar_rail, paint_sidebar_resize_feedback, sidebar_body_bottom, SIDEBAR_COLLAPSE,
