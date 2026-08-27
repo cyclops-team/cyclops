@@ -617,7 +617,15 @@ fn diagnostic_rows(res: &StatusResult, style: &Style) -> Vec<String> {
 /// is not enough: it is not a state the agent is in, it is cyclops unable
 /// to read one, and the pane it names can receive nothing until that is
 /// fixed. The grid keeps its one-line rows and the reason goes underneath,
-/// once, however many rows there are.
+/// The rows under the grid explaining every `? unknown` pane on it.
+///
+/// A state cell says WHAT cyclops read. `unknown` is the one cell where
+/// that is not enough: it is not a state the agent is in, it is cyclops
+/// unable to read one, and the pane it names can receive no automatic
+/// notification until that is fixed. Every distinct reason gets a row, and
+/// panes the daemon gave no reason for get their own, because a pane whose
+/// cause differs from the first one's is exactly the pane an operator
+/// needs to see.
 fn unknown_rows(res: &StatusResult, style: &Style) -> Vec<String> {
     let unknown: Vec<&PaneStatus> = res
         .sessions
@@ -625,26 +633,76 @@ fn unknown_rows(res: &StatusResult, style: &Style) -> Vec<String> {
         .flat_map(|s| s.panes.iter())
         .filter(|p| p.state == AgentState::Unknown && !unmanaged_shell(p))
         .collect();
-    let Some(first) = unknown.first() else {
+    if unknown.is_empty() {
         return Vec::new();
-    };
-    // The pin command names the pane by its tmux id and keeps the name it
-    // already answers to, so it can be pasted whole: `cyclops name` takes
-    // a target and a label, and passing the label as the target would
-    // rename an adopted pane to a placeholder.
-    let loaded = res.manifests.as_ref().map(|m| m.ids.as_slice());
-    vec![
-        String::new(),
-        format!(
+    }
+    // Every distinct reason the daemon gave, not just the first pane's.
+    // Grouping by reason and printing only one group hid every pane whose
+    // cause differed, which is the same disappearance the old
+    // manifest-guess produced, so the fix has to cover all of them.
+    let mut rows = vec![String::new()];
+    let mut seen: Vec<&cyclops_proto::UnknownReason> = Vec::new();
+    for pane in &unknown {
+        let Some(reason) = pane.unknown_reason.as_ref() else {
+            continue;
+        };
+        if seen.contains(&reason) {
+            continue;
+        }
+        seen.push(reason);
+        let panes: Vec<&str> = unknown
+            .iter()
+            .filter(|p| p.unknown_reason.as_ref() == Some(reason))
+            .map(|p| p.pane_id.as_str())
+            .collect();
+        rows.push(format!(
             "  {}",
-            style.dim(&copy::unknown_panes(
-                unknown.len(),
-                &first.pane_id,
-                first.agent.as_deref(),
-                loaded
+            style.dim(&format!(
+                "{} {} unknown: {}",
+                panes.join(", "),
+                if panes.len() == 1 { "reads" } else { "read" },
+                reason.as_str()
             ))
-        ),
-    ]
+        ));
+        rows.push(format!("  {}", style.dim(reason.next_action())));
+    }
+
+    // Panes the daemon gave no reason for. This does NOT guess one. An
+    // older daemon simply did not compute reasons, and inferring a cause
+    // from which manifests happen to be loaded is precisely the lie this
+    // whole slice exists to delete: a pane can read unknown for a reason
+    // that has nothing to do with manifests, and be told to go and check
+    // its manifests.
+    let unexplained: Vec<&str> = unknown
+        .iter()
+        .filter(|p| p.unknown_reason.is_none())
+        .map(|p| p.pane_id.as_str())
+        .collect();
+    if !unexplained.is_empty() {
+        rows.push(format!(
+            "  {}",
+            style.dim(&format!(
+                "{} {} unknown, and this daemon gave no reason",
+                unexplained.join(", "),
+                if unexplained.len() == 1 {
+                    "reads"
+                } else {
+                    "read"
+                }
+            ))
+        ));
+        rows.push(format!(
+            "  {}",
+            style.dim(
+                "Update cyclops so the daemon reports one, or inspect the pane with: \
+                 cyclops read <pane> --source detection"
+            )
+        ));
+    }
+    if rows.len() == 1 {
+        return Vec::new();
+    }
+    rows
 }
 
 /// An ordinary terminal in a watched tmux session is not an unconfigured
@@ -653,10 +711,7 @@ fn unmanaged_shell(pane: &PaneStatus) -> bool {
     pane.agent.is_none()
         && pane.manifest.is_none()
         && pane.state == AgentState::Unknown
-        && matches!(
-            pane.current_command.as_str(),
-            "bash" | "fish" | "sh" | "zsh"
-        )
+        && cyclops_proto::is_plain_shell(&pane.current_command)
 }
 
 /// The roster: one row per named agent, on the same grid as `status`.
@@ -1296,6 +1351,12 @@ pub fn render_detection(target: &str, det: &Detection, style: &Style, now_ms: u6
         " {sep} {}",
         style.dim(&format!("decided by {}", det.decided_by))
     ));
+    // The same daemon-owned fact `status` prints, from the same verdict.
+    // This view is where an operator goes when status surprised them, so
+    // the two disagreeing here would be worse than either being silent.
+    if let Some(reason) = det.unknown_reason.as_ref() {
+        header.push_str(&format!(" {sep} {}", style.dim(reason.as_str())));
+    }
     // Runtime state and write-readiness are two answers, and the diagnostic
     // shows both (rule 12). The verdict comes from the one owner of the
     // rule, never recomputed here, so the surface cannot drift from the
@@ -1310,6 +1371,19 @@ pub fn render_detection(target: &str, det: &Detection, style: &Style, now_ms: u6
             Some(reason) => style.dim(&format!("not write-ready: {reason}")),
         }
     ));
+    // The canonical action, on its own line rather than in the header,
+    // because it is a sentence and the header is a row of chips. Status
+    // prints the identical string from the same shared mapping: an
+    // operator who came here because status surprised them must not find
+    // a second opinion about what to do.
+    //
+    // Emitted on both exits, including the no-readings one, since a pane
+    // with no sensor readings at all is exactly the case that most needs
+    // telling what to do next.
+    if let Some(reason) = det.unknown_reason.as_ref() {
+        header.push('\n');
+        header.push_str(&format!("  {}", style.dim(reason.next_action())));
+    }
     if det.readings.is_empty() {
         return header;
     }
@@ -1453,6 +1527,7 @@ mod tests {
             hooks_verified: None,
             manifest_display_name: None,
             unread: None,
+            unknown_reason: None,
         }
     }
 
@@ -1460,7 +1535,7 @@ mod tests {
     /// golden below. Written once because it is one sentence with one
     /// wording, and a golden that spelled it again would be a second copy
     /// of the copy.
-    const UNKNOWN_NOTE: &str = "\n\n  1 pane reads unknown: none of agy, claude, codex matches what is running there. Nothing can be delivered to an unknown pane. Pin one: cyclops name %4 <label> --manifest <id>. Teaching cyclops a new CLI is one file: docs/reference/MANIFESTS.md.";
+    const UNKNOWN_NOTE: &str = "\n\n  %4 reads unknown, and this daemon gave no reason\n  Update cyclops so the daemon reports one, or inspect the pane with: cyclops read <pane> --source detection";
 
     fn open_delivery(id: &str, to: &str, state: DeliveryState) -> cyclops_proto::OpenDelivery {
         cyclops_proto::OpenDelivery {
@@ -2014,73 +2089,6 @@ mod tests {
         assert!(rendered.contains("Run cyclops health"), "{rendered}");
         assert!(rendered.contains("cyclops daemon restart"), "{rendered}");
         assert!(!rendered.contains("secret body"), "{rendered}");
-    }
-
-    /// An unknown pane is the one cell on the grid that is not a state the
-    /// agent is in: it is cyclops unable to read one, and the pane can
-    /// receive nothing until it is fixed. Two causes wear that same label
-    /// and their fixes are nothing alike, so the daemon's manifest set
-    /// decides which sentence a reader gets. A daemon too old to say is a
-    /// third answer, not the empty set.
-    #[test]
-    fn an_unknown_pane_gets_the_reason_its_cause_earns() {
-        let mut res = fixture();
-
-        // Nothing loaded: the install is broken for every pane at once, and
-        // no per-pane pin would help.
-        res.manifests = Some(cyclops_proto::Manifests {
-            ids: Vec::new(),
-            dir: Some("/x/manifests".into()),
-        });
-        let got = render_status(&res, &Style::none(), Path::new("/x"));
-        assert!(
-            got.contains("1 pane reads unknown: cyclopsd loaded no detection manifests."),
-            "{got}"
-        );
-        assert!(
-            got.contains("Nothing can be delivered to an unknown pane"),
-            "{got}"
-        );
-        assert!(
-            got.contains("cyclops start, then restart cyclopsd"),
-            "{got}"
-        );
-        assert!(!got.contains("--manifest"), "nothing to pin: {got}");
-
-        // A daemon that predates the field says neither, so neither is
-        // claimed: the pin is still the next step and no id list is quoted.
-        res.manifests = None;
-        let got = render_status(&res, &Style::none(), Path::new("/x"));
-        assert!(
-            got.contains("no manifest matches what is running there"),
-            "{got}"
-        );
-        assert!(
-            got.contains("cyclops name %4 <label> --manifest <id>"),
-            "{got}"
-        );
-        assert!(!got.contains("loaded no detection manifests"), "{got}");
-
-        // Two unknown panes take one sentence, counted and pluralized, and
-        // the command names the first of them.
-        res.manifests = Some(cyclops_proto::Manifests {
-            ids: vec!["claude".into()],
-            dir: None,
-        });
-        res.sessions[0].panes[0].state = AgentState::Unknown;
-        let got = render_status(&res, &Style::none(), Path::new("/x"));
-        assert!(got.contains("2 panes read unknown"), "{got}");
-        // The first unknown row is reviewer, which already answers to a
-        // name: the command keeps it rather than renaming the pane.
-        assert!(
-            got.contains("cyclops name %1 reviewer --manifest <id>"),
-            "{got}"
-        );
-        assert_eq!(
-            got.matches("panes read unknown").count(),
-            1,
-            "one sentence however many rows: {got}"
-        );
     }
 
     /// And a grid with nothing unknown on it says nothing at all. The
@@ -2848,6 +2856,168 @@ mod tests {
         );
     }
 
+    /// `status` and `read --source detection` name the same reason for the
+    /// same pane, because both read the daemon's, and neither works one out.
+    ///
+    /// The failure this prevents is specific and used to be real: `status`
+    /// derived its explanation from whether manifests happened to load, so
+    /// a pane that was unknown for an entirely different reason was told to
+    /// go and check its manifests, while the detection view showed the
+    /// truth. An operator comparing the two had no way to tell which was
+    /// lying.
+    #[test]
+    fn status_and_the_detection_view_name_the_same_reason() {
+        use cyclops_proto::UnknownReason;
+
+        for reason in [
+            UnknownReason::LifecycleIncomplete,
+            UnknownReason::NoCurrentBootEdge,
+        ] {
+            let mut res = fixture();
+            let pane = &mut res.sessions[0].panes[0];
+            pane.state = AgentState::Unknown;
+            pane.unknown_reason = Some(reason.clone());
+            let pane_id = pane.pane_id.clone();
+
+            let status = render_status(&res, &Style::none(), Path::new("/dev/null"));
+            let det = Detection {
+                state: AgentState::Unknown,
+                disagreement: false,
+                decided_by: "no_rule".into(),
+                unknown_reason: Some(reason.clone()),
+                stale: false,
+                write_ready: false,
+                write_block: None,
+                composer_semantic: None,
+                readings: Vec::new(),
+            };
+            // Deliberately no readings: the early-return path, which is the
+            // pane most in need of being told what to do next.
+            let view = render_detection(&pane_id, &det, &Style::none(), 1_754_000_010_000);
+
+            assert!(
+                status.contains(reason.as_str()),
+                "status did not name {reason:?}:\n{status}"
+            );
+            assert!(
+                view.contains(reason.as_str()),
+                "the detection view did not name {reason:?}:\n{view}"
+            );
+            // BOTH surfaces carry BOTH facts, and the action is the same
+            // string from the same shared mapping. An operator who came to
+            // the detail view because status surprised them must not find a
+            // second opinion about what to do, and neither surface may hand
+            // them a word with nothing to do about it.
+            assert!(
+                status.contains(reason.next_action()),
+                "status named {reason:?} without its next action:\n{status}"
+            );
+            assert!(
+                view.contains(reason.next_action()),
+                "the detection view named {reason:?} without its next action:\n{view}"
+            );
+        }
+    }
+
+    /// Panes with different reasons all get said. None of them hides.
+    ///
+    /// The first version grouped by the first pane's reason and printed
+    /// only that group, so a pane whose cause differed disappeared from
+    /// the explanation entirely. That is the same disappearance the old
+    /// manifest guess produced, and it is exactly the pane an operator
+    /// most needs to see.
+    #[test]
+    fn every_distinct_reason_is_named_when_reasons_differ() {
+        use cyclops_proto::UnknownReason;
+
+        let mut res = fixture();
+        let session = &mut res.sessions[0];
+        let mut second = session.panes[0].clone();
+        second.pane_id = "%9".into();
+        second.agent = None;
+        session.panes.push(second);
+        let last = session.panes.len() - 1;
+
+        session.panes[0].state = AgentState::Unknown;
+        session.panes[0].unknown_reason = Some(UnknownReason::LifecycleIncomplete);
+        session.panes[last].state = AgentState::Unknown;
+        session.panes[last].unknown_reason = Some(UnknownReason::NoCurrentBootEdge);
+
+        let status = render_status(&res, &Style::none(), Path::new("/dev/null"));
+        for reason in [
+            UnknownReason::LifecycleIncomplete,
+            UnknownReason::NoCurrentBootEdge,
+        ] {
+            assert!(
+                status.contains(reason.as_str()),
+                "{reason:?} was hidden by another pane's reason:\n{status}"
+            );
+            assert!(
+                status.contains(reason.next_action()),
+                "{reason:?} was named without its action:\n{status}"
+            );
+        }
+        assert!(status.contains("%9"), "the second pane vanished:\n{status}");
+    }
+
+    /// A daemon that sends no reason says exactly that, and guesses nothing.
+    ///
+    /// This is the one that used to recreate the lie. The fallback
+    /// inferred a cause from which manifests happened to be loaded, so a
+    /// pane unknown for an unrelated reason was told to go and check its
+    /// manifests. Absent is absent: name it, offer the diagnostic, and
+    /// invent no cause.
+    #[test]
+    fn a_daemon_that_sends_no_reason_says_so_without_guessing() {
+        let mut res = fixture();
+        let pane = &mut res.sessions[0].panes[0];
+        pane.state = AgentState::Unknown;
+        pane.unknown_reason = None;
+        let pane_id = pane.pane_id.clone();
+
+        let status = render_status(&res, &Style::none(), Path::new("/dev/null"));
+        assert!(
+            status.contains(&pane_id),
+            "an unexplained unknown pane vanished from status:\n{status}"
+        );
+        assert!(
+            status.contains("gave no reason"),
+            "status did not say the reason was absent:\n{status}"
+        );
+        assert!(
+            status.contains("--source detection"),
+            "status offered no way to look further:\n{status}"
+        );
+        assert!(
+            !status.contains("--manifest"),
+            "status guessed a manifest cause it was never told:\n{status}"
+        );
+    }
+
+    /// Explained and unexplained panes coexist without either hiding.
+    #[test]
+    fn a_pane_with_a_reason_does_not_hide_one_without() {
+        use cyclops_proto::UnknownReason;
+
+        let mut res = fixture();
+        let session = &mut res.sessions[0];
+        let mut second = session.panes[0].clone();
+        second.pane_id = "%9".into();
+        second.agent = None;
+        session.panes.push(second);
+        let last = session.panes.len() - 1;
+
+        session.panes[0].state = AgentState::Unknown;
+        session.panes[0].unknown_reason = Some(UnknownReason::LifecycleIncomplete);
+        session.panes[last].state = AgentState::Unknown;
+        session.panes[last].unknown_reason = None;
+
+        let status = render_status(&res, &Style::none(), Path::new("/dev/null"));
+        assert!(status.contains("lifecycle_incomplete"), "{status}");
+        assert!(status.contains("gave no reason"), "{status}");
+        assert!(status.contains("%9"), "{status}");
+    }
+
     #[test]
     fn detection_view_is_exact() {
         let now = 1_754_000_010_000;
@@ -2855,6 +3025,7 @@ mod tests {
             state: AgentState::Working,
             disagreement: true,
             decided_by: "hook:Stop".into(),
+            unknown_reason: None,
             stale: false,
             write_ready: false,
             write_block: None,

@@ -100,9 +100,55 @@ $ cyclops status
   %0  ? unknown  mac
 ```
 
-No manifest matched the process in that pane, so Cyclops has no rules for
-reading it and cannot safely write a mailbox notification. Three causes, in
-order of likelihood:
+`unknown` is not a state the agent is in. It means Cyclops could not read
+one, so the pane gets no automatic notification until that is fixed.
+Messaging itself is unaffected: send, unread, inbox, claim and reply all
+keep working against an unknown pane, and nothing is lost. The degradation
+is that you pull rather than being pinged.
+
+**Read the reason before guessing.** Recent daemons say why, and both
+surfaces give the same answer because both print the daemon's:
+
+```
+$ cyclops status
+‿ cyclops · watching main · tmux 3.6a · up 2s
+
+  %1  ? unknown  claude
+
+  %1 reads unknown: lifecycle_incomplete
+  Nothing to fix here: this agent does not report a full turn, so its runtime stays unknown. Sending, unread, claim and reply all still work.
+```
+
+`cyclops read %1 --source detection` names the same reason beside the rule
+that decided the state. The reasons you can see:
+
+| Reason | What to do |
+|---|---|
+| `lifecycle_incomplete` | Nothing. That agent does not report a full turn, missing a start or an end, so runtime stays unknown by design. |
+| `no_current_boot_edge` | Wait for the pane's next turn, or restart the agent. Nothing has been reported for it since the daemon started. |
+| `binding_unproven` | Re-run `cyclops list` to rebind the pane. |
+| `unsupported_vendor` | Teach Cyclops the program with a manifest, or leave it: an unmanaged pane still sends and receives. |
+| `integration_not_installed` | Install that agent's lifecycle integration. |
+| `integration_outdated` | Reinstall it; the installed one is too old for this daemon. |
+
+A build emits only the reasons it can evidence, so a pane with no reason
+printed is a pane this daemon could not explain, **not** a pane with a
+known cause. Status says so directly:
+
+```
+  %4 reads unknown, and this daemon gave no reason
+  Update cyclops so the daemon reports one, or inspect the pane with:
+  cyclops read <pane> --source detection
+```
+
+Do not read that as "no manifest matched". It means the daemon did not
+report a cause, which is most often an older daemon than the client. Check
+that the installed pair match, then look at the pane directly.
+
+## When no reason is reported, and the pane is not running an agent
+
+These are the historical causes, in order of likelihood. Reach for them
+after the detection view, not instead of it:
 
 1. **The pane is running a shell**, not an agent. Expected. Start the agent.
 2. **The process name is not what the manifest expects.** A wrapper script,

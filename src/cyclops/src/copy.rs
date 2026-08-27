@@ -126,48 +126,6 @@ pub fn attention_action_uncertain(
 pub const NO_AGENTS: &str =
     "No agents yet. Name a pane: cyclops name %1 reviewer  (cyclops status lists the panes)";
 
-/// Why a pane reads `? unknown`, and the next step.
-///
-/// The label alone has never been enough, because two different problems
-/// wear it and their fixes are nothing alike. cyclopsd holding no manifests
-/// at all is a broken install: nothing on the machine can be detected or
-/// delivered to, and it is fixed once for every pane. A full manifest set
-/// that binds nothing in one pane is one CLI cyclops has not been taught,
-/// and it is fixed for that pane. A delivery to an unknown pane ends in
-/// attention_required either way, which is why this is said before a
-/// message is sent rather than half a minute after.
-///
-/// `loaded` is the daemon's manifest ids: None from a daemon too old to
-/// say, which is not the same as an empty set and must not be reported as
-/// one.
-pub fn unknown_panes(
-    n: usize,
-    pane_id: &str,
-    label: Option<&str>,
-    loaded: Option<&[String]>,
-) -> String {
-    let head = if n == 1 {
-        "1 pane reads unknown".to_string()
-    } else {
-        format!("{n} panes read unknown")
-    };
-    let (why, next) = match loaded {
-        Some([]) => (
-            "cyclopsd loaded no detection manifests.".to_string(),
-            "Install them and restart: cyclops start, then restart cyclopsd.".to_string(),
-        ),
-        Some(ids) => (
-            format!("none of {} matches what is running there.", ids.join(", ")),
-            pin_a_manifest(pane_id, label),
-        ),
-        None => (
-            "no manifest matches what is running there.".to_string(),
-            pin_a_manifest(pane_id, label),
-        ),
-    };
-    format!("{head}: {why} Nothing can be delivered to an unknown pane. {next}")
-}
-
 /// The command that teaches cyclops what runs in a pane.
 ///
 /// One home, because three surfaces print it: the status grid explaining
@@ -181,16 +139,6 @@ pub fn unknown_panes(
 /// placeholder, which is the one way to get this command wrong.
 fn pin_command(pane: &str, label: &str) -> String {
     format!("cyclops name {pane} {label} --manifest <id>")
-}
-
-/// The next step for a pane no manifest binds: pin one, or write one.
-/// `label` is the name the pane already answers to, so the command can be
-/// pasted whole instead of renaming the pane to a placeholder.
-fn pin_a_manifest(pane: &str, label: Option<&str>) -> String {
-    format!(
-        "Pin one: {}. Teaching cyclops a new CLI is one file: docs/reference/MANIFESTS.md.",
-        pin_command(pane, label.unwrap_or("<label>"))
-    )
 }
 
 /// Said right after `cyclops name` when nothing binds the pane it just
@@ -694,37 +642,17 @@ mod tests {
         );
     }
 
-    /// Three causes, three sentences, and the difference between them is
-    /// the whole point: an empty manifest set is fixed once for the
-    /// machine, a set that binds nothing in one pane is fixed for that
-    /// pane, and a daemon too old to say must be reported as neither.
-    #[test]
-    fn unknown_pane_copy_names_the_cause_and_the_fix() {
-        let ids = vec!["agy".to_string(), "claude".to_string()];
-        assert_eq!(
-            unknown_panes(1, "%4", None, Some(&[])),
-            "1 pane reads unknown: cyclopsd loaded no detection manifests. Nothing can be delivered to an unknown pane. Install them and restart: cyclops start, then restart cyclopsd."
-        );
-        assert_eq!(
-            unknown_panes(1, "%4", None, Some(&ids)),
-            "1 pane reads unknown: none of agy, claude matches what is running there. Nothing can be delivered to an unknown pane. Pin one: cyclops name %4 <label> --manifest <id>. Teaching cyclops a new CLI is one file: docs/reference/MANIFESTS.md."
-        );
-        // A pane that already answers to a name keeps it, so the command
-        // is one a reader can paste instead of edit.
-        assert_eq!(
-            unknown_panes(2, "%4", Some("reviewer"), None),
-            "2 panes read unknown: no manifest matches what is running there. Nothing can be delivered to an unknown pane. Pin one: cyclops name %4 reviewer --manifest <id>. Teaching cyclops a new CLI is one file: docs/reference/MANIFESTS.md."
-        );
-    }
-
-    /// Three surfaces, one command, byte for byte. A reader who has seen
-    /// it on the status grid must not have to compare it with the one a
-    /// refused send prints.
+    /// The surfaces that still name the pin command say it byte for byte.
+    /// A reader who has seen it once must not have to compare spellings.
+    ///
+    /// The status grid used to be in this list. It no longer offers a pin,
+    /// because it no longer guesses that a missing manifest is the cause:
+    /// the daemon says why a pane is unknown, and only some of those
+    /// reasons are fixed by pinning one.
     #[test]
     fn every_surface_prints_the_same_pin_command() {
         let want = "cyclops name %4 reviewer --manifest <id>";
         for said in [
-            unknown_panes(1, "%4", Some("reviewer"), None),
             named_but_undetected("%4", "reviewer"),
             needs_attention_for("reviewer", Some("%4"), None),
         ] {

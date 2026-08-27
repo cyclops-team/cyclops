@@ -2179,6 +2179,118 @@ pub(crate) enum AdmissionOutcome {
     Unproven,
 }
 
+/// Why this pane reads `unknown`, from evidence the daemon already holds.
+///
+/// Only reasons with a real producer are returned. `integration_not_installed`
+/// and `integration_outdated` are part of the protocol's closed set and are
+/// deliberately never produced here, because nothing in the daemon knows
+/// whether a vendor's hooks are installed or at what version: it reads its
+/// own `config.toml` and no vendor configuration at all. Naming them without
+/// a producer would be an invented mapping.
+///
+/// Note what this deliberately does NOT use. `seen_admitting_edge` is the
+/// injection-safety subset, a narrower question about whether a write may be
+/// authorised, and answering "why is runtime unknown" with it would couple
+/// the runtime explanation to the terminal-write gate. Those are separate
+/// facts and stay separate: lifecycle evidence explains runtime, admission
+/// evidence gates writes.
+fn unknown_reason(
+    inner: &Inner,
+    route: &PaneKey,
+    admitted: Option<crate::identity::ProcId>,
+    manifest_id: Option<&str>,
+    current_command: &str,
+) -> Option<cyclops_proto::UnknownReason> {
+    use cyclops_proto::UnknownReason;
+
+    // No manifest matched. That describes two different situations and only
+    // one of them is a problem: a spare pane sitting at a shell prompt is
+    // the expected state and needs no remedy, while an agent CLI Cyclops was
+    // never taught is a gap with a fix. `is_plain_shell` is the one place
+    // that judgement lives, shared with every client so no surface can
+    // decide it differently, and it is why this reason can be produced at
+    // all rather than deferred: without it, saying `unsupported_vendor`
+    // would put a false problem on the grid for every shell pane.
+    let Some(manifest_id) = manifest_id else {
+        return (!cyclops_proto::is_plain_shell(current_command))
+            .then_some(UnknownReason::UnsupportedVendor);
+    };
+    let Some(manifest) = inner.manifests.get(manifest_id) else {
+        return (!cyclops_proto::is_plain_shell(current_command))
+            .then_some(UnknownReason::UnsupportedVendor);
+    };
+
+    // Both roles or no turn can ever complete. An ACK hook is not a
+    // lifecycle role, which is why this asks for the roles rather than for
+    // the presence of hooks.
+    //
+    // `has_lifecycle_role` and not a local `is_some()`: the manifest layer
+    // treats a BLANK name as an absent role, and a second opinion here
+    // would let a manifest declaring `turn_start = ""` look complete to
+    // the reason producer while the parser considers it missing. The pane
+    // would then be told to wait for a turn edge no event can satisfy.
+    // One predicate, owned where the roles are defined.
+    let has_start = manifest
+        .hooks
+        .has_lifecycle_role(cyclops_manifest::LifecycleRole::Start);
+    let has_end = manifest
+        .hooks
+        .has_lifecycle_role(cyclops_manifest::LifecycleRole::End);
+    let mut candidates = Vec::new();
+    if !has_start || !has_end {
+        candidates.push(UnknownReason::LifecycleIncomplete);
+    }
+
+    // An observation of any lifecycle event this manifest declares, for the
+    // exact binding in the pane now, since this daemon started.
+    //
+    // With no proven occupant there is no "exact current binding" to have
+    // observed anything for, so this reason is simply not evaluated. The
+    // separate fact that the binding could not be proven is
+    // `binding_unproven`, which is NOT produced here: capture stability
+    // exists but is not yet a runtime-reason producer, and inventing one
+    // from the write-gating fact is the coupling this milestone removes.
+    // Whether the manifest can complete a turn at all is a property of the
+    // manifest rather than of the binding, so that answer still stands.
+    let Some(agent) = admitted else {
+        return UnknownReason::most_specific(candidates);
+    };
+    // The record has to be durable AND lifecycle-only, and three candidates
+    // are near misses.
+    //
+    // `hook_readings` is the turn in flight and is removed when an end
+    // matches its start, so it answers no for a pane whose turns have all
+    // completed, which would tell an operator to restart a healthy agent.
+    //
+    // `seen_any` is every raw hook, so a Notification, a StopFailure or a
+    // PermissionRequest satisfies it while no turn was ever reported.
+    //
+    // `seen_admitting_edge` is the injection-safety subset and answers
+    // whether a write may be authorised, so explaining runtime with it
+    // would couple this to the terminal-write gate.
+    //
+    // What is left is the durable diagnostic edges, intersected with the
+    // event names this manifest declares as lifecycle roles.
+    // Blank names are absent roles, so they must not be carried into the
+    // intersection either: an edge can never be recorded under an empty
+    // name, and including one would only make the declared set look
+    // larger than the manifest considers it.
+    let declared: Vec<&str> = manifest
+        .hooks
+        .lifecycle_names()
+        .into_iter()
+        .filter(|name| !name.trim().is_empty())
+        .collect();
+    let observed =
+        inner
+            .hook_liveness
+            .seen_declared_lifecycle(route, agent, manifest_id, &declared);
+    if !observed {
+        candidates.push(UnknownReason::NoCurrentBootEdge);
+    }
+    UnknownReason::most_specific(candidates)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn liveness_idle_admission(
     inner: &Inner,
@@ -2813,6 +2925,7 @@ pub(crate) fn fuse(
                 state: s.state,
                 disagreement: true,
                 decided_by: s.id.clone(),
+                unknown_reason: None,
                 stale: false,
                 write_ready: false,
                 write_block: None,
@@ -2823,6 +2936,7 @@ pub(crate) fn fuse(
                 state: AgentState::Unknown,
                 disagreement: false,
                 decided_by: "idle_unconfirmed".into(),
+                unknown_reason: None,
                 stale: false,
                 write_ready: false,
                 write_block: None,
@@ -2836,6 +2950,7 @@ pub(crate) fn fuse(
             state: w.state,
             disagreement: matches!((title, screen), (Some(t), Some(s)) if t.state != s.state),
             decided_by: w.id.clone(),
+            unknown_reason: None,
             stale: false,
             write_ready: false,
             write_block: None,
@@ -2847,6 +2962,7 @@ pub(crate) fn fuse(
             readings,
             disagreement: false,
             decided_by: "no_rule".into(),
+            unknown_reason: None,
             stale: false,
             write_ready: false,
             write_block: None,
@@ -3577,6 +3693,9 @@ async fn recompute_pane_with_evidence(
 
     // Kept for the emitted event: the verdict below consumes manifest_id.
     let source_manifest = manifest_id.clone().unwrap_or_default();
+    // Kept for the unknown-reason producer at the end, which runs after
+    // `manifest_id` itself has been consumed by the fusion below.
+    let reason_manifest = manifest_id.clone();
     let ts = unix_ms();
     // State and ledger timestamps name this capture. Lifecycle eligibility
     // names the event that caused it. Capping protects the same ordering if
@@ -3640,6 +3759,7 @@ async fn recompute_pane_with_evidence(
                     readings: Vec::new(),
                     disagreement: false,
                     decided_by: "pane_in_mode".into(),
+                    unknown_reason: None,
                     stale: false,
                     write_ready: false,
                     write_block: None,
@@ -3730,6 +3850,7 @@ async fn recompute_pane_with_evidence(
             readings: Vec::new(),
             disagreement: false,
             decided_by: "pane_dead".into(),
+            unknown_reason: None,
             stale: false,
             write_ready: false,
             write_block: None,
@@ -3867,6 +3988,7 @@ async fn recompute_pane_with_evidence(
             readings: Vec::new(),
             disagreement: false,
             decided_by: "no_manifest".into(),
+            unknown_reason: None,
             stale: false,
             write_ready: false,
             write_block: None,
@@ -4221,6 +4343,19 @@ async fn recompute_pane_with_evidence(
         if let Some(reason) = recovery_refusal {
             detection = detection.refused(reason);
         }
+        // Before the cache, for the same reason the stamp is: the cache is
+        // what every status surface reads, so a reason attached after it is
+        // a reason nobody sees. The unit tests call the producer directly
+        // and cannot catch that; the parity walk did.
+        if detection.state == AgentState::Unknown {
+            detection.unknown_reason = unknown_reason(
+                inner,
+                &route,
+                admitted,
+                reason_manifest.as_deref(),
+                &row.current_command,
+            );
+        }
         // Restart truth: a clean, current, exact-bound frame with no active
         // start and no qualifying edge from THIS daemon boot stays unknown
         // and names its block, so the notification path records a durable,
@@ -4564,6 +4699,296 @@ line_regex = ['^ACTIVE']
         Manifest::parse(FIXTURE, Path::new("bash.toml")).unwrap()
     }
 
+    /// The fixture with both lifecycle roles declared, so a turn can
+    /// complete. `turn_start` alone is the shape `claude.toml` actually
+    /// ships, which is why the incomplete case needs no invention.
+    fn manifest_with_lifecycle(start: Option<&str>, end: Option<&str>) -> Manifest {
+        let mut m = manifest();
+        m.hooks.turn_start = start.map(str::to_string);
+        m.hooks.turn_end = end.map(str::to_string);
+        m.hooks.turn_end_confirmed = Vec::new();
+        m
+    }
+
+    fn manifests_of(m: Manifest) -> BTreeMap<String, Manifest> {
+        BTreeMap::from([("bash".to_string(), m)])
+    }
+
+    /// A hook that is not a turn edge does not count as one.
+    ///
+    /// `bind_diagnostic` records EVERY raw hook, so `seen_any` is true for
+    /// a Notification, a StopFailure or a PermissionRequest, none of which
+    /// reports a turn. Asking that question here let an ACK-only or
+    /// attention-only pane look like a pane that had been reporting turns,
+    /// which silently removed the operator's reason. The predicate now
+    /// intersects the durable edges with the event names the manifest
+    /// declares as lifecycle roles.
+    #[test]
+    fn only_a_declared_lifecycle_event_satisfies_the_boot_edge() {
+        use cyclops_proto::UnknownReason;
+
+        let pane = PaneKey::new(0, "%1");
+        let agent = crate::identity::ProcId {
+            pid: 4242,
+            birth: 7,
+        };
+        let both = manifest_with_lifecycle(Some("Start"), Some("Stop"));
+        let inner = inner_with(manifests_of(both));
+        inner.hook_liveness.open(&pane);
+
+        // Hooks that are real, recorded, and not turn edges.
+        for (ts, event) in [
+            (10, "Notification"),
+            (11, "StopFailure"),
+            (12, "PermissionRequest"),
+        ] {
+            inner
+                .hook_liveness
+                .bind_diagnostic(&pane, event, ts, agent, "bash")
+                .expect("route open");
+        }
+        assert!(
+            inner.hook_liveness.seen_any(&pane, agent, "bash"),
+            "the fixture wants hooks on record, so the broad question is true"
+        );
+        assert_eq!(
+            unknown_reason(&inner, &pane, Some(agent), Some("bash"), "cycagent"),
+            Some(UnknownReason::NoCurrentBootEdge),
+            "a non-lifecycle hook was accepted as a turn edge"
+        );
+
+        // A declared role. Now a turn really has been reported.
+        inner
+            .hook_liveness
+            .bind_diagnostic(&pane, "Start", 20, agent, "bash")
+            .expect("route open");
+        assert_eq!(
+            unknown_reason(&inner, &pane, Some(agent), Some("bash"), "cycagent"),
+            None,
+            "a declared turn start did not satisfy the boot edge"
+        );
+    }
+
+    /// A blank role name is an absent role, and both layers must agree.
+    ///
+    /// The manifest parser treats `turn_start = ""` as no start at all,
+    /// through `has_lifecycle_role`. A local `is_some()` here would call
+    /// the same manifest complete, so the pane would be told to wait for a
+    /// turn edge that no event can ever satisfy, or told nothing at all,
+    /// instead of being told the manifest cannot complete a turn. Two
+    /// opinions about what counts as declared is the defect; one predicate
+    /// is the fix.
+    #[test]
+    fn a_blank_lifecycle_role_is_an_absent_role() {
+        use cyclops_proto::UnknownReason;
+
+        let route = PaneKey::new(0, "%1");
+        let agent = crate::identity::ProcId {
+            pid: 4242,
+            birth: 7,
+        };
+        for (start, end) in [
+            (Some(""), Some("Stop")),
+            (Some("Start"), Some("")),
+            (Some("   "), Some("Stop")),
+            (Some(""), Some("")),
+        ] {
+            let m = manifest_with_lifecycle(start, end);
+            let inner = inner_with(manifests_of(m));
+            assert_eq!(
+                unknown_reason(&inner, &route, Some(agent), Some("bash"), "cycagent"),
+                Some(UnknownReason::LifecycleIncomplete),
+                "start {start:?} end {end:?} was treated as a declared pair"
+            );
+        }
+        // And the same manifest with both roles really named is complete,
+        // so the blank test is not simply reporting incomplete for
+        // everything.
+        let inner = inner_with(manifests_of(manifest_with_lifecycle(
+            Some("Start"),
+            Some("Stop"),
+        )));
+        assert_eq!(
+            unknown_reason(&inner, &route, Some(agent), Some("bash"), "cycagent"),
+            Some(UnknownReason::NoCurrentBootEdge),
+            "a genuinely declared pair was reported incomplete"
+        );
+    }
+
+    /// A pane sitting at a shell prompt is not an unsupported vendor.
+    ///
+    /// Nothing matches a manifest in either case, which is why they were
+    /// confusable and why this reason was deferred at first. A spare pane
+    /// at a prompt is the expected state of a workspace and needs no
+    /// remedy; saying `unsupported_vendor` there would put a false problem
+    /// on the grid for every shell an operator keeps open.
+    #[test]
+    fn a_shell_pane_is_not_an_unsupported_vendor() {
+        use cyclops_proto::UnknownReason;
+
+        let route = PaneKey::new(0, "%1");
+        let agent = crate::identity::ProcId {
+            pid: 4242,
+            birth: 7,
+        };
+        for shell in ["bash", "zsh", "sh", "fish"] {
+            assert_eq!(
+                unknown_reason(
+                    &inner_with(BTreeMap::new()),
+                    &route,
+                    Some(agent),
+                    None,
+                    shell
+                ),
+                None,
+                "{shell} was called an unsupported vendor"
+            );
+        }
+        assert_eq!(
+            unknown_reason(
+                &inner_with(BTreeMap::new()),
+                &route,
+                Some(agent),
+                None,
+                "some-new-agent-cli"
+            ),
+            Some(UnknownReason::UnsupportedVendor),
+            "a CLI we were never taught was not reported"
+        );
+    }
+
+    /// M2.1 publishes only the reasons it can actually evidence, and the
+    /// other three must be unreachable rather than merely unused.
+    ///
+    /// They stay in the closed wire set and in the one precedence owner,
+    /// because the contract is the full six and a later slice fills them
+    /// in. What must not happen is this slice guessing.
+    ///
+    /// `unsupported_vendor` IS produced, and the thing that unblocked it is
+    /// worth naming: nothing matched a manifest describes an untaught agent
+    /// and an ordinary shell identically, so the reason needed a way to
+    /// tell them apart. The pane's `current_command` was already in the
+    /// daemon and the shell test already existed client-side, so sharing
+    /// `is_plain_shell` gave both halves one answer. Without it, saying
+    /// `unsupported_vendor` would put a false problem on the grid for every
+    /// spare `bash` pane an operator keeps open.
+    ///
+    /// `binding_unproven` waits for M2.2, because capture stability is a
+    /// write-gating fact and is not yet a runtime reason. The install pair
+    /// has no daemon producer at all: the daemon reads its own config and
+    /// no vendor's.
+    #[test]
+    fn m2_1_produces_only_the_three_evidence_backed_reasons() {
+        use cyclops_proto::UnknownReason;
+
+        let route = PaneKey::new(0, "%1");
+        let agent = crate::identity::ProcId {
+            pid: 4242,
+            birth: 7,
+        };
+        let both = manifest_with_lifecycle(Some("Start"), Some("Stop"));
+        let start_only = manifest_with_lifecycle(Some("Start"), None);
+
+        // Every shape the producer can meet, paired with what it must say.
+        /// One producer case: what it is, the daemon holding it, the
+        /// proven occupant if any, the matched manifest if any, and the
+        /// one reason that must come out.
+        type Case = (
+            &'static str,
+            Arc<Inner>,
+            Option<crate::identity::ProcId>,
+            Option<&'static str>,
+            Option<UnknownReason>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "nothing matched, and the pane is not a shell: a CLI we were never taught",
+                inner_with(BTreeMap::new()),
+                Some(agent),
+                None,
+                Some(UnknownReason::UnsupportedVendor),
+            ),
+            (
+                "a manifest id the daemon does not hold, on a non-shell pane",
+                inner_with(BTreeMap::new()),
+                Some(agent),
+                Some("bash"),
+                Some(UnknownReason::UnsupportedVendor),
+            ),
+            (
+                "no proven occupant, so no exact binding to have observed anything",
+                inner_with(manifests_of(both.clone())),
+                None,
+                Some("bash"),
+                None,
+            ),
+            (
+                "a manifest that declares a start and no end can never finish a turn",
+                inner_with(manifests_of(start_only.clone())),
+                Some(agent),
+                Some("bash"),
+                Some(UnknownReason::LifecycleIncomplete),
+            ),
+            (
+                "incomplete lifecycle is a property of the manifest, not the binding",
+                inner_with(manifests_of(start_only)),
+                None,
+                Some("bash"),
+                Some(UnknownReason::LifecycleIncomplete),
+            ),
+            (
+                "both roles declared and nothing observed for this binding yet",
+                inner_with(manifests_of(both.clone())),
+                Some(agent),
+                Some("bash"),
+                Some(UnknownReason::NoCurrentBootEdge),
+            ),
+        ];
+
+        let deferred = [
+            UnknownReason::BindingUnproven,
+            UnknownReason::IntegrationNotInstalled,
+            UnknownReason::IntegrationOutdated,
+        ];
+        for (what, inner, admitted, manifest_id, want) in cases {
+            let got = unknown_reason(&inner, &route, admitted, manifest_id, "cycagent");
+            assert_eq!(got, want, "{what}");
+            if let Some(got) = got {
+                assert!(
+                    !deferred.contains(&got),
+                    "{what} produced a deferred reason"
+                );
+            }
+        }
+
+        // The record this reads must be the DURABLE one. `hook_readings`
+        // holds the turn in flight and is removed when a turn's end matches
+        // its start, so a pane whose turns have all completed has an empty
+        // slot there. Asking it would report "nothing reported this boot"
+        // for an agent that has been reporting perfectly, and would tell
+        // the operator to restart it.
+        let inner = inner_with(manifests_of(both));
+        let reading = SensorReading {
+            sensor: Sensor::Title,
+            state: AgentState::Unknown,
+            rule: "in flight".into(),
+            ts: 1,
+        };
+        inner
+            .hook_readings
+            .lock()
+            .expect("hook readings lock")
+            .insert(
+                route.clone(),
+                HookEntry::bound(agent, Some("bash".to_string()), reading),
+            );
+        assert_eq!(
+            unknown_reason(&inner, &route, Some(agent), Some("bash"), "cycagent"),
+            Some(UnknownReason::NoCurrentBootEdge),
+            "a transient in-flight slot was mistaken for a durable boot edge"
+        );
+    }
+
     fn current_tiers_manifest() -> Manifest {
         Manifest::parse(CURRENT_TIERS_FIXTURE, Path::new("current-tiers.toml")).unwrap()
     }
@@ -4579,6 +5004,7 @@ line_regex = ['^ACTIVE']
             }],
             disagreement: false,
             decided_by: "quota-probe".into(),
+            unknown_reason: None,
             stale: false,
             write_ready: false,
             write_block: None,
@@ -4706,6 +5132,7 @@ line_regex = ['^ACTIVE']
             }],
             disagreement: false,
             decided_by: "fixture".into(),
+            unknown_reason: None,
             stale: false,
             write_ready: false,
             write_block: None,
@@ -6085,6 +6512,7 @@ contains = ["working"]
             }],
             disagreement: false,
             decided_by: "working".into(),
+            unknown_reason: None,
             stale: false,
             write_ready: false,
             write_block: None,
@@ -6100,6 +6528,7 @@ contains = ["working"]
             }],
             disagreement: false,
             decided_by: "composer_empty".into(),
+            unknown_reason: None,
             stale: false,
             write_ready: false,
             write_block: None,
@@ -6160,6 +6589,7 @@ contains = ["working"]
             }],
             disagreement: false,
             decided_by: rule.into(),
+            unknown_reason: None,
             stale: false,
             write_ready: false,
             write_block: None,
@@ -6286,6 +6716,7 @@ contains = ["working"]
             }],
             disagreement: false,
             decided_by: rule.into(),
+            unknown_reason: None,
             stale: false,
             write_ready: false,
             write_block: None,
@@ -6389,6 +6820,7 @@ contains = ["working"]
             }],
             disagreement: false,
             decided_by: rule.into(),
+            unknown_reason: None,
             stale: false,
             write_ready: false,
             write_block: None,
@@ -6487,6 +6919,7 @@ contains = ["working"]
             }],
             disagreement: false,
             decided_by: "composer_empty".into(),
+            unknown_reason: None,
             stale: false,
             write_ready: false,
             write_block: None,
@@ -6645,6 +7078,7 @@ contains = ["working"]
             }],
             disagreement: false,
             decided_by: "composer_empty".into(),
+            unknown_reason: None,
             stale: false,
             write_ready: false,
             write_block: None,
@@ -6853,6 +7287,7 @@ contains = ["working"]
             }],
             disagreement: false,
             decided_by: "composer_empty".into(),
+            unknown_reason: None,
             stale: false,
             write_ready: false,
             write_block: None,
@@ -6922,6 +7357,7 @@ contains = ["working"]
             }],
             disagreement: false,
             decided_by: "screen_busy".into(),
+            unknown_reason: None,
             stale: false,
             write_ready: false,
             write_block: None,
@@ -7158,6 +7594,7 @@ contains = ["working"]
             readings: Vec::new(),
             disagreement: false,
             decided_by: "screen".into(),
+            unknown_reason: None,
             stale,
             write_ready: false,
             write_block: None,
@@ -7422,6 +7859,7 @@ regex = ['^']
                 readings,
                 disagreement: false,
                 decided_by: "test".into(),
+                unknown_reason: None,
                 stale,
                 write_ready: false,
                 write_block: None,
@@ -8040,6 +8478,7 @@ regex = ['^']
             }],
             disagreement: false,
             decided_by: "composer".into(),
+            unknown_reason: None,
             stale: false,
             write_ready: false,
             write_block: None,
@@ -8811,6 +9250,7 @@ regex = ['^']
                 }],
                 disagreement: false,
                 decided_by: "composer".into(),
+                unknown_reason: None,
                 stale: false,
                 write_ready: false,
                 write_block: None,
@@ -8885,6 +9325,7 @@ regex = ['^']
                 }],
                 disagreement: false,
                 decided_by: "blocked_screen".into(),
+                unknown_reason: None,
                 stale: false,
                 write_ready: false,
                 write_block: None,
@@ -8926,6 +9367,7 @@ regex = ['^']
                 }],
                 disagreement: false,
                 decided_by: "visual".into(),
+                unknown_reason: None,
                 stale: false,
                 write_ready: false,
                 write_block: None,
@@ -9159,6 +9601,7 @@ regex = ['^IDLE']
             }],
             disagreement: false,
             decided_by: "composer_empty".into(),
+            unknown_reason: None,
             stale: false,
             write_ready: false,
             write_block: None,
@@ -9250,6 +9693,7 @@ regex = ['^IDLE']
                     readings: Vec::new(),
                     disagreement: false,
                     decided_by: "fixture".into(),
+                    unknown_reason: None,
                     stale: false,
                     write_ready: false,
                     write_block: None,
@@ -9622,6 +10066,7 @@ regex = ['^IDLE']
                 readings: Vec::new(),
                 disagreement: false,
                 decided_by: "test".into(),
+                unknown_reason: None,
                 stale: false,
                 write_ready: false,
                 write_block: None,

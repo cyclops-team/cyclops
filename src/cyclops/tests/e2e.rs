@@ -287,7 +287,7 @@ fn canned_status() -> Value {
 }
 
 /// The block the canned answer's one unknown pane earns, under the grid.
-const UNKNOWN_NOTE: &str = "\n  1 pane reads unknown: none of agy, claude, codex matches what is running there. Nothing can be delivered to an unknown pane. Pin one: cyclops name %4 <label> --manifest <id>. Teaching cyclops a new CLI is one file: docs/reference/MANIFESTS.md.\n";
+const UNKNOWN_NOTE: &str = "\n  %4 reads unknown, and this daemon gave no reason\n  Update cyclops so the daemon reports one, or inspect the pane with: cyclops read <pane> --source detection\n";
 
 #[test]
 fn status_json_prints_the_raw_result() {

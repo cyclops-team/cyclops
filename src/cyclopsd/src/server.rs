@@ -2085,6 +2085,11 @@ fn status_result_with_refresh(
                         // has nothing behind it, so it stays refused.
                         ps.write_ready = entry.is_some_and(|e| e.detection.write_ready);
                         ps.write_block = entry.and_then(|e| e.detection.write_block.clone());
+                        // From the same cached verdict as the state itself,
+                        // so the word and the reason for it can never come
+                        // from two different moments.
+                        ps.unknown_reason =
+                            entry.and_then(|e| e.detection.unknown_reason.clone());
                         ps.working_confirmed = (ps.state == cyclops_proto::AgentState::Working)
                             .then_some(entry.is_some_and(|e| e.working_confirmed));
                         ps.unread = recipient.and_then(|recipient| {

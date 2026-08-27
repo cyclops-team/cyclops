@@ -54,6 +54,7 @@ fn fuse_detection(
         readings,
         disagreement,
         decided_by: decided_by.to_string(),
+        unknown_reason: None,
         stale,
         write_ready: false,
         write_block: None,

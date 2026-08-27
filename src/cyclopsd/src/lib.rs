@@ -5835,6 +5835,7 @@ process_names = ["never"]
                     readings: vec![reading.clone()],
                     disagreement: false,
                     decided_by: "hook".into(),
+                    unknown_reason: None,
                     stale: false,
                     write_ready: false,
                     write_block: Some("agent_working".into()),

@@ -813,6 +813,7 @@ mod tests {
             readings,
             disagreement: false,
             decided_by: "screen:idle".into(),
+            unknown_reason: None,
             stale: false,
             write_ready: false,
             write_block: None,

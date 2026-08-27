@@ -178,6 +178,289 @@ pub struct SensorReading {
     pub ts: u64,
 }
 
+/// Whether a pane is running an ordinary shell rather than a program
+/// Cyclops was never taught.
+///
+/// Both look identical to manifest matching: nothing matched. They are not
+/// the same situation. A shell prompt is the expected state of a spare pane
+/// and needs no remedy; an agent CLI Cyclops has no manifest for is a gap
+/// with a fix. Telling a `bash` pane it is an unsupported vendor would put
+/// a false problem on the grid for every spare pane an operator keeps.
+///
+/// Lives here so the daemon and every client answer it the same way. It
+/// used to be a client-side test, which meant the daemon could not produce
+/// the reason at all and each surface could drift.
+pub fn is_plain_shell(current_command: &str) -> bool {
+    matches!(current_command, "bash" | "fish" | "sh" | "zsh")
+}
+
+/// Why a pane reads `unknown`, as a closed set with one authoritative
+/// precedence.
+///
+/// `unknown` is the one state that is not a statement about the agent: it
+/// says Cyclops could not read one. Durable messaging is unaffected, the
+/// pane can still be sent to, listed, claimed from and replied to; what it
+/// cannot get is an automatic notification. An operator needs the reason
+/// and the next action rather than the word alone.
+///
+/// The set is closed and the producer is the daemon. No surface may infer a
+/// reason from manifests, from an `AgentState` label, or from its own
+/// heuristics, because two surfaces inferring separately is how `status`
+/// and the detection view come to disagree about the same pane.
+///
+/// The wire form is a plain string and unrecognised values survive as
+/// [`UnknownReason::Unrecognized`] rather than failing the response. A
+/// client older than a reason the daemon has learned to produce must
+/// degrade to "a reason I do not know", never to a disconnect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnknownReason {
+    /// The vendor supports a lifecycle integration and it is not installed.
+    IntegrationNotInstalled,
+    /// An integration is installed at a version this daemon cannot use.
+    IntegrationOutdated,
+    /// The matched manifest is missing at least one lifecycle role, start
+    /// or end, so no sequence of events could complete a turn. Either role
+    /// can be the missing one.
+    LifecycleIncomplete,
+    /// The manifest declares lifecycle events and none has been observed
+    /// for the exact current binding since this daemon started.
+    NoCurrentBootEdge,
+    /// The pane's binding could not be proven, so no evidence can be
+    /// attributed to the occupant with confidence.
+    BindingUnproven,
+    /// Nothing running in the pane matches a manifest Cyclops has.
+    UnsupportedVendor,
+    /// A reason produced by a newer daemon than this client. Rendered as
+    /// itself, never guessed at and never treated as any of the above.
+    Unrecognized(String),
+}
+
+impl UnknownReason {
+    /// The stable wire word, and the same token every surface prints.
+    pub fn as_str(&self) -> &str {
+        match self {
+            UnknownReason::IntegrationNotInstalled => "integration_not_installed",
+            UnknownReason::IntegrationOutdated => "integration_outdated",
+            UnknownReason::LifecycleIncomplete => "lifecycle_incomplete",
+            UnknownReason::NoCurrentBootEdge => "no_current_boot_edge",
+            UnknownReason::BindingUnproven => "binding_unproven",
+            UnknownReason::UnsupportedVendor => "unsupported_vendor",
+            UnknownReason::Unrecognized(raw) => raw,
+        }
+    }
+
+    /// Rank for [`UnknownReason::most_specific`]. Lower wins.
+    ///
+    /// One place decides, because a reason is only useful if every surface
+    /// names the same one for the same pane. The order is most specific
+    /// first: a pane whose vendor Cyclops does not know at all is not
+    /// usefully described as missing a boot edge, and a manifest that can
+    /// never complete a turn is not usefully described as missing one
+    /// either.
+    fn rank(&self) -> u8 {
+        match self {
+            UnknownReason::UnsupportedVendor => 0,
+            UnknownReason::BindingUnproven => 1,
+            UnknownReason::IntegrationNotInstalled => 2,
+            UnknownReason::IntegrationOutdated => 3,
+            UnknownReason::LifecycleIncomplete => 4,
+            UnknownReason::NoCurrentBootEdge => 5,
+            // A reason this build does not know cannot be ranked against
+            // ones it does, so it never displaces a known answer.
+            UnknownReason::Unrecognized(_) => u8::MAX,
+        }
+    }
+
+    /// The one reason to show when more than one holds.
+    pub fn most_specific<I: IntoIterator<Item = UnknownReason>>(
+        candidates: I,
+    ) -> Option<UnknownReason> {
+        candidates.into_iter().min_by_key(UnknownReason::rank)
+    }
+
+    /// What the operator or agent should do about it, in one sentence.
+    ///
+    /// Canonical and shared, so `status`, the detection view, the CLI and
+    /// the workspace all tell somebody to do the same thing. A surface with
+    /// less room may abbreviate this; none of them may choose a different
+    /// action, because two surfaces disagreeing about the remedy is worse
+    /// than either one being terse.
+    ///
+    /// It says what to do, not what went wrong: the reason already carries
+    /// that, and an operator reading it has already seen the word `unknown`.
+    pub fn next_action(&self) -> &str {
+        match self {
+            UnknownReason::IntegrationNotInstalled => {
+                "Install this agent's lifecycle integration, then the pane reports its own turns."
+            }
+            UnknownReason::IntegrationOutdated => {
+                "Reinstall this agent's lifecycle integration; the installed one is too old to use."
+            }
+            UnknownReason::LifecycleIncomplete => {
+                "Nothing to fix here: this agent does not report a full turn, so its runtime stays \
+                 unknown. Sending, unread, claim and reply all still work."
+            }
+            UnknownReason::NoCurrentBootEdge => {
+                "Wait for this pane's next turn, or restart the agent: nothing has been reported \
+                 for it since the daemon started."
+            }
+            UnknownReason::BindingUnproven => {
+                "Re-run cyclops list to rebind the pane; its current occupant could not be proven."
+            }
+            UnknownReason::UnsupportedVendor => {
+                "Teach cyclops this program with a manifest, or leave it: an unmanaged pane still \
+                 sends and receives messages."
+            }
+            // Nothing sensible to advise about a reason this build has
+            // never heard of, and inventing one would be worse than saying
+            // so plainly.
+            UnknownReason::Unrecognized(_) => {
+                "This daemon reported a reason this client does not know. Update the client."
+            }
+        }
+    }
+}
+
+impl From<String> for UnknownReason {
+    fn from(raw: String) -> UnknownReason {
+        match raw.as_str() {
+            "integration_not_installed" => UnknownReason::IntegrationNotInstalled,
+            "integration_outdated" => UnknownReason::IntegrationOutdated,
+            "lifecycle_incomplete" => UnknownReason::LifecycleIncomplete,
+            "no_current_boot_edge" => UnknownReason::NoCurrentBootEdge,
+            "binding_unproven" => UnknownReason::BindingUnproven,
+            "unsupported_vendor" => UnknownReason::UnsupportedVendor,
+            _ => UnknownReason::Unrecognized(raw),
+        }
+    }
+}
+
+impl From<UnknownReason> for String {
+    fn from(reason: UnknownReason) -> String {
+        reason.as_str().to_string()
+    }
+}
+
+impl Serialize for UnknownReason {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for UnknownReason {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<UnknownReason, D::Error> {
+        Ok(UnknownReason::from(String::deserialize(deserializer)?))
+    }
+}
+
+#[cfg(test)]
+mod unknown_reason_tests {
+    use super::UnknownReason;
+
+    /// Every reason survives the wire word it is written as. A round trip
+    /// that silently changed a reason would make two surfaces disagree
+    /// about the same pane, which is the whole thing this type prevents.
+    #[test]
+    fn every_reason_round_trips_through_its_wire_word() {
+        for reason in [
+            UnknownReason::IntegrationNotInstalled,
+            UnknownReason::IntegrationOutdated,
+            UnknownReason::LifecycleIncomplete,
+            UnknownReason::NoCurrentBootEdge,
+            UnknownReason::BindingUnproven,
+            UnknownReason::UnsupportedVendor,
+        ] {
+            let word = reason.as_str().to_string();
+            assert_eq!(UnknownReason::from(word), reason);
+        }
+    }
+
+    /// A newer daemon must not disconnect an older client.
+    ///
+    /// The reason set is closed at the producer and open at the reader on
+    /// purpose: a reason this build has never heard of arrives as itself,
+    /// is never mistaken for one it does know, and never fails the
+    /// response it rode in on.
+    #[test]
+    fn a_reason_from_a_newer_daemon_survives_as_itself() {
+        let future = UnknownReason::from("a_reason_from_the_future".to_string());
+        assert_eq!(
+            future,
+            UnknownReason::Unrecognized("a_reason_from_the_future".into())
+        );
+        assert_eq!(future.as_str(), "a_reason_from_the_future");
+        for known in [
+            UnknownReason::LifecycleIncomplete,
+            UnknownReason::NoCurrentBootEdge,
+            UnknownReason::UnsupportedVendor,
+        ] {
+            assert_ne!(future, known);
+        }
+        // And it never displaces an answer this build understands.
+        assert_eq!(
+            UnknownReason::most_specific([future, UnknownReason::NoCurrentBootEdge]),
+            Some(UnknownReason::NoCurrentBootEdge)
+        );
+    }
+
+    /// One precedence, owned here, most specific first.
+    ///
+    /// A pane whose program Cyclops does not know at all is not usefully
+    /// described as missing a boot edge, and a manifest that can never
+    /// complete a turn is not usefully described as missing one either.
+    #[test]
+    fn precedence_prefers_the_more_specific_reason() {
+        let order = [
+            UnknownReason::UnsupportedVendor,
+            UnknownReason::BindingUnproven,
+            UnknownReason::IntegrationNotInstalled,
+            UnknownReason::IntegrationOutdated,
+            UnknownReason::LifecycleIncomplete,
+            UnknownReason::NoCurrentBootEdge,
+        ];
+        for (i, more_specific) in order.iter().enumerate() {
+            for less_specific in &order[i + 1..] {
+                assert_eq!(
+                    UnknownReason::most_specific([less_specific.clone(), more_specific.clone()]),
+                    Some(more_specific.clone()),
+                    "{less_specific:?} displaced {more_specific:?}"
+                );
+            }
+        }
+        assert_eq!(UnknownReason::most_specific([]), None);
+    }
+
+    /// Every reason tells somebody what to do, and no two of them tell
+    /// them the same thing.
+    ///
+    /// A reason without an action is a dead end, which is the state this
+    /// whole slice exists to remove; two reasons sharing an action means
+    /// one of them is not carrying its weight.
+    #[test]
+    fn every_reason_carries_its_own_next_action() {
+        let reasons = [
+            UnknownReason::IntegrationNotInstalled,
+            UnknownReason::IntegrationOutdated,
+            UnknownReason::LifecycleIncomplete,
+            UnknownReason::NoCurrentBootEdge,
+            UnknownReason::BindingUnproven,
+            UnknownReason::UnsupportedVendor,
+        ];
+        let mut actions = Vec::new();
+        for reason in &reasons {
+            let action = reason.next_action();
+            assert!(!action.is_empty(), "{reason:?} has no next action");
+            assert!(
+                !actions.contains(&action),
+                "{reason:?} repeats another reason's action"
+            );
+            actions.push(action);
+        }
+    }
+}
+
 /// Full fusion readout for one pane, exposed via pane.read source=detection.
 /// Sensor disagreement is an observable state, not an internal error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +489,15 @@ pub struct Detection {
     /// None means the rule made no composer claim and never implies clean.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composer_semantic: Option<ComposerSemantic>,
+    /// Why the state is `unknown`, absent for every other state and absent
+    /// from an older daemon that never computed one.
+    ///
+    /// Beside `decided_by` rather than replacing it: `decided_by` names the
+    /// rule or branch that won and is useful for every state, while this
+    /// answers the one question an operator has when the answer is
+    /// `unknown`, and carries the shared next action with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unknown_reason: Option<UnknownReason>,
 }
 
 /// What a pane's composer has proven since text was last seen staged in
@@ -585,6 +877,7 @@ mod write_ready_tests {
             readings,
             disagreement,
             decided_by: "d".into(),
+            unknown_reason: None,
             stale: false,
             write_ready: false,
             write_block: None,
