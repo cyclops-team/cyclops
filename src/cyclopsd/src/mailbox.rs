@@ -7776,6 +7776,110 @@ mod tests {
     }
 
     #[test]
+    /// Gate 1: a durable reply routes to the ORIGINAL endpoint after the
+    /// recipient's alias is renamed.
+    ///
+    /// `reply` derives its recipient from the referenced message's sender
+    /// KEY, which is workspace plus session instance plus pane id and
+    /// carries no label. A rename replaces a directory entry, never a key,
+    /// so routing cannot follow it.
+    ///
+    /// The trap this pins is the one a label-based route would fall into:
+    /// after the rename a DIFFERENT identity wears the sender's old label,
+    /// so a reply resolved by name would land on the impostor.
+    #[test]
+    fn a_reply_routes_to_the_original_endpoint_after_an_alias_rename() {
+        let scratch = StoreScratch::new("reply-after-rename");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, _admin, bob, carol) = test_context();
+
+        let before = MailboxDirectory::new(
+            workspace,
+            [
+                MailboxIdentity {
+                    key: bob,
+                    label: "reviewer".into(),
+                },
+                MailboxIdentity {
+                    key: carol,
+                    label: "observer".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let store = MessageStore::open(&root, journal, workspace, "boot").unwrap();
+        let (sender, _) = broadcast::channel(64);
+        let service = MailboxService::new_with_events(before, store, sender);
+
+        let parent = service
+            .send(
+                MailboxIdentity {
+                    key: bob,
+                    label: "reviewer".into(),
+                },
+                mailbox_send("observer", "Question", "Body"),
+            )
+            .unwrap();
+
+        // The rename, and the trap: bob takes a new label and carol takes
+        // bob's old one, so "reviewer" now names a different endpoint.
+        service
+            .replace_directory(
+                MailboxDirectory::new(
+                    workspace,
+                    [
+                        MailboxIdentity {
+                            key: bob,
+                            label: "lead".into(),
+                        },
+                        MailboxIdentity {
+                            key: carol,
+                            label: "reviewer".into(),
+                        },
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let reply = service
+            .reply(
+                MailboxIdentity {
+                    key: carol,
+                    label: "reviewer".into(),
+                },
+                parent.message_id.clone(),
+                "Answer".into(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            reply.recipient_keys,
+            vec![bob],
+            "the reply left the original endpoint after the rename"
+        );
+        assert_ne!(
+            reply.recipient_keys,
+            vec![carol],
+            "the reply followed the old label to its new owner"
+        );
+        // MEASURED, and worth knowing: the rendered label is the one
+        // RECORDED ON THE PARENT, not the endpoint's current name.
+        // `derive_reply` returns `parent_metadata.presentation.sender_label`,
+        // so after this rename the reply renders as addressed to "reviewer"
+        // while routing to bob, and "reviewer" now names carol. Routing is
+        // right and the display is stale. Pinned as behaviour rather than
+        // silently corrected: which label a reply renders is a product
+        // decision, not part of the routing clause.
+        assert_eq!(
+            reply.recipients,
+            vec!["reviewer".to_string()],
+            "the rendered label is the parent's recorded sender label"
+        );
+    }
+
     fn committed_mailbox_facts_publish_once_in_workspace_sequence_order() {
         let scratch = StoreScratch::new("change-events");
         let root = scratch.root();
