@@ -1222,38 +1222,12 @@ pub async fn run_async() -> i32 {
     // sidebar wide and painted another, and the first reconcile would
     // fight the declaration. `chrome_for` is the one geometry both read.
     model.sidebar_visible = prefs.sidebar_visible;
+    model.messages_visible = prefs.messages_visible;
     let declared_client_size =
         declare_initial_client_size(term_size, &model, &prefs, &sizing, &client, &home).await;
     if declared_client_size.is_some() {
-        if adopted.authority_transferred || adopted.took_a_window {
-            if let Ok(identity) = client.client_identity().await {
-                let my_marker = identity.marker();
-                if let Ok(snapshot) = client.workspace_snapshot().await {
-                    for (sess, owned) in &sizing.owned {
-                        if let Ok(Some(current_driver)) = client.window_driver(sess).await {
-                            if current_driver == my_marker {
-                                if let Some(snap_sess) =
-                                    snapshot.sessions.iter().find(|s| &s.name == sess)
-                                {
-                                    for win_id in &owned.pinned {
-                                        if let Some(snap_win) =
-                                            snap_sess.windows.iter().find(|w| &w.id == win_id)
-                                        {
-                                            for pane in &snap_win.panes {
-                                                if let cyclops_tmux::PaneMinimizationProvenance::Minimized { .. } = pane.minimization {
-                                                    if pane.height > crate::render::MINIMIZED_ROWS as u32 {
-                                                        let _ = client.resize_pane_height(&pane.id, crate::render::MINIMIZED_ROWS).await;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        if let Err(error) = recover_post_resize_geometry(&sizing, &client, &home, None).await {
+            log_err(&home, &format!("boot post-resize recovery failed: {error}"));
         }
         // The resize can rebalance leaf dimensions. Re-list before
         // hydration rather than replaying captures into stale slots.
@@ -2517,8 +2491,14 @@ async fn declare_initial_client_size(
     if !declarable(size) {
         return None;
     }
-    size_owned_windows(sizing, client, size, home).await;
-    Some(size)
+    let canvas =
+        chrome_for(Rect::new(0, 0, term_size.0, term_size.1), model, prefs).tmux_sizing_canvas();
+    let outcome = size_owned_windows(sizing, client, canvas, &model.session.tabs, home).await;
+    if outcome.all_succeeded() {
+        Some(size)
+    } else {
+        None
+    }
 }
 
 /// Whether the workspace may animate (`crate::animate`). Capability first,
@@ -2825,23 +2805,23 @@ fn declarable(size: (u16, u16)) -> bool {
 /// whoever glanced at it next and would put its windows back while its
 /// owner was still using them.
 #[derive(Debug, Default)]
-struct WindowSizing {
+pub struct WindowSizing {
     /// This connection's identity, read once. A reconnect is a new client
     /// and therefore a new identity, so this is dropped with the old link.
-    identity: Option<ClientIdentity>,
+    pub identity: Option<ClientIdentity>,
     /// Sessions owned, each with what this workspace holds in it. Ordered
     /// so a restore visits them the same way twice.
-    owned: BTreeMap<String, OwnedSession>,
+    pub owned: BTreeMap<String, OwnedSession>,
     /// Sessions found already owned by a live workspace. Kept so a follower
     /// asks tmux once rather than on every reconcile.
-    following: BTreeSet<String>,
+    pub following: BTreeSet<String>,
 }
 
 /// What this workspace holds in one session it owns.
 #[derive(Debug, Default)]
-struct OwnedSession {
+pub struct OwnedSession {
     /// Windows this workspace pinned, and therefore must put back.
-    pinned: BTreeSet<String>,
+    pub pinned: BTreeSet<String>,
     /// Windows carrying a record this version cannot read.
     ///
     /// Never pinned by this workspace and never changed by it, and yet the
@@ -2850,7 +2830,7 @@ struct OwnedSession {
     /// own, and releasing the mark over it is what strands it: no policy
     /// applies, no owner exists, and no later workspace can tell what it
     /// was. Holding the mark keeps it visibly somebody's problem.
-    blocked: BTreeSet<String>,
+    pub blocked: BTreeSet<String>,
 }
 
 impl OwnedSession {
@@ -3076,26 +3056,57 @@ async fn adopt_windows(
     }
 }
 
-/// Push `size` to every window this workspace owns, in every session it
-/// owns.
-///
-/// Background sessions included: MEASURED (F76) that `resize-window` needs
-/// no attachment to the session it targets, so a session this workspace
-/// owns but is not currently showing still gets the canvas it will be
-/// displayed at, instead of being reshaped on the way back into view.
+/// Result of resizing execution across pinned windows in a session.
+#[derive(Debug, Default)]
+pub(crate) struct SizingOutcome {
+    pub succeeded: BTreeSet<String>,
+    pub failed: BTreeMap<String, cyclops_tmux::TmuxError>,
+}
+
+impl SizingOutcome {
+    pub fn all_succeeded(&self) -> bool {
+        self.failed.is_empty()
+    }
+}
+
+/// Push per-window topology-derived target sizes to every window this workspace owns,
+/// in every session it owns. Returns exact per-window successes and failures.
 async fn size_owned_windows(
     sizing: &WindowSizing,
     client: &ControlClient,
-    size: (u16, u16),
+    canvas: Rect,
+    tabs: &[TabModel],
     home: &std::path::Path,
-) {
+) -> SizingOutcome {
+    let mut outcome = SizingOutcome::default();
     for owned in sizing.owned.values() {
         for window_id in &owned.pinned {
-            if let Err(error) = client.resize_window(window_id, size.0, size.1).await {
-                log_err(home, &error);
+            let target_size = if let Some(tab) = tabs.iter().find(|t| &t.window_id == window_id) {
+                crate::render::window_target_size_for_layout(canvas, &tab.layout, tab.zoomed)
+            } else {
+                let inner = crate::render::pane_canvas(canvas);
+                (inner.width, inner.height)
+            };
+
+            if !declarable(target_size) {
+                continue;
+            }
+
+            match client
+                .resize_window(window_id, target_size.0, target_size.1)
+                .await
+            {
+                Ok(()) => {
+                    outcome.succeeded.insert(window_id.clone());
+                }
+                Err(error) => {
+                    log_err(home, &error);
+                    outcome.failed.insert(window_id.clone(), error);
+                }
             }
         }
     }
+    outcome
 }
 
 /// Put every window this workspace pinned back on the policy it was found
@@ -3236,52 +3247,64 @@ async fn rekey_ownership(
     }
 }
 
-async fn resize_client(app: &mut App, client: &ControlClient) {
+async fn resize_client(app: &mut App, client: &ControlClient) -> SizingOutcome {
     let (w, h) = app.term_size;
-    let size = desired_tmux_size(Rect::new(0, 0, w, h), &app.model, &app.prefs);
+    let canvas = app.chrome(Rect::new(0, 0, w, h)).tmux_sizing_canvas();
+    let size = crate::render::tmux_client_size(canvas, app.model.active_tab());
     if !declarable(size) || app.declared_client_size == Some(size) {
-        return;
+        return SizingOutcome::default();
     }
-    size_owned_windows(&app.sizing, client, size, &app.home).await;
-    app.declared_client_size = Some(size);
+    let outcome = size_owned_windows(
+        &app.sizing,
+        client,
+        canvas,
+        &app.model.session.tabs,
+        &app.home,
+    )
+    .await;
+    if outcome.all_succeeded() {
+        app.declared_client_size = Some(size);
+    }
+    run_post_resize_recovery(app, client).await;
+    outcome
 }
 
-/// Reconcile pane geometry upon owner authority takeover:
+/// Shared post-resize recovery helper:
 /// 1. Reconciles every exact successfully resized window in every owned session.
-/// 2. For each window in owned[session].pinned, revalidates live driver marker before mutating.
-/// 3. Panes with deliberate minimization provenance (`Minimized { original_height }`)
+/// 2. Always fetches a fresh post-resize snapshot before any pane decision.
+/// 3. For each window in owned[session].pinned, revalidates live driver marker before mutating.
+/// 4. Panes with deliberate minimization provenance (`Minimized { original_height }`)
 ///    must remain collapsed at 1 row after tmux automatic reflow on window resize.
-/// 4. Panes with `None` provenance are NOT modified (manual resize is preserved; we do not
-///    auto-uncrush unknown intent).
-/// 5. Panes with malformed provenance (`Malformed(bad)`) fail closed: surface visible notice,
+/// 5. Panes with `None` provenance that are 1-row high fail closed: they are NOT modified
+///    (manual resize is preserved; no auto-uncrush of unknown intent) and surface an explicit banner.
+/// 6. Panes with malformed provenance (`Malformed(bad)`) fail closed: surface visible notice,
 ///    log error, leave option evidence untouched.
-/// 6. Blocked, unpinned, or follower windows are never touched.
-async fn reconcile_workspace_geometry_on_takeover(app: &mut App, client: &ControlClient) {
-    let Ok(identity) = client.client_identity().await else {
-        return;
-    };
+/// 7. Fails visibly on errors, logs errors, and retains retry state (`needs_reconcile = true`).
+pub async fn recover_post_resize_geometry(
+    sizing: &WindowSizing,
+    client: &ControlClient,
+    home: &std::path::Path,
+    mut notice: Option<&mut NoticeState>,
+) -> Result<bool, TmuxError> {
+    let identity = client.client_identity().await?;
     let my_marker = identity.marker();
 
-    let owned_sessions: Vec<(String, Vec<String>)> = app
-        .sizing
+    let owned_sessions: Vec<(String, Vec<String>)> = sizing
         .owned
         .iter()
         .map(|(sess, owned)| (sess.clone(), owned.pinned.iter().cloned().collect()))
         .collect();
 
     if owned_sessions.is_empty() {
-        return;
+        return Ok(false);
     }
 
-    let Ok(snapshot) = client.workspace_snapshot().await else {
-        return;
-    };
+    let snapshot = client.workspace_snapshot().await?;
+    let mut any_modified = false;
 
     for (session, pinned_windows) in owned_sessions {
-        let Ok(Some(current_driver)) = client.window_driver(&session).await else {
-            continue;
-        };
-        if current_driver != my_marker {
+        let current_driver = client.window_driver(&session).await?;
+        if current_driver.as_ref() != Some(&my_marker) {
             continue;
         }
 
@@ -3303,37 +3326,73 @@ async fn reconcile_workspace_geometry_on_takeover(app: &mut App, client: &Contro
                                 .await
                             {
                                 log_err(
-                                    &app.home,
+                                    home,
                                     &format!(
                                         "failed to re-collapse minimized pane {}: {e}",
                                         pane.id
                                     ),
                                 );
+                                if let Some(ref mut n) = notice {
+                                    n.show(
+                                        format!("error: failed to re-collapse pane {}", pane.id),
+                                        Instant::now(),
+                                    );
+                                }
+                                return Err(e);
                             }
+                            any_modified = true;
                         }
                     }
                     cyclops_tmux::PaneMinimizationProvenance::Malformed(bad) => {
-                        log_err(
-                            &app.home,
-                            &format!(
-                                "{}: malformed minimization provenance ({bad}), refusing recovery",
-                                pane.id
-                            ),
-                        );
-                        app.notice.show(
-                            format!(
-                                "warning: pane {} has malformed minimization record",
-                                pane.id
-                            ),
-                            tokio::time::Instant::now(),
-                        );
+                        if pane.height <= crate::render::MINIMIZED_ROWS as u32 {
+                            log_err(
+                                home,
+                                &format!(
+                                    "{}: malformed minimization provenance ({bad}), refusing recovery",
+                                    pane.id
+                                ),
+                            );
+                            if let Some(ref mut n) = notice {
+                                n.show(
+                                    format!(
+                                        "warning: pane {} has malformed minimization record ({bad}); manual recovery required",
+                                        pane.id
+                                    ),
+                                    Instant::now(),
+                                );
+                            }
+                        }
                     }
                     cyclops_tmux::PaneMinimizationProvenance::None => {
-                        // Fail closed on unknown intent: do not uncrush without positive provenance
+                        if pane.height <= crate::render::MINIMIZED_ROWS as u32 {
+                            // Fail closed on unknown intent: do not uncrush without positive provenance.
+                            if let Some(ref mut n) = notice {
+                                n.show(
+                                    format!(
+                                        "pane {} is 1 row high (unknown provenance); manual resize required to uncrush",
+                                        pane.id
+                                    ),
+                                    Instant::now(),
+                                );
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+    Ok(any_modified)
+}
+
+async fn run_post_resize_recovery(app: &mut App, client: &ControlClient) {
+    if let Err(error) =
+        recover_post_resize_geometry(&app.sizing, client, &app.home, Some(&mut app.notice)).await
+    {
+        log_err(
+            &app.home,
+            &format!("post-resize geometry recovery failed: {error}"),
+        );
+        app.needs_reconcile = true;
     }
 }
 
@@ -5876,6 +5935,9 @@ async fn paste_into_focused_pane(
         return Ok(());
     }
     let pane_id = app.model.active_tab().active_pane.clone();
+    if pane_id.is_empty() {
+        return Ok(());
+    }
     // Paste is pane input just as surely as a keypress. Keep the viewport
     // contract provider-neutral: an operator pasting at a live prompt must
     // see that prompt and the resulting output, not remain pinned in the
@@ -5984,9 +6046,6 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
         app.declared_client_size = None;
     }
     resize_client(app, client).await;
-    if adopted.authority_transferred || adopted.took_a_window {
-        reconcile_workspace_geometry_on_takeover(app, client).await;
-    }
 
     // Fetch FRESH model after resize and takeover recovery so dimensions and
     // provenance are up-to-date with live tmux state before hydration.
@@ -6257,6 +6316,9 @@ async fn handle_key(
         }
         RouterResult::PassThrough(key) => {
             let pane = app.model.active_tab().active_pane.clone();
+            if pane.is_empty() {
+                return Ok(InputOutcome::NoRedraw);
+            }
             match app.select_all.on_key(&pane, &key) {
                 crate::input::SelectAllOutcome::Armed => return Ok(InputOutcome::NoRedraw),
                 crate::input::SelectAllOutcome::ClearLine => {
@@ -8070,6 +8132,8 @@ mod tests {
             },
             active_pane: "%1".into(),
             zoomed: false,
+            minimized: Default::default(),
+            minimization_provenance: Default::default(),
         };
         WorkspaceModel {
             workspaces: vec![crate::model::WorkspaceRow {
@@ -11991,11 +12055,17 @@ mod tests {
             .on_socket(server.socket().to_string())
             .with_config_file("/dev/null");
         let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let id = client.client_identity().await.expect("identity");
+        client
+            .claim_window_driver("s", &id.marker())
+            .await
+            .expect("claim");
         let mut app = stacked_app_with_painted_hits(
             &top,
             &bottom,
             cyclops_proto::scratch::scratch_dir("app-seam-resize-home"),
         );
+        app.sizing.identity = Some(id);
         let mut detached = false;
 
         // Row A of the seam, on the columns the title strip shadowed.
@@ -12100,11 +12170,17 @@ mod tests {
             .on_socket(server.socket().to_string())
             .with_config_file("/dev/null");
         let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let id = client.client_identity().await.expect("identity");
+        client
+            .claim_window_driver("s", &id.marker())
+            .await
+            .expect("claim");
         let mut app = stacked_app_with_painted_hits(
             &top,
             &bottom,
             cyclops_proto::scratch::scratch_dir("app-lost-release-home"),
         );
+        app.sizing.identity = Some(id);
         let mut detached = false;
         let body_row = (0..12)
             .find(|&y| {

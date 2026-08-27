@@ -7,11 +7,11 @@
 //! query, `list-windows`, and one `list-panes` call *per window* — `W + 3`
 //! one-shot tmux processes for a session with `W` windows (MEASURED in
 //! `src/cyclops-workspace/tests/baseline.rs`: 10-15ms per extra window).
-//! [`ControlClient::workspace_snapshot`] replaced that fan-out with two
+//! [`ControlClient::workspace_snapshot`] replaced that fan-out with three
 //! formatted commands over the control client that is already connected,
-//! neither of which scales with window or pane count.
+//! none of which scales with window or pane count.
 //!
-//! ## Why two commands, not one
+//! ## Why three commands, not one
 //!
 //! Every tmux session has at least one window, and every window at least one
 //! pane — VERIFIED directly against tmux 3.7b: killing a session's only pane
@@ -20,7 +20,7 @@
 //! is structurally enough to discover every session, window, and pane that
 //! exists; nothing needs a per-window follow-up.
 //!
-//! The reason for a second command is escaping, not reachability. Session
+//! The reason for additional commands is escaping, not reachability. Session
 //! names and window names are both arbitrary human text, and both can appear
 //! on the same `list-panes -a` line. This crate's strongest precedent for a
 //! free-text field ([`crate::watcher`]'s `PANE_FORMAT`, which carries
@@ -32,10 +32,12 @@
 //! after it. Rather than accept that exposure for both names, `window_name`
 //! keeps the safe last slot on the `list-panes -a` line, and `session_name`
 //! gets its own `list-sessions` line where it is the only, and therefore
-//! safely last, free-text field. Both commands are bounded by session count
-//! and window count respectively — as *data volume*, which was never the
-//! problem; the baseline's `W + 3` was `W + 3` one-shot tmux *processes*, and
-//! this is two, regardless of `W`.
+//! safely last, free-text field. Pane option `@cyclops_pane_minimized_v1`
+//! carries arbitrary option bytes that may also contain tabs, and is safely
+//! queried in a dedicated second `list-panes -a` command as the trailing field.
+//! All three commands are bounded by session count and window count respectively:
+//! as *data volume*, which was never the problem; the baseline's `W + 3` was
+//! `W + 3` one-shot tmux *processes*, and this is three, regardless of `W`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -44,7 +46,7 @@ use crate::control::ControlClient;
 use crate::error::TmuxError;
 use crate::quote::quote_arg;
 
-/// Recorded minimization provenance for a pane stored in `@cyclops_pane_minimized_v1`.
+/// Recorded pre-minimize provenance for a pane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PaneMinimizationProvenance {
     /// No minimization option set on this pane.
@@ -56,18 +58,19 @@ pub enum PaneMinimizationProvenance {
 }
 
 impl PaneMinimizationProvenance {
-    /// Parse from raw tmux option string.
+    /// Parse from raw tmux option string with byte-exact validation (no trimming).
     pub fn parse(raw: &str) -> Self {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
+        if raw.is_empty() {
             return Self::None;
         }
-        if let Some(rest) = trimmed.strip_prefix("v1:") {
-            if let Ok(height) = rest.parse::<u16>() {
-                if height >= 2 {
-                    return Self::Minimized {
-                        original_height: height,
-                    };
+        if let Some(rest) = raw.strip_prefix("v1:") {
+            if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+                if let Ok(height) = rest.parse::<u16>() {
+                    if height >= 2 {
+                        return Self::Minimized {
+                            original_height: height,
+                        };
+                    }
                 }
             }
             return Self::Malformed(raw.to_string());
@@ -442,5 +445,35 @@ mod tests {
         assert_eq!(order, vec!["$1", "$0"]);
         assert_eq!(names.get("$1").map(String::as_str), Some("beta session"));
         assert_eq!(names.get("$0").map(String::as_str), Some("name\twith\ttab"));
+    }
+
+    #[test]
+    fn byte_exact_provenance_parsing_rejects_whitespace_and_trailing_characters() {
+        assert_eq!(
+            PaneMinimizationProvenance::parse(""),
+            PaneMinimizationProvenance::None
+        );
+        assert_eq!(
+            PaneMinimizationProvenance::parse("v1:24"),
+            PaneMinimizationProvenance::Minimized {
+                original_height: 24
+            }
+        );
+        assert_eq!(
+            PaneMinimizationProvenance::parse("v1:24\t"),
+            PaneMinimizationProvenance::Malformed("v1:24\t".to_string())
+        );
+        assert_eq!(
+            PaneMinimizationProvenance::parse(" v1:24 "),
+            PaneMinimizationProvenance::Malformed(" v1:24 ".to_string())
+        );
+        assert_eq!(
+            PaneMinimizationProvenance::parse("v1:1"),
+            PaneMinimizationProvenance::Malformed("v1:1".to_string())
+        );
+        assert_eq!(
+            PaneMinimizationProvenance::parse("   "),
+            PaneMinimizationProvenance::Malformed("   ".to_string())
+        );
     }
 }

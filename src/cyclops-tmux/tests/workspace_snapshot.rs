@@ -3,7 +3,7 @@
 //! `ControlClient::workspace_snapshot` replaces the `W + 3` one-shot-process
 //! fan-out `src/cyclops-workspace/src/sync.rs` performs today
 //! (`list-sessions`, a membership query, `list-windows`, then one
-//! `list-panes` per window) with two control-mode commands over a
+//! `list-panes` per window) with three control-mode commands over a
 //! connection that already exists. These tests prove correctness against
 //! the rig's own tmux invocations — never against the function under test —
 //! prove the command count does not grow with window count, and record
@@ -255,7 +255,7 @@ async fn timing_fan_out_vs_snapshot_on_eight_windows() {
     }
     let fan_out = t.elapsed();
 
-    // 2. workspace_snapshot: two control-mode commands total, regardless of
+    // 2. workspace_snapshot: three control-mode commands total, regardless of
     //    window count (see snapshot_command_count_does_not_scale_with_
     //    window_count above).
     let (client, _notif) = ControlClient::spawn(srv.config(session))

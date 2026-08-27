@@ -477,3 +477,164 @@ async fn multi_session_and_duplicate_pane_id_isolation() {
     client_a.shutdown().await;
     client_b.shutdown().await;
 }
+
+/// Ordinary resize paths (sidebar toggle, messages surface toggle, terminal resize)
+/// and authority takeover all re-collapse deliberate 1-row minimizations via shared recovery.
+#[tokio::test]
+async fn deliberate_minimized_pane_survives_ordinary_resizes_and_takeover_and_restores() {
+    let Some(rig) = Rig::new("geometry-ordinary-resizes") else {
+        return;
+    };
+    rig.session("geo6");
+    rig.server.run_ok(&["split-window", "-v", "-t", "geo6"]);
+
+    let (client, _notif) = ControlClient::spawn(rig.config("geo6"))
+        .await
+        .expect("attach");
+    let identity = client.client_identity().await.expect("identity");
+    client
+        .claim_window_driver("geo6", &identity.marker())
+        .await
+        .expect("claim");
+    client
+        .capture_prior_window_size("@0")
+        .await
+        .expect("capture");
+    client.pin_window_size_manual("@0").await.expect("pin");
+    client.resize_window("@0", 176, 47).await.expect("size");
+
+    // Initially %0 is 24 rows, %1 is 22 rows (plus 1 divider = 47)
+    assert_eq!(rig.pane_heights("geo6"), vec![24, 22]);
+
+    // Deliberately minimize pane %1 with original height 22
+    client
+        .set_pane_option("%1", cyclops_tmux::PANE_MINIMIZED_OPTION_V1, "v1:22")
+        .await
+        .expect("set option");
+    client.resize_pane_height("%1", 1).await.expect("minimize");
+    assert_eq!(rig.pane_heights("geo6"), vec![45, 1]);
+
+    // 1. Ordinary resize path: Terminal size increases (e.g. sidebar collapsed: 198x47)
+    // Tmux automatic reflow expands %1, but shared recovery re-collapses %1 to 1 row
+    client
+        .resize_window("@0", 198, 47)
+        .await
+        .expect("resize window");
+    // Simulate tmux reflow by inflating pane height
+    rig.server.run_ok(&["resize-pane", "-t", "%1", "-y", "6"]);
+    assert_eq!(rig.pane_heights("geo6"), vec![40, 6], "tmux reflowed pane");
+
+    let mut owned = cyclops_workspace::app::OwnedSession::default();
+    owned.pinned.insert("@0".to_string());
+    let mut owned_map = std::collections::BTreeMap::new();
+    owned_map.insert("geo6".to_string(), owned);
+    let sizing = cyclops_workspace::app::WindowSizing {
+        identity: Some(identity.clone()),
+        owned: owned_map,
+        following: std::collections::BTreeSet::new(),
+    };
+
+    let temp_home = std::env::temp_dir();
+    let modified =
+        cyclops_workspace::app::recover_post_resize_geometry(&sizing, &client, &temp_home, None)
+            .await
+            .expect("recover");
+    assert!(modified, "recovery must re-collapse reflowed pane");
+    assert_eq!(
+        rig.pane_heights("geo6"),
+        vec![45, 1],
+        "deliberately minimized pane must be re-collapsed to 1 row"
+    );
+
+    // 2. Ordinary resize path: Terminal size decreases (e.g. 168x47)
+    client
+        .resize_window("@0", 168, 47)
+        .await
+        .expect("resize window 2");
+    rig.server.run_ok(&["resize-pane", "-t", "%1", "-y", "8"]);
+    let modified2 =
+        cyclops_workspace::app::recover_post_resize_geometry(&sizing, &client, &temp_home, None)
+            .await
+            .expect("recover 2");
+    assert!(modified2);
+    assert_eq!(rig.pane_heights("geo6"), vec![45, 1]);
+
+    // 3. Restore: Pane recovers exact original height (22) and clears option
+    client.resize_pane_height("%1", 22).await.expect("restore");
+    client
+        .unset_pane_option("%1", cyclops_tmux::PANE_MINIMIZED_OPTION_V1)
+        .await
+        .expect("unset");
+    assert_eq!(rig.pane_heights("geo6"), vec![24, 22]);
+
+    client.shutdown().await;
+}
+
+/// Byte-exact malformed minimization options (e.g. "v1:24\t" or " v1:24 ") fail closed:
+/// they are never resized, never uncrushed, and evidence is never deleted.
+#[tokio::test]
+async fn byte_exact_malformed_provenance_rejects_trailing_tabs_and_spaces() {
+    let Some(rig) = Rig::new("geometry-byte-exact-malformed") else {
+        return;
+    };
+    rig.session("geo7");
+    rig.server.run_ok(&["split-window", "-v", "-t", "geo7"]);
+
+    let (client, _notif) = ControlClient::spawn(rig.config("geo7"))
+        .await
+        .expect("attach");
+    let identity = client.client_identity().await.expect("identity");
+    client
+        .claim_window_driver("geo7", &identity.marker())
+        .await
+        .expect("claim");
+    client
+        .capture_prior_window_size("@0")
+        .await
+        .expect("capture");
+    client.pin_window_size_manual("@0").await.expect("pin");
+    client.resize_window("@0", 176, 47).await.expect("size");
+
+    // Inject malformed option with literal trailing tab
+    client
+        .set_pane_option("%1", cyclops_tmux::PANE_MINIMIZED_OPTION_V1, "v1:24\t")
+        .await
+        .expect("set option");
+    rig.server.run_ok(&["resize-pane", "-t", "%1", "-y", "1"]);
+
+    let mut owned7 = cyclops_workspace::app::OwnedSession::default();
+    owned7.pinned.insert("@0".to_string());
+    let mut owned_map7 = std::collections::BTreeMap::new();
+    owned_map7.insert("geo7".to_string(), owned7);
+    let sizing = cyclops_workspace::app::WindowSizing {
+        identity: Some(identity.clone()),
+        owned: owned_map7,
+        following: std::collections::BTreeSet::new(),
+    };
+
+    let temp_home = std::env::temp_dir();
+    let modified =
+        cyclops_workspace::app::recover_post_resize_geometry(&sizing, &client, &temp_home, None)
+            .await
+            .expect("recover");
+    assert!(
+        !modified,
+        "malformed provenance must fail closed with 0 mutations"
+    );
+
+    // Option evidence must remain untouched
+    let out = rig.server.run(&[
+        "show-options",
+        "-p",
+        "-t",
+        "%1",
+        cyclops_tmux::PANE_MINIMIZED_OPTION_V1,
+    ]);
+    let prov_text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        prov_text.contains("v1:24"),
+        "raw option evidence must be preserved: {prov_text}"
+    );
+
+    client.shutdown().await;
+}

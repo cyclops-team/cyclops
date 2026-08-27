@@ -9,9 +9,9 @@ use crate::model::{
 use crate::runtime::{snapshot_from_bundle, PaneRuntime};
 
 /// Build the full workspace model from tmux with one
-/// [`ControlClient::workspace_snapshot`] round trip — two control-mode
+/// [`ControlClient::workspace_snapshot`] round trip: three control-mode
 /// commands over the connection that already exists, regardless of session
-/// or window count (see that method's own doc for why two is enough).
+/// or window count (see that method's own doc for why three is enough).
 ///
 /// This replaces the `list-sessions` + all-window-membership query +
 /// `list-windows` + one `list-panes` *per window* fan-out this function used
@@ -98,7 +98,7 @@ fn build_tab(window: &SnapshotWindow) -> Result<TabModel, TmuxError> {
         .find(|p| p.active)
         .map(|p| p.id.clone())
         .or_else(|| window.panes.first().map(|p| p.id.clone()))
-        .unwrap_or_else(|| "%0".to_string());
+        .unwrap_or_default();
     let layout = match resolve_layout(&layout_node, &known) {
         Some(layout) => layout,
         None => {

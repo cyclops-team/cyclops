@@ -309,9 +309,9 @@ fn baseline_reconciliation_fan_out() {
     }
 }
 
-/// NEW shape (L1): one `ControlClient::workspace_snapshot` round trip — two
+/// NEW shape (L1): one `ControlClient::workspace_snapshot` round trip: three
 /// control-mode commands over a connection that already exists, regardless
-/// of window count — replaces the `W + 3` one-shot-process fan-out above.
+/// of window count, replaces the `W + 3` one-shot-process fan-out above.
 /// This is exactly what `src/cyclops-workspace/src/sync.rs`'s
 /// `fetch_workspace_model` calls today. Same fixtures as
 /// `baseline_reconciliation_fan_out`, so the two totals are directly
@@ -322,7 +322,7 @@ async fn baseline_reconciliation_workspace_snapshot() {
         return;
     };
     println!("=== baseline: workspace_snapshot (L1's fetch_workspace_model shape) ===");
-    // workspace_snapshot reads the whole server in two fixed commands, so
+    // workspace_snapshot reads the whole server in three fixed commands, so
     // one client attached anywhere on the server measures every fixture
     // below — the same way one reconcile measures the whole workspace today.
     rig.session_with_windows("snap1", 1);
