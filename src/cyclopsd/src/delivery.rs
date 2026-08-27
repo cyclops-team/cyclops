@@ -9841,7 +9841,7 @@ mod tests {
         // still published is unexpected. Keep a real queued notification
         // parked behind quiesce, cancel only its child, and require the
         // production supervisor to reconstruct that same durable attempt.
-        let (message_scratch, _store, context, _handle, recipient) =
+        let (message_scratch, store, context, _handle, recipient) =
             notification_fixture("notification-supervisor-child-loss");
         let inner_root = NotificationScratch(cyclops_proto::scratch::scratch_dir(
             "notification-supervisor-child-loss-inner",
@@ -9869,11 +9869,32 @@ mod tests {
         })
         .await
         .expect("the production supervisor spawned its child");
-        inner.engine.descendant_stop.send_replace(true);
-        inner.engine.descendant_stop.send_replace(false);
+        // Hold the durable projection while the first child observes the stop.
+        // Recovery increments its counter before reading that projection, so
+        // this gives the test a deterministic point to lower the global stop
+        // latch before the supervisor can spawn its replacement. Without this
+        // ordering, a slow runner can let the replacement inherit `true`,
+        // causing a second legitimate recovery and a BlockedPreWrite result.
+        tokio::task::block_in_place(|| {
+            let _projection = store.lock().expect("message store lock");
+            inner.engine.descendant_stop.send_replace(true);
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while handle.worker_recoveries.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the cancelled child reaches durable recovery"
+                );
+                std::thread::yield_now();
+            }
+            inner.engine.descendant_stop.send_replace(false);
+        });
 
         tokio::time::timeout(Duration::from_secs(1), async {
-            while handle.worker_recoveries.load(Ordering::SeqCst) == 0 {
+            while inner
+                .engine
+                .notification_handle(attempt)
+                .is_none_or(|current| Arc::ptr_eq(&current, &handle))
+            {
                 tokio::task::yield_now().await;
             }
         })
