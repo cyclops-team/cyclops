@@ -1,10 +1,10 @@
 //! Dedicated Gate 3 Release Proof integration suite.
 //!
-//! Covers the four Gate 3 proof gaps identified during release audit:
+//! Covers the four Gate 3 proof invariants:
 //! 1. Multi-alarm clear is one append-only batch fact after complete validation.
 //! 2. Both mailbox notification workers and supported legacy direct-delivery workers
 //!    expose an exact in-flight attempt under the queue mutex.
-//! 3. Recovery failure visibly faults the worker and never silently restarts.
+//! 3. Supervised child recovery failure visibly faults the worker and never silently restarts.
 //! 4. Composer barriers cannot leak between the write boundary and durable state transition.
 
 mod common;
@@ -83,7 +83,7 @@ async fn wait_for_alarm(rig: &mut Rig, message_id: &str) -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Gap 1: Multi-alarm clear is one append-only batch fact after complete validation
+// Invariant 1: Multi-alarm clear is one append-only batch fact after complete validation
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -227,8 +227,7 @@ async fn multi_alarm_clear_is_one_fact_after_complete_validation() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────────────────────
-// Gap 2: Exact in-flight attempt is exposed under queue mutex (Mailbox + Legacy)
+// Invariant 2: Exact in-flight attempt is exposed under queue mutex
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -341,8 +340,10 @@ async fn in_flight_attempt_is_exposed_under_queue_mutex() {
             "notification must be in in-flight state: {:?}",
             recip.notification.state
         );
+        let expected_attempt = current_attempt_id.expect("active attempt id must be Some");
         assert_eq!(
-            current_attempt_id, recip.notification.attempt_id,
+            recip.notification.attempt_id,
+            Some(expected_attempt),
             "worker current job attempt_id must match snapshot attempt_id"
         );
 
@@ -383,65 +384,70 @@ async fn in_flight_attempt_is_exposed_under_queue_mutex() {
             })
         });
 
-        let daemon = rig.daemon.clone();
-        let send_task = tokio::spawn(async move {
-            daemon
-                .deliver_payload(
-                    "admin",
-                    serde_json::from_value::<MsgSendParams>(json!({
-                        "to": ["legacy_worker"],
-                        "subject": "Legacy hold",
-                        "body": "Legacy payload",
-                        "client_key": "legacy-in-flight"
-                    }))
-                    .unwrap(),
-                )
-                .await
-        });
+        let (send_res, expected_legacy_id) = tokio::join!(
+            rig.daemon.deliver_payload(
+                "admin",
+                serde_json::from_value::<MsgSendParams>(json!({
+                    "to": ["legacy_worker"],
+                    "subject": "Legacy hold",
+                    "body": "Legacy payload",
+                    "client_key": "legacy-in-flight"
+                }))
+                .unwrap(),
+            ),
+            async {
+                tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+                    .await
+                    .expect("legacy delivery reached write boundary")
+                    .expect("pause channel stayed open");
 
-        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
-            .await
-            .expect("legacy delivery reached write boundary")
-            .expect("pause channel stayed open");
+                // 1. Query quiesce under the mutex boundary for legacy worker
+                let quiesced = rig
+                    .ctl
+                    .request("daemon.quiesce", json!({"timeout_ms": 100}))
+                    .await;
+                assert!(
+                    quiesced["error"].is_null(),
+                    "legacy quiesce failed: {quiesced}"
+                );
 
-        // 1. Query quiesce under the mutex boundary for legacy worker
-        let quiesced = rig
-            .ctl
-            .request("daemon.quiesce", json!({"timeout_ms": 100}))
-            .await;
-        assert!(
-            quiesced["error"].is_null(),
-            "legacy quiesce failed: {quiesced}"
+                let in_flight = quiesced["result"]["in_flight"]
+                    .as_array()
+                    .expect("in_flight array");
+                assert_eq!(
+                    in_flight.len(),
+                    1,
+                    "exact legacy direct-delivery attempt must be exposed under queue mutex: {quiesced}"
+                );
+                let in_flight_str = in_flight[0].as_str().unwrap();
+                assert!(
+                    in_flight_str.ends_with(" -> legacy_worker"),
+                    "in_flight must name target legacy worker: {in_flight_str}"
+                );
+                let expected_legacy_id = in_flight_str.split(" -> ").next().unwrap().to_string();
+
+                // 2. Query legacy worker registry with exact session and pane key
+                let decoy_pane = "%99".to_string();
+                assert_eq!(
+                    rig.daemon.legacy_worker_current_for_test(0, &decoy_pane),
+                    None,
+                    "decoy pane must not match any worker current job"
+                );
+                let current_legacy_msg_id = rig
+                    .daemon
+                    .legacy_worker_current_for_test(0, &pane)
+                    .expect("legacy worker must own exact in-flight job under queue mutex");
+                assert_eq!(
+                    current_legacy_msg_id, expected_legacy_id,
+                    "legacy worker current job must match in-flight handle"
+                );
+
+                // Release pause and finish
+                hold.add_permits(1);
+                expected_legacy_id
+            }
         );
-
-        let in_flight = quiesced["result"]["in_flight"]
-            .as_array()
-            .expect("in_flight array");
-        assert_eq!(
-            in_flight.len(),
-            1,
-            "exact legacy direct-delivery attempt must be exposed under queue mutex: {quiesced}"
-        );
-        let in_flight_str = in_flight[0].as_str().unwrap();
-        assert!(
-            in_flight_str.ends_with(" -> legacy_worker"),
-            "in_flight must name target legacy worker: {in_flight_str}"
-        );
-        let expected_legacy_id = in_flight_str.split(" -> ").next().unwrap();
-
-        // 2. Query legacy worker registry and WorkerState.current directly under the queue mutex
-        let current_legacy_msg_id = rig
-            .daemon
-            .legacy_worker_current_for_test(&pane)
-            .expect("legacy worker must own exact in-flight job under queue mutex");
-        assert_eq!(
-            current_legacy_msg_id, expected_legacy_id,
-            "legacy worker current job must match in-flight handle"
-        );
-
-        // Release pause and finish
-        hold.add_permits(1);
-        let send_res = send_task.await.unwrap().expect("deliver payload success");
+        let send_res = send_res.expect("deliver payload success");
         assert_eq!(send_res["msg_id"], expected_legacy_id);
 
         rig.shutdown().await;
@@ -449,11 +455,11 @@ async fn in_flight_attempt_is_exposed_under_queue_mutex() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Gap 3: Recovery failure visibly faults the worker and never silently restarts
+// Invariant 3: Supervised child recovery failure visibly faults the worker and never silently restarts
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
-async fn recovery_failure_visibly_faults_and_never_silently_restarts() {
+async fn supervised_child_recovery_failure_visibly_faults_and_never_restarts() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -472,7 +478,7 @@ async fn recovery_failure_visibly_faults_and_never_silently_restarts() {
     rig.label(&pane, "worker").await;
 
     // Pause once at pre_submit (when state is Staged), signal the test,
-    // have the test arm the next journal append immediately, then release into panic.
+    // arm the exact recovery append failure, then release into panic.
     let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
     let (release_tx, release_rx) = tokio::sync::oneshot::channel();
     let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
@@ -515,12 +521,19 @@ async fn recovery_failure_visibly_faults_and_never_silently_restarts() {
         .expect("reached pre_submit")
         .expect("channel open");
 
-    // Arm the next batch append failure directly on the store while delivery is paused in Staged
-    rig.daemon.fail_next_batch_append();
+    // Inspect the exact in-flight attempt owned by the worker
+    let (_, in_flight_attempt) = rig
+        .daemon
+        .mailbox_worker_current_for_test("worker")
+        .expect("in-flight worker job");
+    let target_attempt = in_flight_attempt.expect("in-flight attempt id");
+
+    // Arm the exact-attempt recovery append failure directly on the store
+    rig.daemon.fail_notification_recovery_append(target_attempt);
 
     // Release pause into panic: child crashes, supervisor catches it, recover_failed_job tries to
-    // record attention in journal, store append fails, recover_failed_job returns false, and
-    // supervisor sets Worker::set_fault("notification recovery failed: ...").
+    // record attention in journal for target_attempt, store append fails, recover_failed_job returns false,
+    // and supervisor sets Worker::set_fault.
     let _ = release_tx.send(());
     let _ = send_task.await;
 
@@ -624,7 +637,7 @@ async fn recovery_failure_visibly_faults_and_never_silently_restarts() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Gap 4: Composer barriers cannot leak between write boundary and durable transition
+// Invariant 4: Composer barriers cannot leak between write boundary and durable transition
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -646,9 +659,7 @@ async fn composer_barrier_cannot_leak_between_write_boundary_and_durable_transit
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
 
-    // ── Test the exact roadmap window: inside synchronous on_write boundary after latch_hold claims
-    //    the composer barrier, but before notification.record_writing makes the first durable transition.
-    //    Arm the one-shot seam: fail_pre_record_writing.
+    // Arm one-shot seam: panic after latch_hold claims composer barrier but before record_writing
     rig.daemon.fail_pre_record_writing();
 
     let send1 = rig
@@ -669,8 +680,7 @@ async fn composer_barrier_cannot_leak_between_write_boundary_and_durable_transit
     let first_id = send1["msg_id"].as_str().unwrap().to_string();
 
     // Because the worker exited before the first durable transition, UnwrittenHold dropped and rolled back
-    // the in-memory hold. recover_failed_job requeued the SAME attempt cleanly.
-    // Wait until the same attempt is successfully notified and verified.
+    // the in-memory hold. recover_failed_job requeued the same attempt cleanly.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let snap = rig
@@ -711,6 +721,19 @@ async fn composer_barrier_cannot_leak_between_write_boundary_and_durable_transit
         "all notification facts for first message must share one unique attempt_id: {first_attempt_ids:?}"
     );
     let first_attempt_id = first_attempt_ids.into_iter().next().unwrap();
+
+    // Observe hold status for the pane
+    let (hold_state, _) = rig
+        .daemon
+        .composer_hold_for_test(0, &pane)
+        .expect("detection entry for pane");
+    assert!(
+        matches!(
+            hold_state,
+            cyclops_proto::ComposerHold::Clear | cyclops_proto::ComposerHold::TurnStarted { .. }
+        ),
+        "composer barrier must be clear or turn started: {hold_state:?}"
+    );
 
     // Now send a follower message to prove the composer barrier was not leaked
     let send2 = rig

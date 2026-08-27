@@ -1325,7 +1325,6 @@ async fn observe_session_identity(
 
 /// A booted daemon. Dropping it does not stop the tasks; call
 /// [`Daemon::shutdown`] for a clean exit (detach watchers, remove socket).
-#[derive(Clone)]
 pub struct Daemon {
     inner: Arc<Inner>,
     stop: watch::Sender<bool>,
@@ -1846,15 +1845,11 @@ impl Daemon {
             .store(true, Ordering::SeqCst);
     }
 
-    /// Test-only seam: fail the next batch append on the workspace journal.
+    /// Test-only seam: fail the workspace journal append during recovery for one exact attempt.
     #[doc(hidden)]
-    pub fn fail_next_batch_append(&self) {
+    pub fn fail_notification_recovery_append(&self, attempt_id: NotificationAttemptId) {
         if let Some(service) = self.inner.mailbox.as_ref() {
-            service
-                .store_handle()
-                .lock()
-                .expect("mailbox store lock")
-                .inject_next_batch_append_failure();
+            service.inject_notification_recovery_append_failure(attempt_id);
         }
     }
 
@@ -1873,8 +1868,25 @@ impl Daemon {
     /// Test seam: inspect exact in-flight job owned by a legacy worker
     /// under the queue mutex boundary.
     #[doc(hidden)]
-    pub fn legacy_worker_current_for_test(&self, pane_id: &str) -> Option<String> {
-        self.inner.engine.legacy_worker_current_for_test(pane_id)
+    pub fn legacy_worker_current_for_test(
+        &self,
+        session_idx: usize,
+        pane_id: &str,
+    ) -> Option<String> {
+        let key = PaneKey::new(session_idx, pane_id);
+        self.inner.engine.legacy_worker_current_for_test(&key)
+    }
+
+    /// Test seam: inspect composer hold and owner for a pane.
+    #[doc(hidden)]
+    pub fn composer_hold_for_test(
+        &self,
+        session_idx: usize,
+        pane_id: &str,
+    ) -> Option<(cyclops_proto::ComposerHold, Option<String>)> {
+        let detections = self.inner.detections.lock().expect("detections lock");
+        let entry = detections.get(&PaneKey::new(session_idx, pane_id))?;
+        Some((entry.hold, entry.hold_owner.clone()))
     }
 
     /// Test-only seam: panic at the synchronous on_write boundary before record_writing.

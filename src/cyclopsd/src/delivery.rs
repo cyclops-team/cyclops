@@ -777,17 +777,11 @@ impl Engine {
     }
 
     #[doc(hidden)]
-    pub(crate) fn legacy_worker_current_for_test(&self, pane_id: &str) -> Option<String> {
+    pub(crate) fn legacy_worker_current_for_test(&self, key: &PaneKey) -> Option<String> {
         let workers = self.workers.lock().expect("workers lock");
-        for (key, entry) in workers.iter() {
-            if key.pane_id == pane_id || workers.len() == 1 {
-                let state = entry.worker.state.lock().expect("worker state lock");
-                if let Some(current) = &state.current {
-                    return Some(current.msg_id.clone());
-                }
-            }
-        }
-        None
+        let entry = workers.get(key)?;
+        let state = entry.worker.state.lock().expect("worker state lock");
+        state.current.as_ref().map(|c| c.msg_id.clone())
     }
 
     /// Seed the issued-id set from a ledger so new ids stay unique per

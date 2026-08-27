@@ -4393,7 +4393,9 @@ fn validate_display_label(kind: &str, label: &str) -> Result<(), MailboxError> {
 pub struct MessageStore {
     writer: LedgerWriter,
     projection: MailboxProjection,
-    fail_next_batch_append: bool,
+    fail_notification_recovery_append: Option<NotificationAttemptId>,
+    #[cfg(test)]
+    fail_batch_append: bool,
     #[cfg(test)]
     fail_claimed_staged_clear_appends: usize,
     #[cfg(test)]
@@ -5085,6 +5087,16 @@ impl MailboxService {
 
     pub(crate) fn store_handle(&self) -> Arc<StdMutex<MessageStore>> {
         Arc::clone(&self.store)
+    }
+
+    #[doc(hidden)]
+    pub(crate) fn inject_notification_recovery_append_failure(
+        &self,
+        attempt_id: NotificationAttemptId,
+    ) {
+        if let Ok(mut store) = self.store.lock() {
+            store.inject_notification_recovery_append_failure(attempt_id);
+        }
     }
 
     pub(crate) fn change_publisher(&self) -> Option<MessageChangePublisher> {
@@ -6269,7 +6281,9 @@ impl MessageStore {
         Ok(Self {
             writer,
             projection,
-            fail_next_batch_append: false,
+            fail_notification_recovery_append: None,
+            #[cfg(test)]
+            fail_batch_append: false,
             #[cfg(test)]
             fail_claimed_staged_clear_appends: 0,
             #[cfg(test)]
@@ -6287,8 +6301,17 @@ impl MessageStore {
         self.writer.path()
     }
 
+    #[cfg(test)]
     pub(crate) fn inject_next_batch_append_failure(&mut self) {
-        self.fail_next_batch_append = true;
+        self.fail_batch_append = true;
+    }
+
+    #[doc(hidden)]
+    pub(crate) fn inject_notification_recovery_append_failure(
+        &mut self,
+        attempt_id: NotificationAttemptId,
+    ) {
+        self.fail_notification_recovery_append = Some(attempt_id);
     }
 
     #[cfg(test)]
@@ -7016,7 +7039,8 @@ impl MessageStore {
         };
 
         let prepared = self.projection.prepare_line(&line)?;
-        if std::mem::take(&mut self.fail_next_batch_append) {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_batch_append) {
             return Err(LedgerError::Io {
                 path: self.writer.path().to_path_buf(),
                 source: std::io::Error::other("injected workspace journal append failure"),
@@ -7125,7 +7149,7 @@ impl MessageStore {
 
         let prepared = self.projection.prepare_line(&line)?;
         #[cfg(test)]
-        if std::mem::take(&mut self.fail_next_batch_append) {
+        if std::mem::take(&mut self.fail_batch_append) {
             return Err(LedgerError::Io {
                 path: self.writer.path().to_path_buf(),
                 source: std::io::Error::other("injected workspace journal append failure"),
@@ -7372,12 +7396,24 @@ impl MessageStore {
             data: Some(serde_json::to_value(fact)?),
         };
         let prepared = self.projection.prepare_line(&line)?;
-        if std::mem::take(&mut self.fail_next_batch_append) {
-            return Err(LedgerError::Io {
-                path: self.writer.path().to_path_buf(),
-                source: std::io::Error::other("injected workspace journal append failure"),
+        if let Some(target) = &self.fail_notification_recovery_append {
+            if let Some(data) = &line.data {
+                if data
+                    .get("attempt_id")
+                    .and_then(|a| a.as_str())
+                    .and_then(|s| NotificationAttemptId::parse(s).ok())
+                    == Some(*target)
+                {
+                    self.fail_notification_recovery_append = None;
+                    return Err(LedgerError::Io {
+                        path: self.writer.path().to_path_buf(),
+                        source: std::io::Error::other(
+                            "injected workspace journal recovery append failure",
+                        ),
+                    }
+                    .into());
+                }
             }
-            .into());
         }
         let persisted = self.writer.append(line)?;
         self.projection.commit_line(persisted, prepared);
