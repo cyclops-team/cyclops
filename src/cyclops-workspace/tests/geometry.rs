@@ -4,8 +4,6 @@
 //! client (F48). Sizes mirror a 200x50 terminal with the default 22-column
 //! sidebar; the canvas math itself is unit-tested in `render::canvas`.
 
-use std::time::{Duration, Instant};
-
 use cyclops_testrig::{tmux_available, TmuxServer};
 use cyclops_tmux::{ControlClient, ControlConfig};
 
@@ -60,27 +58,17 @@ impl Rig {
             .map(|l| l.trim().parse().expect("pane width"))
             .collect()
     }
-
-    /// Bounded wait for the window to settle on `expected`. Detach-driven
-    /// recalculation lands after the leaving client's EOF, which has no
-    /// reply to await.
-    fn wait_window_size(&self, session: &str, expected: (u16, u16)) {
-        let t = Instant::now();
-        while self.window_size(session) != expected {
-            assert!(
-                t.elapsed() < Duration::from_secs(5),
-                "window never settled on {expected:?}, still {:?}",
-                self.window_size(session)
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
 }
 
-/// Declared canvas cells always equal laid-out window cells, from attach
-/// through every chrome change the workspace redeclares for.
+/// Canvas cells always equal laid-out window cells, from attach through
+/// every chrome change the workspace resizes for.
+///
+/// The workspace sizes windows with `resize-window` under `window-size
+/// manual`, not by declaring a client size: a declaration is a vote, and
+/// under any voting policy some other client can outvote it and reshape
+/// every pane in the session (F76).
 #[tokio::test]
-async fn window_tracks_every_canvas_redeclaration() {
+async fn window_tracks_every_canvas_change() {
     let Some(rig) = Rig::new("geometry") else {
         return;
     };
@@ -89,10 +77,14 @@ async fn window_tracks_every_canvas_redeclaration() {
     let (client, _notif) = ControlClient::spawn(rig.config("geo"))
         .await
         .expect("attach");
-    client.set_window_size_smallest("@0").await.expect("pin");
+    client
+        .capture_prior_window_size("@0")
+        .await
+        .expect("capture");
+    client.pin_window_size_manual("@0").await.expect("pin");
 
     // Attach: 200x50 terminal, 22-column sidebar, tab bar, one-cell margin.
-    client.set_client_size(176, 47).await.expect("declare");
+    client.resize_window("@0", 176, 47).await.expect("size");
     assert_eq!(rig.window_size("geo"), (176, 47));
     assert_eq!(rig.pane_widths("geo"), vec![176]);
 
@@ -102,30 +94,32 @@ async fn window_tracks_every_canvas_redeclaration() {
     assert_eq!(rig.window_size("geo").0, 176);
     assert_eq!(rig.pane_widths("geo").iter().sum::<u16>(), 175);
 
-    // A wider canvas, the shape a sidebar collapse produces: the window
-    // follows whatever the control client declares. The numbers here are
-    // driven directly rather than derived from a chrome split, because
-    // this test pins the tmux side of the contract; the split itself is
-    // pinned by the chrome tests in app.rs.
+    // A wider canvas, the shape a sidebar collapse produces. The numbers
+    // here are driven directly rather than derived from a chrome split,
+    // because this test pins the tmux side of the contract; the split
+    // itself is pinned by the chrome tests in app.rs.
     client
-        .set_client_size(198, 47)
+        .resize_window("@0", 198, 47)
         .await
         .expect("sidebar hidden");
     assert_eq!(rig.window_size("geo"), (198, 47));
     assert_eq!(rig.pane_widths("geo").iter().sum::<u16>(), 197);
     client
-        .set_client_size(176, 47)
+        .resize_window("@0", 176, 47)
         .await
         .expect("sidebar shown");
     assert_eq!(rig.window_size("geo"), (176, 47));
 
     // Sidebar dragged to 30 columns.
-    client.set_client_size(168, 47).await.expect("sidebar drag");
+    client
+        .resize_window("@0", 168, 47)
+        .await
+        .expect("sidebar drag");
     assert_eq!(rig.window_size("geo"), (168, 47));
 
     // Terminal resized to 220x55.
     client
-        .set_client_size(196, 52)
+        .resize_window("@0", 196, 52)
         .await
         .expect("terminal resize");
     assert_eq!(rig.window_size("geo"), (196, 52));
@@ -134,13 +128,15 @@ async fn window_tracks_every_canvas_redeclaration() {
     client.shutdown().await;
 }
 
-/// The regression the fix exists for: under the previous `latest` policy a
-/// second attached client that declared a larger size took the window with
-/// it, and panes laid out wider than the first client's painted canvas.
-/// Under `smallest` the window never exceeds the workspace canvas; a
-/// smaller viewer shrinks it, which the canvas absorbs as gutter.
+/// The regression this exists for, and Admin measured: no other client can
+/// move a window this workspace owns, whichever direction it would move it.
+///
+/// Under every voting policy the session's size is decided by whoever
+/// attached, so a 62x21 terminal opened next to a 176x47 workspace took the
+/// window, and every agent pane in it, down with it (F76). A window a
+/// workspace owns is on `manual`, which has no vote to lose.
 #[tokio::test]
-async fn a_second_larger_client_cannot_out_size_the_canvas() {
+async fn no_other_client_can_move_an_owned_window() {
     let Some(rig) = Rig::new("geometry-2c") else {
         return;
     };
@@ -149,26 +145,38 @@ async fn a_second_larger_client_cannot_out_size_the_canvas() {
     let (workspace, _n1) = ControlClient::spawn(rig.config("geo2"))
         .await
         .expect("attach");
-    workspace.set_window_size_smallest("@0").await.expect("pin");
-    workspace.set_client_size(176, 47).await.expect("declare");
+    workspace
+        .capture_prior_window_size("@0")
+        .await
+        .expect("capture");
+    workspace.pin_window_size_manual("@0").await.expect("pin");
+    workspace.resize_window("@0", 176, 47).await.expect("size");
     assert_eq!(rig.window_size("geo2"), (176, 47));
 
-    // A bigger viewer attaches and declares: the window must not grow past
-    // the workspace canvas.
+    // A second client attaches and declares, both larger and smaller. Under
+    // `latest` the first would have taken the window; under `smallest` the
+    // second would. Neither does.
     let (viewer, _n2) = ControlClient::spawn(rig.config("geo2"))
         .await
         .expect("attach");
     viewer.set_client_size(240, 58).await.expect("declare");
-    assert_eq!(rig.window_size("geo2"), (176, 47));
+    assert_eq!(
+        rig.window_size("geo2"),
+        (176, 47),
+        "a larger viewer moved it"
+    );
+    viewer.set_client_size(60, 20).await.expect("redeclare");
+    assert_eq!(
+        rig.window_size("geo2"),
+        (176, 47),
+        "a smaller viewer collapsed the owner's session"
+    );
     assert_eq!(rig.pane_widths("geo2"), vec![176]);
 
-    // A smaller viewer wins instead: panes stay inside every canvas.
-    viewer.set_client_size(150, 40).await.expect("redeclare");
-    assert_eq!(rig.window_size("geo2"), (150, 40));
-
-    // The viewer leaves; the workspace canvas is authoritative again.
+    // And the viewer leaving changes nothing either, because it never had
+    // a say.
     viewer.shutdown().await;
-    rig.wait_window_size("geo2", (176, 47));
+    assert_eq!(rig.window_size("geo2"), (176, 47));
 
     workspace.shutdown().await;
 }

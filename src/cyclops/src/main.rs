@@ -48,6 +48,7 @@ mod hookset;
 mod manifests;
 mod render;
 mod setup;
+mod sizing;
 mod skillseed;
 mod soundseed;
 mod style;
@@ -136,6 +137,15 @@ enum Cmd {
     Workspace {
         #[command(subcommand)]
         cmd: WorkspaceCmd,
+    },
+    /// Hand a session's window sizing back to tmux.
+    ///
+    /// A workspace sizes the windows it owns and restores them when it
+    /// quits. Use this when one was killed hard and no workspace is coming
+    /// back to tidy up, or when you are finished with Cyclops on a session.
+    Sizing {
+        #[command(subcommand)]
+        cmd: SizingCmd,
     },
     /// What cyclops is watching and the state of every agent.
     Status,
@@ -268,6 +278,18 @@ enum Cmd {
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SizingCmd {
+    /// Put every window of a session back on the sizing policy it had, and
+    /// clear the ownership mark. Safe to run twice, and a window cyclops
+    /// never sized is left exactly as it is.
+    Release {
+        /// Session to release. Defaults to the one this shell is in.
+        #[arg(long)]
+        session: Option<String>,
     },
 }
 
@@ -863,6 +885,26 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
             cmd: SetupCmd::Check,
         } => setup::run_check(cli.json, &style_for(cli)),
         // Health must not load a theme through an unchecked state path.
+        Cmd::Sizing {
+            cmd: SizingCmd::Release { session },
+        } => match session
+            .clone()
+            .or_else(|| cyclops_tmux::current_session(None))
+        {
+            Some(session) => sizing::run_release(
+                &cyclops_proto::cyclops_home(),
+                &session,
+                cli.json,
+                &style_for(cli),
+            ),
+            None => {
+                eprintln!(
+                    "{}",
+                    style_for(cli).bold("not inside tmux: name the session with --session <name>")
+                );
+                2
+            }
+        },
         Cmd::Health => health::run(cli.json),
         // Cleanup has no arbitrary path input and does not need the daemon.
         Cmd::Cleanup { assets, apply } => cleanup::run(cli.json, assets, *apply),
@@ -1054,7 +1096,8 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 | Cmd::Cleanup { .. }
                 | Cmd::Theme { .. }
                 | Cmd::Update { .. }
-                | Cmd::Workspace { .. } => {
+                | Cmd::Workspace { .. }
+                | Cmd::Sizing { .. } => {
                     unreachable!("handled above")
                 }
             }

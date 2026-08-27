@@ -1471,7 +1471,7 @@ mod tests {
             cursor_style: None,
             term_size: (80, 24),
             declared_client_size: None,
-            pinned_windows: HashSet::new(),
+            sizing: crate::app::WindowSizing::default(),
             needs_reconcile: false,
             needs_hydrate: false,
             paste_seq: 0,

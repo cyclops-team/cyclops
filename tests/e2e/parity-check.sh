@@ -829,6 +829,26 @@ cat "$OUT"
 check "the admin mailbox stays pending without a wake" '^pending not_started$'
 
 echo
+echo "#### docs/guides/sizing.md: handing a session's window sizing back"
+
+# The shapes that page promises. A workspace is not running here, so this is
+# the ordinary path: nothing of cyclops' making to undo, said plainly, and a
+# zero exit. The refusals have their own tests in src/cyclops/tests, because
+# staging a live owner or a corrupt record is not a documentation walk.
+#
+# The session is named because this rig drives the CLI from outside tmux,
+# where there is no current session to default to. That refusal is itself a
+# documented shape, so it is checked first.
+run "$CYC" sizing release --plain
+check "release outside tmux says which flag to use" 'name the session with --session'
+check_exit "release outside tmux exits 2" 2
+
+run "$CYC" sizing release --session main --plain
+check "release names the session it acted on" '^main: cyclops sizing released$'
+check "release counts the windows it put back" 'window\(s\) put back on their original policy$'
+check_exit "releasing a clean session exits 0" 0
+
+echo
 echo "#### The first run docs/guides/QUICKSTART.md walks, from outside the repo"
 
 # A nested rig, and the one that regresses the whole first-run break.
