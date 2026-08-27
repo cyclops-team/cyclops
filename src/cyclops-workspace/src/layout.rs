@@ -629,12 +629,16 @@ fn collect_geometry(
     }
 }
 
-/// Fit sibling lengths to one local axis. Full-size layouts are returned
-/// byte-for-byte; compressed layouts use largest-remainder apportionment so
-/// rounding cannot strand cells. One content cell and one separating border
-/// cell per sibling are reserved when they fit. Below that safe floor, every
-/// nonfocused branch collapses and the focused branch receives the whole
-/// axis, so sibling frames cannot erase its last visible runtime cell.
+/// Fit sibling lengths to one local axis:
+///
+/// 1. Return full-size layouts byte-for-byte.
+/// 2. Reserve one content cell and one separating border cell per sibling
+///    when they fit.
+/// 3. Below that safe floor, collapse every nonfocused branch and give the
+///    focused branch the whole axis so sibling frames cannot erase its last
+///    visible runtime cell.
+/// 4. Otherwise use largest-remainder apportionment so rounding cannot strand
+///    cells.
 fn fit_split_lengths(
     wanted: &[u16],
     available: u16,

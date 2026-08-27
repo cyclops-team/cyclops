@@ -226,7 +226,7 @@ pub struct ExactMessageRequest<'a> {
     pub client_key: &'a str,
 }
 
-/// Send from the Messages surface using exact recipients or a reply reference.
+/// Send from the Messages pane using exact recipients or a reply reference.
 pub fn send_message_full(home: &Path, request: ExactMessageRequest<'_>) -> SendOutcome {
     send_message_request(
         home,

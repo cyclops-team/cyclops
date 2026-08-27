@@ -38,7 +38,7 @@ pub enum BindingAction {
     CloseWorkspace,
     /// Collapse or reopen the sidebar; the state persists across restarts.
     ToggleSidebar,
-    /// Show or hide the right-edge messages drawer.
+    /// Show or hide the right-edge Messages pane.
     ToggleMessages,
     /// Show or hide the tab strip; the state persists across restarts.
     ///

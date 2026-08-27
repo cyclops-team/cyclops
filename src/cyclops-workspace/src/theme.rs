@@ -86,7 +86,7 @@ impl Paint {
     }
 
     /// The same stable role color as ground, with the panel's ink on top:
-    /// an agent's avatar chip in the messages drawer. With color off the
+    /// an agent's avatar chip in the Messages pane. With color off the
     /// chip reverses, so it still reads as a chip (rule 11).
     pub fn role_ground(&self, label: &str) -> Style {
         if !self.colors_enabled {

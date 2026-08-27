@@ -508,7 +508,7 @@ struct App {
     /// The shared Cyclops watch Messages model (HumanQueue).
     messages_queue: cyclops_ui::HumanQueue,
     /// Authenticated mailbox identity that produced the current snapshot.
-    /// Absent means the Messages surface is read-only.
+    /// Absent means the Messages pane is read-only.
     messages_caller: Option<cyclops_proto::RecipientKey>,
     /// Open message detail view when an operator opens a message.
     messages_detail: Option<cyclops_ui::Detail>,
@@ -4102,13 +4102,19 @@ async fn settle_lost_release(app: &mut App, client: &ControlClient) -> bool {
         settled = true;
         if drag.is_active() {
             match drag.target {
-                DragTarget::Sidebar | DragTarget::Messages => {
+                DragTarget::Sidebar => {
                     app.save_prefs_or_log();
                     // Same commit as a release the app actually saw, so
                     // the same topology epoch: the panel is keeping the
                     // width the preview left it at.
                     app.layout_changed();
                     resize_client(app, client).await;
+                }
+                DragTarget::Messages => {
+                    app.save_prefs_or_log();
+                    // The Messages pane width is local chrome. Settling its
+                    // preview must not resize the shared tmux window.
+                    app.layout_changed();
                 }
                 DragTarget::SidebarSplit => {
                     app.save_prefs_or_log();
@@ -4780,8 +4786,9 @@ async fn handle_mouse(
                 app.prefs.messages_width =
                     crate::render::messages_width_for_column(col, app.term_size.0);
                 app.save_prefs_or_log();
+                // The Messages pane width changes only this viewer's local
+                // canvas; tmux pane geometry stays byte-for-byte unchanged.
                 app.layout_changed();
-                resize_client(app, client).await;
             }
             let split_drag = app.drag.as_ref().is_some_and(|drag| {
                 drag.is_active() && matches!(&drag.target, DragTarget::SidebarSplit)
@@ -7874,7 +7881,7 @@ mod tests {
         }
     }
 
-    fn messages_peer_model() -> WorkspaceModel {
+    fn messages_pane_model() -> WorkspaceModel {
         let tab = crate::model::TabModel {
             window_id: "@0".into(),
             name: "1".into(),
@@ -8246,7 +8253,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ctrl_r_retries_a_failed_snapshot_without_drawer_focus() {
+    async fn ctrl_r_retries_a_failed_snapshot_without_messages_pane_focus() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let home = cyclops_proto::scratch::scratch_dir("workspace-messages-retry");
@@ -8277,7 +8284,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clicking_the_messages_chevron_collapses_the_drawer() {
+    async fn clicking_the_messages_chevron_collapses_the_messages_pane() {
         use cyclops_testrig::{tmux_available, TmuxServer};
         use cyclops_tmux::{ControlClient, ControlConfig};
         use ratatui::backend::TestBackend;
@@ -8702,7 +8709,7 @@ mod tests {
     /// edge, and a diff frame has no reason to rewrite them.
     #[test]
     fn collapsing_the_messages_pane_leaves_no_cell_of_it_behind() {
-        let home = cyclops_proto::scratch::scratch_dir("workspace-collapse-drawer");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-collapse-messages-pane");
         let mut motion = Motion::new(false);
         let mut collapsed = test_app(one_pane_model(), home.clone());
         collapsed.term_size = (100, 24);
@@ -8744,8 +8751,8 @@ mod tests {
     /// when it cannot resize the shared tmux window.
     #[test]
     fn messages_pane_is_bordered_and_never_hides_the_selected_agent() {
-        let home = cyclops_proto::scratch::scratch_dir("workspace-messages-peer");
-        let mut app = test_app(messages_peer_model(), home.clone());
+        let home = cyclops_proto::scratch::scratch_dir("workspace-messages-pane");
+        let mut app = test_app(messages_pane_model(), home.clone());
         app.term_size = (96, 24);
 
         let _closed = clean_frame(&mut app, 96, 24);
@@ -8824,6 +8831,181 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    async fn nested_layout_after_messages_width_drag(
+        lost_release: bool,
+    ) -> (String, String, Option<(u16, u16)>, u16, u16) {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        assert!(tmux_available(), "tmux checked by the calling test");
+        let tag = if lost_release {
+            "app-messages-drag-lost"
+        } else {
+            "app-messages-drag-up"
+        };
+        let server = TmuxServer::new(tag);
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-x",
+            "100",
+            "-y",
+            "30",
+            "-s",
+            "s",
+            "/bin/sh",
+        ]);
+        server.run_ok(&["split-window", "-h", "-l", "30", "-t", "s", "/bin/sh"]);
+        server.run_ok(&["split-window", "-v", "-l", "5", "-t", "s", "/bin/sh"]);
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+
+        let output = server.run(&["list-windows", "-t", "s", "-F", "#{window_id}"]);
+        let window_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let read_layout = || {
+            let output = server.run(&[
+                "display-message",
+                "-p",
+                "-t",
+                &window_id,
+                "#{window_layout}",
+            ]);
+            assert!(
+                output.status.success(),
+                "read nested layout: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let source = read_layout();
+        let node = crate::layout::parse_layout(&source).expect("parse nested layout");
+        let layout = crate::layout::resolve_layout(&node, &[]).expect("resolve nested layout");
+        let output = server.run(&[
+            "list-panes",
+            "-t",
+            "s",
+            "-f",
+            "#{pane_active}",
+            "-F",
+            "#{pane_id}",
+        ]);
+        let active_pane = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let mut model = messages_pane_model();
+        model.session.session = "s".into();
+        model.session.tabs[0].window_id = window_id.clone();
+        model.session.tabs[0].layout = layout;
+        model.session.tabs[0].active_pane = active_pane;
+        model.workspaces[0].name = "s".into();
+        model.workspaces[0].window_ids = vec![window_id.clone()];
+        model.messages_visible = true;
+
+        let home = cyclops_proto::scratch::scratch_dir(tag);
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create scratch home");
+        let mut app = test_app(model, home.clone());
+        app.term_size = (100, 30);
+        app.prefs.sidebar_visible = false;
+        app.prefs.messages_visible = true;
+        let adopted = adopt_windows(
+            &mut app.sizing,
+            &client,
+            "s",
+            &app.model.session.tabs,
+            &home,
+        )
+        .await;
+        assert!(adopted.took_a_window, "test app must own the nested window");
+        let before = read_layout();
+
+        let _frame = clean_frame(&mut app, 100, 30);
+        let (divider_col, divider_row) = (0..100u16)
+            .flat_map(|column| (0..30u16).map(move |row| (column, row)))
+            .find(|&(column, row)| {
+                matches!(
+                    app.hit_map.hit(column, row),
+                    Some(HitTarget::MessagesDivider)
+                )
+            })
+            .expect("painted Messages pane divider");
+        let width_before = app.prefs.messages_width;
+        let dragged_col = divider_col.saturating_sub(8);
+        let mut detached = false;
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(
+                MouseEventKind::Down(MouseButton::Left),
+                divider_col,
+                divider_row,
+            ),
+            &mut detached,
+        )
+        .await
+        .expect("start Messages pane width drag");
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(
+                MouseEventKind::Drag(MouseButton::Left),
+                dragged_col,
+                divider_row,
+            ),
+            &mut detached,
+        )
+        .await
+        .expect("preview Messages pane width");
+        let final_kind = if lost_release {
+            MouseEventKind::Moved
+        } else {
+            MouseEventKind::Up(MouseButton::Left)
+        };
+        handle_mouse(
+            &mut app,
+            &client,
+            mouse_at(final_kind, dragged_col, divider_row),
+            &mut detached,
+        )
+        .await
+        .expect("settle Messages pane width drag");
+
+        let result = (
+            before,
+            read_layout(),
+            app.declared_client_size,
+            width_before,
+            app.prefs.messages_width,
+        );
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+        result
+    }
+
+    #[tokio::test]
+    async fn messages_width_drag_release_paths_never_reshape_nested_tmux_layout() {
+        if !cyclops_testrig::tmux_available() {
+            return;
+        }
+        for lost_release in [false, true] {
+            let (before, after, declared, width_before, width_after) =
+                nested_layout_after_messages_width_drag(lost_release).await;
+            assert_ne!(
+                width_after, width_before,
+                "fixture must commit a different local Messages pane width"
+            );
+            assert_eq!(
+                declared, None,
+                "Messages pane width settlement must not declare a tmux size"
+            );
+            assert_eq!(
+                after, before,
+                "Messages pane width settlement reshaped the shared nested layout; \
+                 lost_release={lost_release}"
+            );
+        }
     }
 
     /// A cancelled chrome drag snaps the panel back to the width it had at

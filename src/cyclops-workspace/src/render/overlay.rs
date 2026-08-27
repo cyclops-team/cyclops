@@ -642,7 +642,7 @@ fn wrapped_line_count(text: &str, width: u16) -> usize {
 ///
 /// The saved marker is [`copy::MENU_CHECK`], the same glyph the app
 /// menu's toggle uses, because a theme being on is the same kind of fact
-/// as the drawer being open and should not need a second vocabulary. It rides
+/// as the Messages pane being open and should not need a second vocabulary. It rides
 /// beside the selection highlight, so "which one is saved" and "which
 /// one is the cursor on" stay separable without color.
 #[allow(clippy::too_many_arguments)]
@@ -1202,7 +1202,7 @@ fn input_tail(input: &str, width: usize) -> String {
 /// the answer lives.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MenuChecks {
-    /// Whether the right messages drawer is open.
+    /// Whether the right Messages pane is open.
     pub messages: bool,
 }
 

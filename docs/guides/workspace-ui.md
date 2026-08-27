@@ -190,10 +190,11 @@ their state as the pane opens, closes, or changes width.
 
 When local chrome leaves less room than the current tmux source, Cyclops fits
 the agent card rectangles proportionally into the remaining canvas. Runtime
-cells are still a 1:1 leading viewport; they are never scaled, and the
-follower never resizes the shared tmux window. Pane-divider dragging is
-disabled during that fitted view because local and tmux cell distances no
-longer match. The Messages pane's own width handle remains active.
+cells are still a 1:1 leading viewport; they are never scaled. Opening or
+closing the Messages pane never resizes the shared tmux window, from either
+the sizing driver or a follower. Pane-divider dragging is disabled during
+that fitted view because local and tmux cell distances no longer match. The
+Messages pane's own width handle remains active.
 
 ## Mouse
 

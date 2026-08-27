@@ -70,7 +70,7 @@ impl SidebarTab {
 pub struct WorkspacePrefs {
     pub sidebar_visible: bool,
     pub sidebar_width: u16,
-    /// Messages drawer visibility on the right edge.
+    /// Messages pane visibility on the right edge.
     pub messages_visible: bool,
     pub messages_width: u16,
     /// The sidebar tab last selected, restored on reopen like visibility

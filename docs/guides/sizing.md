@@ -17,14 +17,14 @@ puts every one of them back exactly as it found them.
 One workspace per session does this. A second workspace on the same session
 follows the first one's geometry and says so once, rather than fighting it.
 
-## Local chrome on a follower
+## Local Messages pane chrome
 
 The Messages pane owns a bordered region beside the agent grid. It never
 overlays an agent pane. Opening it reduces only this client's local canvas;
-a sizing follower does not resize the shared tmux window to make room.
-Instead, the follower proportionally fits the agent card rectangles into the
-smaller canvas and shows each runtime as a 1:1 leading viewport. The runtime
-cells are clipped, never scaled.
+neither the sizing driver nor a follower resizes the shared tmux window when
+the pane opens or closes. Instead, this viewer proportionally fits the agent
+card rectangles into the smaller canvas and shows each runtime as a 1:1
+leading viewport. The runtime cells are clipped, never scaled.
 
 Closing the Messages pane returns the width it reserved, apart from its
 one-column reopen rail, and restores the exact pre-open local grid. It does
