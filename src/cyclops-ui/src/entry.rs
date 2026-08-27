@@ -1,6 +1,5 @@
-//! Painting one [`crate::stream::Entry`]: the gutter, the content line,
-//! and the body's first line hanging at the content column in comfortable
-//! density.
+//! Painting one [`crate::stream::Entry`]: the gutter and one body-free
+//! content line.
 //!
 //! Everything about WHAT an entry says — its words, its glyphs, whether it
 //! belongs in the calm view — is decided in `stream.rs` before this file
@@ -15,31 +14,13 @@ use crate::grid;
 use crate::stream::{Entry, EntryKind};
 use crate::theme::Theme;
 
-/// Columns before content: the 8-column HH:MM:SS gutter plus two spaces.
-/// Continuation lines (bodies) hang at this indent, so the gutter stays a
-/// clean aligned column whatever arrives.
-pub const CONTENT_COL: usize = 10;
-
 impl Entry {
-    /// The one or two rendered lines: gutter plus content, and the body's
-    /// first line hanging at the content column when `body_line` asks for
-    /// it (comfortable density). No trailing spaces, no truncation; the
-    /// frame owns width.
-    pub fn lines(&self, theme: &Theme, body_line: bool) -> Vec<String> {
+    /// One body-free rendered line. Message bodies are authorized only when
+    /// a person opens message detail; a resting stream row never owns one.
+    pub fn lines(&self, theme: &Theme) -> Vec<String> {
         let clock = theme.dim(&grid::clock_hms(self.ts));
         let content = self.content(theme);
-        let mut out = vec![format!("{clock}  {content}")];
-        if body_line {
-            if let EntryKind::Msg {
-                body: Some(body), ..
-            } = &self.kind
-            {
-                if let Some(first) = body.lines().next() {
-                    out.push(format!("{}{first}", " ".repeat(CONTENT_COL)));
-                }
-            }
-        }
-        out
+        vec![format!("{clock}  {content}")]
     }
 
     /// Content after the gutter, one line, the shared voice: role color on
@@ -155,7 +136,6 @@ mod tests {
                 to: to.iter().map(|t| t.to_string()).collect(),
                 endpoints: None,
                 subject: subject.into(),
-                body: None,
                 fyi: false,
             },
         }
@@ -166,7 +146,7 @@ mod tests {
         let t = Theme::none();
         let e = msg("codex", &["reviewer"], "Review the rate limiter");
         assert_eq!(
-            e.lines(&t, false),
+            e.lines(&t),
             vec!["12:04:31  codex → reviewer  Review the rate limiter"]
         );
 
@@ -175,23 +155,9 @@ mod tests {
             *f = true;
         }
         assert_eq!(
-            fyi.lines(&t, false),
+            fyi.lines(&t),
             vec!["12:04:31  admin → 2 agents  fyi  Standup in 5"]
         );
-
-        let mut with_body = msg("codex", &["reviewer"], "Review");
-        if let EntryKind::Msg { body, .. } = &mut with_body.kind {
-            *body = Some("gateway.rs:120 drops the burst path\nsecond".into());
-        }
-        assert_eq!(
-            with_body.lines(&t, true),
-            vec![
-                "12:04:31  codex → reviewer  Review",
-                "          gateway.rs:120 drops the burst path",
-            ]
-        );
-        // Compact keeps the body off the grid.
-        assert_eq!(with_body.lines(&t, false).len(), 1);
 
         let e = Entry {
             uid: 0,
@@ -206,7 +172,7 @@ mod tests {
             },
         };
         assert_eq!(
-            e.lines(&t, false),
+            e.lines(&t),
             vec!["12:04:32  reviewer  ✔ delivered · verified"]
         );
 
@@ -224,7 +190,7 @@ mod tests {
             },
         };
         assert_eq!(
-            e.lines(&t, false),
+            e.lines(&t),
             vec!["12:04:33  reviewer  ⚠ blocked_permission"]
         );
 
@@ -243,7 +209,7 @@ mod tests {
             },
         };
         assert_eq!(
-            e.lines(&t, false),
+            e.lines(&t),
             vec!["12:04:34  ⚠ action required · delivery to reviewer needs attention"]
         );
 
@@ -260,7 +226,7 @@ mod tests {
             },
         };
         assert_eq!(
-            e.lines(&t, false),
+            e.lines(&t),
             vec!["12:04:35  reviewer  gate hold · pane in mode"]
         );
 
@@ -281,7 +247,7 @@ mod tests {
             },
         };
         assert!(e.admin_visible());
-        let line = &e.lines(&t, false)[0];
+        let line = &e.lines(&t)[0];
         assert_eq!(
             line,
             "12:04:35  reviewer  ⚠ held · a prompt in this pane needs you"
@@ -298,10 +264,7 @@ mod tests {
                 text: "attached".into(),
             },
         };
-        assert_eq!(
-            e.lines(&t, false),
-            vec!["12:04:36  session main · attached"]
-        );
+        assert_eq!(e.lines(&t), vec!["12:04:36  session main · attached"]);
 
         // The line that ends an alarm quotes the alarm's own cell, so the
         // reader matches the two rows without decoding a second encoding
@@ -323,11 +286,11 @@ mod tests {
             },
         };
         assert_eq!(
-            cleared(Clearance::Moved).lines(&t, false),
+            cleared(Clearance::Moved).lines(&t),
             vec!["12:04:37  reviewer  ✔ cleared · was ⚠ blocked_permission"]
         );
         assert_eq!(
-            cleared(Clearance::PaneGone).lines(&t, false),
+            cleared(Clearance::PaneGone).lines(&t),
             vec!["12:04:37  reviewer  ✔ pane closed · was ⚠ blocked_permission"]
         );
         let e = Entry {
@@ -349,7 +312,7 @@ mod tests {
             },
         };
         assert_eq!(
-            e.lines(&t, false),
+            e.lines(&t),
             vec!["12:04:37  implementer  ✔ cleared · was ⊘ parked · quota"]
         );
     }
@@ -392,7 +355,7 @@ mod tests {
                 state: AgentState::BlockedPermission,
             },
         };
-        let line = &blocked.lines(&t, false)[0];
+        let line = &blocked.lines(&t)[0];
         assert!(
             line.contains("\x1b[38;5;41m⚠ blocked_permission\x1b[0m"),
             "the state cell went unpainted: {line:?}"
@@ -410,7 +373,7 @@ mod tests {
                 cause: None,
             },
         };
-        let line = &parked.lines(&t, false)[0];
+        let line = &parked.lines(&t)[0];
         assert!(
             line.contains("\x1b[38;5;42m⊘ parked \x1b[38;5;43m·\x1b[0m \x1b[38;5;43mquota"),
             "the badge went unpainted: {line:?}"
@@ -420,11 +383,11 @@ mod tests {
         // lines are the words and not one escape byte.
         let plain = Theme::none();
         assert_eq!(
-            blocked.lines(&plain, false)[0],
+            blocked.lines(&plain)[0],
             "12:04:31  reviewer  ⚠ blocked_permission"
         );
         assert_eq!(
-            parked.lines(&plain, false)[0],
+            parked.lines(&plain)[0],
             "12:04:31  implementer  ⊘ parked · quota"
         );
     }

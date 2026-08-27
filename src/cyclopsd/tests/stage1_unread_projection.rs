@@ -381,6 +381,8 @@ async fn slice1_direct_delivery_clears_unread_projection() {
         .await;
     assert_eq!(resp["result"]["label"], "worker", "{resp}");
 
+    let mut events = rig.daemon.subscribe_events();
+
     let send = rig
         .daemon
         .deliver_payload(
@@ -396,6 +398,21 @@ async fn slice1_direct_delivery_clears_unread_projection() {
         .await
         .unwrap();
     assert_eq!(send["deliveries"].as_array().unwrap().len(), 1);
+
+    let message_event = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if event.event == "msg" {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("legacy message event");
+    assert!(
+        message_event.data.get("body").is_none(),
+        "push events are invalidations and metadata, never an authorized body: {message_event:?}"
+    );
 
     // Direct delivery settles to DeliveredDirect, so unread should clear to 0!
     wait_for_option(&rig, &pane, "").await;

@@ -40,7 +40,6 @@ fn synthetic(i: u64) -> Entry {
             to: vec![format!("agent{}", (i + 1) % 7)],
             endpoints: None,
             subject: format!("message number {i} with a realistic subject line"),
-            body: Some("first body line\nsecond body line".into()),
             fyi: i.is_multiple_of(8),
         },
         1 => EntryKind::Delivery {

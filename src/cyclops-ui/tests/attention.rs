@@ -197,7 +197,7 @@ fn backfill_decides_what_is_displayed_never_what_is_counted() {
         let parked: Vec<&Entry> = app.entries().filter(|e| is_the_park(e)).collect();
         assert_eq!(parked.len(), 1, "backfill {backfill} doubled the line");
         assert_eq!(
-            parked[0].lines(&Theme::none(), false),
+            parked[0].lines(&Theme::none()),
             vec!["11:56:40  implementer  ⊘ parked · quota"],
             "backfill {backfill}"
         );

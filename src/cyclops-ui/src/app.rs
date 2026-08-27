@@ -1541,7 +1541,6 @@ mod tests {
                 to: to.iter().map(|t| t.to_string()).collect(),
                 endpoints: None,
                 subject: "s".into(),
-                body: None,
                 fyi: false,
             },
         }

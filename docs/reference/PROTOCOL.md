@@ -1031,7 +1031,7 @@ name prefix, so these are the strings to filter on.
 
 | Event | What happened | `seq` |
 |---|---|---|
-| `msg` | a message entered the legacy direct-delivery session record | yes |
+| `msg` | body-free metadata says a message entered the legacy direct-delivery session record | yes |
 | `messages.changed` | the durable workspace messaging projection changed | yes |
 | `messages.route_changed` | live mailbox route availability changed | no |
 | `delivery-state` | one legacy direct delivery moved to a new state | yes |
@@ -1088,10 +1088,12 @@ being shown.
 Real compatibility lines from two isolated rigs follow. The `msg`, `gate`, and
 `delivery-state` events belong to legacy direct delivery. Standard messaging
 invalidates clients with `messages.changed` and never puts a message body on
-the event stream.
+the event stream. The legacy `msg` push is body-free too; authorized message
+content is read through `msg.history` or `msg.thread`, never from a resting
+stream row.
 
 ```
-{"event":"msg","data":{"body":"y","from":"admin","fyi":false,"id":"m-ebefe2","reply_to":null,"subject":"second","to":["reviewer"]},"seq":22}
+{"event":"msg","data":{"from":"admin","fyi":false,"id":"m-ebefe2","reply_to":null,"subject":"second","to":["reviewer"]},"seq":22}
 {"event":"gate","data":{"action":"proceed","cause":null,"id":"m-ebefe2","rule":"title_idle","to":"reviewer"},"seq":24}
 {"event":"delivery-state","data":{"attempts":1,"cause":"hook_ack","from":"submitted","id":"m-ebefe2","note":null,"to":"reviewer","to_state":"delivered_verified","verified_by":"hook"},"seq":28}
 {"event":"pane-removed","data":{"pane_id":"%1","session":"main","ts":1785744861218}}
