@@ -699,19 +699,19 @@ mod tests {
             .expect("live pane binding")
     }
 
-    /// Gate 2: a missing or mismatched lifecycle end holds and emits
-    /// EXACTLY ONE bounded diagnostic.
+    /// The F1 setup diagnostic fires at most once per binding.
     ///
-    /// The bound is not a timer or a counter, it is set membership keyed on
-    /// the exact binding, so the three ways this could go wrong are all one
-    /// question: does a second reservation for the same binding succeed.
+    /// This is the ZERO-HOOK-EDGE case, not a missing lifecycle end: it
+    /// reports "hooks configured but never seen", and any edge at all,
+    /// including a start, suppresses it. Named precisely because the two
+    /// are easy to confuse and only one of them is this.
     ///
-    /// The two suppressions matter as much as the count. An end edge that
-    /// DID arrive is not a missing end, and a pane whose occupant was
-    /// replaced is not the pane the delivery was about, so neither may
-    /// spend the one diagnostic.
+    /// The bound is not a timer or a counter, it is set membership keyed
+    /// on the exact binding, so the three ways this could go wrong reduce
+    /// to one question: can a second reservation for the same binding
+    /// succeed. The two suppressions carry as much weight as the count.
     #[test]
-    fn a_missing_lifecycle_end_notifies_exactly_once() {
+    fn the_f1_setup_diagnostic_reserves_at_most_once_per_binding() {
         let liveness = HookLiveness::new();
         let route = pane("%1");
         open(&liveness, &route);
@@ -719,21 +719,21 @@ mod tests {
 
         assert!(
             liveness.reserve_f1_if_no_edges(&bound),
-            "the first missing end must be reportable"
+            "the first zero-edge binding must be reportable"
         );
         assert!(
             !liveness.reserve_f1_if_no_edges(&bound),
             "the same binding reported a second diagnostic"
         );
 
-        // An end edge that arrived is not a missing end.
+        // Any edge at all, start or end, means hooks were seen.
         let with_edges = pane("%2");
         open(&liveness, &with_edges);
         let edged = binding(&liveness, &with_edges, proc(200), "test");
         let _ = liveness.bind_diagnostic(&with_edges, "Stop", 1_000, proc(200), "test");
         assert!(
             !liveness.reserve_f1_if_no_edges(&edged),
-            "a pane that produced a hook edge is not a missing end"
+            "a pane that produced any hook edge is not an unseen-hooks case"
         );
 
         // A replaced occupant is not the pane the delivery was about. The
