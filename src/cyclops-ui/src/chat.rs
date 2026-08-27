@@ -2419,7 +2419,9 @@ mod tests {
         let reg = AvatarRegistry::default();
         let lines = render_chat(
             &queue,
-            ChatRenderContext::new(&reg).with_detail(&detail).at(1_010_000),
+            ChatRenderContext::new(&reg)
+                .with_detail(&detail)
+                .at(1_010_000),
             80,
             25,
         );
