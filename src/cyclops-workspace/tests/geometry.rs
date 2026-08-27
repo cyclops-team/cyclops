@@ -206,7 +206,7 @@ async fn successor_owner_recomputes_full_canvas_and_uncrushes_compressed_panes()
     // Split vertically so we have two stacked panes in @0
     rig.server.run_ok(&["split-window", "-v", "-t", "geo3"]);
 
-    // Owner A attaches, captures prior window size, pins manual, and claims driver
+    // Predecessor Owner A attaches, captures prior window size, pins manual, and claims driver
     let (owner, _n1) = ControlClient::spawn(rig.config("geo3"))
         .await
         .expect("owner attach");
@@ -216,42 +216,49 @@ async fn successor_owner_recomputes_full_canvas_and_uncrushes_compressed_panes()
         .expect("capture");
     owner.pin_window_size_manual("@0").await.expect("pin");
 
-    // Owner A shrinks window height down to 10 rows, crushing the bottom pane to 1 row
-    owner.resize_window("@0", 152, 10).await.expect("shrink");
+    // Owner A sizes window down to 229x20, compressing the bottom pane to 1 row
+    owner
+        .resize_window("@0", 229, 20)
+        .await
+        .expect("owner size");
     rig.server.run_ok(&["resize-pane", "-t", "%1", "-y", "1"]);
-    assert_eq!(rig.window_size("geo3"), (152, 10));
+    assert_eq!(rig.window_size("geo3"), (229, 20));
     assert_eq!(
         rig.pane_heights("geo3"),
-        vec![8, 1],
+        vec![18, 1],
         "bottom pane is compressed down to 1 row"
     );
 
-    // Follower B attaches with a large 271x61 terminal
+    // Follower B attaches with a large 271x61 terminal (declaring full 267x58 canvas)
     let (follower, _n2) = ControlClient::spawn(rig.config("geo3"))
         .await
         .expect("follower attach");
     follower
-        .set_client_size(240, 58)
+        .set_client_size(267, 58)
         .await
         .expect("follower declare");
 
     // Invariant: Follower must NOT resize the shared window while owner is live
     assert_eq!(
         rig.window_size("geo3"),
-        (152, 10),
+        (229, 20),
         "follower must never resize the shared window while owner is live"
     );
-    assert_eq!(rig.pane_heights("geo3"), vec![8, 1]);
+    assert_eq!(rig.pane_heights("geo3"), vec![18, 1]);
 
     // Owner A drops / exits
     owner.shutdown().await;
 
-    // Follower B adopts @0, takes over driver, and resizes window to full 240x58 canvas
+    // Follower B adopts @0, takes over driver, and expands window to full 267x58 canvas
     follower
-        .resize_window("@0", 240, 58)
+        .resize_window("@0", 267, 58)
         .await
         .expect("successor resize");
-    assert_eq!(rig.window_size("geo3"), (240, 58));
+    assert_eq!(
+        rig.window_size("geo3"),
+        (267, 58),
+        "successor owner must consume its own full 271x61 client dimensions rather than stopping at 229x58"
+    );
 
     // When successor recomputes layout, the compressed pane (without deliberate minimization provenance)
     // must NOT remain trapped at 1 row!
