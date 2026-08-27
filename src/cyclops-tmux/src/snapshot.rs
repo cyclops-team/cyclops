@@ -142,18 +142,21 @@ pub struct WorkspaceSnapshot {
     pub sessions: Vec<SnapshotSession>,
 }
 
-/// `list-panes -a` format. Every field except the last is a tmux-generated
-/// id, index, flag, or layout string — none of those can contain a tab.
-/// `window_name` is deliberately last: `splitn` with the exact field count
-/// hands back everything past the final known-safe tab as one piece, so a
-/// tab embedded in a window name (a documented edge case, same as
-/// `window_name` in `crate::session::list_windows` and `crate::watcher`'s
-/// `PANE_FORMAT`) lands inside the name instead of corrupting the fields
-/// after it — there are none after it.
-const SNAPSHOT_PANE_FORMAT: &str = "#{session_id}\t#{session_attached}\t#{window_id}\t#{window_index}\t#{window_active}\t#{window_zoomed_flag}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_width}\t#{pane_height}\t#{@cyclops_pane_minimized_v1}\t#{window_layout}\t#{window_name}";
+/// `list-panes -a` format for structural layout. Every field except the last
+/// is a tmux-generated id, index, flag, or layout string. None of those can
+/// contain a tab. `window_name` is deliberately last: `splitn` with the exact
+/// field count hands back everything past the final known-safe tab as one
+/// piece, so a tab embedded in a window name lands inside the name instead of
+/// corrupting fields.
+const SNAPSHOT_PANE_FORMAT: &str = "#{session_id}\t#{session_attached}\t#{window_id}\t#{window_index}\t#{window_active}\t#{window_zoomed_flag}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_width}\t#{pane_height}\t#{window_layout}\t#{window_name}";
 
 /// Number of tab-separated fields in [`SNAPSHOT_PANE_FORMAT`].
-const SNAPSHOT_PANE_FIELDS: usize = 14;
+const SNAPSHOT_PANE_FIELDS: usize = 13;
+
+/// `list-panes -a` format for pane options. `pane_id` is first (contains no tabs),
+/// and `@cyclops_pane_minimized_v1` is last, so arbitrary option values containing
+/// literal tabs swallow into the option payload without shifting structural fields.
+const SNAPSHOT_PANE_OPTIONS_FORMAT: &str = "#{pane_id}\t#{@cyclops_pane_minimized_v1}";
 
 /// `list-sessions` format for names only. `session_id` and `session_attached`
 /// already travel on every `SNAPSHOT_PANE_FORMAT` line; this command exists
@@ -163,10 +166,8 @@ const SNAPSHOT_PANE_FIELDS: usize = 14;
 const SNAPSHOT_SESSION_NAME_FORMAT: &str = "#{session_id}\t#{session_name}";
 
 impl ControlClient {
-    /// Build the whole server's session/window/pane tree with two formatted
-    /// commands over this already-connected client — see the module doc for
-    /// why two, and what was verified about tmux's session/window/pane
-    /// invariant to make one of them sufficient for structure.
+    /// Build the whole server's session/window/pane tree with formatted
+    /// commands over this already-connected client.
     ///
     /// Neither command's cost scales with window or pane count: each is one
     /// control-mode round trip regardless of how many lines it returns.
@@ -177,6 +178,12 @@ impl ControlClient {
                 quote_arg(SNAPSHOT_PANE_FORMAT)
             ))
             .await?;
+        let option_lines = self
+            .command(&format!(
+                "list-panes -a -F {}",
+                quote_arg(SNAPSHOT_PANE_OPTIONS_FORMAT)
+            ))
+            .await?;
         let session_lines = self
             .command(&format!(
                 "list-sessions -F {}",
@@ -184,6 +191,7 @@ impl ControlClient {
             ))
             .await?;
 
+        let options_by_pane = parse_pane_options(&option_lines);
         let (session_order, session_names) = parse_session_names(&session_lines)?;
 
         // Fold every pane line into its window, and every window into its
@@ -213,13 +221,17 @@ impl ControlClient {
                     zoomed: raw.window_zoomed,
                     panes: Vec::new(),
                 });
+            let minimization = options_by_pane
+                .get(&raw.pane_id)
+                .cloned()
+                .unwrap_or(PaneMinimizationProvenance::None);
             window.panes.push(SnapshotPane {
                 id: raw.pane_id,
                 index: raw.pane_index,
                 active: raw.pane_active,
                 width: raw.pane_width,
                 height: raw.pane_height,
-                minimization: raw.pane_minimized,
+                minimization,
             });
         }
 
@@ -273,9 +285,23 @@ struct RawPaneLine {
     pane_active: bool,
     pane_width: u32,
     pane_height: u32,
-    pane_minimized: PaneMinimizationProvenance,
     window_layout: String,
     window_name: String,
+}
+
+fn parse_pane_options(lines: &[String]) -> HashMap<String, PaneMinimizationProvenance> {
+    let mut map = HashMap::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((pane_id, opt)) = line.split_once('\t') {
+            map.insert(pane_id.to_string(), PaneMinimizationProvenance::parse(opt));
+        } else {
+            map.insert(line.clone(), PaneMinimizationProvenance::None);
+        }
+    }
+    map
 }
 
 fn parse_pane_line(line: &str) -> Result<RawPaneLine, TmuxError> {
@@ -296,7 +322,6 @@ fn parse_pane_line(line: &str) -> Result<RawPaneLine, TmuxError> {
     let pane_active = next()? == "1";
     let pane_width = parse_u32(next()?, "pane_width")?;
     let pane_height = parse_u32(next()?, "pane_height")?;
-    let pane_minimized = PaneMinimizationProvenance::parse(next()?);
     let window_layout = next()?.to_string();
     let window_name = next()?.to_string();
     Ok(RawPaneLine {
@@ -311,7 +336,6 @@ fn parse_pane_line(line: &str) -> Result<RawPaneLine, TmuxError> {
         pane_active,
         pane_width,
         pane_height,
-        pane_minimized,
         window_layout,
         window_name,
     })
@@ -355,7 +379,7 @@ mod tests {
 
     #[test]
     fn pane_line_parses_and_keeps_a_tab_inside_the_trailing_window_name() {
-        let line = "$0\t1\t@1\t2\t1\t0\t%3\t1\t1\t80\t24\t\t8205,80x24,0,0{...}\tname\twith\ttabs";
+        let line = "$0\t1\t@1\t2\t1\t0\t%3\t1\t1\t80\t24\t8205,80x24,0,0{...}\tname\twith\ttabs";
         let raw = parse_pane_line(line).expect("parses");
         assert_eq!(raw.session_id, "$0");
         assert!(raw.session_attached);
@@ -368,29 +392,36 @@ mod tests {
         assert!(raw.pane_active);
         assert_eq!(raw.pane_width, 80);
         assert_eq!(raw.pane_height, 24);
-        assert_eq!(raw.pane_minimized, PaneMinimizationProvenance::None);
         assert_eq!(raw.window_layout, "8205,80x24,0,0{...}");
-        // The trailing field swallows every tab after the 13th: a window
+        // The trailing field swallows every tab after the 12th: a window
         // name that happens to contain literal tabs still parses whole
         // instead of corrupting fields that do not exist after it.
         assert_eq!(raw.window_name, "name\twith\ttabs");
+    }
 
-        let line_min = "$0\t1\t@1\t2\t1\t0\t%3\t1\t1\t80\t24\tv1:23\t8205,80x24,0,0{...}\tname";
-        let raw_min = parse_pane_line(line_min).expect("parses with minimized");
+    #[test]
+    fn pane_options_parse_and_keeps_tabs_inside_malformed_provenance() {
+        let lines = vec![
+            "%1\tv1:23".to_string(),
+            "%2\tcorrupted\twith\ttabs".to_string(),
+            "%3\t".to_string(),
+            "%4".to_string(),
+        ];
+        let map = parse_pane_options(&lines);
         assert_eq!(
-            raw_min.pane_minimized,
-            PaneMinimizationProvenance::Minimized {
+            map.get("%1"),
+            Some(&PaneMinimizationProvenance::Minimized {
                 original_height: 23
-            }
+            })
         );
-
-        let line_malformed =
-            "$0\t1\t@1\t2\t1\t0\t%3\t1\t1\t80\t24\tcorrupted\t8205,80x24,0,0{...}\tname";
-        let raw_malformed = parse_pane_line(line_malformed).expect("parses with malformed");
         assert_eq!(
-            raw_malformed.pane_minimized,
-            PaneMinimizationProvenance::Malformed("corrupted".to_string())
+            map.get("%2"),
+            Some(&PaneMinimizationProvenance::Malformed(
+                "corrupted\twith\ttabs".to_string()
+            ))
         );
+        assert_eq!(map.get("%3"), Some(&PaneMinimizationProvenance::None));
+        assert_eq!(map.get("%4"), Some(&PaneMinimizationProvenance::None));
     }
 
     #[test]

@@ -1204,15 +1204,15 @@ pub async fn run_async() -> i32 {
     // size is written, so the first thing this process does to a session is
     // reversible.
     let mut sizing = WindowSizing::default();
-    let following_at_boot = adopt_windows(
+    let adopted = adopt_windows(
         &mut sizing,
         &client,
         &model.session.session,
         &model.session.tabs,
         &home,
     )
-    .await
-    .newly_following;
+    .await;
+    let following_at_boot = adopted.newly_following;
 
     // Declare terminal cells only after the split topology is known. tmux
     // gets pane content cells; two-cell separator bands remain UI chrome.
@@ -1222,10 +1222,39 @@ pub async fn run_async() -> i32 {
     // sidebar wide and painted another, and the first reconcile would
     // fight the declaration. `chrome_for` is the one geometry both read.
     model.sidebar_visible = prefs.sidebar_visible;
-    model.messages_visible = prefs.messages_visible;
     let declared_client_size =
         declare_initial_client_size(term_size, &model, &prefs, &sizing, &client, &home).await;
     if declared_client_size.is_some() {
+        if adopted.authority_transferred || adopted.took_a_window {
+            if let Ok(identity) = client.client_identity().await {
+                let my_marker = identity.marker();
+                if let Ok(snapshot) = client.workspace_snapshot().await {
+                    for (sess, owned) in &sizing.owned {
+                        if let Ok(Some(current_driver)) = client.window_driver(sess).await {
+                            if current_driver == my_marker {
+                                if let Some(snap_sess) =
+                                    snapshot.sessions.iter().find(|s| &s.name == sess)
+                                {
+                                    for win_id in &owned.pinned {
+                                        if let Some(snap_win) =
+                                            snap_sess.windows.iter().find(|w| &w.id == win_id)
+                                        {
+                                            for pane in &snap_win.panes {
+                                                if let cyclops_tmux::PaneMinimizationProvenance::Minimized { .. } = pane.minimization {
+                                                    if pane.height > crate::render::MINIMIZED_ROWS as u32 {
+                                                        let _ = client.resize_pane_height(&pane.id, crate::render::MINIMIZED_ROWS).await;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // The resize can rebalance leaf dimensions. Re-list before
         // hydration rather than replaying captures into stale slots.
         if let Ok(resized) = fetch_workspace_model(&client, &session).await {
@@ -2836,6 +2865,12 @@ impl WindowSizing {
     fn owns(&self, session: &str) -> bool {
         self.owned.contains_key(session)
     }
+
+    pub(crate) fn has_window_authority(&self, session: &str, window_id: &str) -> bool {
+        self.owned
+            .get(session)
+            .is_some_and(|o| o.pinned.contains(window_id))
+    }
 }
 
 /// This connection's identity, read once and remembered.
@@ -3212,53 +3247,91 @@ async fn resize_client(app: &mut App, client: &ControlClient) {
 }
 
 /// Reconcile pane geometry upon owner authority takeover:
-/// 1. Panes with deliberate minimization provenance (`Minimized { original_height }`)
-///    must remain collapsed at 1 row after tmux automatic reflow.
-/// 2. Panes that were accidentally crushed (height <= 1 row and `None` provenance)
-///    are uncrushed to a viable height (e.g. 5 rows or fair share) because the new owner has room.
-/// 3. Panes with malformed provenance (`Malformed(bad)`) fail closed: do NOT touch or uncrush,
-///    log visible warning.
-async fn reconcile_workspace_geometry_on_takeover(
-    app: &App,
-    client: &ControlClient,
-    session: &str,
-) {
-    // Exact sizing authority guard: only the authoritative owner of this session may size panes.
-    if !app.sizing.owned.contains_key(session) {
+/// 1. Reconciles every exact successfully resized window in every owned session.
+/// 2. For each window in owned[session].pinned, revalidates live driver marker before mutating.
+/// 3. Panes with deliberate minimization provenance (`Minimized { original_height }`)
+///    must remain collapsed at 1 row after tmux automatic reflow on window resize.
+/// 4. Panes with `None` provenance are NOT modified (manual resize is preserved; we do not
+///    auto-uncrush unknown intent).
+/// 5. Panes with malformed provenance (`Malformed(bad)`) fail closed: surface visible notice,
+///    log error, leave option evidence untouched.
+/// 6. Blocked, unpinned, or follower windows are never touched.
+async fn reconcile_workspace_geometry_on_takeover(app: &mut App, client: &ControlClient) {
+    let Ok(identity) = client.client_identity().await else {
+        return;
+    };
+    let my_marker = identity.marker();
+
+    let owned_sessions: Vec<(String, Vec<String>)> = app
+        .sizing
+        .owned
+        .iter()
+        .map(|(sess, owned)| (sess.clone(), owned.pinned.iter().cloned().collect()))
+        .collect();
+
+    if owned_sessions.is_empty() {
         return;
     }
-    let tab = app.model.active_tab();
-    let slots = crate::model::visible_pane_dims(tab);
-    for (pane_id, _cols, rows) in slots {
-        let prov = tab
-            .minimization_provenance
-            .get(&pane_id)
-            .cloned()
-            .unwrap_or(cyclops_tmux::PaneMinimizationProvenance::None);
 
-        match prov {
-            cyclops_tmux::PaneMinimizationProvenance::Minimized { .. } => {
-                // If tmux automatic reflow expanded a deliberately minimized pane, re-collapse it to 1 row.
-                if rows > crate::render::MINIMIZED_ROWS {
-                    let _ = client
-                        .resize_pane_height(&pane_id, crate::render::MINIMIZED_ROWS)
-                        .await;
+    let Ok(snapshot) = client.workspace_snapshot().await else {
+        return;
+    };
+
+    for (session, pinned_windows) in owned_sessions {
+        let Ok(Some(current_driver)) = client.window_driver(&session).await else {
+            continue;
+        };
+        if current_driver != my_marker {
+            continue;
+        }
+
+        let Some(snap_session) = snapshot.sessions.iter().find(|s| s.name == session) else {
+            continue;
+        };
+
+        for window_id in pinned_windows {
+            let Some(snap_window) = snap_session.windows.iter().find(|w| w.id == window_id) else {
+                continue;
+            };
+
+            for pane in &snap_window.panes {
+                match &pane.minimization {
+                    cyclops_tmux::PaneMinimizationProvenance::Minimized { .. } => {
+                        if pane.height > crate::render::MINIMIZED_ROWS as u32 {
+                            if let Err(e) = client
+                                .resize_pane_height(&pane.id, crate::render::MINIMIZED_ROWS)
+                                .await
+                            {
+                                log_err(
+                                    &app.home,
+                                    &format!(
+                                        "failed to re-collapse minimized pane {}: {e}",
+                                        pane.id
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    cyclops_tmux::PaneMinimizationProvenance::Malformed(bad) => {
+                        log_err(
+                            &app.home,
+                            &format!(
+                                "{}: malformed minimization provenance ({bad}), refusing recovery",
+                                pane.id
+                            ),
+                        );
+                        app.notice.show(
+                            format!(
+                                "warning: pane {} has malformed minimization record",
+                                pane.id
+                            ),
+                            tokio::time::Instant::now(),
+                        );
+                    }
+                    cyclops_tmux::PaneMinimizationProvenance::None => {
+                        // Fail closed on unknown intent: do not uncrush without positive provenance
+                    }
                 }
-            }
-            cyclops_tmux::PaneMinimizationProvenance::None => {
-                // Accidental compression: uncrush if collapsed to <= 1 row without provenance
-                if rows <= crate::render::MINIMIZED_ROWS {
-                    let _ = client.resize_pane_height(&pane_id, 5).await;
-                }
-            }
-            cyclops_tmux::PaneMinimizationProvenance::Malformed(bad) => {
-                // Fail closed: retain corrupted evidence, do not uncrush, do not delete
-                log_err(
-                    &app.home,
-                    &format!(
-                        "{pane_id}: malformed minimization provenance ({bad}), refusing recovery"
-                    ),
-                );
             }
         }
     }
@@ -5895,7 +5968,28 @@ fn resync_daemon_state(app: &mut App) {
 }
 
 async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_tmux::TmuxError> {
+    // New windows arrive through external events; adopt and pin them first.
     let session = app.model.session.session.clone();
+    let tabs = app.model.session.tabs.clone();
+    let adopted = adopt_windows(&mut app.sizing, client, &session, &tabs, &app.home).await;
+    if adopted.newly_following {
+        app.notice
+            .show(copy::SIZING_FOLLOWER.to_string(), Instant::now());
+    }
+    if adopted.authority_transferred || adopted.took_a_window {
+        // A window pinned just now is holding whatever size it had before
+        // this workspace touched it, and the canvas may not have moved, so
+        // the unchanged-canvas guard in `resize_client` would skip it and
+        // leave a new tab laid out at the wrong size.
+        app.declared_client_size = None;
+    }
+    resize_client(app, client).await;
+    if adopted.authority_transferred || adopted.took_a_window {
+        reconcile_workspace_geometry_on_takeover(app, client).await;
+    }
+
+    // Fetch FRESH model after resize and takeover recovery so dimensions and
+    // provenance are up-to-date with live tmux state before hydration.
     let mut model = fetch_workspace_model(client, &session).await?;
     apply_workspace_order(&mut model, &app.prefs.workspace_order);
     install_reconciled_model(
@@ -5925,27 +6019,6 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
         Err(error) => log_err(&app.home, &format!("decoration reconcile failed: {error}")),
     }
     app.persist_active();
-    // New windows arrive through this snapshot (new tab, session switch,
-    // external new-window); pin them before sizing so no displayed window
-    // ever lays out under another client's authority.
-    let session = app.model.session.session.clone();
-    let tabs = app.model.session.tabs.clone();
-    let adopted = adopt_windows(&mut app.sizing, client, &session, &tabs, &app.home).await;
-    if adopted.newly_following {
-        app.notice
-            .show(copy::SIZING_FOLLOWER.to_string(), Instant::now());
-    }
-    if adopted.authority_transferred || adopted.took_a_window {
-        // A window pinned just now is holding whatever size it had before
-        // this workspace touched it, and the canvas may not have moved, so
-        // the unchanged-canvas guard in `resize_client` would skip it and
-        // leave a new tab laid out at the wrong size.
-        app.declared_client_size = None;
-    }
-    resize_client(app, client).await;
-    if adopted.authority_transferred || adopted.took_a_window {
-        reconcile_workspace_geometry_on_takeover(app, client, &session).await;
-    }
     // Forced only when continuity was actually lost: a control-mode
     // reconnect missed %output while the layout stood still, so the size
     // check would leave same-sized panes showing stale content and stale
@@ -11811,6 +11884,13 @@ mod tests {
             messages_visible: false,
         };
         let mut app = test_app(model, home);
+        app.sizing.owned.insert(
+            "s".into(),
+            OwnedSession {
+                pinned: std::collections::BTreeSet::from(["@0".into()]),
+                blocked: std::collections::BTreeSet::new(),
+            },
+        );
         app.decoration = DecorationSnapshot {
             online: true,
             ..Default::default()

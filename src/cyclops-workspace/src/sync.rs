@@ -430,8 +430,8 @@ mod tests {
             "command count must not grow with window count, got {deltas:?} for W=1,4,8"
         );
         assert_eq!(
-            deltas[0], 2,
-            "fetch_workspace_model must cost exactly workspace_snapshot's two commands"
+            deltas[0], 3,
+            "fetch_workspace_model must cost exactly workspace_snapshot's three commands"
         );
 
         client.shutdown().await;

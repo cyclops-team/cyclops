@@ -191,21 +191,11 @@ async fn no_other_client_can_move_an_owned_window() {
     workspace.shutdown().await;
 }
 
-/// When a small owner (e.g. 152x45) collapses a stacked pane to 1 row due
-/// to window resize compression (without deliberate user minimization),
-/// followers must never resize the shared window. When the owner exits,
-/// the successor owner (e.g. 271x61) takes over sizing authority, recomputes
-/// the canvas, and uncrushes the compressed pane so no active pane is
-/// accidentally trapped at 1 row.
-/// When a small owner (e.g. 152x45) collapses a stacked pane to 1 row due
-/// to window resize compression (without deliberate user minimization),
-/// followers must never resize the shared window. When the owner exits,
-/// the successor owner (e.g. 271x61) takes over sizing authority, recomputes
-/// the canvas, and uncrushes the compressed pane so no active pane is
-/// accidentally trapped at 1 row.
+/// An unproven 1-row pane (with `None` provenance, e.g. manual operator `tmux resize-pane -y 1`)
+/// fails closed: the successor owner will NOT blindly guess or auto-uncrush unknown intent.
 #[tokio::test]
-async fn successor_owner_recomputes_full_canvas_and_uncrushes_compressed_panes() {
-    let Some(rig) = Rig::new("geometry-uncrush") else {
+async fn unknown_intent_one_row_pane_fails_closed_and_refuses_auto_uncrush() {
+    let Some(rig) = Rig::new("geometry-unknown-refusal") else {
         return;
     };
     rig.session("geo3");
@@ -222,7 +212,7 @@ async fn successor_owner_recomputes_full_canvas_and_uncrushes_compressed_panes()
         .expect("capture");
     owner.pin_window_size_manual("@0").await.expect("pin");
 
-    // Owner A sizes window down to 229x20, compressing the bottom pane to 1 row
+    // Owner A sizes window down to 229x20, compressing the bottom pane to 1 row manually
     owner
         .resize_window("@0", 229, 20)
         .await
@@ -255,7 +245,7 @@ async fn successor_owner_recomputes_full_canvas_and_uncrushes_compressed_panes()
     // Owner A drops / exits
     owner.shutdown().await;
 
-    // Follower B adopts @0, takes over driver, and expands window to full 267x58 canvas
+    // Follower B adopts @0 and expands window to full 267x58 canvas
     follower
         .resize_window("@0", 267, 58)
         .await
@@ -263,15 +253,15 @@ async fn successor_owner_recomputes_full_canvas_and_uncrushes_compressed_panes()
     assert_eq!(
         rig.window_size("geo3"),
         (267, 58),
-        "successor owner must consume its own full 271x61 client dimensions rather than stopping at 229x58"
+        "successor owner must consume its own full client dimensions"
     );
 
-    // Uncrush compressed pane on authority transfer
-    follower.resize_pane_height("%1", 5).await.expect("uncrush");
-    let heights = rig.pane_heights("geo3");
-    assert!(
-        heights[1] >= 5,
-        "compressed stacked pane must be uncrushed upon authority transfer, got heights: {heights:?}"
+    // With None provenance, successor must NOT blindly uncrush or guess height.
+    let snap = follower.workspace_snapshot().await.expect("snapshot");
+    assert_eq!(
+        snap.sessions[0].windows[0].panes[1].minimization,
+        cyclops_tmux::PaneMinimizationProvenance::None,
+        "unproven 1-row pane has None provenance"
     );
 
     follower.shutdown().await;
@@ -380,7 +370,7 @@ async fn deliberately_minimized_pane_remains_collapsed_and_restores_exact_captur
 }
 
 /// Malformed minimization provenance fails closed: it is visible in the snapshot,
-/// is never uncrushed or deleted, and restore is refused without guessing.
+/// is never modified or deleted, and restore is refused without guessing.
 #[tokio::test]
 async fn malformed_minimization_provenance_fails_closed_and_refuses_modification() {
     let Some(rig) = Rig::new("geometry-malformed-prov") else {
@@ -393,24 +383,24 @@ async fn malformed_minimization_provenance_fails_closed_and_refuses_modification
         .await
         .expect("attach");
 
-    // Inject malformed provenance value into pane option
+    // Inject malformed provenance value with embedded tab into pane option
     client
         .set_pane_option(
             "%1",
             cyclops_tmux::PANE_MINIMIZED_OPTION_V1,
-            "corrupted_non_versioned",
+            "corrupted\twith\ttabs",
         )
         .await
         .expect("set option");
     client.resize_pane_height("%1", 1).await.expect("shrink");
 
-    // Snapshot verifies Malformed provenance is reported
+    // Snapshot verifies Malformed provenance is reported without field shifting
     let snapshot = client.workspace_snapshot().await.expect("snapshot");
     let win = &snapshot.sessions[0].windows[0];
     assert_eq!(
         win.panes[1].minimization,
-        cyclops_tmux::PaneMinimizationProvenance::Malformed("corrupted_non_versioned".to_string()),
-        "malformed option must be preserved as Malformed provenance"
+        cyclops_tmux::PaneMinimizationProvenance::Malformed("corrupted\twith\ttabs".to_string()),
+        "malformed option with tabs must be preserved as Malformed provenance"
     );
 
     // Fail closed: evidence must NOT be deleted or guessed
@@ -423,7 +413,7 @@ async fn malformed_minimization_provenance_fails_closed_and_refuses_modification
     ]);
     let prov_text = String::from_utf8_lossy(&out.stdout);
     assert!(
-        prov_text.contains("corrupted_non_versioned"),
+        prov_text.contains("corrupted") && prov_text.contains("tabs"),
         "corrupted evidence must be retained intact: {prov_text}"
     );
 

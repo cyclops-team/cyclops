@@ -209,8 +209,8 @@ async fn snapshot_command_count_does_not_scale_with_window_count() {
          regardless of window count, got {deltas:?} for W=1,4,8"
     );
     assert_eq!(
-        deltas[0], 2,
-        "workspace_snapshot is documented as exactly two commands (list-panes -a, list-sessions)"
+        deltas[0], 3,
+        "workspace_snapshot issues a fixed three commands (list-panes -a structure, list-panes -a options, list-sessions)"
     );
     println!("workspace_snapshot commands issued per call for W=1,4,8: {deltas:?}");
 

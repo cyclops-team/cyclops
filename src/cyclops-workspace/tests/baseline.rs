@@ -352,8 +352,8 @@ async fn baseline_reconciliation_workspace_snapshot() {
         assert_eq!(found.windows.len(), w, "expected {w} windows");
         assert_eq!(
             after - before,
-            2,
-            "workspace_snapshot must cost exactly two commands regardless of window count"
+            3,
+            "workspace_snapshot must cost a fixed three commands regardless of window count"
         );
 
         println!(

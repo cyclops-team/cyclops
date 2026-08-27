@@ -115,10 +115,24 @@ pub(super) async fn execute(
             direction,
             cells,
         } => {
-            // No reconcile: tmux's own `%layout-change` notification updates
-            // the model, and asking for a full reconcile on every coalesced
-            // drag step would make dragging feel like it lags the mouse.
-            client.resize_pane(&pane_id, direction, cells).await?;
+            let session = app.model.session.session.clone();
+            let window_id = app.model.active_tab().window_id.clone();
+            if app.sizing.following.contains(&session) {
+                return Ok(Outcome::default());
+            }
+            if app.sizing.owns(&session) && !app.sizing.has_window_authority(&session, &window_id) {
+                return Ok(Outcome::default());
+            }
+            if let Ok(id) = client.client_identity().await {
+                if let Ok(Some(driver)) = client.window_driver(&session).await {
+                    if driver != id.marker() {
+                        return Ok(Outcome::default());
+                    }
+                }
+            }
+            if let Err(e) = client.resize_pane(&pane_id, direction, cells).await {
+                log_err(&app.home, &format!("resize_pane failed on {pane_id}: {e}"));
+            }
             Ok(Outcome::default())
         }
         Action::ScrollPane { pane_id, lines, at } => {
@@ -341,6 +355,33 @@ pub(super) async fn execute(
             })
         }
         Action::ToggleMinimizePane { pane_id } => {
+            let session = app.model.session.session.clone();
+            let window_id = app.model.active_tab().window_id.clone();
+            if !app.sizing.has_window_authority(&session, &window_id) {
+                if app.sizing.following.contains(&session) {
+                    app.notice.show(
+                        crate::app::copy::SIZING_FOLLOWER.to_string(),
+                        tokio::time::Instant::now(),
+                    );
+                } else {
+                    app.notice.show(
+                        format!("refused: window {window_id} is not sizing-owned"),
+                        tokio::time::Instant::now(),
+                    );
+                }
+                return Ok(Outcome::default());
+            }
+
+            let id = client.client_identity().await?;
+            let current_driver = client.window_driver(&session).await.unwrap_or(None);
+            if current_driver.as_deref() != Some(&id.marker()) {
+                app.notice.show(
+                    "refused: lost sizing driver authority".to_string(),
+                    tokio::time::Instant::now(),
+                );
+                return Ok(Outcome::default());
+            }
+
             let prov = app
                 .model
                 .active_tab()
@@ -364,10 +405,23 @@ pub(super) async fn execute(
                     );
                 }
                 cyclops_tmux::PaneMinimizationProvenance::Minimized { original_height } => {
-                    client.resize_pane_height(&pane_id, original_height).await?;
-                    client
+                    if let Err(e) = client.resize_pane_height(&pane_id, original_height).await {
+                        log_err(&app.home, &format!("failed to restore pane {pane_id}: {e}"));
+                        app.notice.show(
+                            format!("failed to restore pane {pane_id}: {e}"),
+                            tokio::time::Instant::now(),
+                        );
+                        return Ok(Outcome::default());
+                    }
+                    if let Err(e) = client
                         .unset_pane_option(&pane_id, cyclops_tmux::PANE_MINIMIZED_OPTION_V1)
-                        .await?;
+                        .await
+                    {
+                        log_err(
+                            &app.home,
+                            &format!("failed to clear minimization option on {pane_id}: {e}"),
+                        );
+                    }
                     app.minimized.remove(&pane_id);
                 }
                 cyclops_tmux::PaneMinimizationProvenance::None => {
@@ -383,9 +437,23 @@ pub(super) async fn execute(
                                 &format!("v1:{was}"),
                             )
                             .await?;
-                        client
+                        if let Err(e) = client
                             .resize_pane_height(&pane_id, crate::render::MINIMIZED_ROWS)
-                            .await?;
+                            .await
+                        {
+                            let _ = client
+                                .unset_pane_option(&pane_id, cyclops_tmux::PANE_MINIMIZED_OPTION_V1)
+                                .await;
+                            log_err(
+                                &app.home,
+                                &format!("failed to minimize pane {pane_id}: {e}"),
+                            );
+                            app.notice.show(
+                                format!("failed to minimize pane {pane_id}: {e}"),
+                                tokio::time::Instant::now(),
+                            );
+                            return Ok(Outcome::default());
+                        }
                         app.minimized.insert(pane_id.clone(), was);
                     }
                 }
