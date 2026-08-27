@@ -760,6 +760,30 @@ impl Engine {
         }
     }
 
+    #[doc(hidden)]
+    pub(crate) fn mailbox_worker_current_for_test(
+        &self,
+        recipient: RecipientKey,
+    ) -> Option<(String, Option<NotificationAttemptId>)> {
+        let workers = self
+            .notification_workers
+            .lock()
+            .expect("notification workers lock");
+        let entry = workers.get(&recipient)?;
+        let state = entry.worker.state.lock().expect("worker state lock");
+        let current = state.current.as_ref()?;
+        let notif_attempt = current.notification.as_ref().map(|n| n.attempt_id());
+        Some((current.msg_id.clone(), notif_attempt))
+    }
+
+    #[doc(hidden)]
+    pub(crate) fn legacy_worker_current_for_test(&self, key: &PaneKey) -> Option<String> {
+        let workers = self.workers.lock().expect("workers lock");
+        let entry = workers.get(key)?;
+        let state = entry.worker.state.lock().expect("worker state lock");
+        state.current.as_ref().map(|c| c.msg_id.clone())
+    }
+
     /// Seed the issued-id set from a ledger so new ids stay unique per
     /// ledger across daemon restarts.
     pub(crate) fn preload_ids(&self, lines: &[LedgerLine]) {
@@ -4385,6 +4409,25 @@ async fn attempt_delivery(
             };
             latch_hold(inner, handle, &proven)?;
             let mut unwritten_hold = UnwrittenHold::new(inner, handle, &proven);
+            let should_panic_attempt = {
+                let current_attempt = handle.notification.as_ref().map(|n| n.attempt_id());
+                let mut guard = inner.fail_pre_record_writing.lock().unwrap();
+                if let Some(target) = *guard {
+                    if current_attempt == Some(target) {
+                        *guard = None;
+                        Some(target)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(target_attempt) = should_panic_attempt {
+                panic!(
+                    "worker exit at synchronous on_write boundary before first durable transition for attempt {target_attempt}"
+                );
+            }
             if let (Some(notification), Some((pane_root, leader, agent))) =
                 (&handle.notification, notification_binding)
             {
@@ -11730,6 +11773,7 @@ composer_trailer_required_prefix = 1
             inject_pause: StdMutex::new(None),
             fail_chrome_restore: AtomicBool::new(false),
             fail_next_final_binding_observation: AtomicBool::new(false),
+            fail_pre_record_writing: StdMutex::new(None),
             workspace_ui: StdMutex::new(crate::workspace_ui::WorkspaceUiState::default()),
             shutdown_request: watch::channel(false).0,
             stop: watch::channel(false).1,

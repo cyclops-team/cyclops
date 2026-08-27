@@ -274,6 +274,8 @@ pub(crate) struct Inner {
     /// Test-only: make the next final pre-write process observation
     /// unavailable after the admitting capture has completed.
     pub(crate) fail_next_final_binding_observation: AtomicBool,
+    /// Test-only: fail at the synchronous on_write boundary before record_writing for a specific attempt.
+    pub(crate) fail_pre_record_writing: StdMutex<Option<NotificationAttemptId>>,
     /// Last-active workspace/tab for the terminal workspace UI.
     pub(crate) workspace_ui: StdMutex<workspace_ui::WorkspaceUiState>,
     /// Self-shutdown request sent only after a successful daemon.shutdown
@@ -1819,6 +1821,12 @@ impl Daemon {
         *self.inner.inject_pause.lock().expect("inject pause lock") = Some(Arc::new(f));
     }
 
+    /// Clear test-only injection pause hook.
+    #[doc(hidden)]
+    pub fn clear_inject_pause(&self) {
+        *self.inner.inject_pause.lock().expect("inject pause lock") = None;
+    }
+
     /// Test-only seam: from here on, the chrome restore behind `--clear`
     /// fails as tmux refusing the command would. Not part of the public API
     /// surface.
@@ -1841,6 +1849,62 @@ impl Daemon {
         self.inner
             .fail_next_final_binding_observation
             .store(true, Ordering::SeqCst);
+    }
+
+    /// Test-only seam: fail the workspace journal append during recovery for one exact attempt.
+    #[doc(hidden)]
+    pub fn fail_notification_recovery_append(&self, attempt_id: NotificationAttemptId) {
+        if let Some(service) = self.inner.mailbox.as_ref() {
+            service.inject_notification_recovery_append_failure(attempt_id);
+        }
+    }
+
+    /// Test seam: inspect exact in-flight job owned by a mailbox notification worker
+    /// under the queue mutex boundary.
+    #[doc(hidden)]
+    pub fn mailbox_worker_current_for_test(
+        &self,
+        recipient_label: &str,
+    ) -> Option<(String, Option<NotificationAttemptId>)> {
+        let service = self.inner.mailbox.as_ref()?;
+        let id = service.identity_for_address(recipient_label).ok()?;
+        self.inner.engine.mailbox_worker_current_for_test(id.key)
+    }
+
+    /// Test seam: inspect exact in-flight job owned by a legacy worker
+    /// under the queue mutex boundary.
+    #[doc(hidden)]
+    pub fn legacy_worker_current_for_test(
+        &self,
+        session_idx: usize,
+        pane_id: &str,
+    ) -> Option<String> {
+        let key = PaneKey::new(session_idx, pane_id);
+        self.inner.engine.legacy_worker_current_for_test(&key)
+    }
+
+    /// Test seam: inspect composer hold and owner for a pane.
+    #[doc(hidden)]
+    pub fn composer_hold_for_test(
+        &self,
+        session_idx: usize,
+        pane_id: &str,
+    ) -> Option<(cyclops_proto::ComposerHold, Option<String>)> {
+        let detections = self.inner.detections.lock().expect("detections lock");
+        let entry = detections.get(&PaneKey::new(session_idx, pane_id))?;
+        Some((entry.hold, entry.hold_owner.clone()))
+    }
+
+    /// Test-only seam: panic at the synchronous on_write boundary before record_writing for the specified attempt.
+    #[doc(hidden)]
+    pub fn fail_pre_record_writing_for_attempt(&self, attempt: NotificationAttemptId) {
+        *self.inner.fail_pre_record_writing.lock().unwrap() = Some(attempt);
+    }
+
+    /// Test-only seam: read the current armed fail_pre_record_writing target attempt.
+    #[doc(hidden)]
+    pub fn fail_pre_record_writing_target_for_test(&self) -> Option<NotificationAttemptId> {
+        *self.inner.fail_pre_record_writing.lock().unwrap()
     }
 
     /// Adopt a pane under a label, or un-adopt it. `target` is a pane id or
@@ -2942,6 +3006,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         inject_pause: StdMutex::new(None),
         fail_chrome_restore: AtomicBool::new(false),
         fail_next_final_binding_observation: AtomicBool::new(false),
+        fail_pre_record_writing: StdMutex::new(None),
         workspace_ui: StdMutex::new(workspace_ui::WorkspaceUiState::default()),
         shutdown_request,
         stop: stop_rx,
@@ -2963,14 +3028,6 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     // the record: it lands in `cyclops ui` and replays out of the ledger.
     // `cyclops status` reads the same fact off the status answer and
     // explains the unknown panes it produces.
-    //
-    // Fyi, not ActionRequired, and the level is load-bearing. A ping is a
-    // POINTER at something in the attention register, and this names
-    // nothing there: no pane is blocked and no delivery is open, because
-    // nothing has been tried yet. An action-required ping naming no item is
-    // admitted to the calm view forever (`cyclops_ui::App::admits`), which
-    // would put "⚠ action required" under a closed eye on every frame until
-    // the daemon is restarted. The calm view forbids that contradiction.
     if manifest_ids.is_empty() {
         let words = no_manifests_warning(inner.manifest_dir.as_deref());
         warn!("{words}");
@@ -2989,7 +3046,6 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     delivery::close_limbo(&inner, &replayed);
     drop(replayed);
 
-    let (listener, socket_cleanup) = bound_socket.into_parts();
     let mut tasks = Vec::new();
     for idx in 0..inner.session_count() {
         tasks.push(tokio::spawn(session_task(
@@ -2998,6 +3054,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
             inner.stop.clone(),
         )));
     }
+    let (listener, socket_cleanup) = bound_socket.into_parts();
     tasks.push(tokio::spawn(server::accept_loop(
         Arc::clone(&inner),
         listener,
@@ -4977,6 +5034,7 @@ mod tests {
             inject_pause: StdMutex::new(None),
             fail_chrome_restore: AtomicBool::new(false),
             fail_next_final_binding_observation: AtomicBool::new(false),
+            fail_pre_record_writing: StdMutex::new(None),
             workspace_ui: StdMutex::new(workspace_ui::WorkspaceUiState::default()),
             shutdown_request: watch::channel(false).0,
             stop: watch::channel(false).1,
