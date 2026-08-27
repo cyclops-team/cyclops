@@ -16,6 +16,54 @@ use cyclops_proto::{
 };
 use serde_json::{json, Value};
 
+/// The escaped Codex composer distinction from the live `/model` incident:
+/// dim text is a ghost suggestion, while bare text is a human draft. The
+/// fixture deliberately returns to a ghost without emitting a turn, which is
+/// enough to prove this must become a durable pre-write block rather than an
+/// in-memory wait.
+const ESC_COMPOSER_MANIFEST: &str = r#"
+[agent]
+id = "fix"
+display_name = "Escaped composer fixture"
+process_names = ["python3", "python", "Python", "cat", "sh", "bash", "dash"]
+
+[[rule]]
+id = "title_working"
+state = "working"
+priority = 1200
+region = "pane_title"
+regex = ['^WORKING']
+
+[[rule]]
+id = "composer_typed_input"
+state = "idle_with_input"
+composer_semantic = "human_input"
+priority = 1050
+region = "bottom_non_empty_lines(6)"
+line_regex_esc = ['^\s*(?:\x1b\[[0-9;]*m)*›(?:\x1b\[[0-9;]*m)*\s+[^\x1b\s]']
+
+[[rule]]
+id = "composer_ghost_suggestion"
+state = "idle"
+composer_semantic = "ghost_suggestion"
+priority = 1040
+region = "bottom_non_empty_lines(6)"
+line_regex_esc = ['^\s*(?:\x1b\[[0-9;]*m)*›(?:\x1b\[[0-9;]*m)*\s+\x1b\[2m']
+
+[[rule]]
+id = "composer_empty_or_ghost"
+state = "idle"
+composer_semantic = "ambiguous"
+priority = 1000
+region = "bottom_non_empty_lines(6)"
+line_regex = ['^\s*›']
+
+[injection]
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+"#;
+
 fn workspace_lines(rig: &Rig) -> Vec<LedgerLine> {
     let workspace = fs::read_dir(rig.home.join("workspaces"))
         .unwrap()
@@ -2333,6 +2381,252 @@ async fn current_command_exec_in_place_reopens_blocked_binding() {
 
     rig.daemon.shutdown().await;
     fs::remove_dir_all(fixture_dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn typed_composer_hold_is_a_durable_prewrite_block_until_a_real_turn() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+
+    let ghost = r#"\033[1m\342\200\272\033[0m \033[2mFind and fix a bug in @filename\033[0m"#;
+    let typed = r#"\033[1m\342\200\272\033[0m fix the rate limiter in gateway.rs"#;
+    let pane_command = format!(
+        "sh -c 'printf \"{ghost}\\n\"; read a; printf \"\\033[2J\\033[H\"; \
+         printf \"{typed}\\n\"; read b; printf \"\\033[2J\\033[H\"; \
+         printf \"{ghost}\\n\"; read c; printf \"\\033[2J\\033[H\"; \
+         printf \"{ghost}\\n\"; exec cat'"
+    );
+    let mut rig = Rig::new(
+        "composer-hold-durable-prewrite",
+        ESC_COMPOSER_MANIFEST,
+        &pane_command,
+        "receipt_block_ms = 300\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    // Human text, not Cyclops input, creates the hold.
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
+    wait_pane_state(&mut rig, "idle_with_input").await;
+
+    let sent = send_workspace_message(
+        &rig,
+        "composer-hold-durable-prewrite",
+        "Held until a real turn",
+        "private body",
+    )
+    .await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        sent["deliveries"][0]["notification_state"], "gating",
+        "{sent}"
+    );
+    assert_eq!(
+        sent["deliveries"][0]["pre_write_cause"], "write_readiness_changed",
+        "the sender receives the durable refusal rather than a generic queue receipt: {sent}"
+    );
+
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::BlockedPreWrite).await;
+    let blocked = notification_transition(&rig, &message_id, NotificationState::BlockedPreWrite)
+        .expect("typed composer hold is persisted");
+    let data = blocked.data.as_ref().expect("blocked transition data");
+    assert_eq!(data["pre_write_cause"], "write_readiness_changed");
+    assert_eq!(
+        data["pre_write_observation"]["write_block"],
+        "composer_hold"
+    );
+    for state in [
+        NotificationState::Writing,
+        NotificationState::Staged,
+        NotificationState::Submitting,
+        NotificationState::Submitted,
+    ] {
+        assert_eq!(notification_state_count(&rig, &message_id, state), 0);
+    }
+    assert!(!pane_history(&rig, &pane).contains("[cyclops"));
+
+    // This fixture matches `bash`/`sh`; a socket client inherits the shell
+    // that starts cargo and therefore has no stable mailbox identity on
+    // every runner. Socket identity is covered separately. This delivery
+    // test uses the same resolved-admin seam as its send and claim setup to
+    // assert the public projection deterministically.
+    let snapshot = json!({
+        "result": serde_json::to_value(
+            rig.daemon
+                .messages_snapshot_for_test("admin", 20)
+                .expect("admin messages snapshot"),
+        )
+        .expect("messages snapshot serializes")
+    });
+    let row = snapshot["result"]["rows"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["message_id"] == message_id))
+        .unwrap_or_else(|| panic!("blocked mailbox row: {snapshot:#}"));
+    assert_eq!(row["needs_action"], true, "{row}");
+    assert_eq!(row["recipients"][0]["fifo_position"], 1, "{row}");
+    assert_eq!(
+        row["recipients"][0]["notification"]["pre_write_block"], "composer_hold",
+        "{row}"
+    );
+    assert_eq!(
+        row["recipients"][0]["can_withdraw_notification"], true,
+        "{row}"
+    );
+
+    let status = rig.ctl.request("status", json!({})).await;
+    let status_row = status["result"]["blocked_notifications"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["message_id"] == message_id))
+        .expect("blocked wake in status");
+    assert_eq!(
+        status_row["recipient"]["notification"]["pre_write_block"],
+        "composer_hold"
+    );
+    assert_eq!(status_row["recipient"]["current_route"]["pane_id"], pane);
+    assert!(
+        status_row["waiting_age_ms"].is_u64(),
+        "blocked wake exposes its durable age: {status_row}"
+    );
+    assert_eq!(status_row["next_action"], "withdraw_notification");
+
+    // Pull remains available while automatic input is held. Claiming this
+    // exact mailbox entry never needs terminal-write proof.
+    rig.daemon
+        .claim_message_for_test("worker", &message_id)
+        .expect("a held message remains claimable");
+    let claimed = json!({
+        "result": serde_json::to_value(
+            rig.daemon
+                .messages_snapshot_for_test("admin", 20)
+                .expect("admin messages snapshot after claim"),
+        )
+        .expect("messages snapshot serializes")
+    });
+    let claimed_row = claimed["result"]["rows"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["message_id"] == message_id))
+        .expect("claimed message remains visible");
+    assert_eq!(claimed_row["recipients"][0]["mailbox"]["status"], "claimed");
+
+    // Withdrawal is exact, pre-write, and leaves the message pullable. It
+    // releases only the FIFO head, so the next message inherits the same
+    // truthful block rather than bypassing the composer hold.
+    let second = send_workspace_message(
+        &rig,
+        "composer-hold-durable-prewrite-second",
+        "Second held message",
+        "second private body",
+    )
+    .await;
+    let second_id = second["msg_id"].as_str().unwrap().to_string();
+    wait_for_notification_state(&mut rig, &second_id, NotificationState::BlockedPreWrite).await;
+    let second_blocked =
+        notification_transition(&rig, &second_id, NotificationState::BlockedPreWrite)
+            .expect("second held wake is persisted");
+    let second_data = second_blocked
+        .data
+        .as_ref()
+        .expect("second blocked transition data");
+    let third = send_workspace_message(
+        &rig,
+        "composer-hold-durable-prewrite-third",
+        "Third held message",
+        "third private body",
+    )
+    .await;
+    let third_id = third["msg_id"].as_str().unwrap().to_string();
+    assert!(notification_attempts(&rig, &third_id).is_empty());
+    let withdrawn = serde_json::to_value(
+        rig.daemon
+            .withdraw_notification_for_test(
+                "admin",
+                serde_json::from_value(row["recipients"][0]["recipient"].clone())
+                    .expect("blocked recipient key"),
+                serde_json::from_value(second_data["attempt_id"].clone())
+                    .expect("blocked attempt id"),
+            )
+            .expect("admin notification withdrawal"),
+    )
+    .expect("withdrawal result serializes");
+    assert_eq!(withdrawn["disposition"], "withdrawn", "{withdrawn}");
+    wait_for_notification_state(&mut rig, &third_id, NotificationState::BlockedPreWrite).await;
+    let after_withdrawal = json!({
+        "result": serde_json::to_value(
+            rig.daemon
+                .messages_snapshot_for_test("admin", 20)
+                .expect("admin messages snapshot after withdrawal"),
+        )
+        .expect("messages snapshot serializes")
+    });
+    let second_row = after_withdrawal["result"]["rows"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|candidate| candidate["message_id"] == second_id)
+        })
+        .expect("withdrawn message remains pullable");
+    assert_eq!(second_row["recipients"][0]["mailbox"]["status"], "pending");
+    assert_eq!(
+        second_row["recipients"][0]["notification"]["operator_withdrawn"],
+        true
+    );
+    assert!(
+        second_row["recipients"][0]["fifo_position"].is_null(),
+        "a wake withdrawn by the operator remains pullable but no longer occupies notification FIFO: {second_row}"
+    );
+    let third_row = after_withdrawal["result"]["rows"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|candidate| candidate["message_id"] == third_id)
+        })
+        .expect("the actionable successor remains visible");
+    assert_eq!(
+        third_row["recipients"][0]["fifo_position"],
+        1,
+        "the scheduler skips a withdrawn wake, so the next actionable notification is first: {third_row}"
+    );
+    let status_after_withdrawal = rig.ctl.request("status", json!({})).await;
+    let third_status = status_after_withdrawal["result"]["blocked_notifications"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|candidate| candidate["message_id"] == third_id)
+        })
+        .expect("the successor's durable pre-write block is visible in status");
+    assert_eq!(
+        third_status["recipient"]["fifo_position"], 1,
+        "status uses the same actionable notification FIFO as Messages: {third_status}"
+    );
+
+    // A ghost redraw alone cannot clear the durable block.
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
+    wait_pane_state(&mut rig, "idle").await;
+    assert_eq!(
+        notification_state_count(&rig, &third_id, NotificationState::Gating),
+        1,
+        "a ghost redraw must not reopen the attempt"
+    );
+
+    // A genuine start and end is the only causal edge that retires the hold.
+    rig.tmux
+        .run_ok(&["select-pane", "-t", &pane, "-T", "WORKING the draft"]);
+    wait_pane_state(&mut rig, "working").await;
+    rig.tmux.run_ok(&["select-pane", "-t", &pane, "-T", "done"]);
+    // A real agent turn also produces output. That output is the causal
+    // route edge which lets the mailbox reconsider its durable block.
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
+    wait_pane_state(&mut rig, "idle").await;
+    wait_for_notification_state(&mut rig, &third_id, NotificationState::Writing).await;
+    assert_eq!(notification_attempts(&rig, &message_id).len(), 1);
+    assert_eq!(notification_attempts(&rig, &second_id).len(), 1);
+    assert_eq!(notification_attempts(&rig, &third_id).len(), 1);
+
+    rig.daemon.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
