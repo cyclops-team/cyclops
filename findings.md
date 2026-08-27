@@ -75,6 +75,7 @@ than a measurement.
 | F66 | The isolated soak detected staged representations and cleared them in 100 trials each for Codex, Claude, and Antigravity; Cursor was unavailable | evidence |
 | F67 | A one-line doorbell must fit the narrow lane because application wrapping is not exact composer evidence | binds |
 | F68 | Codex 0.149.1 colors the prompt glyph separately and may leave its status trailer unstyled under `NO_COLOR` | binds, partial evidence |
+| F75 | A repaint must not query cursor position while the workspace event reader owns stdin | binds |
 
 ## F13. refresh-client -B subscriptions work in control mode on tmux 3.6a (MEASURED)
 
@@ -1963,11 +1964,11 @@ MEASURED 2026-08-26 on `cyclops-workspace`'s
 `quitting_leaves_the_alternate_screen_and_returns_to_a_shell_prompt`, which
 waits 15 s for the workspace's first frame to reach the pane.
 
-`Terminal::clear` is not a write. `ratatui-core-0.1.2`'s
-`terminal/buffers.rs:147-152` answers it by first calling
-`Backend::get_cursor_position`; `ratatui-crossterm-0.1.2/src/lib.rs:302-306`
-forwards that to `crossterm::cursor::position`; and
-`crossterm-0.29.0/src/cursor/sys/unix.rs:32-55` writes `ESC[6n`, then blocks
+`Terminal::clear` is not a write. In `ratatui-core 0.1.2`, the terminal
+buffer implementation at lines 147-152 answers it by first calling
+`Backend::get_cursor_position`; `ratatui-crossterm 0.1.2` at lines 302-306
+forwards that to `crossterm::cursor::position`; and the Unix cursor
+implementation in `crossterm 0.29.0` at lines 32-55 writes `ESC[6n`, then blocks
 the calling thread in `poll_internal(2000 ms)` waiting for the terminal's
 reply to arrive on stdin, and returns an error when it does not.
 

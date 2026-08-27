@@ -6253,12 +6253,8 @@ mod tests {
     struct FlakyBackend {
         inner: TestBackend,
         fail_next_flush: bool,
-        /// Fails the first backend call `Terminal::clear` makes, which is
-        /// the cursor query it snapshots before invalidating the baseline.
-        /// That is how the clear half of `paint` is exercised: the
-        /// observable failure has to happen inside the `?` on
-        /// `terminal.clear()`, and the clear itself is not reached in this
-        /// harness.
+        /// Fails the full-surface invalidation at `clear_region`, before
+        /// Ratatui resets its remembered buffer.
         fail_next_clear: bool,
         /// Cells handed to the backend across every frame. Ratatui writes
         /// only what differs from its remembered buffer, so this is the
