@@ -101,6 +101,45 @@ fn extract_version_build_ref(version: &str) -> Option<&str> {
         .and_then(|without_close| without_close.rsplit_once(" (").map(|(_, build)| build))
 }
 
+fn extract_package_version<'a>(version: &'a str, program: &str) -> Option<&'a str> {
+    version
+        .strip_prefix(program)?
+        .strip_prefix(' ')?
+        .split_once(" (")
+        .map(|(package_version, _)| package_version)
+}
+
+fn status_daemon_matches_candidate(status: &Value, candidate_version: &str) -> bool {
+    let Some(expected) = extract_package_version(candidate_version, "cyclopsd") else {
+        return false;
+    };
+    status.get("daemon_version").and_then(Value::as_str) == Some(expected)
+}
+
+fn listed_agent<'a>(list: &'a Value, pane: &str) -> Option<&'a Value> {
+    list.get("agents")?
+        .as_array()?
+        .iter()
+        .find(|item| item.get("pane_id").and_then(Value::as_str) == Some(pane))
+}
+
+fn message_was_durably_accepted(result: &Value) -> bool {
+    let Some(object) = result.as_object() else {
+        return false;
+    };
+    let msg_id = object
+        .get("msg_id")
+        .and_then(Value::as_str)
+        .and_then(|raw| cyclops_proto::MessageId::new(raw).ok());
+    let seq = object.get("seq").and_then(Value::as_u64);
+    let deliveries = object.get("deliveries").and_then(Value::as_array);
+    let inserted_is_valid = matches!(object.get("inserted"), None | Some(Value::Bool(_)));
+    msg_id.is_some()
+        && seq.is_some_and(|value| value > 0)
+        && deliveries.is_some()
+        && inserted_is_valid
+}
+
 fn validate_frozen_version(version: &str, sha: &str, artifact: &str) -> Result<String, String> {
     let expected_prefix = expected_build_ref_prefix(sha)?;
     let Some(build_ref) = extract_version_build_ref(version) else {
@@ -195,6 +234,34 @@ fn delivery_receipts_prove_wake(result: &Value) -> bool {
                 ),
             }
         })
+}
+
+fn delivery_receipt_summary(result: &Value) -> Vec<String> {
+    result
+        .get("deliveries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|receipt| {
+            let state = receipt
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("missing");
+            let notification = receipt
+                .get("notification_state")
+                .and_then(Value::as_str)
+                .unwrap_or("none");
+            let pre_write_blocked = receipt
+                .get("pre_write_cause")
+                .is_some_and(|value| !value.is_null());
+            let wake_blocked = receipt
+                .get("wake_block")
+                .is_some_and(|value| !value.is_null());
+            format!(
+                "state={state},notification={notification},pre_write_blocked={pre_write_blocked},wake_blocked={wake_blocked}"
+            )
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -419,6 +486,65 @@ struct ExternalCandidateRig {
     _home_guard: HomeGuard,
 }
 
+const RECIPIENT_COMMAND_LOOP: &str = r#"import json
+import pathlib
+import subprocess
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    completed = subprocess.run(request["argv"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    pathlib.Path(request["stdout"]).write_bytes(completed.stdout)
+    pathlib.Path(request["stderr"]).write_bytes(completed.stderr)
+    status = pathlib.Path(request["status"])
+    temporary = status.with_suffix(".tmp")
+    temporary.write_text(str(completed.returncode), encoding="utf-8")
+    temporary.replace(status)
+"#;
+
+struct RecipientCommandOutput {
+    code: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn doorbell_locator_from_capture(capture: &str) -> Option<String> {
+    capture.lines().find_map(|line| {
+        let start = line.find("cyclops inbox claim ")?;
+        let payload = line[start..].trim_end();
+        cyclops_proto::parse_doorbell_v3(payload).map(|attempt_id| {
+            cyclops_proto::notification_attempt_claim_locator(attempt_id).to_string()
+        })
+    })
+}
+
+fn candidate_doorbell_locator(tmux: &TmuxGuard, pane: &str) -> Option<String> {
+    let output = tmux.run(&["capture-pane", "-p", "-S", "-", "-t", pane]);
+    if !output.status.success() {
+        return None;
+    }
+    let capture = String::from_utf8(output.stdout).ok()?;
+    doorbell_locator_from_capture(&capture)
+}
+
+fn wait_for_candidate_doorbell_locator(tmux: &TmuxGuard, pane: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(locator) = candidate_doorbell_locator(tmux, pane) {
+            return locator;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "candidate pane {pane:?} never rendered an exact Format 3 doorbell"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn pane_for_window(tmux: &TmuxGuard, window_name: &str) -> String {
     let output = tmux.run(&[
         "list-panes",
@@ -480,21 +606,21 @@ impl ExternalCandidateRig {
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(home.join("manifests")).expect("create private candidate home");
         let home_guard = HomeGuard(home.clone());
-        let busy_manifest = BUSY_MANIFEST.replacen("id = \"fix\"", "id = \"busy\"", 1);
-        assert_ne!(
-            busy_manifest, BUSY_MANIFEST,
-            "busy fixture manifest has an id"
-        );
-        fs::write(home.join("manifests/busy.toml"), busy_manifest)
-            .expect("write busy candidate manifest");
-        fs::write(home.join("manifests/fix.toml"), CAT_MANIFEST)
-            .expect("write worker candidate manifest");
         let capability = home.join("cyclops-skill.md");
         fs::write(
             &capability,
             include_bytes!("../../../skills/cyclops/SKILL.md"),
         )
         .expect("write private mailbox capability evidence");
+        let mailbox_capability = format!(
+            "\n[messaging]\nmailbox_capability_file = {:?}\n",
+            capability.display().to_string()
+        );
+        fs::write(
+            home.join("manifests/fix.toml"),
+            format!("{BUSY_MANIFEST}{mailbox_capability}"),
+        )
+        .expect("write candidate manifest");
         fs::write(
             home.join("config.toml"),
             format!(
@@ -503,15 +629,17 @@ impl ExternalCandidateRig {
                  tmux_config = \"/dev/null\"\n\
                  manifest_dir = {:?}\n\
                  receipt_block_ms = 5000\n\
-                 ack_timeout_ms = 1500\n\
-                 [messaging]\n\
-                 mailbox_capability_file = {:?}\n",
+                 ack_timeout_ms = 1500\n",
                 tmux.socket(),
                 home.join("manifests").display().to_string(),
-                capability.display().to_string(),
             ),
         )
         .expect("write private candidate config");
+        fs::write(
+            home.join("recipient-command-loop.py"),
+            RECIPIENT_COMMAND_LOOP,
+        )
+        .expect("write recipient command loop");
 
         let mut daemon = CandidateDaemon::spawn(&candidate.daemon.path, &home);
         daemon.wait_ready(&home.join("sock"));
@@ -522,6 +650,74 @@ impl ExternalCandidateRig {
             worker_pane,
             _tmux: tmux,
             _home_guard: home_guard,
+        }
+    }
+
+    fn replace_worker_with_recipient_command_loop(&self, cli: &CandidateBinary) {
+        let command = format!(
+            "exec env CYCLOPS_HOME={} NO_COLOR=1 python3 -u {}",
+            shell_quote(&self.home.display().to_string()),
+            shell_quote(
+                &self
+                    .home
+                    .join("recipient-command-loop.py")
+                    .display()
+                    .to_string()
+            )
+        );
+        self._tmux
+            .run_ok(&["respawn-pane", "-k", "-t", &self.worker_pane, &command]);
+        wait_for_candidate_name(cli, &self.home, &self.worker_pane, "worker", "fix");
+        let worker = wait_for_candidate_state(cli, &self.home, &self.worker_pane, "idle");
+        assert_eq!(
+            worker["manifest"], "fix",
+            "replacement recipient process did not bind the candidate manifest"
+        );
+    }
+
+    fn run_cli_as_recipient(
+        &self,
+        cli: &CandidateBinary,
+        tag: &str,
+        args: &[&str],
+    ) -> RecipientCommandOutput {
+        let stdout = self.home.join(format!("recipient-{tag}.stdout"));
+        let stderr = self.home.join(format!("recipient-{tag}.stderr"));
+        let status = self.home.join(format!("recipient-{tag}.status"));
+        for path in [&stdout, &stderr, &status] {
+            let _ = fs::remove_file(path);
+        }
+        let mut argv = vec![cli.path.display().to_string()];
+        argv.extend(args.iter().map(|arg| (*arg).to_string()));
+        let request = json!({
+            "argv": argv,
+            "stdout": stdout,
+            "stderr": stderr,
+            "status": status,
+        })
+        .to_string();
+        self._tmux
+            .run_ok(&["send-keys", "-t", &self.worker_pane, "-l", &request]);
+        self._tmux
+            .run_ok(&["send-keys", "-t", &self.worker_pane, "Enter"]);
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let code = loop {
+            if let Ok(raw) = fs::read_to_string(&status) {
+                if let Ok(code) = raw.parse::<i32>() {
+                    break code;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "recipient candidate command {tag:?} did not finish"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        RecipientCommandOutput {
+            code,
+            stdout: fs::read(stdout).expect("read recipient candidate stdout"),
+            stderr: fs::read(stderr).expect("read recipient candidate stderr"),
         }
     }
 
@@ -573,34 +769,63 @@ fn json_output(output: &Output, label: &str) -> Value {
     })
 }
 
-fn assert_cli_success(output: &Output, label: &str) {
+fn json_output_allowing_nonzero(output: &Output, label: &str) -> Value {
     assert!(
-        output.status.success(),
+        output.stderr.is_empty(),
         "{}",
         captured_output_failure(
             label,
-            CapturedOutputFailure::ExitStatus(output.status.code())
+            CapturedOutputFailure::UnexpectedStderr(output.stderr.len())
         )
     );
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|_error| {
+        panic!(
+            "{}",
+            captured_output_failure(label, CapturedOutputFailure::InvalidJson)
+        )
+    })
 }
 
 fn wait_for_candidate_state(cli: &CandidateBinary, home: &Path, pane: &str, wanted: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last_state = None;
     loop {
         let output = run_candidate_cli(cli, home, &["list", "--json"]);
         let list = json_output(&output, "cyclops list --json");
-        let item = list
-            .as_array()
-            .expect("list array")
-            .iter()
-            .find(|item| item["pane_id"] == pane)
-            .unwrap_or_else(|| panic!("candidate pane {pane:?} missing from list"));
-        if item["state"] == wanted {
-            return item.clone();
+        if let Some(item) = listed_agent(&list, pane) {
+            if item["state"] == wanted {
+                return item.clone();
+            }
+            last_state = item["state"].as_str().map(str::to_owned);
         }
         assert!(
             Instant::now() < deadline,
-            "candidate pane {pane:?} never reached state {wanted:?}; last item was {item}"
+            "candidate pane {pane:?} never reached state {wanted:?}; last state was {last_state:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_candidate_name(
+    cli: &CandidateBinary,
+    home: &Path,
+    pane: &str,
+    label: &str,
+    manifest: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let output = run_candidate_cli(
+            cli,
+            home,
+            &["name", pane, label, "--manifest", manifest, "--json"],
+        );
+        if output.status.success() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "candidate pane {pane:?} was never available for naming"
         );
         thread::sleep(Duration::from_millis(20));
     }
@@ -611,29 +836,19 @@ fn run_external_candidate_contract(candidate: &FrozenCandidate) -> Value {
 
     let status_output = run_candidate_cli(&candidate.cli, &rig.home, &["status", "--json"]);
     let status = json_output(&status_output, "cyclops status --json");
-    let daemon_version = status["daemon"]["version"]
-        .as_str()
-        .expect("status daemon version");
-    assert_eq!(
-        daemon_version, candidate.daemon.version,
+    assert!(
+        status_daemon_matches_candidate(&status, &candidate.daemon.version),
         "running candidate daemon version mismatch"
     );
 
-    let list_output = run_candidate_cli(&candidate.cli, &rig.home, &["list", "--json"]);
-    let list = json_output(&list_output, "cyclops list --json");
-    let initial_worker = list
-        .as_array()
-        .expect("list array")
-        .iter()
-        .find(|item| item["pane_id"] == rig.worker_pane)
-        .expect("initial worker pane row");
+    wait_for_candidate_name(&candidate.cli, &rig.home, &rig.busy_pane, "blocked", "fix");
+    wait_for_candidate_name(&candidate.cli, &rig.home, &rig.worker_pane, "worker", "fix");
+
+    let initial_worker =
+        wait_for_candidate_state(&candidate.cli, &rig.home, &rig.worker_pane, "idle");
     assert_eq!(
         initial_worker["manifest"], "fix",
         "candidate daemon failed to load worker manifest"
-    );
-    assert_eq!(
-        initial_worker["state"], "idle",
-        "candidate worker pane is not idle at boot"
     );
 
     wait_for_candidate_state(&candidate.cli, &rig.home, &rig.busy_pane, "working");
@@ -644,6 +859,7 @@ fn run_external_candidate_contract(candidate: &FrozenCandidate) -> Value {
         &[
             "send",
             "blocked",
+            "--body",
             "default unproven wake accepts into mailbox",
             "--subject",
             "contract-default",
@@ -651,8 +867,8 @@ fn run_external_candidate_contract(candidate: &FrozenCandidate) -> Value {
         ],
     );
     let default_send = json_output(&default_send_output, "cyclops send --json");
-    assert_eq!(
-        default_send["status"], "accepted",
+    assert!(
+        message_was_durably_accepted(&default_send),
         "default send must accept into mailbox even when wake is unproven"
     );
     assert!(
@@ -666,6 +882,7 @@ fn run_external_candidate_contract(candidate: &FrozenCandidate) -> Value {
         &[
             "send",
             "blocked",
+            "--body",
             "require-wake on a busy pane must fail closed",
             "--subject",
             "contract-blocked",
@@ -680,8 +897,8 @@ fn run_external_candidate_contract(candidate: &FrozenCandidate) -> Value {
     );
     let blocked_json: Value = serde_json::from_slice(&blocked_send.stdout)
         .expect("parse send --require-wake failure json");
-    assert_eq!(
-        blocked_json["status"], "accepted",
+    assert!(
+        message_was_durably_accepted(&blocked_json),
         "require-wake rejection must still record durable mailbox acceptance"
     );
     assert!(
@@ -695,6 +912,7 @@ fn run_external_candidate_contract(candidate: &FrozenCandidate) -> Value {
         &[
             "send",
             "worker",
+            "--body",
             "require-wake on a clean idle pane must prove delivery",
             "--subject",
             "contract-success",
@@ -702,23 +920,47 @@ fn run_external_candidate_contract(candidate: &FrozenCandidate) -> Value {
             "--json",
         ],
     );
-    let success_send = json_output(&success_send_output, "cyclops send --require-wake --json");
-    assert_eq!(
-        success_send["status"], "accepted",
+    let success_send =
+        json_output_allowing_nonzero(&success_send_output, "cyclops send --require-wake --json");
+    assert!(
+        message_was_durably_accepted(&success_send),
         "require-wake on an idle pane must succeed"
     );
     assert!(
         delivery_receipts_prove_wake(&success_send),
-        "require-wake on an idle pane must prove delivery"
+        "require-wake on an idle pane must prove delivery; receipt metadata: {:?}",
+        delivery_receipt_summary(&success_send)
+    );
+    assert!(
+        success_send_output.status.success(),
+        "require-wake returned non-zero despite a wake-proven receipt"
     );
     let message_id = success_send["msg_id"].as_str().expect("send message id");
 
-    let claim_plain = run_candidate_cli(
-        &candidate.cli,
-        &rig.home,
-        &["inbox", "claim", message_id, "--plain"],
+    let claim_locator = wait_for_candidate_doorbell_locator(&rig._tmux, &rig.worker_pane);
+    assert_ne!(
+        claim_locator, message_id,
+        "Format 3 must name the exact notification attempt, not only its message"
     );
-    assert_cli_success(&claim_plain, "cyclops inbox claim --plain");
+    rig.replace_worker_with_recipient_command_loop(&candidate.cli);
+
+    let claim_plain = rig.run_cli_as_recipient(
+        &candidate.cli,
+        "claim",
+        &["inbox", "claim", &claim_locator, "--plain"],
+    );
+    assert_eq!(
+        claim_plain.code,
+        0,
+        "recipient claim failed with status {} and {} captured stderr bytes; captured output withheld",
+        claim_plain.code,
+        claim_plain.stderr.len()
+    );
+    assert!(
+        claim_plain.stderr.is_empty(),
+        "recipient claim polluted stderr with {} captured bytes; captured output withheld",
+        claim_plain.stderr.len()
+    );
     let claim_plain_text = String::from_utf8(claim_plain.stdout).expect("claim --plain is UTF-8");
     assert!(
         claim_plain_text.contains("require-wake on a clean idle pane must prove delivery"),
@@ -729,12 +971,23 @@ fn run_external_candidate_contract(candidate: &FrozenCandidate) -> Value {
         "claim --plain did not print envelope marker"
     );
 
-    let re_claim_plain = run_candidate_cli(
+    let re_claim_plain = rig.run_cli_as_recipient(
         &candidate.cli,
-        &rig.home,
-        &["inbox", "claim", message_id, "--plain"],
+        "reclaim",
+        &["inbox", "claim", &claim_locator, "--plain"],
     );
-    assert_cli_success(&re_claim_plain, "repeat cyclops inbox claim --plain");
+    assert_eq!(
+        re_claim_plain.code,
+        0,
+        "repeat recipient claim failed with status {} and {} captured stderr bytes; captured output withheld",
+        re_claim_plain.code,
+        re_claim_plain.stderr.len()
+    );
+    assert!(
+        re_claim_plain.stderr.is_empty(),
+        "repeat recipient claim polluted stderr with {} captured bytes; captured output withheld",
+        re_claim_plain.stderr.len()
+    );
     let re_claim_text =
         String::from_utf8(re_claim_plain.stdout).expect("repeat claim --plain is UTF-8");
     assert_eq!(
@@ -785,6 +1038,75 @@ fn test_frozen_version_validation() {
 fn test_release_profile_validation() {
     assert!(validate_release_profile(false).is_ok());
     assert!(validate_release_profile(true).is_err());
+}
+
+#[test]
+fn test_status_daemon_identity_uses_the_protocol_field_and_package_version() {
+    let status = json!({"daemon_version": "0.1.0"});
+    assert!(status_daemon_matches_candidate(
+        &status,
+        "cyclopsd 0.1.0 (aa93af5)"
+    ));
+    assert!(!status_daemon_matches_candidate(
+        &json!({"daemon": {"version": "cyclopsd 0.1.0 (aa93af5)"}}),
+        "cyclopsd 0.1.0 (aa93af5)"
+    ));
+    assert!(!status_daemon_matches_candidate(
+        &json!({"daemon_version": "0.2.0"}),
+        "cyclopsd 0.1.0 (aa93af5)"
+    ));
+}
+
+#[test]
+fn test_list_pane_lookup_uses_the_cli_agents_field() {
+    let list = json!({
+        "home": "/private/tmp/cyc",
+        "sessions": ["release-candidate"],
+        "agents": [
+            {"pane_id": "%1", "agent": "blocked"},
+            {"pane_id": "%2", "agent": "worker"}
+        ]
+    });
+    assert_eq!(listed_agent(&list, "%2").unwrap()["agent"], "worker");
+    assert!(listed_agent(&list, "%9").is_none());
+    assert!(listed_agent(&json!([]), "%2").is_none());
+}
+
+#[test]
+fn test_capture_extracts_only_an_exact_format_3_attempt_locator() {
+    let attempt =
+        cyclops_proto::NotificationAttemptId::parse("att-aa93af51-f078-4c70-8a59-805c735271bd")
+            .unwrap();
+    let payload = cyclops_proto::render_doorbell_v3(attempt);
+    let locator = cyclops_proto::notification_attempt_claim_locator(attempt).to_string();
+    let capture = format!("transcript\n❯ {payload}   \nModel x · Ctx: 78%\n");
+    assert_eq!(
+        doorbell_locator_from_capture(&capture).as_deref(),
+        Some(locator.as_str())
+    );
+    assert_eq!(
+        doorbell_locator_from_capture("❯ cyclops inbox claim m-message-only\n"),
+        None
+    );
+}
+
+#[test]
+fn test_durable_acceptance_uses_the_current_send_envelope() {
+    assert!(message_was_durably_accepted(&json!({
+        "msg_id": "m-accepted",
+        "seq": 1,
+        "inserted": true,
+        "deliveries": []
+    })));
+    for invalid in [
+        json!({"status": "accepted"}),
+        json!({"msg_id": "accepted", "seq": 1, "deliveries": []}),
+        json!({"msg_id": "m-accepted", "seq": 0, "deliveries": []}),
+        json!({"msg_id": "m-accepted", "seq": 1}),
+        json!({"msg_id": "m-accepted", "seq": 1, "deliveries": [], "inserted": "yes"}),
+    ] {
+        assert!(!message_was_durably_accepted(&invalid), "{invalid}");
+    }
 }
 
 #[test]

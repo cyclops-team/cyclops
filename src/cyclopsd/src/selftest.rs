@@ -571,6 +571,7 @@ pub(crate) async fn selftest(
         reply_to: None,
         supersedes: None,
         wait: None,
+        require_wake: false,
     };
     let receipt = delivery::msg_send(inner, "cyclopsd", send_params).await?;
     let msg_id = receipt["msg_id"].as_str().unwrap_or_default().to_string();

@@ -652,6 +652,11 @@ pub struct MsgSendParams {
     /// pane state cannot prove that a specific message was completed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait: Option<WaitSpec>,
+    /// Hold the bounded mailbox receipt until the current wake either reaches
+    /// a submitted/notified boundary or settles in a state that cannot prove
+    /// wake. This never waits for agent work or message completion.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_wake: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2104,6 +2109,15 @@ mod tests {
         }))
         .unwrap();
         assert!(legacy.recipient_keys.is_none());
+        assert!(!legacy.require_wake);
+
+        let wake_bound: MsgSendParams = serde_json::from_value(serde_json::json!({
+            "to": ["reviewer"],
+            "subject": "Wake bound",
+            "require_wake": true
+        }))
+        .unwrap();
+        assert!(wake_bound.require_wake);
 
         let legacy_snapshot: MessagesSnapshotResult = serde_json::from_value(serde_json::json!({
             "workspace_id": workspace,

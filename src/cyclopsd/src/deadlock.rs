@@ -37,22 +37,49 @@ pub(crate) fn status_diagnostics(inner: &Inner) -> Vec<StatusDiagnostic> {
         if inner.cached_state(route.session_idx, &route.pane_id) != AgentState::Working {
             continue;
         }
-        candidates.push((record, route));
+        candidates.push(DeadlockCandidate {
+            message_id: record.message_id,
+            notification_attempt: record.attempt_id,
+            recipient: record.recipient,
+            recipient_label: route.label,
+            pane_id: route.pane_id,
+            pane_pid: route.row.pane_pid,
+        });
     }
+    diagnostics_for_candidates(candidates, ProcessSnapshot::read)
+}
+
+struct DeadlockCandidate {
+    message_id: cyclops_proto::MessageId,
+    notification_attempt: cyclops_proto::NotificationAttemptId,
+    recipient: cyclops_proto::RecipientKey,
+    recipient_label: String,
+    pane_id: String,
+    pane_pid: i32,
+}
+
+fn diagnostics_for_candidates(
+    candidates: Vec<DeadlockCandidate>,
+    read_processes: impl FnOnce() -> Option<ProcessSnapshot>,
+) -> Vec<StatusDiagnostic> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
     let mut seen_attempts = HashSet::new();
     let mut diagnostics = Vec::new();
-    if let Some(processes) = ProcessSnapshot::read() {
-        for (record, route) in candidates {
-            if seen_attempts.insert(record.attempt_id)
-                && processes.pane_runs_watch(route.row.pane_pid)
+    if let Some(processes) = read_processes() {
+        for candidate in candidates {
+            if seen_attempts.insert(candidate.notification_attempt)
+                && processes.pane_runs_watch(candidate.pane_pid)
             {
                 diagnostics.push(StatusDiagnostic {
                     code: "deadlock_risk".into(),
-                    message_id: record.message_id,
-                    notification_attempt: record.attempt_id,
-                    recipient: record.recipient,
-                    recipient_label: route.label,
-                    pane_id: route.pane_id,
+                    message_id: candidate.message_id,
+                    notification_attempt: candidate.notification_attempt,
+                    recipient: candidate.recipient,
+                    recipient_label: candidate.recipient_label,
+                    pane_id: candidate.pane_id,
                 });
             }
         }
@@ -126,6 +153,44 @@ impl ProcessSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
+
+    use cyclops_proto::{MessageId, NotificationAttemptId, RecipientKey, WorkspaceId};
+
+    fn candidate() -> DeadlockCandidate {
+        DeadlockCandidate {
+            message_id: MessageId::new("m-deadlock").unwrap(),
+            notification_attempt: NotificationAttemptId::generate(),
+            recipient: RecipientKey::admin(
+                WorkspaceId::from_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            ),
+            recipient_label: "agent".into(),
+            pane_id: "%1".into(),
+            pane_pid: 100,
+        }
+    }
+
+    #[test]
+    fn empty_candidates_skip_the_process_snapshot_read() {
+        let diagnostics = diagnostics_for_candidates(Vec::new(), || {
+            panic!("process snapshot must not be read without candidates")
+        });
+
+        assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn nonempty_candidates_keep_process_snapshot_diagnostics() {
+        let mut processes = ProcessSnapshot::default();
+        processes.foreground_group_by_pid.insert(100, 220);
+        processes.watch_groups.insert(220);
+
+        let diagnostics = diagnostics_for_candidates(vec![candidate()], || Some(processes));
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "deadlock_risk");
+        assert_eq!(diagnostics[0].pane_id, "%1");
+    }
 
     #[test]
     fn process_snapshot_requires_an_exact_watch_process_in_the_foreground_group() {

@@ -419,9 +419,13 @@ the projection supplies the receipt. The shared observation deadline changes
 no state. A message queued behind an older head reports `not_started` and its
 position, with neither the head's `wake_block` nor its `pre_write_cause`.
 
-The CLI's `--require-wake` flag evaluates this one bounded current response; it
-adds no protocol field, polling, or second wait. Exit 0 requires every mailbox
-receipt to carry `notification_state: "submitted"` or `"notified"`. When
+The CLI's `--require-wake` flag sets the additive `require_wake` request field.
+For an immediately decidable FIFO head, the same bounded response observation
+continues past `writing`, `staged`, and `submitting` until the exact attempt
+reaches `submitted` or `notified`, reaches a terminal refusal, or hits the
+existing `receipt_block_ms` cap. It does not poll and never waits for agent work
+or message completion. Exit 0 requires every mailbox receipt to carry
+`notification_state: "submitted"` or `"notified"`. When
 `notification_state` is absent on a supported legacy direct-delivery receipt,
 `state: "submitted"`, `"delivered_verified"`, or `"delivered_unverified"`
 is equivalent proof. Any other notification state, `pre_write_cause`,
