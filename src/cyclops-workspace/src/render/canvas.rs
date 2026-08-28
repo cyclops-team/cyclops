@@ -3059,4 +3059,129 @@ mod tests {
         );
         assert_eq!(rendered_height_broadcast, 48, "1 row overflow: 48 > 47");
     }
+
+    #[test]
+    fn follower_slack_first_messages_open_preserves_agent_width_or_shrinks_by_excess() {
+        let term_area = Rect::new(0, 0, 271, 61);
+        let layout_176 = crate::layout::ResolvedLayout::Leaf {
+            pane_id: "%0".into(),
+            x: 0,
+            y: 0,
+            width: 176,
+            height: 47,
+        };
+        let tab = TabModel {
+            window_id: "@0".into(),
+            name: "main".into(),
+            layout: layout_176,
+            active_pane: "%0".into(),
+            zoomed: false,
+            minimized: Default::default(),
+            minimization_provenance: Default::default(),
+        };
+
+        // 1. Closed Messages: Rail occupies 1 column on right.
+        let closed_chrome = super::super::chrome_areas_for(term_area, false, 22, true, false, 60);
+        assert_eq!(closed_chrome.canvas, Rect::new(1, 1, 269, 60));
+        let closed_inner = pane_canvas(closed_chrome.canvas);
+        assert_eq!(closed_inner, Rect::new(2, 2, 267, 58));
+        let closed_geom = layout_geometry(&tab.layout, closed_inner, "%0", PANE_GAPS);
+        assert_eq!(closed_geom.slots[0].rect, Rect::new(2, 2, 176, 47));
+
+        // 2. Open Messages at W = 60 <= D + 1 (60 <= 92):
+        // Agent width must remain strictly unchanged at 176 columns.
+        let open_60_chrome = super::super::chrome_areas_for(term_area, false, 22, true, true, 60);
+        assert_eq!(open_60_chrome.messages, Some(Rect::new(211, 0, 60, 61)));
+        assert_eq!(open_60_chrome.canvas, Rect::new(1, 1, 210, 60));
+        let open_60_inner = pane_canvas(open_60_chrome.canvas);
+        assert_eq!(open_60_inner, Rect::new(2, 2, 208, 58));
+        let open_60_geom = layout_geometry(&tab.layout, open_60_inner, "%0", PANE_GAPS);
+        assert_eq!(
+            open_60_geom.slots[0].rect.width, 176,
+            "W <= D + 1 must not shrink agent card width"
+        );
+        assert_eq!(open_60_geom.slots[0].rect, Rect::new(2, 2, 176, 47));
+
+        // Render buffer verification for W = 60
+        let mut term = Terminal::new(TestBackend::new(271, 61)).unwrap();
+        let mut hits = HitMap::default();
+        let paused = std::collections::HashSet::new();
+        let dec = DecorationSnapshot::default();
+        let runtimes = RuntimeRegistry::default();
+        let theme = Paint::for_test();
+        term.draw(|f| {
+            let mut ctx = ctx_defaults(&mut hits, &paused, &dec);
+            paint_window(
+                &tab,
+                &runtimes,
+                open_60_chrome.canvas,
+                f.buffer_mut(),
+                &theme,
+                &mut ctx,
+            );
+        })
+        .unwrap();
+
+        // 3. Open Messages at W = 100 > D + 1 (100 > 92):
+        // Agent width shrinks by exact excess: W - (D + 1) = 100 - 92 = 8 columns.
+        // Expected agent width: 176 - 8 = 168 columns.
+        let open_100_chrome = super::super::chrome_areas_for(term_area, false, 22, true, true, 100);
+        assert_eq!(open_100_chrome.messages, Some(Rect::new(171, 0, 100, 61)));
+        assert_eq!(open_100_chrome.canvas, Rect::new(1, 1, 170, 60));
+        let open_100_inner = pane_canvas(open_100_chrome.canvas);
+        assert_eq!(open_100_inner, Rect::new(2, 2, 168, 58));
+        let open_100_geom = layout_geometry(&tab.layout, open_100_inner, "%0", PANE_GAPS);
+        assert_eq!(
+            open_100_geom.slots[0].rect.width, 168,
+            "W > D + 1 must shrink agent card by exactly W - D - 1 columns"
+        );
+        assert_eq!(open_100_geom.slots[0].rect, Rect::new(2, 2, 168, 47));
+    }
+
+    #[test]
+    fn owner_zero_slack_messages_open_reduces_agent_width_by_w_minus_one() {
+        let term_area = Rect::new(0, 0, 271, 61);
+        let layout_267 = crate::layout::ResolvedLayout::Leaf {
+            pane_id: "%0".into(),
+            x: 0,
+            y: 0,
+            width: 267,
+            height: 58,
+        };
+        let tab = TabModel {
+            window_id: "@0".into(),
+            name: "main".into(),
+            layout: layout_267,
+            active_pane: "%0".into(),
+            zoomed: false,
+            minimized: Default::default(),
+            minimization_provenance: Default::default(),
+        };
+
+        // 1. Closed Messages: Full agent card geometry.
+        let closed_chrome = super::super::chrome_areas_for(term_area, false, 22, true, false, 60);
+        let closed_inner = pane_canvas(closed_chrome.canvas);
+        let closed_geom = layout_geometry(&tab.layout, closed_inner, "%0", PANE_GAPS);
+        assert_eq!(closed_geom.slots[0].rect, Rect::new(2, 2, 267, 58));
+
+        // 2. Open Messages at W = 60:
+        // D = 0, so shrinkage = W - 1 = 59 columns.
+        // Expected agent width: 267 - 59 = 208 columns.
+        let open_60_chrome = super::super::chrome_areas_for(term_area, false, 22, true, true, 60);
+        let open_60_inner = pane_canvas(open_60_chrome.canvas);
+        assert_eq!(open_60_inner, Rect::new(2, 2, 208, 58));
+        let open_60_geom = layout_geometry(&tab.layout, open_60_inner, "%0", PANE_GAPS);
+        assert_eq!(
+            open_60_geom.slots[0].rect.width, 208,
+            "Owner D = 0 must reduce agent card width by W - 1 (60 - 1 = 59 columns)"
+        );
+        assert_eq!(open_60_geom.slots[0].rect, Rect::new(2, 2, 208, 58));
+
+        // Invariant: Shared tmux sizing canvas remains unshifted at 269 columns.
+        assert_eq!(
+            open_60_chrome.tmux_sizing_canvas(),
+            closed_chrome.tmux_sizing_canvas()
+        );
+        assert_eq!(open_60_chrome.tmux_sizing_canvas().width, 269);
+    }
 }

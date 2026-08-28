@@ -3251,7 +3251,28 @@ async fn resize_client(app: &mut App, client: &ControlClient) -> SizingOutcome {
     let (w, h) = app.term_size;
     let canvas = app.chrome(Rect::new(0, 0, w, h)).tmux_sizing_canvas();
     let size = crate::render::tmux_client_size(canvas, app.model.active_tab());
-    if !declarable(size) || app.declared_client_size == Some(size) {
+    if !declarable(size) {
+        return SizingOutcome::default();
+    }
+    let any_window_diverged = app.sizing.owned.values().any(|owned| {
+        owned.pinned.iter().any(|window_id| {
+            if let Some(tab) = app
+                .model
+                .session
+                .tabs
+                .iter()
+                .find(|t| &t.window_id == window_id)
+            {
+                let target =
+                    crate::render::window_target_size_for_layout(canvas, &tab.layout, tab.zoomed);
+                let rect = tab.layout.rect();
+                rect.width != target.0 || rect.height != target.1
+            } else {
+                true
+            }
+        })
+    });
+    if app.declared_client_size == Some(size) && !any_window_diverged {
         return SizingOutcome::default();
     }
     let outcome = size_owned_windows(
@@ -6030,7 +6051,16 @@ fn resync_daemon_state(app: &mut App) {
 }
 
 async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_tmux::TmuxError> {
-    // New windows arrive through external events; adopt and pin them first.
+    let session = app.model.session.session.clone();
+    let mut model = fetch_workspace_model(client, &session).await?;
+    apply_workspace_order(&mut model, &app.prefs.workspace_order);
+    install_reconciled_model(
+        &mut app.model,
+        model,
+        app.prefs.sidebar_visible,
+        app.prefs.messages_visible,
+    );
+
     let session = app.model.session.session.clone();
     let tabs = app.model.session.tabs.clone();
     let adopted = adopt_windows(&mut app.sizing, client, &session, &tabs, &app.home).await;
@@ -6047,16 +6077,17 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
     }
     resize_client(app, client).await;
 
-    // Fetch FRESH model after resize and takeover recovery so dimensions and
-    // provenance are up-to-date with live tmux state before hydration.
-    let mut model = fetch_workspace_model(client, &session).await?;
-    apply_workspace_order(&mut model, &app.prefs.workspace_order);
+    // Fetch fresh model after resize and recovery so dimensions and
+    // provenance are up-to-date with live tmux state before hydration and rendering.
+    let mut fresh_model = fetch_workspace_model(client, &session).await?;
+    apply_workspace_order(&mut fresh_model, &app.prefs.workspace_order);
     install_reconciled_model(
         &mut app.model,
-        model,
+        fresh_model,
         app.prefs.sidebar_visible,
         app.prefs.messages_visible,
     );
+
     app.minimized = app.model.active_tab().minimized.clone();
     // An authoritative replacement: panes may have appeared, closed,
     // moved window, or changed proportion since the frame on screen.
@@ -12477,5 +12508,102 @@ mod tests {
             "the top pane must take the dragged pane's slot, got {after:?}"
         );
         client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn authoritative_owner_converges_when_tmux_window_resized_externally() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("owner-stale-cache-reconcile");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "120",
+            "-y",
+            "40",
+            "/bin/sh",
+        ]);
+
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, _rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let home = cyclops_proto::scratch::scratch_dir("owner-stale-cache-home");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create home");
+
+        let (mut model, window_id) = (one_pane_model(), "@0".to_string());
+        model.session.session = "s".to_string();
+        model.session.tabs[0].window_id = window_id.clone();
+        model.sidebar_visible = false;
+        model.messages_visible = false;
+
+        let mut app = test_app(model, home.clone());
+        app.term_size = (120, 40);
+        app.prefs.sidebar_visible = false;
+        app.prefs.messages_visible = false;
+
+        // 1. Initial reconcile adopts window and declares size.
+        reconcile(&mut app, &client)
+            .await
+            .expect("initial reconcile");
+        let desired_size = app.declared_client_size.expect("declared size");
+        assert_eq!(desired_size, (116, 37));
+
+        // Verify tmux window is at target size.
+        let out = server.run(&[
+            "display",
+            "-p",
+            "-t",
+            &window_id,
+            "#{window_width}x#{window_height}",
+        ]);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "116x37");
+
+        // 2. External event resizes tmux window to 80x24 (unexplained slack introduced).
+        server.run_ok(&["resize-window", "-t", &window_id, "-x", "80", "-y", "24"]);
+        let out = server.run(&[
+            "display",
+            "-p",
+            "-t",
+            &window_id,
+            "#{window_width}x#{window_height}",
+        ]);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "80x24");
+
+        // 3. Trigger reconcile as the authoritative owner.
+        reconcile(&mut app, &client)
+            .await
+            .expect("recovery reconcile");
+
+        // 4. Verification: The authoritative owner must converge both live tmux and in-memory model geometry.
+        let out = server.run(&[
+            "display",
+            "-p",
+            "-t",
+            &window_id,
+            "#{window_width}x#{window_height}",
+        ]);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "116x37",
+            "authoritative owner failed to converge tmux window geometry after external resize"
+        );
+        let active_rect = app.model.active_tab().layout.rect();
+        assert_eq!(
+            (active_rect.width, active_rect.height),
+            (116, 37),
+            "in-memory app.model layout must reflect post-resize geometry immediately after single reconcile"
+        );
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
     }
 }

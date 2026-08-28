@@ -1,7 +1,7 @@
 # Window sizing, and how to hand it back
 
 A Cyclops workspace decides how big the tmux windows it shows are. It has
-to: it draws a sidebar, a tab strip and a Messages pane beside real panes,
+to: it draws a sidebar, a tab strip, and a Messages pane beside real panes,
 and the panes and the chrome must agree on one geometry.
 
 A window's size is also its panes' size, so this is not a private rendering
@@ -11,22 +11,44 @@ decision. Change it and every agent running in that session reflows.
 
 For each window it shows, the workspace records what the window's
 `window-size` was, takes the window off every sizing policy
-(`window-size manual`), and moves it with `resize-window`. When it quits it
+(`window-size manual`), and moves it with `resize-window`. When it quits, it
 puts every one of them back exactly as it found them.
 
-One workspace per session does this. A second workspace on the same session
-follows the first one's geometry and says so once, rather than fighting it.
+One workspace per session acts as the authoritative sizing driver. A second
+workspace on the same session follows the first one's geometry and says so
+once, rather than fighting it.
+
+### Authoritative owner reconcile contract
+
+Ownership is tracked per session through the tmux server option
+`@cyclops_window_driver`. The owner does not assume permanent authority or rely
+on stale cached state across disconnections:
+
+1. **Compare-and-set rekeying on reconnect:** When a workspace reconnects, it
+   receives a new client identity. It attempts to migrate its driver claim with
+   an atomic compare-and-set against its prior marker.
+2. **Authority transfer detection:** If a follower detected the stale marker
+   during the disconnect gap and claimed the session, the reconnected client's
+   compare-and-set fails. The client yields authority, removes the session from
+   its owned set, and becomes a follower without overwriting the new owner's
+   window sizes.
+3. **Fresh snapshot verification:** Every reconcile and post-resize pass queries
+   a fresh tmux snapshot before evaluating pane dimensions or minimization
+   provenance.
+4. **Minimization provenance protection:** Panes with recorded minimization
+   provenance (`@cyclops_pane_minimized_v1`) are re-collapsed to 1 row if a
+   window resize caused tmux to automatically reflow them. Panes with no
+   provenance or malformed records fail closed: manual 1-row heights are
+   preserved rather than guessed or automatically uncrushed.
 
 ## Local Messages pane chrome
 
 The Messages pane owns a bordered region beside the agent grid. It never
 overlays an agent pane. Opening it reduces only this client's local canvas;
 neither the sizing driver nor a follower resizes the shared tmux window when
-the pane opens or closes. Instead, this viewer proportionally fits the agent
-card rectangles into the smaller canvas and shows each runtime as a 1:1
-leading viewport. The runtime cells are clipped, never scaled.
+the pane opens or closes.
 
-Every shared size declaration, including cold boot, reconnect, reconcile and
+Every shared size declaration, including cold boot, reconnect, reconcile, and
 host resize, uses the geometry of the collapsed one-column Messages rail.
 When Messages is open, Cyclops adds back only the part of its actual rendered
 width beyond that rail before deriving the tmux target. It does not add back
@@ -35,19 +57,47 @@ shared pane geometry, while the closed agent grid remains cell-exact. At
 exhausted widths where neither the Messages pane nor its rail fits, the same
 target is derived from the actual post-sidebar region before local layout.
 
-Closing the Messages pane returns the width it reserved, apart from its
-one-column reopen rail, and restores the exact pre-open local grid. It does
-not expand that grid beyond the current tmux source. If the terminal is wider
-than the source, any remaining far-right space belongs to the shared sizing
-state and is resolved by the sizing owner or a later authority takeover, not
-by a follower changing the window.
+### Slack-first Messages opening rule
 
-While cards are locally fitted, their divider seams are not resize handles:
-a local pointer delta is no longer the same number of tmux source cells. The
-Messages pane width handle remains active because it changes local chrome,
-not tmux geometry. At an extreme width or height where sibling content and a
-separating border cannot all fit, nonfocused branches collapse so the focused
-pane retains visible content and a paintable card.
+When the Messages pane opens or expands, it consumes unused right-side columns
+(slack) before shrinking any agent cards:
+
+- **Follower slack as bordered peer space:** On a follower client whose terminal
+  is wider than the shared tmux layout, the surplus right-side columns form an
+  intentional bordered peer space. Outer pane borders extend cleanly across the
+  slack to maintain visual grounding.
+- **Slack consumption:** If the available right-side slack is greater than or
+  equal to the Messages pane width, the Messages pane occupies that slack
+  directly. The agent cards remain completely uncompressed and retain their
+  full 1:1 cell dimensions.
+- **Proportional fitting:** If the requested Messages pane width exceeds the
+  available right-side slack, the remaining difference proportionally fits the
+  agent card rectangles into the reduced canvas.
+- **Restoration on close:** Closing the Messages pane returns the width it
+  reserved, apart from its one-column reopen rail, restoring the exact pre-open
+  local grid without stretching it past the tmux source.
+
+### 1:1 runtime cells and divider drag enablement
+
+Visible pane cells always render 1:1 from the runtime's leading viewport.
+Runtime cells are clipped, never scaled or interpolated:
+
+- **Divider drag enabled:** When no fitting occurs (the local canvas
+  accommodates the full tmux source layout, with Messages closed or fitting
+  within available slack), local pointer coordinates match tmux source cells
+  1:1. Pane divider seams act as active resize handles and can be dragged to
+  resize tmux panes.
+- **Divider drag disabled during fitting:** When local chrome reduces the
+  canvas below the tmux source dimensions and cards are proportionally fitted,
+  divider dragging is disabled because local pointer deltas no longer equal tmux
+  source cells.
+- **Messages width handle:** The Messages pane divider handle remains active in
+  all layout states because it adjusts local UI chrome rather than shared tmux
+  geometry.
+
+At an extreme width or height where sibling content and a separating border
+cannot all fit, nonfocused branches collapse so the focused pane retains
+visible content and a paintable card.
 
 **Why not let tmux decide.** Every `window-size` policy resolves votes
 between attached clients, and a terminal always votes. Under `smallest` one

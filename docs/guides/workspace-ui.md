@@ -188,18 +188,33 @@ muted border at rest and a double accent border while it has keyboard focus.
 Its queue selection, detail scroll, composer, scopes, and shortcuts keep
 their state as the pane opens, closes, or changes width.
 
-When local chrome leaves less room than the current tmux source, Cyclops fits
-the agent card rectangles proportionally into the remaining canvas. Runtime
-cells are still a 1:1 leading viewport; they are never scaled. Opening or
-closing the Messages pane never resizes the shared tmux window, from either
-the sizing driver or a follower. Pane-divider dragging is disabled during
-that fitted view because local and tmux cell distances no longer match. The
-Messages pane's own width handle remains active.
+When the Messages pane opens or widens, it follows the slack-first opening rule:
+it consumes any unused right-side columns before shrinking agent cards. On a
+follower client where the local terminal is wider than the driver-pinned tmux
+window, this surplus space forms an intentional bordered peer space. Outer pane
+borders extend across the slack to preserve clean visual grounding. If the
+available right-side slack accommodates the Messages pane width, agent cards
+remain uncompressed and cell-exact.
 
-Cold boot, reconnect, reconcile and terminal resize all use the same shared
+If local chrome leaves less room than the current tmux source, Cyclops fits the
+agent card rectangles proportionally into the remaining canvas. Runtime cells
+remain a 1:1 leading viewport; they are never scaled or interpolated. Opening or
+closing the Messages pane never resizes the shared tmux window, from either the
+sizing driver or a follower.
+
+Pane-divider dragging is enabled whenever no fitting occurs, because local
+screen coordinates match tmux source cells 1:1. When local chrome forces
+proportional card fitting, pane-divider dragging is disabled because local and
+tmux cell distances no longer match. The Messages pane's own width handle
+remains active in all states because it adjusts local chrome rather than tmux
+geometry.
+
+Cold boot, reconnect, reconcile, and terminal resize all use the same shared
 target: the agent canvas with only the collapsed one-column Messages rail
 reserved. Opening or widening Messages changes the local fit, not that target;
 exhausted widths derive it from the actual region left after sidebar chrome.
+Reconciles follow the authoritative owner contract, querying fresh snapshots
+and revalidating driver authority before modifying shared geometry.
 
 ## Mouse
 
