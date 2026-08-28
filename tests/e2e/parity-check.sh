@@ -59,13 +59,15 @@ FAILS=0
 # already built. Off by default it costs nothing; on, it is a cold compile.
 # CI runs it as its own job so it does not sit in front of the test results.
 WITH_INSTALLER=0
+INSTALLER_ONLY=0
 # The real home, kept because the installer section runs with HOME pointed
 # at a throwaway and still needs to find the toolchain.
 CALLER_HOME="$HOME"
 case "${1:-}" in
   --with-installer) WITH_INSTALLER=1 ;;
+  --installer-only) WITH_INSTALLER=1; INSTALLER_ONLY=1 ;;
   "") ;;
-  *) echo "!! unknown option: $1 (only --with-installer)" >&2; exit 2 ;;
+  *) echo "!! unknown option: $1 (only --with-installer, --installer-only)" >&2; exit 2 ;;
 esac
 
 cd "$REPO"
@@ -352,6 +354,7 @@ check_exit() {
   fi
 }
 
+if [ "$INSTALLER_ONLY" -eq 0 ]; then
 echo "== rig home:   $CYCLOPS_HOME (removed on exit)"
 echo "== tmux:       private TMUX_TMPDIR=$TMUX_TMPDIR (removed on exit)"
 
@@ -1208,6 +1211,7 @@ check "the bound message is on the record" '^ +[0-9]+s +implementer → reviewer
 check_absent "history has no standard delivery badge" 'delivered ·|needs attention ·'
 
 stop_stock_daemon
+fi
 
 if [ "$WITH_INSTALLER" -eq 0 ]; then
   echo

@@ -115,10 +115,7 @@ jobs:
       - name: Install tmux
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y tmux; else brew install tmux; fi
-      # The debug binaries the parity walk before it needs, then the
-      # installer section on top.
-      - run: cargo build --workspace
-      - run: ./tests/e2e/parity-check.sh --with-installer
+      - run: ./tests/e2e/parity-check.sh --installer-only
 
   # ADR-001 owns the tmux-churn risk by testing the adapter against tmux HEAD.
   # Failures here are early warning, not merge blockers.
