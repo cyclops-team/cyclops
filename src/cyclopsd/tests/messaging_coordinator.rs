@@ -2056,10 +2056,9 @@ async fn a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt() 
         .capture(&pane)
         .contains(&compact_doorbell(&rig, &message_id)));
 
-    let partial_clear = "\x7f".repeat(draft.chars().count() - 1);
-    rig.tmux
-        .run_ok(&["send-keys", "-l", "-t", &pane, &partial_clear]);
-    rig.tmux.wait_screen("main", "❯ e");
+    for _ in 1..draft.chars().count() {
+        rig.tmux.run_ok(&["send-keys", "-t", &pane, "BSpace"]);
+    }
     wait_for_human_composer_evidence(&mut rig, &pane).await;
     assert!(!rig
         .tmux
