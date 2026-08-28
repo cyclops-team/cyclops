@@ -751,7 +751,7 @@ async fn new_session_returns_its_id_detached_in_the_requested_directory() {
     // Detached creation: this client must still be looking at `host`.
     let attached = lines(&srv, &["list-clients", "-F", "#{client_session}"]);
     assert_eq!(attached, vec!["host"], "-d must not steal the client");
-    let path = field(&srv, &format!("{id}:"), "#{pane_current_path}");
+    let path = field_when_set(&srv, &format!("{id}:"), "#{pane_current_path}");
     assert!(
         same_dir(&path, &dir),
         "the session should start in the requested directory, got {path}"
