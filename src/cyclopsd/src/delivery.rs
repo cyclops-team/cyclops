@@ -2489,8 +2489,10 @@ pub(crate) async fn msg_send(
     // of a fabricated wait result. Every entry carries the same
     // {outcome, state, waited_ms} shape agent.wait resolves with.
     if let Some(spec) = &params.wait {
-        // Test seam between delivery resolution and the wait, so a test can
-        // swap the pane occupant deterministically. No-op in production.
+        // Test seam after the initial receipt snapshot but before the
+        // combined wait resolves each delivery and begins pane observation.
+        // It lets tests order those two boundaries deterministically and is
+        // a no-op in production.
         inject_pause(inner, "pre_wait").await;
         let timeout = spec.timeout_ms.unwrap_or(WAIT_DEFAULT_MS).min(WAIT_MAX_MS);
         let wait_deadline = Instant::now() + Duration::from_millis(timeout);

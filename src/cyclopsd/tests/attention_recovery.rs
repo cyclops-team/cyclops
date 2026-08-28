@@ -114,15 +114,14 @@ async fn wait_for_resolution(rig: &Rig, attempt_id: &str, resolution: Notificati
     }
 }
 
-async fn wait_for_inject_phase(
-    entered: &mut tokio::sync::mpsc::UnboundedReceiver<&'static str>,
-    expected: &'static str,
+async fn wait_for_inject_signal(
+    entered: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+    phase: &'static str,
 ) {
-    let observed = tokio::time::timeout(Duration::from_secs(10), entered.recv())
+    tokio::time::timeout(Duration::from_secs(10), entered.recv())
         .await
-        .expect("inject phase was reached")
+        .unwrap_or_else(|_| panic!("inject phase {phase} was not reached"))
         .expect("inject phase sender stayed open");
-    assert_eq!(observed, expected);
 }
 
 async fn assert_alarm_cause(rig: &mut Rig, attempt_id: &str, cause: &str) {
@@ -661,7 +660,9 @@ async fn pending_exact_owned_doorbell_submits_once_without_operator_input() {
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
 
-    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (pre_submit_tx, mut pre_submit_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (automatic_tx, mut automatic_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (after_action_tx, mut after_action_rx) = tokio::sync::mpsc::unbounded_channel();
     let pre_submit = Arc::new(tokio::sync::Semaphore::new(0));
     let automatic = Arc::new(tokio::sync::Semaphore::new(0));
     let after_action = Arc::new(tokio::sync::Semaphore::new(0));
@@ -669,16 +670,19 @@ async fn pending_exact_owned_doorbell_submits_once_without_operator_input() {
     let paused_automatic = Arc::clone(&automatic);
     let paused_after_action = Arc::clone(&after_action);
     rig.daemon.set_inject_pause(move |phase| {
-        let entered_tx = entered_tx.clone();
-        let paused = match phase {
-            "pre_submit" => Some(Arc::clone(&paused_pre_submit)),
-            "automatic_attention_before_resolve" => Some(Arc::clone(&paused_automatic)),
-            "attention_after_action_accepted" => Some(Arc::clone(&paused_after_action)),
+        let pause = match phase {
+            "pre_submit" => Some((pre_submit_tx.clone(), Arc::clone(&paused_pre_submit))),
+            "automatic_attention_before_resolve" => {
+                Some((automatic_tx.clone(), Arc::clone(&paused_automatic)))
+            }
+            "attention_after_action_accepted" => {
+                Some((after_action_tx.clone(), Arc::clone(&paused_after_action)))
+            }
             _ => None,
         };
         Box::pin(async move {
-            if let Some(paused) = paused {
-                let _ = entered_tx.send(phase);
+            if let Some((entered, paused)) = pause {
+                let _ = entered.send(());
                 paused.acquire_owned().await.unwrap().forget();
             }
         })
@@ -699,7 +703,7 @@ async fn pending_exact_owned_doorbell_submits_once_without_operator_input() {
         .await
         .unwrap();
     let message_id = sent["msg_id"].as_str().unwrap().to_string();
-    wait_for_inject_phase(&mut entered_rx, "pre_submit").await;
+    wait_for_inject_signal(&mut pre_submit_rx, "pre_submit").await;
     rig.tmux
         .run_ok(&["select-pane", "-t", &pane, "-T", "BLOCKED"]);
     common::wait_pane_state(&mut rig, "blocked_modal").await;
@@ -708,13 +712,13 @@ async fn pending_exact_owned_doorbell_submits_once_without_operator_input() {
     let attempt_id = wait_for_alarm(&mut rig, &message_id).await;
     assert_alarm_cause(&mut rig, &attempt_id, "verify_failed").await;
     assert!(!submit_log.exists(), "failed delivery sent a submit key");
-    wait_for_inject_phase(&mut entered_rx, "automatic_attention_before_resolve").await;
+    wait_for_inject_signal(&mut automatic_rx, "automatic_attention_before_resolve").await;
     rig.tmux
         .run_ok(&["select-pane", "-t", &pane, "-T", "worker"]);
     common::wait_pane_state(&mut rig, "unknown").await;
 
     automatic.add_permits(32);
-    wait_for_inject_phase(&mut entered_rx, "attention_after_action_accepted").await;
+    wait_for_inject_signal(&mut after_action_rx, "attention_after_action_accepted").await;
     rig.daemon
         .claim_message_for_test("worker", &message_id)
         .expect("claim after automatic action acceptance");
@@ -761,21 +765,23 @@ async fn claimed_exact_owned_doorbell_clears_without_another_submit() {
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
 
-    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (pre_submit_tx, mut pre_submit_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (automatic_tx, mut automatic_rx) = tokio::sync::mpsc::unbounded_channel();
     let pre_submit = Arc::new(tokio::sync::Semaphore::new(0));
     let automatic = Arc::new(tokio::sync::Semaphore::new(0));
     let paused_pre_submit = Arc::clone(&pre_submit);
     let paused_automatic = Arc::clone(&automatic);
     rig.daemon.set_inject_pause(move |phase| {
-        let entered_tx = entered_tx.clone();
-        let paused = match phase {
-            "pre_submit" => Some(Arc::clone(&paused_pre_submit)),
-            "automatic_attention_before_resolve" => Some(Arc::clone(&paused_automatic)),
+        let pause = match phase {
+            "pre_submit" => Some((pre_submit_tx.clone(), Arc::clone(&paused_pre_submit))),
+            "automatic_attention_before_resolve" => {
+                Some((automatic_tx.clone(), Arc::clone(&paused_automatic)))
+            }
             _ => None,
         };
         Box::pin(async move {
-            if let Some(paused) = paused {
-                let _ = entered_tx.send(phase);
+            if let Some((entered, paused)) = pause {
+                let _ = entered.send(());
                 paused.acquire_owned().await.unwrap().forget();
             }
         })
@@ -796,7 +802,7 @@ async fn claimed_exact_owned_doorbell_clears_without_another_submit() {
         .await
         .unwrap();
     let message_id = sent["msg_id"].as_str().unwrap().to_string();
-    wait_for_inject_phase(&mut entered_rx, "pre_submit").await;
+    wait_for_inject_signal(&mut pre_submit_rx, "pre_submit").await;
     rig.tmux
         .run_ok(&["select-pane", "-t", &pane, "-T", "BLOCKED"]);
     common::wait_pane_state(&mut rig, "blocked_modal").await;
@@ -805,7 +811,7 @@ async fn claimed_exact_owned_doorbell_clears_without_another_submit() {
     let attempt_id = wait_for_alarm(&mut rig, &message_id).await;
     assert_alarm_cause(&mut rig, &attempt_id, "verify_failed").await;
     assert!(!submit_log.exists(), "failed delivery sent a submit key");
-    wait_for_inject_phase(&mut entered_rx, "automatic_attention_before_resolve").await;
+    wait_for_inject_signal(&mut automatic_rx, "automatic_attention_before_resolve").await;
     rig.tmux
         .run_ok(&["select-pane", "-t", &pane, "-T", "worker"]);
     common::wait_pane_state(&mut rig, "unknown").await;

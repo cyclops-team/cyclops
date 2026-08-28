@@ -31,27 +31,61 @@ async fn send_and_wait_starts_after_delivery_resolution() {
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "waity").await;
 
-    // Release the pane 400ms in, while msg.send is blocked on the wait.
-    let socket = rig.tmux.socket().to_string();
-    let pane_for_release = pane.clone();
-    let releaser = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(400));
-        let _ = std::process::Command::new("tmux")
-            .args(["-u", "-L", &socket, "-f", "/dev/null"])
-            .args(["send-keys", "-t", &pane_for_release, "x", "Enter"])
-            .status();
+    // Park the combined request immediately before its pane wait. The
+    // delivery worker remains independent, so the coordinator can prove the
+    // exact delivery resolved before allowing `turn_ended` to start.
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let release_seam = std::sync::Arc::clone(&release);
+    rig.daemon.set_inject_pause(move |phase| {
+        let entered_tx = entered_tx.clone();
+        let release = std::sync::Arc::clone(&release_seam);
+        Box::pin(async move {
+            if phase != "pre_wait" {
+                return;
+            }
+            let _ = entered_tx.send(());
+            release
+                .acquire_owned()
+                .await
+                .expect("pre-wait release")
+                .forget();
+        })
     });
 
-    let (result, _) = rig
-        .send(json!({
-            "to": ["waity"],
-            "subject": "wait for me",
-            "body": "a\nb\nc",
-            "wait": {"until": "turn_ended", "timeout_ms": 2500},
-        }))
-        .await;
-    releaser.join().expect("releaser thread");
+    let params: cyclops_proto::MsgSendParams = serde_json::from_value(json!({
+        "to": ["waity"],
+        "subject": "wait for me",
+        "body": "a\nb\nc",
+        "wait": {"until": "turn_ended", "timeout_ms": 2500},
+    }))
+    .expect("send params");
+    let daemon = &rig.daemon;
+    let events = &mut rig.ev;
+    let tmux = &rig.tmux;
+    let (result, delivered_msg_id) = tokio::join!(daemon.deliver_payload("admin", params), async {
+        tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("send reached the pre-wait seam")
+            .expect("pre-wait signal exists");
+        tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
+        let delivered = events
+            .wait_event(Duration::from_secs(8), |event| {
+                event["event"] == "delivery-state"
+                    && event["data"]["to"] == "waity"
+                    && event["data"]["to_state"] == "delivered_unverified"
+            })
+            .await;
+        let msg_id = delivered["data"]["id"]
+            .as_str()
+            .expect("delivery event names the message")
+            .to_string();
+        release.add_permits(1);
+        msg_id
+    });
+    let result = result.expect("send-and-wait answers");
     let msg_id = result["msg_id"].as_str().unwrap().to_string();
+    assert_eq!(msg_id, delivered_msg_id);
 
     // The receipt phase capped out while busy: queued is honest.
     assert_eq!(result["deliveries"][0]["state"], "queued", "{result}");

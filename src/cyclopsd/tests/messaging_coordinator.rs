@@ -3440,6 +3440,7 @@ async fn a_human_draft_is_untouched_by_hook_admission_recovery() {
     rig.tmux
         .run_ok(&["send-keys", "-l", "-t", &pane, "human draft stays private"]);
     rig.tmux.wait_screen("main", "human draft stays private");
+    wait_for_human_composer_evidence(&mut rig, &pane).await;
 
     let sent = send_workspace_message(&rig, "hook-admission-draft", "Draft", "private body").await;
     let message_id = sent["msg_id"].as_str().unwrap().to_string();
@@ -3453,7 +3454,10 @@ async fn a_human_draft_is_untouched_by_hook_admission_recovery() {
 
     let start = report_hook(&rig, "SessionStart", 1, json!({"session_id": "session-1"})).await;
     assert_eq!(start["applied"], true, "{start}");
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Hook reporting completes its route-evidence reconciliation before it
+    // returns. The pane-level refusal remains the human-input verdict here;
+    // `composer_hold` belongs to a durable blocked notification, not this
+    // still-gating attempt.
     let held = rig.tmux.capture(&pane);
     assert!(held.contains("human draft stays private"));
     assert!(!held.contains(&compact_doorbell(&rig, &message_id)));
@@ -3468,6 +3472,8 @@ async fn a_human_draft_is_untouched_by_hook_admission_recovery() {
     );
 
     rig.tmux.run_ok(&["send-keys", "-t", &pane, "Enter"]);
+    wait_for_pane_write_block(&mut rig, &pane, None).await;
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::Writing).await;
     let released = wait_for_doorbell(&rig, &pane, &message_id).await;
     assert!(!released.contains("private body"));
     assert_eq!(notification_attempts(&rig, &message_id).len(), 1);
