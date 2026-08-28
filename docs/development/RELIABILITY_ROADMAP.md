@@ -2,6 +2,19 @@
 
 Status: current normative implementation roadmap for the reliability release.
 
+Frozen planning baseline:
+
+- commit: `ab0ccd98576445c32035d60d5e547c235fc1c8b2`
+- `RELIABILITY_ROADMAP.md` SHA-256 at that commit:
+  `efa7b2f88eac7c25868a5b48aa354709d7fdc499b586a74085aba43cd1c79126`
+
+The baseline identifies the accepted release program before implementation.
+Later commits may update the contract owners and this one current normative
+roadmap as measured implementation facts are learned; they do not create a
+second roadmap. Every reliability implementation pull request names this
+baseline commit and roadmap hash so its authority is reviewable without a
+local task folder or handoff record.
+
 This document defines the remaining production-hardening work for Cyclops. It
 does not replace the stable contracts in:
 
