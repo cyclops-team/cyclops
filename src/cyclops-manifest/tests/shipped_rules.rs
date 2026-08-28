@@ -1470,7 +1470,9 @@ fn claude_2_1_246_terminal_suffix_matches_a_real_long_turn() {
 
 /// MEASURED 2026-08-28 (Claude Code 2.1.251, live pane %1): Sonnet 5 adds
 /// model effort and the agent navigation hint to the two trailer rows. The
-/// completed row and clean composer keep the same escaped identities.
+/// completed row and clean composer keep the same escaped identities. At
+/// 123 columns the final reset after the completed row occupies its own
+/// otherwise-empty row.
 #[test]
 fn claude_2_1_251_terminal_suffix_matches_the_current_trailer() {
     let claude = &shipped()["claude"];
@@ -1497,8 +1499,8 @@ fn claude_2_1_251_terminal_suffix_matches_the_current_trailer() {
         ],
         &[
             "\u{1b}[38;5;231m⏺\u{1b}[39m Hey! What's up?",
-            "\u{1b}[38;5;246m✻\u{1b}[39m \u{1b}[38;5;246mCooked for 1s · done 2:48 PM\u{1b}[39m",
-            "",
+            "\u{1b}[38;5;246m✻\u{1b}[39m \u{1b}[38;5;246mCooked for 1s · done 2:48 PM",
+            "\u{1b}[39m",
             "",
             "",
             "",

@@ -166,7 +166,7 @@ regex = ['(?m)^[·✶✽✳✢✻]\s+\S+\s+for\s+\d+[smhd](?:\s+\d+[smhd])*\s+·
 # 38;5;215 color, then the 244 rule, the styled composer, the 244 rule, and
 # the trailer. Styling is proven on the same rows, in the same order, as the
 # plain suffix above; per-line escaped clauses could not tie them together.
-regex_esc = ['(?m)^\x1b\[38;5;246m[·✶✽✳✢✻]\x1b\[39m\s+\x1b\[38;5;246m\S+\s+for\s+\d+[smhd](?:\s+\d+[smhd])*\s+·\s+done\s+\d{1,2}:\d{2}\s+(?:AM|PM)\x1b\[39m\s*\n(?:(?:[^\x1b\n][^\n]*|\x1b\[(?:38;5;24[46]|39|0)m[^\n]*)\n)*\x1b\[38;5;244m─{32,}\s*\n(?:\x1b\[(?:38;5;246|39)m)*❯(?:\x{a0}| )*(?:\x1b\[(?:38;5;246|39)m)*\s*\n\x1b\[38;5;244m─{32,}\s*\n[^\n]*(?:\n[^\n]*)?\z']
+regex_esc = ['(?m)^\x1b\[38;5;246m[·✶✽✳✢✻]\x1b\[39m\s+\x1b\[38;5;246m\S+\s+for\s+\d+[smhd](?:\s+\d+[smhd])*\s+·\s+done\s+\d{1,2}:\d{2}\s+(?:AM|PM)(?:\x1b\[39m)?[ \t]*\n(?:(?:[^\x1b\n][^\n]*|\x1b\[(?:38;5;24[46]|39|0)m[^\n]*)\n)*\x1b\[38;5;244m─{32,}\s*\n(?:\x1b\[(?:38;5;246|39)m)*❯(?:\x{a0}| )*(?:\x1b\[(?:38;5;246|39)m)*\s*\n\x1b\[38;5;244m─{32,}\s*\n[^\n]*(?:\n[^\n]*)?\z']
 evidence = "MEASURED live capture on Claude Code 2.1.236 (2026-08-20): styled active frames"
 # MEASURED 2026-08-26 (Claude Code 2.1.246, pane %1, captured idle frame in
 # shipped_rules.rs claude_2_1_246_terminal_suffix_matches_a_real_long_turn):
@@ -180,6 +180,10 @@ evidence = "MEASURED live capture on Claude Code 2.1.236 (2026-08-20): styled ac
 # appends the `/rc` shortcut after `N K used`. It remains inside the same
 # escaped, row-connected terminal suffix and does not broaden the completed
 # row or clean-composer proof.
+# At 123 columns the final 39m reset can occupy its own terminal row after the
+# completed line. Empty-row slicing removes that row before rule evaluation,
+# so the escaped suffix accepts the otherwise identical completed row without
+# its trailing reset.
 
 [[rule]]
 id = "composer_working_spinner_status_no_color"
