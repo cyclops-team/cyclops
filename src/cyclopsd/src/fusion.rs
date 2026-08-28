@@ -1623,6 +1623,12 @@ fn pane_binding_observation(
     row: &PaneRow,
     occupant: Occupant,
 ) -> BindingObservation {
+    if inner
+        .fail_next_admitted_binding_observation
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        return BindingObservation::NotVendor;
+    }
     if row.dead || occupant == Occupant::Gone {
         BindingObservation::Gone
     } else if occupant == Occupant::Unprovable {
@@ -1645,6 +1651,19 @@ fn binding_replacement_proven(
         BindingObservation::NotVendor | BindingObservation::Gone => true,
         BindingObservation::Unprovable => false,
     }
+}
+
+fn composer_hold_carried_entry<'a>(
+    prior_entry: Option<&'a DetEntry>,
+    admitted: Option<crate::identity::ProcId>,
+    manifest_id: Option<&str>,
+    row_dead: bool,
+    seen: Occupant,
+) -> Option<&'a DetEntry> {
+    prior_entry.filter(|e| {
+        (admitted.is_some_and(|a| e.agent == Some(a) && e.manifest.as_deref() == manifest_id))
+            || (admitted.is_none() && e.hold.refuses() && !row_dead && seen != Occupant::Gone)
+    })
 }
 
 /// The current binding of a pane, or None if any part of it could not be
@@ -4328,11 +4347,19 @@ async fn recompute_pane_with_evidence(
         // the hold on the group would clear it twice, and a runtime
         // `working` state would mask that until the pane came back
         // write-ready with the hold gone.
-        let carried = prior_entry
-            .filter(|e| admitted.is_some() && e.agent == admitted && e.manifest == manifest_id);
+        let identity_unproven =
+            unobservable || (admitted.is_none() && prior_entry.is_some_and(|e| e.hold.refuses()));
+        let carried = composer_hold_carried_entry(
+            prior_entry,
+            admitted,
+            manifest_id.as_deref(),
+            row.dead,
+            seen,
+        );
         let prior_quota_screen_clear = carried.is_some_and(|entry| entry.quota_screen_clear);
         // Holds carry only across observations of the same cached agent
-        // and manifest. First sight of an occupant therefore starts clear.
+        // and manifest, or while preserving an active hold across an unproven identity.
+        // First sight of an occupant therefore starts clear.
         let base_hold = carried.map(|entry| entry.hold).unwrap_or_default();
         let mut turn = carried.and_then(|entry| entry.turn.clone());
         let hold_owner = carried.and_then(|entry| entry.hold_owner.clone());
@@ -4374,7 +4401,10 @@ async fn recompute_pane_with_evidence(
         // barrier gets cleared by a failed `ps`. Runtime state still
         // publishes, so liveness and status keep moving; only the write
         // answer becomes a refusal.
-        let frozen = unobservable.then_some(prior_entry).flatten().cloned();
+        let frozen = (unobservable || (identity_unproven && !row.dead && seen != Occupant::Gone))
+            .then_some(prior_entry)
+            .flatten()
+            .cloned();
         let (hold, stranded, final_turn, final_owner, missing_end_diagnostic) = match &frozen {
             Some(entry) => (
                 entry.hold,
@@ -4419,7 +4449,7 @@ async fn recompute_pane_with_evidence(
         // and every status surface read. Stamping afterwards would leave
         // them all reading a verdict nobody finished.
         let mut detection = detection.stamped(row.in_mode, hold);
-        if unobservable {
+        if unobservable || identity_unproven {
             detection = detection.occupant_unprovable();
         } else if stranded {
             detection = detection.refused("turn_evidence_lost");
@@ -5386,6 +5416,209 @@ contains = ["working"]
         );
         let candidates = inner.hook_lifecycle.lock().unwrap();
         assert!(candidates.end_is_current(&pane, &stop));
+    }
+
+    #[test]
+    fn transient_unproven_identity_preserves_carried_hold_without_authorizing_write() {
+        let mut manifests = BTreeMap::new();
+        manifests.insert("claude".into(), lifecycle_manifest());
+        let inner = inner_with(manifests);
+        let route = pane();
+        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+
+        let initial_det = Detection {
+            state: AgentState::Idle,
+            readings: vec![],
+            disagreement: false,
+            decided_by: "fixture".into(),
+            unknown_reason: None,
+            stale: false,
+            write_ready: false,
+            write_block: Some("composer_hold".into()),
+            composer_semantic: Some(ComposerSemantic::HumanInput),
+        };
+        inner.detections.lock().unwrap().insert(
+            route.clone(),
+            DetEntry {
+                detection: initial_det,
+                binding: None,
+                manifest: Some("claude".into()),
+                occupant: Some(71),
+                agent: Some(agent),
+                in_mode: false,
+                quota_screen_clear: false,
+                hold: ComposerHold::Staged,
+                turn: None,
+                hold_owner: Some("claude".into()),
+                composer: ComposerProjection::default(),
+                working_confirmed: false,
+                since: std::time::Instant::now(),
+            },
+        );
+
+        let row = PaneRow {
+            pane_id: route.pane_id.clone(),
+            window_id: "@0".into(),
+            window_name: "main".into(),
+            title: "IDLE".into(),
+            dead: false,
+            in_mode: false,
+            current_command: "claude".into(),
+            width: 80,
+            height: 24,
+            active: true,
+            pane_pid: 71,
+        };
+
+        let prior_guard = inner.detections.lock().unwrap();
+        let prior_entry = prior_guard.get(&route);
+        let carried = composer_hold_carried_entry(
+            prior_entry,
+            None,
+            Some("claude"),
+            row.dead,
+            Occupant::Leader(71),
+        );
+        assert_eq!(
+            carried.map(|e| e.hold),
+            Some(ComposerHold::Staged),
+            "unproven identity must carry active staged hold"
+        );
+    }
+
+    #[test]
+    fn decoy_replacement_generation_does_not_inherit_prior_occupant_composer_hold() {
+        let mut manifests = BTreeMap::new();
+        manifests.insert("claude".into(), lifecycle_manifest());
+        let inner = inner_with(manifests);
+        let route = pane();
+        let agent1 = crate::identity::ProcId { pid: 71, birth: 3 };
+        let agent2 = crate::identity::ProcId { pid: 99, birth: 4 };
+
+        let initial_det = Detection {
+            state: AgentState::Idle,
+            readings: vec![],
+            disagreement: false,
+            decided_by: "fixture".into(),
+            unknown_reason: None,
+            stale: false,
+            write_ready: false,
+            write_block: Some("composer_hold".into()),
+            composer_semantic: Some(ComposerSemantic::HumanInput),
+        };
+        inner.detections.lock().unwrap().insert(
+            route.clone(),
+            DetEntry {
+                detection: initial_det,
+                binding: None,
+                manifest: Some("claude".into()),
+                occupant: Some(71),
+                agent: Some(agent1),
+                in_mode: false,
+                quota_screen_clear: false,
+                hold: ComposerHold::Staged,
+                turn: None,
+                hold_owner: Some("claude".into()),
+                composer: ComposerProjection::default(),
+                working_confirmed: false,
+                since: std::time::Instant::now(),
+            },
+        );
+
+        let row = PaneRow {
+            pane_id: route.pane_id.clone(),
+            window_id: "@0".into(),
+            window_name: "main".into(),
+            title: "IDLE".into(),
+            dead: false,
+            in_mode: false,
+            current_command: "claude".into(),
+            width: 80,
+            height: 24,
+            active: true,
+            pane_pid: 99,
+        };
+
+        let prior_guard = inner.detections.lock().unwrap();
+        let prior_entry = prior_guard.get(&route);
+        let carried = composer_hold_carried_entry(
+            prior_entry,
+            Some(agent2),
+            Some("claude"),
+            row.dead,
+            Occupant::Leader(99),
+        );
+        assert!(
+            carried.is_none(),
+            "replacement occupant generation must not inherit prior hold across ProcessInstanceId boundary"
+        );
+    }
+
+    #[test]
+    fn unproven_identity_without_prior_agent_carries_human_input_hold() {
+        let mut manifests = BTreeMap::new();
+        manifests.insert("claude".into(), lifecycle_manifest());
+        let inner = inner_with(manifests);
+        let route = pane();
+
+        let initial_det = Detection {
+            state: AgentState::Idle,
+            readings: vec![],
+            disagreement: false,
+            decided_by: "fixture".into(),
+            unknown_reason: None,
+            stale: false,
+            write_ready: false,
+            write_block: Some("composer_hold".into()),
+            composer_semantic: Some(ComposerSemantic::HumanInput),
+        };
+        inner.detections.lock().unwrap().insert(
+            route.clone(),
+            DetEntry {
+                detection: initial_det,
+                binding: None,
+                manifest: Some("claude".into()),
+                occupant: Some(71),
+                agent: None,
+                in_mode: false,
+                quota_screen_clear: false,
+                hold: ComposerHold::Staged,
+                turn: None,
+                hold_owner: Some("claude".into()),
+                composer: ComposerProjection::default(),
+                working_confirmed: false,
+                since: std::time::Instant::now(),
+            },
+        );
+
+        let row = PaneRow {
+            pane_id: route.pane_id.clone(),
+            window_id: "@0".into(),
+            window_name: "main".into(),
+            title: "IDLE".into(),
+            dead: false,
+            in_mode: false,
+            current_command: "claude".into(),
+            width: 80,
+            height: 24,
+            active: true,
+            pane_pid: 71,
+        };
+
+        let prior_guard = inner.detections.lock().unwrap();
+        let prior_entry = prior_guard.get(&route);
+        let carried = composer_hold_carried_entry(
+            prior_entry,
+            None,
+            Some("claude"),
+            row.dead,
+            Occupant::Leader(71),
+        );
+        assert_eq!(
+            carried.map(|e| e.hold),
+            Some(ComposerHold::Staged),
+            "unproven identity without prior agent must carry active human-input hold"
+        );
     }
 
     #[test]
@@ -10135,6 +10368,7 @@ regex = ['^IDLE']
             name_reconcile_pause: StdMutex::new(None),
             fail_chrome_restore: std::sync::atomic::AtomicBool::new(false),
             fail_next_final_binding_observation: std::sync::atomic::AtomicBool::new(false),
+            fail_next_admitted_binding_observation: std::sync::atomic::AtomicBool::new(false),
             fail_pre_record_writing: std::sync::Mutex::new(None),
             workspace_ui: StdMutex::new(crate::workspace_ui::WorkspaceUiState::default()),
             shutdown_request: tokio::sync::watch::channel(false).0,

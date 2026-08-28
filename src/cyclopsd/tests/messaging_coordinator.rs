@@ -2711,7 +2711,9 @@ async fn typed_composer_hold_is_a_durable_prewrite_block_until_a_real_turn() {
         "status uses the same actionable notification FIFO as Messages: {third_status}"
     );
 
-    // A ghost redraw alone cannot clear the durable block.
+    // A ghost redraw alone cannot clear the durable block, even across a
+    // transient process-table identity lapse during the shell transition.
+    rig.daemon.fail_next_admitted_binding_observation();
     rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
     wait_pane_state(&mut rig, "idle").await;
     assert_eq!(
@@ -3676,6 +3678,98 @@ async fn claim_and_exact_withdrawal_each_release_a_hook_admission_block_without_
     );
     assert_eq!(notification_attempts(&rig, &pair.second).len(), 1);
     assert_eq!(notification_attempts(&rig, &third_id).len(), 1);
+
+    rig.daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn decoy_replacement_generation_does_not_inherit_prior_occupant_composer_hold() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let ghost = r#"\033[1m\342\200\272\033[0m \033[2mFind and fix a bug in @filename\033[0m"#;
+    let typed = r#"\033[1m\342\200\272\033[0m fix the rate limiter in gateway.rs"#;
+    let pane_command = format!(
+        "sh -c 'printf \"{ghost}\\n\"; read a; printf \"\\033[2J\\033[H\"; \
+         printf \"{typed}\\n\"; exec cat'"
+    );
+    let mut rig = Rig::new(
+        "composer-hold-decoy-generation",
+        ESC_COMPOSER_MANIFEST,
+        &pane_command,
+        "receipt_block_ms = 300\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    let initial_pid = pane_pid(&rig, &pane);
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    // First occupant types input, entering staged hold.
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
+    wait_pane_state(&mut rig, "idle_with_input").await;
+
+    let sent = send_workspace_message(
+        &rig,
+        "composer-hold-decoy-generation",
+        "Held for first occupant",
+        "private body",
+    )
+    .await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::BlockedPreWrite).await;
+    let blocked = notification_transition(&rig, &message_id, NotificationState::BlockedPreWrite)
+        .expect("notification reached BlockedPreWrite");
+    let blocked_data = blocked.data.as_ref().expect("blocked transition data");
+
+    // Withdraw first message using direct resolved-admin seam so FIFO is clear for replacement message.
+    let snapshot = json!({
+        "result": serde_json::to_value(
+            rig.daemon
+                .messages_snapshot_for_test("admin", 20)
+                .expect("admin messages snapshot"),
+        )
+        .expect("messages snapshot serializes")
+    });
+    let first = snapshot["result"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["message_id"].as_str() == Some(message_id.as_str()))
+        .expect("first message exists");
+    let recipient_key = serde_json::from_value(first["recipients"][0]["recipient"].clone())
+        .expect("blocked recipient key");
+    let attempt_id =
+        serde_json::from_value(blocked_data["attempt_id"].clone()).expect("blocked attempt id");
+    let withdrawn = serde_json::to_value(
+        rig.daemon
+            .withdraw_notification_for_test("admin", recipient_key, attempt_id)
+            .expect("admin notification withdrawal"),
+    )
+    .expect("withdrawal result serializes");
+    assert_eq!(withdrawn["disposition"], "withdrawn", "{withdrawn}");
+
+    // Replace the occupant with a fresh process tree in the same pane using respawn-pane.
+    let clean_pane_command = format!("sh -c 'printf \"{ghost}\\n\"; exec cat'");
+    rig.tmux
+        .run_ok(&["respawn-pane", "-k", "-t", &pane, &clean_pane_command]);
+    let replacement_pid = wait_for_pane_pid_change(&rig, &pane, initial_pid).await;
+    assert_ne!(replacement_pid, initial_pid);
+    wait_pane_state(&mut rig, "idle").await;
+
+    // Send a new message to the replacement occupant.
+    let replacement_sent = send_workspace_message(
+        &rig,
+        "composer-hold-decoy-generation-replacement",
+        "For replacement occupant",
+        "second private body",
+    )
+    .await;
+    let replacement_id = replacement_sent["msg_id"].as_str().unwrap().to_string();
+
+    // The replacement occupant generation starts with a clean hold and proceeds to write without being blocked by prior occupant's hold.
+    wait_for_notification_state(&mut rig, &replacement_id, NotificationState::Writing).await;
 
     rig.daemon.shutdown().await;
 }
