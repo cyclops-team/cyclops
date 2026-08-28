@@ -906,6 +906,22 @@ impl Rig {
                 "40",
                 pane_cmd,
             ]);
+            // `new-session` returning proves creation, not that a separate
+            // control client can already observe the live pane. Put one tmux
+            // round trip between creation and daemon boot so watcher startup
+            // cannot race the server's first session publication on a loaded
+            // runner.
+            let visible = tmux.run(&["list-panes", "-t", name, "-F", "#{pane_id}\t#{pane_dead}"]);
+            let rows: Vec<_> = String::from_utf8_lossy(&visible.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            assert!(
+                visible.status.success() && rows.len() == 1 && rows[0].ends_with("\t0"),
+                "tmux session {name} was not ready before daemon boot: status={} rows={rows:?} stderr={}",
+                visible.status,
+                String::from_utf8_lossy(&visible.stderr)
+            );
         }
 
         let (cfg, _) = cyclopsd::Config::load(&home).expect("config loads");
