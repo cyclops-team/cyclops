@@ -19,6 +19,61 @@ use crate::runtime::CursorShape;
 
 static RESTORING: AtomicBool = AtomicBool::new(false);
 
+const BEGIN_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026h";
+const END_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026l";
+
+/// Present one Ratatui frame atomically on terminals that implement DEC
+/// synchronized updates.
+///
+/// Ratatui writes a frame through several `write` calls and finishes it with
+/// one `flush`. A fast stream of pane echo, such as ordinary typing, can let
+/// a terminal paint between those writes even though Cyclops never asked for
+/// a full repaint. Opening the synchronized update on the first byte and
+/// closing it at the frame flush keeps the previous complete frame visible
+/// until the next complete frame is ready. Unsupported terminals ignore both
+/// markers.
+pub(crate) struct SynchronizedWriter<W: Write> {
+    inner: W,
+    open: bool,
+}
+
+impl<W: Write> SynchronizedWriter<W> {
+    pub(crate) fn new(inner: W) -> Self {
+        Self { inner, open: false }
+    }
+
+    fn close_frame(&mut self) -> io::Result<()> {
+        if self.open {
+            self.inner.write_all(END_SYNCHRONIZED_UPDATE)?;
+            self.open = false;
+        }
+        self.inner.flush()
+    }
+}
+
+impl<W: Write> Write for SynchronizedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if !self.open {
+            self.inner.write_all(BEGIN_SYNCHRONIZED_UPDATE)?;
+            self.open = true;
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.close_frame()
+    }
+}
+
+impl<W: Write> Drop for SynchronizedWriter<W> {
+    fn drop(&mut self) {
+        let _ = self.close_frame();
+    }
+}
+
 /// Emit the focused pane's requested cursor shape (DECSCUSR) to the host
 /// terminal. Lives beside the guard because it changes terminal state the
 /// guard must undo: `restore` puts the user's configured shape back on
@@ -201,6 +256,22 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "\x1b]10;#3a2b26\x1b\\\x1b]11;#faf6e6\x1b\\",
             "foreground and background channels are lowercase, zero-padded hex"
+        );
+    }
+
+    #[test]
+    fn each_flushed_frame_is_one_synchronized_terminal_update() {
+        let mut out = SynchronizedWriter::new(Vec::new());
+
+        out.write_all(b"first ").unwrap();
+        out.write_all(b"frame").unwrap();
+        out.flush().unwrap();
+        out.write_all(b"second").unwrap();
+        out.flush().unwrap();
+
+        assert_eq!(
+            out.inner, b"\x1b[?2026hfirst frame\x1b[?2026l\x1b[?2026hsecond\x1b[?2026l",
+            "typing frames must never be exposed between Ratatui writes"
         );
     }
 

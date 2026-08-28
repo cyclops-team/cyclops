@@ -88,6 +88,44 @@ async fn watching_a_session_after_boot_makes_status_see_it() {
         "a repeat watch must not duplicate the session: {status}"
     );
 
+    // Once a runtime session that was live is positively removed, it must
+    // disappear from the public projection. Reusing the display name later
+    // creates a fresh watcher rather than reviving the dead row.
+    rig.tmux.run_ok(&["kill-session", "-t", "=extra"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = rig.ctl.request("status", json!({})).await;
+        if status["result"]["sessions"] == json!([]) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "status retained the removed runtime session: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    rig.tmux.run_ok(&[
+        "new-session",
+        "-d",
+        "-s",
+        "extra",
+        "-x",
+        "160",
+        "-y",
+        "40",
+        "cat",
+    ]);
+    let replacement = rig
+        .ctl
+        .request("session.watch", json!({"session": "extra"}))
+        .await;
+    assert_eq!(replacement["result"]["added"], json!(true), "{replacement}");
+    rig.wait_attached_session(0, 1).await;
+    let status = rig.ctl.request("status", json!({})).await;
+    assert_eq!(status["result"]["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(status["result"]["sessions"][0]["name"], json!("extra"));
+
     // An empty session name never reaches watch_session at all.
     let empty = rig
         .ctl

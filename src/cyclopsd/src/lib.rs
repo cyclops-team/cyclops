@@ -341,6 +341,15 @@ pub(crate) struct SessionSlot {
     /// collision. The atomic above is the state; this channel is only the
     /// edge that makes a blocked task observe it immediately.
     alias_changed: watch::Sender<Option<usize>>,
+    /// Configured sessions survive absence and wait for `cyclops start` to
+    /// create them. Runtime sessions come from a live workspace and retire
+    /// after that exact tmux session is positively gone, so reopening a
+    /// terminal creates one fresh watcher instead of retaining a zero-pane
+    /// ghost forever.
+    persistent: AtomicBool,
+    observed_live: AtomicBool,
+    retired: AtomicBool,
+    retired_changed: watch::Sender<bool>,
     #[cfg(test)]
     rename_pause: StdMutex<Option<SessionRenamePause>>,
     pub(crate) link: StdMutex<SessionLink>,
@@ -381,13 +390,26 @@ impl SessionSlot {
     /// and `watch_session` both build slots this way so the two paths a
     /// session can join the daemon by stay in lockstep.
     pub(crate) fn new(name: String, ledger: Arc<LedgerWriter>) -> Self {
+        Self::new_with_persistence(name, ledger, true)
+    }
+
+    fn new_runtime(name: String, ledger: Arc<LedgerWriter>) -> Self {
+        Self::new_with_persistence(name, ledger, false)
+    }
+
+    fn new_with_persistence(name: String, ledger: Arc<LedgerWriter>, persistent: bool) -> Self {
         let (alias_changed, _) = watch::channel(None);
+        let (retired_changed, _) = watch::channel(false);
         SessionSlot {
             name: StdMutex::new(name),
             boot_target: StdMutex::new(None),
             boot_identity: StdMutex::new(None),
             alias_of: AtomicUsize::new(usize::MAX),
             alias_changed,
+            persistent: AtomicBool::new(persistent),
+            observed_live: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            retired_changed,
             #[cfg(test)]
             rename_pause: StdMutex::new(None),
             link: StdMutex::new(SessionLink::default()),
@@ -451,7 +473,37 @@ impl SessionSlot {
     }
 
     fn is_canonical(&self) -> bool {
-        self.alias_of().is_none()
+        self.alias_of().is_none() && !self.retired.load(Ordering::Acquire)
+    }
+
+    fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Acquire)
+    }
+
+    fn promote_persistent(&self) {
+        self.persistent.store(true, Ordering::Release);
+    }
+
+    fn is_persistent(&self) -> bool {
+        self.persistent.load(Ordering::Acquire)
+    }
+
+    fn mark_observed_live(&self) {
+        self.observed_live.store(true, Ordering::Release);
+    }
+
+    fn retire_if_runtime(&self) -> bool {
+        if self.persistent.load(Ordering::Acquire) || !self.observed_live.load(Ordering::Acquire) {
+            return false;
+        }
+        let retired = self
+            .retired
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if retired {
+            self.retired_changed.send_replace(true);
+        }
+        retired
     }
 
     fn journal_file_name(&self) -> Option<String> {
@@ -3330,23 +3382,42 @@ pub(crate) async fn watch_session(
         rename_session_slot_locked(inner, idx, name.to_string(), None);
         return Ok((idx, false));
     }
-    let descendant = PathBuf::from("ledger").join(format!("{name}.ndjson"));
-    let path = inner.state_root.path().join(&descendant);
-    let ledger =
-        LedgerWriter::open(&inner.state_root, &descendant, &inner.boot_id).map_err(|e| {
-            WireError {
-                code: "internal".to_string(),
-                message: format!("open ledger {}: {e}", path.display()),
-                data: None,
+    // A runtime session can disappear and later be recreated under the
+    // same display name. Its retired slot still owns the one legal writer
+    // for this append-only ledger, so reuse that handle while giving the
+    // replacement tmux session a fresh slot and identity.
+    let retired_ledger = inner
+        .session_slots()
+        .into_iter()
+        .rev()
+        .find(|slot| slot.is_retired() && slot.name() == name)
+        .map(|slot| Arc::clone(&slot.ledger));
+    let ledger = match retired_ledger {
+        Some(ledger) => ledger,
+        None => {
+            let descendant = PathBuf::from("ledger").join(format!("{name}.ndjson"));
+            let path = inner.state_root.path().join(&descendant);
+            let ledger = Arc::new(
+                LedgerWriter::open(&inner.state_root, &descendant, &inner.boot_id).map_err(
+                    |e| WireError {
+                        code: "internal".to_string(),
+                        message: format!("open ledger {}: {e}", path.display()),
+                        data: None,
+                    },
+                )?,
+            );
+            // Same id-preload boot does: message ids stay unique across
+            // restarts and every session this daemon has watched.
+            match ledger.read_after(0) {
+                Ok(lines) => inner.engine.preload_ids(&lines),
+                Err(e) => {
+                    warn!(session = %name, error = %e, "ledger replay for id preload failed")
+                }
             }
-        })?;
-    // Same id-preload boot does: message ids stay unique across restarts
-    // and across every session this daemon has ever watched.
-    match ledger.read_after(0) {
-        Ok(lines) => inner.engine.preload_ids(&lines),
-        Err(e) => warn!(session = %name, error = %e, "ledger replay for id preload failed"),
-    }
-    let slot = Arc::new(SessionSlot::new(name.to_string(), Arc::new(ledger)));
+            ledger
+        }
+    };
+    let slot = Arc::new(SessionSlot::new_runtime(name.to_string(), ledger));
     // Push, then drop the lock before doing anything else: the locking
     // rule this field's doc comment states is never taking another lock,
     // or awaiting, while holding the sessions lock.
@@ -3693,6 +3764,14 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                             link.mailbox_panes.clear();
                         });
                         messaging::schedule_available(&inner);
+                        if slot.retire_if_runtime() {
+                            info!(
+                                session = %name,
+                                session_idx = idx,
+                                "retired runtime watcher after tmux session disappeared"
+                            );
+                            return;
+                        }
                     }
                     if !announced_missing {
                         // Two different situations reach this arm, and only
@@ -3838,6 +3917,12 @@ fn rename_session_slot_locked(
         .into_iter()
         .find(|(other_idx, other)| *other_idx != idx && other.name() == new_name);
     let retired = if let Some((other_idx, other)) = collision {
+        if other.is_persistent() {
+            // The runtime slot owns the proven live watcher and wins this
+            // collision, but it also inherits the configured slot's duty to
+            // wait for the session if it is recreated later.
+            slot.promote_persistent();
+        }
         let (target_is_live, target_instance_id) = {
             let link = other.link.lock().expect("session link lock");
             (
@@ -4187,6 +4272,7 @@ async fn run_session(
         warn!(session = %watcher.session(), error = %error, "cannot publish mailbox directory");
         return false;
     }
+    slot.mark_observed_live();
     drop(_registration);
     info!(session = %slot.name(), "attached to tmux session");
     session_lifecycle(inner, idx, true);
@@ -7266,6 +7352,75 @@ process_names = ["never"]
         assert!(!dir.join("ledger/new-name.ndjson").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A workspace-created session belongs to that live workspace, not to
+    /// daemon configuration. Once tmux positively proves the session gone,
+    /// status must drop its zero-pane watcher and a later workspace with the
+    /// same display name must receive a fresh durable session identity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_gone_runtime_session_retires_before_the_same_name_is_watched_again() {
+        if !cyclops_testrig::tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let server = cyclops_testrig::TmuxServer::new("runtime-session-retirement");
+        server.run_ok(&["new-session", "-d", "-s", "anchor", "sleep 60"]);
+
+        let mut inner = bare_inner("cyc-runtime-session-retirement");
+        let home = inner.cfg.home.clone();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        {
+            let mutable = Arc::get_mut(&mut inner).expect("bare inner is unique");
+            mutable.cfg.tmux_socket = Some(server.socket().to_string());
+            mutable.cfg.tmux_config = Some(PathBuf::from("/dev/null"));
+            mutable.shutdown_request = stop_tx.clone();
+            mutable.stop = stop_rx;
+        }
+
+        let (first_idx, added) = watch_session(&inner, "ephemeral")
+            .await
+            .expect("runtime session is watched");
+        assert!(added);
+        let first = inner.session(first_idx).expect("first slot");
+        server.run_ok(&["new-session", "-d", "-s", "ephemeral", "sleep 60"]);
+        let first_binding = wait_for_session_binding(&first, None).await;
+        let mut retired = first.retired_changed.subscribe();
+
+        server.run_ok(&["kill-session", "-t", "=ephemeral"]);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !*retired.borrow_and_update() {
+                retired.changed().await.expect("retirement sender lives");
+            }
+        })
+        .await
+        .expect("runtime watcher retires after positive session loss");
+
+        assert_eq!(inner.session_index("ephemeral"), None);
+        assert!(
+            inner
+                .active_session_slots()
+                .iter()
+                .all(|(_, slot)| slot.name() != "ephemeral"),
+            "status must not retain the dead runtime session"
+        );
+
+        server.run_ok(&["new-session", "-d", "-s", "ephemeral", "sleep 60"]);
+        let (second_idx, added) = watch_session(&inner, "ephemeral")
+            .await
+            .expect("replacement runtime session is watched");
+        assert!(added);
+        assert_ne!(second_idx, first_idx, "retired index cannot be reused");
+        let second = inner.session(second_idx).expect("second slot");
+        let second_binding = wait_for_session_binding(&second, None).await;
+        assert_ne!(
+            second_binding.session_instance_id(),
+            first_binding.session_instance_id(),
+            "a recreated tmux session needs a new durable identity"
+        );
+
+        stop_tx.send_replace(true);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[tokio::test]

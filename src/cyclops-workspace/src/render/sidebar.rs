@@ -39,8 +39,6 @@ pub const SIDEBAR_COLLAPSE: &str = "◂";
 pub const SIDEBAR_EXPAND: &str = "▸";
 pub const MESSAGES_COLLAPSE: &str = "▸";
 pub const MESSAGES_EXPAND: &str = "◂";
-/// Visible resize handle at the Messages pane's anchored left edge.
-pub const MESSAGES_RESIZE_GRIP: &str = "⠿";
 
 /// The one column at the panel's own outer edge that still answers as the
 /// resize handle. The handle itself moved: it used to be this hidden
@@ -481,17 +479,6 @@ pub fn paint_messages(
         .border_style(border_style)
         .render(area, buf);
 
-    // Unlike an invisible one-cell seam, this is discoverable at rest. The
-    // grip sits on the actual left boundary, so dragging it maps directly to
-    // the Messages width without a first-frame jump.
-    super::overlay_text(
-        buf,
-        area,
-        area.x,
-        area.y,
-        MESSAGES_RESIZE_GRIP,
-        border_style,
-    );
     if area.width > 11 {
         super::overlay_text(buf, area, area.x + 2, area.y, " Messages ", border_style);
     }
@@ -3726,11 +3713,7 @@ mod tests {
             MESSAGES_COLLAPSE,
             "open, the chevron points right to collapse the Messages pane"
         );
-        assert_eq!(
-            buf[(170, 0)].symbol(),
-            MESSAGES_RESIZE_GRIP,
-            "the divider advertises its resize grip at rest"
-        );
+        assert_eq!(buf[(170, 0)].symbol(), "╭");
         assert_eq!(
             (172..182).map(|x| buf[(x, 0)].symbol()).collect::<String>(),
             " Messages ",
