@@ -275,7 +275,7 @@ async fn shutdown_joins_the_unread_worker_before_restoring_user_chrome() {
         .await;
     assert_eq!(response["result"]["label"], "worker", "{response}");
 
-    let unread_chrome = rig.daemon.hold_unread_projection_for_test().await;
+    let unread_pause = rig.daemon.pause_next_unread_projection_for_test();
     rig.daemon
         .msg_send(
             "admin",
@@ -289,16 +289,15 @@ async fn shutdown_joins_the_unread_worker_before_restoring_user_chrome() {
         )
         .await
         .unwrap();
-    wait_for_pending_unread_projection_count(&rig, 0).await;
-    tokio::task::yield_now().await;
+    unread_pause.wait_until_derived().await;
 
     let shutdown = rig.daemon.shutdown();
     tokio::pin!(shutdown);
     tokio::select! {
-        () = &mut shutdown => panic!("shutdown bypassed the held unread projection"),
+        () = &mut shutdown => panic!("shutdown bypassed the in-flight unread projection"),
         _ = tokio::time::sleep(Duration::from_millis(50)) => {}
     }
-    drop(unread_chrome);
+    unread_pause.release();
     shutdown.await;
 
     assert!(
