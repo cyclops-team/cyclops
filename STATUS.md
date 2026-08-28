@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-08-27. Cyclops is pre-release software at version `0.1.0`.
+Updated 2026-08-28. Cyclops is pre-release software at version `0.1.0`.
 The Rust implementation on `main` is the current product; the shell/Python
 implementation remains available as the read-only `v1-final` tag.
 
@@ -22,6 +22,11 @@ implementation remains available as the read-only `v1-final` tag.
 - Notification recovery is append-only and operator explicit. Eligible
   messages can be requeued, and alarms can be cleared by exact id or through
   an age preview whose exact id set is confirmed before mutation.
+- Agent activity and composer safety are separate. Visible human input holds a
+  notification even when the agent is idle. Partial deletion remains held; a
+  settled exact empty composer releases the same unowned human attempt through
+  the ordinary gate. Hidden, ambiguous, stale, modal, replacement, and
+  recovery-owned holds remain blocked.
 - Bare `cyclops` opens the full-screen workspace, seeding the shipped
   themes on the way in. It provides a workspace sidebar, tabs, embedded
   pane terminals, split controls, pane swapping by keyboard or drag,
@@ -66,6 +71,16 @@ scratch storage, verifies the installer with
 website. An advisory job also tests against tmux built from its current
 development branch.
 
+The final stabilization head `0492d7a` passed the fast repository gate with
+1,848 nextest tests plus the daemon integration suites and doctests. A matched
+CLI and daemon built from that SHA were installed and restarted. A live fresh
+Codex 0.150.1 and AGY 1.1.22 exercise proved durable send, exact Format 3
+claim, reply, visible human-input hold, partial-backspace refusal, and
+same-attempt release after the final character became settled and exactly
+empty. The opt-in frozen transport component passed on that SHA. The separate
+Gate 7 stage-and-clear component reported `Limitation`, not `Passed`, because
+its authenticated vendor subprocess cells were not all executable.
+
 The parity walk currently contains 123 checks before the optional installer
 exercise. Test counts are intentionally not pinned here because they change
 whenever coverage grows.
@@ -96,13 +111,13 @@ whenever coverage grows.
   rewriting `config.toml` or creating an old-name ghost.
 - Agent activity detection remains version-specific and conservative. Unknown
   chrome or a vendor version without sufficient current evidence holds terminal
-  writes instead of guessing. The 2026-08-25 evidence snapshot is:
+  writes instead of guessing. The 2026-08-28 evidence snapshot is:
 
   | Vendor | Shipped version claim | Newer live evidence | Remaining gap |
   | --- | --- | --- | --- |
-  | Claude Code | 2.1.221 | 2.1.239 composer extraction, clearing, and stage-and-clear soak | Current idle, working, staged, modal, and quota matrix |
-  | Codex CLI | 0.149.1 | Fresh, resumed, and daemon-restart delivery; human-draft protection; typed, working, tool, modal, raw and collapsed composer states; exact hook ACK, claim, and reply | Revalidate on later Codex releases |
-  | Antigravity CLI | 1.1.11 | 1.1.21 exact composer and file-access permission; 1.1.18 stage-and-clear soak | Current full matrix beyond the measured composer and permission states, plus lifecycle evidence |
+  | Claude Code | 2.1.221 | 2.1.248 discovered on the final host; older composer fixtures and soak remain valid historical evidence | Final live campaign unavailable; current idle, working, staged, modal, and quota matrix |
+  | Codex CLI | 0.149.1 | 0.150.1 fresh-pane discovery in the final two-agent exercise; historical fresh, resumed, restart, draft, modal, raw, collapsed, claim, and reply evidence | Full current-version live matrix beyond the exercised cells |
+  | Antigravity CLI | 1.1.11 | 1.1.22 live Format 3 claim, reply, human-draft hold, partial deletion refusal, and final-backspace release; narrow truecolor empty-Context trailer evidence | Full current matrix beyond the exercised cells; automated clear keys remain unavailable |
   | Cursor Agent CLI | 2026.07.23-e383d2b | No installed binary on the evidence host | Installed current binary, full matrix, and paired start and end hook payloads |
 
   The soak proves staging verification and cleanup only. It does not promote a
@@ -113,4 +128,8 @@ For the repository map and design boundaries, read
 [docs/development/HANDOFF.md](docs/development/HANDOFF.md). For user-facing
 setup, start with [docs/guides/install.md](docs/guides/install.md) and
 [docs/guides/QUICKSTART.md](docs/guides/QUICKSTART.md). Historical milestone
-details remain in [CHANGELOG.md](CHANGELOG.md).
+details remain in [CHANGELOG.md](CHANGELOG.md). The stabilization failures,
+rejected alternatives, and final evidence are in
+[docs/development/STABILIZATION_HISTORY.md](docs/development/STABILIZATION_HISTORY.md);
+prioritized architecture follow-up is in
+[docs/development/NEXT.md](docs/development/NEXT.md).
