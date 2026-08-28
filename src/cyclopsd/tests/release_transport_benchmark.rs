@@ -806,13 +806,9 @@ async fn wait_for_notification(rig: &Rig, message_id: &str, wanted: MessageNotif
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "opt-in frozen-candidate benchmark; requires release profile, clean exact SHA, and both candidate binaries"]
 async fn frozen_candidate_separates_transport_phases() {
-    let candidate = match try_frozen_candidate() {
-        Ok(candidate) => candidate,
-        Err(preflight_error) => {
-            eprintln!("skipping opt-in frozen transport benchmark: {preflight_error}");
-            return;
-        }
-    };
+    let candidate = try_frozen_candidate().unwrap_or_else(|preflight_error| {
+        panic!("frozen transport benchmark preflight failed: {preflight_error}")
+    });
 
     let cli_contract = run_external_candidate_contract(&candidate);
     let count = samples();
