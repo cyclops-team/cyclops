@@ -67,12 +67,20 @@ Cyclops skill without replacing unrelated settings. Use
 [installation guide](docs/guides/install.md) for paths, options, updates,
 rollback, and uninstall.
 
-Run `cyclops` to open the full-screen terminal workspace; it starts tmux and
-the daemon automatically when needed. If you prefer native tmux without the
-workspace UI, run `cyclops start --preset duo` followed by
-`tmux attach -t main`. Run `cyclops watch` for the standalone Stream and
-Messages TUI. None of these interfaces is required for background
-agent-to-agent messaging.
+## How to run Cyclops
+
+For normal interactive use, run `cyclops`. It opens the full-screen workspace
+and starts tmux and the daemon when needed.
+
+| Command | What it opens | Use it when... |
+|---|---|---|
+| `cyclops` | The full Cyclops workspace with sidebar, tabs, panes, and Messages | You want the recommended everyday interface. |
+| `cyclops start --preset duo`, then `cyclops` | The full workspace with a named two-pane layout | You want Cyclops to construct a preset before opening the UI. |
+| `cyclops start --preset duo`, then `tmux attach -t main` | The same session in a native tmux client, without Cyclops workspace chrome | You want a headless script, a custom tmux setup, or a raw-tmux recovery path. |
+| `cyclops watch` | The standalone Stream and Messages monitor | Your agents already run elsewhere and you only need coordination visibility. |
+
+The daemon and mailbox do not depend on any interface remaining open. Closing
+the workspace or watch UI does not discard accepted messages.
 
 ## Send, wake, and claim
 
