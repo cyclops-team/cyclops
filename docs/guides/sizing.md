@@ -126,15 +126,16 @@ Follow those and the session is yours again.
 | `3` | Refused. Nothing was read or written; the message says why |
 | `1` | tmux itself failed; the error is printed |
 
-## The two options it uses
+## The options it uses
 
-Both live in the tmux server, which is why they survive a workspace that
+They live in the tmux server, which is why they survive a workspace that
 dies.
 
 | Option | Scope | Holds |
 |---|---|---|
 | `@cyclops_window_driver` | session | Which client sizes this session, as `client_name:client_created` |
 | `@cyclops_prior_window_size` | window | What the window's `window-size` was before Cyclops pinned it |
+| `@cyclops_pane_minimized_v1` | pane | Provenance for deliberately minimized panes, as `v1:<original_height>` |
 
 Reading them is safe. Changing them by hand is what the refusal messages
 above ask you to do, and nothing else should.

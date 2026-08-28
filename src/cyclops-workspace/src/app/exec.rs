@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use cyclops_tmux::{ControlClient, TmuxError};
 use uuid::Uuid;
 
-use super::App;
+use super::{log_err, App};
 use crate::action::{Action, Insertion, TabDestination};
 use crate::copy;
 use crate::daemon;
@@ -115,10 +115,78 @@ pub(super) async fn execute(
             direction,
             cells,
         } => {
-            // No reconcile: tmux's own `%layout-change` notification updates
-            // the model, and asking for a full reconcile on every coalesced
-            // drag step would make dragging feel like it lags the mouse.
-            client.resize_pane(&pane_id, direction, cells).await?;
+            let session = app.model.session.session.clone();
+            let target_tab = app
+                .model
+                .session
+                .tabs
+                .iter()
+                .find(|tab| crate::layout::layout_contains_pane(&tab.layout, &pane_id));
+
+            let Some(tab) = target_tab else {
+                app.notice.show(
+                    format!("refused: pane {pane_id} not found in active session"),
+                    tokio::time::Instant::now(),
+                );
+                return Ok(Outcome::default());
+            };
+            let window_id = tab.window_id.clone();
+
+            if app.sizing.following.contains(&session) {
+                app.notice.show(
+                    crate::app::copy::SIZING_FOLLOWER.to_string(),
+                    tokio::time::Instant::now(),
+                );
+                return Ok(Outcome::default());
+            }
+            if app.sizing.owns(&session) {
+                if !app.sizing.has_window_authority(&session, &window_id) {
+                    app.notice.show(
+                        format!("refused: window {window_id} is not sizing-owned"),
+                        tokio::time::Instant::now(),
+                    );
+                    return Ok(Outcome::default());
+                }
+                let id = match client.client_identity().await {
+                    Ok(id) => id,
+                    Err(e) => {
+                        log_err(&app.home, &format!("failed to verify client identity: {e}"));
+                        app.notice.show(
+                            format!("refused: failed to verify client identity: {e}"),
+                            tokio::time::Instant::now(),
+                        );
+                        return Ok(Outcome::default());
+                    }
+                };
+                let current_driver = match client.window_driver(&session).await {
+                    Ok(driver) => driver,
+                    Err(e) => {
+                        log_err(
+                            &app.home,
+                            &format!("failed to query window driver for {session}: {e}"),
+                        );
+                        app.notice.show(
+                            format!("refused: failed to query window driver: {e}"),
+                            tokio::time::Instant::now(),
+                        );
+                        return Ok(Outcome::default());
+                    }
+                };
+                if current_driver.as_deref() != Some(&id.marker()) {
+                    app.notice.show(
+                        "refused: lost sizing driver authority".to_string(),
+                        tokio::time::Instant::now(),
+                    );
+                    return Ok(Outcome::default());
+                }
+            }
+            if let Err(e) = client.resize_pane(&pane_id, direction, cells).await {
+                log_err(&app.home, &format!("resize_pane failed on {pane_id}: {e}"));
+                app.notice.show(
+                    format!("resize_pane failed on {pane_id}: {e}"),
+                    tokio::time::Instant::now(),
+                );
+            }
             Ok(Outcome::default())
         }
         Action::ScrollPane { pane_id, lines, at } => {
@@ -341,39 +409,187 @@ pub(super) async fn execute(
             })
         }
         Action::ToggleMinimizePane { pane_id } => {
-            // The height to go back to is the height it has right now, read
-            // from the frame that is on screen. tmux is the authority on
-            // pane geometry and the render follows it 1:1, so the painted
-            // height IS the tmux height.
-            match app.minimized.remove(&pane_id) {
-                Some(rows) => {
-                    client.resize_pane_height(&pane_id, rows).await?;
+            let session = app.model.session.session.clone();
+            let target_tab = app
+                .model
+                .session
+                .tabs
+                .iter()
+                .find(|tab| crate::layout::layout_contains_pane(&tab.layout, &pane_id));
+
+            let Some(tab) = target_tab else {
+                app.notice.show(
+                    format!("refused: pane {pane_id} not found in active session"),
+                    tokio::time::Instant::now(),
+                );
+                return Ok(Outcome::default());
+            };
+            let window_id = tab.window_id.clone();
+            if app.sizing.following.contains(&session) {
+                app.notice.show(
+                    crate::app::copy::SIZING_FOLLOWER.to_string(),
+                    tokio::time::Instant::now(),
+                );
+                return Ok(Outcome::default());
+            }
+            if app.sizing.owns(&session) {
+                if !app.sizing.has_window_authority(&session, &window_id) {
+                    app.notice.show(
+                        format!("refused: window {window_id} is not sizing-owned"),
+                        tokio::time::Instant::now(),
+                    );
+                    return Ok(Outcome::default());
                 }
-                None => {
+
+                let id = match client.client_identity().await {
+                    Ok(id) => id,
+                    Err(e) => {
+                        log_err(&app.home, &format!("failed to verify client identity: {e}"));
+                        app.notice.show(
+                            format!("refused: failed to verify client identity: {e}"),
+                            tokio::time::Instant::now(),
+                        );
+                        return Ok(Outcome::default());
+                    }
+                };
+                let current_driver = match client.window_driver(&session).await {
+                    Ok(driver) => driver,
+                    Err(e) => {
+                        log_err(
+                            &app.home,
+                            &format!("failed to query window driver for {session}: {e}"),
+                        );
+                        app.notice.show(
+                            format!("refused: failed to query window driver: {e}"),
+                            tokio::time::Instant::now(),
+                        );
+                        return Ok(Outcome::default());
+                    }
+                };
+                if current_driver.as_deref() != Some(&id.marker()) {
+                    app.notice.show(
+                        "refused: lost sizing driver authority".to_string(),
+                        tokio::time::Instant::now(),
+                    );
+                    return Ok(Outcome::default());
+                }
+            }
+
+            let raw_option = client
+                .display(
+                    &pane_id,
+                    &format!("#{{q:{}}}", cyclops_tmux::PANE_MINIMIZED_OPTION_V1),
+                )
+                .await;
+            let prov = match raw_option {
+                Ok(raw) => cyclops_tmux::PaneMinimizationProvenance::parse(&raw),
+                Err(e) => {
+                    log_err(
+                        &app.home,
+                        &format!("failed to query minimization option on {pane_id}: {e}"),
+                    );
+                    app.notice.show(
+                        format!("refused: failed to query minimization option on {pane_id}: {e}"),
+                        tokio::time::Instant::now(),
+                    );
+                    return Ok(Outcome::default());
+                }
+            };
+
+            match prov {
+                cyclops_tmux::PaneMinimizationProvenance::Malformed(bad) => {
+                    log_err(
+                        &app.home,
+                        &format!(
+                            "{pane_id}: minimization record is unreadable ({bad}), \
+                             so this workspace will not size it or delete the record"
+                        ),
+                    );
+                    app.notice.show(
+                        format!("refused: minimization record on {pane_id} is unreadable"),
+                        tokio::time::Instant::now(),
+                    );
+                    return Ok(Outcome::default());
+                }
+                cyclops_tmux::PaneMinimizationProvenance::Minimized { original_height } => {
+                    if let Err(e) = client.resize_pane_height(&pane_id, original_height).await {
+                        log_err(&app.home, &format!("failed to restore pane {pane_id}: {e}"));
+                        app.notice.show(
+                            format!("failed to restore pane {pane_id}: {e}"),
+                            tokio::time::Instant::now(),
+                        );
+                        return Ok(Outcome::default());
+                    }
+                    if let Err(e) = client
+                        .unset_pane_option(&pane_id, cyclops_tmux::PANE_MINIMIZED_OPTION_V1)
+                        .await
+                    {
+                        log_err(
+                            &app.home,
+                            &format!("failed to clear minimization option on {pane_id}: {e}"),
+                        );
+                        app.notice.show(
+                            format!("failed to clear minimization option on {pane_id}: {e}"),
+                            tokio::time::Instant::now(),
+                        );
+                        return Ok(Outcome::default());
+                    }
+                    app.minimized.remove(&pane_id);
+                }
+                cyclops_tmux::PaneMinimizationProvenance::None => {
                     let Some(geometry) = app.hit_map.pane_geometry(&pane_id) else {
-                        // Nothing painted it this frame, so there is no
-                        // height to remember and nothing to collapse.
                         return Ok(Outcome::default());
                     };
                     let was = geometry.inner.height;
-                    // A pane already at the floor has nothing to give, and
-                    // recording that as its restore height would make the
-                    // restore a no-op forever after.
-                    if was <= crate::render::MINIMIZED_ROWS {
-                        return Ok(Outcome::default());
+                    if was > crate::render::MINIMIZED_ROWS {
+                        if let Err(e) = client
+                            .set_pane_option(
+                                &pane_id,
+                                cyclops_tmux::PANE_MINIMIZED_OPTION_V1,
+                                &format!("v1:{was}"),
+                            )
+                            .await
+                        {
+                            log_err(
+                                &app.home,
+                                &format!("failed to set minimization option on {pane_id}: {e}"),
+                            );
+                            app.notice.show(
+                                format!("failed to set minimization option on {pane_id}: {e}"),
+                                tokio::time::Instant::now(),
+                            );
+                            return Ok(Outcome::default());
+                        }
+                        if let Err(e) = client
+                            .resize_pane_height(&pane_id, crate::render::MINIMIZED_ROWS)
+                            .await
+                        {
+                            if let Err(rollback_err) = client
+                                .unset_pane_option(&pane_id, cyclops_tmux::PANE_MINIMIZED_OPTION_V1)
+                                .await
+                            {
+                                let msg = format!(
+                                    "failed to minimize pane {pane_id}: {e}; rollback unset failed: {rollback_err}"
+                                );
+                                log_err(&app.home, &msg);
+                                app.notice.show(msg, tokio::time::Instant::now());
+                                return Ok(Outcome::default());
+                            }
+                            log_err(
+                                &app.home,
+                                &format!("failed to minimize pane {pane_id}: {e}"),
+                            );
+                            app.notice.show(
+                                format!("failed to minimize pane {pane_id}: {e}"),
+                                tokio::time::Instant::now(),
+                            );
+                            return Ok(Outcome::default());
+                        }
+                        app.minimized.insert(pane_id, was);
                     }
-                    app.minimized.insert(pane_id.clone(), was);
-                    client
-                        .resize_pane_height(&pane_id, crate::render::MINIMIZED_ROWS)
-                        .await?;
                 }
             }
-            // tmux moved the layout, so the model has to be re-read before
-            // the next frame paints panes at the old geometry.
-            Ok(Outcome {
-                reconcile: true,
-                ..Outcome::default()
-            })
+            Ok(Outcome::reconcile())
         }
         Action::FocusFiles => {
             // Open what the cursor is going to live in. Focusing a panel
@@ -1425,6 +1641,8 @@ mod tests {
             layout,
             active_pane: pane_id.to_string(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         };
         WorkspaceModel {
             workspaces: vec![WorkspaceRow {
@@ -1624,6 +1842,8 @@ mod tests {
             },
             active_pane: pane_id.to_string(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         }
     }
 
@@ -2538,6 +2758,8 @@ mod tests {
                     layout,
                     active_pane,
                     zoomed: false,
+                    minimized: Default::default(),
+                    minimization_provenance: Default::default(),
                 }],
                 active_tab: 0,
             },

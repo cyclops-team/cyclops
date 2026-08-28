@@ -9,9 +9,9 @@ use crate::model::{
 use crate::runtime::{snapshot_from_bundle, PaneRuntime};
 
 /// Build the full workspace model from tmux with one
-/// [`ControlClient::workspace_snapshot`] round trip — two control-mode
+/// [`ControlClient::workspace_snapshot`] round trip: three control-mode
 /// commands over the connection that already exists, regardless of session
-/// or window count (see that method's own doc for why two is enough).
+/// or window count (see that method's own doc for why three is enough).
 ///
 /// This replaces the `list-sessions` + all-window-membership query +
 /// `list-windows` + one `list-panes` *per window* fan-out this function used
@@ -82,6 +82,14 @@ fn session_model_from_snapshot(
 
 fn build_tab(window: &SnapshotWindow) -> Result<TabModel, TmuxError> {
     let known: Vec<String> = window.panes.iter().map(|p| p.id.clone()).collect();
+    let mut minimized = std::collections::HashMap::new();
+    let mut minimization_provenance = std::collections::HashMap::new();
+    for pane in &window.panes {
+        minimization_provenance.insert(pane.id.clone(), pane.minimization.clone());
+        if let Some(was) = pane.minimization.original_height() {
+            minimized.insert(pane.id.clone(), was);
+        }
+    }
     let layout_node = parse_layout(&window.layout)
         .map_err(|e| TmuxError::Protocol(format!("layout parse: {e}")))?;
     let active_pane = window
@@ -90,7 +98,7 @@ fn build_tab(window: &SnapshotWindow) -> Result<TabModel, TmuxError> {
         .find(|p| p.active)
         .map(|p| p.id.clone())
         .or_else(|| window.panes.first().map(|p| p.id.clone()))
-        .unwrap_or_else(|| "%0".to_string());
+        .unwrap_or_default();
     let layout = match resolve_layout(&layout_node, &known) {
         Some(layout) => layout,
         None => {
@@ -118,6 +126,8 @@ fn build_tab(window: &SnapshotWindow) -> Result<TabModel, TmuxError> {
         layout,
         active_pane,
         zoomed: window.zoomed,
+        minimized,
+        minimization_provenance,
     })
 }
 
@@ -420,8 +430,8 @@ mod tests {
             "command count must not grow with window count, got {deltas:?} for W=1,4,8"
         );
         assert_eq!(
-            deltas[0], 2,
-            "fetch_workspace_model must cost exactly workspace_snapshot's two commands"
+            deltas[0], 3,
+            "fetch_workspace_model must cost exactly workspace_snapshot's three commands"
         );
 
         client.shutdown().await;
@@ -489,6 +499,8 @@ mod tests {
             },
             active_pane: "%0".to_string(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         };
 
         let mut registry = RuntimeRegistry::default();
@@ -545,6 +557,8 @@ mod tests {
             },
             active_pane: "%0".to_string(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         };
 
         let mut registry = RuntimeRegistry::default();
@@ -630,6 +644,8 @@ mod tests {
             },
             active_pane: "%0".to_string(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         };
 
         let mut registry = RuntimeRegistry::default();

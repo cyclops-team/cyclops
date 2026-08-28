@@ -68,6 +68,9 @@ impl PaneDirection {
     }
 }
 
+/// The namespaced and versioned option holding deliberate minimization provenance.
+pub const PANE_MINIMIZED_OPTION_V1: &str = "@cyclops_pane_minimized_v1";
+
 impl ControlClient {
     /// Focus the neighbouring pane in `direction`, starting from whichever
     /// pane is current. tmux picks the neighbour from the live layout, so a
@@ -157,6 +160,34 @@ impl ControlClient {
         self.command(&format!("resize-pane -t {} -y {rows}", quote_arg(pane_id)))
             .await
             .map(|_| ())
+    }
+
+    /// Set a user option on a pane (`set-option -p -t %pane @option value`).
+    pub async fn set_pane_option(
+        &self,
+        pane_id: &str,
+        option: &str,
+        value: &str,
+    ) -> Result<(), TmuxError> {
+        self.command(&format!(
+            "set-option -p -t {} {} {}",
+            quote_arg(pane_id),
+            quote_arg(option),
+            quote_arg(value)
+        ))
+        .await
+        .map(|_| ())
+    }
+
+    /// Unset a user option on a pane (`set-option -p -u -t %pane @option`).
+    pub async fn unset_pane_option(&self, pane_id: &str, option: &str) -> Result<(), TmuxError> {
+        self.command(&format!(
+            "set-option -p -u -t {} {}",
+            quote_arg(pane_id),
+            quote_arg(option)
+        ))
+        .await
+        .map(|_| ())
     }
 
     /// Toggle zoom on the window holding `pane_id` (`resize-pane -Z`).

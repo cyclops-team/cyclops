@@ -162,19 +162,28 @@ pub fn pane_canvas(canvas: Rect) -> Rect {
     }
 }
 
-/// Grid size declared to tmux for the active tab. Separator overhead is
-/// removed here and restored only as chrome by [`paint_window`].
-pub fn tmux_client_size(canvas: Rect, tab: &TabModel) -> (u16, u16) {
+/// Compute the exact target grid size for a specific layout tree and zoom state.
+pub fn window_target_size_for_layout(
+    canvas: Rect,
+    layout: &crate::layout::ResolvedLayout,
+    zoomed: bool,
+) -> (u16, u16) {
     let inner = pane_canvas(canvas);
-    let (gap_width, gap_height) = if tab.zoomed {
+    let (gap_width, gap_height) = if zoomed {
         (0, 0)
     } else {
-        layout_gap_overhead(&tab.layout, PANE_GAPS)
+        layout_gap_overhead(layout, PANE_GAPS)
     };
     (
         inner.width.saturating_sub(gap_width),
         inner.height.saturating_sub(gap_height),
     )
+}
+
+/// Grid size declared to tmux for the active tab. Separator overhead is
+/// removed here and restored only as chrome by [`paint_window`].
+pub fn tmux_client_size(canvas: Rect, tab: &TabModel) -> (u16, u16) {
+    window_target_size_for_layout(canvas, &tab.layout, tab.zoomed)
 }
 
 /// Render every pane of the active window. The gaps tmux leaves between
@@ -1075,6 +1084,8 @@ mod tests {
             layout,
             active_pane: focused.into(),
             zoomed: false,
+            minimized: Default::default(),
+            minimization_provenance: Default::default(),
         };
         let mut runtimes = RuntimeRegistry::default();
         let mut runtime = crate::runtime::PaneRuntime::new(5, 5);
@@ -2544,6 +2555,8 @@ mod tests {
             layout: resolve_layout(&node, &[]).unwrap(),
             active_pane: "%0".into(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         };
         let mut decoration = DecorationSnapshot {
             online: true,
@@ -2644,6 +2657,8 @@ mod tests {
             layout: resolve_layout(&node, &[]).unwrap(),
             active_pane: "%0".into(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         };
         let mut decoration = DecorationSnapshot {
             online: true,
@@ -2699,6 +2714,8 @@ mod tests {
             layout: resolve_layout(&node, &[]).unwrap(),
             active_pane: "%0".into(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         };
         let mut decoration = DecorationSnapshot {
             online: true,
@@ -2855,6 +2872,8 @@ mod tests {
             layout: perf_row_layout(n, leaf_w, leaf_h),
             active_pane: "%0".to_string(),
             zoomed: false,
+            minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
         }
     }
 
@@ -2930,5 +2949,114 @@ mod tests {
                 "full_frame_paint {n}-pane: canvas={canvas_w}x{canvas_h} iters={ITERS} p10={p10_us:.1}us median={median_us:.1}us p90={p90_us:.1}us max={max_us:.1}us"
             );
         }
+    }
+
+    #[test]
+    fn test_two_window_horizontal_vertical_topology_sizing_and_broadcast_refusal() {
+        use crate::layout::{parse_layout, resolve_layout};
+
+        fn make_tab(window_id: &str, layout_str: &str) -> TabModel {
+            let node = parse_layout(layout_str).unwrap();
+            let layout = resolve_layout(&node, &[]).unwrap();
+            TabModel {
+                window_id: window_id.to_string(),
+                name: "tab".to_string(),
+                layout,
+                active_pane: "%0".to_string(),
+                zoomed: false,
+                minimized: std::collections::HashMap::new(),
+                minimization_provenance: std::collections::HashMap::new(),
+            }
+        }
+
+        let canvas = Rect::new(0, 0, 178, 49);
+        let inner = pane_canvas(canvas);
+        assert_eq!(inner, Rect::new(1, 1, 176, 47));
+
+        // Window 1: Horizontal split (2 side-by-side panes: 87x47 + 88x47 + 1-col tmux divider = 176x47)
+        let tab_h = make_tab("@0", "1111,176x47,0,0{87x47,0,0,0,88x47,88,0,1}");
+        // Window 2: Vertical split (2 stacked panes: 176x23 + 176x23 + 1-row tmux divider = 176x47)
+        let tab_v = make_tab("@1", "2222,176x47,0,0[176x23,0,0,2,176x23,0,24,3]");
+
+        // 1. Verify exact per-window gap overheads
+        assert_eq!(
+            crate::layout::layout_gap_overhead(&tab_h.layout, PANE_GAPS),
+            (1, 0)
+        );
+        assert_eq!(
+            crate::layout::layout_gap_overhead(&tab_v.layout, PANE_GAPS),
+            (0, 1)
+        );
+
+        // 2. Verify target sizes match respective topologies: window_size + gap_overhead == inner_canvas_size
+        let target_h = tmux_client_size(canvas, &tab_h);
+        let target_v = tmux_client_size(canvas, &tab_v);
+        assert_eq!(
+            target_h,
+            (175, 47),
+            "Horizontal split needs 1 less column for 2-col visual gap"
+        );
+        assert_eq!(
+            target_v,
+            (176, 46),
+            "Vertical split needs 1 less row for 2-row visual gap"
+        );
+
+        assert_eq!(target_h.0 + 1, inner.width);
+        assert_eq!(target_h.1, inner.height);
+        assert_eq!(target_v.0, inner.width);
+        assert_eq!(target_v.1 + 1, inner.height);
+
+        // 3. Verify that layout_geometry rendered with target sizes perfectly fills inner canvas
+        let geom_h = crate::layout::layout_geometry(&tab_h.layout, inner, "%0", PANE_GAPS);
+        let geom_v = crate::layout::layout_geometry(&tab_v.layout, inner, "%2", PANE_GAPS);
+
+        let max_x_h = geom_h
+            .slots
+            .iter()
+            .map(|s| s.rect.x + s.rect.width)
+            .max()
+            .unwrap();
+        let max_y_h = geom_h
+            .slots
+            .iter()
+            .map(|s| s.rect.y + s.rect.height)
+            .max()
+            .unwrap();
+        assert_eq!((max_x_h - inner.x, max_y_h - inner.y), (176, 47));
+
+        let max_x_v = geom_v
+            .slots
+            .iter()
+            .map(|s| s.rect.x + s.rect.width)
+            .max()
+            .unwrap();
+        let max_y_v = geom_v
+            .slots
+            .iter()
+            .map(|s| s.rect.y + s.rect.height)
+            .max()
+            .unwrap();
+        assert_eq!((max_x_v - inner.x, max_y_v - inner.y), (176, 47));
+
+        // 4. Mutation Test: Simulating buggy broadcast of active target (target_h) to Window 2 (tab_v)
+        let broadcast_node_v = parse_layout("3333,175x47,0,0[175x23,0,0,2,175x23,0,24,3]").unwrap();
+        let broadcast_layout_v = resolve_layout(&broadcast_node_v, &[]).unwrap();
+        let (gap_w_broadcast, gap_h_broadcast) =
+            crate::layout::layout_gap_overhead(&broadcast_layout_v, PANE_GAPS);
+
+        let rendered_width_broadcast = 175 + gap_w_broadcast;
+        let rendered_height_broadcast = 47 + gap_h_broadcast;
+
+        assert_ne!(
+            (rendered_width_broadcast, rendered_height_broadcast),
+            (inner.width, inner.height),
+            "Broadcasting active target (175, 47) to vertical split window must fail the canvas equality invariant"
+        );
+        assert_eq!(
+            rendered_width_broadcast, 175,
+            "1 column underflow: 175 != 176"
+        );
+        assert_eq!(rendered_height_broadcast, 48, "1 row overflow: 48 > 47");
     }
 }

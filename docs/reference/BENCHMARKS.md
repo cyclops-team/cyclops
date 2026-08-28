@@ -365,9 +365,9 @@ the comparison survives. Measured here:
 
 | Windows | Old fan-out (`list-sessions` + membership + `list-windows` + `list-panes` per window) | Current `workspace_snapshot` |
 |---|---|---|
-| 1 | 13.69ms, 4 commands (W+3) | 0.18ms, 2 commands (fixed) |
-| 4 | 22.93ms, 7 commands (W+3) | 0.28ms, 2 commands (fixed) |
-| 8 | 36.22ms, 11 commands (W+3) | 0.33ms, 2 commands (fixed) |
+| 1 | 13.69ms, 4 commands (W+3) | 0.27ms, 3 commands (fixed) |
+| 4 | 22.93ms, 7 commands (W+3) | 0.38ms, 3 commands (fixed) |
+| 8 | 36.22ms, 11 commands (W+3) | 0.45ms, 3 commands (fixed) |
 
 | Panes | Old serial `hydrate_pane` loop | Current concurrent `hydrate_panes` |
 |---|---|---|
@@ -375,7 +375,7 @@ the comparison survives. Measured here:
 | 4 | 0.57ms | 0.30ms |
 | 8 | 1.68ms | 0.38ms |
 
-At eight windows the snapshot is about 110x faster in wall time and the
+At eight windows the snapshot is about 80x faster in wall time and the
 command count stops scaling with window count at all. At one pane the
 concurrent hydration is slightly slower than serial, which is the expected
 floor: there is nothing to overlap with a single pane.
@@ -404,7 +404,7 @@ isolated tmux server, n=100 each:
 |---|---|
 | One-shot `tmux display-message` process | 4.51ms |
 | One-shot `tmux capture-pane -p -J -S -500` process | 4.26ms |
-| One command over the daemon's open control connection | about 0.09ms (`workspace_snapshot` issues 2 in 0.18ms) |
+| One command over the daemon's open control connection | about 0.09ms (`workspace_snapshot` issues 3 in 0.27ms) |
 
 A v1 send was instrumented here by putting a counting shim ahead of `tmux`
 on PATH. One successful send spawned **24 one-shot tmux processes**, and
