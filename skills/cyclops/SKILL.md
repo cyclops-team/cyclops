@@ -152,7 +152,7 @@ Cyclops writes the summary beside one exact claim instruction after proving a
 clean composer:
 
 ```text
-[cyclops] FROM: codey-cyclops | Run the focused test suite. Report any exact failure. Claim: cyclops inbox claim m-att_<22-character-attempt-token>
+[cyclops from codey-cyclops] Run the focused test suite. Report any exact failure. | cyclops inbox claim m-att_<22-character-attempt-token>
 ```
 
 This is a two-surface contract:
@@ -161,7 +161,9 @@ This is a two-surface contract:
    for a CLI send or reply, even while the recipient is working. Working does
    not discard the wake. Human input or an ambiguous composer makes the worker
    wait until the composer is proven available, then it stages the same
-   summary and exact claim once.
+   summary and exact claim once. If the complete row cannot fit without
+   wrapping, Cyclops stages the shorter exact claim instead; the full summary
+   remains in the Messages view and mailbox.
 2. The mailbox is the authoritative back end. The subject, routing header, and
    complete technical body live there. The summary is only orientation. Run
    the exact `cyclops inbox claim m-att_...` command, read the complete claimed

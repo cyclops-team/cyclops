@@ -440,10 +440,11 @@ unknown state exits 1. The message is already durably accepted, so that exit
 must not trigger an unkeyed resend.
 
 For a non-admin recipient, a CLI-originated message with a summary selects
-Format 4 at the terminal write boundary:
+Format 4 at the terminal write boundary when the complete preview and claim
+fit one verifiable composer row:
 
 ```text
-[cyclops] FROM: implementer | The rate limiter is ready for review. Check the burst path for regressions. Claim: cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
+[cyclops from implementer] The rate limiter is ready for review. Check the burst path for regressions. | cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
 ```
 
 The 22-character URL-safe token encodes the complete 128-bit notification
@@ -458,7 +459,10 @@ preview is presentation only. The authenticated claim returns the immutable
 routing header and full technical body that the recipient must read before
 acting.
 
-The Format 4 claim instruction and Format 3 legacy command require a pane at
+The Format 4 requirement is the rendered row width, including the vendor
+prompt. If the full row does not fit at selection time, the same attempt uses
+the shorter exact Format 3 claim so the daemon can still verify and submit it;
+the durable summary remains in the Messages view. Format 3 requires a pane at
 least 60 columns wide. A narrower pane is
 recorded as `blocked_pre_write` with the compatible cause
 `write_readiness_changed`, plus its observed and required widths. Current
@@ -468,9 +472,11 @@ attempt once. The operator may withdraw it while it remains provably
 pre-write.
 
 Summaryless legacy clients retain the Format 3 capability path and canonical
-direct-payload fallback. Current CLI sends and replies always queue Format 4;
-working state does not discard it, while human input or ambiguous composer
-evidence keeps it waiting before the write boundary.
+direct-payload fallback. Current CLI sends and replies always queue a mailbox
+claim, prefer Format 4 when it is exactly provable, and use Format 3 when the
+preview would wrap. Working state does not discard either wake, while human
+input or ambiguous composer evidence keeps it waiting before the write
+boundary.
 
 The compatibility wire states are `not_started`, `queued`, `gating`, `writing`,
 `staged`, `submitted`, `notified`, `attention_required`, and `superseded`. This

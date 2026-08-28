@@ -1038,8 +1038,9 @@ async fn summary_notification_stages_the_preview_and_exact_claim_without_the_bod
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
     wait_pane_state(&mut rig, "idle").await;
+    resize_pane_and_allow_event(&mut rig, &pane, 244).await;
 
-    let summary = "Review the parser change. Report any release blocker.";
+    let summary = "This message outlines our Cyclops multi-agent communication test and includes a secret note. Claim the inbox message to read the complete test summary and details.";
     let body = "private implementation details must remain in the mailbox";
     let sent =
         send_summarized_workspace_message(&rig, "summary-claim", "Parser review", summary, body)
@@ -1055,7 +1056,7 @@ async fn summary_notification_stages_the_preview_and_exact_claim_without_the_bod
         "summary missing from pane: {screen}"
     );
     assert!(
-        screen.contains("FROM: admin"),
+        screen.contains("[cyclops from admin]"),
         "sender missing from pane: {screen}"
     );
     assert!(
@@ -1072,6 +1073,66 @@ async fn summary_notification_stages_the_preview_and_exact_claim_without_the_bod
     assert_eq!(
         writing.data.as_ref().unwrap()["doorbell_format"],
         cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM
+    );
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::Submitted).await;
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::AttentionRequired),
+        0,
+        "a proven one-row summary notification must submit without operator recovery"
+    );
+    rig.daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_summary_uses_the_exact_claim_instead_of_stranding_after_paste() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "workspace-summary-claim-fallback",
+        CAT_MANIFEST,
+        &composer_pane(),
+        "delivery_retry_max = 0",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+    resize_pane_and_allow_event(&mut rig, &pane, 80).await;
+
+    let summary = "This summary cannot fit beside its exact claim at this width. The mailbox still contains every detail.";
+    let sent = send_summarized_workspace_message(
+        &rig,
+        "summary-claim-fallback",
+        "Narrow summary",
+        summary,
+        "private body",
+    )
+    .await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::Submitted).await;
+
+    let attempt = current_notification_attempt(&workspace_lines(&rig), &message_id)
+        .expect("the fallback keeps the same exact attempt");
+    let screen = pane_history(&rig, &pane);
+    assert!(
+        screen.contains(&cyclops_proto::render_doorbell_v3(attempt)),
+        "the exact claim fallback did not reach the pane: {screen}"
+    );
+    assert!(
+        !screen.contains(summary),
+        "an unprovable wrapped preview was pasted"
+    );
+    let writing = notification_transition(&rig, &message_id, NotificationState::Writing)
+        .expect("the fallback fixes its selected format durably");
+    assert_eq!(
+        writing.data.as_ref().unwrap()["doorbell_format"],
+        cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM
+    );
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::AttentionRequired),
+        0
     );
     rig.daemon.shutdown().await;
 }
@@ -1804,9 +1865,10 @@ async fn a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt() 
         .capture(&pane)
         .contains(&compact_doorbell(&rig, &message_id)));
 
-    for _ in 1..draft.chars().count() {
-        rig.tmux.run_ok(&["send-keys", "-t", &pane, "BSpace"]);
-    }
+    let partial_clear = "\x7f".repeat(draft.chars().count() - 1);
+    rig.tmux
+        .run_ok(&["send-keys", "-l", "-t", &pane, &partial_clear]);
+    rig.tmux.wait_screen("main", "❯ e");
     wait_for_human_composer_evidence(&mut rig, &pane).await;
     assert!(!rig
         .tmux
@@ -2023,6 +2085,7 @@ async fn a_human_modal_holds_one_notification_attempt_until_the_prompt_is_cleare
     );
 
     rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
+    rig.tmux.wait_screen("main", "Model x · Ctx: 78%");
     // The clear first has to reach the delivery state machine and pass all
     // pre-write checks to the post_final_prewrite boundary, then complete
     // staging. Waiting on these durable latches separates a missed release
@@ -2637,7 +2700,32 @@ async fn current_command_exec_in_place_reopens_blocked_binding() {
     wait_pane_state(&mut rig, "idle").await;
     let pane_root = pane_pid(&rig, &pane);
 
-    rig.daemon.fail_next_final_binding_observation();
+    let (prewrite_tx, mut prewrite_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (resumed_tx, mut resumed_rx) = tokio::sync::mpsc::unbounded_channel();
+    let prewrite_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let prewrite_release_seam = Arc::clone(&prewrite_release);
+    let first_prewrite = Arc::new(AtomicBool::new(true));
+    rig.daemon.set_inject_pause({
+        let first_prewrite = Arc::clone(&first_prewrite);
+        move |phase| {
+            let prewrite_tx = prewrite_tx.clone();
+            let resumed_tx = resumed_tx.clone();
+            let prewrite_release = Arc::clone(&prewrite_release_seam);
+            let should_pause = phase == "pre_paste" && first_prewrite.swap(false, Ordering::SeqCst);
+            Box::pin(async move {
+                if !should_pause {
+                    return;
+                }
+                let _ = prewrite_tx.send(());
+                prewrite_release
+                    .acquire_owned()
+                    .await
+                    .expect("release initial prewrite")
+                    .forget();
+                let _ = resumed_tx.send(());
+            })
+        }
+    });
     let sent = send_workspace_message(
         &rig,
         "current-command-binding",
@@ -2646,6 +2734,17 @@ async fn current_command_exec_in_place_reopens_blocked_binding() {
     )
     .await;
     let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    tokio::time::timeout(Duration::from_secs(8), prewrite_rx.recv())
+        .await
+        .expect("initial binding reached the final prewrite path")
+        .expect("prewrite pause sender stayed open");
+    rig.daemon.fail_next_final_binding_observation();
+    prewrite_release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(8), resumed_rx.recv())
+        .await
+        .expect("initial prewrite resumed")
+        .expect("prewrite resume sender stayed open");
+    rig.daemon.clear_inject_pause();
     wait_for_notification_state(&mut rig, &message_id, NotificationState::BlockedPreWrite).await;
     let blocked = notification_transition(&rig, &message_id, NotificationState::BlockedPreWrite)
         .expect("the terminal binding observation failed closed");

@@ -911,7 +911,7 @@ pub fn render_doorbell_v4(
     attempt_id: NotificationAttemptId,
 ) -> String {
     format!(
-        "[cyclops] FROM: {sender_label} | {summary} Claim: {}",
+        "[cyclops from {sender_label}] {summary} | {}",
         render_doorbell_v3(attempt_id)
     )
 }

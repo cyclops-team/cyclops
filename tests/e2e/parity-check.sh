@@ -684,13 +684,13 @@ check "acceptance is separate from notification" '^accepted m-[[:xdigit:]]{32}$'
 check "the wake is a second fact" '^✓ accepted( · [0-9]+ ahead)? · wake (not started|queued|checking readiness|writing|staged|submitted|notified|withdrawn|needs attention|superseded)$'
 check_exit "mailbox acceptance exits 0" 0
 REVIEW_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
-wait_for "the reviewer mailbox doorbell" 100 pane_matches "$N2" '^❯ \[cyclops\] FROM: implementer \| Review the release notes\. Confirm the mailbox contract\. Claim: cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
+wait_for "the reviewer mailbox doorbell" 100 pane_matches "$N2" '^❯ \[cyclops from implementer\] Review the release notes\. Confirm the mailbox contract\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 printf '\n$ tmux capture-pane -p -t %s\n' "$N2"
 tmx capture-pane -p -t "$N2" | grep -v '^$' > "$OUT"
 cat "$OUT"
-check "the recipient sees the sender, summary, and exact attempt doorbell" '^❯ \[cyclops\] FROM: implementer \| Review the release notes\. Confirm the mailbox contract\. Claim: cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
+check "the recipient sees the sender, summary, and exact attempt doorbell" '^❯ \[cyclops from implementer\] Review the release notes\. Confirm the mailbox contract\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 check_absent "the pane does not receive the body" '^Check the mailbox contract\.$'
-REVIEW_LOCATOR="$(awk '/^❯ \[cyclops\] FROM: implementer \| Review the release notes\. Confirm the mailbox contract\. Claim: cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$/ { print $NF; exit }' "$OUT")"
+REVIEW_LOCATOR="$(awk '/^❯ \[cyclops from implementer\] Review the release notes\. Confirm the mailbox contract\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$/ { print $NF; exit }' "$OUT")"
 [ -n "$REVIEW_LOCATOR" ] || { echo "!! exact attempt locator was not captured" >&2; exit 1; }
 wait_for "the reviewer doorbell to be submitted" 100 notification_crossed_submit "$REVIEW_ID"
 
@@ -780,7 +780,7 @@ agent_command implementer "$N1" 'send reviewer --subject "Burst path fix, ready 
 check "the handoff is accepted from the pane" '^accepted m-[[:xdigit:]]{32}$'
 check_exit "the handoff exits 0" 0
 HANDOFF="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
-wait_for "the handoff doorbell" 100 pane_matches "$N2" '^❯ \[cyclops\] FROM: implementer \| Review the burst path fix\. Check the passing tests\. Claim: cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
+wait_for "the handoff doorbell" 100 pane_matches "$N2" '^❯ \[cyclops from implementer\] Review the burst path fix\. Check the passing tests\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 wait_for "the handoff doorbell to be submitted" 100 notification_crossed_submit "$HANDOFF"
 
 stop_composer reviewer "$N2"
@@ -795,7 +795,7 @@ agent_command reviewer "$N2" "reply $HANDOFF --summary \"Approve the burst path 
 check "reply derives routing from the parent" '^accepted m-[[:xdigit:]]{32}$'
 check_exit "an accepted reply exits 0" 0
 REPLY_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
-wait_for "the reply doorbell" 100 pane_matches "$N1" '^❯ \[cyclops\] FROM: reviewer \| Approve the burst path fix\. Note one retry issue\. Claim: cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
+wait_for "the reply doorbell" 100 pane_matches "$N1" '^❯ \[cyclops from reviewer\] Approve the burst path fix\. Note one retry issue\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 wait_for "the reply doorbell to be submitted" 100 notification_crossed_submit "$REPLY_ID"
 stop_composer implementer "$N1"
 agent_command implementer "$N1" "inbox claim $REPLY_ID --plain"
@@ -1034,7 +1034,7 @@ check "the first message is accepted"     '^accepted m-[[:xdigit:]]{32}$'
 check "and reports notification separately" '^✓ accepted( · [0-9]+ ahead)? · wake (not started|queued|checking readiness|writing|staged|submitted|notified|withdrawn|needs attention|superseded)$'
 check_exit "and accepted send exits 0" 0
 DUO_MESSAGE_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
-wait_for "the second rig reviewer doorbell" 100 duo_pane_matches "$D2" '^❯ \[cyclops\] FROM: implementer \| Review the greeting\. Reply when ready\. Claim: cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
+wait_for "the second rig reviewer doorbell" 100 duo_pane_matches "$D2" '^❯ \[cyclops from implementer\] Review the greeting\. Reply when ready\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 wait_for "the second rig doorbell to be submitted" 100 duo_notification_crossed_submit "$DUO_MESSAGE_ID"
 
 printf '\n$ cyclops history\n'
@@ -1200,10 +1200,10 @@ check "the default bound send is accepted" '^accepted m-[[:xdigit:]]{32}$'
 check "its wake state is separate" '^✓ accepted( · [0-9]+ ahead)? · wake (not started|queued|checking readiness|writing|staged|submitted|notified|withdrawn|needs attention|superseded)$'
 check_exit "the default bound send exits 0" 0
 STOCK_BOUND_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
-wait_for "the defaults reviewer doorbell" 100 stock_pane_matches "$S2" '^❯ \[cyclops\] FROM: implementer \| Review the bound greeting\. Claim the private details\. Claim: cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
+wait_for "the defaults reviewer doorbell" 100 stock_pane_matches "$S2" '^❯ \[cyclops from implementer\] Review the bound greeting\. Claim the private details\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 wait_for "the defaults doorbell to be submitted" 100 stock_notification_crossed_submit "$STOCK_BOUND_ID"
 stock_tmx capture-pane -p -t "$S2" > "$OUT"
-check "the default pane gets the sender, summary, and exact attempt doorbell" '^❯ \[cyclops\] FROM: implementer \| Review the bound greeting\. Claim the private details\. Claim: cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
+check "the default pane gets the sender, summary, and exact attempt doorbell" '^❯ \[cyclops from implementer\] Review the bound greeting\. Claim the private details\. \| cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 check_absent "the default pane does not get the body" '^private default body$'
 
 # History owns message facts, not standard notification badges.
