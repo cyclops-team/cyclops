@@ -12,6 +12,16 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 retries = 0
 fail-fast = false
 
+[test-groups]
+# Daemon integration tests each own a private tmux server, daemon, socket, and
+# fixture process tree. Keep their concurrency at the repository's existing
+# eight-slot process bound.
+cyclopsd-rigs = { max-threads = 8 }
+
+[[profile.default.overrides]]
+filter = 'package(cyclopsd)'
+test-group = 'cyclopsd-rigs'
+
 # Nextest launches every test in its own process. That bypasses the
 # workspace performance suite's in-process serial lock and lets its tmux
 # floods compete with the UI suites' wall-clock budgets. Give each of these

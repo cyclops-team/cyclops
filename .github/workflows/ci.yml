@@ -58,7 +58,7 @@ jobs:
         run: |
           status=0
           cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast || status=$?
-          cargo test -p cyclopsd --all-targets --no-fail-fast || status=$?
+          cargo nextest run -p cyclopsd --no-fail-fast || status=$?
           cargo test --workspace --doc || status=$?
           exit "$status"
       # A path in a doc is checkable. Before this, ARCHITECTURE.md pointed
@@ -90,7 +90,7 @@ jobs:
           mkdir -p "$CYCLOPS_TEST_TMP"
           status=0
           cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast || status=$?
-          cargo test -p cyclopsd --all-targets --no-fail-fast || status=$?
+          cargo nextest run -p cyclopsd --no-fail-fast || status=$?
           cargo test --workspace --doc || status=$?
           exit "$status"
 
@@ -146,6 +146,6 @@ jobs:
         run: |
           status=0
           cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast || status=$?
-          cargo test -p cyclopsd --all-targets --no-fail-fast || status=$?
+          cargo nextest run -p cyclopsd --no-fail-fast || status=$?
           cargo test --workspace --doc || status=$?
           exit "$status"
