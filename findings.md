@@ -2118,3 +2118,35 @@ hook to restore on death. The hook was measured working, and it does fire on
 SIGTERM, but its per-window restore list must be re-baked whenever a tab
 opens, it is itself state that outlives a crashed owner, and hook context
 exposes only `hook_client`, which by M8 is the weaker half of the key.
+
+## F77. AGY 1.1.22 changed two status-row fields without changing the composer
+
+MEASURED 2026-08-28 on a fresh AGY 1.1.22 pane at 79x49 under tmux 3.6a.
+Cyclops staged one exact body-free format 3 doorbell in the active composer,
+but correctly withheld Enter because the shipped 1.1.21 trailer rules could
+not prove that the two rows below it were vendor chrome. The resulting
+notification was `attention_required` with `verify_failed`; its durable
+mailbox entry remained claimable, and an exact socket claim and reply still
+succeeded after the operator cleared the staged row.
+
+Two independently necessary status-row changes caused the refusal:
+
+- The plain row ended in `Ctx:` with no percentage. The shipped rule required
+  `Ctx: <digits>%`.
+- The escaped row painted `Gemini` with truecolor
+  `ESC[38;2;174;198;207m`. The shipped rule allowed only the earlier
+  256-color `ESC[38;5;<index>m` prefix.
+
+Probe: capture only the prompt and two trailer rows from the isolated pane,
+then run the production composer extractor and exact staging proof against a
+generated `render_doorbell_v3` row. Before the manifest change,
+`agy_1_1_22_truecolor_empty_ctx_format_3_reaches_the_submit_gate` returned
+`ComposerContentProof::Unprovable`. After the change it returns the exact
+visible doorbell and admits the submit gate. The shipped-rules suite separately
+keeps conversational text and trailer lookalikes rejected.
+
+Fix: accept an empty or populated context value, and accept only the two
+measured color encodings at the anchored `Gemini` prefix. Rejected alternatives:
+disabling the trailer requirement, accepting arbitrary SGR, or treating the
+visible doorbell alone as ownership proof. Each would weaken the active
+composer boundary instead of teaching the manifest the measured vendor chrome.

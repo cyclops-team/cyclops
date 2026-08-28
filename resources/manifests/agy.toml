@@ -202,19 +202,22 @@ paste-then-Enter would have lost the message silently."""
 # painted. The two lists are one layout: entry i is row i, plain and escaped.
 composer_trailer_regex = [
   '^─+$',
-  '^\s{0,4}Gemini [^·]+(?: · [^·]+){2,} · Ctx: \d+%(?: · .+)?\s*$',
+  '^\s{0,4}Gemini [^·]+(?: · [^·]+){2,} · Ctx:(?: \d+%)?(?: · .+)?\s*$',
 ]
 composer_trailer_regex_esc = [
   '^\x1b\[90m─',
-  '^\x1b\[38;5;\d+mGemini\b',
+  '^\x1b\[(?:38;5;\d+|38;2;\d+;\d+;\d+)mGemini\b',
 ]
 # The first 2 rows are painted every time; the rest are optional.
 composer_trailer_required_prefix = 2
-# MEASURED live on agy 1.1.21. The active composer prompt is one plain `>`
+# MEASURED live on agy 1.1.21 and 1.1.22. The active composer prompt is one
+# plain `>`
 # followed by one separator space and the exact compact doorbell. Joined
 # continuation rows carry no trusted chrome here, so preserve every byte and
 # let the exact payload comparison decide. The styled trailer still proves the
-# active composer boundary before Cyclops can submit.
+# active composer boundary before Cyclops can submit. AGY 1.1.22 may leave the
+# Ctx value empty and paints the model name with truecolor instead of the
+# earlier 256-color palette; both measured shapes remain chrome-only.
 composer_prompt_regex = '^\s*>\s?(?P<content>.*)$'
 composer_continuation_regex = '^(?P<content>.*)$'
 
