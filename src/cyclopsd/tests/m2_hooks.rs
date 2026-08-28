@@ -206,6 +206,14 @@ async fn f1_zero_edge_tier1_downgrades_notifies_once_and_loses_nothing() {
     loop {
         let status = rig.ctl.request("status", json!({})).await;
         let pane_status = status_pane(&status);
+        if pane_status["write_block"] == "status_refresh_incomplete" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first delivery status refresh never completed: {status}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            continue;
+        }
         assert_eq!(pane_status["hooks_verified"], false, "{status}");
         if pane_status["write_ready"] == true {
             break;
