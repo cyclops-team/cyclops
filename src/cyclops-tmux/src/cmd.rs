@@ -13,6 +13,8 @@
 use std::path::Path;
 use std::process::Command;
 
+use tokio::process::Command as TokioCommand;
+
 use crate::error::TmuxError;
 
 /// Run one tmux command and return its stdout, trailing newline trimmed.
@@ -39,6 +41,40 @@ pub(crate) fn run(
     }
     cmd.args(args);
     let out = cmd.output().map_err(|e| TmuxError::Spawn(e.to_string()))?;
+    if out.status.success() {
+        let mut text = String::from_utf8_lossy(&out.stdout).to_string();
+        while text.ends_with('\n') || text.ends_with('\r') {
+            text.pop();
+        }
+        Ok(text)
+    } else {
+        Err(TmuxError::Command(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ))
+    }
+}
+
+/// Async one-shot tmux command. Dropping the future kills the child, which
+/// lets a caller put one bound around a larger operation that includes this
+/// authoritative probe and any work selected by its result.
+pub(crate) async fn run_async(
+    socket: Option<&str>,
+    config_file: Option<&Path>,
+    args: &[&str],
+) -> Result<String, TmuxError> {
+    let mut cmd = TokioCommand::new("tmux");
+    cmd.arg("-u");
+    if let Some(sock) = socket {
+        cmd.args(["-L", sock]).env_remove("TMUX");
+    }
+    if let Some(cfg) = config_file {
+        cmd.arg("-f").arg(cfg);
+    }
+    cmd.args(args).kill_on_drop(true);
+    let out = cmd
+        .output()
+        .await
+        .map_err(|error| TmuxError::Spawn(error.to_string()))?;
     if out.status.success() {
         let mut text = String::from_utf8_lossy(&out.stdout).to_string();
         while text.ends_with('\n') || text.ends_with('\r') {

@@ -1,6 +1,8 @@
 //! Session discovery for workspace attach.
 
-use crate::cmd::{run, session_target};
+use std::path::Path;
+
+use crate::cmd::{run, run_async, session_target};
 use crate::error::TmuxError;
 
 /// One session on a tmux server.
@@ -45,6 +47,52 @@ pub struct WindowPaneRow {
 pub struct WindowMembership {
     pub session_id: String,
     pub window_id: String,
+}
+
+/// Resolve a server-global pane id to exactly one stable tmux session id.
+///
+/// `list-panes -a` is authoritative even when every per-session watcher is
+/// between a structural hint and its debounced reconcile. A linked window can
+/// make one pane appear under more than one session; that is deliberately an
+/// ambiguity error rather than an arbitrary owner choice.
+pub async fn pane_session_id(
+    pane_id: &str,
+    socket: Option<&str>,
+    config_file: Option<&Path>,
+) -> Result<Option<String>, TmuxError> {
+    let out = run_async(
+        socket,
+        config_file,
+        &["list-panes", "-a", "-F", "#{pane_id}\t#{session_id}"],
+    )
+    .await?;
+    parse_pane_session_id(&out, pane_id)
+}
+
+fn parse_pane_session_id(out: &str, pane_id: &str) -> Result<Option<String>, TmuxError> {
+    let mut found: Option<String> = None;
+    for line in out.lines() {
+        let Some((pane, session)) = line.split_once('\t') else {
+            return Err(TmuxError::Protocol(format!(
+                "list-panes ownership line: {line:?}"
+            )));
+        };
+        if pane != pane_id {
+            continue;
+        }
+        if session.is_empty() || session.contains('\t') {
+            return Err(TmuxError::Protocol(format!(
+                "list-panes ownership line: {line:?}"
+            )));
+        }
+        if found.as_deref().is_some_and(|current| current != session) {
+            return Err(TmuxError::Protocol(format!(
+                "pane {pane_id} belongs to more than one session"
+            )));
+        }
+        found = Some(session.to_string());
+    }
+    Ok(found)
 }
 
 /// List sessions on the server `socket` names (None = default server).
@@ -210,4 +258,22 @@ pub fn active_pane(session: &str, socket: Option<&str>) -> Result<String, TmuxEr
     Err(TmuxError::Protocol(format!(
         "no active pane in session {session}"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_pane_session_id;
+
+    #[test]
+    fn pane_owner_is_exact_absent_or_ambiguous() {
+        let rows = "%1\t$0\n%2\t$1";
+        assert_eq!(
+            parse_pane_session_id(rows, "%2").unwrap(),
+            Some("$1".into())
+        );
+        assert_eq!(parse_pane_session_id(rows, "%9").unwrap(), None);
+
+        let linked = "%2\t$0\n%2\t$1";
+        assert!(parse_pane_session_id(linked, "%2").is_err());
+    }
 }

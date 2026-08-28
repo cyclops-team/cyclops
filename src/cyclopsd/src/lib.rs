@@ -94,7 +94,8 @@ use cyclops_proto::{
 };
 use cyclops_state::{RepairSummary, StateRoot};
 use cyclops_tmux::{
-    ControlConfig, PaneEvent, PaneField, PaneRow, SessionWatcher, TmuxError, TmuxVersion,
+    pane_session_id, ControlConfig, PaneEvent, PaneField, PaneRow, SessionWatcher, TmuxError,
+    TmuxVersion,
 };
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, watch, Notify};
@@ -106,6 +107,9 @@ const OUTPUT_SETTLE: Duration = Duration::from_millis(300);
 /// Watcher reconnect backoff bounds (reconnects only, never state polls).
 const RECONNECT_MIN: Duration = Duration::from_millis(200);
 const RECONNECT_MAX: Duration = Duration::from_secs(5);
+/// Maximum wall time a pane-label request lends to authoritative discovery
+/// after its normal cache lookup misses.
+const NAME_RECONCILE_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long shutdown waits for tasks before aborting them.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 /// Event broadcast capacity. Doubles as every subscriber's buffer: a
@@ -121,6 +125,12 @@ pub(crate) type InjectPause = Arc<
     dyn Fn(&'static str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         + Send
         + Sync,
+>;
+
+/// Test seam: an async pause before a watcher reconcile requested by
+/// `pane.label`. Always None in production.
+pub(crate) type NameReconcilePause = Arc<
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
 >;
 
 /// One pane inside one append-only daemon session slot.
@@ -268,6 +278,8 @@ pub(crate) struct Inner {
     pub(crate) hook_liveness: selftest::HookLiveness,
     /// Test-only injection pause, see [`InjectPause`].
     pub(crate) inject_pause: StdMutex<Option<InjectPause>>,
+    /// Test-only naming reconcile pause, see [`NameReconcilePause`].
+    pub(crate) name_reconcile_pause: StdMutex<Option<NameReconcilePause>>,
     /// Test-only: make the `--clear` chrome restore fail the way tmux
     /// refusing a command would. See [`Daemon::fail_chrome_restore`].
     pub(crate) fail_chrome_restore: AtomicBool,
@@ -1827,6 +1839,33 @@ impl Daemon {
         *self.inner.inject_pause.lock().expect("inject pause lock") = None;
     }
 
+    /// Test-only seam: pause a pane-name fallback before it reconciles one
+    /// watched session. Not part of the public API surface.
+    #[doc(hidden)]
+    pub fn set_name_reconcile_pause<F>(&self, f: F)
+    where
+        F: Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        *self
+            .inner
+            .name_reconcile_pause
+            .lock()
+            .expect("name reconcile pause lock") = Some(Arc::new(f));
+    }
+
+    /// Clear the test-only pane-name reconcile pause hook.
+    #[doc(hidden)]
+    pub fn clear_name_reconcile_pause(&self) {
+        *self
+            .inner
+            .name_reconcile_pause
+            .lock()
+            .expect("name reconcile pause lock") = None;
+    }
+
     /// Test-only seam: from here on, the chrome restore behind `--clear`
     /// fails as tmux refusing the command would. Not part of the public API
     /// surface.
@@ -1942,8 +1981,30 @@ pub(crate) async fn label_pane(
     label: Option<String>,
     manifest: Option<String>,
 ) -> Result<Value, WireError> {
-    // 1. Resolve.
-    let Some((session_idx, pane_id)) = inner.resolve_recipient(target) else {
+    // 1. Resolve. A pane can be real before the structural notification's
+    //    debounce updates the watcher table, and a lost hint can leave that
+    //    table stale. Naming is an explicit request about current tmux state,
+    //    so a raw pane-id cache miss earns one authoritative owner lookup and
+    //    one reconcile of that session alone, under one wall-clock bound.
+    let mut resolved = inner.resolve_recipient(target);
+    if resolved.is_none() && target.parse::<TmuxPaneId>().is_ok() {
+        match tokio::time::timeout(
+            NAME_RECONCILE_TIMEOUT,
+            reconcile_raw_pane_for_naming(inner, target),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                debug!(%error, pane_id = target, "cannot refresh pane table for naming");
+            }
+            Err(_) => {
+                debug!(pane_id = target, "pane naming reconcile timed out");
+            }
+        }
+        resolved = inner.resolve_recipient(target);
+    }
+    let Some((session_idx, pane_id)) = resolved else {
         return Err(WireError {
             code: "no_such_target".to_string(),
             message: format!("no such target {target:?}"),
@@ -2046,6 +2107,45 @@ pub(crate) async fn label_pane(
             .get(&PaneKey::new(session_idx, &pane_id))
             .and_then(|e| e.manifest.clone())),
     }))
+}
+
+/// Resolve one raw tmux pane id to its stable owner and refresh only that
+/// session. Every lock below protects a short clone/read and is dropped
+/// before the optional test pause or watcher reconcile awaits.
+async fn reconcile_raw_pane_for_naming(inner: &Arc<Inner>, target: &str) -> Result<(), TmuxError> {
+    let Some(session_id) = pane_session_id(
+        target,
+        inner.cfg.tmux_socket.as_deref(),
+        inner.cfg.tmux_config.as_deref(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let watcher = inner
+        .active_session_slots()
+        .into_iter()
+        .filter_map(|(_, slot)| {
+            slot.link
+                .lock()
+                .expect("session link lock")
+                .watcher
+                .as_ref()
+                .map(Arc::clone)
+        })
+        .find(|watcher| watcher.session_id() == Some(session_id.as_str()));
+    let Some(watcher) = watcher else {
+        return Ok(());
+    };
+    let pause = inner
+        .name_reconcile_pause
+        .lock()
+        .expect("name reconcile pause lock")
+        .clone();
+    if let Some(pause) = pause {
+        pause(watcher.session()).await;
+    }
+    watcher.reconcile_now().await
 }
 
 /// Why a name cannot be claimed: who wears it now, where, and the way
@@ -3004,6 +3104,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         ack_state: ack::AckState::new(),
         hook_liveness: selftest::HookLiveness::new(),
         inject_pause: StdMutex::new(None),
+        name_reconcile_pause: StdMutex::new(None),
         fail_chrome_restore: AtomicBool::new(false),
         fail_next_final_binding_observation: AtomicBool::new(false),
         fail_pre_record_writing: StdMutex::new(None),
@@ -5032,6 +5133,7 @@ mod tests {
             ack_state: ack::AckState::new(),
             hook_liveness: selftest::HookLiveness::new(),
             inject_pause: StdMutex::new(None),
+            name_reconcile_pause: StdMutex::new(None),
             fail_chrome_restore: AtomicBool::new(false),
             fail_next_final_binding_observation: AtomicBool::new(false),
             fail_pre_record_writing: StdMutex::new(None),

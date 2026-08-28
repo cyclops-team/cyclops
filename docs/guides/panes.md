@@ -30,6 +30,12 @@ cyclops list
 `cyclops status` lists every pane cyclops watches, with its pane id.
 That is where the `%4` comes from.
 
+If tmux created the pane just before the naming request, `cyclops name`
+asks tmux which session owns that id and refreshes only that session before
+deciding the id does not exist. The fallback has a one-second wall-clock
+bound, so an unhealthy watcher cannot leave naming stuck. You do not need to
+wait for the structural-change debounce and retry.
+
 `--self` skips that lookup: it names the pane the command is running in,
 taking the id from `$TMUX_PANE`, which tmux sets in every process it
 starts. It is the form an agent uses to register itself on startup, and
