@@ -700,16 +700,16 @@
         <div class="sect-body">skills/cyclops/SKILL.md is one file that teaches a coding agent the send/wait/reply verbs and the safety rules. Nothing installs it automatically: copy it where your agent looks for instructions (for Claude Code, ~/.claude/skills/cyclops/SKILL.md) — or skip it, since every command explains itself with --help and every delivered message carries its own reply instructions.</div>
       </details>
       <details class="sect">
-        <summary><span class="sect-chev"></span><span class="sect-title mono">docs/</span><span class="sect-trail">23 pages in 3 sections; start at development/HANDOFF.md</span></summary>
-        <div class="sect-body">Split by audience: docs/development/ (8 pages — HANDOFF, ARCHITECTURE, DELIVERY, INVARIANTS, GOALS, STYLE, CUTOVER, V5), docs/guides/ (11 how-to pages — QUICKSTART, install, send, workspaces…), docs/reference/ (MANIFESTS, PROTOCOL, hooks, BENCHMARKS), plus docs/public/, the rendered public docs site. The developer front door is docs/development/HANDOFF.md. Unusual and important: docs are CI-enforced. Quoted terminal output must match what the binaries actually print (tests/e2e/parity-check.sh) and every quoted file path must exist (scripts/check-doc-paths.py). Treat doc edits like code edits.</div>
+        <summary><span class="sect-chev"></span><span class="sect-title mono">docs/</span><span class="sect-trail">22 pages in 3 sections; start at development/HANDOFF.md</span></summary>
+        <div class="sect-body">Split by audience: docs/development/ (7 pages: HANDOFF, ARCHITECTURE, DELIVERY, INVARIANTS, GOALS, STYLE, V5), docs/guides/ (11 how-to pages: QUICKSTART, install, send, workspaces...), docs/reference/ (MANIFESTS, PROTOCOL, hooks, BENCHMARKS), plus docs/public/, the rendered public docs site. The developer front door is docs/development/HANDOFF.md. Unusual and important: docs are CI-enforced. Quoted terminal output must match what the binaries actually print (tests/e2e/parity-check.sh) and every quoted file path must exist (scripts/check-doc-paths.py). Treat doc edits like code edits.</div>
       </details>
       <details class="sect">
         <summary><span class="sect-chev"></span><span class="sect-title mono">demos/</span><span class="sect-trail">runnable proofs</span></summary>
         <div class="sect-body">End-to-end scripts that run the real binaries on throwaway tmux servers and touch nothing of yours: m0-status through m5-theme (send, a two-agent conversation, the stream, naming, workspace save/destroy/restore, live theme switching), plus per-step launch/record scripts. The self-contained delivery demo is m1-send.sh. House rule: ship a demo with anything a user will do end to end — on this codebase demos have caught defects four times that reading the code did not.</div>
       </details>
       <details class="sect">
-        <summary><span class="sect-chev"></span><span class="sect-title mono">scripts/</span><span class="sect-trail">installer + doc gate + v1 shim</span></summary>
-        <div class="sect-body">install.sh (the build-from-source installer: builds both binaries, places them on your PATH, backs up your shell profile before touching it, never uses sudo, has --uninstall, and can opt panes into vendor hook wiring), check-doc-paths.py (the doc-path CI gate), and commpact-shim/ (the prepared v1 compatibility shim and its guarded installer — nothing installs it automatically).</div>
+        <summary><span class="sect-chev"></span><span class="sect-title mono">scripts/</span><span class="sect-trail">installer + doc gate</span></summary>
+        <div class="sect-body">install.sh (the build-from-source installer: builds both binaries, places them on your PATH, backs up your shell profile before touching it, never uses sudo, has --uninstall, and can opt panes into vendor hook wiring), and check-doc-paths.py (the doc-path CI gate).</div>
       </details>
       <details class="sect">
         <summary><span class="sect-chev"></span><span class="sect-title mono">tests/</span><span class="sect-trail">e2e gates + the test-only tmux rig</span></summary>
@@ -1184,9 +1184,8 @@
             risking your changes.
           </div>
           <p class="small tertiary">
-            The previous shell/Python implementation lives on as the read-only <code>v1</code> branch
-            and <code>v1-final</code> tag. Nothing migrates v1 state automatically;
-            <code>docs/development/CUTOVER.md</code> is the runbook if you still run it.
+            The previous shell/Python implementation lives on at the read-only
+            <code>v1-final</code> tag as historical predecessor reference.
           </p>
         </div>
       </div>
@@ -1219,7 +1218,7 @@
           <p class="small tertiary">
             Touching either installer adds <code>cmp scripts/install.sh website/static/install.sh</code>
             and <code>./tests/e2e/parity-check.sh --with-installer</code> (a release build). CI also
-            reruns the suite with scratch storage relocated, tests the v1 shim, checks the website
+            reruns the suite with scratch storage relocated, checks the website
             build, and runs an advisory job against tmux built from master.
           </p>
         </div>

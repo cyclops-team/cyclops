@@ -94,7 +94,7 @@ consumed via `{ workspace = true }` (or an explicit `path` in ledger).
 |---|---|
 | tmux ≥ 3.2 | The product itself and most tests (developed on 3.6a; CI also builds tmux master as an advisory canary) |
 | Rust stable toolchain | Building; CI uses `dtolnay/rust-toolchain@stable` with rustfmt + clippy. Cloud VMs may need ≥1.85 for lockfile/`edition2024` dependency crates — see `AGENTS.md` Custom Instructions |
-| Python 3 | `scripts/check-doc-paths.py`, `scripts/commpact-shim/test_shim.py`, `tests/e2e/m1_soak.py`, `tests/e2e/test_vocab.py`, and demos that probe the ledger |
+| Python 3 | `scripts/check-doc-paths.py`, `tests/e2e/m1_soak.py`, `tests/e2e/test_vocab.py`, and demos that probe the ledger |
 | jq | Demos that read the ledger back (`demos/m1-send.sh`, `demos/m2-conversation.sh`, `demos/m3-stream.sh`, `tests/e2e/parity-check.sh`) |
 | POSIX shell | `demos/`, `scripts/install.sh` (`bash -n` must always pass on demos), `resources/hooks/` templates, `tests/e2e/lib/lib.sh` |
 | Node.js / npm | Website CI only (`npm run check`, `npm run build`) — not required to build or run the Rust product |

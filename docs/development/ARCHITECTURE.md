@@ -484,8 +484,7 @@ renders), `resources/layouts/` (the four workspace presets, compiled in with
 two SHIPPED lists are held to), `demos/` (runnable end-to-end
 scripts; `tests/e2e/lib/lib.sh` holds the two rules the scripts must not copy, the
 scratch root and the tmux teardown), `tests/e2e/lib/` (the Python probe
-harness), `scripts/commpact-shim/` (the prepared v1 shim and its guarded
-installer; nothing installs it, see docs/development/CUTOVER.md), `website/` (the
+harness), `website/` (the
 landing page for usecyclops.dev, outside the Cargo workspace and checked by
 its own CI job).
 
@@ -506,9 +505,7 @@ its own CI job).
 | tmux specifics confined to one adapter, CI against tmux HEAD | `src/cyclops-tmux`; advisory tmux-HEAD CI job. One invocation is outside it: `cyclopsd::probe_tmux` runs `tmux -V` and parses through the adapter, which the adapter's own header names as the exception |
 
 The MCP front-door on the same daemon (option D absorbed) is not built and
-is not a dependency of anything shipped. The v1 shim and its runbook remain
-available for an explicit migration; nothing installs them automatically
-(`docs/development/CUTOVER.md`).
+is not a dependency of anything shipped.
 
 ### The validation amendments
 

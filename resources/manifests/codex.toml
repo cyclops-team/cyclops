@@ -147,7 +147,7 @@ region = "bottom_non_empty_lines(6)"
 line_regex = ['^\s*›']
 note = """The composer line renders ghost-text suggestions such as
 '› Write tests for @filename' when empty. Ghost text is NOT staged user input.
-This is the same trap cyclops v1 hardcoded an allowlist for (bin/commPact:678-683);
+This is the same trap the predecessor v1 implementation hardcoded an allowlist for;
 matching the glyph rather than emptiness avoids needing that allowlist.
 FALLBACK ONLY: on a plain capture this rule also matches typed text and reads
 it as idle. The esc rules above outrank it whenever an escaped capture is

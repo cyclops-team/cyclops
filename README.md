@@ -155,7 +155,6 @@ behind it. Otherwise, one page per question.
 | [V5.md](docs/development/V5.md) | What the v5 line is for |
 | [GOALS.md](docs/development/GOALS.md) | The quality bar every milestone is reviewed against |
 | [STYLE.md](docs/development/STYLE.md) | How this codebase is written |
-| [CUTOVER.md](docs/development/CUTOVER.md) | Migrating from the v1 shell toolkit |
 
 ## License
 

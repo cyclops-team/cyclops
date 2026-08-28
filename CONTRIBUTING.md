@@ -212,7 +212,6 @@ throw away the signal that tells a portability bug from a real regression.
 | `cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast` | Any parallel-safe test fails, on either OS |
 | `cargo test -p cyclopsd --all-targets --no-fail-fast` | Any daemon test fails under its process-isolated rig contract |
 | `cargo test --workspace --doc` | A Rust doctest fails |
-| `python3 scripts/commpact-shim/test_shim.py` | The commPact v1 shim broke (bash and python, invisible to cargo) |
 | `python3 scripts/check-doc-paths.py` | A doc points at a file this repo does not have, or a page exists that no front door links to. `--selftest` proves the checker still catches, so a green run cannot mean it stopped looking |
 | `./tests/e2e/parity-check.sh` | A doc quotes output the binaries no longer print |
 | The whole suite again with `CYCLOPS_TEST_TMP` relocated | Something hardcoded a scratch path (F24) |

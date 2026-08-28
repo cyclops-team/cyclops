@@ -46,10 +46,9 @@ stage "doc paths" python3 scripts/check-doc-paths.py
 stage "test" rust_tests
 
 if [ "$fast" = "1" ]; then
-    printf '== fast pass done (skipped: shim, parity)\n'
+    printf '== fast pass done (skipped: parity)\n'
     exit 0
 fi
 
-stage "v1 shim" python3 scripts/commpact-shim/test_shim.py
 stage "parity" ./tests/e2e/parity-check.sh
 printf '== all gates green\n'

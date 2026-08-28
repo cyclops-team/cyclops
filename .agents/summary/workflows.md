@@ -179,8 +179,7 @@ flowchart TB
     subgraph test["test (ubuntu + macos, fail-fast: false)"]
         a["cargo fmt --check"] --> b["cargo clippy -D warnings"]
         b --> c["nextest parallel-safe suites, cargo test cyclopsd, then workspace doctests"]
-        c --> d["commPact shim tests (python)"]
-        d --> e["check-doc-paths.py --selftest, then run"]
+        c --> e["check-doc-paths.py --selftest, then run"]
         e --> f["tests/e2e/parity-check.sh (docs and binaries agree)"]
         f --> g["whole suite again with CYCLOPS_TEST_TMP relocated (F24)"]
     end

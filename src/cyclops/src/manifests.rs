@@ -135,6 +135,7 @@ const EVER_SHIPPED_FNV64: &[&str] = &[
     "192c1584efd10f6f",
     "ee41a0a36c59c466",
     "f6c7c7aaa830babb",
+    "ed6a0d16eff01e23",
 ];
 
 /// True when these bytes are a manifest this project wrote, so replacing

@@ -384,7 +384,7 @@ async fn m0_shadow_daemon_end_to_end() {
     assert_eq!(readings[1]["rule"], "screen_idle");
 
     // pane.read resolves adoption labels too, like every verb that
-    // promises "label or pane id" (the v1 shim maps `read <label>` here).
+    // promises "label or pane id".
     let resp = c
         .request("pane.label", json!({"target": pane_id, "label": "fixture"}))
         .await;
