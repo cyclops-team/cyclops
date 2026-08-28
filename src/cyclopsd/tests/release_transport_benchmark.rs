@@ -29,6 +29,7 @@ const CHILD_OUTPUT_CAP: usize = 1024 * 1024;
 #[derive(Clone, Copy)]
 enum CapturedOutputFailure {
     TimedOut,
+    WaitFailed,
     ExitStatus(Option<i32>),
     UnexpectedStderr(usize),
     InvalidJson,
@@ -37,6 +38,7 @@ enum CapturedOutputFailure {
 fn captured_output_failure(label: &str, failure: CapturedOutputFailure) -> String {
     let reason = match failure {
         CapturedOutputFailure::TimedOut => "exceeded 15 seconds".to_string(),
+        CapturedOutputFailure::WaitFailed => "could not observe child status".to_string(),
         CapturedOutputFailure::ExitStatus(code) => {
             format!("failed with status {code:?}")
         }
@@ -249,7 +251,16 @@ fn bounded_output(command: &mut Command, label: &str) -> Output {
                     captured_output_failure(label, CapturedOutputFailure::TimedOut)
                 );
             }
-            Err(error) => panic!("wait for {label}: {error}"),
+            Err(_error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_handle.join();
+                let _ = stderr_handle.join();
+                panic!(
+                    "{}",
+                    captured_output_failure(label, CapturedOutputFailure::WaitFailed)
+                );
+            }
         }
     };
     let stdout = stdout_handle
@@ -805,6 +816,7 @@ fn test_bounded_output_drains_past_the_retained_cap() {
 fn test_candidate_failure_diagnostics_withhold_captured_content() {
     let reasons = [
         CapturedOutputFailure::TimedOut,
+        CapturedOutputFailure::WaitFailed,
         CapturedOutputFailure::ExitStatus(Some(7)),
         CapturedOutputFailure::ExitStatus(None),
         CapturedOutputFailure::UnexpectedStderr(42),
