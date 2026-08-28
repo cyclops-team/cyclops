@@ -1825,6 +1825,10 @@ async fn a_human_modal_holds_one_notification_attempt_until_the_prompt_is_cleare
     );
 
     rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
+    // The clear first has to reach the delivery state machine. Waiting on
+    // that durable boundary separates a missed release edge from a pane-paint
+    // delay, and leaves the screen assertion to prove the subsequent write.
+    wait_for_notification_state(&mut rig, &pair.first, NotificationState::Writing).await;
     let released = wait_for_doorbell(&rig, &pane, &pair.first).await;
     assert!(!released.contains("first body"));
     assert!(!released.contains(&pair.second));
