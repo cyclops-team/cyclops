@@ -3230,12 +3230,7 @@ async fn a_working_pane_with_a_proven_clean_composer_accepts_a_notification() {
     let message_id = sent["msg_id"].as_str().unwrap().to_string();
 
     wait_for_notification_state(&mut rig, &message_id, NotificationState::Writing).await;
-    assert!(
-        rig.tmux
-            .capture(&pane)
-            .contains(&compact_doorbell(&rig, &message_id)),
-        "working pane with a clean composer must receive the doorbell"
-    );
+    wait_for_doorbell(&rig, &pane, &message_id).await;
 
     rig.daemon.shutdown().await;
 }
