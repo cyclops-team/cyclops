@@ -49,8 +49,7 @@ rustup when it is missing, never uses `sudo`, and prints every file it changes.
 ```bash
 curl -fsSL https://www.usecyclops.dev/install.sh | sh
 exec "$SHELL" -l
-cyclops start --preset duo
-tmux attach -t main
+cyclops
 ```
 
 Or install from a clone:
@@ -68,9 +67,12 @@ Cyclops skill without replacing unrelated settings. Use
 [installation guide](docs/guides/install.md) for paths, options, updates,
 rollback, and uninstall.
 
-Run `cyclops` to open the full workspace. Run `cyclops watch` for the smaller
-stream and Messages TUI. Neither interface is required for agent-to-agent
-messaging.
+Run `cyclops` to open the full-screen terminal workspace; it starts tmux and
+the daemon automatically when needed. If you prefer native tmux without the
+workspace UI, run `cyclops start --preset duo` followed by
+`tmux attach -t main`. Run `cyclops watch` for the standalone Stream and
+Messages TUI. None of these interfaces is required for background
+agent-to-agent messaging.
 
 ## Send, wake, and claim
 
