@@ -1086,6 +1086,7 @@ fn shipped_composer_trailers_match_captured_chrome_only() {
             &[
                 "────────────────────────",
                 "Gemini 3.7 Flash · High · ~ · Full · Ctx: 79% · 97% 5h, 83% wk · (195K / 1048K)",
+                "Gemini 3.7 Flash · High · /tmp/release · Full · Ctx:",
             ],
             &["run the tests", "[cyclops:end m-1]", "Gemini said something"],
         ),

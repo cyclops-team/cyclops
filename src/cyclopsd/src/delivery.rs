@@ -15043,6 +15043,37 @@ mod composer_content_proof {
         );
     }
 
+    /// MEASURED 2026-08-28 on AGY 1.1.22. The model status row changed from
+    /// a 256-color prefix to truecolor and may leave the context value empty.
+    /// Both rows are still vendor chrome, so an exact format 3 doorbell must
+    /// remain provable without accepting any additional composer content.
+    #[test]
+    fn agy_1_1_22_truecolor_empty_ctx_format_3_reaches_the_submit_gate() {
+        let manifest = shipped("agy");
+        let attempt_id =
+            NotificationAttemptId::parse("att-01234567-89ab-4def-8123-456789abcdef").unwrap();
+        let doorbell = cyclops_proto::render_doorbell_v3(attempt_id);
+        let capture = format!(
+            "\u{1b}[94m>\u{1b}[39m {doorbell}\n\
+             \u{1b}[90m───────────────────────────────────────────────────────────────────────────────\n\
+             \u{1b}[38;2;174;198;207mGemini 3.7 Flash\u{1b}[38;2;200;200;200m · \u{1b}[38;2;255;179;186mHigh\u{1b}[38;2;200;200;200m · \u{1b}[38;2;168;230;163m/tmp/release\u{1b}[38;2;200;200;200m · \u{1b}[38;2;203;170;203mFull\u{1b}[38;2;200;200;200m · \u{1b}[38;2;168;230;163mCtx:"
+        );
+
+        assert_eq!(
+            exact_composer_content_from_joined_capture(&manifest, &capture),
+            ComposerContentProof::Visible(doorbell.clone())
+        );
+        assert_eq!(
+            exact_staging_proof(
+                &manifest,
+                &capture,
+                StagingTarget::ExactRow(&doorbell),
+                &doorbell,
+            ),
+            Some((true, doorbell))
+        );
+    }
+
     #[test]
     fn current_raw_claude_capture_is_safe_to_submit() {
         let capture = include_str!(concat!(
