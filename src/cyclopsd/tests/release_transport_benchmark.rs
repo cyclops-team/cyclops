@@ -24,6 +24,8 @@ use common::{
 use cyclops_proto::{DeliveryState, MessageNotificationState};
 use serde_json::{json, Value};
 
+const CHILD_OUTPUT_CAP: usize = 1024 * 1024;
+
 fn samples() -> usize {
     std::env::var("CYC_RELEASE_SAMPLES")
         .ok()
@@ -185,6 +187,19 @@ struct FrozenCandidate {
     daemon: CandidateBinary,
 }
 
+fn drain_bounded(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut retained = Vec::with_capacity(CHILD_OUTPUT_CAP.min(8192));
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            return Ok(retained);
+        }
+        let remaining = CHILD_OUTPUT_CAP.saturating_sub(retained.len());
+        retained.extend_from_slice(&chunk[..read.min(remaining)]);
+    }
+}
+
 fn bounded_output(command: &mut Command, label: &str) -> Output {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command
@@ -194,16 +209,8 @@ fn bounded_output(command: &mut Command, label: &str) -> Output {
     let mut stdout_pipe = child.stdout.take().expect("child stdout");
     let mut stderr_pipe = child.stderr.take().expect("child stderr");
 
-    let stdout_handle = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
-    });
-    let stderr_handle = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
-    });
+    let stdout_handle = thread::spawn(move || drain_bounded(&mut stdout_pipe));
+    let stderr_handle = thread::spawn(move || drain_bounded(&mut stderr_pipe));
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let status = loop {
@@ -213,19 +220,21 @@ fn bounded_output(command: &mut Command, label: &str) -> Output {
             Ok(None) => {
                 let _ = child.kill();
                 let _status = child.wait().expect("collect killed child status");
-                let stdout = stdout_handle.join().unwrap_or_default();
-                let stderr = stderr_handle.join().unwrap_or_default();
-                panic!(
-                    "{label} exceeded 15 seconds; stdout={:?} stderr={:?}",
-                    String::from_utf8_lossy(&stdout),
-                    String::from_utf8_lossy(&stderr)
-                );
+                let _ = stdout_handle.join();
+                let _ = stderr_handle.join();
+                panic!("{label} exceeded 15 seconds; captured output withheld");
             }
             Err(error) => panic!("wait for {label}: {error}"),
         }
     };
-    let stdout = stdout_handle.join().expect("join stdout thread");
-    let stderr = stderr_handle.join().expect("join stderr thread");
+    let stdout = stdout_handle
+        .join()
+        .expect("join stdout thread")
+        .expect("read child stdout");
+    let stderr = stderr_handle
+        .join()
+        .expect("join stderr thread")
+        .expect("read child stderr");
     Output {
         status,
         stdout,
@@ -252,8 +261,8 @@ fn try_candidate_binary(
     );
     if !output.status.success() {
         return Err(format!(
-            "candidate {program} --version failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "candidate {program} --version failed with status {:?}; captured output withheld",
+            output.status.code()
         ));
     }
     let version = String::from_utf8(output.stdout)
@@ -385,8 +394,8 @@ fn pane_for_window(tmux: &TmuxGuard, window_name: &str) -> String {
     ]);
     assert!(
         output.status.success(),
-        "list private candidate panes: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "list private candidate panes failed with status {:?}; captured output withheld",
+        output.status.code()
     );
     String::from_utf8(output.stdout)
         .expect("tmux pane list is UTF-8")
@@ -481,9 +490,8 @@ impl ExternalCandidateRig {
         let stopped = run_candidate_cli(cli, &self.home, &["daemon", "stop", "--json"]);
         assert!(
             stopped.status.success(),
-            "candidate daemon stop failed: stdout={:?} stderr={:?}",
-            String::from_utf8_lossy(&stopped.stdout),
-            String::from_utf8_lossy(&stopped.stderr)
+            "candidate daemon stop failed with status {:?}; captured output withheld",
+            stopped.status.code()
         );
         self.daemon.wait_for_clean_exit();
     }
@@ -499,33 +507,29 @@ fn run_candidate_cli(binary: &CandidateBinary, home: &Path, args: &[&str]) -> Ou
         .env_remove("TMUX_PANE")
         .env_remove("CARGO_TARGET_DIR")
         .args(args);
-    bounded_output(&mut command, &format!("candidate CLI {args:?}"))
+    bounded_output(&mut command, "candidate CLI")
 }
 
 fn json_output(output: &Output, label: &str) -> Value {
     assert!(
         output.stderr.is_empty(),
-        "{label} polluted JSON stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "{label} polluted JSON stderr ({} captured bytes; content withheld)",
+        output.stderr.len()
     );
     assert!(
         output.status.success(),
         "{label} returned non-zero exit status"
     );
     serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
-        panic!(
-            "{label} emitted invalid JSON: {error}; stdout={:?}",
-            String::from_utf8_lossy(&output.stdout)
-        )
+        panic!("{label} emitted invalid JSON: {error}; captured content withheld")
     })
 }
 
 fn assert_cli_success(output: &Output, label: &str) {
     assert!(
         output.status.success(),
-        "{label} failed: stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        "{label} failed with status {:?}; captured output withheld",
+        output.status.code()
     );
 }
 
@@ -745,16 +749,37 @@ fn test_frozen_checkout_validation() {
 }
 
 #[test]
-fn test_bounded_output_drains_large_pipe() {
+fn test_bounded_output_drains_past_the_retained_cap() {
     let mut command = Command::new("python3");
     command.args([
         "-c",
-        "import sys; sys.stdout.write('A' * 131072); sys.stderr.write('B' * 65536)",
+        "import sys; sys.stdout.write('A' * 2097152); sys.stderr.write('B' * 2097152)",
     ]);
     let output = bounded_output(&mut command, "large pipe test");
     assert!(output.status.success());
-    assert_eq!(output.stdout.len(), 131072);
-    assert_eq!(output.stderr.len(), 65536);
+    assert_eq!(output.stdout.len(), CHILD_OUTPUT_CAP);
+    assert_eq!(output.stderr.len(), CHILD_OUTPUT_CAP);
+}
+
+#[test]
+fn test_candidate_failure_diagnostics_withhold_captured_content() {
+    let sentinel = "PRIVATE-BENCHMARK-PAYLOAD";
+    let output = Command::new("python3")
+        .args([
+            "-c",
+            "import sys; print('PRIVATE-BENCHMARK-PAYLOAD'); print('PRIVATE-BENCHMARK-PAYLOAD', file=sys.stderr); sys.exit(7)",
+        ])
+        .output()
+        .expect("run diagnostic privacy fixture");
+    let panic = std::panic::catch_unwind(|| assert_cli_success(&output, "candidate CLI"))
+        .expect_err("non-zero candidate command must fail");
+    let message = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .expect("assertion panic carries text");
+    assert!(!message.contains(sentinel));
+    assert!(message.contains("captured output withheld"));
 }
 
 #[test]
