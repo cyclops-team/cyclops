@@ -17,6 +17,17 @@
 //!    the daemon's exact screen parser. This component never authorizes a
 //!    delivery and does not replace process binding or the full injection gate.
 //! 6. Fail-Closed: Immediate defect abortion with non-zero test exit on failure.
+//! 7. Authentication: Live trials use only explicitly pre-provisioned,
+//!    owner-only vendor profiles below the Cyclops scratch root. The harness
+//!    never copies or inherits operator credentials.
+//!
+//! Live profile contract: `CYCLOPS_GATE7_PROFILE_ROOT` names an absolute 0700
+//! directory below `cyclops_proto::scratch::scratch_root()`. Each participating
+//! vendor has `<root>/<vendor>/home` and `<root>/<vendor>/workspace`, also 0700.
+//! Before freezing the candidate, an operator authenticates that vendor with
+//! the disposable dedicated home and explicitly trusts that exact workspace.
+//! The vendor may mutate this profile during the campaign. Missing profiles
+//! are recorded as a limitation; unsafe paths are never launched.
 
 #![allow(dead_code)]
 
@@ -24,9 +35,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use cyclops_manifest::{load_dir, Manifest};
+use cyclops_manifest::{load_dir, strip_csi, Manifest};
 use cyclops_proto::scratch::{scratch_dir, scratch_root};
-use cyclops_proto::{render_doorbell_v3, NotificationAttemptId};
+use cyclops_proto::{render_doorbell_v3, AgentState, NotificationAttemptId};
 use cyclops_testrig::TmuxServer;
 use cyclopsd::{prove_composer_representation, ComposerRepresentationProof};
 use serde::{Deserialize, Serialize};
@@ -60,6 +71,9 @@ pub enum ClosedReasonCode {
     ClearCommandFailed,
     HarnessAborted,
     VendorUnavailable,
+    VendorAuthNotProvisioned,
+    VendorProfileIncomplete,
+    VendorProfileUnsafe,
     OptInRequired,
     BinaryIdentityMismatch,
     RequiredVendorLimitation,
@@ -312,6 +326,148 @@ fn isolated_vendor_launch_command(home: &Path, launch_command: &str) -> String {
         "exec /usr/bin/env -i {environment} /bin/sh -c {}",
         sh_quote(launch_command)
     )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProvisionedVendorProfile {
+    home: PathBuf,
+    workspace: PathBuf,
+}
+
+fn owner_only_directory(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return false;
+        };
+        metadata.file_type().is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == unsafe { libc::getuid() }
+            && metadata.permissions().mode() & 0o700 == 0o700
+            && metadata.permissions().mode() & 0o077 == 0
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+fn private_profile_tree(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let mut pending = vec![path.to_path_buf()];
+        let mut inspected = 0usize;
+        while let Some(next) = pending.pop() {
+            inspected += 1;
+            if inspected > 10_000 {
+                return false;
+            }
+            let Ok(metadata) = std::fs::symlink_metadata(&next) else {
+                return false;
+            };
+            if metadata.uid() != unsafe { libc::getuid() }
+                || metadata.permissions().mode() & 0o077 != 0
+                || metadata.file_type().is_symlink()
+            {
+                return false;
+            }
+            if metadata.file_type().is_dir() {
+                if metadata.permissions().mode() & 0o700 != 0o700 {
+                    return false;
+                }
+                let Ok(entries) = std::fs::read_dir(&next) else {
+                    return false;
+                };
+                for entry in entries {
+                    let Ok(entry) = entry else {
+                        return false;
+                    };
+                    pending.push(entry.path());
+                }
+            } else if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+fn canonical_owner_only_directory(path: &Path, allowed_root: &Path) -> bool {
+    if !path.is_absolute() || !owner_only_directory(path) {
+        return false;
+    }
+    let Ok(canonical_path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(canonical_root) = std::fs::canonicalize(allowed_root) else {
+        return false;
+    };
+    canonical_path == path && canonical_path.starts_with(canonical_root)
+}
+
+/// Resolves an explicitly prepared live-vendor profile without copying or
+/// inheriting operator credentials. Expected layout:
+/// `<profile-root>/<vendor>/{home,workspace}`.
+fn provisioned_vendor_profile(
+    profile_root: Option<&Path>,
+    vendor_id: &str,
+) -> Result<ProvisionedVendorProfile, ClosedReasonCode> {
+    let Some(profile_root) = profile_root else {
+        return Err(ClosedReasonCode::VendorAuthNotProvisioned);
+    };
+    if !vendor_id
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(ClosedReasonCode::VendorProfileUnsafe);
+    }
+
+    let allowed_root = scratch_root();
+    if !canonical_owner_only_directory(profile_root, &allowed_root) {
+        return Err(ClosedReasonCode::VendorProfileUnsafe);
+    }
+
+    let vendor_root = profile_root.join(vendor_id);
+    let home = vendor_root.join("home");
+    let workspace = vendor_root.join("workspace");
+    if !vendor_root.exists() || !home.exists() || !workspace.exists() {
+        return Err(ClosedReasonCode::VendorAuthNotProvisioned);
+    }
+    if !canonical_owner_only_directory(&vendor_root, profile_root)
+        || !canonical_owner_only_directory(&home, profile_root)
+        || !canonical_owner_only_directory(&workspace, profile_root)
+        || !private_profile_tree(&home)
+        || !private_profile_tree(&workspace)
+    {
+        return Err(ClosedReasonCode::VendorProfileUnsafe);
+    }
+
+    Ok(ProvisionedVendorProfile { home, workspace })
+}
+
+fn initial_timeout_reason(manifest: &Manifest, escaped_capture: &str) -> ClosedReasonCode {
+    let plain_capture = strip_csi(escaped_capture);
+    match manifest
+        .evaluate_esc("", &plain_capture, Some(escaped_capture))
+        .map(|rule| rule.state)
+    {
+        Some(AgentState::BlockedModal | AgentState::BlockedPermission) => {
+            ClosedReasonCode::VendorProfileIncomplete
+        }
+        _ => ClosedReasonCode::InitialIdleTimeout,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1294,6 +1450,113 @@ fn test_vendor_state_environment_is_fully_scratch_rooted() {
 }
 
 #[test]
+fn test_live_vendor_profiles_are_explicit_owner_only_and_scratch_scoped() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        fn create_private_dir(path: &Path) {
+            std::fs::create_dir_all(path).expect("create private profile directory");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .expect("set private profile directory mode");
+        }
+
+        assert_eq!(
+            provisioned_vendor_profile(None, "codex"),
+            Err(ClosedReasonCode::VendorAuthNotProvisioned)
+        );
+
+        let scratch = Gate7ScratchHome::new().expect("create scratch");
+        let profiles = scratch.path().join("profiles");
+        let codex = profiles.join("codex");
+        let home = codex.join("home");
+        let workspace = codex.join("workspace");
+        for directory in [&profiles, &codex, &home, &workspace] {
+            create_private_dir(directory);
+        }
+
+        assert_eq!(
+            provisioned_vendor_profile(Some(&profiles), "codex"),
+            Ok(ProvisionedVendorProfile {
+                home: home.clone(),
+                workspace: workspace.clone(),
+            })
+        );
+        assert_eq!(
+            provisioned_vendor_profile(Some(&profiles), "claude"),
+            Err(ClosedReasonCode::VendorAuthNotProvisioned)
+        );
+        assert_eq!(
+            provisioned_vendor_profile(Some(&profiles), "../codex"),
+            Err(ClosedReasonCode::VendorProfileUnsafe)
+        );
+
+        let credential = home.join("credential.json");
+        std::fs::write(&credential, b"fixture credential").expect("write private fixture");
+        std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o644))
+            .expect("make fixture credential unsafe");
+        assert_eq!(
+            provisioned_vendor_profile(Some(&profiles), "codex"),
+            Err(ClosedReasonCode::VendorProfileUnsafe)
+        );
+        std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600))
+            .expect("restore fixture credential mode");
+
+        let linked_credential = home.join("credential-link.json");
+        std::fs::hard_link(&credential, &linked_credential).expect("create fixture hard link");
+        assert_eq!(
+            provisioned_vendor_profile(Some(&profiles), "codex"),
+            Err(ClosedReasonCode::VendorProfileUnsafe)
+        );
+        std::fs::remove_file(&linked_credential).expect("remove fixture hard link");
+        std::fs::remove_file(&credential).expect("remove fixture credential");
+
+        let nested_link = home.join("operator-home-link");
+        symlink("/", &nested_link).expect("create nested profile symlink");
+        assert_eq!(
+            provisioned_vendor_profile(Some(&profiles), "codex"),
+            Err(ClosedReasonCode::VendorProfileUnsafe)
+        );
+        std::fs::remove_file(&nested_link).expect("remove nested profile symlink");
+
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755))
+            .expect("make profile home unsafe");
+        assert_eq!(
+            provisioned_vendor_profile(Some(&profiles), "codex"),
+            Err(ClosedReasonCode::VendorProfileUnsafe)
+        );
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
+            .expect("restore profile home mode");
+
+        let real_claude = scratch.path().join("real-claude");
+        create_private_dir(&real_claude);
+        create_private_dir(&real_claude.join("home"));
+        create_private_dir(&real_claude.join("workspace"));
+        symlink(&real_claude, profiles.join("claude")).expect("create profile symlink");
+        assert_eq!(
+            provisioned_vendor_profile(Some(&profiles), "claude"),
+            Err(ClosedReasonCode::VendorProfileUnsafe)
+        );
+    }
+}
+
+#[test]
+fn test_recognized_auth_or_trust_modal_is_a_profile_limitation() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources/manifests");
+    let manifests = load_dir(&manifest_dir).expect("load shipped manifests");
+    let codex = manifests.get("codex").expect("codex manifest");
+
+    assert_eq!(
+        initial_timeout_reason(codex, "Do you trust the contents of this directory"),
+        ClosedReasonCode::VendorProfileIncomplete
+    );
+    assert_eq!(
+        initial_timeout_reason(codex, "unrecognized vendor screen"),
+        ClosedReasonCode::InitialIdleTimeout
+    );
+}
+
+#[test]
 fn test_adversarial_serialized_report_leak_check() {
     let sentinels = [
         "SECRET_USER_PROMPT_KEYWORD_XYZ",
@@ -1446,7 +1709,7 @@ fn test_missing_clear_action_is_a_vendor_neutral_limitation() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "live vendor harness requires CYCLOPS_LIVE_VENDOR=1, CYCLOPS_FROZEN_SHA=<40-char-sha>, and installed binaries"]
+#[ignore = "live vendor harness requires explicit opt-in, frozen SHA, installed binaries, and pre-provisioned vendor profiles"]
 fn live_vendor_evidence_campaign_opt_in() {
     // 1. Strict opt-in runtime refusal (panics if not set)
     check_opt_in_value(std::env::var("CYCLOPS_LIVE_VENDOR").as_deref().ok())
@@ -1494,6 +1757,7 @@ fn live_vendor_evidence_campaign_opt_in() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources/manifests");
     let manifests = load_dir(&manifest_dir).expect("load shipped manifests");
     let server = TmuxServer::new("gate7-stage-clear");
+    let profile_root = std::env::var_os("CYCLOPS_GATE7_PROFILE_ROOT").map(PathBuf::from);
 
     let vendors = vec!["codex", "claude", "agy", "cursor"];
     let widths = [60u16, 100u16];
@@ -1549,9 +1813,34 @@ fn live_vendor_evidence_campaign_opt_in() {
                 );
             }
 
+            // Authentication and directory trust are prepared explicitly by
+            // the operator in a dedicated owner-only profile. The harness
+            // never inherits HOME and never copies credentials from it.
+            let profile = match provisioned_vendor_profile(profile_root.as_deref(), v) {
+                Ok(profile) => profile,
+                Err(reason_code) => {
+                    return (
+                        VendorSummary {
+                            vendor_id: v.to_string(),
+                            installation_status: status,
+                            discovered_version: info,
+                            version_claim_manifest: m.agent.version_tested.clone(),
+                            total_trials: 0,
+                            widths_tested: vec![],
+                            proof_counts: ProofCounts::default(),
+                            verdict: CampaignVerdict::Limitation,
+                            reason_code,
+                        },
+                        vec![],
+                        false,
+                    );
+                }
+            };
+
             let mut counts = ProofCounts::default();
             let mut trial_obs = Vec::new();
             let mut vendor_failed = false;
+            let mut vendor_limited = false;
             let mut failure_reason = None;
             let mut trial_index = 0;
             let mut attempted_widths = Vec::new();
@@ -1562,11 +1851,9 @@ fn live_vendor_evidence_campaign_opt_in() {
                 attempted_widths.push(width);
                 let session_name = format!("g7-{v}-{width}-{}", trial_index);
                 let launch_cmd = m.agent.launch.as_deref().unwrap_or(v);
-                let trial_home = scratch.path().join("trials").join(&session_name);
-                prepare_isolated_vendor_home(&trial_home)
-                    .expect("create isolated vendor state directory");
-                let trial_home_str = trial_home.to_string_lossy();
-                let isolated_launch = isolated_vendor_launch_command(&trial_home, launch_cmd);
+                let workspace = &profile.workspace;
+                let workspace_str = workspace.to_string_lossy();
+                let isolated_launch = isolated_vendor_launch_command(&profile.home, launch_cmd);
 
                 let t_trial_start = Instant::now();
                 let attempt_id = NotificationAttemptId::generate();
@@ -1587,7 +1874,7 @@ fn live_vendor_evidence_campaign_opt_in() {
                     "-y",
                     "24",
                     "-c",
-                    &trial_home_str,
+                    &workspace_str,
                     &isolated_launch,
                 ]);
 
@@ -1625,9 +1912,19 @@ fn live_vendor_evidence_campaign_opt_in() {
                 });
 
                 if !initial_clean {
-                    counts.failures += 1;
-                    vendor_failed = true;
-                    failure_reason = Some(ClosedReasonCode::InitialIdleTimeout);
+                    let capture =
+                        server.run(&["capture-pane", "-e", "-p", "-J", "-t", &target_pane]);
+                    let reason =
+                        initial_timeout_reason(m, &String::from_utf8_lossy(&capture.stdout));
+                    let verdict = if reason == ClosedReasonCode::VendorProfileIncomplete {
+                        vendor_limited = true;
+                        CampaignVerdict::Limitation
+                    } else {
+                        counts.failures += 1;
+                        vendor_failed = true;
+                        CampaignVerdict::Failed
+                    };
+                    failure_reason = Some(reason);
                     let elapsed = t_trial_start.elapsed().as_secs_f64() * 1000.0;
                     trial_obs.push(trial_observation(
                         v,
@@ -1642,8 +1939,8 @@ fn live_vendor_evidence_campaign_opt_in() {
                         elapsed,
                         0.0,
                         elapsed,
-                        CampaignVerdict::Failed,
-                        ClosedReasonCode::InitialIdleTimeout,
+                        verdict,
+                        reason,
                     ));
                     server.run(&["kill-session", "-t", &session_name]);
                     break;
@@ -1806,13 +2103,13 @@ fn live_vendor_evidence_campaign_opt_in() {
                 ));
             }
 
-            let summary_verdict = if vendor_failed {
-                CampaignVerdict::Failed
-            } else {
-                CampaignVerdict::Passed
+            let summary_verdict = match (vendor_failed, vendor_limited) {
+                (true, _) => CampaignVerdict::Failed,
+                (false, true) => CampaignVerdict::Limitation,
+                (false, false) => CampaignVerdict::Passed,
             };
-            let summary_reason = if vendor_failed {
-                failure_reason.expect("a failed vendor records its exact reason")
+            let summary_reason = if vendor_failed || vendor_limited {
+                failure_reason.expect("a non-passed vendor records its exact reason")
             } else {
                 ClosedReasonCode::AllTrialsVerified
             };
