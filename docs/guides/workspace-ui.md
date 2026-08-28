@@ -342,8 +342,8 @@ showing section's list (a click on a row puts the cursor there;
 moves too). Landing on a row checks it: the `✓` (the same one the app
 menu's toggles wear) moves to the row, showing what `Enter` would save,
 and nothing is saved yet. `Enter` (or the `Apply` button) saves what is
-checked and closes; `Esc` closes and forgets it. (The View section is
-the exception: its rows are switches, and flip at once.) The card is
+checked and closes; `Esc` closes and forgets it. (View and Delivery are
+the exceptions: their controls apply at once and the card stays open.) The card is
 one size for every section: it is sized for the longest list, so
 switching sections never resizes it.
 
@@ -384,6 +384,15 @@ switching sections never resizes it.
   missing or there is no player for it; only a system with no alert
   sound at all falls back to the terminal bell, which many terminals
   ship with the sound turned off.
+- **Delivery** contains the default-off `Force staged submit` switch and its
+  0 to 20 second delay. Select `Delay` and use `←`/`→` to move the slider.
+  This escape hatch applies only after Cyclops has pasted an exact notification
+  and ordinary verification fails. It does not paste again. At expiry the
+  daemon rechecks the exact attempt and bound pane process, then presses Enter
+  once. A claim, withdrawal, replacement, or disabled setting cancels it. The
+  warning is literal: because this bypasses composer-content proof, it may
+  submit human input that appeared after the notification was pasted. At 0
+  seconds the key is attempted immediately.
 
 `show_settings` is the binding name; `show_themes`, from when the card
 was only a theme picker, still works in an existing config.

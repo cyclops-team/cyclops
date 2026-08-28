@@ -782,6 +782,10 @@ pub enum NotificationFact {
         message_id: MessageId,
         recipient: RecipientKey,
         resolution: NotificationResolution,
+        /// True only for the explicit, opt-in timed escape hatch. This is an
+        /// audit distinction; it does not weaken projection validation.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        forced: bool,
     },
     /// Durable proof that the terminal action key was accepted by the terminal.
     ///
@@ -1868,6 +1872,7 @@ mod tests {
                     message_id: message_id.clone(),
                     recipient,
                     resolution: NotificationResolution::Complete,
+                    forced: false,
                 },
                 "notification_resolution_intent",
             ),

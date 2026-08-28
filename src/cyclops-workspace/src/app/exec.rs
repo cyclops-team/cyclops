@@ -34,7 +34,8 @@ use crate::copy;
 use crate::daemon;
 use crate::decoration::{self, DecorationSnapshot};
 use crate::dialog::{
-    Composed, Dialog, SettingsSection, SoundPicker, SoundRow, ThemePicker, ViewSwitches,
+    Composed, Dialog, ForceSubmitPicker, SettingsSection, SoundPicker, SoundRow, ThemePicker,
+    ViewSwitches,
 };
 use crate::naming;
 use crate::persist::SidebarTab;
@@ -681,6 +682,14 @@ pub(super) async fn execute(
         }
         Action::ShowSettings { section } => {
             let (names, active) = theme_rows(&app.home);
+            let delivery = match crate::daemon::force_submit_settings(&app.home) {
+                Ok(settings) => ForceSubmitPicker::new(settings.enabled, settings.delay_seconds),
+                Err(error) => {
+                    let mut picker = ForceSubmitPicker::new(false, 5);
+                    picker.notice = Some(error);
+                    picker
+                }
+            };
             // What close-without-apply puts back: browsing previews into
             // `paint.theme` directly (see [`preview_selected_theme`]), so
             // the theme that is live right now rides beside the picker.
@@ -699,6 +708,7 @@ pub(super) async fn execute(
                     crate::sound::choices(&app.home),
                     &app.prefs.sound,
                 ),
+                delivery,
             });
             Ok(Outcome::default())
         }
@@ -724,6 +734,25 @@ pub(super) async fn execute(
                 persist: true,
                 ..Outcome::default()
             })
+        }
+        Action::ApplyForceSubmitSettings {
+            enabled,
+            delay_seconds,
+        } => {
+            let result =
+                crate::daemon::set_force_submit_settings(&app.home, enabled, delay_seconds);
+            if let Some(Dialog::Settings { delivery, .. }) = app.dialog.as_mut() {
+                match result {
+                    Ok(settings) => {
+                        delivery.enabled = settings.enabled;
+                        delivery.delay_seconds = settings.delay_seconds;
+                        delivery.adjust_delay(0);
+                        delivery.notice = None;
+                    }
+                    Err(error) => delivery.notice = Some(error),
+                }
+            }
+            Ok(Outcome::default())
         }
         Action::Detach => Ok(Outcome {
             detach: true,
@@ -2931,6 +2960,7 @@ mod tests {
             },
             view: ViewSwitches::new(true, true),
             sound: SoundPicker::new(false, vec!["system".into()], "system"),
+            delivery: ForceSubmitPicker::new(false, 5),
         }
     }
 
@@ -2978,6 +3008,7 @@ mod tests {
                 themes,
                 view,
                 sound,
+                ..
             }) => {
                 assert_eq!(*section, SettingsSection::Theme, "opens on themes");
                 assert_eq!(
@@ -3237,6 +3268,7 @@ mod tests {
             },
             view: ViewSwitches::new(true, true),
             sound: SoundPicker::new(false, vec!["system".into()], "system"),
+            delivery: ForceSubmitPicker::new(false, 5),
         });
         preview_selected_theme(&mut app);
         assert_ne!(app.paint.theme.resolve(dim).rgb, original, "browsed");
@@ -3290,6 +3322,7 @@ mod tests {
             },
             view: ViewSwitches::new(true, true),
             sound: SoundPicker::new(false, vec!["system".into()], "system"),
+            delivery: ForceSubmitPicker::new(false, 5),
         });
 
         if let Some(open) = app.dialog.as_mut() {
@@ -3341,6 +3374,7 @@ mod tests {
                 vec!["bow-ripple".into(), "system".into()],
                 "bow-ripple",
             ),
+            delivery: ForceSubmitPicker::new(false, 5),
         });
 
         let outcome = execute(

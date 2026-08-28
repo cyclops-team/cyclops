@@ -14,6 +14,7 @@ use cyclops_tmux::{PaneRow, SessionWatcher};
 use tokio::time::Instant;
 use tracing::{debug, error};
 
+use crate::delivery;
 use crate::mailbox::{
     AcceptResult, ClaimOutcome, MailboxIdentity, MailboxSend, MailboxService, MailboxServiceError,
     UnclaimedReminderQueue,
@@ -724,6 +725,105 @@ pub(crate) fn schedule_unclaimed_reminders(inner: &Arc<Inner>) {
             }
         }
         Err(error) => error!(%error, "cannot inspect unclaimed reminder candidates"),
+    }
+}
+
+/// Arm the explicit post-paste escape hatch for one exact verify-failed
+/// doorbell. Multiple callers may arm the same attempt; durable resolution
+/// intent elects one key and makes every competing timer a no-op.
+pub(crate) fn schedule_force_submit(inner: &Arc<Inner>, record: cyclops_proto::NotificationRecord) {
+    if !record.needs_exact_owned_reconciliation() || !inner.force_submit.get().0 {
+        return;
+    }
+    let Some(service) = inner.mailbox.as_ref().map(Arc::clone) else {
+        return;
+    };
+    let task_inner = Arc::clone(inner);
+    inner.engine.spawn_descendant_task(async move {
+        loop {
+            let (enabled, threshold_ms) = task_inner.force_submit.get();
+            if !enabled {
+                return;
+            }
+            let elapsed_ms = crate::unix_ms().saturating_sub(record.updated_at);
+            let remaining_ms = threshold_ms.saturating_sub(elapsed_ms);
+            if remaining_ms == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(remaining_ms)).await;
+        }
+
+        let pane_id = record
+            .recipient
+            .pane_id()
+            .map(|pane_id| pane_id.to_string())
+            .unwrap_or_default();
+        let result = loop {
+            let target = match service.attention_target(&record.attempt_id.to_string()) {
+                Ok(target) => target,
+                Err(_) => return,
+            };
+            match crate::attention_resolution::force_complete(&task_inner, &service, &target).await
+            {
+                Err(crate::attention_resolution::AttentionActionError::Store(error))
+                    if error.notification_resolution_in_progress() =>
+                {
+                    // The ordinary exact-evidence worker may already own this
+                    // attempt. It is bounded, and the forced path must wait
+                    // for that safer decision instead of losing its timer to
+                    // a transient in-memory reservation.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                result => break result,
+            }
+        };
+        match result {
+            Ok(_) => delivery::admin_notify(
+                &task_inner,
+                cyclops_proto::NotifyLevel::Fyi,
+                "forced notification submit completed",
+                &format!(
+                    "message {} attempt {} used the configured post-paste escape hatch",
+                    record.message_id, record.attempt_id
+                ),
+                Some(record.message_id.as_str()),
+                None,
+                delivery::About::pane(&pane_id),
+            ),
+            Err(crate::attention_resolution::AttentionActionError::ForceRefused(_))
+            | Err(crate::attention_resolution::AttentionActionError::Store(_)) => None,
+            Err(error) => delivery::admin_notify(
+                &task_inner,
+                cyclops_proto::NotifyLevel::ActionRequired,
+                "forced notification submit remains uncertain",
+                &format!(
+                    "message {} attempt {} accepted no second key: {error}",
+                    record.message_id, record.attempt_id
+                ),
+                Some(record.message_id.as_str()),
+                None,
+                delivery::About::pane(&pane_id),
+            ),
+        };
+    });
+}
+
+/// Re-arm unresolved exact attempts after daemon replay or when the operator
+/// enables or shortens the setting at runtime.
+pub(crate) fn schedule_force_submit_candidates(inner: &Arc<Inner>) {
+    if !inner.force_submit.get().0 {
+        return;
+    }
+    let Some(service) = inner.mailbox.as_ref() else {
+        return;
+    };
+    match service.force_submit_candidates() {
+        Ok(records) => {
+            for record in records {
+                schedule_force_submit(inner, record);
+            }
+        }
+        Err(error) => error!(%error, "cannot inspect force-submit candidates"),
     }
 }
 

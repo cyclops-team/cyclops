@@ -5650,6 +5650,7 @@ async fn fail_attempt(
                                 inner,
                                 record.recipient,
                             );
+                            crate::messaging::schedule_force_submit(inner, record);
                         }
                     }
                     Err(NotificationAdapterError::TerminalConflict(_)) => return false,
@@ -11928,6 +11929,7 @@ composer_trailer_required_prefix = 1
         let session_identities = crate::sessionstore::SessionIdentities::open(&state_root).unwrap();
         Arc::new(Inner {
             cfg: crate::Config::defaults(path),
+            force_submit: crate::ForceSubmitRuntime::new(false, 5_000),
             state_root,
             state_repair: cyclops_state::RepairSummary::default(),
             workspace_id,

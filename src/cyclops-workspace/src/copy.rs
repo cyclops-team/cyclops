@@ -180,6 +180,15 @@ pub const SETTINGS_SECTION_VIEW: &str = "View";
 
 pub const SETTINGS_SECTION_SOUND: &str = "Sound";
 
+pub const SETTINGS_SECTION_DELIVERY: &str = "Delivery";
+
+pub const FORCE_SUBMIT_ON: &str = "Force staged submit: on";
+pub const FORCE_SUBMIT_OFF: &str = "Force staged submit: off";
+pub const FORCE_SUBMIT_NOTE: &str = "Press Enter once after failure. May submit human input.";
+pub const FORCE_SUBMIT_DELAY: &str = "Delay";
+pub const FORCE_SUBMIT_HINT: &str =
+    "Default is off. Select Delay and use ←/→ from 0 to 20 seconds.";
+
 pub const KEYBINDS_TITLE: &str = "Keybinds";
 
 /// The keybinds card's one muted line: how to move, since nothing on

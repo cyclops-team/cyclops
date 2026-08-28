@@ -110,6 +110,20 @@ Both shapes are written once, only after proving the pane occupant, manifest,
 and clean composer. An ambiguous write or submit raises attention. Cyclops does
 not write either shape again automatically.
 
+The workspace Settings card has an optional `Force staged submit` escape hatch
+for a narrower failure: Cyclops already pasted the exact notification, but its
+normal verification could not confirm Enter. It is off by default. When enabled,
+the daemon waits the selected 0 to 20 seconds, rechecks the exact recipient,
+pane process generation, manifest, and tmux mode, then presses the manifest's
+submit key once without re-pasting the notification. A claim, withdrawal,
+replacement attempt, settled barrier, or disabled setting makes the timer a
+no-op. The durable resolution intent prevents duplicate timers or a restart
+from pressing a second key.
+
+This setting intentionally bypasses composer-content proof. At 0 seconds it can
+submit human input that appeared after the notification was pasted. Use it only
+when immediate liveness matters more than preserving unsubmitted composer text.
+
 ## Claim a doorbell message
 
 List pending metadata without exposing bodies:

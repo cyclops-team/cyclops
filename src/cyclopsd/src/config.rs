@@ -5,6 +5,7 @@
 //! daemon keeps booting against a newer config file. A missing file is a
 //! valid empty config: the daemon watches nothing and status still answers.
 
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
@@ -40,6 +41,13 @@ pub struct Config {
     /// `None` is the shipped default. A configured positive duration arms one
     /// exact-attempt timer after the first proven doorbell notification.
     pub unclaimed_reminder_ms: Option<u64>,
+    /// Opt-in escape hatch for a notification already pasted into a composer
+    /// but left in verify-failed attention. The daemon may press Enter once
+    /// after this delay without exact composer-content proof.
+    pub force_notification_submit: bool,
+    /// Delay retained while the escape hatch is off, so toggling it back on
+    /// restores the operator's chosen position.
+    pub force_notification_submit_delay_ms: u64,
     /// Theme name. The daemon never reads this field: `cyclops-theme`
     /// re-reads the same key out of the same file (`select::config_theme`)
     /// and that is what paints every surface, borders included. It is
@@ -71,6 +79,8 @@ impl Config {
             receipt_block_ms: 2500,
             gate_hold_notify_ms: 120_000,
             unclaimed_reminder_ms: None,
+            force_notification_submit: false,
+            force_notification_submit_delay_ms: 5_000,
             theme: None,
             chrome: true,
             default_workspace: None,
@@ -177,6 +187,24 @@ impl Config {
                         value.type_str()
                     )),
                 },
+                "force_notification_submit" => match value.as_str() {
+                    Some("on") => cfg.force_notification_submit = true,
+                    Some("off") => cfg.force_notification_submit = false,
+                    _ => warnings.push(format!(
+                        "`force_notification_submit` must be \"on\" or \"off\", not {value}; leaving it off"
+                    )),
+                },
+                "force_notification_submit_delay_ms" => match ms_value(&value) {
+                    Some(v) if v <= 20_000 => cfg.force_notification_submit_delay_ms = v,
+                    Some(_) => warnings.push(
+                        "`force_notification_submit_delay_ms` must be between 0 and 20000; using 5000"
+                            .to_string(),
+                    ),
+                    None => warnings.push(format!(
+                        "`force_notification_submit_delay_ms` must be a non-negative integer, not a {}; using 5000",
+                        value.type_str()
+                    )),
+                },
                 // Recognized, never used, and deliberately silent about a
                 // wrong type: cyclops-theme reads this same key out of
                 // this same file and warns about it there. Two crates
@@ -233,6 +261,40 @@ impl Config {
         }
         None
     }
+}
+
+/// Persist the operator's force-submit choice without disturbing any other
+/// daemon or workspace setting. The caller updates the live runtime only
+/// after this atomic replacement succeeds.
+pub(crate) fn save_force_notification_submit(
+    home: &Path,
+    enabled: bool,
+    delay_ms: u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(delay_ms <= 20_000, "force-submit delay exceeds 20 seconds");
+    let root = cyclops_state::StateRoot::open_or_create(home)?;
+    let mut table: toml::Table = match root.open_read(Path::new("config.toml"))? {
+        Some(mut file) => {
+            let mut text = String::new();
+            file.read_to_string(&mut text)?;
+            text.parse()?
+        }
+        None => toml::Table::new(),
+    };
+    table.insert(
+        "force_notification_submit".into(),
+        toml::Value::String(if enabled { "on" } else { "off" }.into()),
+    );
+    table.insert(
+        "force_notification_submit_delay_ms".into(),
+        toml::Value::Integer(i64::try_from(delay_ms).expect("20 seconds fits i64")),
+    );
+    let mut body = toml::to_string_pretty(&table)?;
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    root.replace_file(Path::new("config.toml"), body.as_bytes())?;
+    Ok(())
 }
 
 /// Non-negative integer TOML value for the timing/count knobs.
@@ -378,8 +440,10 @@ next_tab = "Alt+n"
         assert_eq!(cfg.receipt_block_ms, 2500);
         assert_eq!(cfg.gate_hold_notify_ms, 120_000);
         assert_eq!(cfg.unclaimed_reminder_ms, None);
+        assert!(!cfg.force_notification_submit);
+        assert_eq!(cfg.force_notification_submit_delay_ms, 5_000);
 
-        let text = "ack_timeout_ms = 200\ndelivery_retry_max = 0\nreceipt_block_ms = 900\ngate_hold_notify_ms = 300\nunclaimed_reminder_ms = 45000\n";
+        let text = "ack_timeout_ms = 200\ndelivery_retry_max = 0\nreceipt_block_ms = 900\ngate_hold_notify_ms = 300\nunclaimed_reminder_ms = 45000\nforce_notification_submit = \"on\"\nforce_notification_submit_delay_ms = 0\n";
         let (cfg, warnings) = Config::parse(text, Path::new("/h")).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(cfg.ack_timeout_ms, 200);
@@ -387,11 +451,48 @@ next_tab = "Alt+n"
         assert_eq!(cfg.receipt_block_ms, 900);
         assert_eq!(cfg.gate_hold_notify_ms, 300);
         assert_eq!(cfg.unclaimed_reminder_ms, Some(45_000));
+        assert!(cfg.force_notification_submit);
+        assert_eq!(cfg.force_notification_submit_delay_ms, 0);
 
         let (cfg, warnings) =
             Config::parse("unclaimed_reminder_ms = 0\n", Path::new("/h")).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(cfg.unclaimed_reminder_ms, None);
+    }
+
+    #[test]
+    fn force_submit_delay_refuses_values_above_the_ui_contract() {
+        let (cfg, warnings) = Config::parse(
+            "force_notification_submit = \"on\"\nforce_notification_submit_delay_ms = 20001\n",
+            Path::new("/h"),
+        )
+        .unwrap();
+        assert!(cfg.force_notification_submit);
+        assert_eq!(cfg.force_notification_submit_delay_ms, 5_000);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+    }
+
+    #[test]
+    fn saving_force_submit_preserves_unrelated_operator_settings() {
+        let home = cyclops_proto::scratch::scratch_dir("cfg-force-submit-save");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("create scratch home");
+        std::fs::write(
+            home.join("config.toml"),
+            "theme = \"sorbet\"\n[workspace]\nsidebar_width = 31\n",
+        )
+        .expect("write config");
+
+        save_force_notification_submit(&home, true, 20_000).expect("save force-submit setting");
+        let saved = std::fs::read_to_string(home.join("config.toml")).expect("read saved config");
+        assert!(saved.contains("theme = \"sorbet\""), "{saved}");
+        assert!(saved.contains("sidebar_width = 31"), "{saved}");
+        let (cfg, warnings) = Config::load(&home).expect("reload config");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(cfg.force_notification_submit);
+        assert_eq!(cfg.force_notification_submit_delay_ms, 20_000);
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

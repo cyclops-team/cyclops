@@ -4494,7 +4494,8 @@ async fn handle_mouse(
                         if matches!(
                             app.dialog,
                             Some(Dialog::Settings {
-                                section: dialog::SettingsSection::View,
+                                section: dialog::SettingsSection::View
+                                    | dialog::SettingsSection::Delivery,
                                 ..
                             })
                         ) {
@@ -6426,6 +6427,32 @@ async fn handle_dialog_key(
         DialogKeyAction::SwitchSection(delta) => {
             if let Some(open) = app.dialog.as_mut() {
                 dialog::switch_settings_section(open, delta);
+            }
+        }
+        DialogKeyAction::Adjust(delta) => {
+            let changed = app
+                .dialog
+                .as_mut()
+                .is_some_and(|open| dialog::adjust_force_submit_delay(open, delta));
+            if changed {
+                let setting = app.dialog.as_ref().and_then(|open| match open {
+                    Dialog::Settings { delivery, .. } => {
+                        Some((delivery.enabled, delivery.delay_seconds))
+                    }
+                    _ => None,
+                });
+                if let Some((enabled, delay_seconds)) = setting {
+                    let outcome = exec::execute(
+                        app,
+                        client,
+                        action::Action::ApplyForceSubmitSettings {
+                            enabled,
+                            delay_seconds,
+                        },
+                    )
+                    .await?;
+                    apply_outcome(app, outcome);
+                }
             }
         }
         DialogKeyAction::ScrollStart | DialogKeyAction::ScrollEnd => {
@@ -10944,6 +10971,7 @@ mod tests {
             },
             view: dialog::ViewSwitches::new(true, true),
             sound: dialog::SoundPicker::new(false, vec!["system".into()], "system"),
+            delivery: dialog::ForceSubmitPicker::new(false, 5),
         });
         exec::preview_selected_theme(&mut app);
         assert_ne!(app.paint.theme.resolve(dim).rgb, original, "previewed");
@@ -11001,6 +11029,7 @@ mod tests {
             },
             view: dialog::ViewSwitches::new(true, true),
             sound: dialog::SoundPicker::new(false, vec!["system".into()], "system"),
+            delivery: dialog::ForceSubmitPicker::new(false, 5),
         });
         exec::preview_selected_theme(&mut app);
         assert_eq!(app.paint.theme.resolve(dim).rgb, (0x22, 0x22, 0x22));

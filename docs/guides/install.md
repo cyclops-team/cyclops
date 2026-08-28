@@ -286,6 +286,8 @@ delivery_retry_max = 1       # retries only when no notification or legacy paylo
 receipt_block_ms = 2500      # cap for observing an immediately decidable receipt
 gate_hold_notify_ms = 120000 # one admin ping when a worker is held this long
 unclaimed_reminder_ms = 0    # disabled; positive arms one bounded reminder per unclaimed attempt
+force_notification_submit = "off"        # dangerous post-paste Enter fallback
+force_notification_submit_delay_ms = 5000 # 0 through 20000; used only when enabled
 ```
 
 Standard `cyclops send` acceptance is durable before notification scheduling.
@@ -311,6 +313,17 @@ Working with positive clean-composer proof may write, while human input or
 ambiguous composer evidence still refuses. Claim, withdrawal, or replacement
 makes the timer obsolete without terminal IO. One durable allowance prevents a
 restart or duplicate timer from writing more than one reminder.
+
+`force_notification_submit` is a separate, default-off escape hatch for an
+exact notification that crossed the paste boundary and then reached
+`verify_failed`. It never pastes a second notification. After
+`force_notification_submit_delay_ms`, the daemon revalidates the exact pending
+attempt, bound process generation, manifest, pane, and tmux mode, records a
+durable forced resolution intent, and presses the manifest submit key at most
+once. Claim, withdrawal, replacement, settlement, or switching the setting off
+makes the timer obsolete. This deliberately bypasses composer-content proof,
+so 0 milliseconds may submit human input that appeared after the paste. The
+workspace Settings card exposes the same choice as a 0 to 20 second slider.
 
 Unknown keys warn and are ignored. The file is data; nothing in it executes.
 

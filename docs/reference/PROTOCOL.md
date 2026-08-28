@@ -112,6 +112,8 @@ alphabet.
 | `messages.follow` | Page losslessly through body-free message changes after a sequence |
 | `msg.requeue` | Explicitly requeue a notification that permits the transition |
 | `notification.withdraw` | Suppress one exact `queued`, `gating`, or `blocked_pre_write` wake while leaving its mailbox item pending |
+| `notification.force_submit.get` | Read the administrator's default-off post-paste Enter fallback |
+| `notification.force_submit.set` | Persist and apply that fallback with a 0 to 20 second delay |
 | `alarm.preview` | Preview unresolved notification alarms older than a duration |
 | `attention.show` | Read safety checks for one staged notification attempt |
 | `attention.complete` | Submit one exact staged notification attempt |
@@ -820,6 +822,21 @@ remains uncertain even if the composer later looks empty. Exact staged bytes,
 typed or trailing content, hidden or unprovable content, a modal, or a changed
 binding keep the action unresolved. A call requesting the other resolution
 refuses.
+
+`notification.force_submit.get` and `notification.force_submit.set` are also
+administrator-only. Set takes `enabled`, `delay_seconds` from 0 through 20,
+and `protocol_version`. It persists the operator choice before updating the
+live daemon. This is not a second delivery path: only an exact current
+Doorbell Format 3 or 4 attempt in `attention_required` with cause
+`verify_failed` qualifies, after notification bytes crossed the write boundary.
+The timer rechecks that the mailbox entry is pending and that the recipient,
+pane process generation, agent generation, manifest, live pane, and tmux mode
+still match. It appends `notification_resolution_intent` with `forced: true`
+before sending the manifest submit key, then uses the ordinary action-accepted,
+consumption, and settlement facts. Durable intent admits at most one key across
+competing timers and restart. Claim, withdrawal, replacement, settlement, or a
+disabled setting refuses without terminal IO. The forced path bypasses only
+composer-content proof and may therefore submit human input.
 
 ### msg.history and msg.thread
 
