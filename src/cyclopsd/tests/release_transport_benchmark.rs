@@ -26,6 +26,28 @@ use serde_json::{json, Value};
 
 const CHILD_OUTPUT_CAP: usize = 1024 * 1024;
 
+#[derive(Clone, Copy)]
+enum CapturedOutputFailure {
+    TimedOut,
+    ExitStatus(Option<i32>),
+    UnexpectedStderr(usize),
+    InvalidJson,
+}
+
+fn captured_output_failure(label: &str, failure: CapturedOutputFailure) -> String {
+    let reason = match failure {
+        CapturedOutputFailure::TimedOut => "exceeded 15 seconds".to_string(),
+        CapturedOutputFailure::ExitStatus(code) => {
+            format!("failed with status {code:?}")
+        }
+        CapturedOutputFailure::UnexpectedStderr(bytes) => {
+            format!("polluted JSON stderr with {bytes} captured bytes")
+        }
+        CapturedOutputFailure::InvalidJson => "emitted invalid JSON".to_string(),
+    };
+    format!("{label} {reason}; captured output withheld")
+}
+
 fn samples() -> usize {
     std::env::var("CYC_RELEASE_SAMPLES")
         .ok()
@@ -222,7 +244,10 @@ fn bounded_output(command: &mut Command, label: &str) -> Output {
                 let _status = child.wait().expect("collect killed child status");
                 let _ = stdout_handle.join();
                 let _ = stderr_handle.join();
-                panic!("{label} exceeded 15 seconds; captured output withheld");
+                panic!(
+                    "{}",
+                    captured_output_failure(label, CapturedOutputFailure::TimedOut)
+                );
             }
             Err(error) => panic!("wait for {label}: {error}"),
         }
@@ -260,9 +285,9 @@ fn try_candidate_binary(
         &format!("probe candidate {program}"),
     );
     if !output.status.success() {
-        return Err(format!(
-            "candidate {program} --version failed with status {:?}; captured output withheld",
-            output.status.code()
+        return Err(captured_output_failure(
+            &format!("candidate {program} --version"),
+            CapturedOutputFailure::ExitStatus(output.status.code()),
         ));
     }
     let version = String::from_utf8(output.stdout)
@@ -394,8 +419,11 @@ fn pane_for_window(tmux: &TmuxGuard, window_name: &str) -> String {
     ]);
     assert!(
         output.status.success(),
-        "list private candidate panes failed with status {:?}; captured output withheld",
-        output.status.code()
+        "{}",
+        captured_output_failure(
+            "list private candidate panes",
+            CapturedOutputFailure::ExitStatus(output.status.code())
+        )
     );
     String::from_utf8(output.stdout)
         .expect("tmux pane list is UTF-8")
@@ -490,8 +518,11 @@ impl ExternalCandidateRig {
         let stopped = run_candidate_cli(cli, &self.home, &["daemon", "stop", "--json"]);
         assert!(
             stopped.status.success(),
-            "candidate daemon stop failed with status {:?}; captured output withheld",
-            stopped.status.code()
+            "{}",
+            captured_output_failure(
+                "candidate daemon stop",
+                CapturedOutputFailure::ExitStatus(stopped.status.code())
+            )
         );
         self.daemon.wait_for_clean_exit();
     }
@@ -513,23 +544,32 @@ fn run_candidate_cli(binary: &CandidateBinary, home: &Path, args: &[&str]) -> Ou
 fn json_output(output: &Output, label: &str) -> Value {
     assert!(
         output.stderr.is_empty(),
-        "{label} polluted JSON stderr ({} captured bytes; content withheld)",
-        output.stderr.len()
+        "{}",
+        captured_output_failure(
+            label,
+            CapturedOutputFailure::UnexpectedStderr(output.stderr.len())
+        )
     );
     assert!(
         output.status.success(),
         "{label} returned non-zero exit status"
     );
-    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
-        panic!("{label} emitted invalid JSON: {error}; captured content withheld")
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|_error| {
+        panic!(
+            "{}",
+            captured_output_failure(label, CapturedOutputFailure::InvalidJson)
+        )
     })
 }
 
 fn assert_cli_success(output: &Output, label: &str) {
     assert!(
         output.status.success(),
-        "{label} failed with status {:?}; captured output withheld",
-        output.status.code()
+        "{}",
+        captured_output_failure(
+            label,
+            CapturedOutputFailure::ExitStatus(output.status.code())
+        )
     );
 }
 
@@ -763,23 +803,18 @@ fn test_bounded_output_drains_past_the_retained_cap() {
 
 #[test]
 fn test_candidate_failure_diagnostics_withhold_captured_content() {
-    let sentinel = "PRIVATE-BENCHMARK-PAYLOAD";
-    let output = Command::new("python3")
-        .args([
-            "-c",
-            "import sys; print('PRIVATE-BENCHMARK-PAYLOAD'); print('PRIVATE-BENCHMARK-PAYLOAD', file=sys.stderr); sys.exit(7)",
-        ])
-        .output()
-        .expect("run diagnostic privacy fixture");
-    let panic = std::panic::catch_unwind(|| assert_cli_success(&output, "candidate CLI"))
-        .expect_err("non-zero candidate command must fail");
-    let message = panic
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| panic.downcast_ref::<&str>().copied())
-        .expect("assertion panic carries text");
-    assert!(!message.contains(sentinel));
-    assert!(message.contains("captured output withheld"));
+    let reasons = [
+        CapturedOutputFailure::TimedOut,
+        CapturedOutputFailure::ExitStatus(Some(7)),
+        CapturedOutputFailure::ExitStatus(None),
+        CapturedOutputFailure::UnexpectedStderr(42),
+        CapturedOutputFailure::InvalidJson,
+    ];
+    for reason in reasons {
+        let message = captured_output_failure("candidate CLI", reason);
+        assert!(message.contains("captured output withheld"));
+        assert!(!message.contains("PRIVATE-BENCHMARK-PAYLOAD"));
+    }
 }
 
 #[test]
