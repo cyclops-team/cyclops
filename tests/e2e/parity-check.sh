@@ -695,7 +695,6 @@ REVIEW_LOCATOR="$(awk '/^❯ cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$/ { pri
 wait_for "the reviewer doorbell to be submitted" 100 notification_crossed_submit "$REVIEW_ID"
 
 # The same durable recipient agent claims the payload over the socket.
-stop_composer reviewer "$N2"
 agent_command reviewer "$N2" "inbox list --plain"
 check "inbox list exposes metadata" "^$REVIEW_ID implementer · Release notes review\$"
 agent_command reviewer "$N2" "inbox claim $REVIEW_LOCATOR --plain"
@@ -706,6 +705,7 @@ agent_command reviewer "$N2" "inbox claim $REVIEW_LOCATOR --plain"
 check "the same locator repeat returns the same payload" '^Check the mailbox contract\.$'
 agent_command reviewer "$N2" "inbox claim $REVIEW_ID --plain"
 check "plain repeat claim returns the same payload" '^Check the mailbox contract\.$'
+stop_composer reviewer "$N2"
 
 # Stopping the composer changes the foreground process after Enter. The exact
 # authenticated claim settles the wake before that late receipt observation can

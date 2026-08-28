@@ -127,7 +127,7 @@ pub(crate) type InjectPause = Arc<
         + Sync,
 >;
 
-/// Test seam: an async pause before a watcher reconcile requested by
+/// Test seam: force and optionally pause a watcher reconcile requested by
 /// `pane.label`. Always None in production.
 pub(crate) type NameReconcilePause = Arc<
     dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
@@ -278,7 +278,7 @@ pub(crate) struct Inner {
     pub(crate) hook_liveness: selftest::HookLiveness,
     /// Test-only injection pause, see [`InjectPause`].
     pub(crate) inject_pause: StdMutex<Option<InjectPause>>,
-    /// Test-only naming reconcile pause, see [`NameReconcilePause`].
+    /// Test-only forced naming reconcile and pause, see [`NameReconcilePause`].
     pub(crate) name_reconcile_pause: StdMutex<Option<NameReconcilePause>>,
     /// Test-only: make the `--clear` chrome restore fail the way tmux
     /// refusing a command would. See [`Daemon::fail_chrome_restore`].
@@ -1839,8 +1839,8 @@ impl Daemon {
         *self.inner.inject_pause.lock().expect("inject pause lock") = None;
     }
 
-    /// Test-only seam: pause a pane-name fallback before it reconciles one
-    /// watched session. Not part of the public API surface.
+    /// Test-only seam: force a pane-name fallback and pause it before it
+    /// reconciles one watched session. Not part of the public API surface.
     #[doc(hidden)]
     pub fn set_name_reconcile_pause<F>(&self, f: F)
     where
@@ -1986,7 +1986,17 @@ pub(crate) async fn label_pane(
     //    table stale. Naming is an explicit request about current tmux state,
     //    so a raw pane-id cache miss earns one authoritative owner lookup and
     //    one reconcile of that session alone, under one wall-clock bound.
-    let mut resolved = inner.resolve_recipient(target);
+    let forced_test_reconcile = target.parse::<TmuxPaneId>().is_ok()
+        && inner
+            .name_reconcile_pause
+            .lock()
+            .expect("name reconcile pause lock")
+            .is_some();
+    let mut resolved = if forced_test_reconcile {
+        None
+    } else {
+        inner.resolve_recipient(target)
+    };
     if resolved.is_none() && target.parse::<TmuxPaneId>().is_ok() {
         match tokio::time::timeout(
             NAME_RECONCILE_TIMEOUT,
