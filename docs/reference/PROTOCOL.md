@@ -112,6 +112,8 @@ alphabet.
 | `messages.follow` | Page losslessly through body-free message changes after a sequence |
 | `msg.requeue` | Explicitly requeue a notification that permits the transition |
 | `notification.withdraw` | Suppress one exact `queued`, `gating`, or `blocked_pre_write` wake while leaving its mailbox item pending |
+| `notification.force_submit.get` | Read the administrator's default-off post-paste Enter fallback |
+| `notification.force_submit.set` | Persist and apply that fallback with a 0 to 20 second delay |
 | `alarm.preview` | Preview unresolved notification alarms older than a duration |
 | `attention.show` | Read safety checks for one staged notification attempt |
 | `attention.complete` | Submit one exact staged notification attempt |
@@ -440,10 +442,11 @@ unknown state exits 1. The message is already durably accepted, so that exit
 must not trigger an unkeyed resend.
 
 For a non-admin recipient, a CLI-originated message with a summary selects
-Format 4 at the terminal write boundary:
+Format 4 at the terminal write boundary when the complete preview and claim
+fit one verifiable composer row:
 
 ```text
-[cyclops] FROM: implementer | The rate limiter is ready for review. Check the burst path for regressions. Claim: cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
+[cyclops from implementer] The rate limiter is ready for review. Check the burst path for regressions. | cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
 ```
 
 The 22-character URL-safe token encodes the complete 128-bit notification
@@ -458,7 +461,10 @@ preview is presentation only. The authenticated claim returns the immutable
 routing header and full technical body that the recipient must read before
 acting.
 
-The Format 4 claim instruction and Format 3 legacy command require a pane at
+The Format 4 requirement is the rendered row width, including the vendor
+prompt. If the full row does not fit at selection time, the same attempt uses
+the shorter exact Format 3 claim so the daemon can still verify and submit it;
+the durable summary remains in the Messages view. Format 3 requires a pane at
 least 60 columns wide. A narrower pane is
 recorded as `blocked_pre_write` with the compatible cause
 `write_readiness_changed`, plus its observed and required widths. Current
@@ -468,9 +474,11 @@ attempt once. The operator may withdraw it while it remains provably
 pre-write.
 
 Summaryless legacy clients retain the Format 3 capability path and canonical
-direct-payload fallback. Current CLI sends and replies always queue Format 4;
-working state does not discard it, while human input or ambiguous composer
-evidence keeps it waiting before the write boundary.
+direct-payload fallback. Current CLI sends and replies always queue a mailbox
+claim, prefer Format 4 when it is exactly provable, and use Format 3 when the
+preview would wrap. Working state does not discard either wake, while human
+input or ambiguous composer evidence keeps it waiting before the write
+boundary.
 
 The compatibility wire states are `not_started`, `queued`, `gating`, `writing`,
 `staged`, `submitted`, `notified`, `attention_required`, and `superseded`. This
@@ -814,6 +822,21 @@ remains uncertain even if the composer later looks empty. Exact staged bytes,
 typed or trailing content, hidden or unprovable content, a modal, or a changed
 binding keep the action unresolved. A call requesting the other resolution
 refuses.
+
+`notification.force_submit.get` and `notification.force_submit.set` are also
+administrator-only. Set takes `enabled`, `delay_seconds` from 0 through 20,
+and `protocol_version`. It persists the operator choice before updating the
+live daemon. This is not a second delivery path: only an exact current
+Doorbell Format 3 or 4 attempt in `attention_required` with cause
+`verify_failed` qualifies, after notification bytes crossed the write boundary.
+The timer rechecks that the mailbox entry is pending and that the recipient,
+pane process generation, agent generation, manifest, live pane, and tmux mode
+still match. It appends `notification_resolution_intent` with `forced: true`
+before sending the manifest submit key, then uses the ordinary action-accepted,
+consumption, and settlement facts. Durable intent admits at most one key across
+competing timers and restart. Claim, withdrawal, replacement, settlement, or a
+disabled setting refuses without terminal IO. The forced path bypasses only
+composer-content proof and may therefore submit human input.
 
 ### msg.history and msg.thread
 

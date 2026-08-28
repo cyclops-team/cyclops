@@ -90,21 +90,39 @@ and wake state.
 
 ## Receive
 
-CLI sends and replies use this summary-bearing notification:
+CLI sends and replies use this summary-bearing notification when the complete
+preview and claim fit one verifiable composer row:
 
 ```text
-[cyclops] FROM: implementer | The rate limiter is ready for review. Check the burst path for regressions. Claim: cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
+[cyclops from implementer] The rate limiter is ready for review. Check the burst path for regressions. | cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
 ```
 
 The reserved locator remains valid positional-claim input. Its 22-character
 token losslessly identifies the exact current notification attempt. The daemon
 atomically resolves that attempt to its message and claims it for the
-authenticated recipient. Summaryless legacy wire clients retain their
-versioned Format 3 and direct-payload compatibility paths.
+authenticated recipient. If that row would wrap, the daemon stages the
+shorter exact Format 3 claim instead of pasting an unprovable preview and
+leaving it unsubmitted. The full summary remains visible in `cyclops
+messages`. Summaryless legacy wire clients retain their versioned Format 3
+and direct-payload compatibility paths.
 
 Both shapes are written once, only after proving the pane occupant, manifest,
 and clean composer. An ambiguous write or submit raises attention. Cyclops does
 not write either shape again automatically.
+
+The workspace Settings card has an optional `Force staged submit` escape hatch
+for a narrower failure: Cyclops already pasted the exact notification, but its
+normal verification could not confirm Enter. It is off by default. When enabled,
+the daemon waits the selected 0 to 20 seconds, rechecks the exact recipient,
+pane process generation, manifest, and tmux mode, then presses the manifest's
+submit key once without re-pasting the notification. A claim, withdrawal,
+replacement attempt, settled barrier, or disabled setting makes the timer a
+no-op. The durable resolution intent prevents duplicate timers or a restart
+from pressing a second key.
+
+This setting intentionally bypasses composer-content proof. At 0 seconds it can
+submit human input that appeared after the notification was pasted. Use it only
+when immediate liveness matters more than preserving unsubmitted composer text.
 
 ## Claim a doorbell message
 

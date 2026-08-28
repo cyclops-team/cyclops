@@ -158,6 +158,14 @@ exactly empty, that same attempt re-enters the normal gate automatically. A
 hidden editor, modal, stale frame, ambiguous composer, replaced occupant, or
 daemon-owned recovery barrier remains blocked.
 
+For operators who prefer liveness over that final content guarantee, Settings
+includes a default-off `Force staged submit` timer from 0 to 20 seconds. It
+applies only after an exact notification was pasted but normal verification
+failed. The daemon rechecks the exact attempt and pane process, then presses
+Enter once without pasting again. A claim or replacement cancels it. This mode
+can submit human input, especially at 0 seconds, so it is never enabled by
+default.
+
 <!-- Media slot: docs/public/images/composer-hold.png
      Suggested content: visible draft, held notification, final erase, same attempt released. -->
 

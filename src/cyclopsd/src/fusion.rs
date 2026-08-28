@@ -10339,6 +10339,7 @@ regex = ['^IDLE']
         let session_identities = crate::sessionstore::SessionIdentities::open(&state_root).unwrap();
         Arc::new(Inner {
             cfg: crate::Config::defaults(&home),
+            force_submit: crate::ForceSubmitRuntime::new(false, 5_000),
             state_root,
             state_repair: cyclops_state::RepairSummary::default(),
             workspace_id,

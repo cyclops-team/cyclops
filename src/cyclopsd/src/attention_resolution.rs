@@ -34,6 +34,8 @@ pub(crate) enum AttentionActionError {
         "the terminal action outcome is uncertain; no second key will be sent; reopen this exact attempt after its required durable evidence is recorded"
     )]
     Uncertain,
+    #[error("forced submit refused: {0}")]
+    ForceRefused(&'static str),
 }
 
 struct ActionRoute {
@@ -82,6 +84,166 @@ pub(crate) async fn resolve(
         spawn_exact_owned_worker(inner, Arc::clone(service), target.record.attempt_id);
     }
     result
+}
+
+/// Press the manifest submit key once for an exact verify-failed notification
+/// after the operator's opt-in timer expires.
+///
+/// This deliberately bypasses composer-content proof, and nothing else. The
+/// exact recipient, pane process generation, admitted agent generation,
+/// manifest, live pane, and tmux mode are checked before and after the durable
+/// intent. Intent is appended before the key, so a crash can lose the action
+/// but can never authorize a second key.
+pub(crate) async fn force_complete(
+    inner: &Arc<Inner>,
+    service: &Arc<MailboxService>,
+    target: &AttentionTarget,
+) -> Result<AttentionResolveResult, AttentionActionError> {
+    if !inner.force_submit.get().0 {
+        return Err(AttentionActionError::ForceRefused("setting is off"));
+    }
+    if !target.record.needs_exact_owned_reconciliation() {
+        return Err(AttentionActionError::ForceRefused(
+            "attempt is not an exact verify-failed doorbell",
+        ));
+    }
+    if !service.force_submit_target_is_pending(target)? {
+        return Err(AttentionActionError::ForceRefused(
+            "attempt was claimed, withdrawn, replaced, or settled",
+        ));
+    }
+    let start = service.begin_attention_resolution(target, NotificationResolution::Complete)?;
+    match start {
+        AttentionResolutionStart::Fresh => {}
+        AttentionResolutionStart::AcceptedUnconsumed => {
+            return reconcile_existing_intent(
+                inner,
+                service,
+                target,
+                NotificationResolution::Complete,
+                true,
+            )
+            .await;
+        }
+        AttentionResolutionStart::ReconcileOnly | AttentionResolutionStart::IntentOnlyUncertain => {
+            service.cancel_attention_resolution(target.record.attempt_id)?;
+            return Err(AttentionActionError::Uncertain);
+        }
+    }
+
+    if force_action_route(inner, service, target).is_none() {
+        service.cancel_attention_resolution(target.record.attempt_id)?;
+        return Err(AttentionActionError::ForceRefused(
+            "recipient process or pane mode changed",
+        ));
+    }
+    service.record_forced_attention_resolution_intent(target)?;
+    delivery::inject_pause(inner, "force_submit_after_intent").await;
+
+    if !inner.force_submit.get().0 {
+        withdraw_pre_key(inner, service, target, NotificationResolution::Complete)?;
+        return Err(AttentionActionError::ForceRefused("setting was disabled"));
+    }
+    let Some(route) = force_action_route(inner, service, target) else {
+        withdraw_pre_key(inner, service, target, NotificationResolution::Complete)?;
+        return Err(AttentionActionError::ForceRefused(
+            "recipient process or pane mode changed",
+        ));
+    };
+    let Some(keys) = action_keys(&route.manifest, NotificationResolution::Complete) else {
+        withdraw_pre_key(inner, service, target, NotificationResolution::Complete)?;
+        return Err(AttentionActionError::ForceRefused(
+            "manifest has no submit key",
+        ));
+    };
+
+    let mut evidence_events = inner.events.subscribe();
+    let dispatch_started_ms = unix_ms();
+    let expected_payload = expected_notification(service, target)
+        .ok_or(AttentionActionError::ForceRefused("payload is obsolete"))?;
+    let registration = service.register_attention_consumption_candidate(
+        target,
+        route.session_idx,
+        route.row.pane_id.clone(),
+        expected_payload,
+        dispatch_started_ms,
+    )?;
+    let registration = registration.map(|signal| {
+        ConsumptionRegistration::new(Arc::clone(service), target.record.attempt_id, signal)
+    });
+
+    if route
+        .watcher
+        .client()
+        .send_keys(&route.row.pane_id, &keys)
+        .await
+        .is_err()
+    {
+        let _ = service.cancel_attention_resolution(target.record.attempt_id);
+        return Err(AttentionActionError::Uncertain);
+    }
+    delivery::inject_pause(inner, "force_submit_after_key_before_accepted").await;
+    if service
+        .record_attention_resolution_action_accepted(target, NotificationResolution::Complete)
+        .is_err()
+    {
+        let _ = service.cancel_attention_resolution(target.record.attempt_id);
+        return Err(AttentionActionError::Uncertain);
+    }
+
+    let consumption = ConsumptionRequirement {
+        binding: target
+            .record
+            .binding
+            .clone()
+            .expect("force-submit eligibility requires a binding"),
+        signal: registration.as_ref().map(ConsumptionRegistration::signal),
+    };
+    let Some(confirmed) = observe_post_action_clear(
+        inner,
+        service,
+        target,
+        &mut evidence_events,
+        Some(&consumption),
+    )
+    .await
+    else {
+        let _ = service.cancel_attention_resolution(target.record.attempt_id);
+        return Err(AttentionActionError::Uncertain);
+    };
+    settle_resolution(
+        inner,
+        service,
+        target,
+        NotificationResolution::Complete,
+        confirmed,
+    )
+    .await
+}
+
+fn force_action_route(
+    inner: &Arc<Inner>,
+    service: &MailboxService,
+    target: &AttentionTarget,
+) -> Option<ActionRoute> {
+    let binding = target.record.binding.as_ref()?;
+    let route =
+        crate::messaging::notification_route(inner, service, target.record.recipient).ok()??;
+    if route.row.dead || route.row.in_mode {
+        return None;
+    }
+    let admitted = fusion::admitted_binding(inner, route.session_idx, &route.row);
+    let (process_matches, manifest_matches) = binding_checks(admitted.as_ref(), binding);
+    if !process_matches || !manifest_matches {
+        return None;
+    }
+    let manifest = inner.manifests.get(binding.manifest.as_str())?.clone();
+    Some(ActionRoute {
+        session_idx: route.session_idx,
+        watcher: route.watcher,
+        row: route.row,
+        manifest,
+    })
 }
 
 /// Reconcile exact Cyclops-owned composer content after relevant evidence moves.
@@ -143,6 +305,7 @@ fn spawn_exact_owned_worker(
                     "exact-owned composer notification reconciled"
                 ),
                 Err(AttentionActionError::Evidence(_)) => {}
+                Err(AttentionActionError::ForceRefused(_)) => {}
                 Err(AttentionActionError::Uncertain) => tracing::warn!(
                     %attempt_id,
                     "exact-owned composer reconciliation remains uncertain"

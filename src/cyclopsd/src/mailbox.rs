@@ -2377,6 +2377,7 @@ impl MailboxProjection {
             message_id,
             recipient,
             resolution,
+            forced: _,
         } = fact
         else {
             return Err(MailboxError::InvalidNotificationFact(
@@ -5368,6 +5369,51 @@ impl MailboxService {
         Ok(records)
     }
 
+    /// Exact verify-failed attempts eligible for the operator's opt-in timed
+    /// Enter escape hatch. Durable resolution intent is checked again when
+    /// the timer fires, so duplicate scheduler calls cannot send two keys.
+    pub(crate) fn force_submit_candidates(
+        &self,
+    ) -> Result<Vec<NotificationRecord>, MailboxServiceError> {
+        let store = self.store()?;
+        let mut records: Vec<_> = store
+            .projection()
+            .notifications
+            .values()
+            .filter(|record| record.needs_exact_owned_reconciliation())
+            .filter(|record| {
+                store
+                    .projection()
+                    .get_entry(record.recipient, &record.message_id)
+                    .is_some_and(|entry| entry.state.is_pending())
+            })
+            .cloned()
+            .collect();
+        records.sort_by_key(|record| record.updated_seq);
+        Ok(records)
+    }
+
+    /// Revalidate the exact timer target at the action boundary. A claim,
+    /// withdrawal, replacement attempt, or settled barrier makes the timer a
+    /// no-op even if it was eligible when originally armed.
+    pub(crate) fn force_submit_target_is_pending(
+        &self,
+        target: &AttentionTarget,
+    ) -> Result<bool, MailboxServiceError> {
+        let store = self.store()?;
+        let projection = store.projection();
+        let current = projection.alarm_by_attempt(target.record.attempt_id);
+        Ok(current == Some(&target.record)
+            && current.is_some_and(NotificationRecord::needs_exact_owned_reconciliation)
+            && projection.notification(target.record.recipient, &target.record.message_id)
+                == current
+            && projection
+                .active_notification_barriers
+                .get(&target.record.attempt_id)
+                == current
+            && projection.entry_is_pending(target.record.recipient, &target.record.message_id))
+    }
+
     /// Atomically classify or queue one due reminder under the store lock.
     pub(crate) fn queue_unclaimed_reminder(
         &self,
@@ -6012,6 +6058,33 @@ impl MailboxService {
             .projection()
             .last_sequence()
             .expect("attention resolution intent advances the workspace sequence");
+        self.publish_change(
+            seq,
+            &[
+                MessagesChangedArea::Notifications,
+                MessagesChangedArea::Attention,
+            ],
+        );
+        Ok(())
+    }
+
+    /// Persist the timed escape hatch before its one terminal key. The fact
+    /// carries no message content and marks the action as forced for audit.
+    pub(crate) fn record_forced_attention_resolution_intent(
+        &self,
+        target: &AttentionTarget,
+    ) -> Result<(), MailboxServiceError> {
+        let mut store = self.store()?;
+        store.record_forced_notification_resolution_intent(
+            target.record.message_id.clone(),
+            target.record.recipient,
+            target.record.attempt_id,
+            NotificationResolution::Complete,
+        )?;
+        let seq = store
+            .projection()
+            .last_sequence()
+            .expect("forced resolution intent advances the workspace sequence");
         self.publish_change(
             seq,
             &[
@@ -7496,12 +7569,38 @@ impl MessageStore {
         attempt_id: NotificationAttemptId,
         resolution: NotificationResolution,
     ) -> Result<NotificationRecord, MessageStoreError> {
+        self.record_notification_resolution_intent_kind(
+            message_id, recipient, attempt_id, resolution, false,
+        )
+    }
+
+    fn record_forced_notification_resolution_intent(
+        &mut self,
+        message_id: MessageId,
+        recipient: RecipientKey,
+        attempt_id: NotificationAttemptId,
+        resolution: NotificationResolution,
+    ) -> Result<NotificationRecord, MessageStoreError> {
+        self.record_notification_resolution_intent_kind(
+            message_id, recipient, attempt_id, resolution, true,
+        )
+    }
+
+    fn record_notification_resolution_intent_kind(
+        &mut self,
+        message_id: MessageId,
+        recipient: RecipientKey,
+        attempt_id: NotificationAttemptId,
+        resolution: NotificationResolution,
+        forced: bool,
+    ) -> Result<NotificationRecord, MessageStoreError> {
         let fact = NotificationFact::NotificationResolutionIntent {
             record_version: CANONICAL_RECORD_VERSION,
             attempt_id,
             message_id: message_id.clone(),
             recipient,
             resolution,
+            forced,
         };
         self.append_notification_fact_at(message_id, recipient, fact, now_ms())
     }

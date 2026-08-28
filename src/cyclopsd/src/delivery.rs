@@ -110,6 +110,23 @@ struct AttemptPayload {
     transport: Option<NotificationTransport>,
     doorbell_format: Option<u32>,
     capability: Option<MailboxCapabilityProof>,
+    capability_required: bool,
+}
+
+impl AttemptPayload {
+    fn required_pane_width(&self) -> Option<u32> {
+        match self.doorbell_format {
+            Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM) => {
+                Some(cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH)
+            }
+            Some(cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM) => Some(
+                u32::try_from(2 + unicode_width::UnicodeWidthStr::width(self.bytes.as_str()))
+                    .unwrap_or(u32::MAX)
+                    .max(cyclops_proto::DOORBELL_V4_MIN_PANE_WIDTH),
+            ),
+            _ => None,
+        }
+    }
 }
 
 impl MailboxCapabilityProof {
@@ -137,7 +154,7 @@ fn notification_prewrite_bookend(
     pane_width: u32,
 ) -> Option<String> {
     if matches!(selected.transport, Some(NotificationTransport::Doorbell))
-        && selected.doorbell_format != Some(cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM)
+        && selected.capability_required
     {
         let current =
             recipient
@@ -149,13 +166,9 @@ fn notification_prewrite_bookend(
             return Some("capability_changed".to_string());
         }
     }
-    if selected.doorbell_format == Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM)
-        && pane_width < cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH
-    {
-        return Some(format!("pane_too_narrow:{pane_width}"));
-    }
-    if selected.doorbell_format == Some(cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM)
-        && pane_width < cyclops_proto::DOORBELL_V4_MIN_PANE_WIDTH
+    if selected
+        .required_pane_width()
+        .is_some_and(|required| pane_width < required)
     {
         return Some(format!("pane_too_narrow:{pane_width}"));
     }
@@ -191,6 +204,7 @@ fn select_attempt_payload(
     handle: &DeliveryHandle,
     manifest: &Manifest,
     observed: Option<&fusion::Binding>,
+    pane_width: Option<u32>,
 ) -> Result<AttemptPayload, NotificationAdapterError> {
     let Some(notification) = &handle.notification else {
         return Ok(AttemptPayload {
@@ -198,6 +212,7 @@ fn select_attempt_payload(
             transport: None,
             doorbell_format: None,
             capability: None,
+            capability_required: false,
         });
     };
     let capability = observed.and_then(|binding| {
@@ -214,15 +229,31 @@ fn select_attempt_payload(
     });
     if let Some(metadata) = metadata {
         if let Some(summary) = metadata.summary {
-            return Ok(AttemptPayload {
-                bytes: cyclops_proto::render_doorbell_v4(
-                    &metadata.presentation.sender_label,
-                    &summary,
-                    notification.attempt_id(),
-                ),
+            let bytes = cyclops_proto::render_doorbell_v4(
+                &metadata.presentation.sender_label,
+                &summary,
+                notification.attempt_id(),
+            );
+            let candidate = AttemptPayload {
+                bytes,
                 transport: Some(NotificationTransport::Doorbell),
                 doorbell_format: Some(cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM),
                 capability: None,
+                capability_required: false,
+            };
+            if pane_width.is_none_or(|width| {
+                candidate
+                    .required_pane_width()
+                    .is_some_and(|required| width >= required)
+            }) {
+                return Ok(candidate);
+            }
+            return Ok(AttemptPayload {
+                bytes: cyclops_proto::render_doorbell_v3(notification.attempt_id()),
+                transport: Some(NotificationTransport::Doorbell),
+                doorbell_format: Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
+                capability: None,
+                capability_required: false,
             });
         }
     }
@@ -233,6 +264,7 @@ fn select_attempt_payload(
             transport: Some(NotificationTransport::Doorbell),
             doorbell_format: Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
             capability,
+            capability_required: true,
         });
     }
 
@@ -241,6 +273,7 @@ fn select_attempt_payload(
         transport: Some(NotificationTransport::DirectPayload),
         doorbell_format: None,
         capability: None,
+        capability_required: false,
     })
 }
 
@@ -4182,10 +4215,11 @@ async fn attempt_delivery(
             inner.engine.buffer_seq.fetch_add(1, Ordering::Relaxed)
         ),
     };
-    let observed = watcher
-        .pane(&handle.pane_id)
-        .and_then(|row| fusion::admitted_binding(inner, handle.session_idx, &row));
-    let selected = match select_attempt_payload(handle, manifest, observed.as_ref()) {
+    let observed_row = watcher.pane(&handle.pane_id);
+    let pane_width = observed_row.as_ref().map(|row| row.width);
+    let observed =
+        observed_row.and_then(|row| fusion::admitted_binding(inner, handle.session_idx, &row));
+    let selected = match select_attempt_payload(handle, manifest, observed.as_ref(), pane_width) {
         Ok(selected) => selected,
         Err(error) => {
             error!(id = %handle.msg_id, error = %error, "notification payload reconstruction failed");
@@ -4339,7 +4373,7 @@ async fn attempt_delivery(
                     .and_then(|binding| notification_binding(notification.recipient(), binding)),
                 route_evidence: Some(inner.route_evidence_id(handle.session_idx, &handle.pane_id)),
                 pane_width: Some(final_row.width),
-                required_pane_width: None,
+                required_pane_width: selected.required_pane_width(),
                 write_block: None,
             });
     let proven = match observed_binding {
@@ -4348,12 +4382,12 @@ async fn attempt_delivery(
         // identity while becoming another program.
         Some(binding) if binding.manifest == manifest_id => binding,
         _ => {
-            // Width is a separate paired observation used only by the
-            // pane-too-narrow bookend below. Carrying an observed width
-            // without its required width makes a binding failure invalid
-            // durable data and would strand the attempt in Gating.
+            // Widths are a paired observation used only by the pane-too-narrow
+            // bookend below. Carrying either half through a binding failure
+            // makes the durable observation invalid and strands the attempt.
             let observation = observation.map(|mut observation| {
                 observation.pane_width = None;
+                observation.required_pane_width = None;
                 observation
             });
             gate_line(inner, handle, "rebound", None, Some("binding_unprovable"));
@@ -5616,6 +5650,7 @@ async fn fail_attempt(
                                 inner,
                                 record.recipient,
                             );
+                            crate::messaging::schedule_force_submit(inner, record);
                         }
                     }
                     Err(NotificationAdapterError::TerminalConflict(_)) => return false,
@@ -10752,7 +10787,7 @@ mod tests {
         )
         .unwrap();
 
-        let selected = select_attempt_payload(&handle, &manifest, None).unwrap();
+        let selected = select_attempt_payload(&handle, &manifest, None, None).unwrap();
         assert_eq!(
             selected.bytes,
             cyclops_proto::render_doorbell_v3(reminder.attempt_id)
@@ -11060,6 +11095,7 @@ mod tests {
                 file: file.clone(),
                 expected_digest: mailbox_capability::file_digest(&file).unwrap(),
             }),
+            capability_required: true,
         };
         let binding = fusion::Binding {
             pane_root: crate::identity::ProcId { pid: 40, birth: 5 },
@@ -11893,6 +11929,7 @@ composer_trailer_required_prefix = 1
         let session_identities = crate::sessionstore::SessionIdentities::open(&state_root).unwrap();
         Arc::new(Inner {
             cfg: crate::Config::defaults(path),
+            force_submit: crate::ForceSubmitRuntime::new(false, 5_000),
             state_root,
             state_repair: cyclops_state::RepairSummary::default(),
             workspace_id,

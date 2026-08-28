@@ -82,7 +82,7 @@ pub use delivery::{prove_composer_representation, ComposerRepresentationProof};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -159,6 +159,10 @@ impl PaneKey {
 /// need lives here behind one Arc.
 pub(crate) struct Inner {
     pub(crate) cfg: Config,
+    /// Live form of the operator's opt-in post-paste force-submit setting.
+    /// Config remains the boot snapshot; this pair is updated after an atomic
+    /// config write so the Settings card takes effect without a daemon restart.
+    pub(crate) force_submit: ForceSubmitRuntime,
     /// Validated descriptor anchoring every session-ledger open in this daemon.
     pub(crate) state_root: Arc<StateRoot>,
     /// One boot-wide aggregate recorded on each session's boot fact.
@@ -307,6 +311,32 @@ pub(crate) struct Inner {
     /// alongside `Daemon.tasks` so a session added at runtime shuts down
     /// exactly as cleanly as one that was configured.
     pub(crate) extra_tasks: StdMutex<Vec<JoinHandle<()>>>,
+}
+
+pub(crate) struct ForceSubmitRuntime {
+    enabled: AtomicBool,
+    delay_ms: AtomicU64,
+}
+
+impl ForceSubmitRuntime {
+    fn new(enabled: bool, delay_ms: u64) -> Self {
+        Self {
+            enabled: AtomicBool::new(enabled),
+            delay_ms: AtomicU64::new(delay_ms.min(20_000)),
+        }
+    }
+
+    pub(crate) fn get(&self) -> (bool, u64) {
+        (
+            self.enabled.load(Ordering::Acquire),
+            self.delay_ms.load(Ordering::Acquire),
+        )
+    }
+
+    pub(crate) fn set(&self, enabled: bool, delay_ms: u64) {
+        self.delay_ms.store(delay_ms.min(20_000), Ordering::Release);
+        self.enabled.store(enabled, Ordering::Release);
+    }
 }
 
 #[cfg(test)]
@@ -1719,6 +1749,14 @@ impl Daemon {
         messaging::claim(&self.inner, service, claimant.key, message_id)
             .map_err(server::mailbox_service_error)?;
         Ok(())
+    }
+
+    /// Re-run the production replay/runtime scan for force-submit candidates.
+    /// Tests use this to prove duplicate schedulers still elect one durable
+    /// terminal action for the exact attempt.
+    #[doc(hidden)]
+    pub fn schedule_force_submit_candidates_for_test(&self) {
+        messaging::schedule_force_submit_candidates(&self.inner);
     }
 
     /// Test seam for a body-free mailbox snapshot with an already-resolved
@@ -3207,8 +3245,13 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     // receiver every configured session got. boot keeps the sender.
     let (stop, stop_rx) = watch::channel(false);
     let (shutdown_request, _) = watch::channel(false);
+    let force_submit = ForceSubmitRuntime::new(
+        cfg.force_notification_submit,
+        cfg.force_notification_submit_delay_ms,
+    );
     let inner = Arc::new(Inner {
         cfg,
+        force_submit,
         state_root,
         state_repair: repair,
         workspace_id,
@@ -3291,6 +3334,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     delivery::close_limbo(&inner, &replayed);
     drop(replayed);
     messaging::schedule_unclaimed_reminders(&inner);
+    messaging::schedule_force_submit_candidates(&inner);
 
     let mut tasks = Vec::new();
     for idx in 0..inner.session_count() {
@@ -5351,6 +5395,7 @@ mod tests {
         let session_identities = sessionstore::SessionIdentities::open(&state_root).unwrap();
         Arc::new(Inner {
             cfg: Config::defaults(&home),
+            force_submit: ForceSubmitRuntime::new(false, 5_000),
             state_root,
             state_repair: RepairSummary::default(),
             workspace_id,

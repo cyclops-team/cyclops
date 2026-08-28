@@ -618,6 +618,23 @@ pub struct WorkspaceUiSetParams {
     pub protocol_version: u32,
 }
 
+/// Current opt-in post-paste force-submit setting.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForceSubmitSettings {
+    pub enabled: bool,
+    /// Whole seconds exposed by the workspace slider, from 0 through 20.
+    pub delay_seconds: u8,
+}
+
+/// Administrative update for the post-paste force-submit escape hatch.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ForceSubmitSettingsSetParams {
+    pub enabled: bool,
+    pub delay_seconds: u8,
+    #[serde(default)]
+    pub protocol_version: u32,
+}
+
 // --- Messaging (implemented from M1; types are part of protocol v1) ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

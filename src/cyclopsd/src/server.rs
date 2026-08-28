@@ -750,6 +750,87 @@ pub(crate) async fn dispatch(
             crate::workspace_ui::workspace_ui_set(&inner.workspace_ui, &params);
             (Response::ok(id, json!({"saved": true})), None)
         }
+        "notification.force_submit.get" => {
+            if let Err(error) = require_mailbox_admin(inner, peer) {
+                return (
+                    Response {
+                        id,
+                        result: None,
+                        error: Some(error),
+                    },
+                    None,
+                );
+            }
+            let (enabled, delay_ms) = inner.force_submit.get();
+            let result = cyclops_proto::ForceSubmitSettings {
+                enabled,
+                delay_seconds: u8::try_from(delay_ms / 1_000).unwrap_or(20).min(20),
+            };
+            (
+                Response::ok(
+                    id,
+                    serde_json::to_value(result).expect("force-submit settings serialize"),
+                ),
+                None,
+            )
+        }
+        "notification.force_submit.set" => {
+            if let Err(error) = require_mailbox_admin(inner, peer) {
+                return (
+                    Response {
+                        id,
+                        result: None,
+                        error: Some(error),
+                    },
+                    None,
+                );
+            }
+            let params: cyclops_proto::ForceSubmitSettingsSetParams =
+                match decode_params(&id, req.params, "notification.force_submit.set params") {
+                    Ok(params) => params,
+                    Err(response) => return (response, None),
+                };
+            if params.delay_seconds > 20 {
+                return (
+                    Response::err(
+                        id,
+                        "bad_request",
+                        "force-submit delay must be between 0 and 20 seconds",
+                    ),
+                    None,
+                );
+            }
+            let delay_ms = u64::from(params.delay_seconds) * 1_000;
+            if let Err(error) = crate::config::save_force_notification_submit(
+                &inner.cfg.home,
+                params.enabled,
+                delay_ms,
+            ) {
+                return (
+                    Response::err(
+                        id,
+                        "storage_failed",
+                        format!("cannot save force-submit setting: {error}"),
+                    ),
+                    None,
+                );
+            }
+            inner.force_submit.set(params.enabled, delay_ms);
+            if params.enabled {
+                crate::messaging::schedule_force_submit_candidates(inner);
+            }
+            let result = cyclops_proto::ForceSubmitSettings {
+                enabled: params.enabled,
+                delay_seconds: params.delay_seconds,
+            };
+            (
+                Response::ok(
+                    id,
+                    serde_json::to_value(result).expect("force-submit settings serialize"),
+                ),
+                None,
+            )
+        }
         method => {
             if let Some((_, milestone)) = UNIMPLEMENTED.iter().find(|(m, _)| *m == method) {
                 (
@@ -1261,6 +1342,11 @@ fn attention_action_error(error: crate::attention_resolution::AttentionActionErr
         },
         AttentionActionError::Uncertain => WireError {
             code: "attention_action_uncertain".to_string(),
+            message: error.to_string(),
+            data: None,
+        },
+        AttentionActionError::ForceRefused(_) => WireError {
+            code: "force_submit_refused".to_string(),
             message: error.to_string(),
             data: None,
         },
@@ -2851,6 +2937,7 @@ mod tests {
         let session_identities = crate::sessionstore::SessionIdentities::open(&state_root).unwrap();
         Arc::new(Inner {
             cfg: Config::defaults(&home),
+            force_submit: crate::ForceSubmitRuntime::new(false, 5_000),
             state_root,
             state_repair: cyclops_state::RepairSummary::default(),
             workspace_id,
