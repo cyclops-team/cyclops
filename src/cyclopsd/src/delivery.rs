@@ -8414,6 +8414,59 @@ fn exact_staging_snapshot_matches(
         && current.map(|(matched, _)| matched) == Some(id_staged)
 }
 
+/// Closed screen-representation outcomes for the Gate 7 component harness.
+///
+/// This proof cannot authorize delivery. It deliberately excludes process
+/// binding, pane mode, action safety, and durable composer holds. The daemon's
+/// normal gate remains the only authority for a real write.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerRepresentationProof {
+    ExactStaged,
+    WriteSafeClean,
+    WriteSafeGhost,
+    HiddenOrAmbiguous,
+}
+
+/// Classifies the visible composer through production representation parsers.
+///
+/// Callers must not use this as a write-readiness decision. It exists only so
+/// the opt-in live harness can measure the same exact staged-row and
+/// clean-or-ghost screen representations the daemon consumes.
+#[doc(hidden)]
+pub fn prove_composer_representation(
+    manifest: &Manifest,
+    screen: &str,
+    expected_staged: Option<&str>,
+) -> ComposerRepresentationProof {
+    if let Some(expected) = expected_staged {
+        if exact_staging_proof(
+            manifest,
+            screen,
+            StagingTarget::ExactRow(expected),
+            expected,
+        )
+        .is_some()
+        {
+            return ComposerRepresentationProof::ExactStaged;
+        }
+    } else {
+        if clean_composer_proof(manifest, screen) {
+            return ComposerRepresentationProof::WriteSafeClean;
+        }
+        let plain = strip_csi(screen);
+        let winner = fusion::screen_winner_esc(manifest, &plain, Some(screen));
+        if winner.is_some_and(|rule| {
+            rule.state == AgentState::Idle
+                && rule.composer_semantic == Some(ComposerSemantic::GhostSuggestion)
+        }) {
+            return ComposerRepresentationProof::WriteSafeGhost;
+        }
+    }
+    ComposerRepresentationProof::HiddenOrAmbiguous
+}
+
 /// Extract exact visible composer rows from a joined escaped capture.
 ///
 /// The caller must use `capture-pane -J -e`. Joining removes only rows tmux

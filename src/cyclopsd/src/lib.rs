@@ -76,6 +76,8 @@ pub use config::Config;
 /// vendor's reported prompt against these bytes, so anything that needs
 /// to reason about a delivery's text has to build it the same way.
 pub use delivery::render_payload;
+#[doc(hidden)]
+pub use delivery::{prove_composer_representation, ComposerRepresentationProof};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
