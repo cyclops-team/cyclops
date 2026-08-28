@@ -655,4 +655,10 @@ daemon and copy out any history you want to keep before removing
 `~/.cyclops`. Canonical mailbox journals are under
 `~/.cyclops/workspaces/<workspace-id>/messages.ndjson`; session state and
 legacy direct-delivery records are under `~/.cyclops/ledger/`. Copy the whole
-Cyclops home if you need both.
+Cyclops home if you need both. A complete uninstall must also remove only the
+Cyclops command hooks from installed vendor configuration. Check
+`~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.agents/hooks.json`, and
+`~/.cursor/hooks.json` where those files exist. Delete entries whose command
+invokes a `cyclops` binary followed by `hook <Event>`, while preserving every
+unrelated key, hook, and setting. Removing the binaries before these entries
+leaves the vendor CLI reporting hook exit code 127.

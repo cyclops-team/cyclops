@@ -67,6 +67,25 @@ Cyclops skill without replacing unrelated settings. Use
 [installation guide](docs/guides/install.md) for paths, options, updates,
 rollback, and uninstall.
 
+## Uninstall completely
+
+The managed uninstall stops the matching daemon, removes the installed binary
+pair, and removes the installer-owned PATH block. It deliberately preserves
+your mailbox history, configuration, and vendor settings:
+
+```bash
+curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
+```
+
+For a complete removal, first copy any history you want to keep. Then remove
+the Cyclops hook commands from `~/.claude/settings.json`,
+`~/.codex/hooks.json`, `~/.agents/hooks.json`, and
+`~/.cursor/hooks.json` where those files exist, preserving every unrelated
+entry. Finally, delete `~/.cyclops`. This last step permanently removes local
+mailbox journals, configuration, themes, prepared hooks, and operational
+records. The [installation guide](docs/guides/install.md#uninstall) lists the
+records worth exporting before that irreversible step.
+
 ## How to run Cyclops
 
 For normal interactive use, run `cyclops`. It opens the full-screen workspace
