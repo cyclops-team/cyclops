@@ -453,11 +453,14 @@ fn same_enumeration(between: &str, quoted: bool) -> bool {
 /// a table of tuples or a list of constructor calls is not a run. Those
 /// reach [`inside_bool_fns`] when they sit in a predicate, and nothing
 /// otherwise.
-fn bare_runs(code: &str, spelling: &Spelling) -> Vec<(usize, usize, BTreeSet<&'static str>)> {
-    let found = occurrences(code, spelling.all);
+fn bare_runs(
+    code: &str,
+    spelling: &Spelling,
+    found: &[(usize, usize, &'static str)],
+) -> Vec<(usize, usize, BTreeSet<&'static str>)> {
     let mut out: Vec<(usize, usize, BTreeSet<&'static str>)> = Vec::new();
     let mut end_of_previous = None;
-    for (start, end, name) in found {
+    for &(start, end, name) in found {
         match end_of_previous {
             Some(prev) if same_enumeration(&code[prev..start], spelling.quoted) => {
                 let run = out.last_mut().expect("a run is open");
@@ -482,10 +485,9 @@ fn bare_runs(code: &str, spelling: &Spelling) -> Vec<(usize, usize, BTreeSet<&'s
 /// bool without being the literal (`s.is_x()`, `!other(s)`, a block).
 fn mapped_to_bool(
     code: &str,
-    spelling: &Spelling,
+    skeleton: &str,
+    runs: &[(usize, usize, BTreeSet<&'static str>)],
 ) -> (BTreeSet<&'static str>, BTreeSet<&'static str>) {
-    let skeleton = blank_literals(code);
-    let runs = bare_runs(code, spelling);
     let mut yes = BTreeSet::new();
     let mut no = BTreeSet::new();
     let mut from = 0;
@@ -505,10 +507,11 @@ fn mapped_to_bool(
         // nothing but bare punctuation in between. Quotes count as bare
         // whatever the spelling, because a wire name's own closing quote
         // sits between the run and the arrow.
-        if let Some(run) = runs
-            .iter()
-            .rev()
-            .find(|(_, end, _)| *end <= arrow && same_enumeration(&code[*end..arrow], true))
+        let preceding = runs.partition_point(|(_, end, _)| *end <= arrow);
+        if let Some(run) = preceding
+            .checked_sub(1)
+            .map(|at| &runs[at])
+            .filter(|(_, end, _)| same_enumeration(&code[*end..arrow], true))
         {
             side.extend(run.2.iter().copied());
         }
@@ -526,11 +529,19 @@ fn mapped_to_bool(
 /// (`const NEEDY: DeliveryState = DeliveryState::AttentionRequired;` then
 /// `s == NEEDY`), and `assert_eq!`, which is an assertion and not a
 /// verdict.
-fn compared(code: &str, spelling: &Spelling) -> BTreeSet<&'static str> {
+fn compared(code: &str, found: &[(usize, usize, &'static str)]) -> BTreeSet<&'static str> {
     let mut out = BTreeSet::new();
-    for (start, end, name) in occurrences(code, spelling.all) {
-        let before = strip_paths(code[..start].trim_end_matches(['"', ' ', '\n', '\t', '\r']));
-        let before = before.trim_end();
+    for &(start, end, name) in found {
+        // Only the path immediately before this state can separate it from
+        // a comparison operator. Rewriting the whole source prefix for every
+        // occurrence made this scan quadratic on large files.
+        let before = code[..start].trim_end_matches(['"', ' ', '\n', '\t', '\r']);
+        let path_start = before
+            .as_bytes()
+            .iter()
+            .rposition(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_' && *byte != b':')
+            .map_or(0, |at| at + 1);
+        let before = before[..path_start].trim_end();
         let after = code[end..].trim_start_matches(['"', ' ', '\n', '\t', '\r']);
         if before.ends_with("==")
             || before.ends_with("!=")
@@ -557,23 +568,26 @@ fn compared(code: &str, spelling: &Spelling) -> BTreeSet<&'static str> {
 /// the other cannot: everything the body names, and everything it names
 /// OUTSIDE any nested block. A predicate that mentions an unrelated state
 /// in a loop or a guard would otherwise escape by having named it at all.
-fn inside_bool_fns(code: &str, spelling: &Spelling) -> Vec<BTreeSet<&'static str>> {
-    let skeleton = blank_literals(code);
+fn inside_bool_fns(
+    skeleton: &str,
+    found: &[(usize, usize, &'static str)],
+) -> Vec<BTreeSet<&'static str>> {
     let mut out = Vec::new();
     let mut from = 0;
     while let Some(rel) = skeleton[from..].find("-> bool") {
         let at = from + rel;
         from = at + "-> bool".len();
-        let Some((open, close)) = block_after(&skeleton, from) else {
+        let Some((open, close)) = block_after(skeleton, from) else {
             continue;
         };
-        let body = &code[open..close];
         let depth = brace_depths(&skeleton[open..close]);
         let mut all = BTreeSet::new();
         let mut own = BTreeSet::new();
-        for (start, _, name) in occurrences(body, spelling.all) {
+        let first = found.partition_point(|(start, _, _)| *start < open);
+        let past_last = found.partition_point(|(start, _, _)| *start < close);
+        for &(start, _, name) in &found[first..past_last] {
             all.insert(name);
-            if depth[start] == 1 {
+            if depth[start - open] == 1 {
                 own.insert(name);
             }
         }
@@ -611,18 +625,21 @@ fn brace_depths(skeleton: &str) -> Vec<usize> {
 /// weaker statement than "this file does not decide the rule".
 fn matches_a_copy_shape(code: &str, spelling: &Spelling) -> bool {
     let want = spelling.wanted();
-    if bare_runs(code, spelling).iter().any(|(_, _, s)| *s == want) {
+    let found = occurrences(code, spelling.all);
+    let runs = bare_runs(code, spelling, &found);
+    if runs.iter().any(|(_, _, s)| *s == want) {
         return true;
     }
-    let (yes, no) = mapped_to_bool(code, spelling);
+    let skeleton = blank_literals(code);
+    let (yes, no) = mapped_to_bool(code, &skeleton, &runs);
     // Either polarity: a rule written inside out is the same rule.
     if yes == want || no == want {
         return true;
     }
-    if compared(code, spelling) == want {
+    if compared(code, &found) == want {
         return true;
     }
-    inside_bool_fns(code, spelling)
+    inside_bool_fns(&skeleton, &found)
         .into_iter()
         .any(|s| s == want)
 }
