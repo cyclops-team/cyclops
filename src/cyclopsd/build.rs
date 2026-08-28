@@ -32,11 +32,16 @@ fn main() {
     // A linked worktree's ../../.git is a pointer file, not the HEAD whose
     // contents advance. Watch both the actual HEAD and its symbolic target so
     // a new commit cannot reuse build metadata cached for its predecessor.
-    if let Some(head) = git(&["rev-parse", "--git-path", "HEAD"]) {
+    if let Some(head) = git(&["rev-parse", "--path-format=absolute", "--git-path", "HEAD"]) {
         println!("cargo:rerun-if-changed={head}");
     }
     if let Some(reference) = git(&["symbolic-ref", "-q", "HEAD"]) {
-        if let Some(path) = git(&["rev-parse", "--git-path", &reference]) {
+        if let Some(path) = git(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            &reference,
+        ]) {
             println!("cargo:rerun-if-changed={path}");
         }
     }

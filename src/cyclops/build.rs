@@ -21,5 +21,22 @@ fn main() {
         sha
     };
     println!("cargo:rustc-env=CYCLOPS_BUILD_REF={build_ref}");
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
+
+    // Cargo resolves rerun paths from this crate, while git normally prints
+    // them relative to the repository. Ask for absolute paths so both a
+    // normal checkout and a linked worktree follow the real HEAD and branch
+    // ref instead of a nonexistent src/cyclops/.git path.
+    if let Some(head) = git(&["rev-parse", "--path-format=absolute", "--git-path", "HEAD"]) {
+        println!("cargo:rerun-if-changed={head}");
+    }
+    if let Some(reference) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        if let Some(path) = git(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            &reference,
+        ]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
 }
