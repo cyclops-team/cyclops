@@ -36,7 +36,7 @@ contracts, and historical records separate:
 | Active contracts | [Architecture](ARCHITECTURE.md), [delivery](DELIVERY.md), [invariants](INVARIANTS.md), [goals](GOALS.md), and [style](STYLE.md) | Read before changing product behavior or tests. |
 | Prioritized work | [Next architecture work](NEXT.md) | Behavior-preserving work that is approved but not yet implemented. |
 | Frozen and historical records | [Reliability roadmap](RELIABILITY_ROADMAP.md), [stabilization history](STABILIZATION_HISTORY.md), [V5 line](V5.md), [changelog](../../CHANGELOG.md), and [findings](../../findings.md) | Preserve the reasoning and evidence behind the current system. Do not treat old plans as current behavior. |
-| Internal release material | [Media plan](../public/README.md) and [demo checklist](../../DEMO_DAY_CHECKLIST.md) | Maintainer working material, not public onboarding. |
+| Internal release material | [Media plan](../public/README.md) and [archived demo checklist](archive/demo-day-checklist.md) | Maintainer and historical material, not public onboarding. |
 | Repository instructions | [Agent entrypoint](../../AGENTS.md), [contributing](../../CONTRIBUTING.md), and [security](../../SECURITY.md) | Rules for automated contributors, human contributors, and vulnerability reports. |
 
 This hierarchy is deliberate. Do not move every internal record back into the
@@ -129,7 +129,7 @@ its own home, and cleans both up.
 
 Then [QUICKSTART.md](../guides/QUICKSTART.md) for the two-agent walk with your own
 CLIs. Development loop and gates: [CONTRIBUTING.md](../../CONTRIBUTING.md).
-Preparing a release demo: [DEMO_DAY_CHECKLIST.md](../../DEMO_DAY_CHECKLIST.md).
+Historical release-demo planning: [archived Demo Day checklist](archive/demo-day-checklist.md).
 
 ### Explain current mailbox messaging
 
@@ -497,6 +497,6 @@ maintained. Two worth knowing on day one because they look like bugs:
   Grid topology alone genuinely cannot answer it.
 
 One process document lives outside `docs/`:
-[DEMO_DAY_CHECKLIST.md](../../DEMO_DAY_CHECKLIST.md) is the working
+[The archived Demo Day checklist](archive/demo-day-checklist.md) was the working
 checklist for the public launch pass, kept at the root while that work is
 in flight.

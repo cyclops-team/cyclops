@@ -51,7 +51,7 @@ cyclops/
 ├── AGENTS.md             # condensed agent orientation + gates (human-maintained Custom Instructions)
 ├── STATUS.md             # maintained backlog, risks, known floors
 ├── SECURITY.md           # vulnerability reporting (private)
-├── DEMO_DAY_CHECKLIST.md # launch-pass working checklist
+├── docs/development/archive/demo-day-checklist.md # historical launch-pass checklist
 ├── findings.md           # measured facts (F13+) each with the probe that proved it
 └── CHANGELOG.md          # per-milestone history
 ```

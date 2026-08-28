@@ -224,5 +224,5 @@ contract).
 | `scripts/` | `install.sh` (POSIX source installer: builds, places binaries, edits profile with backup, `--uninstall` restores; can pass `--wire-hooks` via setup), `check-doc-paths.py` (doc-path + orphan gate) |
 | `tests/` | Test-only tmux rig in `testrig/`; parity, soak, vocabulary, and probe machinery in `e2e/` |
 | `SECURITY.md` | Private vulnerability reporting instructions |
-| `DEMO_DAY_CHECKLIST.md` | Working checklist for the public launch pass |
+| `docs/development/archive/demo-day-checklist.md` | Archived checklist from the public launch pass |
 | `docs/development/V5.md` | v5 line: admin-as-participant / composer / hooks / status detection |
