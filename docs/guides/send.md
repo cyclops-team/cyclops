@@ -51,10 +51,14 @@ script needs every recipient's current receipt to prove that the wake reached
 `delivered_unverified`. Every other wake state, a missing or unknown state,
 `pre_write_cause`, `wake_block`, or a delivery that needs human action exits 1.
 
-`--require-wake` evaluates the daemon's bounded current receipt. It does not
-poll or add a second wait. A nonzero result does not undo durable acceptance,
-so inspect the message before taking action and never use an unkeyed resend as
-recovery. Reuse the same explicit client key only for an intended exact retry.
+`--require-wake` asks the daemon's bounded receipt observation to continue past
+`writing`, `staged`, and `submitting` for an immediately decidable FIFO head.
+It returns when the exact attempt proves `submitted` or `notified`, reaches a
+terminal refusal, or hits the existing receipt cap. It does not poll and never
+waits for agent work or message completion. A nonzero result does not undo
+durable acceptance, so inspect the message before taking action and never use
+an unkeyed resend as recovery. Reuse the same explicit client key only for an
+intended exact retry.
 Inspect a named block before requeueing; unchanged evidence cannot clear a
 terminal pre-write block.
 

@@ -502,10 +502,10 @@ struct SendArgs {
     /// Sender-scoped idempotency key for exact retries.
     #[arg(long)]
     client_key: Option<String>,
-    /// Exit 0 only when every recipient's current receipt proves wake
+    /// Exit 0 only when every recipient's bounded receipt proves wake
     /// submitted or notified, or an equivalent legacy direct-delivery
-    /// boundary. Uses the bounded daemon receipt without waiting again;
-    /// nonzero does not undo durable acceptance.
+    /// boundary. The daemon waits past writing and staging, but never for
+    /// agent work or message completion. Nonzero does not undo acceptance.
     #[arg(long)]
     require_wake: bool,
     /// Message id this replies to. Recipient and subject come from the referenced message.
@@ -1738,6 +1738,7 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
         reply_to: args.reply_to.clone(),
         supersedes,
         wait: None,
+        require_wake: args.require_wake,
     })
     .expect("msg.send params serialize");
     let asked = if to.len() == 1 {
@@ -3472,11 +3473,11 @@ mod tests {
         };
         let help = error.to_string();
         for words in [
-            "every recipient's current receipt",
+            "every recipient's bounded receipt",
             "submitted or notified",
             "legacy direct-delivery",
-            "without waiting again",
-            "does not undo durable acceptance",
+            "waits past writing and staging",
+            "never for agent work or message completion",
         ] {
             assert!(help.contains(words), "missing {words:?} in {help}");
         }

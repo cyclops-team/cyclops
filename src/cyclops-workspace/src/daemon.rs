@@ -266,6 +266,7 @@ fn send_message_request(home: &Path, request: MessageRequest<'_>) -> SendOutcome
         reply_to: request.reply_to,
         supersedes: None,
         wait: None,
+        require_wake: false,
     }) {
         Ok(params) => params,
         Err(error) => {

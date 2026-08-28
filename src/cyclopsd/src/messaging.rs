@@ -730,14 +730,28 @@ pub(crate) fn schedule_unclaimed_reminders(inner: &Arc<Inner>) {
 fn has_first_durable_disposition(
     disposition: &crate::mailbox::MessageDisposition,
     head: &ScheduledHead,
+    require_wake: bool,
 ) -> bool {
     if disposition.attempt_id != Some(head.attempt_id) {
         return true;
     }
-    !matches!(
-        disposition.notification_state_raw,
-        Some(NotificationState::Queued | NotificationState::Gating)
-    )
+    if require_wake {
+        !matches!(
+            disposition.notification_state_raw,
+            Some(
+                NotificationState::Queued
+                    | NotificationState::Gating
+                    | NotificationState::Writing
+                    | NotificationState::Staged
+                    | NotificationState::Submitting
+            )
+        )
+    } else {
+        !matches!(
+            disposition.notification_state_raw,
+            Some(NotificationState::Queued | NotificationState::Gating)
+        )
+    }
 }
 
 async fn wait_for_messages_change(
@@ -760,12 +774,14 @@ async fn observe_first_durable_dispositions(
     outcomes: &HashMap<RecipientKey, RecipientScheduleOutcome>,
     events: tokio::sync::broadcast::Receiver<cyclops_proto::Event>,
     deadline: Instant,
+    require_wake: bool,
 ) -> Result<Vec<crate::mailbox::MessageDisposition>, MailboxServiceError> {
     observe_first_durable_dispositions_with(
         message_id,
         outcomes,
         events,
         deadline,
+        require_wake,
         || service.message_dispositions(message_id),
         Instant::now,
     )
@@ -777,6 +793,7 @@ async fn observe_first_durable_dispositions_with(
     outcomes: &HashMap<RecipientKey, RecipientScheduleOutcome>,
     mut events: tokio::sync::broadcast::Receiver<cyclops_proto::Event>,
     deadline: Instant,
+    require_wake: bool,
     mut read_projection: impl FnMut() -> Result<
         Vec<crate::mailbox::MessageDisposition>,
         MailboxServiceError,
@@ -800,7 +817,9 @@ async fn observe_first_durable_dispositions_with(
             dispositions
                 .iter()
                 .find(|disposition| disposition.recipient == *recipient)
-                .is_none_or(|disposition| !has_first_durable_disposition(disposition, head))
+                .is_none_or(|disposition| {
+                    !has_first_durable_disposition(disposition, head, require_wake)
+                })
         });
         if pending.is_empty() {
             return Ok(dispositions);
@@ -822,6 +841,7 @@ async fn finish_acceptance(
     inner: &Arc<Inner>,
     service: &Arc<MailboxService>,
     accepted: AcceptResult,
+    require_wake: bool,
 ) -> Result<MsgSendResult, MailboxServiceError> {
     // Subscribe before scheduling. A worker may commit its first disposition
     // before enqueue returns; the immediate projection read below remains the
@@ -845,6 +865,7 @@ async fn finish_acceptance(
         &schedule.outcomes,
         events,
         deadline,
+        require_wake,
     )
     .await?;
     Ok(MsgSendResult {
@@ -898,6 +919,7 @@ pub(crate) async fn send(
     sender: MailboxIdentity,
     params: MsgSendParams,
 ) -> Result<MsgSendResult, MailboxServiceError> {
+    let require_wake = params.require_wake;
     if params.reply_to.is_some() && (!params.to.is_empty() || params.recipient_keys.is_some()) {
         return Err(crate::mailbox::MailboxDirectoryError::ReplyRecipientSelectors.into());
     }
@@ -927,7 +949,7 @@ pub(crate) async fn send(
             },
         )?,
     };
-    finish_acceptance(inner, service, accepted).await
+    finish_acceptance(inner, service, accepted, require_wake).await
 }
 
 pub(crate) async fn reply(
@@ -939,7 +961,7 @@ pub(crate) async fn reply(
     client_key: Option<String>,
 ) -> Result<MsgSendResult, MailboxServiceError> {
     let accepted = service.reply(sender, reference, body, client_key)?;
-    finish_acceptance(inner, service, accepted).await
+    finish_acceptance(inner, service, accepted, false).await
 }
 
 pub(crate) fn claim(
@@ -1362,6 +1384,37 @@ mod tests {
         );
         context.record_submitted().unwrap();
         context.record_notified().unwrap()
+    }
+
+    #[test]
+    fn require_wake_waits_past_writing_and_staged_for_the_exact_attempt() {
+        let (_scratch, service, _events, _recipient, _) =
+            mailbox_service("require-wake-boundary", 8);
+        let (accepted, context, head) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        record_doorbell_write(&context);
+
+        let writing = service
+            .message_dispositions(&accepted.message_id)
+            .unwrap()
+            .remove(0);
+        assert!(has_first_durable_disposition(&writing, &head, false));
+        assert!(!has_first_durable_disposition(&writing, &head, true));
+
+        context.record_staged().unwrap();
+        let staged = service
+            .message_dispositions(&accepted.message_id)
+            .unwrap()
+            .remove(0);
+        assert!(!has_first_durable_disposition(&staged, &head, true));
+
+        context.reserve_submit().unwrap();
+        context.record_submitted().unwrap();
+        let submitted = service
+            .message_dispositions(&accepted.message_id)
+            .unwrap()
+            .remove(0);
+        assert!(has_first_durable_disposition(&submitted, &head, true));
     }
 
     #[test]
@@ -1806,6 +1859,7 @@ mod tests {
             &outcomes,
             receiver,
             Instant::now() + Duration::from_secs(1),
+            false,
         );
         let advance = async {
             tokio::task::yield_now().await;
@@ -1890,6 +1944,7 @@ mod tests {
             &outcomes,
             receiver,
             Instant::now() + Duration::from_secs(1),
+            false,
         )
         .await
         .unwrap();
@@ -2017,6 +2072,7 @@ mod tests {
             &outcomes,
             receiver,
             Instant::now() + Duration::from_millis(10),
+            false,
         )
         .await
         .unwrap();
@@ -2047,6 +2103,7 @@ mod tests {
             &outcomes,
             receiver,
             Instant::now() + Duration::from_secs(10),
+            false,
             || {
                 reads += 1;
                 if reads == 2 {
@@ -2174,6 +2231,7 @@ mod tests {
             &outcomes,
             receiver,
             deadline,
+            false,
             || {
                 reads += 1;
                 if reads == 2 {
@@ -2254,6 +2312,7 @@ mod tests {
             &outcomes,
             receiver,
             deadline,
+            false,
         )
         .await
         .unwrap();
