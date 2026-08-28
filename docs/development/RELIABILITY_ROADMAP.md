@@ -429,6 +429,12 @@ only the exact version and representation that ran.
 These changes may improve ownership after the release gates pass. They are not
 reasons to delay a correct release or to rewrite working code during hardening.
 
+- **High priority: extract a sans-IO delivery core.** Move pure delivery
+  transitions toward an explicit `(state, input) -> (state, effects)` module
+  while keeping tmux, journals, process identity, timers, locks, and RPC at the
+  adapters. Land only narrow behavior-preserving slices with replay, mutation,
+  and crash-boundary evidence. The executable sequence and deferrals are in
+  [NEXT.md](NEXT.md).
 - Deepen pane runtime ownership so discovery, lifecycle, readiness, and process
   generation have one narrow public interface.
 - Separate durable endpoint adoption from live tmux route lookup.

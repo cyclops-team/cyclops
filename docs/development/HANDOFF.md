@@ -8,6 +8,10 @@ For the current reliability release, start with
 [RELIABILITY_ROADMAP.md](RELIABILITY_ROADMAP.md). It owns implementation order
 and frozen release gates; this file remains the codebase ownership map.
 
+The completed stabilization run is recorded in
+[STABILIZATION_HISTORY.md](STABILIZATION_HISTORY.md). The prioritized
+post-stabilization architecture work is in [NEXT.md](NEXT.md).
+
 Cyclops coordinates terminal coding agents that are already running in your
 tmux session. It watches panes, works out whether each agent is idle,
 working or blocked, accepts messages into durable workspace mailboxes, and

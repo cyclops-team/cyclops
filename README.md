@@ -6,157 +6,254 @@
 
 **One eye. Many agents. A single coordinated team.**
 
-Cyclops is an open-source coordination layer for coding agents running in
-your terminal. Run the agents you already use, watch them from one
-workspace, hand work between them through durable mailboxes, and keep it all
-on an append-only record you can audit later. If it runs in your terminal,
-it can run in Cyclops.
+Cyclops coordinates coding agents that run in tmux. It gives them a durable
+mailbox, guarded terminal notifications, and an optional workspace where a
+human can see and control the whole team.
 
-[usecyclops.dev](https://www.usecyclops.dev) · [quickstart](docs/guides/QUICKSTART.md) · [the docs, one page per question](#docs)
+The messaging protocol and the workspace are deliberately separate. Agents can
+use Cyclops without opening the UI. If the UI closes, accepted messages remain
+in the append-only journal.
 
-Pre-release, and honest about it: [STATUS.md](STATUS.md) says what is built.
+Cyclops is pre-release software at version `0.1.0`. It currently ships tested
+manifests for Codex CLI, Claude Code, Antigravity CLI, and Cursor Agent CLI.
+Detection is conservative and version-sensitive: unknown terminal chrome holds
+a write instead of guessing. See [STATUS.md](STATUS.md) for current evidence and
+limits.
 
-## Install
+[usecyclops.dev](https://www.usecyclops.dev) · [quickstart](docs/guides/QUICKSTART.md) · [documentation](#documentation)
 
-Needs tmux 3.2+, curl, and Git. Cyclops builds from source; if Rust is
-missing, the installer installs it with [rustup](https://rustup.rs) and
-continues (`CYCLOPS_NO_RUSTUP=1` declines).
+<!-- Media slot: docs/public/images/workspace-overview.png
+     Suggested content: the workspace with two agents and Messages open. -->
+
+## Why Cyclops
+
+Raw `tmux send-keys` is immediate, but it has no durable acceptance, recipient
+authorization, ordering, claim, or receipt. It can also overwrite text that a
+human is typing. Cyclops adds those missing boundaries:
+
+- A send is durably accepted before terminal notification begins.
+- Message bodies remain in the authenticated mailbox. Pane doorbells are
+  content-free claim commands.
+- Notifications are FIFO per recipient and remain tied to stable pane and
+  process identities.
+- Terminal writes require current composer evidence. Human input, a modal,
+  ambiguous chrome, or a replaced process fails closed.
+- Claims, replies, recovery, and operator actions are append-only facts that can
+  be inspected later.
+
+## First five minutes
+
+Cyclops needs tmux 3.2+, Git, curl, and Rust. The installer can install Rust with
+rustup when it is missing, never uses `sudo`, and prints every file it changes.
 
 ```bash
 curl -fsSL https://www.usecyclops.dev/install.sh | sh
+exec "$SHELL" -l
+cyclops start --preset duo
+tmux attach -t main
 ```
 
-That builds both binaries, puts them on your PATH, and writes the config.
-By default it also merges Cyclops hook entries into installed agent CLIs and
-places the Cyclops skill in their supported skill homes. Unrelated vendor
-settings are preserved and each vendor file is backed up before its first
-edit. Set `CYCLOPS_NO_VENDOR_HOOKS=1` to skip hook and skill wiring. Budget a
-few minutes: it is a full release compile. It prints every file it touches,
-backs up any shell profile it edits, and never uses sudo.
-To install from a clone instead:
+Or install from a clone:
 
 ```bash
-git clone https://github.com/cyclops-team/cyclops.git && cd cyclops
+git clone https://github.com/cyclops-team/cyclops.git
+cd cyclops
 ./scripts/install.sh
 ```
 
-Later, `cyclops update` proves and activates a matched binary pair, and
-`cyclops update --rollback` can reactivate a replay-proven retained pair
-without reverting state. The
-`sh -s -- --uninstall` on the installer takes everything back off.
-Details, options, and troubleshooting: [installation guide](docs/guides/install.md).
+The installer builds `cyclops` and `cyclopsd` from source, installs a matched
+pair, writes the initial config, and can wire supported vendor hooks and the
+Cyclops skill without replacing unrelated settings. Use
+`CYCLOPS_NO_VENDOR_HOOKS=1` to skip that wiring. See the
+[installation guide](docs/guides/install.md) for paths, options, updates,
+rollback, and uninstall.
 
-## Run it
+Run `cyclops` to open the full workspace. Run `cyclops watch` for the smaller
+stream and Messages TUI. Neither interface is required for agent-to-agent
+messaging.
+
+## Send, wake, and claim
 
 ```bash
-cyclops
+cyclops name implementer --self
+cyclops send reviewer --subject "Review the parser" --body "Please review commit abc123."
 ```
 
-One command, from anywhere. It opens the full-screen workspace with your
-sessions and agents in a sidebar, tabs, and live panes, starting a tmux
-session and the daemon if none is running. Start your coding agents inside
-its panes the way you normally would, and talk to them there.
+A standard send returns after durable acceptance. Notification continues
+asynchronously. Use `--require-wake` only when the caller must wait for the
+stronger submitted or notified boundary:
 
-## What using it looks like
+```bash
+cyclops send reviewer --subject "Review the parser" \
+  --body "Please review commit abc123." --require-wake
+```
 
-You keep talking to your agents in natural language; Cyclops gives them a
-shared way to address one another through durable mailboxes:
+The recipient sees a body-free Format 3 doorbell containing an exact
+`m-att_...` claim token. Claiming that token retrieves the authorized envelope,
+including TO, FROM, subject, body, and reply context:
 
-> Implement the rate limiter change. When you're done, send it to
-> reviewer and ask for a review.
+```bash
+cyclops inbox claim m-att_<token>
+cyclops reply <message-id> --body "Reviewed. No blockers."
+```
 
-The agent runs `cyclops send reviewer ...` from its own pane. The daemon
-resolves the sender from the calling process, accepts the message into the
-durable workspace mailbox, and queues a guarded pane notification. When setup
-reports `mailbox doorbell`, that notification is content-free and the reviewer
-claims the exact message before reading its body. If claim-skill proof is not
-current, Cyclops uses the visible full-payload compatibility path instead. You
-watch the handoff from the workspace instead of relaying it by hand.
+These are different facts:
 
-Your agents learn the verbs from one file:
-[skills/cyclops/SKILL.md](skills/cyclops/SKILL.md), which the installer
-places at the canonical skill destination for every installed supported
-consumer. Codex and Cursor share one copy under `~/.agents`; setup never
-creates duplicate vendor copies. Scripts use structured command forms with
-`--json`; `watch` emits NDJSON, while `update` and `daemon log` remain text.
-The commands you will actually type:
+1. **Accepted** means the journal has the message.
+2. **Notified** means a safe terminal wake was submitted.
+3. **Claimed** means the recipient retrieved the exact body.
+4. **Completed** requires an explicit agent-side completion or reply. Cyclops
+   does not infer task completion from idle state.
 
-| Command | What it does |
+<!-- Media slot: docs/public/images/messages-queue.png
+     Suggested content: a body-free resting queue and an opened authorized thread. -->
+
+## The composer rule
+
+Agent activity and composer safety are independent.
+
+- `idle` and `working` describe activity for the human.
+- `clean`, `withInput`, and `ambiguous` determine whether Cyclops may write.
+
+An idle agent with visible human input is not safe to notify. A working agent
+with a structurally proven clean composer may be safe. Cyclops holds the same
+notification attempt while input remains. Partial backspacing remains held;
+when the final visible character is erased and the settled composer is proven
+exactly empty, that same attempt re-enters the normal gate automatically. A
+hidden editor, modal, stale frame, ambiguous composer, replaced occupant, or
+daemon-owned recovery barrier remains blocked.
+
+<!-- Media slot: docs/public/images/composer-hold.png
+     Suggested content: visible draft, held notification, final erase, same attempt released. -->
+
+## The workspace
+
+The full-screen workspace keeps tmux as the terminal owner while adding:
+
+- sessions, workspaces, tabs, splits, resizing, and drag controls;
+- live terminal cells with keyboard, mouse, selection, and clipboard support;
+- named agents and conservative idle, working, gating, blocked, and failed
+  status;
+- a bordered Messages peer pane with authorized threads, recipient state, and
+  operator actions;
+- themes, sounds, unread projection, and independent viewport state.
+
+Closing the workspace does not stop the daemon or discard accepted messages.
+The CLI, daemon, mailbox, and `cyclops watch` remain independently usable.
+
+<!-- Video slot: docs/public/media/first-handoff.gif
+     Suggested content: two agents, durable send, doorbell claim, reply, and thread view. -->
+
+## Recovery and honesty
+
+Cyclops never converts uncertainty into success.
+
+- Pre-write failure leaves the message queued or durably blocked without
+  writing bytes.
+- A post-write outcome that cannot be proven stops for operator attention
+  rather than risking a duplicate paste.
+- Daemon restart replays the journal and reconstructs mailbox state.
+- Stable tmux and process identities prevent a renamed or replaced pane from
+  inheriting another occupant's delivery.
+- Raw tmux remains an operator-controlled emergency path, not an automatic
+  fallback and not a source of synthetic receipts.
+
+Start troubleshooting with `cyclops health`, `cyclops status`, and
+[`docs/guides/troubleshooting.md`](docs/guides/troubleshooting.md).
+
+## Useful commands
+
+| Command | Purpose |
 |---|---|
-| `cyclops` | Open the workspace (starts tmux and the daemon when needed) |
-| `cyclops name <pane> <label>` | Name a pane so cyclops can address it |
-| `cyclops send <agent> --subject ...` | Accept a durable message and report its wake state |
-| `cyclops inbox list`; `cyclops inbox claim <id>` | List pending metadata or claim one exact payload |
-| `cyclops reply <message-id>` | Reply using the parent message's route and thread |
-| `cyclops messages` | Read body-free mailbox and notification state |
-| `cyclops alarm preview --older-than <age>` | Preview exact unresolved alarm ids without changing them |
-| `cyclops alarm clear <id>...` | Clear exact alarms; the age-selected form previews and confirms first |
-| `cyclops list` | Every named agent, how it is doing, what it is on |
-| `cyclops history` | The message record, newest last |
-| `cyclops wait <agent> --until idle` | Block on an occupant-pinned pane state; does not prove task completion |
-| `cyclops watch` | Live admin, firehose, and Messages views |
-| `cyclops update` | Prove and activate a matched pair; restart a running daemon and leave a stopped daemon stopped |
-| `cyclops update --rollback` | Reactivate a replay-proven retained pair without reverting state |
+| `cyclops` | Open the full workspace |
+| `cyclops start --preset duo` | Create a workspace from a shipped layout |
+| `cyclops name --self <label>` | Give the calling pane an address |
+| `cyclops send <agent> ...` | Durably accept a message and queue its wake |
+| `cyclops inbox list` | List pending metadata without exposing bodies |
+| `cyclops inbox claim <m-att_...>` | Retrieve one exact authorized envelope |
+| `cyclops reply <message-id> ...` | Reply on the durable route and thread |
+| `cyclops messages` | Inspect mailbox and notification state |
+| `cyclops status` | Inspect agents, readiness, blocks, and recovery actions |
+| `cyclops watch` | Open the stream and Messages TUI |
+| `cyclops health` | Inspect install, daemon, state, and rollback readiness |
+| `cyclops update` | Prove and activate a matched CLI and daemon pair |
 
-Every command explains itself with `--help`. Daemon reads and direct
-mutations expose structured `--json` forms except `daemon log`. The guarded
-`alarm clear --older-than` form is
-interactive by design; scripts preview JSON and pass the returned exact ids
-to `alarm clear`. The two-agent review handoff, start to finish, is the
-[quickstart](docs/guides/QUICKSTART.md).
+Every command documents its structured and plain forms with `--help`.
 
-## How it works
+## Architecture in one view
 
-A Rust daemon (`cyclopsd`) holds one scripted connection to tmux per
-watched session, over tmux control mode: cyclops asks, tmux answers, and
-tmux keeps owning your panes and layout. Agent state comes from sensor
-fusion from vendor hook events, pane titles, output activity, and screen evidence,
-with per-CLI detection rules shipped as data in
-[`resources/manifests/`](resources/manifests/), not code, so any terminal
-agent works without an SDK or a wrapper. Mailbox messages and claims use one
-append-only journal per durable workspace. Pane state and legacy direct
-delivery remain in separate append-only session ledgers.
+```mermaid
+flowchart LR
+    A[Agent or admin CLI] -->|NDJSON RPC| D[cyclopsd]
+    D -->|fsync before acceptance| J[(append-only journal)]
+    D -->|content-free guarded wake| T[tmux pane]
+    T -->|exact m-att claim| D
+    D -->|authorized envelope| R[Recipient]
+    W[Optional workspace and watch UI] -->|snapshots and events| D
+    W -->|terminal cells and layout| T
+```
 
-## Docs
+The daemon owns mailboxes, notification coordination, identity, recovery, and
+sensor fusion. `cyclops-tmux` owns tmux interaction. Manifests under
+[`resources/manifests/`](resources/manifests/) describe supported terminal
+chrome as data. The workspace and watch UI are projections over the same
+daemon state, not the authority for delivery.
 
-**Going to work on the code? Start at
-[HANDOFF.md](docs/development/HANDOFF.md)**, the map and decisions
-behind it. Otherwise, one page per question.
+## Development and verification
 
-| | |
+The normal contributor gate is:
+
+```bash
+./scripts/check.sh --fast
+```
+
+CI runs the core suites on Linux and macOS, validates relocated scratch storage
+and the installer lifecycle, checks documentation and website parity, and keeps
+the upstream tmux-head job advisory. Release evidence components are opt-in and
+must be bound to a clean frozen SHA; they are not ordinary unit-test claims.
+
+Read the [engineering map](docs/development/HANDOFF.md),
+[invariants](docs/development/INVARIANTS.md), and
+[contributing guide](CONTRIBUTING.md) before changing the delivery path. The
+[stabilization history](docs/development/STABILIZATION_HISTORY.md) records the
+failures and fixes that produced the current system. The
+[next architecture work](docs/development/NEXT.md) explains the planned
+behavior-preserving delivery-core extraction.
+
+## Documentation
+
+| Page | Question it answers |
 |---|---|
-| [QUICKSTART.md](docs/guides/QUICKSTART.md) | Two agents and a review gate, start to finish |
-| [install.md](docs/guides/install.md) | Build it, configure it, update it, run the tests |
-| [skills/cyclops/SKILL.md](skills/cyclops/SKILL.md) | Teaching your coding agent to use Cyclops itself |
-| [send.md](docs/guides/send.md) | Acceptance, claim, reply, notification, and recovery |
-| [history.md](docs/guides/history.md) | Reading the record, threads, paging |
-| [wait.md](docs/guides/wait.md) | Waiting on an agent, exit codes |
-| [panes.md](docs/guides/panes.md) | Naming, the roster, the tmux border |
-| [sizing.md](docs/guides/sizing.md) | Who sizes a session's windows, and `cyclops sizing release` |
-| [workspaces.md](docs/guides/workspaces.md) | Presets, save and restore, `cyclops start` |
-| [workspace-ui.md](docs/guides/workspace-ui.md) | The full-screen workspace (`cyclops`) |
-| [ui.md](docs/guides/ui.md) | The stream and Messages TUI (`cyclops watch`) |
-| [themes.md](docs/guides/themes.md) | Semantic color tokens, shipped themes |
-| [hooks.md](docs/reference/hooks.md) | Wiring vendor hooks, verifying they fire |
-| [MANIFESTS.md](docs/reference/MANIFESTS.md) | Teaching cyclops a new agent CLI |
-| [PROTOCOL.md](docs/reference/PROTOCOL.md) | The socket: methods, requests, responses |
-| [BENCHMARKS.md](docs/reference/BENCHMARKS.md) | Latency, throughput, and render cost, with sources |
-| [troubleshooting.md](docs/guides/troubleshooting.md) | When something is wrong |
-| [HANDOFF.md](docs/development/HANDOFF.md) | Start here to work on the codebase |
-| [AGENTS.md](AGENTS.md) | The same front door for AI coding agents |
-| [ARCHITECTURE.md](docs/development/ARCHITECTURE.md) | How the pieces fit |
-| [DELIVERY.md](docs/development/DELIVERY.md) | Legacy direct-delivery compatibility design |
-| [INVARIANTS.md](docs/development/INVARIANTS.md) | Rules a change must never break |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | The development loop and the gates a change must pass |
-| [SECURITY.md](SECURITY.md) | Reporting a vulnerability privately |
-| [STATUS.md](STATUS.md) | What is built, milestone by milestone |
-| [CHANGELOG.md](CHANGELOG.md) | What each milestone changed |
-| [findings.md](findings.md) | The measurements the design rests on |
-| [V5.md](docs/development/V5.md) | What the v5 line is for |
-| [GOALS.md](docs/development/GOALS.md) | The quality bar every milestone is reviewed against |
-| [STYLE.md](docs/development/STYLE.md) | How this codebase is written |
+| [Quickstart](docs/guides/QUICKSTART.md) | How do two agents complete a first handoff? |
+| [Install](docs/guides/install.md) | What is installed, updated, rolled back, or removed? |
+| [Send](docs/guides/send.md) | What do acceptance, wake, claim, reply, and recovery mean? |
+| [Workspace UI](docs/guides/workspace-ui.md) | How do I use the full workspace? |
+| [Watch UI](docs/guides/ui.md) | How do I use Stream and Messages? |
+| [Panes](docs/guides/panes.md) | How are panes named and identified? |
+| [Sizing](docs/guides/sizing.md) | Who is allowed to resize a shared tmux session? |
+| [Workspaces](docs/guides/workspaces.md) | How are layouts saved, restored, and started? |
+| [History](docs/guides/history.md) | How do I page and inspect the durable record? |
+| [Wait](docs/guides/wait.md) | What does waiting on pane state prove? |
+| [Themes](docs/guides/themes.md) | How do semantic colors and shipped themes work? |
+| [Hooks](docs/reference/hooks.md) | How are vendor lifecycle hooks wired and verified? |
+| [Manifests](docs/reference/MANIFESTS.md) | How is another terminal agent described safely? |
+| [Protocol](docs/reference/PROTOCOL.md) | What are the socket methods and wire shapes? |
+| [Benchmarks](docs/reference/BENCHMARKS.md) | What performance claims have measured sources? |
+| [Public media plan](docs/public/README.md) | Which screenshots and videos are reserved for release? |
+| [Status](STATUS.md) | What is built, proven, limited, or deferred? |
+| [Engineering handoff](docs/development/HANDOFF.md) | Where does each subsystem live? |
+| [Stabilization history](docs/development/STABILIZATION_HISTORY.md) | Which failures were fixed, and how were they proved? |
+| [Next architecture work](docs/development/NEXT.md) | What is the prioritized post-stabilization backlog? |
+| [Goals](docs/development/GOALS.md) | What quality bar governs the project? |
+| [Style](docs/development/STYLE.md) | How is production and test code written? |
+| [V5](docs/development/V5.md) | What is the current architecture line for? |
+| [Contributing](CONTRIBUTING.md) | How should a change be developed and checked? |
+| [Security](SECURITY.md) | How should a vulnerability be reported? |
+| [Changelog](CHANGELOG.md) | What did the historical milestones change? |
+| [Findings](findings.md) | Which measurements and incidents shaped the design? |
+| [Agent entrypoint](AGENTS.md) | Which repository instructions must agents follow? |
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Upstream attribution for the v1 lineage is
-in [NOTICE](NOTICE).
+MIT. See [LICENSE](LICENSE). Upstream attribution for the historical v1 lineage
+is in [NOTICE](NOTICE).

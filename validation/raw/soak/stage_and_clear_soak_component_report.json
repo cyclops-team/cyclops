@@ -1,0 +1,122 @@
+{
+  "schema_version": "1.0.0",
+  "report_id": "lve-stage-clear-2026-08-28T09:45:22Z-0492d7a780",
+  "generated_at": "2026-08-28T09:45:22Z",
+  "component_scope": "Gate 7 Stage-and-Clear Representation Component (no process binding or delivery authorization)",
+  "git_commit": {
+    "sha": "0492d7a7800ea5a8028cf517541301469d5e81a2",
+    "tree_clean": true
+  },
+  "host_platform": {
+    "os": "macos",
+    "arch": "aarch64",
+    "platform_tuple": "macos-aarch64",
+    "kernel_release": "25.5.0",
+    "tmux_version": "tmux 3.6a"
+  },
+  "campaign_metadata": {
+    "campaign_name": "Gate 7 Stage-and-Clear Representation Component",
+    "opt_in_flag": "CYCLOPS_LIVE_VENDOR=1",
+    "metric_scope": "Doorbell Format 3 staging and composer-clear screen representation",
+    "total_trials": 0,
+    "total_duration_ms": 66.24995799999999
+  },
+  "component_verdict": "limitation",
+  "component_reason_code": "required_vendor_limitation",
+  "gate7_closed_cell_inventory": [
+    {
+      "cell_id": "g7_stage_and_clear_representation",
+      "description": "Live Doorbell Format 3 staging and composer-clear screen representation",
+      "coverage_tier": "STAGE_CLEAR_COMPONENT",
+      "verdict": "limitation",
+      "reason_code": "required_vendor_limitation"
+    }
+  ],
+  "vendor_summaries": [
+    {
+      "vendor_id": "codex",
+      "installation_status": "installed_live",
+      "discovered_version": {
+        "semver_parsed": "0.150.1",
+        "presence": "installed_live"
+      },
+      "version_claim_manifest": "0.149.1",
+      "total_trials": 0,
+      "widths_tested": [],
+      "proof_counts": {
+        "exact_row_proof": 0,
+        "sentinel_proof": 0,
+        "collapsed_chip": 0,
+        "structural_trailer": 0,
+        "safe_clear_representations": 0,
+        "failures": 0
+      },
+      "verdict": "limitation",
+      "reason_code": "vendor_auth_not_provisioned"
+    },
+    {
+      "vendor_id": "claude",
+      "installation_status": "installed_live",
+      "discovered_version": {
+        "semver_parsed": "2.1.248",
+        "presence": "installed_live"
+      },
+      "version_claim_manifest": "2.1.221",
+      "total_trials": 0,
+      "widths_tested": [],
+      "proof_counts": {
+        "exact_row_proof": 0,
+        "sentinel_proof": 0,
+        "collapsed_chip": 0,
+        "structural_trailer": 0,
+        "safe_clear_representations": 0,
+        "failures": 0
+      },
+      "verdict": "limitation",
+      "reason_code": "vendor_auth_not_provisioned"
+    },
+    {
+      "vendor_id": "agy",
+      "installation_status": "installed_live",
+      "discovered_version": {
+        "semver_parsed": "1.1.22",
+        "presence": "installed_live"
+      },
+      "version_claim_manifest": "1.1.11",
+      "total_trials": 0,
+      "widths_tested": [],
+      "proof_counts": {
+        "exact_row_proof": 0,
+        "sentinel_proof": 0,
+        "collapsed_chip": 0,
+        "structural_trailer": 0,
+        "safe_clear_representations": 0,
+        "failures": 0
+      },
+      "verdict": "limitation",
+      "reason_code": "clear_keys_unsupported_manual_only"
+    },
+    {
+      "vendor_id": "cursor",
+      "installation_status": "unavailable_offline_gate",
+      "discovered_version": {
+        "semver_parsed": "none",
+        "presence": "unavailable_offline_gate"
+      },
+      "version_claim_manifest": "2026.07.23-e383d2b",
+      "total_trials": 0,
+      "widths_tested": [],
+      "proof_counts": {
+        "exact_row_proof": 0,
+        "sentinel_proof": 0,
+        "collapsed_chip": 0,
+        "structural_trailer": 0,
+        "safe_clear_representations": 0,
+        "failures": 0
+      },
+      "verdict": "limitation",
+      "reason_code": "vendor_unavailable"
+    }
+  ],
+  "observations": []
+}
