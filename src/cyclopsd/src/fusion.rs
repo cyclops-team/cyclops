@@ -10112,6 +10112,7 @@ regex = ['^IDLE']
                     addresses: vec!["codex".into()],
                     recipient_keys: None,
                     subject: "recover".into(),
+                    summary: None,
                     body: "body".into(),
                     fyi: false,
                     client_key: None,

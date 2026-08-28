@@ -484,6 +484,9 @@ struct SendArgs {
     /// One line the recipient sees first.
     #[arg(long)]
     subject: String,
+    /// Exactly two sentences shown beside the recipient's inbox claim.
+    #[arg(long)]
+    summary: String,
     /// Message body text.
     #[arg(long, conflicts_with = "body_file")]
     body: Option<String>,
@@ -557,6 +560,9 @@ enum InboxCmd {
 struct ReplyArgs {
     /// Message identifier being answered.
     message_id: String,
+    /// Exactly two sentences shown beside the recipient's inbox claim.
+    #[arg(long)]
+    summary: String,
     /// Reply body text.
     #[arg(long, conflicts_with = "body_file")]
     body: Option<String>,
@@ -1702,6 +1708,10 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
         eprintln!("{}", copy::NO_RECIPIENT);
         return EXIT_USAGE;
     }
+    if let Err(error) = cyclops_proto::validate_message_summary(&args.summary) {
+        eprintln!("{error}");
+        return EXIT_USAGE;
+    }
     let body = match (&args.body, &args.body_file) {
         (Some(b), _) => b.clone(),
         (None, Some(path)) => match read_body_file(path) {
@@ -1732,6 +1742,7 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
         recipient_keys: None,
         expected_caller: None,
         subject: args.subject.clone(),
+        summary: Some(args.summary.clone()),
         body,
         fyi: args.fyi,
         client_key: args.client_key.clone(),
@@ -2604,11 +2615,17 @@ fn print_claim_payload(message: &cyclops_proto::InboxMessage) {
             message.message_id, message.sender_label, subject
         );
     }
+    if let Some(summary) = &message.summary {
+        println!("Summary: {summary}");
+    }
     if let Some(body) = &message.body {
         println!("{body}");
     }
     if message.kind != cyclops_proto::Kind::Fyi {
-        println!("Reply: cyclops reply {} --body \"...\"", message.message_id);
+        println!(
+            "Reply: cyclops reply {} --summary \"First sentence. Second sentence.\" --body \"...\"",
+            message.message_id
+        );
     }
     println!("[cyclops:end {}]", message.message_id);
 }
@@ -2621,6 +2638,10 @@ fn cmd_reply(cli: &Cli, style: &Style, args: &ReplyArgs) -> i32 {
             return EXIT_USAGE;
         }
     };
+    if let Err(error) = cyclops_proto::validate_message_summary(&args.summary) {
+        eprintln!("{error}");
+        return EXIT_USAGE;
+    }
     let body = match (&args.body, &args.body_file) {
         (Some(body), _) => body.clone(),
         (None, Some(path)) => match read_body_file(path) {
@@ -2638,6 +2659,7 @@ fn cmd_reply(cli: &Cli, style: &Style, args: &ReplyArgs) -> i32 {
     };
     let params = serde_json::to_value(cyclops_proto::ReplyParams {
         message_id,
+        summary: Some(args.summary.clone()),
         body,
         client_key: args.client_key.clone(),
     })
@@ -3399,6 +3421,8 @@ mod tests {
             "send",
             "--subject",
             "ignored for validated reply",
+            "--summary",
+            "This replies to the parent. The route stays exact.",
             "--reply-to",
             "m-parent",
             "--client-key",
@@ -3417,6 +3441,8 @@ mod tests {
             "reviewer",
             "--subject",
             "ignored",
+            "--summary",
+            "This is invalid here. The recipient selector conflicts.",
             "--reply-to",
             "m-parent",
         ])
@@ -3428,6 +3454,8 @@ mod tests {
             "reviewer",
             "--subject",
             "replacement",
+            "--summary",
+            "This replaces the prior handoff. The new facts are current.",
             "--supersedes",
             "m-old",
         ])
@@ -3447,10 +3475,38 @@ mod tests {
             "reviewer",
             "--subject",
             "run tests",
+            "--summary",
+            "Run the focused tests. Report the exact result.",
             "--wait",
             "turn-ended",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn send_and_reply_require_a_summary_argument() {
+        assert!(
+            Cli::try_parse_from(["cyclops", "send", "reviewer", "--subject", "Review",]).is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "cyclops",
+            "send",
+            "reviewer",
+            "--subject",
+            "Review",
+            "--summary",
+            "Review the patch. Report any blocker.",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["cyclops", "reply", "m-parent"]).is_err());
+        assert!(Cli::try_parse_from([
+            "cyclops",
+            "reply",
+            "m-parent",
+            "--summary",
+            "The review is complete. No blockers remain.",
+        ])
+        .is_ok());
     }
 
     #[test]

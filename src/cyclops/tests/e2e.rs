@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 
 const GEMINI_ENDPOINT: &str =
     "agent:00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000002/%9";
+const TEST_SUMMARY: &str = "Test message. Inspect the result.";
 
 /// Scratch home unique per test and process, under the relocatable
 /// scratch root. Kept short: Unix socket paths cap out around 104 bytes
@@ -1108,6 +1109,7 @@ fn inbox_next_subscribes_before_listing_and_claims_after_one_event() {
                             "recipient_label": "codey-test",
                             "sender_label": "gemini-test",
                             "subject": "Startup retrospective",
+                            "summary": "The startup path is now clear. Review the socket handoff.",
                             "body": "The socket path breaks the circular wait.",
                             "thread_root": "m-live-use"
                         }
@@ -1141,8 +1143,9 @@ fn inbox_next_subscribes_before_listing_and_claims_after_one_event() {
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "[cyclops m-live-use] TO: codey-test  FROM: gemini-test  SUBJECT: Startup retrospective\n\
+         Summary: The startup path is now clear. Review the socket handoff.\n\
          The socket path breaks the circular wait.\n\
-         Reply: cyclops reply m-live-use --body \"...\"\n\
+         Reply: cyclops reply m-live-use --summary \"First sentence. Second sentence.\" --body \"...\"\n\
          [cyclops:end m-live-use]\n"
     );
     assert!(out.stderr.is_empty());
@@ -1268,7 +1271,7 @@ fn inbox_next_relists_when_the_selected_message_was_superseded() {
         String::from_utf8_lossy(&out.stdout),
         "[cyclops m-new] FROM: gemini-test  SUBJECT: Replacement request\n\
          Use the replacement.\n\
-         Reply: cyclops reply m-new --body \"...\"\n\
+         Reply: cyclops reply m-new --summary \"First sentence. Second sentence.\" --body \"...\"\n\
          [cyclops:end m-new]\n"
     );
     let _ = fs::remove_dir_all(&home);
@@ -1759,6 +1762,8 @@ fn send_happy_path_stdin_body_delivers_verified() {
             "reviewer",
             "--subject",
             "Review the rate limiter",
+            "--summary",
+            TEST_SUMMARY,
             "--body-file",
             "-",
         ],
@@ -1811,6 +1816,8 @@ fn send_broadcast_renders_the_aligned_grid() {
             "implementer",
             "--subject",
             "Sync",
+            "--summary",
+            TEST_SUMMARY,
             "--body",
             "b",
             "--fyi",
@@ -1842,7 +1849,17 @@ fn send_all_targets_star_and_reports_screen_verification() {
             false,
         )
     });
-    let out = run_cyclops(&home, &["send", "--all", "--subject", "Standup"]);
+    let out = run_cyclops(
+        &home,
+        &[
+            "send",
+            "--all",
+            "--subject",
+            "Standup",
+            "--summary",
+            TEST_SUMMARY,
+        ],
+    );
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -1878,6 +1895,8 @@ fn send_parked_with_required_wake_exits_one_with_reset_hint() {
             "reviewer",
             "--subject",
             "s",
+            "--summary",
+            TEST_SUMMARY,
             "--body",
             "b",
             "--require-wake",
@@ -1913,7 +1932,16 @@ fn accepted_send_with_blocked_wake_defaults_to_success() {
     });
     let out = run_cyclops(
         &home,
-        &["send", "reviewer", "--subject", "s", "--body", "b"],
+        &[
+            "send",
+            "reviewer",
+            "--subject",
+            "s",
+            "--summary",
+            TEST_SUMMARY,
+            "--body",
+            "b",
+        ],
     );
     assert!(out.status.success());
     assert!(
@@ -1952,7 +1980,15 @@ fn mailbox_attention_with_required_wake_exits_one_in_plain_and_json() {
     });
     let plain = run_cyclops(
         &plain_home,
-        &["send", "reviewer", "--subject", "s", "--require-wake"],
+        &[
+            "send",
+            "reviewer",
+            "--subject",
+            "s",
+            "--summary",
+            TEST_SUMMARY,
+            "--require-wake",
+        ],
     );
     assert_eq!(plain.status.code(), Some(1));
     assert_eq!(
@@ -1977,6 +2013,8 @@ fn mailbox_attention_with_required_wake_exits_one_in_plain_and_json() {
             "reviewer",
             "--subject",
             "s",
+            "--summary",
+            TEST_SUMMARY,
             "--require-wake",
             "--json",
         ],
@@ -2020,7 +2058,15 @@ fn require_wake_checks_every_mailbox_notification_state_in_plain_and_json() {
         let plain = run_send_result(
             &format!("rw-{index}-p"),
             result.clone(),
-            &["send", "reviewer", "--subject", "state", "--require-wake"],
+            &[
+                "send",
+                "reviewer",
+                "--subject",
+                "state",
+                "--summary",
+                TEST_SUMMARY,
+                "--require-wake",
+            ],
         );
         assert_eq!(plain.status.code(), Some(expected_exit), "{state} plain");
 
@@ -2032,6 +2078,8 @@ fn require_wake_checks_every_mailbox_notification_state_in_plain_and_json() {
                 "reviewer",
                 "--subject",
                 "state",
+                "--summary",
+                TEST_SUMMARY,
                 "--require-wake",
                 "--json",
             ],
@@ -2046,14 +2094,29 @@ fn require_wake_checks_every_mailbox_notification_state_in_plain_and_json() {
         let default_plain = run_send_result(
             &format!("rw-{index}-dp"),
             result.clone(),
-            &["send", "reviewer", "--subject", "state"],
+            &[
+                "send",
+                "reviewer",
+                "--subject",
+                "state",
+                "--summary",
+                TEST_SUMMARY,
+            ],
         );
         assert!(default_plain.status.success(), "{state} default plain");
 
         let default_json = run_send_result(
             &format!("rw-{index}-dj"),
             result,
-            &["send", "reviewer", "--subject", "state", "--json"],
+            &[
+                "send",
+                "reviewer",
+                "--subject",
+                "state",
+                "--summary",
+                TEST_SUMMARY,
+                "--json",
+            ],
         );
         assert!(default_json.status.success(), "{state} default JSON");
     }
@@ -2071,7 +2134,15 @@ fn require_wake_accepts_proven_legacy_direct_delivery_states() {
             "deliveries": [{"to": "reviewer", "state": state}]
         });
         for (mode, json_flag) in [("p", false), ("j", true)] {
-            let mut args = vec!["send", "reviewer", "--subject", "legacy", "--require-wake"];
+            let mut args = vec![
+                "send",
+                "reviewer",
+                "--subject",
+                "legacy",
+                "--summary",
+                TEST_SUMMARY,
+                "--require-wake",
+            ];
             if json_flag {
                 args.push("--json");
             }
@@ -2122,7 +2193,15 @@ fn require_wake_fails_closed_for_missing_unknown_and_broadcast_receipts() {
     .enumerate()
     {
         for (mode, json_flag) in [("p", false), ("j", true)] {
-            let mut args = vec!["send", "reviewer", "--subject", "unknown", "--require-wake"];
+            let mut args = vec![
+                "send",
+                "reviewer",
+                "--subject",
+                "unknown",
+                "--summary",
+                TEST_SUMMARY,
+                "--require-wake",
+            ];
             if json_flag {
                 args.push("--json");
             }
@@ -2150,6 +2229,8 @@ fn require_wake_fails_closed_for_missing_unknown_and_broadcast_receipts() {
             "implementer",
             "--subject",
             "broadcast",
+            "--summary",
+            TEST_SUMMARY,
             "--require-wake",
         ],
     );
@@ -2173,6 +2254,8 @@ fn require_wake_fails_closed_for_missing_unknown_and_broadcast_receipts() {
             "implementer",
             "--subject",
             "broadcast",
+            "--summary",
+            TEST_SUMMARY,
             "--require-wake",
             "--json",
         ],
@@ -2192,7 +2275,14 @@ fn default_send_accepts_a_future_receipt_state_with_an_honest_plain_warning() {
     let plain = run_send_result(
         "rw-future-send-plain",
         result.clone(),
-        &["send", "reviewer", "--subject", "future"],
+        &[
+            "send",
+            "reviewer",
+            "--subject",
+            "future",
+            "--summary",
+            TEST_SUMMARY,
+        ],
     );
     assert!(
         plain.status.success(),
@@ -2207,7 +2297,15 @@ fn default_send_accepts_a_future_receipt_state_with_an_honest_plain_warning() {
     let machine = run_send_result(
         "rw-future-send-json",
         result.clone(),
-        &["send", "reviewer", "--subject", "future", "--json"],
+        &[
+            "send",
+            "reviewer",
+            "--subject",
+            "future",
+            "--summary",
+            TEST_SUMMARY,
+            "--json",
+        ],
     );
     assert!(machine.status.success());
     assert_eq!(
@@ -2221,7 +2319,14 @@ fn default_send_rejects_the_same_incomplete_acceptance_envelope_in_plain_and_jso
     let plain = run_send_result(
         "rw-empty-send-plain",
         json!({}),
-        &["send", "reviewer", "--subject", "incomplete"],
+        &[
+            "send",
+            "reviewer",
+            "--subject",
+            "incomplete",
+            "--summary",
+            TEST_SUMMARY,
+        ],
     );
     assert_eq!(plain.status.code(), Some(1));
     assert!(plain.stdout.is_empty());
@@ -2230,7 +2335,15 @@ fn default_send_rejects_the_same_incomplete_acceptance_envelope_in_plain_and_jso
     let machine = run_send_result(
         "rw-empty-send-json",
         json!({}),
-        &["send", "reviewer", "--subject", "incomplete", "--json"],
+        &[
+            "send",
+            "reviewer",
+            "--subject",
+            "incomplete",
+            "--summary",
+            TEST_SUMMARY,
+            "--json",
+        ],
     );
     assert_eq!(machine.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&machine.stdout), "{}\n");
@@ -2248,7 +2361,14 @@ fn default_send_rejects_a_zero_sequence_in_plain_and_json() {
     let plain = run_send_result(
         "rw-zero-seq-send-plain",
         result.clone(),
-        &["send", "reviewer", "--subject", "invalid sequence"],
+        &[
+            "send",
+            "reviewer",
+            "--subject",
+            "invalid sequence",
+            "--summary",
+            TEST_SUMMARY,
+        ],
     );
     assert_eq!(plain.status.code(), Some(1));
     assert!(plain.stdout.is_empty());
@@ -2262,6 +2382,8 @@ fn default_send_rejects_a_zero_sequence_in_plain_and_json() {
             "reviewer",
             "--subject",
             "invalid sequence",
+            "--summary",
+            TEST_SUMMARY,
             "--json",
         ],
     );
@@ -2285,7 +2407,14 @@ fn default_reply_accepts_a_future_receipt_state_with_the_same_plain_warning() {
     let plain = run_send_result(
         "rw-future-reply-plain",
         result.clone(),
-        &["reply", "m-parent", "--body", "future"],
+        &[
+            "reply",
+            "m-parent",
+            "--summary",
+            TEST_SUMMARY,
+            "--body",
+            "future",
+        ],
     );
     assert!(
         plain.status.success(),
@@ -2300,7 +2429,15 @@ fn default_reply_accepts_a_future_receipt_state_with_the_same_plain_warning() {
     let machine = run_send_result(
         "rw-future-reply-json",
         result.clone(),
-        &["reply", "m-parent", "--body", "future", "--json"],
+        &[
+            "reply",
+            "m-parent",
+            "--summary",
+            TEST_SUMMARY,
+            "--body",
+            "future",
+            "--json",
+        ],
     );
     assert!(machine.status.success());
     assert_eq!(
@@ -2314,7 +2451,14 @@ fn default_reply_rejects_the_same_incomplete_acceptance_envelope_in_plain_and_js
     let plain = run_send_result(
         "rw-empty-reply-plain",
         json!({}),
-        &["reply", "m-parent", "--body", "incomplete"],
+        &[
+            "reply",
+            "m-parent",
+            "--summary",
+            TEST_SUMMARY,
+            "--body",
+            "incomplete",
+        ],
     );
     assert_eq!(plain.status.code(), Some(1));
     assert!(plain.stdout.is_empty());
@@ -2323,7 +2467,15 @@ fn default_reply_rejects_the_same_incomplete_acceptance_envelope_in_plain_and_js
     let machine = run_send_result(
         "rw-empty-reply-json",
         json!({}),
-        &["reply", "m-parent", "--body", "incomplete", "--json"],
+        &[
+            "reply",
+            "m-parent",
+            "--summary",
+            TEST_SUMMARY,
+            "--body",
+            "incomplete",
+            "--json",
+        ],
     );
     assert_eq!(machine.status.code(), Some(1));
     assert_eq!(String::from_utf8_lossy(&machine.stdout), "{}\n");
@@ -2353,7 +2505,15 @@ fn send_to_an_undetected_pane_says_it_did_not_arrive_and_required_wake_exits_one
     });
     let out = run_cyclops(
         &home,
-        &["send", "worker", "--subject", "hello", "--require-wake"],
+        &[
+            "send",
+            "worker",
+            "--subject",
+            "hello",
+            "--summary",
+            TEST_SUMMARY,
+            "--require-wake",
+        ],
     );
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
@@ -2388,7 +2548,17 @@ fn an_older_daemon_without_the_pane_field_still_gets_worded_copy() {
             false,
         )
     });
-    let out = run_cyclops(&home, &["send", "worker", "--subject", "hello"]);
+    let out = run_cyclops(
+        &home,
+        &[
+            "send",
+            "worker",
+            "--subject",
+            "hello",
+            "--summary",
+            TEST_SUMMARY,
+        ],
+    );
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
@@ -2418,7 +2588,17 @@ fn send_in_flight_reports_the_state_it_is_in_not_queued() {
             false,
         )
     });
-    let out = run_cyclops(&home, &["send", "worker", "--subject", "hello"]);
+    let out = run_cyclops(
+        &home,
+        &[
+            "send",
+            "worker",
+            "--subject",
+            "hello",
+            "--summary",
+            TEST_SUMMARY,
+        ],
+    );
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout), "● submitted\n");
     assert_eq!(
@@ -2449,6 +2629,8 @@ fn send_json_passthrough_keeps_the_exit_code() {
             "reviewer",
             "--subject",
             "s",
+            "--summary",
+            TEST_SUMMARY,
             "--json",
             "--require-wake",
         ],
@@ -2480,7 +2662,10 @@ fn send_unknown_recipient_names_it_and_lists_known() {
             false,
         )
     });
-    let out = run_cyclops(&home, &["send", "ghost", "--subject", "s"]);
+    let out = run_cyclops(
+        &home,
+        &["send", "ghost", "--subject", "s", "--summary", TEST_SUMMARY],
+    );
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty());
     assert_eq!(
@@ -2494,12 +2679,21 @@ fn send_unknown_recipient_names_it_and_lists_known() {
 fn send_without_recipient_is_a_usage_error() {
     let home = scratch_home("sn");
     // No daemon on purpose: usage errors must not hide behind a down one.
-    let out = run_cyclops(&home, &["send", "--subject", "s"]);
+    let out = run_cyclops(
+        &home,
+        &[
+            "send",
+            "--subject",
+            "s",
+            "--summary",
+            "First sentence. Second sentence.",
+        ],
+    );
     assert_eq!(out.status.code(), Some(2));
     assert!(out.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&out.stderr).trim(),
-        "no recipient. Name one (cyclops send reviewer --subject \"...\"), or pass --to or --all."
+        "no recipient. Name one (cyclops send reviewer --subject \"...\" --summary \"First sentence. Second sentence.\"), or pass --to or --all."
     );
     let _ = fs::remove_dir_all(&home);
 }
@@ -2747,13 +2941,13 @@ fn history_empty_states_invite_a_send() {
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "No messages yet. Send one: cyclops send <target> --subject ..."
+        "No messages yet. Send one: cyclops send <target> --subject ... --summary \"First sentence. Second sentence.\""
     );
     let out = run_cyclops(&home, &["history", "--with", "reviewer"]);
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "No messages with reviewer yet. Send one: cyclops send reviewer --subject ..."
+        "No messages with reviewer yet. Send one: cyclops send reviewer --subject ... --summary \"First sentence. Second sentence.\""
     );
     let _ = fs::remove_dir_all(&home);
 }

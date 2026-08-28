@@ -25,6 +25,59 @@ pub enum MailboxTypeError {
     InvalidRequestDigest(String),
     #[error("failed to serialize semantic payload for digest: {0}")]
     SerializationError(String),
+    #[error("message summary must contain exactly two sentences on one line (maximum {MESSAGE_SUMMARY_MAX_CHARS} characters)")]
+    InvalidMessageSummary,
+}
+
+/// Maximum preview size carried beside an exact mailbox claim.
+///
+/// The summary is deliberately small enough to remain an operator-facing
+/// preview rather than a second message body.
+pub const MESSAGE_SUMMARY_MAX_CHARS: usize = 240;
+
+/// Validate the sender-authored preview carried by CLI message notifications.
+///
+/// A sentence ends with one or more `.`, `?`, or `!` characters followed by
+/// whitespace or the end of the string. The summary is one line so terminal
+/// staging and durable reconstruction see the same bytes.
+pub fn validate_message_summary(summary: &str) -> Result<(), MailboxTypeError> {
+    if summary.is_empty()
+        || summary.trim() != summary
+        || summary.chars().count() > MESSAGE_SUMMARY_MAX_CHARS
+        || summary.chars().any(char::is_control)
+    {
+        return Err(MailboxTypeError::InvalidMessageSummary);
+    }
+
+    let chars: Vec<char> = summary.chars().collect();
+    let mut sentence_count = 0;
+    let mut sentence_has_content = false;
+    let mut index = 0;
+    while index < chars.len() {
+        let current = chars[index];
+        if matches!(current, '.' | '?' | '!') {
+            let mut end = index + 1;
+            while end < chars.len() && matches!(chars[end], '.' | '?' | '!') {
+                end += 1;
+            }
+            if sentence_has_content && (end == chars.len() || chars[end].is_whitespace()) {
+                sentence_count += 1;
+                sentence_has_content = false;
+            }
+            index = end;
+            continue;
+        }
+        if !current.is_whitespace() {
+            sentence_has_content = true;
+        }
+        index += 1;
+    }
+
+    if sentence_count == 2 && !sentence_has_content {
+        Ok(())
+    } else {
+        Err(MailboxTypeError::InvalidMessageSummary)
+    }
 }
 
 /// Validated unique identifier for a message record (e.g. "m-a1b2c3").
@@ -92,6 +145,14 @@ impl<'de> Deserialize<'de> for MessageId {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RequestDigest(String);
 
+/// Message fields covered by a semantic request digest.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequestContent<'a> {
+    pub subject: Option<&'a str>,
+    pub summary: Option<&'a str>,
+    pub body: Option<&'a str>,
+}
+
 impl RequestDigest {
     /// Construct and validate a request digest string.
     pub fn parse(value: impl Into<String>) -> Result<Self, MailboxTypeError> {
@@ -118,8 +179,7 @@ impl RequestDigest {
         kind: Kind,
         sender: RecipientKey,
         recipients: &[RecipientKey],
-        subject: Option<&str>,
-        body: Option<&str>,
+        content: RequestContent<'_>,
         reply_to: Option<&MessageId>,
         supersedes: Option<&MessageId>,
     ) -> Result<Self, MailboxTypeError> {
@@ -132,6 +192,8 @@ impl RequestDigest {
             sender: RecipientKey,
             recipients: &'a [RecipientKey],
             subject: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            summary: Option<&'a str>,
             body: Option<&'a str>,
             reply_to: Option<&'a MessageId>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -142,8 +204,9 @@ impl RequestDigest {
             kind,
             sender,
             recipients: &sorted_recipients,
-            subject,
-            body,
+            subject: content.subject,
+            summary: content.summary,
+            body: content.body,
             reply_to,
             supersedes,
         };
@@ -213,6 +276,10 @@ pub struct MessageMetadata {
     pub recipients: Vec<RecipientKey>,
     /// Immutable human-readable labels captured when the message is accepted.
     pub presentation: MessagePresentation,
+    /// Sender-authored two-sentence preview shown beside an exact claim.
+    /// Older messages omit it and keep their original notification format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     /// Authoritative thread root message identifier (required).
     pub thread_root: MessageId,
     /// Optional sender-scoped idempotency client key.
@@ -410,8 +477,11 @@ mod tests {
             Kind::Msg,
             admin,
             &[r1, r2],
-            Some("Subject"),
-            Some("Body"),
+            RequestContent {
+                subject: Some("Subject"),
+                summary: None,
+                body: Some("Body"),
+            },
             None,
             None,
         )
@@ -428,8 +498,11 @@ mod tests {
             Kind::Msg,
             admin,
             &[r2, r1],
-            Some("Subject"),
-            Some("Body"),
+            RequestContent {
+                subject: Some("Subject"),
+                summary: None,
+                body: Some("Body"),
+            },
             None,
             None,
         )
@@ -442,8 +515,11 @@ mod tests {
             Kind::Msg,
             admin,
             &[r1, r2],
-            Some("Different Subject"),
-            Some("Body"),
+            RequestContent {
+                subject: Some("Different Subject"),
+                summary: None,
+                body: Some("Body"),
+            },
             None,
             None,
         )
@@ -454,8 +530,11 @@ mod tests {
             Kind::Fyi,
             admin,
             &[r1, r2],
-            Some("Subject"),
-            Some("Body"),
+            RequestContent {
+                subject: Some("Subject"),
+                summary: None,
+                body: Some("Body"),
+            },
             None,
             None,
         )
@@ -467,13 +546,31 @@ mod tests {
             Kind::Msg,
             admin,
             &[r1, r2],
-            Some("Subject"),
-            Some("Body"),
+            RequestContent {
+                subject: Some("Subject"),
+                summary: None,
+                body: Some("Body"),
+            },
             Some(&reply_id),
             None,
         )
         .unwrap();
         assert_ne!(d1, d_with_reply);
+
+        let d_with_summary = RequestDigest::compute(
+            Kind::Msg,
+            admin,
+            &[r1, r2],
+            RequestContent {
+                subject: Some("Subject"),
+                summary: Some("First sentence. Second sentence."),
+                body: Some("Body"),
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        assert_ne!(d1, d_with_summary);
 
         // Serde deserialization validation
         let json = serde_json::to_string(&d1).unwrap();
@@ -485,5 +582,30 @@ mod tests {
             r#""v1:uppercaseHEX1234567890abcdef1234567890abcdef1234567890abcdef1234567890""#
         )
         .is_err());
+    }
+
+    #[test]
+    fn message_summary_requires_two_bounded_single_line_sentences() {
+        assert!(validate_message_summary("Tests pass. The change is ready.").is_ok());
+        assert!(validate_message_summary("What changed? The retry is safe!").is_ok());
+
+        for invalid in [
+            "One sentence only.",
+            "One. Two. Three.",
+            "First sentence.\nSecond sentence.",
+            " First sentence. Second sentence.",
+            "First sentence. Second sentence. ",
+        ] {
+            assert_eq!(
+                validate_message_summary(invalid),
+                Err(MailboxTypeError::InvalidMessageSummary),
+                "accepted invalid summary: {invalid:?}"
+            );
+        }
+        let too_long = format!("{}. Done.", "a".repeat(MESSAGE_SUMMARY_MAX_CHARS));
+        assert_eq!(
+            validate_message_summary(&too_long),
+            Err(MailboxTypeError::InvalidMessageSummary)
+        );
     }
 }

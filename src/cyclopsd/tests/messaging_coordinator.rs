@@ -192,6 +192,29 @@ async fn send_workspace_message(rig: &Rig, client_key: &str, subject: &str, body
         .unwrap()
 }
 
+async fn send_summarized_workspace_message(
+    rig: &Rig,
+    client_key: &str,
+    subject: &str,
+    summary: &str,
+    body: &str,
+) -> Value {
+    rig.daemon
+        .msg_send(
+            "admin",
+            serde_json::from_value(json!({
+                "to": ["worker"],
+                "subject": subject,
+                "summary": summary,
+                "body": body,
+                "client_key": client_key
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
 struct WaitingPair {
     first: String,
     second: String,
@@ -996,6 +1019,60 @@ async fn changed_chrome_does_not_receipt_a_swallowed_compact_doorbell() {
     );
     assert!(screen.contains("Ctx: 77%"), "{screen}");
 
+    rig.daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn summary_notification_stages_the_preview_and_exact_claim_without_the_body() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "workspace-summary-claim",
+        CAT_MANIFEST,
+        &composer_pane(),
+        "delivery_retry_max = 0",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let summary = "Review the parser change. Report any release blocker.";
+    let body = "private implementation details must remain in the mailbox";
+    let sent =
+        send_summarized_workspace_message(&rig, "summary-claim", "Parser review", summary, body)
+            .await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::Staged).await;
+
+    let attempt = current_notification_attempt(&workspace_lines(&rig), &message_id)
+        .expect("the summary notification has one exact attempt");
+    let screen = rig.tmux.capture(&pane);
+    assert!(
+        screen.contains(summary),
+        "summary missing from pane: {screen}"
+    );
+    assert!(
+        screen.contains("FROM: admin"),
+        "sender missing from pane: {screen}"
+    );
+    assert!(
+        screen.contains(&cyclops_proto::render_doorbell_v3(attempt)),
+        "claim command missing from pane: {screen}"
+    );
+    assert!(
+        !screen.contains(body),
+        "message body leaked into pane: {screen}"
+    );
+
+    let writing = notification_transition(&rig, &message_id, NotificationState::Writing)
+        .expect("writing transition fixes the selected format");
+    assert_eq!(
+        writing.data.as_ref().unwrap()["doorbell_format"],
+        cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM
+    );
     rig.daemon.shutdown().await;
 }
 

@@ -967,7 +967,9 @@ pub fn run_start(
     }
     if let Some(first) = addressable {
         steps.push((
-            format!("cyclops send {first} --subject \"hello\""),
+            format!(
+                "cyclops send {first} --subject \"hello\" --summary \"Hello from Cyclops. Reply when you are ready.\""
+            ),
             "send the first message".into(),
         ));
     }
@@ -2802,14 +2804,14 @@ mod tests {
                 "open the workspace and start your agents".to_string(),
             ),
             (
-                "cyclops send implementer --subject \"hello\"".to_string(),
+                "cyclops send implementer --subject \"hello\" --summary \"Hello from Cyclops. Reply when you are ready.\"".to_string(),
                 "send the first message".to_string(),
             ),
         ];
         let expected = "Next:\n\
-                        \x20 1  cyclopsd &                                  start the daemon\n\
-                        \x20 2  tmux attach -t main                         open the workspace and start your agents\n\
-                        \x20 3  cyclops send implementer --subject \"hello\"  send the first message";
+                        \x20 1  cyclopsd &                                                                                            start the daemon\n\
+                        \x20 2  tmux attach -t main                                                                                   open the workspace and start your agents\n\
+                        \x20 3  cyclops send implementer --subject \"hello\" --summary \"Hello from Cyclops. Reply when you are ready.\"  send the first message";
         assert_eq!(next_steps(&steps, &plain), expected);
     }
 }

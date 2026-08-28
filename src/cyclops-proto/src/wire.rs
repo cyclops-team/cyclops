@@ -634,6 +634,10 @@ pub struct MsgSendParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_caller: Option<crate::identity::RecipientKey>,
     pub subject: String,
+    /// Sender-authored two-sentence preview for the claim notification.
+    /// Optional on the wire for compatibility; the public CLI requires it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     #[serde(default)]
     pub body: String,
     /// Announcement expecting no reply.
@@ -1250,6 +1254,8 @@ pub struct InboxMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<crate::mailbox::MessageId>,
@@ -1259,6 +1265,9 @@ pub struct InboxMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplyParams {
     pub message_id: crate::mailbox::MessageId,
+    /// Sender-authored two-sentence preview for the claim notification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     pub body: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_key: Option<String>,

@@ -260,6 +260,7 @@ fn send_message_request(home: &Path, request: MessageRequest<'_>) -> SendOutcome
         recipient_keys: request.recipient_keys,
         expected_caller: request.expected_caller,
         subject: request.subject.to_string(),
+        summary: None,
         body: request.body.to_string(),
         fyi: request.fyi,
         client_key: Some(request.client_key.to_string()),
