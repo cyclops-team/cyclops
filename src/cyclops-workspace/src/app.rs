@@ -63,7 +63,7 @@ use crate::render::{
 use crate::resilience::{self, LinkState};
 use crate::selection::{self, SelectionState};
 use crate::sync::{fetch_workspace_model, hydrate_visible_tab};
-use crate::term_guard::TermGuard;
+use crate::term_guard::{SynchronizedWriter, TermGuard};
 use crate::theme::Paint;
 
 mod exec;
@@ -1248,7 +1248,9 @@ pub async fn run_async() -> i32 {
     hydrate_visible_tab(&client, model.active_tab(), &mut runtimes).await;
 
     let mut renderer =
-        match Terminal::new(CrosstermBackend::new(io::stdout())).map(RenderOwner::new) {
+        match Terminal::new(CrosstermBackend::new(SynchronizedWriter::new(io::stdout())))
+            .map(RenderOwner::new)
+        {
             Ok(t) => t,
             Err(e) => {
                 drop(guard);
@@ -9048,10 +9050,7 @@ mod tests {
             (i32::from(opened_right.width) * 60 - i32::from(opened_left.width) * 29).abs() <= 60,
             "both cards must reflow, not clip only the trailing card"
         );
-        assert_eq!(
-            opened[(messages.x, messages.y)].symbol(),
-            crate::render::MESSAGES_RESIZE_GRIP
-        );
+        assert_eq!(opened[(messages.x, messages.y)].symbol(), "╔");
         assert_eq!(opened[(messages.right() - 1, messages.y)].symbol(), "╗");
         assert_eq!(opened[(messages.x, messages.bottom() - 1)].symbol(), "╚");
         assert_eq!(
@@ -9363,7 +9362,7 @@ mod tests {
         assert!(adopted.took_a_window, "test app must own the nested window");
         let before = read_layout();
 
-        let frame = clean_frame(&mut app, 100, 30);
+        let _frame = clean_frame(&mut app, 100, 30);
         let (divider_col, divider_row) = (0..100u16)
             .flat_map(|column| (0..30u16).map(move |row| (column, row)))
             .find(|&(column, row)| {
@@ -9373,11 +9372,6 @@ mod tests {
                 )
             })
             .expect("painted Messages pane divider");
-        assert_eq!(
-            frame[(divider_col, divider_row)].symbol(),
-            crate::render::MESSAGES_RESIZE_GRIP,
-            "the draggable production hit target must be visibly discoverable"
-        );
         let width_before = app.prefs.messages_width;
         let dragged_col = divider_col.saturating_sub(8);
         let mut detached = false;

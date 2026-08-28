@@ -97,7 +97,11 @@ impl DragState {
             // Sidebar rows are one cell apart; requiring the general
             // three-cell threshold would make adjacent rows impossible to
             // reorder with a natural vertical drag.
-            DragTarget::Workspace { .. } | DragTarget::Agent { .. } => 1,
+            DragTarget::Workspace { .. }
+            | DragTarget::Agent { .. }
+            | DragTarget::Sidebar
+            | DragTarget::Messages
+            | DragTarget::SidebarSplit => 1,
             _ => DRAG_THRESHOLD_PX,
         };
         sx.abs_diff(cx) >= threshold || sy.abs_diff(cy) >= threshold
@@ -234,6 +238,14 @@ mod tests {
         );
         drag.on_move(4, 5);
         assert!(drag.is_active());
+    }
+
+    #[test]
+    fn a_one_cell_messages_drag_resizes_instead_of_feeling_stuck() {
+        let mut drag = DragState::on_down(DragTarget::Messages, 80, 0);
+        drag.on_move(79, 0);
+        assert!(drag.is_active());
+        assert_eq!(drag.on_up(), Some(DragTarget::Messages));
     }
 
     #[test]
