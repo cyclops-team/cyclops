@@ -944,6 +944,13 @@ a restart. It does not touch `config.toml`: a restart goes back to
 watching only the configured list, not whatever a client added here in the
 meantime.
 
+A runtime watch remains pending if the session has not appeared yet. After it
+has attached successfully, positive tmux evidence that the session was removed
+retires that runtime watch from `status`. Recreating the same display name then
+creates a fresh session identity and watcher while reusing the existing durable
+ledger. Configured sessions are different: they remain persistent and keep
+waiting for `cyclops start` to recreate them.
+
 Watching a session that is already watched is a no-op, not an error:
 `added` is false and nothing is opened twice.
 
