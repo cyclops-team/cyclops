@@ -165,37 +165,56 @@ def line_of(text, index):
     return text.count("\n", 0, index) + 1
 
 
-# The two front doors. README.md indexes every page in a table; HANDOFF.md
-# is the one a newcomer is pointed at first. A page reachable from neither
-# is a page nobody finds.
+# The two front doors. README.md serves users; HANDOFF.md serves contributors.
+# They may link to section indexes, which in turn link to individual pages.
+# Requiring every page directly in a front door made README.md an unhelpful
+# flat inventory and discouraged useful hierarchy.
 FRONT_DOORS = ["README.md", "docs/development/HANDOFF.md"]
+
+
+def linked_markdown_pages(page):
+    """Existing in-repo Markdown pages linked from one page."""
+    targets = []
+    text = page.read_text()
+    for m in LINK.finditer(text):
+        target = m.group(1).split("#")[0]
+        if not target or target.startswith(("http://", "https://", "mailto:")):
+            continue
+        candidate = (page.parent / target).resolve()
+        try:
+            candidate.relative_to(REPO)
+        except ValueError:
+            continue
+        if candidate.suffix == ".md" and candidate.exists():
+            targets.append(candidate)
+    return targets
 
 
 def check_orphans():
     """Every page has to be reachable from a front door.
 
-    This is the rule that keeps the doc set from growing sideways. Adding
-    a page is cheap and linking it is one line, so a page that is worth
-    writing is worth putting in the index; one that is not worth indexing
-    should not exist. Without this, a doc set gets larger and less useful
-    at the same time.
+    Reachability, rather than a direct link, is the useful rule. It permits
+    public, reference, and engineering indexes while still catching pages
+    that no reader can navigate to. Without this, a doc set either grows
+    sideways or forces its root README to become a file inventory.
     """
-    linked = set()
-    for door in FRONT_DOORS:
-        text = (REPO / door).read_text()
-        for m in LINK.finditer(text):
-            target = m.group(1).split("#")[0]
-            if target.endswith(".md"):
-                linked.add(Path(target).name)
+    reachable = set()
+    pending = [(REPO / door).resolve() for door in FRONT_DOORS]
+    while pending:
+        page = pending.pop()
+        if page in reachable:
+            continue
+        reachable.add(page)
+        pending.extend(linked_markdown_pages(page))
 
     # notebook.md is the maintainer's working scratchpad of raw feedback,
     # not a documentation page: indexing it from a front door would put
     # unedited notes in the reader's path, and the rule above is about
     # pages written to be read.
     orphans = sorted(
-        p.name
+        str(p.relative_to(REPO))
         for p in docs()
-        if p.name not in linked and p.name not in {"README.md", "notebook.md"}
+        if p.resolve() not in reachable and p.name != "notebook.md"
     )
     if not orphans:
         return []
@@ -284,9 +303,9 @@ def main():
         for name in orphans:
             print(f"  {name}")
         print(
-            "\nAdd a row to the table in README.md, or a link from\n"
-            "docs/development/HANDOFF.md. A page nobody can navigate to is a page that\n"
-            "goes stale unread; if it is not worth indexing, delete it."
+            "\nLink each page from the relevant public, reference, or engineering\n"
+            "index. A page nobody can navigate to goes stale unread; if it is not\n"
+            "worth indexing, delete it."
         )
     return 1
 

@@ -224,36 +224,20 @@ behavior-preserving delivery-core extraction.
 
 ## Documentation
 
-| Page | Question it answers |
+Choose the path that matches what you are doing. Internal plans, historical
+records, and release working notes live behind the engineering map instead of
+competing with the public starting points.
+
+| I want to... | Start here |
 |---|---|
-| [Quickstart](docs/guides/QUICKSTART.md) | How do two agents complete a first handoff? |
-| [Install](docs/guides/install.md) | What is installed, updated, rolled back, or removed? |
-| [Send](docs/guides/send.md) | What do acceptance, wake, claim, reply, and recovery mean? |
-| [Workspace UI](docs/guides/workspace-ui.md) | How do I use the full workspace? |
-| [Watch UI](docs/guides/ui.md) | How do I use Stream and Messages? |
-| [Panes](docs/guides/panes.md) | How are panes named and identified? |
-| [Sizing](docs/guides/sizing.md) | Who is allowed to resize a shared tmux session? |
-| [Workspaces](docs/guides/workspaces.md) | How are layouts saved, restored, and started? |
-| [History](docs/guides/history.md) | How do I page and inspect the durable record? |
-| [Wait](docs/guides/wait.md) | What does waiting on pane state prove? |
-| [Themes](docs/guides/themes.md) | How do semantic colors and shipped themes work? |
-| [Hooks](docs/reference/hooks.md) | How are vendor lifecycle hooks wired and verified? |
-| [Manifests](docs/reference/MANIFESTS.md) | How is another terminal agent described safely? |
-| [Protocol](docs/reference/PROTOCOL.md) | What are the socket methods and wire shapes? |
-| [Benchmarks](docs/reference/BENCHMARKS.md) | What performance claims have measured sources? |
-| [Public media plan](docs/public/README.md) | Which screenshots and videos are reserved for release? |
-| [Status](STATUS.md) | What is built, proven, limited, or deferred? |
-| [Engineering handoff](docs/development/HANDOFF.md) | Where does each subsystem live? |
-| [Stabilization history](docs/development/STABILIZATION_HISTORY.md) | Which failures were fixed, and how were they proved? |
-| [Next architecture work](docs/development/NEXT.md) | What is the prioritized post-stabilization backlog? |
-| [Goals](docs/development/GOALS.md) | What quality bar governs the project? |
-| [Style](docs/development/STYLE.md) | How is production and test code written? |
-| [V5](docs/development/V5.md) | What is the current architecture line for? |
-| [Contributing](CONTRIBUTING.md) | How should a change be developed and checked? |
-| [Security](SECURITY.md) | How should a vulnerability be reported? |
-| [Changelog](CHANGELOG.md) | What did the historical milestones change? |
-| [Findings](findings.md) | Which measurements and incidents shaped the design? |
-| [Agent entrypoint](AGENTS.md) | Which repository instructions must agents follow? |
+| Install Cyclops and complete a first handoff | [User guides](docs/guides/README.md) |
+| Understand send, wake, claim, reply, and recovery | [Messaging guide](docs/guides/send.md) |
+| Use the full-screen workspace | [Workspace UI guide](docs/guides/workspace-ui.md) |
+| Monitor Stream and Messages without the workspace | [Watch UI guide](docs/guides/ui.md) |
+| Check what is proven, limited, or deferred | [Current status](STATUS.md) |
+| Look up wire methods, manifests, hooks, or benchmarks | [Technical reference](docs/reference/README.md) |
+| Understand or change the codebase | [Engineering map](docs/development/HANDOFF.md) and [contributing guide](CONTRIBUTING.md) |
+| Report a vulnerability | [Security policy](SECURITY.md) |
 
 ## License
 

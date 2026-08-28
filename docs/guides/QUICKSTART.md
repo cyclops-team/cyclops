@@ -61,37 +61,43 @@ happens when the shipped set gains one.
 
 Nothing below needs the repo. Run it from wherever you work.
 
-## 2. Open the workspace
+## 2. Build and open the workspace
 
-One command. It builds the session, starts the daemon if none is running,
-waits for it to reach the session, and names the panes.
+`duo` is two panes side by side, one implementer and one reviewer. The first
+command constructs that named layout and returns. The second opens the full
+Cyclops workspace around it:
 
-`duo` is two panes side by side, one implementer and one reviewer.
-
-```
-$ cyclops start --preset duo
-✔ workspace ready · 2 agents
-
-Next:
-  1  tmux attach -t main                         open the workspace and start your agents
-  2  cyclops send implementer --subject "hello"  send the first message
+```bash
+cyclops start --preset duo
+cyclops
 ```
 
-The heavy check means the daemon confirmed the roster: two panes it will
-deliver to, not two names in a file. A light `✓` means it could not be
-asked, and the line under it says so.
+The confirmation from `cyclops start` means the daemon reached the session
+and confirmed its roster: two panes it can address, not two names in a file.
+A light `✓` means it could not be asked, and the line under it says why.
 
 The daemon outlives the shell you typed in. `cyclops daemon status` says
 whether one is running, `cyclops daemon stop` takes it down, and
 `cyclops daemon log` is where a detached one writes.
 
-Attach, and start one agent CLI in each pane the way you normally would.
+Start one agent CLI in each workspace pane the way you normally would.
+
+If you intentionally want native tmux without the Cyclops sidebar, tabs,
+Messages pane, or workspace controls, exit the workspace and run:
+
+```bash
+tmux attach -t main
+```
+
+That is a supported headless or tmux-native path, not the recommended public
+first-run interface.
 
 Or have cyclops start them. `--agents` names them by manifest id, one per
 named pane in layout order:
 
 ```
 cyclops start --preset duo --agents claude,codex
+cyclops
 ```
 
 Typing the names is the decision to run them, so they start in that run

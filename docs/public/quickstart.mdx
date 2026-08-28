@@ -37,26 +37,25 @@ produced. They assume the named `implementer` pane that the
 preset-built workspace below creates.
 
 **Want that named-pane layout from the start, or a specific arrangement
-for scripting or CI?** `cyclops start` is the preset-based constructor. Run
-it alone for the same one-pane `solo` layout the rest of this walkthrough
-uses, or pass `--preset` for a different shipped arrangement, such as
-`duo` for a named `reviewer` pane alongside `implementer`:
+for scripting or CI?** `cyclops start` is the preset-based constructor. It
+builds the layout and returns; run `cyclops` afterward to open that session in
+the full workspace. Use `duo` for a named `reviewer` pane alongside
+`implementer`:
 
 ```bash
-cyclops start
 cyclops start --preset duo
+cyclops
 ```
 
 ## 3. Start an agent
 
-Attach to the session and run the coding-agent CLI normally:
+Start Claude Code, Codex CLI, Cursor Agent, or another CLI with a detection
+manifest in the workspace pane. The default one-pane layout names its pane
+`implementer`; the `duo` preset also provides `reviewer`.
 
-```bash
-tmux attach -t main
-```
-
-The default pane is named `implementer`. Start Claude Code, Codex CLI, Cursor
-Agent, or another CLI for which you have a detection manifest.
+If you explicitly prefer a native tmux client without Cyclops workspace
+chrome, `tmux attach -t main` opens the same session as a standard tmux grid.
+It does not show the Cyclops sidebar, tabs, or Messages pane.
 
 Cursor detection ships, but its current-version terminal-notification path has
 not completed live validation. It fails closed when exact evidence is missing;

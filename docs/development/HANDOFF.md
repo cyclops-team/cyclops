@@ -4,13 +4,12 @@ A map, not a summary. Where things live, where to start reading for the
 job you have been handed, and which decisions were deliberate so you do not
 spend a day undoing one.
 
-For the current reliability release, start with
-[RELIABILITY_ROADMAP.md](RELIABILITY_ROADMAP.md). It owns implementation order
-and frozen release gates; this file remains the codebase ownership map.
-
+For current behavior, start with this map and the normative contracts it links.
 The completed stabilization run is recorded in
-[STABILIZATION_HISTORY.md](STABILIZATION_HISTORY.md). The prioritized
-post-stabilization architecture work is in [NEXT.md](NEXT.md).
+[STABILIZATION_HISTORY.md](STABILIZATION_HISTORY.md). The prioritized next
+architecture work is in [NEXT.md](NEXT.md). The
+[reliability roadmap](RELIABILITY_ROADMAP.md) is the frozen gate record for the
+stabilization campaign, not the current public starting point.
 
 Cyclops coordinates terminal coding agents that are already running in your
 tmux session. It watches panes, works out whether each agent is idle,
@@ -24,6 +23,26 @@ For current messaging, start with [send.md](../guides/send.md),
 `src/cyclopsd/src/messaging.rs`. Sections explicitly labeled legacy describe
 the compatibility path used by hook self-tests and old session records, not
 standard `cyclops send`.
+
+## Documentation map
+
+The repository keeps public operation, technical reference, active engineering
+contracts, and historical records separate:
+
+| Layer | Documents | How to use them |
+|---|---|---|
+| User operation | [User guides](../guides/README.md) | Install, message, monitor, recover, and use the workspace. |
+| Stable reference | [Technical reference](../reference/README.md) | Wire methods, manifests, hooks, and measured performance claims. |
+| Active contracts | [Architecture](ARCHITECTURE.md), [delivery](DELIVERY.md), [invariants](INVARIANTS.md), [goals](GOALS.md), and [style](STYLE.md) | Read before changing product behavior or tests. |
+| Prioritized work | [Next architecture work](NEXT.md) | Behavior-preserving work that is approved but not yet implemented. |
+| Frozen and historical records | [Reliability roadmap](RELIABILITY_ROADMAP.md), [stabilization history](STABILIZATION_HISTORY.md), [V5 line](V5.md), [changelog](../../CHANGELOG.md), and [findings](../../findings.md) | Preserve the reasoning and evidence behind the current system. Do not treat old plans as current behavior. |
+| Internal release material | [Media plan](../public/README.md) and [demo checklist](../../DEMO_DAY_CHECKLIST.md) | Maintainer working material, not public onboarding. |
+| Repository instructions | [Agent entrypoint](../../AGENTS.md), [contributing](../../CONTRIBUTING.md), and [security](../../SECURITY.md) | Rules for automated contributors, human contributors, and vulnerability reports. |
+
+This hierarchy is deliberate. Do not move every internal record back into the
+root README. If a historical page conflicts with current code or a normative
+contract, the current code and contract win and the history should be labeled
+as history rather than rewritten as a new promise.
 
 ## The shape
 
