@@ -94,7 +94,7 @@ pub use ops::{PaneDirection, SplitDirection, PANE_MINIMIZED_OPTION_V1};
 pub use quote::quote_arg;
 pub use session::{
     active_pane, current_session, list_panes, list_sessions, list_window_memberships, list_windows,
-    SessionRow, WindowMembership, WindowPaneRow, WindowRow,
+    pane_session_id, SessionRow, WindowMembership, WindowPaneRow, WindowRow,
 };
 pub use sizing::{
     release_session_sizing, Captured, ClientIdentity, PriorWindowSize, ReleaseOutcome,

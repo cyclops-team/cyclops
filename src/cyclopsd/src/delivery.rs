@@ -11771,6 +11771,7 @@ composer_trailer_required_prefix = 1
             ack_state: crate::ack::AckState::new(),
             hook_liveness: crate::selftest::HookLiveness::new(),
             inject_pause: StdMutex::new(None),
+            name_reconcile_pause: StdMutex::new(None),
             fail_chrome_restore: AtomicBool::new(false),
             fail_next_final_binding_observation: AtomicBool::new(false),
             fail_pre_record_writing: StdMutex::new(None),

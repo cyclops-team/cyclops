@@ -16,6 +16,8 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::*;
@@ -125,6 +127,223 @@ fn pane_labeled_lines(rig: &Rig) -> Vec<Value> {
         .into_iter()
         .filter(|l| l["data"]["event"] == json!("pane_labeled"))
         .collect()
+}
+
+/// A label typo cannot become valid through pane-table reconciliation. It
+/// must fail from the registry fast path even when an unrelated watched
+/// session's control client is alive but no longer making progress.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_typo_fails_honestly_without_waiting_for_an_unrelated_session() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new_multi(
+        "m4name-typo-bound",
+        CHROME_MANIFEST,
+        &[("unrelated", "cat"), ("target", "cat")],
+        "",
+    )
+    .await;
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let pause = Arc::clone(&release);
+    rig.daemon.set_name_reconcile_pause(move |session| {
+        let pause = Arc::clone(&pause);
+        Box::pin(async move {
+            if session == "unrelated" {
+                pause.acquire().await.expect("pause remains open").forget();
+            }
+        })
+    });
+
+    let response = tokio::time::timeout(
+        Duration::from_millis(500),
+        rig.ctl.request(
+            "pane.label",
+            json!({"target": "not-a-real-label", "label": "nobody"}),
+        ),
+    )
+    .await;
+    release.add_permits(1);
+    rig.daemon.clear_name_reconcile_pause();
+    let response = response.expect("a typo must not await an unrelated watcher");
+    assert_eq!(
+        response["error"]["code"],
+        json!("no_such_target"),
+        "{response}"
+    );
+
+    rig.shutdown().await;
+}
+
+/// A raw pane id identifies one pane on one tmux server. If that pane is new
+/// enough to miss the cache, naming must refresh only its owning session; a
+/// stalled unrelated watcher cannot sit in front of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn naming_a_new_pane_does_not_touch_or_await_an_unrelated_session() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new_multi(
+        "m4name-one-owner",
+        CHROME_MANIFEST,
+        &[("unrelated", "cat"), ("target", "cat")],
+        "",
+    )
+    .await;
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let pause = Arc::clone(&release);
+    rig.daemon.set_name_reconcile_pause(move |session| {
+        let pause = Arc::clone(&pause);
+        Box::pin(async move {
+            if session == "unrelated" {
+                pause.acquire().await.expect("pause remains open").forget();
+            }
+        })
+    });
+
+    let split = rig.tmux.run(&[
+        "split-window",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-t",
+        "target",
+        "cat",
+    ]);
+    assert!(split.status.success(), "split failed: {split:?}");
+    let pane = String::from_utf8_lossy(&split.stdout).trim().to_string();
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        rig.ctl.request(
+            "pane.label",
+            json!({"target": pane, "label": "fresh-reviewer"}),
+        ),
+    )
+    .await;
+    release.add_permits(1);
+    rig.daemon.clear_name_reconcile_pause();
+    let response = response.expect("the target session must bypass an unrelated watcher");
+    assert_eq!(
+        response["result"]["label"],
+        json!("fresh-reviewer"),
+        "{response}"
+    );
+
+    rig.shutdown().await;
+}
+
+/// Even the one owning watcher is an external dependency. If its explicit
+/// reconcile stops making progress, the socket request still gets a bounded,
+/// truthful answer instead of inheriting the watcher's unbounded queue wait.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stuck_owner_reconcile_cannot_make_naming_unbounded() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new("m4name-owner-bound", CHROME_MANIFEST, "cat", "").await;
+    let entered = Arc::new(AtomicBool::new(false));
+    let entered_pause = Arc::clone(&entered);
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let pause = Arc::clone(&release);
+    rig.daemon.set_name_reconcile_pause(move |_| {
+        entered_pause.store(true, Ordering::SeqCst);
+        let pause = Arc::clone(&pause);
+        Box::pin(async move {
+            pause.acquire().await.expect("pause remains open").forget();
+        })
+    });
+
+    let split = rig.tmux.run(&[
+        "split-window",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-t",
+        "main",
+        "cat",
+    ]);
+    assert!(split.status.success(), "split failed: {split:?}");
+    let pane = String::from_utf8_lossy(&split.stdout).trim().to_string();
+
+    let started = Instant::now();
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        rig.ctl.request(
+            "pane.label",
+            json!({"target": pane, "label": "bounded-reviewer"}),
+        ),
+    )
+    .await;
+    release.add_permits(1);
+    rig.daemon.clear_name_reconcile_pause();
+    let response = response.expect("the whole fallback must have an outer bound");
+    assert!(
+        entered.load(Ordering::SeqCst),
+        "the request never exercised the stuck owner fallback: {response}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the naming fallback exceeded its outer bound: {response}"
+    );
+    assert!(
+        response["result"]["label"] == json!("bounded-reviewer")
+            || response["error"]["code"] == json!("no_such_target"),
+        "the bounded response must reflect the live cache honestly: {response}"
+    );
+
+    rig.shutdown().await;
+}
+
+/// Naming is an explicit request about tmux's current pane population. A
+/// structural notification only arms the watcher's 30ms reconcile, so a
+/// pane created immediately before this request is real before it appears in
+/// the cached table. The request must close that gap itself instead of making
+/// the operator wait and retry.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_pane_can_be_named_before_the_structural_debounce_fires() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new("m4name-fresh-pane", CHROME_MANIFEST, "cat", "").await;
+
+    let split = rig.tmux.run(&[
+        "split-window",
+        "-d",
+        "-P",
+        "-F",
+        "#{pane_id}",
+        "-t",
+        "main",
+        "cat",
+    ]);
+    assert!(split.status.success(), "split failed: {split:?}");
+    let pane = String::from_utf8_lossy(&split.stdout).trim().to_string();
+    assert!(
+        pane.starts_with('%'),
+        "split did not print a pane id: {split:?}"
+    );
+
+    let response = rig
+        .ctl
+        .request(
+            "pane.label",
+            json!({"target": pane, "label": "fresh-reviewer"}),
+        )
+        .await;
+    assert_eq!(
+        response["result"]["label"],
+        json!("fresh-reviewer"),
+        "{response}"
+    );
+
+    rig.shutdown().await;
 }
 
 /// The round trip the verb promises: name it, see it on the roster, find

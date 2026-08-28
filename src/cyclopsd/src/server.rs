@@ -2887,6 +2887,7 @@ mod tests {
             ack_state: crate::ack::AckState::new(),
             hook_liveness: crate::selftest::HookLiveness::new(),
             inject_pause: StdMutex::new(None),
+            name_reconcile_pause: StdMutex::new(None),
             fail_chrome_restore: std::sync::atomic::AtomicBool::new(false),
             fail_next_final_binding_observation: std::sync::atomic::AtomicBool::new(false),
             fail_pre_record_writing: std::sync::Mutex::new(None),
