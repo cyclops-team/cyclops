@@ -396,6 +396,18 @@ fn pane_history(rig: &Rig, pane: &str) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+fn joined_pane_history(rig: &Rig, pane: &str) -> String {
+    let output = rig
+        .tmux
+        .run(&["capture-pane", "-p", "-J", "-S", "-", "-t", pane]);
+    assert!(
+        output.status.success(),
+        "joined capture pane history failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 async fn wait_for_pane_mode(rig: &mut Rig, pane: &str, expected: bool) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -436,28 +448,6 @@ async fn resize_pane_and_allow_event(rig: &mut Rig, pane: &str, width: u32) {
         assert!(
             Instant::now() < deadline,
             "daemon did not observe pane {pane} at width {width}: {status}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-async fn wait_for_pane_write_ready(rig: &mut Rig, pane: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let status = rig.ctl.request("status", json!({})).await;
-        let ready = status["result"]["sessions"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|session| session["panes"].as_array())
-            .flatten()
-            .any(|row| row["pane_id"] == pane && row["write_ready"] == true);
-        if ready {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "pane {pane} did not become write-ready: {status}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -573,7 +563,7 @@ async fn private_body_shapes_never_reach_the_notification_pane() {
     let message_id = result["msg_id"].as_str().unwrap().to_string();
 
     wait_for_doorbell(&rig, &pane, &message_id).await;
-    let screen = pane_history(&rig, &pane);
+    let screen = joined_pane_history(&rig, &pane);
     for private_text in [
         "Private transport shapes",
         "/approve --all",
@@ -979,7 +969,7 @@ async fn a_hook_start_after_submit_reservation_withholds_enter() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_claim_before_submit_clears_only_the_exact_doorbell_and_advances_fifo() {
+async fn a_claim_before_submit_still_submits_the_operator_visible_doorbell() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -1039,17 +1029,8 @@ async fn a_claim_before_submit_clears_only_the_exact_doorbell_and_advances_fifo(
     );
     release.add_permits(1);
 
-    let cleared =
-        wait_for_workspace_fact(&rig, &first_id, "notification_claimed_staged_cleared").await;
-    rig.ev
-        .wait_event(Duration::from_secs(5), |event| {
-            event["event"] == "messages.changed"
-                && event["seq"] == cleared.seq
-                && event["data"]["changed"]
-                    .as_array()
-                    .is_some_and(|areas| areas.iter().any(|area| area == "notifications"))
-        })
-        .await;
+    wait_for_notification_state(&mut rig, &first_id, NotificationState::Submitted).await;
+    wait_for_notification_state(&mut rig, &first_id, NotificationState::Notified).await;
     let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
     let first_row = snapshot["result"]["rows"]
         .as_array()
@@ -1058,24 +1039,18 @@ async fn a_claim_before_submit_clears_only_the_exact_doorbell_and_advances_fifo(
         .find(|row| row["message_id"].as_str() == Some(first_id.as_str()))
         .expect("claimed message remains visible");
     assert_eq!(
-        first_row["recipients"][0]["notification"]["state"], "staged",
-        "the compatibility state preserves that bytes crossed the write boundary"
+        first_row["recipients"][0]["notification"]["state"], "notified",
+        "socket retrieval must not suppress the independent pane notification"
     );
     assert_eq!(
         first_row["recipients"][0]["notification"]["settlement"],
-        "withdrawn_by_claim"
+        serde_json::Value::Null
     );
     assert_eq!(
         notification_state_count(&rig, &first_id, NotificationState::Submitted),
-        0
+        1
     );
-    assert!(!rig.tmux.capture(&pane).contains(&first_id));
-    wait_for_pane_write_ready(&mut rig, &pane).await;
-
-    let second =
-        send_workspace_message(&rig, "claim-before-submit-second", "Second", "second body").await;
-    let second_id = second["msg_id"].as_str().unwrap().to_string();
-    wait_for_notification_state(&mut rig, &second_id, NotificationState::Writing).await;
+    assert!(pane_history(&rig, &pane).contains(&compact_doorbell(&rig, &first_id)));
     rig.daemon.shutdown().await;
 }
 
@@ -1275,7 +1250,7 @@ async fn summary_notification_stages_the_preview_and_exact_claim_without_the_bod
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_oversized_summary_uses_the_exact_claim_instead_of_stranding_after_paste() {
+async fn an_oversized_summary_soft_wraps_without_dropping_the_operator_preview() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -1305,21 +1280,21 @@ async fn an_oversized_summary_uses_the_exact_claim_instead_of_stranding_after_pa
     wait_for_notification_state(&mut rig, &message_id, NotificationState::Submitted).await;
 
     let attempt = current_notification_attempt(&workspace_lines(&rig), &message_id)
-        .expect("the fallback keeps the same exact attempt");
-    let screen = pane_history(&rig, &pane);
+        .expect("the summary notification keeps the same exact attempt");
+    let screen = joined_pane_history(&rig, &pane);
     assert!(
         screen.contains(&cyclops_proto::render_doorbell_v3(attempt)),
-        "the exact claim fallback did not reach the pane: {screen}"
+        "the exact claim did not reach the pane: {screen}"
     );
     assert!(
-        !screen.contains(summary),
-        "an unprovable wrapped preview was pasted"
+        screen.contains(summary),
+        "the wrapped operator preview was dropped: {screen}"
     );
     let writing = notification_transition(&rig, &message_id, NotificationState::Writing)
-        .expect("the fallback fixes its selected format durably");
+        .expect("the summary notification fixes its selected format durably");
     assert_eq!(
         writing.data.as_ref().unwrap()["doorbell_format"],
-        cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM
+        cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM
     );
     assert_eq!(
         notification_state_count(&rig, &message_id, NotificationState::AttentionRequired),
@@ -1329,7 +1304,7 @@ async fn an_oversized_summary_uses_the_exact_claim_instead_of_stranding_after_pa
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn format_3_width_block_writes_nothing_then_reopens_once_on_a_size_edge() {
+async fn format_3_soft_wraps_in_a_narrow_pane_without_a_width_block() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -1348,58 +1323,23 @@ async fn format_3_width_block_writes_nothing_then_reopens_once_on_a_size_edge() 
 
     let sent = send_workspace_message(&rig, "format3-width", "Width", "private body").await;
     let message_id = sent["msg_id"].as_str().unwrap().to_string();
-    wait_for_notification_state(&mut rig, &message_id, NotificationState::BlockedPreWrite).await;
-    let blocked = notification_transition(&rig, &message_id, NotificationState::BlockedPreWrite)
-        .expect("the narrow pane block is durable");
-    let fact = blocked.data.as_ref().expect("blocked transition data");
-    assert_eq!(fact["pre_write_cause"], "write_readiness_changed");
-    assert_eq!(fact["pre_write_observation"]["pane_width"], 59);
-    assert_eq!(
-        fact["pre_write_observation"]["required_pane_width"],
-        cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH
-    );
-    let attempt = NotificationAttemptId::parse(fact["attempt_id"].as_str().unwrap()).unwrap();
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::Submitted).await;
+    let attempt = current_notification_attempt(&workspace_lines(&rig), &message_id)
+        .expect("the narrow-pane notification has one exact attempt");
     let doorbell = cyclops_proto::render_doorbell_v3(attempt);
-    assert_eq!(
-        notification_state_count(&rig, &message_id, NotificationState::Writing),
-        0
-    );
-    assert!(!pane_history(&rig, &pane).contains(&doorbell));
-
-    let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
-    let notification = &snapshot["result"]["rows"][0]["recipients"][0]["notification"];
-    assert_eq!(notification["pre_write_cause"], "write_readiness_changed");
-    assert_eq!(notification["pre_write_pane_width"], 59);
-    assert_eq!(
-        notification["pre_write_required_pane_width"],
-        cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH
-    );
-
-    resize_pane_and_allow_event(&mut rig, &pane, cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH).await;
-    wait_for_notification_state(&mut rig, &message_id, NotificationState::Writing).await;
-    assert_eq!(
-        notification_state_count(&rig, &message_id, NotificationState::Gating),
-        2,
-        "one width edge must reopen the same attempt exactly once"
-    );
+    assert!(joined_pane_history(&rig, &pane).contains(&doorbell));
     assert_eq!(
         notification_state_count(&rig, &message_id, NotificationState::BlockedPreWrite),
-        1
+        0,
+        "terminal width must not suppress an operator-visible doorbell"
     );
     assert_eq!(notification_attempts(&rig, &message_id).len(), 1);
-
-    resize_pane_and_allow_event(&mut rig, &pane, cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH).await;
-    assert_eq!(
-        notification_state_count(&rig, &message_id, NotificationState::Gating),
-        2,
-        "an unchanged size cannot start another reopen chain"
-    );
 
     rig.daemon.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn format_3_resize_between_final_read_and_write_is_caught() {
+async fn format_3_resize_between_final_read_and_write_still_soft_wraps() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -1440,22 +1380,14 @@ async fn format_3_resize_between_final_read_and_write_is_caught() {
     resize_pane_and_allow_event(&mut rig, &pane, 59).await;
     release.add_permits(1);
 
-    wait_for_notification_state(&mut rig, &message_id, NotificationState::BlockedPreWrite).await;
-    let blocked = notification_transition(&rig, &message_id, NotificationState::BlockedPreWrite)
-        .expect("the on-write width bookend refused the pane");
-    let fact = blocked.data.as_ref().expect("blocked transition data");
-    assert_eq!(fact["pre_write_cause"], "write_readiness_changed");
-    assert_eq!(fact["pre_write_observation"]["pane_width"], 59);
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::Submitted).await;
+    let attempt = current_notification_attempt(&workspace_lines(&rig), &message_id)
+        .expect("the resized notification has one exact attempt");
+    assert!(joined_pane_history(&rig, &pane).contains(&cyclops_proto::render_doorbell_v3(attempt)));
     assert_eq!(
-        fact["pre_write_observation"]["required_pane_width"],
-        cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH
-    );
-    let attempt = NotificationAttemptId::parse(fact["attempt_id"].as_str().unwrap()).unwrap();
-    assert_eq!(
-        notification_state_count(&rig, &message_id, NotificationState::Writing),
+        notification_state_count(&rig, &message_id, NotificationState::BlockedPreWrite),
         0
     );
-    assert!(!pane_history(&rig, &pane).contains(&cyclops_proto::render_doorbell_v3(attempt)));
 
     rig.daemon.shutdown().await;
 }
@@ -3087,7 +3019,7 @@ async fn typed_composer_hold_is_a_durable_prewrite_block_until_a_real_turn() {
     assert_eq!(status_row["next_action"], "withdraw_notification");
 
     // Pull remains available while automatic input is held. Claiming this
-    // exact mailbox entry never needs terminal-write proof.
+    // exact mailbox entry does not cancel the operator-visible notification.
     rig.daemon
         .claim_message_for_test("worker", &message_id)
         .expect("a held message remains claimable");
@@ -3104,6 +3036,24 @@ async fn typed_composer_hold_is_a_durable_prewrite_block_until_a_real_turn() {
         .and_then(|rows| rows.iter().find(|row| row["message_id"] == message_id))
         .expect("claimed message remains visible");
     assert_eq!(claimed_row["recipients"][0]["mailbox"]["status"], "claimed");
+    assert_eq!(
+        claimed_row["recipients"][0]["notification"]["pre_write_block"],
+        "composer_hold"
+    );
+
+    let first_withdrawn = rig
+        .daemon
+        .withdraw_notification_for_test(
+            "admin",
+            serde_json::from_value(row["recipients"][0]["recipient"].clone())
+                .expect("blocked recipient key"),
+            serde_json::from_value(data["attempt_id"].clone()).expect("blocked attempt id"),
+        )
+        .expect("admin withdraws the claimed operator notification");
+    assert_eq!(
+        first_withdrawn.disposition,
+        cyclops_proto::NotificationWithdrawDisposition::Withdrawn
+    );
 
     // Withdrawal is exact, pre-write, and leaves the message pullable. It
     // releases only the FIFO head, so the next message inherits the same
@@ -4058,12 +4008,11 @@ async fn an_admitting_edge_racing_the_block_append_does_not_strand_the_attempt()
     rig.daemon.shutdown().await;
 }
 
-/// A recipient claim and an exact administrator withdrawal each release
-/// the FIFO behind a hook admission block, and neither deletes the mailbox
-/// message: the claimed one stays claimed, the withdrawn one stays pending.
+/// A recipient claim leaves the operator notification at the FIFO head. An
+/// exact administrator withdrawal releases it without changing the claimed
+/// mailbox message, then the next pending notification may advance.
 #[tokio::test(flavor = "multi_thread")]
-async fn claim_and_exact_withdrawal_each_release_a_hook_admission_block_without_deleting_the_message(
-) {
+async fn claim_preserves_and_exact_withdrawal_releases_a_hook_admission_notification() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -4087,13 +4036,12 @@ async fn claim_and_exact_withdrawal_each_release_a_hook_admission_block_without_
     assert_only_oldest_attempt_exists(&rig, &pair);
     assert!(notification_attempts(&rig, &third_id).is_empty());
 
-    // The recipient claims the blocked head: its attempt is withdrawn by
-    // the claim, the message stays claimed, and the next message is
-    // scheduled into the same block.
+    // The recipient claims the backend payload, but the independent operator
+    // notification remains the exact FIFO owner.
     rig.daemon
         .claim_message_for_test("worker", &pair.first)
         .expect("exact recipient claim");
-    wait_for_notification_state(&mut rig, &pair.second, NotificationState::BlockedPreWrite).await;
+    assert!(notification_attempts(&rig, &pair.second).is_empty());
     let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
     let rows = snapshot["result"]["rows"].as_array().unwrap();
     let row_of = |id: &str| {
@@ -4105,8 +4053,38 @@ async fn claim_and_exact_withdrawal_each_release_a_hook_admission_block_without_
     assert_eq!(first_row["recipients"][0]["mailbox"]["status"], "claimed");
     assert_eq!(
         first_row["recipients"][0]["notification"]["settlement"],
-        "withdrawn_by_claim"
+        serde_json::Value::Null
     );
+    assert_eq!(
+        first_row["recipients"][0]["notification"]["pre_write_block"],
+        "hook_admission_unproven"
+    );
+    let first_recipient = first_row["recipients"][0]["recipient"].clone();
+    let first_blocked =
+        notification_transition(&rig, &pair.first, NotificationState::BlockedPreWrite)
+            .expect("the first block is durable");
+    let first_attempt = first_blocked
+        .data
+        .as_ref()
+        .expect("blocked transition data")["attempt_id"]
+        .clone();
+    let first_withdrawn = rig
+        .ctl
+        .request(
+            "notification.withdraw",
+            json!({"attempt_id": first_attempt, "recipient": first_recipient}),
+        )
+        .await;
+    assert!(first_withdrawn["error"].is_null(), "{first_withdrawn}");
+
+    wait_for_notification_state(&mut rig, &pair.second, NotificationState::BlockedPreWrite).await;
+    let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
+    let rows = snapshot["result"]["rows"].as_array().unwrap();
+    let row_of = |id: &str| {
+        rows.iter()
+            .find(|row| row["message_id"] == id)
+            .expect("message row survives")
+    };
     let second_row = row_of(&pair.second);
     // The wire spells a blocked pre-write as gating plus its cause fields.
     assert_eq!(

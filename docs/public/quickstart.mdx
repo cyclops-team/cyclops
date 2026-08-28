@@ -65,7 +65,9 @@ use `cyclops inbox next` or `cyclops inbox claim` over the socket. See
 An authenticated claim prints one framed message with immutable `TO`, `FROM`,
 and `SUBJECT` labels, the full durable body, an exact reply command, and a
 matching `[cyclops:end <message-id>]` marker. The short terminal wake contains
-only the sender-authored preview and exact claim, never the full body.
+only the sender-authored preview and exact claim, never the full body. A socket
+claim may retrieve that body first, but it does not cancel the separately
+queued pane notification.
 
 ## 4. Check the roster
 

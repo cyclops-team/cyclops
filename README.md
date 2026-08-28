@@ -122,8 +122,11 @@ cyclops send reviewer --subject "Review the parser" \
 
 The recipient sees the two-sentence preview plus an exact `m-att_...` claim
 token. If the composer contains human input, the notification waits until the
-composer is proven available. Claiming the token retrieves the authorized
-envelope, including TO, FROM, subject, summary, full body, and reply context:
+composer is proven available. Narrow panes may visually soft-wrap the
+notification, but Cyclops keeps the supplied summary. Claiming through the
+socket does not cancel this independently queued pane notification. Claiming
+the token retrieves the authorized envelope, including TO, FROM, subject,
+summary, full body, and reply context:
 
 ```bash
 cyclops inbox claim m-att_<token>

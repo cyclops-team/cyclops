@@ -17,9 +17,11 @@ Filtered watch uses current display labels. Discover them first with
 `cyclops list --all`. An unknown active label fails immediately instead of
 opening a stream that can never match. Display labels can be renamed, so
 `--with`, `--from`, and `--to` are human view filters, not durable endpoint
-selectors. Automation that needs the next message should use `cyclops inbox
-next --timeout 30s`. Its optional `--from` accepts the canonical sender key
-shown by `cyclops inbox list --json`, never a display label.
+selectors. Automation that needs the next message may use `cyclops inbox next
+--timeout 30s`. Its optional `--from` accepts the canonical sender key shown by
+`cyclops inbox list --json`, never a display label. A socket claim retrieves
+the durable body but does not suppress the separate human-visible pane
+notification.
 The JSON event stream accepts `--kinds`, not the three TUI display filters.
 
 The admin stream shows only what is aimed at you: messages addressed to

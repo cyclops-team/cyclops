@@ -115,17 +115,7 @@ struct AttemptPayload {
 
 impl AttemptPayload {
     fn required_pane_width(&self) -> Option<u32> {
-        match self.doorbell_format {
-            Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM) => {
-                Some(cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH)
-            }
-            Some(cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM) => Some(
-                u32::try_from(2 + unicode_width::UnicodeWidthStr::width(self.bytes.as_str()))
-                    .unwrap_or(u32::MAX)
-                    .max(cyclops_proto::DOORBELL_V4_MIN_PANE_WIDTH),
-            ),
-            _ => None,
-        }
+        None
     }
 }
 
@@ -204,7 +194,7 @@ fn select_attempt_payload(
     handle: &DeliveryHandle,
     manifest: &Manifest,
     observed: Option<&fusion::Binding>,
-    pane_width: Option<u32>,
+    _pane_width: Option<u32>,
 ) -> Result<AttemptPayload, NotificationAdapterError> {
     let Some(notification) = &handle.notification else {
         return Ok(AttemptPayload {
@@ -234,24 +224,10 @@ fn select_attempt_payload(
                 &summary,
                 notification.attempt_id(),
             );
-            let candidate = AttemptPayload {
+            return Ok(AttemptPayload {
                 bytes,
                 transport: Some(NotificationTransport::Doorbell),
                 doorbell_format: Some(cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM),
-                capability: None,
-                capability_required: false,
-            };
-            if pane_width.is_none_or(|width| {
-                candidate
-                    .required_pane_width()
-                    .is_some_and(|required| width >= required)
-            }) {
-                return Ok(candidate);
-            }
-            return Ok(AttemptPayload {
-                bytes: cyclops_proto::render_doorbell_v3(notification.attempt_id()),
-                transport: Some(NotificationTransport::Doorbell),
-                doorbell_format: Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
                 capability: None,
                 capability_required: false,
             });
@@ -9712,6 +9688,19 @@ mod tests {
         Arc<DeliveryHandle>,
         RecipientKey,
     ) {
+        notification_fixture_with_summary(tag, None)
+    }
+
+    fn notification_fixture_with_summary(
+        tag: &str,
+        summary: Option<&str>,
+    ) -> (
+        NotificationScratch,
+        Arc<StdMutex<MessageStore>>,
+        NotificationContext,
+        Arc<DeliveryHandle>,
+        RecipientKey,
+    ) {
         let path = cyclops_proto::scratch::scratch_dir(&format!(
             "notification-adapter-{tag}-{}",
             uuid::Uuid::new_v4()
@@ -9739,7 +9728,7 @@ mod tests {
                     sender: admin,
                     recipients: vec![recipient],
                     subject: Some("Wake".into()),
-                    summary: None,
+                    summary: summary.map(str::to_string),
                     body: Some("Review the mailbox".into()),
                     client_key: None,
                     supersedes: None,
@@ -9859,9 +9848,9 @@ mod tests {
         assert!(matches!(
             claimed,
             crate::mailbox::ClaimOutcome::Claimed {
-                consumed_doorbell_attempt: Some(attempt),
+                consumed_doorbell_attempt: None,
                 ..
-            } if attempt == context.attempt_id()
+            }
         ));
         notification_state(store, recipient, context.message_id())
     }
@@ -10802,6 +10791,35 @@ mod tests {
     }
 
     #[test]
+    fn a_summary_notification_keeps_its_operator_preview_in_a_narrow_pane() {
+        let summary = "Yahir needs three jazz songs tonight. Reply with concise recommendations.";
+        let (_scratch, _store, context, handle, _recipient) =
+            notification_fixture_with_summary("narrow-summary", Some(summary));
+        let manifest = Manifest::parse(
+            "[agent]\nid = \"fix\"\ndisplay_name = \"Fix\"\nprocess_names = [\"cat\"]\n",
+            Path::new("fix.toml"),
+        )
+        .unwrap();
+
+        let selected = select_attempt_payload(&handle, &manifest, None, Some(60)).unwrap();
+
+        assert_eq!(
+            selected.bytes,
+            cyclops_proto::render_doorbell_v4("admin", summary, context.attempt_id())
+        );
+        assert_eq!(selected.transport, Some(NotificationTransport::Doorbell));
+        assert_eq!(
+            selected.doorbell_format,
+            Some(cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM)
+        );
+        assert_eq!(
+            selected.required_pane_width(),
+            None,
+            "format 4 may soft-wrap instead of dropping its human-readable summary"
+        );
+    }
+
+    #[test]
     fn mailbox_capability_proof_is_exact_and_binding_scoped() {
         let scratch = cyclops_proto::scratch::scratch_dir(&format!(
             "mailbox-capability-{}",
@@ -11071,7 +11089,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_loss_outranks_a_narrow_format_3_pane() {
+    fn capability_loss_refuses_but_a_narrow_doorbell_may_soft_wrap() {
         let scratch = NotificationScratch(cyclops_proto::scratch::scratch_dir(&format!(
             "capability-bookend-{}",
             uuid::Uuid::new_v4()
@@ -11107,7 +11125,8 @@ mod tests {
 
         assert_eq!(
             notification_prewrite_bookend(&selected, Some(recipient), &binding, narrow),
-            Some(format!("pane_too_narrow:{narrow}"))
+            None,
+            "operator-visible doorbells may soft-wrap in a narrow pane"
         );
         assert_eq!(
             notification_prewrite_bookend(
@@ -11117,7 +11136,7 @@ mod tests {
                 cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH,
             ),
             None,
-            "an exact current capability and safe width pass the prewrite bookend"
+            "an exact current capability passes the prewrite bookend"
         );
         std::fs::write(&file, "operator edit").unwrap();
         assert_eq!(
@@ -12522,9 +12541,9 @@ composer_trailer_required_prefix = 1
         );
     }
 
-    #[tokio::test]
-    async fn claim_withdrawal_wakes_the_exact_attempt_and_prevents_the_write() {
-        let (_scratch, store, context, handle, recipient) = notification_fixture("claimed");
+    #[test]
+    fn a_socket_claim_does_not_suppress_the_operator_visible_doorbell() {
+        let (_scratch, store, context, _handle, recipient) = notification_fixture("claimed");
         context.record_gating().unwrap();
         let outcome = store
             .lock()
@@ -12537,46 +12556,13 @@ composer_trailer_required_prefix = 1
         else {
             panic!("first claim must append a claim fact");
         };
-        assert_eq!(withdrawn_attempt, Some(context.attempt_id()));
-
-        let engine = Engine::new();
-        engine
-            .notification_attempts
-            .lock()
-            .unwrap()
-            .insert(context.attempt_id(), Arc::downgrade(&handle));
-        engine.cancel_notification(context.attempt_id());
-        tokio::time::timeout(Duration::from_millis(100), handle.cancel.notified())
-            .await
-            .expect("claim wakes the withdrawn attempt");
-
-        let manifest = sentinel_manifest();
-        let payload = handle.payload();
-        let screen = format!("\u{1b}[39m❯ {payload}\n{CHROME}");
-        let injector = MockInjector::new(vec![&screen]);
-        injector.spool(&payload).await.unwrap();
-        let error = inject(
-            &injector,
-            &handle,
-            &manifest,
-            StagingTarget::ExactRow(&payload),
-            &payload,
-            &|| {
-                context
-                    .ensure_current_gating()
-                    .map_err(notification_write_cause)
-            },
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            error,
-            InjectFailure::Other(NO_LONGER_CURRENT_BEFORE_WRITE.to_string())
-        );
-        assert!(injector.pasted.lock().unwrap().is_empty());
+        assert_eq!(withdrawn_attempt, None);
+        context
+            .ensure_current_gating()
+            .expect("socket claim must not cancel the independent pane notification");
         assert_eq!(
             notification_state(&store, recipient, context.message_id()).state,
-            cyclops_proto::NotificationState::Withdrawn
+            cyclops_proto::NotificationState::Gating
         );
     }
 
@@ -12642,7 +12628,7 @@ composer_trailer_required_prefix = 1
             panic!("first claim must append a claim fact");
         };
         assert_eq!(withdrawn_attempt, None);
-        assert_eq!(consumed_doorbell_attempt, Some(context.attempt_id()));
+        assert_eq!(consumed_doorbell_attempt, None);
 
         let store = store.lock().unwrap();
         let record = store
@@ -12658,7 +12644,7 @@ composer_trailer_required_prefix = 1
         drop(store);
         assert_eq!(
             context.reserve_submit().unwrap(),
-            SubmitReservation::ClaimedBeforeSubmit
+            SubmitReservation::Reserved
         );
     }
 
@@ -13116,7 +13102,7 @@ composer_trailer_required_prefix = 1
     }
 
     #[test]
-    fn a_claim_that_wins_the_prewrite_block_releases_fifo_without_faulting() {
+    fn a_socket_claim_does_not_retire_the_operator_notification_prewrite_block() {
         let (_scratch, store, context, handle, recipient) =
             notification_fixture("claim-wins-prewrite-block");
         context.record_gating().unwrap();
@@ -13127,9 +13113,7 @@ composer_trailer_required_prefix = 1
             .unwrap();
 
         let worker = Arc::new(Worker::new());
-        let follower = DeliveryHandle::new("m-follower", "reviewer", "%1", 0, String::new());
         worker.enqueue_back(Arc::clone(&handle));
-        worker.enqueue_back(Arc::clone(&follower));
         assert!(Arc::ptr_eq(
             &worker.current_or_next().expect("current attempt"),
             &handle
@@ -13146,16 +13130,17 @@ composer_trailer_required_prefix = 1
                 generation: 1,
             },
         );
-        assert!(record.is_none());
+        assert!(record.is_some());
         assert!(!worker.is_faulted());
         assert_eq!(
             notification_state(&store, recipient, context.message_id()).state,
-            NotificationState::Withdrawn
+            NotificationState::BlockedPreWrite
         );
-        assert!(worker.finish(&handle));
         assert!(Arc::ptr_eq(
-            &worker.current_or_next().expect("follower advances"),
-            &follower
+            &worker
+                .current_or_next()
+                .expect("notification remains the FIFO owner"),
+            &handle
         ));
     }
 
@@ -13375,7 +13360,7 @@ line_regex_esc = ['^❯$']
         assert_eq!(first_entry.message_id, *context.message_id());
         assert_eq!(first_message.message_id, *context.message_id());
         assert_eq!(withdrawn_attempt, None);
-        assert_eq!(consumed_doorbell_attempt, Some(context.attempt_id()));
+        assert_eq!(consumed_doorbell_attempt, None);
         assert_eq!(
             notification_state(&store, recipient, context.message_id()).state,
             NotificationState::Submitting,
@@ -13401,7 +13386,7 @@ line_regex_esc = ['^❯$']
         assert_eq!(repeated_entry.message_id, first_entry.message_id);
         assert_eq!(repeated_message.message_id, first_message.message_id);
         assert_eq!(withdrawn_attempt, None);
-        assert_eq!(consumed_doorbell_attempt, Some(context.attempt_id()));
+        assert_eq!(consumed_doorbell_attempt, None);
         assert_eq!(
             store.lock().unwrap().projection().last_sequence(),
             sequence_before_reclaim,
@@ -13520,7 +13505,7 @@ line_regex_esc = ['^❯$']
     }
 
     #[test]
-    fn withdrawn_notification_never_enters_the_delivery_gate() {
+    fn claimed_doorbell_still_enters_the_operator_notification_gate() {
         let (_scratch, store, context, _handle, recipient) =
             notification_fixture("withdrawn-before-gate");
         let outcome = store
@@ -13534,15 +13519,14 @@ line_regex_esc = ['^❯$']
         else {
             panic!("first claim must append a claim fact");
         };
-        assert_eq!(withdrawn_attempt, Some(context.attempt_id()));
+        assert_eq!(withdrawn_attempt, None);
 
-        assert!(matches!(
-            context.record_gating(),
-            Err(NotificationAdapterError::NoLongerCurrentBeforeWrite)
-        ));
+        context
+            .record_gating()
+            .expect("claim and operator-visible pane notification are independent");
         assert_eq!(
             notification_state(&store, recipient, context.message_id()).state,
-            cyclops_proto::NotificationState::Withdrawn
+            cyclops_proto::NotificationState::Gating
         );
     }
 
@@ -15141,6 +15125,36 @@ mod composer_content_proof {
             "\u{1b}[94m>\u{1b}[39m {doorbell}\n\
              \u{1b}[90m───────────────────────────────────────────────────────────────────────────────\n\
              \u{1b}[38;2;174;198;207mGemini 3.7 Flash\u{1b}[38;2;200;200;200m · \u{1b}[38;2;255;179;186mHigh\u{1b}[38;2;200;200;200m · \u{1b}[38;2;168;230;163m/tmp/release\u{1b}[38;2;200;200;200m · \u{1b}[38;2;203;170;203mFull\u{1b}[38;2;200;200;200m · \u{1b}[38;2;168;230;163mCtx:"
+        );
+
+        assert_eq!(
+            exact_composer_content_from_joined_capture(&manifest, &capture),
+            ComposerContentProof::Visible(doorbell.clone())
+        );
+        assert_eq!(
+            exact_staging_proof(
+                &manifest,
+                &capture,
+                StagingTarget::ExactRow(&doorbell),
+                &doorbell,
+            ),
+            Some((true, doorbell))
+        );
+    }
+
+    /// MEASURED 2026-08-28 on Claude Code 2.1.251. The `/rc` shortcut is
+    /// right-aligned after the ordinary model status fields. It remains
+    /// vendor chrome and must not make an exact Format 3 doorbell ambiguous.
+    #[test]
+    fn claude_2_1_251_rc_status_format_3_reaches_the_submit_gate() {
+        let manifest = shipped("claude");
+        let attempt_id =
+            NotificationAttemptId::parse("att-01234567-89ab-4def-8123-456789abcdef").unwrap();
+        let doorbell = cyclops_proto::render_doorbell_v3(attempt_id);
+        let capture = format!(
+            "\u{1b}[39m❯\u{a0}{doorbell}\n\
+             \u{1b}[38;5;244m───────────────────────────────────────────────────────────────────────────────\n\
+             \u{1b}[39m  \u{1b}[38;5;174mSonnet 5\u{1b}[38;5;246m · \u{1b}[38;5;216mlow\u{1b}[38;5;246m · ~ · \u{1b}[38;5;72mCtx: 95%\u{1b}[38;5;246m · 5h: 100% · 7d: 1% · \u{1b}[38;5;180m1000K window\u{1b}[38;5;246m · \u{1b}[38;5;180m52K used            /rc"
         );
 
         assert_eq!(

@@ -208,15 +208,17 @@ impl NotificationState {
 
     /// Settle notification work after the exact recipient claims the message.
     ///
-    /// A pre-write wake is unnecessary after retrieval. A proven submitted
-    /// doorbell is consumed, but this does not prove task completion. Staged,
-    /// submitting, direct payload, and unresolved attention states remain
-    /// unchanged.
+    /// Mailbox retrieval and the operator-visible doorbell are independent.
+    /// A proven submitted doorbell is consumed, but this does not prove task
+    /// completion. Only legacy direct payload work is withdrawn before write.
     pub fn settled_by_claim(self, transport: NotificationTransport) -> Self {
         use NotificationState::*;
 
         match (self, transport) {
-            (Queued | Gating | BlockedPreWrite | QuotaHeld | QuotaResetObserved, _) => Withdrawn,
+            (
+                Queued | Gating | BlockedPreWrite | QuotaHeld | QuotaResetObserved,
+                NotificationTransport::DirectPayload,
+            ) => Withdrawn,
             (Submitted, NotificationTransport::Doorbell) => Notified,
             _ => self,
         }
@@ -1296,7 +1298,7 @@ mod tests {
     }
 
     #[test]
-    fn claim_settlement_withdraws_only_pre_write_wakes() {
+    fn claim_settlement_preserves_operator_doorbells_but_withdraws_direct_payloads() {
         use NotificationState::*;
 
         for state in [
@@ -1308,7 +1310,7 @@ mod tests {
         ] {
             assert_eq!(
                 state.settled_by_claim(NotificationTransport::Doorbell),
-                Withdrawn
+                state
             );
             assert_eq!(
                 state.settled_by_claim(NotificationTransport::DirectPayload),

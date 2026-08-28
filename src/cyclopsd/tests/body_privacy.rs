@@ -469,7 +469,7 @@ async fn an_unadopted_pane_cannot_claim_its_former_mailbox_body() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn claiming_the_oldest_withdraws_only_its_attempt_and_schedules_the_next() {
+async fn claiming_the_oldest_preserves_its_notification_fifo_until_operator_withdrawal() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -548,31 +548,40 @@ async fn claiming_the_oldest_withdraws_only_its_attempt_and_schedules_the_next()
         .find(|row| row["message_id"] == second_id)
         .unwrap();
     assert_eq!(first_row["recipients"][0]["mailbox"]["status"], "claimed");
-    assert_eq!(
-        first_row["recipients"][0]["notification"]["state"],
-        "not_started"
-    );
-    assert_eq!(
-        first_row["recipients"][0]["notification"]["settlement"],
-        "withdrawn_by_claim"
-    );
-    assert_eq!(second_row["recipients"][0]["mailbox"]["status"], "pending");
     assert!(matches!(
-        second_row["recipients"][0]["notification"]["state"].as_str(),
+        first_row["recipients"][0]["notification"]["state"].as_str(),
         Some("queued" | "gating")
     ));
+    assert!(first_row["recipients"][0]["notification"]["settlement"].is_null());
+    assert_eq!(second_row["recipients"][0]["mailbox"]["status"], "pending");
+    assert_eq!(
+        second_row["recipients"][0]["notification"]["state"],
+        "not_started"
+    );
     assert_eq!(notification_attempts(&rig, &first_id).len(), 1);
-    assert_eq!(notification_attempts(&rig, &second_id).len(), 1);
+    assert!(notification_attempts(&rig, &second_id).is_empty());
+
+    let attempt_id = first_row["recipients"][0]["notification"]["attempt_id"].clone();
+    let recipient_key = first_row["recipients"][0]["recipient"].clone();
+    let withdrawn = rig
+        .ctl
+        .request(
+            "notification.withdraw",
+            json!({"attempt_id": attempt_id, "recipient": recipient_key}),
+        )
+        .await;
+    assert!(withdrawn["error"].is_null(), "{withdrawn}");
+    let second_attempt = wait_for_notification_attempt(&rig, &second_id).await;
     assert_ne!(
         notification_attempts(&rig, &first_id),
-        notification_attempts(&rig, &second_id)
+        BTreeSet::from([second_attempt])
     );
 
     rig.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn authenticated_claim_withdraws_exact_blocked_attempt_and_releases_fifo() {
+async fn authenticated_claim_preserves_blocked_attempt_until_operator_withdrawal() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -664,7 +673,6 @@ async fn authenticated_claim_withdraws_exact_blocked_attempt_and_releases_fifo()
         .into_iter()
         .any(|line| { line["id"] == first_id && line["data"]["type"] == "message_claimed" }));
 
-    let second_attempt = wait_for_notification_attempt(&rig, &second_id).await;
     let snapshot = pane_request(
         &mut rig,
         &client_dir,
@@ -685,21 +693,30 @@ async fn authenticated_claim_withdraws_exact_blocked_attempt_and_releases_fifo()
         .find(|row| row["message_id"] == second_id)
         .expect("second message remains visible");
     assert_eq!(first_row["recipients"][0]["mailbox"]["status"], "claimed");
-    // The durable message_claimed fact projects the attempt to Withdrawn.
-    // The compatibility wire view exposes that closed state as this pair.
+    assert!(matches!(
+        first_row["recipients"][0]["notification"]["state"].as_str(),
+        Some("gating" | "blocked_pre_write")
+    ));
+    assert!(first_row["recipients"][0]["notification"]["settlement"].is_null());
+    assert_eq!(second_row["recipients"][0]["mailbox"]["status"], "pending");
     assert_eq!(
-        first_row["recipients"][0]["notification"]["state"],
+        second_row["recipients"][0]["notification"]["state"],
         "not_started"
     );
-    assert_eq!(
-        first_row["recipients"][0]["notification"]["settlement"],
-        "withdrawn_by_claim"
-    );
-    assert_eq!(second_row["recipients"][0]["mailbox"]["status"], "pending");
-    assert!(matches!(
-        second_row["recipients"][0]["notification"]["state"].as_str(),
-        Some("queued" | "gating")
-    ));
+    assert!(notification_attempts(&rig, &second_id).is_empty());
+
+    let withdrawn = rig
+        .ctl
+        .request(
+            "notification.withdraw",
+            json!({
+                "attempt_id": first_attempt,
+                "recipient": first_row["recipients"][0]["recipient"].clone()
+            }),
+        )
+        .await;
+    assert!(withdrawn["error"].is_null(), "{withdrawn}");
+    let second_attempt = wait_for_notification_attempt(&rig, &second_id).await;
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(notification_attempts(&rig, &first_id).len(), 1);

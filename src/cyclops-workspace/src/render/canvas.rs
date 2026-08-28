@@ -3177,11 +3177,12 @@ mod tests {
         );
         assert_eq!(open_60_geom.slots[0].rect, Rect::new(2, 2, 208, 58));
 
-        // Invariant: Shared tmux sizing canvas remains unshifted at 269 columns.
-        assert_eq!(
-            open_60_chrome.tmux_sizing_canvas(),
-            closed_chrome.tmux_sizing_canvas()
+        // The tmux grid follows the visible agent canvas so child TUIs wrap
+        // before the Messages pane instead of rendering underneath it.
+        assert_eq!(open_60_chrome.tmux_sizing_canvas(), open_60_chrome.canvas);
+        assert_eq!(open_60_chrome.tmux_sizing_canvas().width, 210);
+        assert!(
+            open_60_chrome.tmux_sizing_canvas().width < closed_chrome.tmux_sizing_canvas().width
         );
-        assert_eq!(open_60_chrome.tmux_sizing_canvas().width, 269);
     }
 }

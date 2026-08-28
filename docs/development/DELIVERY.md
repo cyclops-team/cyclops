@@ -11,7 +11,9 @@ queues Format 4 for every non-admin recipient:
 
 - **Summary claim:** Cyclops stages the sender-authored preview and the exact
   attempt claim command. The summary is for the human watching the pane. The
-  recipient claims and reads the authoritative body from the mailbox.
+  recipient claims and reads the authoritative body from the mailbox. Narrow
+  panes may visually soft-wrap the notification; width never removes the
+  supplied summary.
 - **Legacy compatibility:** summaryless wire clients retain Format 3 when the
   exact claim skill is proven and the canonical direct-payload fallback when
   it is not.
@@ -42,6 +44,11 @@ Both paths are one-shot. An ambiguous paste, verification, submit, or receipt
 opens one attention entry and never writes the payload a second time. Attention
 recovery rebuilds the expected bytes from the durable transport: the fixed row
 for a doorbell, or the canonical message payload for direct fallback.
+
+Mailbox retrieval and pane notification are independent settlements. A socket
+claim completes body retrieval but does not withdraw a queued or staged Format
+4 notification. The worker still submits the human-visible summary and claim
+when the exact recipient composer becomes safe.
 
 ## Runtime and composer are independent axes
 
@@ -131,14 +138,15 @@ is a content-free workspace journal fact. Legacy direct deliveries still use
 `cyclops_proto::DeliveryState` in session ledgers.
 
 An authenticated mailbox claim orders against the terminal write boundary.
-`queued`, `gating`, `quota_held`, and `quota_reset_observed` become `withdrawn`
-inside the `message_claimed` fact and cancel that exact pending attempt. A claim
-at `staged` leaves the attempt and composer barrier intact until Cyclops
-re-proves and clears the exact doorbell. One
-`notification_claimed_staged_cleared` fact then changes the attempt to
-`withdrawn_after_staging` and retires its barrier together. A claim at
-`submitting` retrieves the message once but does not cancel the reserved
+For current doorbells, a claim at `queued`, `gating`, `blocked_pre_write`,
+`quota_held`, `quota_reset_observed`, `writing`, or `staged` retrieves the body
+without withdrawing the operator-visible notification. The attempt retains
+FIFO ownership and continues through the ordinary safe composer gate. A claim
+at `submitting` retrieves the message once but does not cancel the reserved
 terminal key. A claim at `submitted` advances the doorbell to `notified`.
+Legacy direct-payload attempts still become `withdrawn` when claimed before
+write. Historical claimed-staged facts remain replayable as
+`withdrawn_after_staging`.
 An `ack_timeout` alarm for an exact-attempt doorbell with a complete binding
 can advance to `notified` after an exact recipient claim and composer
 reconciliation. The daemon must first clear the exact staged doorbell, or prove

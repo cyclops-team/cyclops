@@ -4347,9 +4347,8 @@ async fn settle_lost_release(app: &mut App, client: &ControlClient) -> bool {
                 }
                 DragTarget::Messages => {
                     app.save_prefs_or_log();
-                    // The Messages pane width is local chrome. Settling its
-                    // preview must not resize the shared tmux window.
                     app.layout_changed();
+                    resize_client(app, client).await;
                 }
                 DragTarget::SidebarSplit => {
                     app.save_prefs_or_log();
@@ -5022,9 +5021,8 @@ async fn handle_mouse(
                 app.prefs.messages_width =
                     crate::render::messages_width_for_column(col, app.term_size.0);
                 app.save_prefs_or_log();
-                // The Messages pane width changes only this viewer's local
-                // canvas; tmux pane geometry stays byte-for-byte unchanged.
                 app.layout_changed();
+                resize_client(app, client).await;
             }
             let split_drag = app.drag.as_ref().is_some_and(|drag| {
                 drag.is_active() && matches!(&drag.target, DragTarget::SidebarSplit)
@@ -9200,15 +9198,12 @@ mod tests {
         let adopted = adopt_windows(&mut sizing, &client, "s", &model.session.tabs, &home).await;
         assert!(adopted.took_a_window, "boot fixture must own its window");
 
-        // The collapsed Messages rail is the reference geometry regardless
-        // of persisted visibility. Derive it independently from the paint
-        // canvas so a helper that also adds back the rail cannot self-verify.
-        model.messages_visible = false;
-        let collapsed_rail_target = crate::render::tmux_client_size(
+        // Cold boot must size child PTYs to the same visible canvas that the
+        // first frame paints, including persisted Messages visibility.
+        let painted_target = crate::render::tmux_client_size(
             chrome_for(Rect::new(0, 0, 100, 30), &model, &prefs).canvas,
             model.active_tab(),
         );
-        model.messages_visible = messages_visible;
         // Enter through the exact production cold-boot calculation and
         // write, after persisted visibility has been installed on the model.
         let declared =
@@ -9218,11 +9213,11 @@ mod tests {
         let layout = nested_tmux_layout(&server, &window_id);
         client.shutdown().await;
         let _ = std::fs::remove_dir_all(home);
-        (declared, layout, collapsed_rail_target)
+        (declared, layout, painted_target)
     }
 
     #[tokio::test]
-    async fn persisted_open_cold_boot_sizes_nested_tmux_like_messages_closed() {
+    async fn persisted_open_cold_boot_sizes_tmux_to_the_visible_canvas() {
         if !cyclops_testrig::tmux_available() {
             return;
         }
@@ -9230,24 +9225,24 @@ mod tests {
         let open = persisted_boot_sizing_observation("boot-messages-open", true).await;
         assert_eq!(
             closed.0, closed.2,
-            "cold boot added back the collapsed Messages rail"
+            "closed cold boot diverged from its painted canvas"
         );
         assert_eq!(
             open.0, open.2,
-            "persisted-open cold boot did not use collapsed-rail geometry"
+            "persisted-open cold boot diverged from its painted canvas"
         );
-        assert_eq!(
-            open.0, closed.0,
-            "persisted Messages visibility changed the cold-boot tmux target"
+        assert!(
+            open.0 .0 < closed.0 .0,
+            "persisted-open Messages must narrow the child PTY to its visible canvas"
         );
-        assert_eq!(
+        assert_ne!(
             open.1, closed.1,
-            "persisted-open cold boot rebalanced the nested tmux layout"
+            "persisted-open cold boot did not reflow the nested tmux layout"
         );
     }
 
     #[tokio::test]
-    async fn reconcile_with_open_resized_messages_keeps_nested_tmux_layout() {
+    async fn reconcile_with_open_resized_messages_reflows_nested_tmux_layout() {
         use cyclops_testrig::TmuxServer;
         use cyclops_tmux::{ControlClient, ControlConfig};
 
@@ -9286,15 +9281,17 @@ mod tests {
             .await
             .expect("open Messages reconcile");
         assert!(app.model.messages_visible);
-        assert_eq!(
-            app.declared_client_size,
-            Some(closed_size),
-            "changed local Messages width changed the generic tmux target"
+        let open_size = app
+            .declared_client_size
+            .expect("open Messages size declared");
+        assert!(
+            open_size.0 < closed_size.0,
+            "open Messages did not narrow the child PTY to the visible canvas"
         );
-        assert_eq!(
+        assert_ne!(
             nested_tmux_layout(&server, &window_id),
             closed_layout,
-            "generic reconcile rebalanced nested tmux for local Messages chrome"
+            "generic reconcile did not reflow nested tmux for Messages chrome"
         );
 
         client.shutdown().await;
@@ -9453,7 +9450,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn messages_width_drag_release_paths_never_reshape_nested_tmux_layout() {
+    async fn messages_width_drag_release_paths_resize_nested_tmux_layout() {
         if !cyclops_testrig::tmux_available() {
             return;
         }
@@ -9464,13 +9461,13 @@ mod tests {
                 width_after, width_before,
                 "fixture must commit a different local Messages pane width"
             );
-            assert_eq!(
-                declared, None,
-                "Messages pane width settlement must not declare a tmux size"
+            assert!(
+                declared.is_some(),
+                "Messages pane width settlement must declare the visible tmux size"
             );
-            assert_eq!(
+            assert_ne!(
                 after, before,
-                "Messages pane width settlement reshaped the shared nested layout; \
+                "Messages pane width settlement did not reshape the shared nested layout; \
                  lost_release={lost_release}"
             );
         }
@@ -11269,17 +11266,15 @@ mod tests {
         assert_eq!(reconnect.socket_name, boot.socket_name);
     }
 
-    /// Boot sizing and the first frame must derive from the same chrome for
-    /// every persisted visibility combination. The paint canvas may be
-    /// narrower while Messages is open, but the shared target must remain
-    /// the collapsed-rail geometry returned by `desired_tmux_size`.
+    /// Boot sizing and the first frame must derive from the same visible
+    /// chrome for every persisted visibility combination.
     #[test]
     fn boot_declares_the_geometry_the_first_frame_paints_for_every_chrome_combination() {
         let area = Rect::new(0, 0, 200, 50);
         for sidebar_visible in [true, false] {
             for tab_bar_visible in [true, false] {
-                let mut messages_independent_size = None;
-                for messages_visible in [true, false] {
+                let mut closed_size: Option<(u16, u16)> = None;
+                for messages_visible in [false, true] {
                     let prefs = WorkspacePrefs {
                         sidebar_visible,
                         tab_bar_visible,
@@ -11298,13 +11293,14 @@ mod tests {
                     model.messages_visible = prefs.messages_visible;
                     let boot = chrome_for(area, &model, &prefs);
                     let declared = desired_tmux_size(area, &model, &prefs);
-                    if let Some(expected) = messages_independent_size {
-                        assert_eq!(
-                            declared, expected,
-                            "{what}: Messages visibility changed the shared tmux target"
+                    if messages_visible {
+                        let closed = closed_size.expect("closed size measured first");
+                        assert!(
+                            declared.0 < closed.0,
+                            "{what}: open Messages did not narrow the visible tmux target"
                         );
                     } else {
-                        messages_independent_size = Some(declared);
+                        closed_size = Some(declared);
                     }
 
                     let mut app = test_app(

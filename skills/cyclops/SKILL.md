@@ -161,9 +161,9 @@ This is a two-surface contract:
    for a CLI send or reply, even while the recipient is working. Working does
    not discard the wake. Human input or an ambiguous composer makes the worker
    wait until the composer is proven available, then it stages the same
-   summary and exact claim once. If the complete row cannot fit without
-   wrapping, Cyclops stages the shorter exact claim instead; the full summary
-   remains in the Messages view and mailbox.
+   summary and exact claim once. Narrow panes may visually soft-wrap the
+   notification across terminal rows. Cyclops never drops the supplied summary
+   merely to keep the notification on one row.
 2. The mailbox is the authoritative back end. The subject, routing header, and
    complete technical body live there. The summary is only orientation. Run
    the exact `cyclops inbox claim m-att_...` command, read the complete claimed
@@ -234,12 +234,12 @@ $ cyclops inbox next --timeout 30s
 ```
 
 The command subscribes before checking the inbox, claims at most one message,
-and exits `2` if none arrives before the deadline. It never writes to the pane,
-so it still works while the foreground command makes the agent read as
-working. Do not run `cyclops watch` or a polling loop in the foreground while
-waiting for a paste-dependent notification. That foreground tool keeps the
-pane working and can gate the notification it is waiting for. Return to the
-prompt for the normal wake, or use bounded `inbox next` for automation.
+and exits `2` if none arrives before the deadline. It never writes to the pane.
+Claiming the body through `inbox next` does not cancel the separately queued
+human-visible pane notification. Cyclops still stages that notification when
+the composer is safe, even if the body was already claimed through the socket.
+Prefer the normal pane wake for interactive agent work; use bounded `inbox
+next` only when an automation genuinely needs a socket wait.
 
 For one sender, copy the canonical `sender` key from `cyclops inbox list
 --json` and use `inbox next --from <recipient-key>`. Do not pass a display

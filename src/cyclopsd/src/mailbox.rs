@@ -2168,7 +2168,18 @@ impl MailboxProjection {
                 line.seq
             )));
         }
-        self.require_pending_entry(recipient, &message_id)?;
+        let entry =
+            self.get_entry(recipient, &message_id)
+                .ok_or_else(|| MailboxError::EntryNotFound {
+                    message_id: message_id.clone(),
+                    recipient,
+                })?;
+        if !entry.state.is_pending() && !entry.state.is_claimed() {
+            return Err(MailboxError::NotificationMessageNotPending {
+                message_id: message_id.clone(),
+                recipient,
+            });
+        }
         let key = (recipient, message_id.clone());
         let current =
             self.notifications
@@ -3345,6 +3356,36 @@ impl MailboxProjection {
                         .active_notification_barriers
                         .get(&record.attempt_id)
                         .is_some_and(|active| active == *record)
+            })
+            .min_by_key(|record| record.started_seq)
+    }
+
+    /// Oldest pre-submit operator notification whose mailbox payload was
+    /// already claimed through the socket. Retrieval does not relinquish this
+    /// notification's FIFO position.
+    fn claimed_operator_notification(
+        &self,
+        recipient: RecipientKey,
+    ) -> Option<&NotificationRecord> {
+        self.notifications
+            .values()
+            .filter(|record| {
+                record.recipient == recipient
+                    && record.transport == NotificationTransport::Doorbell
+                    && matches!(
+                        record.state,
+                        NotificationState::Queued
+                            | NotificationState::Gating
+                            | NotificationState::BlockedPreWrite
+                            | NotificationState::QuotaHeld
+                            | NotificationState::QuotaResetObserved
+                            | NotificationState::Writing
+                            | NotificationState::Staged
+                            | NotificationState::Submitting
+                    )
+                    && self
+                        .get_entry(recipient, &record.message_id)
+                        .is_some_and(|entry| entry.state.is_claimed())
             })
             .min_by_key(|record| record.started_seq)
     }
@@ -4849,6 +4890,10 @@ impl MailboxService {
                 (entries.values().any(|entry| entry.state.is_pending())
                     || store
                         .projection()
+                        .claimed_operator_notification(*recipient)
+                        .is_some()
+                    || store
+                        .projection()
                         .claimed_notification_barrier(*recipient)
                         .is_some())
                 .then_some(*recipient)
@@ -4907,6 +4952,17 @@ impl MailboxService {
                 return Ok(None);
             }
             return Ok(Some(record));
+        }
+        if let Some(record) = store
+            .projection()
+            .claimed_operator_notification(recipient)
+            .cloned()
+        {
+            return Ok(matches!(
+                record.state,
+                NotificationState::Queued | NotificationState::Gating
+            )
+            .then_some(record));
         }
         loop {
             let Some(message_id) = Self::first_actionable_pending_message_id(&store, recipient)
@@ -6807,20 +6863,16 @@ impl MessageStore {
             .get(&(entry.recipient, message_id.clone()))
             .copied();
         // A repeat claim preserves the consumed attempt only when the claim
-        // fact itself moved that attempt to Notified. A later screen or hook
-        // receipt has another sequence and must not be attributed to claim.
+        // fact itself moved a submitted doorbell to Notified. Retrieval before
+        // submit does not consume the independent operator notification.
         let consumed_doorbell_attempt = self
             .projection
             .notification(entry.recipient, &message_id)
             .filter(|record| {
                 record.transport == NotificationTransport::Doorbell
-                    && (matches!(
-                        record.state,
-                        NotificationState::Staged
-                            | NotificationState::Submitting
-                            | NotificationState::Submitted
-                    ) || (record.state == NotificationState::Notified
-                        && prior_claim_seq == Some(record.updated_seq)))
+                    && (record.state == NotificationState::Submitted
+                        || (record.state == NotificationState::Notified
+                            && prior_claim_seq == Some(record.updated_seq)))
             })
             .map(|record| record.attempt_id);
         let claimed_ack_timeout_attempt = self
@@ -6862,13 +6914,7 @@ impl MessageStore {
             .projection
             .notification(entry.recipient, &message_id)
             .filter(|record| {
-                matches!(
-                    record.state,
-                    NotificationState::Queued
-                        | NotificationState::Gating
-                        | NotificationState::QuotaHeld
-                        | NotificationState::QuotaResetObserved
-                )
+                record.state.settled_by_claim(record.transport) == NotificationState::Withdrawn
             })
             .map(|record| record.attempt_id);
         let fact = MailboxFact::MessageClaimed {
@@ -7454,7 +7500,8 @@ impl MessageStore {
         Ok(())
     }
 
-    /// Withdraw one exact unwritten notification while leaving its message pending.
+    /// Withdraw one exact unwritten operator notification without changing its
+    /// independently pending or claimed mailbox entry.
     pub fn withdraw_notification_before_write(
         &mut self,
         operator: RecipientKey,
@@ -8629,14 +8676,7 @@ mod tests {
         next_change(&mut events, 5, &[MessagesChangedArea::Notifications]);
         let lines_before_claim = service.journal_lines().unwrap().len();
         service.claim(carol, claimable.message_id.clone()).unwrap();
-        next_change(
-            &mut events,
-            6,
-            &[
-                MessagesChangedArea::Mailboxes,
-                MessagesChangedArea::Notifications,
-            ],
-        );
+        next_change(&mut events, 6, &[MessagesChangedArea::Mailboxes]);
         let record = service
             .store()
             .unwrap()
@@ -8644,7 +8684,7 @@ mod tests {
             .notification(carol, &claimable.message_id)
             .cloned()
             .unwrap();
-        assert_eq!(record.state, NotificationState::Withdrawn);
+        assert_eq!(record.state, NotificationState::Queued);
         let lines = service.journal_lines().unwrap();
         assert_eq!(lines.len(), lines_before_claim + 1);
         assert_eq!(
@@ -8660,12 +8700,9 @@ mod tests {
         assert_eq!(dispositions.len(), 1);
         assert_eq!(
             dispositions[0].notification_state,
-            MessageNotificationState::NotStarted
+            MessageNotificationState::Queued
         );
-        assert_eq!(
-            dispositions[0].notification_settlement,
-            Some(MessageNotificationSettlement::WithdrawnByClaim)
-        );
+        assert_eq!(dispositions[0].notification_settlement, None);
         let snapshot = service.messages_snapshot(carol, 10).unwrap();
         let notification = &snapshot
             .rows
@@ -8674,11 +8711,8 @@ mod tests {
             .unwrap()
             .recipients[0]
             .notification;
-        assert_eq!(notification.state, MessageNotificationState::NotStarted);
-        assert_eq!(
-            notification.settlement,
-            Some(MessageNotificationSettlement::WithdrawnByClaim)
-        );
+        assert_eq!(notification.state, MessageNotificationState::Queued);
+        assert_eq!(notification.settlement, None);
     }
 
     #[test]
@@ -9434,6 +9468,11 @@ mod tests {
         assert_eq!(service.journal_lines().unwrap().len(), 3);
 
         service.claim(bob, first_id).unwrap();
+        let same_after_claim = service.prepare_oldest_notification(bob).unwrap().unwrap();
+        assert_eq!(same_after_claim.attempt_id, first_attempt);
+        service
+            .withdraw_notification_before_write(service.admin().key, bob, first_attempt)
+            .unwrap();
         let next = service.prepare_oldest_notification(bob).unwrap().unwrap();
         assert_eq!(next.message_id, second_id);
         assert_ne!(next.attempt_id, first_attempt);
@@ -9939,6 +9978,10 @@ mod tests {
             .is_none());
 
         service.claim(bob, first.message_id).unwrap();
+        assert!(service.prepare_oldest_notification(bob).unwrap().is_none());
+        service
+            .withdraw_notification_before_write(service.admin().key, bob, queued.attempt_id)
+            .unwrap();
         let next = service.prepare_oldest_notification(bob).unwrap().unwrap();
         assert_eq!(next.message_id, second.message_id);
         assert_ne!(next.attempt_id, queued.attempt_id);
@@ -10645,7 +10688,7 @@ mod tests {
     }
 
     #[test]
-    fn operator_withdrawal_refuses_inexact_or_post_write_targets_without_appending() {
+    fn operator_withdrawal_accepts_claimed_prewrite_but_refuses_inexact_or_post_write_targets() {
         let scratch = StoreScratch::new("operator-prewrite-withdrawal-refusals");
         let root = scratch.root();
         let journal = Path::new("workspaces/current/messages.ndjson");
@@ -10694,12 +10737,12 @@ mod tests {
 
         service.claim(bob, first.message_id).unwrap();
         let before_claimed = service.journal_lines().unwrap().len();
-        assert_refused_without_append(service.withdraw_notification_before_write(
-            admin,
-            bob,
-            bob_attempt.attempt_id,
-        ));
-        assert_eq!(service.journal_lines().unwrap().len(), before_claimed);
+        let (withdrawn, inserted) = service
+            .withdraw_notification_before_write(admin, bob, bob_attempt.attempt_id)
+            .unwrap();
+        assert!(inserted);
+        assert_eq!(withdrawn.state, NotificationState::WithdrawnByOperator);
+        assert_eq!(service.journal_lines().unwrap().len(), before_claimed + 1);
 
         let post_write = service
             .send(service.admin(), mailbox_send("implementer", "Writing", ""))
@@ -10849,10 +10892,10 @@ mod tests {
         else {
             panic!("oldest message was not freshly claimed");
         };
-        assert_eq!(withdrawn_attempt, Some(oldest.attempt_id));
-        let next = service.prepare_oldest_notification(bob).unwrap().unwrap();
-        assert_eq!(next.message_id, accepted[1].message_id);
-        assert_ne!(next.attempt_id, oldest.attempt_id);
+        assert_eq!(withdrawn_attempt, None);
+        let same_after_claim = service.prepare_oldest_notification(bob).unwrap().unwrap();
+        assert_eq!(same_after_claim.message_id, oldest.message_id);
+        assert_eq!(same_after_claim.attempt_id, oldest.attempt_id);
 
         let store = service.store().unwrap();
         assert_eq!(
@@ -10861,16 +10904,12 @@ mod tests {
                 .notification(bob, &accepted[0].message_id)
                 .unwrap()
                 .state,
-            NotificationState::Withdrawn
-        );
-        assert_eq!(
-            store
-                .projection()
-                .notification(bob, &accepted[1].message_id)
-                .unwrap()
-                .state,
             NotificationState::Queued
         );
+        assert!(store
+            .projection()
+            .notification(bob, &accepted[1].message_id)
+            .is_none());
     }
 
     #[test]
@@ -12956,7 +12995,7 @@ mod tests {
     }
 
     #[test]
-    fn quota_attempts_are_withdrawn_by_supersession_and_claim_on_replay() {
+    fn quota_attempts_preserve_operator_notification_state_across_claim_and_replay() {
         let scratch = StoreScratch::new("quota-withdrawal");
         let root = scratch.root();
         let journal = Path::new("workspaces/current/messages.ndjson");
@@ -12996,7 +13035,7 @@ mod tests {
             else {
                 panic!("quota-reset message was not claimed");
             };
-            assert_eq!(withdrawn_attempt, Some(attempt(2)));
+            assert_eq!(withdrawn_attempt, None);
 
             assert_eq!(
                 store.projection().notification(bob, &held).unwrap().state,
@@ -13008,7 +13047,7 @@ mod tests {
                     .notification(carol, &reset)
                     .unwrap()
                     .state,
-                NotificationState::Withdrawn
+                NotificationState::QuotaResetObserved
             );
         }
 
@@ -13027,7 +13066,7 @@ mod tests {
                 .notification(carol, &reset)
                 .unwrap()
                 .state,
-            NotificationState::Withdrawn
+            NotificationState::QuotaResetObserved
         );
     }
 

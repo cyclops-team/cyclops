@@ -16,8 +16,10 @@ and exact claim as the recipient's guarded pane notification. The receipt
 keeps those facts separate: `accepted` covers the mailbox record, while `wake
 <state>` reports the current notification attempt.
 
-A socket claim may complete without any body appearing in the composer. The
-Messages view records the mailbox and wake outcomes separately.
+A socket claim may retrieve the body before the pane notification appears.
+That claim does not cancel the separately queued human-visible notification;
+Cyclops still stages the summary and exact claim when the composer is safe.
+The Messages view records the mailbox and wake outcomes separately.
 
 In doorbell mode, the wake carries an exact attempt token. Running that command
 atomically claims the message currently bound to the attempt. A recipient may
@@ -32,9 +34,9 @@ cyclops reply <message-id> \
   --body "Reviewed. One issue."
 ```
 
-The terminal wake stays deliberately short so Cyclops can prove its exact
-bytes across supported composers. The authenticated claim returns the rich
-envelope instead:
+The terminal wake carries the required two-sentence summary and exact claim
+command. It may visually soft-wrap in a narrow pane, but Cyclops does not drop
+the summary. The authenticated claim returns the rich envelope instead:
 
 ```text
 [cyclops m-…] TO: reviewer  FROM: implementer  SUBJECT: Review the last commit

@@ -442,8 +442,7 @@ unknown state exits 1. The message is already durably accepted, so that exit
 must not trigger an unkeyed resend.
 
 For a non-admin recipient, a CLI-originated message with a summary selects
-Format 4 at the terminal write boundary when the complete preview and claim
-fit one verifiable composer row:
+Format 4 at the terminal write boundary:
 
 ```text
 [cyclops from implementer] The rate limiter is ready for review. Check the burst path for regressions. | cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
@@ -461,35 +460,27 @@ preview is presentation only. The authenticated claim returns the immutable
 routing header and full technical body that the recipient must read before
 acting.
 
-The Format 4 requirement is the rendered row width, including the vendor
-prompt. If the full row does not fit at selection time, the same attempt uses
-the shorter exact Format 3 claim so the daemon can still verify and submit it;
-the durable summary remains in the Messages view. Format 3 requires a pane at
-least 60 columns wide. A narrower pane is
-recorded as `blocked_pre_write` with the compatible cause
-`write_readiness_changed`, plus its observed and required widths. Current
-clients render that evidence as `pane too narrow`. No paste occurs. A later
-width observation meeting the recorded requirement may reopen that same
-attempt once. The operator may withdraw it while it remains provably
-pre-write.
+Format 4 may visually soft-wrap across terminal rows when the recipient pane
+is narrow. The written bytes remain one exact notification containing both the
+supplied summary and claim command. Verification joins soft-wrapped terminal
+rows before comparing those bytes, so width never causes Cyclops to discard
+the summary or replace it with a shorter notification.
 
 Summaryless legacy clients retain the Format 3 capability path and canonical
-direct-payload fallback. Current CLI sends and replies always queue a mailbox
-claim, prefer Format 4 when it is exactly provable, and use Format 3 when the
-preview would wrap. Working state does not discard either wake, while human
+direct-payload fallback. Current CLI sends and replies require a summary and
+therefore queue Format 4. Working state does not discard the wake, while human
 input or ambiguous composer evidence keeps it waiting before the write
 boundary.
 
 The compatibility wire states are `not_started`, `queued`, `gating`, `writing`,
 `staged`, `submitted`, `notified`, `attention_required`, and `superseded`. This
-closed vocabulary remains decodable by older clients. A pre-write claim
-settlement reports `not_started`; a post-write exact clear reports `staged`.
-Both add `settlement: "withdrawn_by_claim"` in `messages.snapshot`. A send
-receipt uses the parallel additive field
-`notification_settlement: "withdrawn_by_claim"`. The internal states remain
-`withdrawn` and `withdrawn_after_staging`; `submitting` also reports `staged`
-until terminal IO succeeds. `superseded` is reserved for actual message
-replacement.
+closed vocabulary remains decodable by older clients. Current doorbell claims
+settle the mailbox body without withdrawing a queued or staged pane
+notification. The mailbox and human-visible notification therefore complete
+independently. Legacy direct-payload attempts may still use the compatibility
+settlements `withdrawn` and `withdrawn_after_staging`; `submitting` reports
+`staged` until terminal IO succeeds. `superseded` is reserved for actual
+message replacement.
 An ambiguous terminal outcome moves to `attention_required` and never triggers
 an automatic second write. A doorbell message remains pending until claim. A
 successful direct fallback settles the mailbox entry as `delivered_direct`.
@@ -650,10 +641,12 @@ target. No other method interprets the reserved locator.
 Reclaiming the same id returns `already_claimed` with the same payload and
 appends no second claim. An entry that is no longer claimable returns
 `message_not_pending`; a subscribed receive client should list again within its
-original deadline. A pre-write wake becomes `withdrawn`. A claim at `staged`
-does not prove Enter. Cyclops must re-prove the exact doorbell and complete
-binding, clear those bytes once, and positively identify a visible empty
-composer under the same manifest and binding. One
+original deadline. Claiming the mailbox body does not withdraw the independent
+human-visible doorbell. A claimed pre-write doorbell keeps its recipient FIFO
+position and continues through the ordinary gate. A claim at `staged` does not
+prove Enter. Cyclops must re-prove the exact doorbell and complete binding,
+clear those bytes once, and positively identify a visible empty composer under
+the same manifest and binding. One
 `notification_claimed_staged_cleared` fact then changes the state to
 `withdrawn_after_staging` and retires the exact composer barrier together. If
 that append fails, both projections remain unchanged and Cyclops repeats only

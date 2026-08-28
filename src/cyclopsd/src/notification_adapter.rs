@@ -51,6 +51,10 @@ pub(crate) enum ClaimedNotificationBarrier {
     AckTimeout,
 }
 
+fn entry_allows_notification(state: &MailboxEntryState, transport: NotificationTransport) -> bool {
+    state.is_pending() || (state.is_claimed() && transport == NotificationTransport::Doorbell)
+}
+
 impl NotificationContext {
     #[allow(dead_code)]
     pub(crate) fn new(
@@ -154,15 +158,17 @@ impl NotificationContext {
             .store
             .lock()
             .map_err(|_| NotificationAdapterError::StoreLockPoisoned)?;
-        let pending = store
-            .projection()
-            .get_entry(self.recipient, &self.message_id)
-            .is_some_and(|entry| entry.state.is_pending());
         let current = store
             .projection()
             .notification(self.recipient, &self.message_id)
             .cloned();
-        if !pending || current.as_ref().is_none_or(|record| !self.owns(record)) {
+        let entry_allows = current.as_ref().is_some_and(|record| {
+            store
+                .projection()
+                .get_entry(self.recipient, &self.message_id)
+                .is_some_and(|entry| entry_allows_notification(&entry.state, record.transport))
+        });
+        if !entry_allows || current.as_ref().is_none_or(|record| !self.owns(record)) {
             return Err(NotificationAdapterError::NoLongerCurrentBeforeWrite);
         }
         let current = current.expect("current attempt checked above");
@@ -188,15 +194,17 @@ impl NotificationContext {
             .store
             .lock()
             .map_err(|_| NotificationAdapterError::StoreLockPoisoned)?;
-        let pending = store
-            .projection()
-            .get_entry(self.recipient, &self.message_id)
-            .is_some_and(|entry| entry.state.is_pending());
         let current = store
             .projection()
             .notification(self.recipient, &self.message_id)
-            .is_some_and(|record| self.owns(record) && record.state == NotificationState::Gating);
-        if !pending || !current {
+            .filter(|record| self.owns(record) && record.state == NotificationState::Gating);
+        let entry_allows = current.is_some_and(|record| {
+            store
+                .projection()
+                .get_entry(self.recipient, &self.message_id)
+                .is_some_and(|entry| entry_allows_notification(&entry.state, record.transport))
+        });
+        if !entry_allows {
             return Err(NotificationAdapterError::NoLongerCurrentBeforeWrite);
         }
         Ok(())
@@ -218,15 +226,17 @@ impl NotificationContext {
             .store
             .lock()
             .map_err(|_| NotificationAdapterError::StoreLockPoisoned)?;
-        let pending = store
-            .projection()
-            .get_entry(self.recipient, &self.message_id)
-            .is_some_and(|entry| entry.state.is_pending());
         let current = store
             .projection()
             .notification(self.recipient, &self.message_id)
-            .is_some_and(|record| self.owns(record) && record.state == NotificationState::Gating);
-        if !pending || !current {
+            .filter(|record| self.owns(record) && record.state == NotificationState::Gating);
+        let entry_allows = current.is_some_and(|_record| {
+            store
+                .projection()
+                .get_entry(self.recipient, &self.message_id)
+                .is_some_and(|entry| entry_allows_notification(&entry.state, transport))
+        });
+        if !entry_allows {
             return Err(NotificationAdapterError::NoLongerCurrentBeforeWrite);
         }
         let binding = NotificationBinding {
@@ -274,10 +284,10 @@ impl NotificationContext {
             .projection()
             .get_entry(self.recipient, &self.message_id)
             .ok_or(NotificationAdapterError::NoLongerCurrentBeforeWrite)?;
-        if entry.state.is_claimed() {
+        if entry.state.is_claimed() && current.transport != NotificationTransport::Doorbell {
             return Ok(SubmitReservation::ClaimedBeforeSubmit);
         }
-        if !entry.state.is_pending() {
+        if !entry_allows_notification(&entry.state, current.transport) {
             return Err(NotificationAdapterError::NoLongerCurrentBeforeWrite);
         }
         self.advance_locked(&mut store, NotificationState::Submitting, None, None)?;

@@ -157,6 +157,7 @@ id = "composer_completed_terminal_suffix_2_1_246"
 state = "idle"
 composer_semantic = "clean"
 lifecycle_evidence = true
+active_start_terminal = true
 priority = 1148
 region = "bottom_non_empty_lines(24)"
 regex = ['(?m)^[·✶✽✳✢✻]\s+\S+\s+for\s+\d+[smhd](?:\s+\d+[smhd])*\s+·\s+done\s+\d{1,2}:\d{2}\s+(?:AM|PM)\s*\n(?:[^·✶✽✳✢✻\n][^\n]*\n)*─{32,}\s*\n❯\s*\n─{32,}\s*\n(?:\s{0,4}(?:\S[^·\n]*(?: · [^·\n]+){2,} · \d+K window(?: · \d+K used)?(?:\s+/rc)?|(?:Opus|Sonnet|Haiku) \d+(?:\.\d+)?(?: \([^·\n]*\))? · (?:xhigh|high|medium|low)(?: · [^·\n]+)* · [^·\n]*…)\s*(?:\n\s{0,4}paste again to expand\s*)?(?:\n\s{0,4}(?:⏸|⏵⏵) [^·\n]*\b(?:on|off)\b(?: \([^)]*\))?(?: · .+)?\s*)?|\s{0,4}(?:⏸|⏵⏵) [^·\n]*\b(?:on|off)\b(?: \([^)]*\))?(?: · .+)?\s*)\z']
@@ -375,7 +376,7 @@ unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]
 # row keeps the model and effort fields, then ends one later field with ….
 composer_trailer_regex = [
   '^─+$',
-  '^\s{0,4}(?:\S[^·]*(?: · [^·]+){2,} · \d+K window(?: · \d+K used)?|(?:Opus|Sonnet|Haiku) \d+(?:\.\d+)?(?: \([^·]*\))? · (?:xhigh|high|medium|low)(?: · [^·]+)* · [^·]*…)\s*$',
+  '^\s{0,4}(?:\S[^·]*(?: · [^·]+){2,} · \d+K window(?: · \d+K used)?(?:\s+/rc)?|(?:Opus|Sonnet|Haiku) \d+(?:\.\d+)?(?: \([^·]*\))? · (?:xhigh|high|medium|low)(?: · [^·]+)* · [^·]*…)\s*$',
   '^\s{0,4}paste again to expand\s*$',
   '^\s{0,4}(?:⏸|⏵⏵) [^·]*\b(?:on|off)\b(?: \([^)]*\))?(?: · .+)?\s*$',
 ]

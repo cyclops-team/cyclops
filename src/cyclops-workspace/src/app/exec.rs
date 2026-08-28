@@ -338,10 +338,11 @@ pub(super) async fn execute(
         Action::ToggleMessages => {
             app.model.messages_visible = !app.model.messages_visible;
             app.prefs.messages_visible = app.model.messages_visible;
-            // The Messages pane consumes only this viewer's canvas. Opening
-            // or closing it must not resize the shared tmux window, whether
-            // this workspace owns that window or follows another owner.
             app.layout_changed();
+            // The child TUI must see the same width the workspace paints.
+            // Only the authoritative sizing owner mutates the shared window;
+            // followers continue to fail closed through `resize_client`.
+            super::resize_client(app, client).await;
             if app.model.messages_visible {
                 app.messages_focused = true;
                 super::request_messages_snapshot(app);
@@ -2744,7 +2745,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn toggle_messages_persists_visibility_without_reshaping_nested_tmux_layout() {
+    async fn toggle_messages_resizes_tmux_to_the_visible_agent_canvas() {
         if !tmux_available() {
             return;
         }
@@ -2808,6 +2809,11 @@ mod tests {
         .await;
         assert!(adopted.took_a_window, "test app must own the nested window");
         assert!(!app.model.messages_visible, "the default is collapsed");
+        let closed_target = crate::app::desired_tmux_size(
+            ratatui::layout::Rect::new(0, 0, app.term_size.0, app.term_size.1),
+            &app.model,
+            &app.prefs,
+        );
 
         let outcome = execute(&mut app, &client, Action::ToggleMessages)
             .await
@@ -2821,6 +2827,11 @@ mod tests {
         );
         let after_open = window_layout(&server, &window_id);
         let declared_after_open = app.declared_client_size;
+        let open_target = crate::app::desired_tmux_size(
+            ratatui::layout::Rect::new(0, 0, app.term_size.0, app.term_size.1),
+            &app.model,
+            &app.prefs,
+        );
 
         crate::persist::save_prefs(&home, &app.prefs).expect("save prefs");
         assert!(
@@ -2836,21 +2847,19 @@ mod tests {
         assert!(!app.prefs.messages_visible);
         assert!(!app.messages_focused, "closing clears Messages pane focus");
         let after_close = window_layout(&server, &window_id);
-        assert_eq!(
-            declared_after_open, None,
-            "opening Messages must not declare a new tmux client size"
+        assert!(
+            open_target.0 < closed_target.0,
+            "Messages must reserve width"
         );
-        assert_eq!(
-            app.declared_client_size, None,
-            "closing Messages must not declare a new tmux client size"
-        );
-        assert_eq!(
+        assert_eq!(declared_after_open, Some(open_target));
+        assert_eq!(app.declared_client_size, Some(closed_target));
+        assert_ne!(
             after_open, before,
-            "opening the local Messages pane must not reshape shared tmux panes"
+            "opening Messages must send SIGWINCH-sized geometry to child TUIs"
         );
-        assert_eq!(
-            after_close, before,
-            "closing the local Messages pane must restore local width without reshaping tmux"
+        assert_ne!(
+            after_close, after_open,
+            "closing Messages must return the panes to the wider declared canvas"
         );
 
         let _ = std::fs::remove_dir_all(&home);

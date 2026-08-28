@@ -254,6 +254,13 @@ impl HookEntry {
         self.active_start_for(agent, manifest) && self.confirmed_start
     }
 
+    /// A payload-matched start that only became authoritative after the
+    /// screen showed the vendor working. Its matching end is visual too, so
+    /// one later stable screen observation is part of the same lifecycle.
+    fn promoted_start_for(&self, agent: crate::identity::ProcId, manifest: Option<&str>) -> bool {
+        self.confirmed_start_for(agent, manifest) && self.promoted
+    }
+
     /// Does this binding own a confirmed lifecycle that cannot name turns?
     pub(crate) fn confirmed_unkeyed_start_for(
         &self,
@@ -568,12 +575,33 @@ async fn lifecycle_recheck_worker(
 }
 
 fn targeted_reobservation_needed(inner: &Inner, pane: &PaneKey) -> bool {
+    let (ordinary_follow_up, promoted_binding) = {
+        let detections = inner.detections.lock().expect("detections lock");
+        let Some(entry) = detections.get(pane) else {
+            return false;
+        };
+        let promoted_binding = if entry.detection.state == AgentState::Working {
+            entry.agent.zip(entry.manifest.clone())
+        } else {
+            None
+        };
+        (
+            needs_targeted_reobservation(&entry.detection, entry.hold),
+            promoted_binding,
+        )
+    };
+    if ordinary_follow_up {
+        return true;
+    }
+    let Some((agent, manifest)) = promoted_binding else {
+        return false;
+    };
     inner
-        .detections
+        .hook_readings
         .lock()
-        .expect("detections lock")
+        .expect("hook readings lock")
         .get(pane)
-        .is_some_and(|entry| needs_targeted_reobservation(&entry.detection, entry.hold))
+        .is_some_and(|entry| entry.promoted_start_for(agent, Some(&manifest)))
 }
 
 fn needs_targeted_reobservation(detection: &Detection, hold: ComposerHold) -> bool {
@@ -713,6 +741,26 @@ fn positive_visual_working(inner: &Inner, manifest: &str, detection: &Detection)
         })
 }
 
+fn positive_visual_terminal(inner: &Inner, manifest: &str, detection: &Detection) -> bool {
+    let Some(manifest) = inner.manifests.get(manifest) else {
+        return false;
+    };
+    !detection.stale
+        && matches!(
+            detection.state,
+            AgentState::Idle | AgentState::IdleWithInput
+        )
+        && detection.readings.iter().any(|reading| {
+            reading.sensor == Sensor::Screen
+                && matches!(reading.state, AgentState::Idle | AgentState::IdleWithInput)
+                && manifest
+                    .rules
+                    .iter()
+                    .find(|rule| rule.id == reading.rule)
+                    .is_some_and(|rule| rule.active_start_terminal)
+        })
+}
+
 fn terminal_visual_state(detection: &Detection, in_mode: bool) -> Option<AgentState> {
     if in_mode || detection.stale {
         return None;
@@ -810,7 +858,9 @@ fn reconcile_unkeyed_dispatch_start_with_evidence(
     }
 
     let accepted = positive_visual_working(inner, manifest, detection);
-    let rejected = visual_rejects_start(detection, in_mode);
+    let admission_window_closed = observed_ms >= provisional.ready_at_ms;
+    let rejected = visual_rejects_start(detection, in_mode)
+        || (admission_window_closed && positive_visual_terminal(inner, manifest, detection));
     if !accepted && !rejected {
         return false;
     }
@@ -5249,6 +5299,74 @@ line_regex = ['^ACTIVE']
         assert!(needs_targeted_reobservation(&stable, ComposerHold::Staged));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_promoted_visual_turn_arms_one_follow_up_after_a_stable_working_capture() {
+        let inner = inner_with(BTreeMap::new());
+        let pane = pane();
+        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+        let detection = lifecycle_detection(Sensor::Screen, AgentState::Working);
+        inner.detections.lock().unwrap().insert(
+            pane.clone(),
+            DetEntry {
+                detection,
+                binding: None,
+                manifest: Some("claude".into()),
+                occupant: Some(agent.pid),
+                agent: Some(agent),
+                in_mode: false,
+                quota_screen_clear: false,
+                hold: ComposerHold::Clear,
+                turn: None,
+                hold_owner: None,
+                composer: ComposerProjection::default(),
+                working_confirmed: true,
+                since: std::time::Instant::now(),
+            },
+        );
+        inner.hook_readings.lock().unwrap().insert(
+            pane.clone(),
+            HookEntry::provisional_start(
+                agent,
+                Some("claude".into()),
+                SensorReading {
+                    sensor: Sensor::Hook,
+                    state: AgentState::Working,
+                    rule: "UserPromptSubmit".into(),
+                    ts: 10,
+                },
+            )
+            .promote(),
+        );
+
+        schedule_lifecycle_recheck(&inner, &pane);
+        schedule_lifecycle_recheck(&inner, &pane);
+        assert_eq!(
+            inner.lifecycle_rechecks.lock().unwrap().len(),
+            1,
+            "a transient final repaint needs exactly one follow-up, not a polling loop"
+        );
+        cancel_lifecycle_recheck(&inner, &pane);
+
+        inner.hook_readings.lock().unwrap().insert(
+            pane.clone(),
+            HookEntry::unkeyed_turn_started(
+                agent,
+                Some("claude".into()),
+                SensorReading {
+                    sensor: Sensor::Hook,
+                    state: AgentState::Working,
+                    rule: "authoritative_start".into(),
+                    ts: 20,
+                },
+            ),
+        );
+        schedule_lifecycle_recheck(&inner, &pane);
+        assert!(
+            inner.lifecycle_rechecks.lock().unwrap().is_empty(),
+            "an authoritative hook-owned turn must wait for its own end"
+        );
+    }
+
     fn lifecycle_detection(sensor: Sensor, state: AgentState) -> Detection {
         Detection {
             state,
@@ -5296,6 +5414,16 @@ priority = 90
 region = "bottom_non_empty_lines(3)"
 lifecycle_evidence = false
 contains = ["working"]
+
+[[rule]]
+id = "trusted_idle"
+state = "idle"
+composer_semantic = "clean"
+priority = 80
+region = "bottom_non_empty_lines(3)"
+lifecycle_evidence = true
+active_start_terminal = true
+contains = ["done"]
 "#,
             Path::new("claude.toml"),
         )
@@ -5765,6 +5893,44 @@ contains = ["working"]
             .unwrap()
             .get(&pane)
             .is_some_and(|entry| entry.confirmed_unkeyed_start_for(agent, Some("claude"))));
+    }
+
+    #[test]
+    fn an_unkeyed_start_without_a_turn_retires_on_terminal_evidence_after_its_admission_window() {
+        let mut manifests = BTreeMap::new();
+        manifests.insert("claude".into(), lifecycle_manifest());
+        let inner = inner_with(manifests);
+        let pane = pane();
+        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+        inner.hook_readings.lock().unwrap().insert(
+            pane.clone(),
+            HookEntry::provisional_start(
+                agent,
+                Some("claude".into()),
+                SensorReading {
+                    sensor: Sensor::Hook,
+                    state: AgentState::Working,
+                    rule: "UserPromptSubmit".into(),
+                    ts: 1_000,
+                },
+            ),
+        );
+        let terminal = named_lifecycle_detection("trusted_idle", Sensor::Screen, AgentState::Idle);
+
+        assert!(!reconcile_unkeyed_dispatch_start(
+            &inner,
+            &pane,
+            agent,
+            "claude",
+            &terminal,
+            false,
+            1_000 + UNKEYED_DISPATCH_SETTLE_MS,
+            LifecycleObservation::Stable,
+        ));
+        assert!(
+            inner.hook_readings.lock().unwrap().get(&pane).is_none(),
+            "a local command that never paints Working must not hold the pane forever"
+        );
     }
 
     #[test]

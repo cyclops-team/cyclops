@@ -85,13 +85,12 @@ two-sentence summary and one exact `inbox claim` command, never the full body.
 Working state does not discard the wake. Human input or an ambiguous composer
 makes it wait until the composer is proven available. A pull client may claim
 the same message through the authenticated socket without changing the
-composer. `cyclops messages` is the authoritative combined view of mailbox
-and wake state.
+composer or canceling the independently queued terminal wake. `cyclops
+messages` is the authoritative combined view of mailbox and wake state.
 
 ## Receive
 
-CLI sends and replies use this summary-bearing notification when the complete
-preview and claim fit one verifiable composer row:
+CLI sends and replies use this summary-bearing notification:
 
 ```text
 [cyclops from implementer] The rate limiter is ready for review. Check the burst path for regressions. | cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
@@ -100,11 +99,11 @@ preview and claim fit one verifiable composer row:
 The reserved locator remains valid positional-claim input. Its 22-character
 token losslessly identifies the exact current notification attempt. The daemon
 atomically resolves that attempt to its message and claims it for the
-authenticated recipient. If that row would wrap, the daemon stages the
-shorter exact Format 3 claim instead of pasting an unprovable preview and
-leaving it unsubmitted. The full summary remains visible in `cyclops
-messages`. Summaryless legacy wire clients retain their versioned Format 3
-and direct-payload compatibility paths.
+authenticated recipient. A narrow pane may visually soft-wrap the notification
+across terminal rows. Verification joins those rows before comparing the exact
+bytes, and Cyclops never drops the summary because of pane width. Summaryless
+legacy wire clients retain their versioned Format 3 and direct-payload
+compatibility paths.
 
 Both shapes are written once, only after proving the pane occupant, manifest,
 and clean composer. An ambiguous write or submit raises attention. Cyclops does
@@ -146,6 +145,9 @@ message, does not poll, and never writes to the terminal composer. Exit `2`
 means no pending message arrived before the deadline. With `--json`, that
 outcome is a `timeout` object with `data.pending: false`. Every failure in JSON
 mode is one object on stdout with stable `code`, `message`, and `data` fields.
+Claiming through this socket command does not cancel the independent pane
+notification. The daemon still stages the sender's two-sentence summary and
+exact claim command when the recipient composer becomes safe.
 
 To wait for one durable sender, copy its canonical `sender` key from
 `cyclops inbox list --json` and pass it to `--from`. Labels such as
@@ -201,11 +203,10 @@ accepted m-a912ef
 Use a reply or another explicit workflow fact when completion must be durable.
 Pane state cannot prove which message a turn handled.
 
-Do not run a foreground `cyclops watch` or polling loop to wait for a
-notification that must be written into the same pane. The wait makes the pane
-working, which safely gates the write and creates a circular wait. Return to
-the prompt for the normal one-line wake, or use bounded `inbox next` to pull
-and claim through the socket.
+Do not run a polling loop to approximate mailbox delivery. Return to the prompt
+for the normal human-visible wake. Use bounded `inbox next` only when an
+automation genuinely needs to wait for and claim the durable body over the
+socket; that claim does not replace or cancel the pane notification.
 
 ## The admin inbox
 
@@ -296,10 +297,8 @@ A wake that stops before writing reports one exact cause, including
 `write_readiness_changed`, `spool_failed`, `paste_command_unwritten`,
 `binding_unprovable`, `composer_semantic_missing`, or `worker_failed`. The
 message remains claimable.
-For format 3, `write_readiness_changed` with an observed width below its
-recorded required width is shown as `pane too narrow`. The width pair is
-content-free, no pane write occurred, and a later size edge may reopen that
-same attempt once.
+Current summary-bearing Format 4 notifications may visually soft-wrap in a
+narrow pane. Their summary is never removed because of pane width.
 A workspace administrator can release the FIFO without touching the pane:
 
 ```bash

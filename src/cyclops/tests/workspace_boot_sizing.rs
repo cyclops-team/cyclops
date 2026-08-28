@@ -88,7 +88,7 @@ fn alternate_on(server: &TmuxServer, pane: &str) -> bool {
 }
 
 #[test]
-fn persisted_open_messages_uses_collapsed_rail_size_through_real_boot() {
+fn persisted_open_messages_uses_visible_canvas_size_through_real_boot() {
     if !tmux_available() {
         return;
     }
@@ -189,12 +189,12 @@ fn persisted_open_messages_uses_collapsed_rail_size_through_real_boot() {
     );
     assert_eq!(
         first_resize(rig.target()),
-        Some((95, 26)),
+        Some((72, 26)),
         "the first real run_async resize used the local Messages paint canvas"
     );
     assert_eq!(
         window_size(rig.target()),
-        (95, 26),
+        (72, 26),
         "the live workspace converged on the same shared tmux geometry"
     );
 

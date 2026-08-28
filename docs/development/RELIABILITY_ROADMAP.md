@@ -211,8 +211,10 @@ The correction has four parts:
    releases that recipient FIFO. Unknown or post-write boundaries remain
    attention work.
 4. Keep authenticated socket claim usable while terminal wake is blocked. A
-   claim settles the blocked pre-write notification and admits the next FIFO
-   item under the existing claim-settlement rules.
+   claim settles body retrieval without canceling the blocked pre-write pane
+   notification. That same notification retains FIFO ownership until it is
+   submitted, withdrawn by the operator, or otherwise reaches a terminal
+   state.
 
 The sender and every operator surface must distinguish durable acceptance from
 `wake blocked before write: binding_unprovable`. The incident closes only when
@@ -287,12 +289,15 @@ An earlier focused pass does not substitute for the frozen run.
   one-reopen allowance.
 - A matched idle rule without composer ownership semantics settles into one
   visible `composer_semantic_missing` pre-write block with zero pane writes.
-- Recipient-scoped withdrawal accepts only an exact, unclaimed, provably
-  unwritten `queued`, `gating`, or `blocked_pre_write` attempt, appends one
-  durable fact, and releases the next FIFO item. Availability alone does not
-  promote ordinary queue or gate waits into human work.
+- Recipient-scoped withdrawal accepts only an exact, provably unwritten
+  `queued`, `gating`, or `blocked_pre_write` operator notification, appends one
+  durable fact, and releases the next FIFO item. The mailbox body may already
+  be claimed because retrieval and the human-visible notification are
+  independent. Availability alone does not promote ordinary queue or gate
+  waits into human work.
 - A socket claim remains available while terminal wake is blocked and settles
-  the blocked pre-write attempt without a second terminal write.
+  body retrieval without canceling the independently queued human-visible
+  summary and claim notification.
 - Session churn keeps worker, route, and queue counts bounded.
 
 ### Gate 4: identity, status, wait, and watch truth
