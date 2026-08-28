@@ -568,9 +568,14 @@ impl ComposerHold {
         if det.state == AgentState::Dead {
             return ComposerHold::Clear;
         }
-        // Text in the composer, from any sensor that can see one.
+        // Text in the composer, from any sensor that can see one. Composer
+        // semantics are deliberately independent from lifecycle readings: a
+        // manifest may classify the draft without allowing that rule to vote
+        // on Idle or Working. Ignoring that positive draft observation lets
+        // a later hidden or wrapped frame look clean and lose the hold.
         if det.state == AgentState::IdleWithInput
             || det.reads(Sensor::Screen, AgentState::IdleWithInput)
+            || det.composer_semantic == Some(ComposerSemantic::HumanInput)
         {
             return match self {
                 // Already known to have been staged under a running
@@ -1203,6 +1208,31 @@ mod write_ready_tests {
         );
         assert_eq!(h.advance(&title_only, None), h);
         assert_eq!(h.advance(&clean, None), ComposerHold::Clear);
+    }
+
+    /// Composer classification and lifecycle voting are independent. A
+    /// manifest may positively identify human input while deliberately
+    /// keeping that rule out of the Idle or Working state decision. The
+    /// semantic still has to latch the temporal hold, or a later hidden frame
+    /// can turn the same staged bytes into an apparently clean composer.
+    #[test]
+    fn human_input_semantics_latch_the_hold_without_a_lifecycle_vote() {
+        let mut human = det(
+            AgentState::Unknown,
+            vec![reading(Sensor::Screen, AgentState::Idle)],
+            false,
+        );
+        human.composer_semantic = Some(ComposerSemantic::HumanInput);
+        let held = ComposerHold::Clear.advance(&human, None);
+        assert_eq!(held, ComposerHold::Staged);
+
+        let mut hidden = det(
+            AgentState::Idle,
+            vec![reading(Sensor::Screen, AgentState::Idle)],
+            false,
+        );
+        hidden.composer_semantic = Some(ComposerSemantic::Clean);
+        assert_eq!(held.advance(&hidden, None), ComposerHold::Staged);
     }
 
     /// The fused winner is one state chosen by priority, so a composer

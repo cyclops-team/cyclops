@@ -440,6 +440,28 @@ async fn wait_for_pane_write_ready(rig: &mut Rig, pane: &str) {
     }
 }
 
+async fn wait_for_human_composer_evidence(rig: &mut Rig, pane: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = rig.ctl.request("status", json!({})).await;
+        let held = status["result"]["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|session| session["panes"].as_array())
+            .flatten()
+            .any(|row| row["pane_id"] == pane && row["composer"] == "human_draft");
+        if held {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pane {pane} did not record the human composer evidence: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn pane_pid(rig: &Rig, pane: &str) -> i64 {
     let output = rig
         .tmux
@@ -1627,6 +1649,7 @@ async fn a_human_draft_holds_one_notification_attempt_until_its_turn_finishes() 
     rig.tmux
         .run_ok(&["send-keys", "-l", "-t", &pane, "human draft stays private"]);
     rig.tmux.wait_screen("main", "human draft stays private");
+    wait_for_human_composer_evidence(&mut rig, &pane).await;
 
     let pair = send_waiting_pair(&rig, "draft").await;
 
@@ -1656,6 +1679,64 @@ async fn a_human_draft_holds_one_notification_attempt_until_its_turn_finishes() 
         notification_state_count(&rig, &pair.first, NotificationState::Staged),
         1
     );
+
+    rig.daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hidden_human_draft_is_not_mistaken_for_a_manual_clear() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "workspace-hidden-human-draft",
+        CAT_MANIFEST,
+        &composer_pane(),
+        "",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    rig.tmux
+        .run_ok(&["send-keys", "-l", "-t", &pane, "human draft stays private"]);
+    rig.tmux.wait_screen("main", "human draft stays private");
+    wait_for_human_composer_evidence(&mut rig, &pane).await;
+
+    // The fixture keeps the bytes staged but stops drawing them. From the
+    // screen this is indistinguishable from a manually cleared composer, so
+    // repeated clean captures are not positive deletion evidence.
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "C-g"]);
+    wait_pane_state(&mut rig, "idle").await;
+    assert!(!rig
+        .tmux
+        .capture(&pane)
+        .contains("human draft stays private"));
+
+    let pair = send_waiting_pair(&rig, "hidden-draft").await;
+    wait_for_notification_state(&mut rig, &pair.first, NotificationState::BlockedPreWrite).await;
+    let held = notification_transition(&rig, &pair.first, NotificationState::BlockedPreWrite)
+        .expect("the hidden draft remains a durable pre-write block");
+    let held = held.data.as_ref().expect("blocked transition data");
+    assert_eq!(
+        held["pre_write_observation"]["write_block"], "composer_hold",
+        "a clean-looking frame released hidden human input: {held}"
+    );
+    assert!(!rig
+        .tmux
+        .capture(&pane)
+        .contains(&compact_doorbell(&rig, &pair.first)));
+    assert_only_oldest_attempt_exists(&rig, &pair);
+
+    // Submit proves the apparently empty composer still held the draft. Only
+    // that real turn may release the barrier and admit the waiting doorbell.
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "Enter"]);
+    let released = wait_for_doorbell(&rig, &pane, &pair.first).await;
+    assert!(released.contains("human draft stays private"));
+    assert!(!released.contains("first body"));
+    assert!(!released.contains(&pair.second));
 
     rig.daemon.shutdown().await;
 }
