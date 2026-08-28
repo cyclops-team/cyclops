@@ -2,15 +2,14 @@
 
 Bare `cyclops` on a TTY opens the full-screen terminal workspace: a
 project sidebar, a tab bar, and a live pane canvas fed by tmux control
-mode. The tab bar shows by default however many tabs the workspace has,
-because the `+` that makes the next tab lives there; the `Tab bar` row
-on the settings card's View section is what puts it away and brings it
-back. The sidebar is
-the one side panel: the workspace and agent tree, over a file tree of
-what is on disk. It collapses out of the way with `Ctrl+B` `b` or with
-the `◂` chevron on its outer edge, leaving a one-column rail whose `▸`
-chevron brings it back. The collapse and the tab bar's visibility both
-persist, so the workspace reopens the way you left it.
+mode. The tab bar is visible by default because its `+` creates the next
+tab. The `Tab bar` row in Settings hides or restores it.
+
+The sidebar contains the workspace and agent tree above the file tree. Collapse
+it with `Ctrl+B` `b` or the `◂` chevron; the remaining `▸` rail restores it.
+Sidebar and tab-bar visibility persist, so the workspace reopens the way you
+left it.
+
 With no tmux server running (or no sessions on it), it starts one: a
 fresh session named `main` with a single shell pane in the directory you
 ran it from. Its first tab is `1`; automatic tab names continue with `2`,
@@ -31,6 +30,19 @@ cyclops watch --plain     # line-oriented stream, no screen takeover
 ```
 
 `cyclops ui` still works and prints a deprecation note; use `cyclops watch`.
+
+## Choose the right entry point
+
+| Command | What opens | Use it for |
+|---|---|---|
+| `cyclops` | The full workspace: sidebar, tabs, live panes, files, controls, and Messages | Normal interactive work |
+| `cyclops start --preset duo`, then `cyclops` | The same full workspace after constructing a named preset | A specific starting layout inside the UI |
+| `cyclops start --preset duo`, then `tmux attach -t main` | The native tmux client and its configured chrome, without the Cyclops workspace UI | Headless scripts, remote sessions, or an intentionally native-tmux workflow |
+| `cyclops watch` | The standalone Stream and Messages monitor, without live pane canvases | A companion dashboard or event stream |
+
+`cyclops start` is a constructor, not the workspace renderer. It creates or
+restores the session, starts the daemon when needed, names the panes it can
+prove, and exits. `tmux attach` then shows that session through native tmux.
 
 ## Keyboard
 

@@ -1,6 +1,6 @@
 # Stabilization history
 
-This document records the stabilization run from PR 56 through PR 95. It is a
+This document records the stabilization run from PR 56 through PR 97. It is a
 technical history, not a list of release claims. A merged fix, a fixture proof,
 a live vendor observation, and an opt-in evidence component are different kinds
 of evidence and are named separately below.
@@ -144,10 +144,14 @@ real process-isolation workload.
 | 93 | Preserved composer holds across transient identity loss but never across a replacement generation. |
 | 94 | Added narrow AGY 1.1.22 empty-Context and truecolor trailer evidence. |
 | 95 | Released the same held attempt after settled visible input became exactly empty. |
+| 96 | Rewrote the public baseline around standalone messaging, honest evidence, recovery, and prioritized follow-up. |
+| 97 | Made bare `cyclops` the public UI entry point and identified native tmux as an explicit alternative. |
 
 PR 88 and PR 89 do not exist. PR 73 and PR 82 were measured negative
 experiments and were closed without merge. That distinction matters: the
 history includes what was rejected so those ideas do not return as folklore.
+The range therefore contains 38 merged pull requests, not 42 consecutive
+landings.
 
 ## Final evidence at `0492d7a`
 

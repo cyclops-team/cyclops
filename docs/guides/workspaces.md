@@ -5,8 +5,22 @@ called, and where they start. It is one file you can read, edit and commit.
 
 ## Open one
 
+For the normal full-screen workspace UI, run bare `cyclops`. Use `cyclops
+start` when you need to construct or restore a specific saved workspace or
+preset before opening it:
+
 ```bash
-cyclops start
+cyclops start --preset duo
+cyclops
+```
+
+`start` performs the setup and exits. If you deliberately want native tmux
+without the Cyclops sidebar, tabs, Messages pane, file panel, or workspace
+controls, attach directly instead:
+
+```bash
+cyclops start --preset duo
+tmux attach -t main
 ```
 
 ```
@@ -14,7 +28,7 @@ cyclops start
   started cyclopsd, logging to ~/.cyclops/cyclopsd.log
 
 Next:
-  1  tmux attach -t main  open the workspace and start your agents
+  1  cyclops  open the full workspace UI and start your agents
 ```
 
 `start` is safe to run as often as you like. A session that is already
