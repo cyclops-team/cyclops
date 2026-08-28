@@ -177,8 +177,9 @@ pub fn spawn_reader(tx: tokio::sync::mpsc::Sender<Key>) {
         let mut buf = [0u8; 4096];
         let mut pending: Vec<u8> = Vec::new();
         let mut in_paste = false;
+        let mut paste_scan_from = 0;
         loop {
-            for key in drain(&mut pending, &mut in_paste) {
+            for key in drain(&mut pending, &mut in_paste, &mut paste_scan_from) {
                 if tx.blocking_send(key).is_err() {
                     return;
                 }
@@ -200,6 +201,7 @@ pub fn spawn_reader(tx: tokio::sync::mpsc::Sender<Key>) {
                         // thing this buffer exists to prevent.
                         pending.clear();
                         in_paste = false;
+                        paste_scan_from = 0;
                         if tx.blocking_send(Key::PasteRejected).is_err() {
                             return;
                         }
@@ -243,15 +245,18 @@ const PASTE_ABANDON_MS: libc::c_int = 2_000;
 /// mode one byte early. That is the property markers alone could not
 /// give: with them, the payload's own bytes decided when quarantine
 /// ended.
-fn drain(pending: &mut Vec<u8>, in_paste: &mut bool) -> Vec<Key> {
+fn drain(pending: &mut Vec<u8>, in_paste: &mut bool, paste_scan_from: &mut usize) -> Vec<Key> {
     let mut out = Vec::new();
     loop {
         if *in_paste {
-            match find(pending, PASTE_END) {
+            match find(&pending[*paste_scan_from..], PASTE_END)
+                .map(|relative| *paste_scan_from + relative)
+            {
                 Some(at) => {
                     let payload: Vec<u8> = pending.drain(..at).collect();
                     pending.drain(..PASTE_END.len());
                     *in_paste = false;
+                    *paste_scan_from = 0;
                     // Checked here too, not only while waiting: a paste
                     // whose terminator arrives in the same read was
                     // delivered whole however large it was.
@@ -267,7 +272,15 @@ fn drain(pending: &mut Vec<u8>, in_paste: &mut bool) -> Vec<Key> {
                     if pending.len() > PASTE_MAX {
                         pending.clear();
                         *in_paste = false;
+                        *paste_scan_from = 0;
                         out.push(Key::PasteRejected);
+                    } else {
+                        // A future terminator can start only in the suffix
+                        // shorter than the marker. The rest was already
+                        // searched on the previous read.
+                        *paste_scan_from = pending
+                            .len()
+                            .saturating_sub(PASTE_END.len().saturating_sub(1));
                     }
                     return out;
                 }
@@ -279,6 +292,7 @@ fn drain(pending: &mut Vec<u8>, in_paste: &mut bool) -> Vec<Key> {
                     pending.drain(..PASTE_BEGIN.len());
                     out.extend(decode(&head));
                     *in_paste = true;
+                    *paste_scan_from = 0;
                 }
                 None => {
                     // Hold back anything that could still become the
@@ -495,10 +509,11 @@ mod stream_tests {
     fn through_reader(bytes: &[u8], chunk: usize) -> Vec<Key> {
         let mut pending: Vec<u8> = Vec::new();
         let mut in_paste = false;
+        let mut paste_scan_from = 0;
         let mut out = Vec::new();
         for piece in bytes.chunks(chunk.max(1)) {
             pending.extend_from_slice(piece);
-            out.extend(drain(&mut pending, &mut in_paste));
+            out.extend(drain(&mut pending, &mut in_paste, &mut paste_scan_from));
         }
         // Input stops here. A half-read sequence that is just an ESC
         // becomes the escape key. An unterminated paste is thrown away
