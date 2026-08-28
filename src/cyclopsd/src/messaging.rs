@@ -16,6 +16,7 @@ use tracing::{debug, error};
 
 use crate::mailbox::{
     AcceptResult, ClaimOutcome, MailboxIdentity, MailboxSend, MailboxService, MailboxServiceError,
+    UnclaimedReminderQueue,
 };
 use crate::notification_adapter::NotificationContext;
 use crate::{Inner, PaneKey};
@@ -590,6 +591,139 @@ pub(crate) fn schedule_available(inner: &Arc<Inner>) {
         if let Err(error) = schedule_recipient(inner, service, recipient) {
             error!(%recipient, %error, "cannot schedule mailbox notification");
         }
+    }
+}
+
+/// Arm one exact-attempt, one-shot reminder after a proven doorbell.
+///
+/// The deadline wakes once. If the prior write barrier is still active, the
+/// task waits only on durable workspace change events until that exact barrier
+/// retires or the attempt becomes obsolete. It never polls the pane and never
+/// invents a second readiness rule; the ordinary notification worker owns the
+/// eventual stamped composer-safe gate.
+pub(crate) fn schedule_unclaimed_reminder(
+    inner: &Arc<Inner>,
+    record: cyclops_proto::NotificationRecord,
+) {
+    let Some(threshold_ms) = inner.cfg.unclaimed_reminder_ms else {
+        return;
+    };
+    if record.state != NotificationState::Notified
+        || record.transport != cyclops_proto::NotificationTransport::Doorbell
+        || record.unclaimed_reminder_count != 0
+    {
+        return;
+    }
+    let Some(service) = inner.mailbox.as_ref().map(Arc::clone) else {
+        return;
+    };
+    let elapsed_ms = crate::unix_ms().saturating_sub(record.updated_at);
+    let delay = Duration::from_millis(threshold_ms.saturating_sub(elapsed_ms));
+    let attempt_id = record.attempt_id;
+    let mut events = inner.events.subscribe();
+    let task_inner = Arc::clone(inner);
+    inner.engine.spawn_descendant_task(async move {
+        tokio::time::sleep(delay).await;
+        let first = service.queue_unclaimed_reminder(attempt_id);
+        let outcome = match first {
+            Ok(UnclaimedReminderQueue::WaitingForPriorBarrier) => {
+                reconcile_due_unclaimed_reminder_barrier(
+                    &task_inner,
+                    &service,
+                    record.recipient,
+                    attempt_id,
+                )
+                .await;
+                wait_and_queue_unclaimed_reminder(
+                    &service,
+                    attempt_id,
+                    Duration::ZERO,
+                    &mut events,
+                )
+                .await
+            }
+            Ok(UnclaimedReminderQueue::Queued(record)) => Ok(Some(*record)),
+            Ok(UnclaimedReminderQueue::Obsolete) => Ok(None),
+            Err(error) => Err(error),
+        };
+        match outcome {
+            Ok(Some(record)) => {
+                if let Err(error) = schedule_recipient(&task_inner, &service, record.recipient) {
+                    error!(attempt = %attempt_id, %error, "cannot schedule queued unclaimed reminder");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                error!(attempt = %attempt_id, %error, "cannot queue unclaimed reminder");
+            }
+        }
+    });
+}
+
+/// One due reminder may ask the existing barrier one fresh question.
+///
+/// This is a named one-shot deadline, not a polling loop. Tracking the exact
+/// attempt makes the standard recovery pass eligible to retire only that
+/// barrier, and the forced capture still requires the recorded occupant plus
+/// positive clean-composer evidence.
+async fn reconcile_due_unclaimed_reminder_barrier(
+    inner: &Arc<Inner>,
+    service: &Arc<MailboxService>,
+    recipient: RecipientKey,
+    attempt_id: NotificationAttemptId,
+) {
+    inner
+        .composer_recovery
+        .lock()
+        .expect("composer recovery lock")
+        .track(attempt_id);
+    let Ok(Some(route)) = notification_route(inner, service, recipient) else {
+        return;
+    };
+    crate::fusion::recompute_pane(
+        inner,
+        route.session_idx,
+        &route.watcher,
+        &route.pane_id,
+        true,
+        "unclaimed_reminder_due",
+    )
+    .await;
+}
+
+async fn wait_and_queue_unclaimed_reminder(
+    service: &MailboxService,
+    attempt_id: NotificationAttemptId,
+    delay: Duration,
+    events: &mut tokio::sync::broadcast::Receiver<cyclops_proto::Event>,
+) -> Result<Option<cyclops_proto::NotificationRecord>, MailboxServiceError> {
+    tokio::time::sleep(delay).await;
+    loop {
+        match service.queue_unclaimed_reminder(attempt_id)? {
+            UnclaimedReminderQueue::Queued(record) => return Ok(Some(*record)),
+            UnclaimedReminderQueue::Obsolete => return Ok(None),
+            UnclaimedReminderQueue::WaitingForPriorBarrier => {}
+        }
+        match events.recv().await {
+            Ok(event) if event.event == "messages.changed" => {}
+            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(None),
+        }
+    }
+}
+
+/// Re-arm pending exact reminders after journal replay.
+pub(crate) fn schedule_unclaimed_reminders(inner: &Arc<Inner>) {
+    let Some(service) = inner.mailbox.as_ref() else {
+        return;
+    };
+    match service.unclaimed_reminder_candidates() {
+        Ok(records) => {
+            for record in records {
+                schedule_unclaimed_reminder(inner, record);
+            }
+        }
+        Err(error) => error!(%error, "cannot inspect unclaimed reminder candidates"),
     }
 }
 
@@ -1214,6 +1348,20 @@ mod tests {
                 Some(DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
             )
             .unwrap();
+    }
+
+    fn record_notified_doorbell(
+        context: &NotificationContext,
+    ) -> cyclops_proto::NotificationRecord {
+        context.record_gating().unwrap();
+        record_doorbell_write(context);
+        context.record_staged().unwrap();
+        assert_eq!(
+            context.reserve_submit().unwrap(),
+            crate::notification_adapter::SubmitReservation::Reserved
+        );
+        context.record_submitted().unwrap();
+        context.record_notified().unwrap()
     }
 
     #[test]
@@ -1926,6 +2074,82 @@ mod tests {
             dispositions[0].wake_block,
             Some(MessageWakeBlock::WorkerSupervisorExited)
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_due_reminder_waits_for_the_prior_barrier_then_queues_once() {
+        let (_scratch, service, events, _recipient, _) = mailbox_service("reminder-barrier", 8);
+        let (accepted, context, _) = queued_attempt(&service);
+        let notified = record_notified_doorbell(&context);
+        let attempt_id = notified.attempt_id;
+        let mut receiver = events.subscribe();
+        let wait_service = Arc::clone(&service);
+        let waiter = tokio::spawn(async move {
+            wait_and_queue_unclaimed_reminder(
+                &wait_service,
+                attempt_id,
+                Duration::from_secs(10),
+                &mut receiver,
+            )
+            .await
+        });
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "the old write barrier must win");
+        assert_eq!(
+            service.message_dispositions(&accepted.message_id).unwrap()[0].notification_state_raw,
+            Some(NotificationState::Notified)
+        );
+
+        service
+            .retire_notification_barrier(
+                &notified,
+                cyclops_proto::NotificationBarrierRetirementCause::ComposerObservedClear,
+                None,
+            )
+            .unwrap();
+        let queued = waiter.await.unwrap().unwrap().unwrap();
+        assert_eq!(queued.state, NotificationState::Gating);
+        assert_eq!(queued.attempt_id, attempt_id);
+        assert_eq!(queued.unclaimed_reminder_count, 1);
+        assert_eq!(
+            service.queue_unclaimed_reminder(attempt_id).unwrap(),
+            UnclaimedReminderQueue::Obsolete
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_obsoletes_the_exact_reminder_without_a_fact_or_terminal_io() {
+        let (_scratch, service, events, recipient, _) = mailbox_service("reminder-claim", 8);
+        let (accepted, context, _) = queued_attempt(&service);
+        let notified = record_notified_doorbell(&context);
+        let attempt_id = notified.attempt_id;
+        let lines_before = service.journal_lines().unwrap().len();
+        let mut receiver = events.subscribe();
+        let wait_service = Arc::clone(&service);
+        let waiter = tokio::spawn(async move {
+            wait_and_queue_unclaimed_reminder(
+                &wait_service,
+                attempt_id,
+                Duration::from_secs(10),
+                &mut receiver,
+            )
+            .await
+        });
+        service.claim(recipient, accepted.message_id).unwrap();
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(waiter.await.unwrap().unwrap(), None);
+        let lines = service.journal_lines().unwrap();
+        assert_eq!(lines.len(), lines_before + 1, "only the claim appends");
+        assert!(lines.iter().all(|line| {
+            line.data
+                .as_ref()
+                .and_then(|data| data.get("type"))
+                .and_then(|v| v.as_str())
+                != Some("notification_unclaimed_reminder_queued")
+        }));
     }
 
     #[tokio::test(start_paused = true)]

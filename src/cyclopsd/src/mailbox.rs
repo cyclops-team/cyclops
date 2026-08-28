@@ -1016,6 +1016,9 @@ impl MailboxProjection {
             Some("notification_transition") => {
                 self.prepare_notification_transition(line, replaying)
             }
+            Some("notification_unclaimed_reminder_queued") => {
+                self.prepare_unclaimed_reminder_queued(line)
+            }
             Some("notification_requeued") => self.prepare_notification_requeue(line),
             Some("notifications_requeued") => self.prepare_notification_requeues(line),
             Some("notification_cleared") => self.prepare_notification_clear(line),
@@ -1218,6 +1221,7 @@ impl MailboxProjection {
                         wake_block: None,
                         pre_write_observation: None,
                         pre_write_reopen_count: current.pre_write_reopen_count,
+                        unclaimed_reminder_count: current.unclaimed_reminder_count,
                         started_seq: current.started_seq,
                         updated_seq: line.seq,
                         updated_at: line.ts,
@@ -1363,6 +1367,7 @@ impl MailboxProjection {
                         wake_block: None,
                         pre_write_observation: None,
                         pre_write_reopen_count: current.pre_write_reopen_count,
+                        unclaimed_reminder_count: current.unclaimed_reminder_count,
                         started_seq: current.started_seq,
                         updated_seq: line.seq,
                         updated_at: line.ts,
@@ -1661,6 +1666,7 @@ impl MailboxProjection {
                         wake_block: None,
                         pre_write_observation: None,
                         pre_write_reopen_count: 0,
+                        unclaimed_reminder_count: 0,
                         started_seq: line.seq,
                         updated_seq: line.seq,
                         updated_at: line.ts,
@@ -1709,6 +1715,7 @@ impl MailboxProjection {
                     } else {
                         current.pre_write_reopen_count
                     },
+                    unclaimed_reminder_count: current.unclaimed_reminder_count,
                     started_seq: current.started_seq,
                     updated_seq: line.seq,
                     updated_at: line.ts,
@@ -1721,6 +1728,72 @@ impl MailboxProjection {
             key,
             record,
             new_attempt,
+        })
+    }
+
+    fn prepare_unclaimed_reminder_queued(
+        &self,
+        line: &LedgerLine,
+    ) -> Result<PreparedMutation, MailboxError> {
+        let fact: NotificationFact = serde_json::from_value(
+            line.data
+                .clone()
+                .ok_or_else(|| MailboxError::InvalidNotificationFact("missing data".into()))?,
+        )
+        .map_err(|error| MailboxError::InvalidNotificationFact(error.to_string()))?;
+        let NotificationFact::NotificationUnclaimedReminderQueued {
+            record_version,
+            attempt_id,
+            message_id,
+            recipient,
+        } = fact
+        else {
+            return Err(MailboxError::InvalidNotificationFact(
+                "expected notification_unclaimed_reminder_queued".into(),
+            ));
+        };
+
+        self.validate_notification_envelope(line, record_version, &message_id, recipient)?;
+        self.require_pending_entry(recipient, &message_id)?;
+        let key = (recipient, message_id.clone());
+        let current =
+            self.notifications
+                .get(&key)
+                .ok_or_else(|| MailboxError::NotificationNotFound {
+                    message_id: message_id.clone(),
+                    recipient,
+                })?;
+        if current.attempt_id != attempt_id {
+            return Err(MailboxError::NotificationAttemptMismatch {
+                expected: current.attempt_id,
+                found: attempt_id,
+            });
+        }
+        if current.state != NotificationState::Notified
+            || current.transport != NotificationTransport::Doorbell
+            || current.unclaimed_reminder_count != 0
+            || self.active_notification_barriers.contains_key(&attempt_id)
+        {
+            return Err(MailboxError::InvalidNotificationFact(
+                "unclaimed reminder requires one pending, notified doorbell with a retired prior barrier and unused allowance"
+                    .into(),
+            ));
+        }
+
+        let mut record = current.clone();
+        record.state = NotificationState::Gating;
+        record.cause = None;
+        record.verify_outcome = None;
+        record.pre_write_cause = None;
+        record.wake_block = None;
+        record.pre_write_observation = None;
+        record.unclaimed_reminder_count = 1;
+        record.updated_seq = line.seq;
+        record.updated_at = line.ts;
+        Ok(PreparedMutation::Notification {
+            key,
+            record,
+            new_attempt: false,
         })
     }
 
@@ -1858,6 +1931,7 @@ impl MailboxProjection {
                 wake_block: None,
                 pre_write_observation: None,
                 pre_write_reopen_count: 0,
+                unclaimed_reminder_count: 0,
                 started_seq: line.seq,
                 updated_seq: line.seq,
                 updated_at: line.ts,
@@ -2114,6 +2188,7 @@ impl MailboxProjection {
                 wake_block: None,
                 pre_write_observation: None,
                 pre_write_reopen_count: current.pre_write_reopen_count,
+                unclaimed_reminder_count: current.unclaimed_reminder_count,
                 started_seq: current.started_seq,
                 updated_seq: line.seq,
                 updated_at: line.ts,
@@ -4431,6 +4506,13 @@ pub struct MailboxService {
         StdMutex<HashMap<NotificationAttemptId, AttentionConsumptionCandidate>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnclaimedReminderQueue {
+    Queued(Box<NotificationRecord>),
+    WaitingForPriorBarrier,
+    Obsolete,
+}
+
 #[derive(Default)]
 struct ExactReconciliationRequests {
     running: HashSet<NotificationAttemptId>,
@@ -5244,6 +5326,68 @@ impl MailboxService {
         &self,
     ) -> Result<Vec<NotificationRecord>, MailboxServiceError> {
         Ok(self.store()?.projection().gating_notifications())
+    }
+
+    /// Doorbells that may arm one exact-attempt reminder timer.
+    pub(crate) fn unclaimed_reminder_candidates(
+        &self,
+    ) -> Result<Vec<NotificationRecord>, MailboxServiceError> {
+        let store = self.store()?;
+        let mut records: Vec<_> = store
+            .projection()
+            .notifications
+            .values()
+            .filter(|record| {
+                record.state == NotificationState::Notified
+                    && record.transport == NotificationTransport::Doorbell
+                    && record.unclaimed_reminder_count == 0
+                    && store
+                        .projection()
+                        .get_entry(record.recipient, &record.message_id)
+                        .is_some_and(|entry| entry.state.is_pending())
+            })
+            .cloned()
+            .collect();
+        records.sort_by_key(|record| record.updated_seq);
+        Ok(records)
+    }
+
+    /// Atomically classify or queue one due reminder under the store lock.
+    pub(crate) fn queue_unclaimed_reminder(
+        &self,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<UnclaimedReminderQueue, MailboxServiceError> {
+        let mut store = self.store()?;
+        let Some(current) = store
+            .projection()
+            .notification_by_attempt(attempt_id)
+            .cloned()
+        else {
+            return Ok(UnclaimedReminderQueue::Obsolete);
+        };
+        let pending = store
+            .projection()
+            .get_entry(current.recipient, &current.message_id)
+            .is_some_and(|entry| entry.state.is_pending());
+        if !pending
+            || current.state != NotificationState::Notified
+            || current.transport != NotificationTransport::Doorbell
+            || current.unclaimed_reminder_count != 0
+        {
+            return Ok(UnclaimedReminderQueue::Obsolete);
+        }
+        if store
+            .projection()
+            .active_notification_barriers
+            .contains_key(&attempt_id)
+        {
+            return Ok(UnclaimedReminderQueue::WaitingForPriorBarrier);
+        }
+        let record = store
+            .queue_unclaimed_reminder(attempt_id)?
+            .expect("eligibility checked under the same store lock");
+        self.publish_change(record.updated_seq, &[MessagesChangedArea::Notifications]);
+        Ok(UnclaimedReminderQueue::Queued(Box::new(record)))
     }
 
     /// Persist one exact reason that a composer barrier no longer applies.
@@ -6955,6 +7099,50 @@ impl MessageStore {
             pre_write_observation: pre_write_observation.map(Box::new),
         };
         self.append_notification_fact_at(message_id, recipient, fact, ts)
+    }
+
+    /// Spend the single reminder allowance for one exact pending doorbell.
+    ///
+    /// Obsolete timers are normal: a claim, withdrawal, or replacement may
+    /// win before the deadline. Those cases return `None` without appending.
+    pub(crate) fn queue_unclaimed_reminder(
+        &mut self,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<Option<NotificationRecord>, MessageStoreError> {
+        self.queue_unclaimed_reminder_at(attempt_id, now_ms())
+    }
+
+    fn queue_unclaimed_reminder_at(
+        &mut self,
+        attempt_id: NotificationAttemptId,
+        ts: u64,
+    ) -> Result<Option<NotificationRecord>, MessageStoreError> {
+        let Some(current) = self.projection.notification_by_attempt(attempt_id).cloned() else {
+            return Ok(None);
+        };
+        let pending = self
+            .projection
+            .get_entry(current.recipient, &current.message_id)
+            .is_some_and(|entry| entry.state.is_pending());
+        if !pending
+            || current.state != NotificationState::Notified
+            || current.transport != NotificationTransport::Doorbell
+            || current.unclaimed_reminder_count != 0
+            || self
+                .projection
+                .active_notification_barriers
+                .contains_key(&attempt_id)
+        {
+            return Ok(None);
+        }
+        let fact = NotificationFact::NotificationUnclaimedReminderQueued {
+            record_version: CANONICAL_RECORD_VERSION,
+            attempt_id,
+            message_id: current.message_id.clone(),
+            recipient: current.recipient,
+        };
+        self.append_notification_fact_at(current.message_id, current.recipient, fact, ts)
+            .map(Some)
     }
 
     /// Start a new queued attempt after an operator explicitly requeues attention.
@@ -9116,6 +9304,136 @@ mod tests {
         let next = service.prepare_oldest_notification(bob).unwrap().unwrap();
         assert_eq!(next.message_id, second_id);
         assert_ne!(next.attempt_id, first_attempt);
+    }
+
+    #[test]
+    fn unclaimed_reminder_reopens_one_exact_pending_doorbell_once() {
+        let scratch = StoreScratch::new("unclaimed-reminder-once");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, admin, bob, _) = test_context();
+        let message_id = MessageId::new("m-unclaimed-reminder").unwrap();
+        let attempt_id = attempt(701);
+        let mut store = MessageStore::open(&root, journal, workspace, "boot-1").unwrap();
+        store
+            .accept_at(
+                message_id.clone(),
+                draft(admin, vec![bob], "secret body", None),
+                1,
+            )
+            .unwrap();
+        store
+            .append_notification_transition_at(
+                message_id.clone(),
+                bob,
+                attempt_id,
+                NotificationState::Queued,
+                None,
+                None,
+                2,
+            )
+            .unwrap();
+        store
+            .append_notification_transition_at(
+                message_id.clone(),
+                bob,
+                attempt_id,
+                NotificationState::Gating,
+                None,
+                None,
+                3,
+            )
+            .unwrap();
+        store
+            .append_notification_transition_with_transport_at(
+                message_id.clone(),
+                bob,
+                attempt_id,
+                NotificationState::Writing,
+                Some(notification_binding(bob)),
+                Some(NotificationTransport::Doorbell),
+                Some(DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
+                None,
+                4,
+            )
+            .unwrap();
+        for (ts, state) in [
+            NotificationState::Staged,
+            NotificationState::Submitting,
+            NotificationState::Submitted,
+            NotificationState::Notified,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store
+                .append_notification_transition_at(
+                    message_id.clone(),
+                    bob,
+                    attempt_id,
+                    state,
+                    None,
+                    None,
+                    5 + ts as u64,
+                )
+                .unwrap();
+        }
+
+        let before_barrier = store.writer.read_after(0).unwrap().len();
+        assert_eq!(
+            store.queue_unclaimed_reminder_at(attempt_id, 9).unwrap(),
+            None,
+            "the reminder must not replace or weaken the prior write barrier"
+        );
+        assert_eq!(store.writer.read_after(0).unwrap().len(), before_barrier);
+        store
+            .retire_notification_barrier(
+                message_id.clone(),
+                bob,
+                attempt_id,
+                NotificationBarrierRetirementCause::ComposerObservedClear,
+                None,
+            )
+            .unwrap();
+        let before = store.writer.read_after(0).unwrap().len();
+        let reopened = store
+            .queue_unclaimed_reminder_at(attempt_id, 10)
+            .unwrap()
+            .expect("the exact pending doorbell has one reminder allowance");
+        assert_eq!(reopened.state, NotificationState::Gating);
+        assert_eq!(reopened.attempt_id, attempt_id);
+        assert_eq!(reopened.unclaimed_reminder_count, 1);
+        let lines = store.writer.read_after(0).unwrap();
+        assert_eq!(lines.len(), before + 1);
+        let fact = lines.last().unwrap();
+        assert_eq!(
+            fact.body, None,
+            "reminder facts never carry message content"
+        );
+        assert_eq!(
+            fact.data
+                .as_ref()
+                .and_then(|data| data.get("type"))
+                .and_then(|v| v.as_str()),
+            Some("notification_unclaimed_reminder_queued")
+        );
+
+        let before_repeat = lines.len();
+        assert_eq!(
+            store.queue_unclaimed_reminder_at(attempt_id, 11).unwrap(),
+            None,
+            "one exact attempt cannot spend its reminder allowance twice"
+        );
+        assert_eq!(store.writer.read_after(0).unwrap().len(), before_repeat);
+
+        drop(store);
+        let replayed = MessageStore::open(&root, journal, workspace, "boot-2").unwrap();
+        let record = replayed
+            .projection()
+            .notification(bob, &message_id)
+            .unwrap();
+        assert_eq!(record.state, NotificationState::Gating);
+        assert_eq!(record.unclaimed_reminder_count, 1);
     }
 
     #[test]

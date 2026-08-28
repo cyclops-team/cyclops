@@ -801,6 +801,7 @@ mod tests {
             wake_block: None,
             pre_write_observation: None,
             pre_write_reopen_count: 0,
+            unclaimed_reminder_count: 0,
             started_seq: 4,
             updated_seq: 5,
             updated_at: 6,

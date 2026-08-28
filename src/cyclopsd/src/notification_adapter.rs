@@ -639,7 +639,7 @@ impl NotificationContext {
     }
 
     fn owns(&self, record: &NotificationRecord) -> bool {
-        record.attempt_id == self.attempt_id && record.pre_write_reopen_count == self.run_epoch
+        record.attempt_id == self.attempt_id && record.execution_epoch() == self.run_epoch
     }
 
     fn publish_transition(&self, record: &NotificationRecord) {
@@ -677,7 +677,7 @@ fn notification_run_epoch(
                 .projection()
                 .notification(recipient, message_id)
                 .filter(|record| record.attempt_id == attempt_id)
-                .map(|record| record.pre_write_reopen_count)
+                .map(NotificationRecord::execution_epoch)
         })
         .unwrap_or(0)
 }

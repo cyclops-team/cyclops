@@ -3146,6 +3146,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     // Any delivery the previous run left unresolved gets a named ending now.
     delivery::close_limbo(&inner, &replayed);
     drop(replayed);
+    messaging::schedule_unclaimed_reminders(&inner);
 
     let mut tasks = Vec::new();
     for idx in 0..inner.session_count() {

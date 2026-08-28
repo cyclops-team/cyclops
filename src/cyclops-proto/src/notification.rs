@@ -604,12 +604,30 @@ pub struct NotificationRecord {
     /// work, which prevents proof flapping from becoming a retry loop.
     #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub pre_write_reopen_count: u8,
+    /// Durable unclaimed-doorbell reminders already queued for this attempt.
+    ///
+    /// The current contract permits at most one. Keeping the bound on the
+    /// attempt record makes it survive daemon restart and prevents duplicate
+    /// timers from producing duplicate terminal writes.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub unclaimed_reminder_count: u8,
     pub started_seq: u64,
     pub updated_seq: u64,
     pub updated_at: u64,
 }
 
 impl NotificationRecord {
+    /// Durable execution generation for this exact attempt.
+    ///
+    /// Pre-write recovery and the one unclaimed reminder both reuse the exact
+    /// attempt id. Encoding both bounded counters prevents a stale worker from
+    /// writing after either newer run has taken ownership.
+    pub fn execution_epoch(&self) -> u8 {
+        self.pre_write_reopen_count
+            .saturating_mul(2)
+            .saturating_add(self.unclaimed_reminder_count)
+    }
+
     /// Whether this exact failed wake may enter automatic composer recovery.
     ///
     /// The terminal still has to prove the complete binding, exact rendered
@@ -687,6 +705,17 @@ pub enum NotificationFact {
         wake_block: Option<crate::wire::MessageWakeBlock>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pre_write_observation: Option<Box<NotificationPreWriteObservation>>,
+    },
+    /// Re-open one still-pending, already-notified doorbell for one reminder.
+    ///
+    /// This fact is content-free and names the exact attempt. Projection
+    /// validation refuses claims, replacements, non-doorbell transports, and
+    /// attempts that already spent their single reminder allowance.
+    NotificationUnclaimedReminderQueued {
+        record_version: u32,
+        attempt_id: NotificationAttemptId,
+        message_id: MessageId,
+        recipient: RecipientKey,
     },
     NotificationRequeued {
         record_version: u32,
@@ -1162,6 +1191,7 @@ mod tests {
             wake_block: None,
             pre_write_observation: None,
             pre_write_reopen_count: 0,
+            unclaimed_reminder_count: 0,
             started_seq: 1,
             updated_seq: 3,
             updated_at: 4,
@@ -1325,6 +1355,7 @@ mod tests {
             wake_block: None,
             pre_write_observation: None,
             pre_write_reopen_count: 0,
+            unclaimed_reminder_count: 0,
             started_seq: 1,
             updated_seq: 7,
             updated_at: 8,

@@ -3316,6 +3316,106 @@ async fn a_working_pane_with_a_proven_clean_composer_accepts_a_notification() {
     rig.daemon.shutdown().await;
 }
 
+/// An opt-in stale reminder is another run of the ordinary notification
+/// worker, not a second injection path. It reuses the exact attempt locator,
+/// passes through the same composer gate, and spends one durable allowance.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unclaimed_doorbell_reminds_once_through_the_ordinary_gate() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "workspace-unclaimed-reminder",
+        CAT_MANIFEST,
+        &composer_pane(),
+        "delivery_retry_max = 0\nunclaimed_reminder_ms = 100\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+
+    let sent = send_workspace_message(
+        &rig,
+        "unclaimed-reminder",
+        "Reminder envelope",
+        "private body never reaches the pane",
+    )
+    .await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    let doorbell = compact_doorbell(&rig, &message_id);
+
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        let lines = workspace_lines(&rig);
+        let reminder_facts = lines
+            .iter()
+            .filter(|line| {
+                line.id == message_id
+                    && line.data.as_ref().is_some_and(|data| {
+                        data["type"] == "notification_unclaimed_reminder_queued"
+                    })
+            })
+            .count();
+        let notified = notification_state_count(&rig, &message_id, NotificationState::Notified);
+        if reminder_facts == 1 && notified == 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "one reminder did not complete: reminder_facts={reminder_facts}, notified={notified}, lines={lines:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let history = pane_history(&rig, &pane);
+    assert!(history.contains(&doorbell), "{history}");
+    assert_eq!(
+        history.matches("FAKETUI-WORKING").count(),
+        2,
+        "the original doorbell and its reminder must each execute once: {history}"
+    );
+    assert_eq!(notification_attempts(&rig, &message_id).len(), 1);
+    for state in [
+        NotificationState::Writing,
+        NotificationState::Staged,
+        NotificationState::Submitted,
+        NotificationState::Notified,
+    ] {
+        assert_eq!(
+            notification_state_count(&rig, &message_id, state),
+            2,
+            "both writes must stay on the exact attempt and complete {state:?} once"
+        );
+    }
+    assert!(!history.contains("Reminder envelope"), "{history}");
+    assert!(
+        !history.contains("private body never reaches the pane"),
+        "{history}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        workspace_lines(&rig)
+            .iter()
+            .filter(|line| {
+                line.id == message_id
+                    && line.data.as_ref().is_some_and(|data| {
+                        data["type"] == "notification_unclaimed_reminder_queued"
+                    })
+            })
+            .count(),
+        1,
+        "the exact attempt has one durable reminder allowance"
+    );
+    assert_eq!(
+        pane_history(&rig, &pane).matches("FAKETUI-WORKING").count(),
+        2
+    );
+
+    rig.daemon.shutdown().await;
+}
+
 /// A human draft is a hold, never a hook admission block, and an admitting
 /// edge arriving over the draft writes nothing and touches nothing. The
 /// human's own submit is what frees the composer; the edge already

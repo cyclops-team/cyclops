@@ -35,6 +35,11 @@ pub struct Config {
     /// long (working pane, human typing, detached session). Visibility for
     /// wedged holds; the delivery itself keeps waiting for events.
     pub gate_hold_notify_ms: u64,
+    /// One optional, bounded reminder for a doorbell that remains unclaimed.
+    ///
+    /// `None` is the shipped default. A configured positive duration arms one
+    /// exact-attempt timer after the first proven doorbell notification.
+    pub unclaimed_reminder_ms: Option<u64>,
     /// Theme name. The daemon never reads this field: `cyclops-theme`
     /// re-reads the same key out of the same file (`select::config_theme`)
     /// and that is what paints every surface, borders included. It is
@@ -65,6 +70,7 @@ impl Config {
             delivery_retry_max: 1,
             receipt_block_ms: 2500,
             gate_hold_notify_ms: 120_000,
+            unclaimed_reminder_ms: None,
             theme: None,
             chrome: true,
             default_workspace: None,
@@ -161,6 +167,14 @@ impl Config {
                         "`gate_hold_notify_ms` must be a non-negative integer, not a {}; using {}",
                         value.type_str(),
                         cfg.gate_hold_notify_ms
+                    )),
+                },
+                "unclaimed_reminder_ms" => match ms_value(&value) {
+                    Some(0) => cfg.unclaimed_reminder_ms = None,
+                    Some(v) => cfg.unclaimed_reminder_ms = Some(v),
+                    None => warnings.push(format!(
+                        "`unclaimed_reminder_ms` must be a non-negative integer, not a {}; reminders remain off",
+                        value.type_str()
                     )),
                 },
                 // Recognized, never used, and deliberately silent about a
@@ -363,14 +377,21 @@ next_tab = "Alt+n"
         assert_eq!(cfg.delivery_retry_max, 1);
         assert_eq!(cfg.receipt_block_ms, 2500);
         assert_eq!(cfg.gate_hold_notify_ms, 120_000);
+        assert_eq!(cfg.unclaimed_reminder_ms, None);
 
-        let text = "ack_timeout_ms = 200\ndelivery_retry_max = 0\nreceipt_block_ms = 900\ngate_hold_notify_ms = 300\n";
+        let text = "ack_timeout_ms = 200\ndelivery_retry_max = 0\nreceipt_block_ms = 900\ngate_hold_notify_ms = 300\nunclaimed_reminder_ms = 45000\n";
         let (cfg, warnings) = Config::parse(text, Path::new("/h")).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(cfg.ack_timeout_ms, 200);
         assert_eq!(cfg.delivery_retry_max, 0);
         assert_eq!(cfg.receipt_block_ms, 900);
         assert_eq!(cfg.gate_hold_notify_ms, 300);
+        assert_eq!(cfg.unclaimed_reminder_ms, Some(45_000));
+
+        let (cfg, warnings) =
+            Config::parse("unclaimed_reminder_ms = 0\n", Path::new("/h")).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(cfg.unclaimed_reminder_ms, None);
     }
 
     #[test]

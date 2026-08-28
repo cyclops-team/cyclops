@@ -201,7 +201,8 @@ fn select_attempt_payload(
             &binding.manifest,
         )
     });
-    if capability.is_some() {
+    let reminder = notification.current_record()?.unclaimed_reminder_count > 0;
+    if capability.is_some() || reminder {
         return Ok(AttemptPayload {
             bytes: cyclops_proto::render_doorbell_v3(notification.attempt_id()),
             transport: Some(NotificationTransport::Doorbell),
@@ -3163,7 +3164,7 @@ fn recover_failed_job(
             }
         };
         if current.attempt_id != notification.attempt_id()
-            || current.pre_write_reopen_count != notification.run_epoch()
+            || current.execution_epoch() != notification.run_epoch()
         {
             // Another run now owns this attempt. The stale task has no fact left to write.
             worker.finish(handle);
@@ -6706,7 +6707,7 @@ fn record_notification_notified(
         return Ok(true);
     };
     match notification.record_notified() {
-        Ok(_) => {
+        Ok(record) => {
             if handle.notification_transport() == Some(NotificationTransport::DirectPayload) {
                 notification.record_delivered_direct()?;
                 let recipient = notification.recipient();
@@ -6725,6 +6726,8 @@ fn record_notification_notified(
                         );
                     }
                 }
+            } else {
+                crate::messaging::schedule_unclaimed_reminder(inner, record);
             }
             Ok(true)
         }
@@ -10609,6 +10612,61 @@ mod tests {
             assert_eq!(active[0].recipient, recipient);
             assert_eq!(active[0].state, NotificationState::Notified);
         }
+    }
+
+    #[test]
+    fn an_unclaimed_reminder_can_only_select_the_content_free_exact_claim_doorbell() {
+        let (_scratch, store, context, _handle, recipient) =
+            notification_fixture("reminder-content-free");
+        prepare_notification_receipt(&context);
+        let notified = context.record_notified().unwrap();
+        let reminder = {
+            let mut store = store.lock().unwrap();
+            store
+                .retire_notification_barrier(
+                    notified.message_id.clone(),
+                    recipient,
+                    notified.attempt_id,
+                    cyclops_proto::NotificationBarrierRetirementCause::ComposerObservedClear,
+                    None,
+                )
+                .unwrap();
+            store
+                .queue_unclaimed_reminder(notified.attempt_id)
+                .unwrap()
+                .unwrap()
+        };
+        let reminder_context = NotificationContext::new(
+            Arc::clone(&store),
+            reminder.message_id.clone(),
+            recipient,
+            reminder.attempt_id,
+        );
+        let handle = DeliveryHandle::for_notification(
+            "reviewer",
+            "%1",
+            0,
+            "stale placeholder must be replaced".into(),
+            reminder_context,
+        );
+        let manifest = Manifest::parse(
+            "[agent]\nid = \"fix\"\ndisplay_name = \"Fix\"\nprocess_names = [\"cat\"]\n",
+            Path::new("fix.toml"),
+        )
+        .unwrap();
+
+        let selected = select_attempt_payload(&handle, &manifest, None).unwrap();
+        assert_eq!(
+            selected.bytes,
+            cyclops_proto::render_doorbell_v3(reminder.attempt_id)
+        );
+        assert_eq!(selected.transport, Some(NotificationTransport::Doorbell));
+        assert_eq!(
+            selected.doorbell_format,
+            Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM)
+        );
+        assert!(selected.capability.is_none());
+        assert!(!selected.bytes.contains("Review the mailbox"));
     }
 
     #[test]
