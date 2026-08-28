@@ -8414,6 +8414,47 @@ fn exact_staging_snapshot_matches(
         && current.map(|(matched, _)| matched) == Some(id_staged)
 }
 
+/// Closed proof outcomes for the Gate 7 stage-and-clear harness seam.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerSeamProof {
+    ExactStaged,
+    Clean,
+    HiddenOrAmbiguous,
+}
+
+/// Evaluates active composer state directly via production exact staging and clean proof paths.
+#[doc(hidden)]
+pub fn prove_composer_seam(
+    manifest: &Manifest,
+    screen: &str,
+    expected_staged: Option<&str>,
+) -> ComposerSeamProof {
+    if let Some(expected) = expected_staged {
+        if exact_staging_proof(
+            manifest,
+            screen,
+            StagingTarget::ExactRow(expected),
+            expected,
+        )
+        .is_some()
+        {
+            return ComposerSeamProof::ExactStaged;
+        }
+    } else if let ComposerContentProof::Visible(content) = exact_composer_content_for_state(
+        manifest,
+        screen,
+        AgentState::Idle,
+        Some(ComposerSemantic::Clean),
+    ) {
+        if content.is_empty() {
+            return ComposerSeamProof::Clean;
+        }
+    }
+    ComposerSeamProof::HiddenOrAmbiguous
+}
+
 /// Extract exact visible composer rows from a joined escaped capture.
 ///
 /// The caller must use `capture-pane -J -e`. Joining removes only rows tmux
