@@ -513,9 +513,10 @@ pub struct Detection {
 /// write on that frame pastes into a person's sentence.
 ///
 /// So a pane that has been seen holding text stays refused until a TURN
-/// proves the text left, which is the only positive evidence any vendor
-/// gives. Nothing here is inferred from elapsed time or from a hook that
-/// did not arrive.
+/// consumes it, or until a settled output observation positively classifies
+/// the visible composer as empty. The second path is what lets an operator
+/// erase a draft without submitting it. A single capture, elapsed time, or a
+/// hook that did not arrive never releases the hold.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComposerHold {
@@ -624,6 +625,31 @@ impl ComposerHold {
             return ComposerHold::Clear;
         }
         self
+    }
+
+    /// Release unowned visible input after the pane's output has settled on
+    /// an exact empty-composer rule.
+    ///
+    /// The caller owns the temporal boundary and must invoke this only after
+    /// the existing output-settle debounce. Keeping that boundary outside the
+    /// protocol type prevents an ordinary capture, status request, or stale
+    /// reconciliation from turning one blank redraw frame into permission to
+    /// paste. Ghost suggestions are intentionally excluded: they are safe for
+    /// a fresh write but do not prove that previously observed human input was
+    /// erased.
+    pub fn release_after_settled_visible_empty(self, det: &Detection) -> ComposerHold {
+        let visible_empty = !det.stale
+            && det.composer_semantic == Some(ComposerSemantic::Clean)
+            && det
+                .readings
+                .iter()
+                .any(|reading| reading.sensor == Sensor::Screen)
+            && matches!(det.state, AgentState::Idle | AgentState::Working);
+        if self.is_waiting() && visible_empty {
+            ComposerHold::Clear
+        } else {
+            self
+        }
     }
 
     /// Is this hold still waiting for a turn to take the staged text?
@@ -1233,6 +1259,51 @@ mod write_ready_tests {
         );
         hidden.composer_semantic = Some(ComposerSemantic::Clean);
         assert_eq!(held.advance(&hidden, None), ComposerHold::Staged);
+    }
+
+    #[test]
+    fn settled_visible_empty_releases_unsubmitted_human_input() {
+        let mut clean = det(
+            AgentState::Idle,
+            vec![reading(Sensor::Screen, AgentState::Idle)],
+            false,
+        );
+        clean.composer_semantic = Some(ComposerSemantic::Clean);
+        assert_eq!(
+            ComposerHold::Staged.release_after_settled_visible_empty(&clean),
+            ComposerHold::Clear
+        );
+        assert_eq!(
+            ComposerHold::StagedDuringTurn.release_after_settled_visible_empty(&clean),
+            ComposerHold::Clear
+        );
+    }
+
+    #[test]
+    fn settled_nonempty_ambiguous_or_stale_frames_keep_human_input_held() {
+        let mut detection = det(
+            AgentState::Idle,
+            vec![reading(Sensor::Screen, AgentState::Idle)],
+            false,
+        );
+        for semantic in [
+            ComposerSemantic::HumanInput,
+            ComposerSemantic::GhostSuggestion,
+            ComposerSemantic::Ambiguous,
+        ] {
+            detection.composer_semantic = Some(semantic);
+            assert_eq!(
+                ComposerHold::Staged.release_after_settled_visible_empty(&detection),
+                ComposerHold::Staged,
+                "{semantic:?} released a human-input hold"
+            );
+        }
+        detection.composer_semantic = Some(ComposerSemantic::Clean);
+        detection.stale = true;
+        assert_eq!(
+            ComposerHold::Staged.release_after_settled_visible_empty(&detection),
+            ComposerHold::Staged
+        );
     }
 
     /// The fused winner is one state chosen by priority, so a composer

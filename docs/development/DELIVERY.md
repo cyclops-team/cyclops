@@ -185,8 +185,9 @@ timer. In order:
      holds in gating and the gate line names it
      (`not_write_ready:<reason>`). `composer_hold` is the one that
      outlives the frame it was raised on: a pane seen holding text stays
-     refused until a turn end with a clean screen reading proves the text
-     left (INVARIANTS rule 12).
+     refused until a turn end with a clean screen reading consumes it, or a
+     settled output observation proves that the operator erased the visible
+     composer (INVARIANTS rule 12).
 4. Just before pasting, re-read title and capture once more (the gate
    snapshot must be fresher than any human keystroke round-trip). The
    admitted pid is the agent's, resolved fresh; a process table that

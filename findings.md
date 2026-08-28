@@ -2150,3 +2150,37 @@ measured color encodings at the anchored `Gemini` prefix. Rejected alternatives:
 disabling the trailer requirement, accepting arbitrary SGR, or treating the
 visible doorbell alone as ownership proof. Each would weaken the active
 composer boundary instead of teaching the manifest the measured vendor chrome.
+
+## F78. A visible draft erased without submission left the notification asleep
+
+MEASURED 2026-08-28 on installed Cyclops build `87f3ffa`, AGY 1.1.22, and
+tmux 3.6a. A person typed the 20-byte draft `HUMAN DRAFT MUST WIN`; status
+correctly reported `idle_with_input`, `composer_semantic: human_input`, and
+`write_ready: false`. A message accepted during that draft remained at FIFO
+position 1 with one notification attempt and `write_block: composer_hold`.
+No terminal bytes were written.
+
+The person then sent exactly 20 Backspace keys. The composer became visibly
+empty and status changed to `idle` with `composer_semantic: clean`, but the
+same attempt remained in `gating` until `cyclops wait --until turn-ended`
+timed out after 60 seconds. The hold state was `Staged`, and
+`ComposerHold::advance` could clear it only after a turn started and ended.
+Deleting a draft starts no turn, so the release branch was unreachable.
+
+Fix: an unowned human-input hold may retire when the existing 300 ms output
+settle boundary observes a fresh exact `clean` composer rule on the same live
+pane. The ordinary capture path still cannot release it, and partial input,
+ghost suggestions, ambiguous or stale evidence, pane modes, blocked states,
+replacement occupants, and every daemon-owned or restart-recovered hold remain
+refused. The readiness edge re-evaluates the existing notification attempt; it
+does not requeue it or mint a replacement attempt.
+
+Probe:
+`a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt`
+teaches the fixture real Backspace deletion, proves the initial hold, erases
+one character per key, and requires the same attempt to reach exactly one
+write with no body disclosure and no `notification_requeued` fact. The prior
+single-frame and active hidden-frame tests remain fail-closed. A vendor mode
+that hides undiscarded bytes behind the same settled clean chrome is outside
+the generic screen contract and must expose a non-clean manifest rule if it
+needs stronger treatment.
