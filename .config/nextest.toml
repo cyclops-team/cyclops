@@ -12,6 +12,30 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 retries = 0
 fail-fast = false
 
+# Tmux-backed integration tests each own a private server, shell processes,
+# and several one-shot tmux clients. Eight such test processes can exhaust the
+# macOS runner's process budget even though every individual test is bounded.
+# Keep pure tests on the full pool and bound only the binaries that start tmux.
+[test-groups]
+tmux-rig = { max-threads = 4 }
+
+[[profile.default.overrides]]
+filter = '''
+  (binary_id(cyclops-tmux::*) & kind(test)) |
+  binary_id(cyclops-workspace::baseline) |
+  binary_id(cyclops-workspace::boot) |
+  binary_id(cyclops-workspace::geometry) |
+  binary_id(cyclops-workspace::hydration) |
+  binary_id(cyclops::bare_cyclops) |
+  binary_id(cyclops::sizing_cli) |
+  binary_id(cyclops::workspace_boot_sizing) |
+  binary_id(cyclops::workspace_cli) |
+  binary_id(cyclops-testrig::shell_teardown) |
+  binary_id(cyclops-testrig::teardown) |
+  binary_id(cyclops-testrig::teardown_has_one_home)
+'''
+test-group = 'tmux-rig'
+
 # Nextest launches every test in its own process. That bypasses the
 # workspace performance suite's in-process serial lock and lets its tmux
 # floods compete with the UI suites' wall-clock budgets. Give each of these

@@ -2129,9 +2129,12 @@ async fn a_transient_hidden_frame_does_not_bypass_the_active_human_hold() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
+    let manifest =
+        CAT_MANIFEST.replacen("lifecycle_evidence = false", "lifecycle_evidence = true", 1);
+    assert_ne!(manifest, CAT_MANIFEST, "fixture lifecycle override applies");
     let mut rig = Rig::new(
         "workspace-hidden-human-draft",
-        CAT_MANIFEST,
+        &manifest,
         &composer_pane(),
         "",
     )
@@ -2144,19 +2147,24 @@ async fn a_transient_hidden_frame_does_not_bypass_the_active_human_hold() {
         .run_ok(&["send-keys", "-l", "-t", &pane, "human draft stays private"]);
     rig.tmux.wait_screen("main", "human draft stays private");
     wait_for_human_composer_evidence(&mut rig, &pane).await;
+    wait_pane_state(&mut rig, "idle_with_input").await;
 
-    // The fixture keeps the bytes staged but stops drawing them. An immediate
-    // clean-looking frame is not the settled output boundary and cannot clear
-    // the active hold before this attempt gates.
+    // Establish the durable barrier before hiding the text. The previous test
+    // sent only after C-g, so a loaded runner could cross the 300ms output
+    // settlement boundary first and legitimately release the unowned hold.
+    // That tested scheduler speed instead of the promised transient-frame
+    // behavior.
+    let pair = send_waiting_pair(&rig, "hidden-draft").await;
+    wait_for_notification_state(&mut rig, &pair.first, NotificationState::BlockedPreWrite).await;
+
+    // The fixture keeps the bytes staged but stops drawing them. This one
+    // clean-looking frame cannot bypass the already durable hold.
     rig.tmux.run_ok(&["send-keys", "-t", &pane, "C-g"]);
-    wait_pane_state(&mut rig, "idle").await;
     assert!(!rig
         .tmux
         .capture(&pane)
         .contains("human draft stays private"));
 
-    let pair = send_waiting_pair(&rig, "hidden-draft").await;
-    wait_for_notification_state(&mut rig, &pair.first, NotificationState::BlockedPreWrite).await;
     let held = notification_transition(&rig, &pair.first, NotificationState::BlockedPreWrite)
         .expect("the transient hidden frame remains a durable pre-write block");
     let held = held.data.as_ref().expect("blocked transition data");
