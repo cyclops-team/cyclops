@@ -89,11 +89,11 @@ whenever coverage grows.
 - Renaming a watched session (folder-following does this) is followed live:
   the watcher matches the rename by the session's stable tmux id and the
   daemon's slot and durable adoption records move to the new name in place,
-  so watching continues with no re-registration. Two edges remain: the open
-  ledger file keeps its old-name path for that daemon run (a system line
-  records the rename), and `config.toml`'s `sessions` list is not rewritten,
-  so a restarted daemon waits on the old name until something re-registers
-  the new one.
+  so watching continues with no re-registration. The open ledger keeps its
+  old-name path for continuity, and the authenticated system rename line is
+  replayed at boot only when its old-name chain and persisted live identity
+  validate. A restarted daemon then reconnects by stable tmux id without
+  rewriting `config.toml` or creating an old-name ghost.
 - Agent activity detection remains version-specific and conservative. Unknown
   chrome or a vendor version without sufficient current evidence holds terminal
   writes instead of guessing. The 2026-08-25 evidence snapshot is:

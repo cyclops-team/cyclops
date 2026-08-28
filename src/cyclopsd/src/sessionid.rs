@@ -85,7 +85,6 @@ impl SessionIdentityRegistry {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn instance_of(&self, key: &LiveSessionKey) -> Option<SessionInstanceId> {
         self.by_key.get(key).copied()
     }
