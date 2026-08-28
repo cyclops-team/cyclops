@@ -1805,6 +1805,16 @@ async fn a_human_modal_holds_one_notification_attempt_until_the_prompt_is_cleare
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
 
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    rig.daemon.set_inject_pause(move |phase| {
+        let entered_tx = entered_tx.clone();
+        Box::pin(async move {
+            if phase == "post_final_prewrite" {
+                let _ = entered_tx.send(());
+            }
+        })
+    });
+
     let pair = send_waiting_pair(&rig, "modal").await;
 
     rig.ev
@@ -1825,15 +1835,27 @@ async fn a_human_modal_holds_one_notification_attempt_until_the_prompt_is_cleare
     );
 
     rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
-    // The clear first has to reach the delivery state machine. Waiting on
-    // that durable boundary separates a missed release edge from a pane-paint
-    // delay, and leaves the screen assertion to prove the subsequent write.
+    // The clear first has to reach the delivery state machine and pass all
+    // pre-write checks to the post_final_prewrite boundary, then complete
+    // staging. Waiting on these durable latches separates a missed release
+    // edge from a pane-paint delay, and leaves the screen capture to assert
+    // the final verified doorbell.
+    tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+        .await
+        .expect("reopen must reach the post_final_prewrite execution boundary")
+        .expect("pause sender stayed open");
     wait_for_notification_state(&mut rig, &pair.first, NotificationState::Writing).await;
-    let released = wait_for_doorbell(&rig, &pane, &pair.first).await;
+    wait_for_notification_state(&mut rig, &pair.first, NotificationState::Staged).await;
+    let released = rig.tmux.capture(&pane);
+    let expected = current_compact_doorbell(&rig, &pair.first)
+        .expect("staged attempt must have a formatted doorbell");
+    assert!(
+        released.contains(&expected),
+        "doorbell was not shown: {released}"
+    );
     assert!(!released.contains("first body"));
     assert!(!released.contains(&pair.second));
     assert_only_oldest_attempt_exists(&rig, &pair);
-    wait_for_notification_state(&mut rig, &pair.first, NotificationState::Staged).await;
     assert_eq!(
         notification_state_count(&rig, &pair.first, NotificationState::Staged),
         1
