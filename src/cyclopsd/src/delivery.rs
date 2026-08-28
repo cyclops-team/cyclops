@@ -11887,6 +11887,7 @@ composer_trailer_required_prefix = 1
             name_reconcile_pause: StdMutex::new(None),
             fail_chrome_restore: AtomicBool::new(false),
             fail_next_final_binding_observation: AtomicBool::new(false),
+            fail_next_admitted_binding_observation: AtomicBool::new(false),
             fail_pre_record_writing: StdMutex::new(None),
             workspace_ui: StdMutex::new(crate::workspace_ui::WorkspaceUiState::default()),
             shutdown_request: watch::channel(false).0,

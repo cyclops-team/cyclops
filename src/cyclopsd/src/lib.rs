@@ -288,6 +288,9 @@ pub(crate) struct Inner {
     /// Test-only: make the next final pre-write process observation
     /// unavailable after the admitting capture has completed.
     pub(crate) fail_next_final_binding_observation: AtomicBool,
+    /// Test-only: make the next admitted binding observation during fusion
+    /// recomputation unprovable to simulate transient identity lapses.
+    pub(crate) fail_next_admitted_binding_observation: AtomicBool,
     /// Test-only: fail at the synchronous on_write boundary before record_writing for a specific attempt.
     pub(crate) fail_pre_record_writing: StdMutex<Option<NotificationAttemptId>>,
     /// Last-active workspace/tab for the terminal workspace UI.
@@ -1925,6 +1928,15 @@ impl Daemon {
             .store(true, Ordering::SeqCst);
     }
 
+    /// Test-only seam: fail the next admitted binding observation during fusion
+    /// recomputation. Simulates transient process-table identity lapses.
+    #[doc(hidden)]
+    pub fn fail_next_admitted_binding_observation(&self) {
+        self.inner
+            .fail_next_admitted_binding_observation
+            .store(true, Ordering::SeqCst);
+    }
+
     /// Test-only seam: fail the workspace journal append during recovery for one exact attempt.
     #[doc(hidden)]
     pub fn fail_notification_recovery_append(&self, attempt_id: NotificationAttemptId) {
@@ -3186,6 +3198,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         name_reconcile_pause: StdMutex::new(None),
         fail_chrome_restore: AtomicBool::new(false),
         fail_next_final_binding_observation: AtomicBool::new(false),
+        fail_next_admitted_binding_observation: AtomicBool::new(false),
         fail_pre_record_writing: StdMutex::new(None),
         workspace_ui: StdMutex::new(workspace_ui::WorkspaceUiState::default()),
         shutdown_request,
@@ -5290,6 +5303,7 @@ mod tests {
             name_reconcile_pause: StdMutex::new(None),
             fail_chrome_restore: AtomicBool::new(false),
             fail_next_final_binding_observation: AtomicBool::new(false),
+            fail_next_admitted_binding_observation: AtomicBool::new(false),
             fail_pre_record_writing: StdMutex::new(None),
             workspace_ui: StdMutex::new(workspace_ui::WorkspaceUiState::default()),
             shutdown_request: watch::channel(false).0,
