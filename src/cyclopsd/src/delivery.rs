@@ -8414,23 +8414,32 @@ fn exact_staging_snapshot_matches(
         && current.map(|(matched, _)| matched) == Some(id_staged)
 }
 
-/// Closed proof outcomes for the Gate 7 stage-and-clear harness seam.
+/// Closed screen-representation outcomes for the Gate 7 component harness.
+///
+/// This proof cannot authorize delivery. It deliberately excludes process
+/// binding, pane mode, action safety, and durable composer holds. The daemon's
+/// normal gate remains the only authority for a real write.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ComposerSeamProof {
+pub enum ComposerRepresentationProof {
     ExactStaged,
-    Clean,
+    WriteSafeClean,
+    WriteSafeGhost,
     HiddenOrAmbiguous,
 }
 
-/// Evaluates active composer state directly via production exact staging and clean proof paths.
+/// Classifies the visible composer through production representation parsers.
+///
+/// Callers must not use this as a write-readiness decision. It exists only so
+/// the opt-in live harness can measure the same exact staged-row and
+/// clean-or-ghost screen representations the daemon consumes.
 #[doc(hidden)]
-pub fn prove_composer_seam(
+pub fn prove_composer_representation(
     manifest: &Manifest,
     screen: &str,
     expected_staged: Option<&str>,
-) -> ComposerSeamProof {
+) -> ComposerRepresentationProof {
     if let Some(expected) = expected_staged {
         if exact_staging_proof(
             manifest,
@@ -8440,19 +8449,22 @@ pub fn prove_composer_seam(
         )
         .is_some()
         {
-            return ComposerSeamProof::ExactStaged;
+            return ComposerRepresentationProof::ExactStaged;
         }
-    } else if let ComposerContentProof::Visible(content) = exact_composer_content_for_state(
-        manifest,
-        screen,
-        AgentState::Idle,
-        Some(ComposerSemantic::Clean),
-    ) {
-        if content.is_empty() {
-            return ComposerSeamProof::Clean;
+    } else {
+        if clean_composer_proof(manifest, screen) {
+            return ComposerRepresentationProof::WriteSafeClean;
+        }
+        let plain = strip_csi(screen);
+        let winner = fusion::screen_winner_esc(manifest, &plain, Some(screen));
+        if winner.is_some_and(|rule| {
+            rule.state == AgentState::Idle
+                && rule.composer_semantic == Some(ComposerSemantic::GhostSuggestion)
+        }) {
+            return ComposerRepresentationProof::WriteSafeGhost;
         }
     }
-    ComposerSeamProof::HiddenOrAmbiguous
+    ComposerRepresentationProof::HiddenOrAmbiguous
 }
 
 /// Extract exact visible composer rows from a joined escaped capture.

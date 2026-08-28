@@ -1,7 +1,7 @@
 //! Gate 7 Stage-and-Clear Evidence Soak Component.
 //!
 //! Narrow Scope: Validates Doorbell Format 3 staging representation detection
-//! and clean clear teardown against dynamically installed AI agent CLIs.
+//! and composer-clear representation against dynamically installed AI agent CLIs.
 //! This harness is strictly one component of Gate 7 evidence, not the complete
 //! Gate 7 certification or frozen campaign closure.
 //!
@@ -13,7 +13,9 @@
 //! 3. Zero Mutation: Ordinary tests validate schemas and guards without
 //!    invoking vendor binaries or modifying committed evidence.
 //! 4. F24 Isolation: Ephemeral scratch directories rooted via `cyclops_proto::scratch::scratch_dir`.
-//! 5. Production Seam: Staging and clean clear proofs evaluated directly via `prove_composer_seam`.
+//! 5. Production Parser: Staging and clear representations are classified by
+//!    the daemon's exact screen parser. This component never authorizes a
+//!    delivery and does not replace process binding or the full injection gate.
 //! 6. Fail-Closed: Immediate defect abortion with non-zero test exit on failure.
 
 #![allow(dead_code)]
@@ -26,7 +28,7 @@ use cyclops_manifest::{load_dir, Manifest};
 use cyclops_proto::scratch::{scratch_dir, scratch_root};
 use cyclops_proto::{render_doorbell_v3, NotificationAttemptId};
 use cyclops_testrig::TmuxServer;
-use cyclopsd::{prove_composer_seam, ComposerSeamProof};
+use cyclopsd::{prove_composer_representation, ComposerRepresentationProof};
 use serde::{Deserialize, Serialize};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
@@ -53,6 +55,10 @@ pub enum ClosedReasonCode {
     VerificationMismatch,
     ClearFailed,
     InitialIdleTimeout,
+    VendorLaunchFailed,
+    StageCommandFailed,
+    ClearCommandFailed,
+    HarnessAborted,
     VendorUnavailable,
     OptInRequired,
     BinaryIdentityMismatch,
@@ -105,7 +111,7 @@ pub struct ProofCounts {
     pub sentinel_proof: usize,
     pub collapsed_chip: usize,
     pub structural_trailer: usize,
-    pub clean_clears: usize,
+    pub safe_clear_representations: usize,
     pub failures: usize,
 }
 
@@ -150,8 +156,8 @@ pub struct ObservationRecord {
     pub discovered_version: String,
     pub terminal_dimensions: (u16, u16),
     pub structural_input_metrics: StructuralInputMetrics,
-    pub proof_classification: ComposerSeamProof,
-    pub clear_verified: bool,
+    pub proof_classification: ComposerRepresentationProof,
+    pub clear_representation_verified: bool,
     pub latency_metrics_ms: LatencyMetricsMs,
     pub verdict: CampaignVerdict,
     pub reason_code: ClosedReasonCode,
@@ -176,9 +182,42 @@ pub struct StageAndClearComponentReport {
     pub host_platform: HostPlatformMetadata,
     pub campaign_metadata: CampaignMetadata,
     pub component_verdict: CampaignVerdict,
+    pub component_reason_code: ClosedReasonCode,
     pub gate7_closed_cell_inventory: Vec<Gate7CellStatus>,
     pub vendor_summaries: Vec<VendorSummary>,
     pub observations: Vec<ObservationRecord>,
+}
+
+struct FailureArtifactGuard {
+    path: PathBuf,
+    report: Option<StageAndClearComponentReport>,
+}
+
+impl FailureArtifactGuard {
+    fn new(path: PathBuf, report: StageAndClearComponentReport) -> Self {
+        Self {
+            path,
+            report: Some(report),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.report = None;
+    }
+}
+
+impl Drop for FailureArtifactGuard {
+    fn drop(&mut self) {
+        let Some(report) = self.report.take() else {
+            return;
+        };
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&report) {
+            let _ = std::fs::write(&self.path, json);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -390,22 +429,18 @@ pub fn verify_checkout_integrity(expected_sha: &str) -> Result<GitCommitMetadata
     })
 }
 
-/// Pure verifier for build ref against caller-supplied 40-character SHA.
-pub fn verify_build_ref_pure(build_ref: &str, expected_sha: &str) -> Result<(), String> {
+/// Pure verifier for the exact build identity against a frozen commit.
+pub fn verify_build_id_pure(build_id: &str, expected_sha: &str) -> Result<(), String> {
     validate_sha40(expected_sha)?;
-    if build_ref.is_empty() || build_ref == "unknown" {
-        return Err("build ref is empty or unknown".to_string());
+    if build_id.is_empty() || build_id == "unknown" {
+        return Err("build identity is empty or unknown".to_string());
     }
-    if build_ref.contains(".dirty") {
-        return Err("build ref indicates dirty tree".to_string());
+    if build_id.contains(".dirty") {
+        return Err("build identity indicates dirty sources".to_string());
     }
-    if build_ref.len() < 7 || build_ref.len() > 40 {
-        return Err(format!("build ref length {} invalid", build_ref.len()));
-    }
-    let expected_prefix = &expected_sha[..build_ref.len()];
-    if build_ref != expected_prefix {
+    if build_id != expected_sha {
         return Err(format!(
-            "build ref {build_ref} does not match expected SHA prefix {expected_prefix}"
+            "build identity {build_id} does not exactly match frozen SHA {expected_sha}"
         ));
     }
     Ok(())
@@ -414,7 +449,7 @@ pub fn verify_build_ref_pure(build_ref: &str, expected_sha: &str) -> Result<(), 
 /// Verifies that the compiled library/test build ref matches the caller SHA.
 pub fn verify_build_ref_integrity(expected_sha: &str) -> Result<GitCommitMetadata, String> {
     let meta = verify_checkout_integrity(expected_sha)?;
-    verify_build_ref_pure(env!("CYCLOPS_BUILD_REF"), expected_sha)?;
+    verify_build_id_pure(env!("CYCLOPS_BUILD_ID"), expected_sha)?;
     Ok(meta)
 }
 
@@ -522,8 +557,8 @@ fn trial_observation(
     platform_tuple: &str,
     discovered_version: &str,
     structural_input_metrics: StructuralInputMetrics,
-    proof_classification: ComposerSeamProof,
-    clear_verified: bool,
+    proof_classification: ComposerRepresentationProof,
+    clear_representation_verified: bool,
     staging_detection_ms: f64,
     clear_teardown_ms: f64,
     total_wall_ms: f64,
@@ -540,7 +575,7 @@ fn trial_observation(
         terminal_dimensions: (width, 24),
         structural_input_metrics,
         proof_classification,
-        clear_verified,
+        clear_representation_verified,
         latency_metrics_ms: LatencyMetricsMs {
             staging_detection_ms,
             clear_teardown_ms,
@@ -552,6 +587,27 @@ fn trial_observation(
 }
 
 fn validate_report_consistency(report: &StageAndClearComponentReport) -> Result<(), String> {
+    let reason_matches_verdict = match report.component_verdict {
+        CampaignVerdict::Passed => {
+            report.component_reason_code == ClosedReasonCode::AllTrialsVerified
+        }
+        CampaignVerdict::Failed => !matches!(
+            report.component_reason_code,
+            ClosedReasonCode::AllTrialsVerified
+                | ClosedReasonCode::RequiredVendorLimitation
+                | ClosedReasonCode::AdminDecisionRequired
+        ),
+        CampaignVerdict::Limitation => {
+            report.component_reason_code == ClosedReasonCode::RequiredVendorLimitation
+        }
+        CampaignVerdict::AdminDecision => {
+            report.component_reason_code == ClosedReasonCode::AdminDecisionRequired
+        }
+    };
+    if !reason_matches_verdict {
+        return Err("component reason code contradicts component verdict".to_string());
+    }
+
     if report.campaign_metadata.total_trials != report.observations.len() {
         return Err("campaign total_trials does not equal observation count".to_string());
     }
@@ -637,7 +693,11 @@ pub fn assert_no_sentinels(val: &serde_json::Value, sentinels: &[&str]) {
     }
 }
 
-/// Builds the explicit closed cell inventory for Gate 7 requirements.
+/// Builds the single cell this component is capable of measuring.
+///
+/// The full Gate 7 inventory belongs to the frozen-candidate campaign. Keeping
+/// unrelated cells out of this artifact prevents an unexecuted requirement
+/// from looking certified merely because it appeared in a component report.
 pub fn build_gate7_cell_inventory(stage_cell_verdict: CampaignVerdict) -> Vec<Gate7CellStatus> {
     let stage_reason = match stage_cell_verdict {
         CampaignVerdict::Passed => ClosedReasonCode::AllTrialsVerified,
@@ -646,73 +706,14 @@ pub fn build_gate7_cell_inventory(stage_cell_verdict: CampaignVerdict) -> Vec<Ga
         CampaignVerdict::AdminDecision => ClosedReasonCode::AdminDecisionRequired,
     };
 
-    vec![
-        Gate7CellStatus {
-            cell_id: "g7_stage_and_clear_soak".to_string(),
-            description: "Live Doorbell Format 3 staging representation and clean clear teardown"
-                .to_string(),
-            coverage_tier: "STAGE_CLEAR_SOAK_HARNESS".to_string(),
-            verdict: Some(stage_cell_verdict),
-            reason_code: stage_reason,
-        },
-        Gate7CellStatus {
-            cell_id: "g7_fresh_launch_idle".to_string(),
-            description: "Process spawn, PID binding, and idle composer admission".to_string(),
-            coverage_tier: "INTEGRATION_TEST_SUITE".to_string(),
-            verdict: None,
-            reason_code: ClosedReasonCode::OutOfScopeIntegrationSuite,
-        },
-        Gate7CellStatus {
-            cell_id: "g7_session_resume_and_restart".to_string(),
-            description: "Session resume and daemon restart queue recovery".to_string(),
-            coverage_tier: "INTEGRATION_TEST_SUITE".to_string(),
-            verdict: None,
-            reason_code: ClosedReasonCode::OutOfScopeIntegrationSuite,
-        },
-        Gate7CellStatus {
-            cell_id: "g7_socket_claim_and_reply".to_string(),
-            description: "Socket inbox claim via peer credentials and reply correlation"
-                .to_string(),
-            coverage_tier: "INTEGRATION_TEST_SUITE".to_string(),
-            verdict: None,
-            reason_code: ClosedReasonCode::OutOfScopeIntegrationSuite,
-        },
-        Gate7CellStatus {
-            cell_id: "g7_working_spinner_generation".to_string(),
-            description: "Title and screen Braille spinner detection mid-turn".to_string(),
-            coverage_tier: "INTEGRATION_TEST_SUITE".to_string(),
-            verdict: None,
-            reason_code: ClosedReasonCode::OutOfScopeIntegrationSuite,
-        },
-        Gate7CellStatus {
-            cell_id: "g7_multiline_and_collapsed_chip".to_string(),
-            description: "Multiline payload wrapping and collapsed chip hold".to_string(),
-            coverage_tier: "INTEGRATION_TEST_SUITE".to_string(),
-            verdict: None,
-            reason_code: ClosedReasonCode::OutOfScopeIntegrationSuite,
-        },
-        Gate7CellStatus {
-            cell_id: "g7_modal_dialogs_trust_approval".to_string(),
-            description: "Directory trust and command approval modal hold".to_string(),
-            coverage_tier: "OFFLINE_FIXTURE".to_string(),
-            verdict: None,
-            reason_code: ClosedReasonCode::OutOfScopeOfflineFixture,
-        },
-        Gate7CellStatus {
-            cell_id: "g7_quota_exhaustion_banner".to_string(),
-            description: "Rate limit and quota exhaustion parking".to_string(),
-            coverage_tier: "OFFLINE_FIXTURE".to_string(),
-            verdict: None,
-            reason_code: ClosedReasonCode::OutOfScopeOfflineFixture,
-        },
-        Gate7CellStatus {
-            cell_id: "g7_cursor_offline_gate".to_string(),
-            description: "Cursor agent honest absence and fixture parsing".to_string(),
-            coverage_tier: "OFFLINE_FIXTURE".to_string(),
-            verdict: None,
-            reason_code: ClosedReasonCode::OutOfScopeOfflineFixture,
-        },
-    ]
+    vec![Gate7CellStatus {
+        cell_id: "g7_stage_and_clear_representation".to_string(),
+        description: "Live Doorbell Format 3 staging and composer-clear screen representation"
+            .to_string(),
+        coverage_tier: "STAGE_CLEAR_COMPONENT".to_string(),
+        verdict: Some(stage_cell_verdict),
+        reason_code: stage_reason,
+    }]
 }
 
 /// Evaluates overall component verdict given individual vendor summaries.
@@ -797,6 +798,17 @@ where
     predicate()
 }
 
+fn representation_is_write_safe(proof: ComposerRepresentationProof) -> bool {
+    matches!(
+        proof,
+        ComposerRepresentationProof::WriteSafeClean | ComposerRepresentationProof::WriteSafeGhost
+    )
+}
+
+fn has_measured_clear_action(manifest: &Manifest) -> bool {
+    !manifest.injection.clear_keys.is_empty()
+}
+
 // ---------------------------------------------------------------------------
 // Unit Tests for Harness Safety, Schema & Guards (Run in Ordinary Test Suite)
 // ---------------------------------------------------------------------------
@@ -811,15 +823,14 @@ fn test_sha40_validation_rules() {
 }
 
 #[test]
-fn test_pure_build_ref_verifier() {
+fn test_pure_build_identity_verifier_requires_exact_clean_sha() {
     let sha = "5ee0f17e00000000000000000000000000000000";
-    assert!(verify_build_ref_pure("5ee0f17", sha).is_ok());
-    assert!(verify_build_ref_pure(sha, sha).is_ok());
-    assert!(verify_build_ref_pure("5ee0f17.dirty", sha).is_err());
-    assert!(verify_build_ref_pure("unknown", sha).is_err());
-    assert!(verify_build_ref_pure("", sha).is_err());
-    assert!(verify_build_ref_pure("5ee0f1", sha).is_err()); // < 7 chars
-    assert!(verify_build_ref_pure("deadbeef", sha).is_err()); // mismatch
+    assert!(verify_build_id_pure(sha, sha).is_ok());
+    assert!(verify_build_id_pure("5ee0f17", sha).is_err());
+    assert!(verify_build_id_pure("5ee0f17e00000000000000000000000000000000.dirty", sha).is_err());
+    assert!(verify_build_id_pure("unknown", sha).is_err());
+    assert!(verify_build_id_pure("", sha).is_err());
+    assert!(verify_build_id_pure("deadbeefe00000000000000000000000000000000", sha).is_err());
 }
 
 #[test]
@@ -867,11 +878,12 @@ fn test_schema_serialization_round_trip() {
         campaign_metadata: CampaignMetadata {
             campaign_name: "Gate 7 Stage-and-Clear Soak".to_string(),
             opt_in_flag: "CYCLOPS_LIVE_VENDOR=1".to_string(),
-            metric_scope: "staging representation and clean teardown".to_string(),
+            metric_scope: "staging and composer-clear representation".to_string(),
             total_trials: 0,
             total_duration_ms: 0.0,
         },
         component_verdict: CampaignVerdict::Limitation,
+        component_reason_code: ClosedReasonCode::RequiredVendorLimitation,
         gate7_closed_cell_inventory: build_gate7_cell_inventory(CampaignVerdict::Limitation),
         vendor_summaries: vec![],
         observations: vec![],
@@ -883,7 +895,7 @@ fn test_schema_serialization_round_trip() {
     assert_eq!(deserialized.schema_version, "1.0.0");
     assert_eq!(deserialized.git_commit.sha, report.git_commit.sha);
     assert_eq!(deserialized.component_verdict, CampaignVerdict::Limitation);
-    assert_eq!(deserialized.gate7_closed_cell_inventory.len(), 9);
+    assert_eq!(deserialized.gate7_closed_cell_inventory.len(), 1);
 }
 
 #[test]
@@ -922,7 +934,7 @@ fn test_missing_vendor_prevents_passed_verdict() {
             widths_tested: vec![60, 100],
             proof_counts: ProofCounts {
                 exact_row_proof: 2,
-                clean_clears: 2,
+                safe_clear_representations: 2,
                 ..Default::default()
             },
             verdict: CampaignVerdict::Passed,
@@ -968,7 +980,7 @@ fn test_missing_cursor_yields_limitation_when_others_pass() {
             widths_tested: vec![60, 100],
             proof_counts: ProofCounts {
                 exact_row_proof: 2,
-                clean_clears: 2,
+                safe_clear_representations: 2,
                 ..Default::default()
             },
             verdict: CampaignVerdict::Passed,
@@ -986,7 +998,7 @@ fn test_missing_cursor_yields_limitation_when_others_pass() {
             widths_tested: vec![60, 100],
             proof_counts: ProofCounts {
                 exact_row_proof: 2,
-                clean_clears: 2,
+                safe_clear_representations: 2,
                 ..Default::default()
             },
             verdict: CampaignVerdict::Passed,
@@ -1004,7 +1016,7 @@ fn test_missing_cursor_yields_limitation_when_others_pass() {
             widths_tested: vec![60, 100],
             proof_counts: ProofCounts {
                 exact_row_proof: 2,
-                clean_clears: 2,
+                safe_clear_representations: 2,
                 ..Default::default()
             },
             verdict: CampaignVerdict::Passed,
@@ -1129,7 +1141,7 @@ fn test_report_consistency_requires_one_observation_per_attempted_trial() {
         "darwin-arm64",
         "0.150.1",
         structural_metrics_for("cyclops inbox claim m-att_test"),
-        ComposerSeamProof::HiddenOrAmbiguous,
+        ComposerRepresentationProof::HiddenOrAmbiguous,
         false,
         5_000.0,
         0.0,
@@ -1167,11 +1179,12 @@ fn test_report_consistency_requires_one_observation_per_attempted_trial() {
         campaign_metadata: CampaignMetadata {
             campaign_name: "Gate 7 Stage-and-Clear Soak".to_string(),
             opt_in_flag: "CYCLOPS_LIVE_VENDOR=1".to_string(),
-            metric_scope: "staging representation and clean teardown".to_string(),
+            metric_scope: "staging and composer-clear representation".to_string(),
             total_trials: 1,
             total_duration_ms: 5_000.0,
         },
         component_verdict: CampaignVerdict::Failed,
+        component_reason_code: ClosedReasonCode::InitialIdleTimeout,
         gate7_closed_cell_inventory: build_gate7_cell_inventory(CampaignVerdict::Failed),
         vendor_summaries: vec![summary],
         observations: vec![observation],
@@ -1199,6 +1212,49 @@ fn test_f24_scratch_directory_root() {
     assert!(
         scratch.path().starts_with(&expected_root),
         "scratch directory must start with F24 scratch root"
+    );
+}
+
+#[test]
+fn test_failure_guard_writes_a_closed_failed_artifact_on_unwind_path() {
+    let scratch = Gate7ScratchHome::new().expect("create scratch");
+    let path = scratch.path().join("failed-component.json");
+    {
+        let _guard = FailureArtifactGuard::new(
+            path.clone(),
+            StageAndClearComponentReport {
+                schema_version: "1.0.0".to_string(),
+                report_id: "lve-abort-test".to_string(),
+                generated_at: "2026-08-27T20:30:00Z".to_string(),
+                component_scope: "Gate 7 Stage-and-Clear Representation Component".to_string(),
+                git_commit: GitCommitMetadata {
+                    sha: "5ee0f17e00000000000000000000000000000000".to_string(),
+                    tree_clean: true,
+                },
+                host_platform: discover_host_platform(),
+                campaign_metadata: CampaignMetadata {
+                    campaign_name: "Gate 7 Stage-and-Clear Representation Component".to_string(),
+                    opt_in_flag: "CYCLOPS_LIVE_VENDOR=1".to_string(),
+                    metric_scope: "staging and composer-clear representation".to_string(),
+                    total_trials: 0,
+                    total_duration_ms: 0.0,
+                },
+                component_verdict: CampaignVerdict::Failed,
+                component_reason_code: ClosedReasonCode::HarnessAborted,
+                gate7_closed_cell_inventory: build_gate7_cell_inventory(CampaignVerdict::Failed),
+                vendor_summaries: vec![],
+                observations: vec![],
+            },
+        );
+    }
+
+    let value: StageAndClearComponentReport =
+        serde_json::from_slice(&std::fs::read(&path).expect("failure artifact must be written"))
+            .expect("failure artifact schema");
+    assert_eq!(value.component_verdict, CampaignVerdict::Failed);
+    assert_eq!(
+        value.component_reason_code,
+        ClosedReasonCode::HarnessAborted
     );
 }
 
@@ -1257,8 +1313,8 @@ fn test_adversarial_serialized_report_leak_check() {
         discovered_version: "0.150.1".to_string(),
         terminal_dimensions: (60, 24),
         structural_input_metrics: metrics,
-        proof_classification: ComposerSeamProof::ExactStaged,
-        clear_verified: true,
+        proof_classification: ComposerRepresentationProof::ExactStaged,
+        clear_representation_verified: true,
         latency_metrics_ms: LatencyMetricsMs {
             staging_detection_ms: 12.0,
             clear_teardown_ms: 8.0,
@@ -1281,11 +1337,12 @@ fn test_adversarial_serialized_report_leak_check() {
         campaign_metadata: CampaignMetadata {
             campaign_name: "Gate 7 Stage-and-Clear Soak".to_string(),
             opt_in_flag: "CYCLOPS_LIVE_VENDOR=1".to_string(),
-            metric_scope: "staging representation and clean teardown".to_string(),
+            metric_scope: "staging and composer-clear representation".to_string(),
             total_trials: 1,
             total_duration_ms: 20.0,
         },
         component_verdict: CampaignVerdict::Passed,
+        component_reason_code: ClosedReasonCode::AllTrialsVerified,
         gate7_closed_cell_inventory: build_gate7_cell_inventory(CampaignVerdict::Passed),
         vendor_summaries: vec![],
         observations: vec![obs],
@@ -1296,7 +1353,7 @@ fn test_adversarial_serialized_report_leak_check() {
 }
 
 #[test]
-fn test_delivery_prove_composer_seam_regression() {
+fn test_delivery_prove_composer_representation_regression() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources/manifests");
     let manifests = load_dir(&manifest_dir).expect("load shipped manifests");
     let claude = manifests.get("claude").expect("claude manifest");
@@ -1312,8 +1369,8 @@ fn test_delivery_prove_composer_seam_regression() {
            ⏵⏵ bypass permissions on (shift+tab to cycle)"
     );
     assert_eq!(
-        prove_composer_seam(claude, &staged_capture, Some(&format3_doorbell)),
-        ComposerSeamProof::ExactStaged
+        prove_composer_representation(claude, &staged_capture, Some(&format3_doorbell)),
+        ComposerRepresentationProof::ExactStaged
     );
 
     // 2. Different human text -> HiddenOrAmbiguous
@@ -1322,8 +1379,8 @@ fn test_delivery_prove_composer_seam_regression() {
            Haiku 4.5 · low · ~ · Ctx: 76% · 200K window · 47K used\n\
            ⏵⏵ bypass permissions on (shift+tab to cycle)";
     assert_eq!(
-        prove_composer_seam(claude, different_human_capture, Some(&format3_doorbell)),
-        ComposerSeamProof::HiddenOrAmbiguous
+        prove_composer_representation(claude, different_human_capture, Some(&format3_doorbell)),
+        ComposerRepresentationProof::HiddenOrAmbiguous
     );
 
     // 3. True empty composer -> Clean
@@ -1332,8 +1389,8 @@ fn test_delivery_prove_composer_seam_regression() {
            Haiku 4.5 · low · ~ · Ctx: 76% · 200K window · 47K used\n\
            ⏵⏵ bypass permissions on (shift+tab to cycle)";
     assert_eq!(
-        prove_composer_seam(claude, clean_empty_capture, None),
-        ComposerSeamProof::Clean
+        prove_composer_representation(claude, clean_empty_capture, None),
+        ComposerRepresentationProof::WriteSafeClean
     );
 
     // 4. Tabs and non-breaking spaces are composer bytes, not terminal padding.
@@ -1343,8 +1400,8 @@ fn test_delivery_prove_composer_seam_regression() {
            Haiku 4.5 · low · ~ · Ctx: 76% · 200K window · 47K used\n\
            ⏵⏵ bypass permissions on (shift+tab to cycle)";
     assert_eq!(
-        prove_composer_seam(claude, whitespace_tab_capture, None),
-        ComposerSeamProof::HiddenOrAmbiguous
+        prove_composer_representation(claude, whitespace_tab_capture, None),
+        ComposerRepresentationProof::HiddenOrAmbiguous
     );
 
     let whitespace_nbsp_capture = "❯\u{a0}\u{a0}\n\
@@ -1352,9 +1409,36 @@ fn test_delivery_prove_composer_seam_regression() {
            Haiku 4.5 · low · ~ · Ctx: 76% · 200K window · 47K used\n\
            ⏵⏵ bypass permissions on (shift+tab to cycle)";
     assert_eq!(
-        prove_composer_seam(claude, whitespace_nbsp_capture, None),
-        ComposerSeamProof::HiddenOrAmbiguous
+        prove_composer_representation(claude, whitespace_nbsp_capture, None),
+        ComposerRepresentationProof::HiddenOrAmbiguous
     );
+
+    let codex = manifests.get("codex").expect("codex manifest");
+    let codex_ghost =
+        include_str!("../../cyclops-manifest/tests/fixtures/codex_ghost_composer_esc.txt");
+    assert_eq!(
+        prove_composer_representation(codex, codex_ghost, None),
+        ComposerRepresentationProof::WriteSafeGhost,
+        "the component may classify the shipped ghost representation but cannot authorize a write"
+    );
+}
+
+#[test]
+fn test_missing_clear_action_is_a_vendor_neutral_limitation() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../resources/manifests");
+    let manifests = load_dir(&manifest_dir).expect("load shipped manifests");
+    assert!(has_measured_clear_action(
+        manifests.get("codex").expect("codex manifest")
+    ));
+    assert!(has_measured_clear_action(
+        manifests.get("claude").expect("claude manifest")
+    ));
+    assert!(!has_measured_clear_action(
+        manifests.get("agy").expect("agy manifest")
+    ));
+    assert!(!has_measured_clear_action(
+        manifests.get("cursor").expect("cursor manifest")
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -1373,6 +1457,37 @@ fn live_vendor_evidence_campaign_opt_in() {
         .expect("CYCLOPS_FROZEN_SHA must be provided as a 40-character hex SHA");
     let commit_meta = verify_build_ref_integrity(&expected_sha)
         .expect("build ref and checkout integrity verification failed");
+    let host_meta = discover_host_platform();
+    let report_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../validation/raw/soak/stage_and_clear_soak_component_report.json");
+    let mut failure_artifact = FailureArtifactGuard::new(
+        report_path.clone(),
+        StageAndClearComponentReport {
+            schema_version: "1.0.0".to_string(),
+            report_id: format!(
+                "lve-stage-clear-abort-{}-{}",
+                utc_now_iso8601(),
+                &commit_meta.sha[..10]
+            ),
+            generated_at: utc_now_iso8601(),
+            component_scope: "Gate 7 Stage-and-Clear Representation Component".to_string(),
+            git_commit: commit_meta.clone(),
+            host_platform: host_meta.clone(),
+            campaign_metadata: CampaignMetadata {
+                campaign_name: "Gate 7 Stage-and-Clear Representation Component".to_string(),
+                opt_in_flag: "CYCLOPS_LIVE_VENDOR=1".to_string(),
+                metric_scope: "Doorbell Format 3 staging and composer-clear representation"
+                    .to_string(),
+                total_trials: 0,
+                total_duration_ms: 0.0,
+            },
+            component_verdict: CampaignVerdict::Failed,
+            component_reason_code: ClosedReasonCode::HarnessAborted,
+            gate7_closed_cell_inventory: build_gate7_cell_inventory(CampaignVerdict::Failed),
+            vendor_summaries: vec![],
+            observations: vec![],
+        },
+    );
 
     // 3. Prepare isolated RAII 0700 scratch directory conforming to F24
     let scratch = Gate7ScratchHome::new().expect("create scratch directory");
@@ -1412,10 +1527,11 @@ fn live_vendor_evidence_campaign_opt_in() {
             }
 
             let m = manifest.expect("manifest must exist for discovered vendor");
-            let clear_action_available = !m.injection.clear_keys.is_empty();
+            let clear_action_available = has_measured_clear_action(m);
 
-            // AGY Clear Handling: Declare limitation per design without key spam
-            if v == "agy" && !clear_action_available {
+            // A vendor without a measured clear action cannot participate in
+            // this component. Do not guess a key or spam the live composer.
+            if !clear_action_available {
                 return (
                     VendorSummary {
                         vendor_id: v.to_string(),
@@ -1461,7 +1577,7 @@ fn live_vendor_evidence_campaign_opt_in() {
                 // in the exact F24 scratch tree. An installed binary that
                 // cannot reach a clean composer under this isolation fails the
                 // campaign instead of reading or writing the operator's home.
-                server.run_ok(&[
+                let launch = server.run(&[
                     "new-session",
                     "-d",
                     "-s",
@@ -1475,13 +1591,37 @@ fn live_vendor_evidence_campaign_opt_in() {
                     &isolated_launch,
                 ]);
 
+                if !launch.status.success() {
+                    counts.failures += 1;
+                    vendor_failed = true;
+                    failure_reason = Some(ClosedReasonCode::VendorLaunchFailed);
+                    let elapsed = t_trial_start.elapsed().as_secs_f64() * 1000.0;
+                    trial_obs.push(trial_observation(
+                        v,
+                        trial_index,
+                        width,
+                        &commit_meta.sha,
+                        &platform_tuple,
+                        &info.semver_parsed,
+                        metrics,
+                        ComposerRepresentationProof::HiddenOrAmbiguous,
+                        false,
+                        elapsed,
+                        0.0,
+                        elapsed,
+                        CampaignVerdict::Failed,
+                        ClosedReasonCode::VendorLaunchFailed,
+                    ));
+                    break;
+                }
+
                 let target_pane = format!("{session_name}:0.0");
 
-                // 1. Bounded condition wait for initial idle/clean composer
+                // 1. Bounded condition wait for a write-safe composer representation.
                 let initial_clean = wait_condition(STATE_SETTLE_TIMEOUT, || {
                     let esc = server.run(&["capture-pane", "-e", "-p", "-J", "-t", &target_pane]);
                     let raw_esc = String::from_utf8_lossy(&esc.stdout);
-                    prove_composer_seam(m, &raw_esc, None) == ComposerSeamProof::Clean
+                    representation_is_write_safe(prove_composer_representation(m, &raw_esc, None))
                 });
 
                 if !initial_clean {
@@ -1497,7 +1637,7 @@ fn live_vendor_evidence_campaign_opt_in() {
                         &platform_tuple,
                         &info.semver_parsed,
                         metrics,
-                        ComposerSeamProof::HiddenOrAmbiguous,
+                        ComposerRepresentationProof::HiddenOrAmbiguous,
                         false,
                         elapsed,
                         0.0,
@@ -1510,14 +1650,38 @@ fn live_vendor_evidence_campaign_opt_in() {
                 }
 
                 // 2. Stage format 3 compact doorbell
-                server.run_ok(&["send-keys", "-t", &target_pane, "-l", &doorbell_cmd]);
+                let stage = server.run(&["send-keys", "-t", &target_pane, "-l", &doorbell_cmd]);
+                if !stage.status.success() {
+                    counts.failures += 1;
+                    vendor_failed = true;
+                    failure_reason = Some(ClosedReasonCode::StageCommandFailed);
+                    let elapsed = t_trial_start.elapsed().as_secs_f64() * 1000.0;
+                    trial_obs.push(trial_observation(
+                        v,
+                        trial_index,
+                        width,
+                        &commit_meta.sha,
+                        &platform_tuple,
+                        &info.semver_parsed,
+                        metrics,
+                        ComposerRepresentationProof::HiddenOrAmbiguous,
+                        false,
+                        elapsed,
+                        0.0,
+                        elapsed,
+                        CampaignVerdict::Failed,
+                        ClosedReasonCode::StageCommandFailed,
+                    ));
+                    server.run(&["kill-session", "-t", &session_name]);
+                    break;
+                }
 
                 // 3. Bounded condition wait for exact staging proof
                 let staged_verified = wait_condition(STATE_SETTLE_TIMEOUT, || {
                     let esc = server.run(&["capture-pane", "-e", "-p", "-J", "-t", &target_pane]);
                     let raw_esc = String::from_utf8_lossy(&esc.stdout);
-                    prove_composer_seam(m, &raw_esc, Some(&doorbell_cmd))
-                        == ComposerSeamProof::ExactStaged
+                    prove_composer_representation(m, &raw_esc, Some(&doorbell_cmd))
+                        == ComposerRepresentationProof::ExactStaged
                 });
 
                 let t_stage = t_trial_start.elapsed().as_secs_f64() * 1000.0;
@@ -1535,7 +1699,7 @@ fn live_vendor_evidence_campaign_opt_in() {
                         &platform_tuple,
                         &info.semver_parsed,
                         metrics,
-                        ComposerSeamProof::HiddenOrAmbiguous,
+                        ComposerRepresentationProof::HiddenOrAmbiguous,
                         false,
                         t_stage,
                         0.0,
@@ -1550,19 +1714,51 @@ fn live_vendor_evidence_campaign_opt_in() {
 
                 // 4. Clear execution with bounded wait
                 let t_clear_start = Instant::now();
+                let mut clear_command_ok = true;
                 for k in &m.injection.clear_keys {
-                    server.run(&["send-keys", "-t", &target_pane, k]);
+                    if !server
+                        .run(&["send-keys", "-t", &target_pane, k])
+                        .status
+                        .success()
+                    {
+                        clear_command_ok = false;
+                        break;
+                    }
+                }
+                if !clear_command_ok {
+                    counts.failures += 1;
+                    vendor_failed = true;
+                    failure_reason = Some(ClosedReasonCode::ClearCommandFailed);
+                    let elapsed = t_trial_start.elapsed().as_secs_f64() * 1000.0;
+                    trial_obs.push(trial_observation(
+                        v,
+                        trial_index,
+                        width,
+                        &commit_meta.sha,
+                        &platform_tuple,
+                        &info.semver_parsed,
+                        metrics,
+                        ComposerRepresentationProof::HiddenOrAmbiguous,
+                        false,
+                        t_stage,
+                        t_clear_start.elapsed().as_secs_f64() * 1000.0,
+                        elapsed,
+                        CampaignVerdict::Failed,
+                        ClosedReasonCode::ClearCommandFailed,
+                    ));
+                    server.run(&["kill-session", "-t", &session_name]);
+                    break;
                 }
 
-                let clear_clean = wait_condition(STATE_SETTLE_TIMEOUT, || {
+                let clear_representation = wait_condition(STATE_SETTLE_TIMEOUT, || {
                     let esc = server.run(&["capture-pane", "-e", "-p", "-J", "-t", &target_pane]);
                     let raw_esc = String::from_utf8_lossy(&esc.stdout);
-                    prove_composer_seam(m, &raw_esc, None) == ComposerSeamProof::Clean
+                    representation_is_write_safe(prove_composer_representation(m, &raw_esc, None))
                 });
 
                 let t_clear = t_clear_start.elapsed().as_secs_f64() * 1000.0;
 
-                if !clear_clean {
+                if !clear_representation {
                     counts.failures += 1;
                     vendor_failed = true;
                     failure_reason = Some(ClosedReasonCode::ClearFailed);
@@ -1575,7 +1771,7 @@ fn live_vendor_evidence_campaign_opt_in() {
                         &platform_tuple,
                         &info.semver_parsed,
                         metrics,
-                        ComposerSeamProof::HiddenOrAmbiguous,
+                        ComposerRepresentationProof::HiddenOrAmbiguous,
                         false,
                         t_stage,
                         t_clear,
@@ -1586,7 +1782,7 @@ fn live_vendor_evidence_campaign_opt_in() {
                     server.run(&["kill-session", "-t", &session_name]);
                     break;
                 }
-                counts.clean_clears += 1;
+                counts.safe_clear_representations += 1;
 
                 // Clean session teardown
                 server.run(&["kill-session", "-t", &session_name]);
@@ -1600,7 +1796,7 @@ fn live_vendor_evidence_campaign_opt_in() {
                     &platform_tuple,
                     &info.semver_parsed,
                     metrics,
-                    ComposerSeamProof::ExactStaged,
+                    ComposerRepresentationProof::ExactStaged,
                     true,
                     t_stage,
                     t_clear,
@@ -1640,8 +1836,17 @@ fn live_vendor_evidence_campaign_opt_in() {
 
     drop(scratch);
 
-    let host_meta = discover_host_platform();
     let total_duration_ms = start_instant.elapsed().as_secs_f64() * 1000.0;
+    let component_reason_code = match component_verdict {
+        CampaignVerdict::Passed => ClosedReasonCode::AllTrialsVerified,
+        CampaignVerdict::Failed => vendor_summaries
+            .iter()
+            .find(|summary| summary.verdict == CampaignVerdict::Failed)
+            .map(|summary| summary.reason_code)
+            .unwrap_or(ClosedReasonCode::HarnessAborted),
+        CampaignVerdict::Limitation => ClosedReasonCode::RequiredVendorLimitation,
+        CampaignVerdict::AdminDecision => ClosedReasonCode::AdminDecisionRequired,
+    };
 
     let report = StageAndClearComponentReport {
         schema_version: "1.0.0".to_string(),
@@ -1651,17 +1856,19 @@ fn live_vendor_evidence_campaign_opt_in() {
             &commit_meta.sha[..10]
         ),
         generated_at: utc_now_iso8601(),
-        component_scope: "Gate 7 Stage-and-Clear Soak Component (Narrow Scope: Doorbell Format 3 staging representation and clean teardown)".to_string(),
+        component_scope: "Gate 7 Stage-and-Clear Representation Component (no process binding or delivery authorization)".to_string(),
         git_commit: commit_meta,
         host_platform: host_meta,
         campaign_metadata: CampaignMetadata {
-            campaign_name: "Gate 7 Stage-and-Clear Soak Component".to_string(),
+            campaign_name: "Gate 7 Stage-and-Clear Representation Component".to_string(),
             opt_in_flag: "CYCLOPS_LIVE_VENDOR=1".to_string(),
-            metric_scope: "Doorbell Format 3 staging representation and clean clear teardown".to_string(),
+            metric_scope: "Doorbell Format 3 staging and composer-clear screen representation"
+                .to_string(),
             total_trials: observations.len(),
             total_duration_ms,
         },
         component_verdict,
+        component_reason_code,
         gate7_closed_cell_inventory: build_gate7_cell_inventory(component_verdict),
         vendor_summaries,
         observations,
@@ -1669,17 +1876,16 @@ fn live_vendor_evidence_campaign_opt_in() {
 
     validate_report_consistency(&report).expect("campaign report must be internally consistent");
 
-    let report_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../validation/raw/soak/stage_and_clear_soak_component_report.json");
     if let Some(parent) = report_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let json_str = serde_json::to_string_pretty(&report).expect("serialize report");
     std::fs::write(&report_path, json_str).expect("write stage and clear component report");
+    failure_artifact.disarm();
 
-    assert_eq!(
+    assert_ne!(
         component_verdict,
-        CampaignVerdict::Passed,
-        "live vendor soak campaign failed: non-zero failure exit"
+        CampaignVerdict::Failed,
+        "live vendor component found a defect; the failure artifact was written"
     );
 }
