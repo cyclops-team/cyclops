@@ -360,6 +360,63 @@ pub(crate) struct SessionJournalReplay {
     pub(crate) recovery: Vec<(usize, Vec<LedgerLine>)>,
 }
 
+/// Recover the display name last observed for a configured session.
+///
+/// A followed tmux rename is recorded in the session's existing ledger. The
+/// ledger filename remains the configured root so history stays contiguous,
+/// but an authenticated rename is the durable boot target for the next daemon
+/// run. The caller still supplies the configured name as a conservative
+/// fallback when an old ledger has no valid identity-bound rename fact.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SessionRenameRecovery {
+    pub(crate) name: String,
+    pub(crate) binding: cyclops_proto::SessionIdentityBinding,
+}
+
+/// Recover a display name only when the rename chain is authenticated and
+/// bound to one durable live-session identity. Legacy rename facts are hints
+/// for history, never a reason to retarget a daemon after restart.
+pub(crate) fn latest_session_rename(
+    lines: &[LedgerLine],
+    configured: &str,
+) -> Option<SessionRenameRecovery> {
+    let mut name = configured.to_owned();
+    let mut binding = None;
+    for line in lines {
+        let Some(data) = line.data.as_ref() else {
+            continue;
+        };
+        if line.kind != Kind::System || data["event"] != "renamed" {
+            continue;
+        }
+        if line.from != "cyclopsd" {
+            return None;
+        }
+        let old_name = data["old_name"].as_str()?;
+        let new_name = data["new_name"].as_str()?;
+        if old_name != name || !valid_session_name(new_name) {
+            return None;
+        }
+        let value = data.get("identity")?;
+        let Ok(next_binding) = serde_json::from_value(value.clone()) else {
+            return None;
+        };
+        if binding
+            .as_ref()
+            .is_some_and(|current| current != &next_binding)
+        {
+            return None;
+        }
+        binding = Some(next_binding);
+        name = new_name.to_owned();
+    }
+    binding.map(|binding| SessionRenameRecovery { name, binding })
+}
+
+fn valid_session_name(name: &str) -> bool {
+    !name.trim().is_empty()
+}
+
 struct SessionJournalNode {
     journal: String,
     lines: Vec<LedgerLine>,
@@ -1144,8 +1201,9 @@ mod tests {
     use super::*;
     use crate::mailbox::{MailboxDirectory, MailboxSend, MailboxService, MessageStore};
     use cyclops_proto::{
-        Delivery, DeliveryState, MessageId, MessagePresentation, RecipientPresentation,
-        RequestDigest, SessionInstanceId, TmuxPaneId, VerifiedBy, WorkspaceId,
+        Delivery, DeliveryState, LiveSessionKey, MessageId, MessagePresentation, OsBootId,
+        ProcessInstanceId, RecipientPresentation, RequestDigest, SessionIdentityBinding,
+        SessionInstanceId, TmuxPaneId, TmuxSessionId, VerifiedBy, WorkspaceId,
         CANONICAL_RECORD_VERSION,
     };
     use std::path::Path;
@@ -1187,6 +1245,83 @@ mod tests {
             ),
             label: label.into(),
         }
+    }
+
+    fn rename_line(from: &str, old_name: &str, new_name: &str, with_identity: bool) -> LedgerLine {
+        let workspace = WorkspaceId::from_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let binding = SessionIdentityBinding::new(
+            LiveSessionKey::new(
+                workspace,
+                OsBootId::new("boot-a").unwrap(),
+                ProcessInstanceId::new(900, 1000).unwrap(),
+                TmuxSessionId::from_str("$1").unwrap(),
+            ),
+            SessionInstanceId::from_str("00000000-0000-0000-0000-000000000002").unwrap(),
+        );
+        let mut data = serde_json::json!({
+            "event": "renamed",
+            "old_name": old_name,
+            "new_name": new_name,
+        });
+        if with_identity {
+            data["identity"] = serde_json::to_value(binding).unwrap();
+        }
+        LedgerLine {
+            seq: 1,
+            boot_id: "boot".into(),
+            id: "e-rename".into(),
+            ts: 1,
+            kind: Kind::System,
+            from: from.into(),
+            to: Vec::new(),
+            subject: None,
+            body: None,
+            reply_to: None,
+            deliveries: Vec::new(),
+            data: Some(data),
+        }
+    }
+
+    #[test]
+    fn boot_rename_recovery_rejects_unauthenticated_or_malformed_facts() {
+        assert!(
+            latest_session_rename(&[rename_line("cyclopsd", "main", "renamed", true)], "main")
+                .is_some()
+        );
+        assert!(
+            latest_session_rename(&[rename_line("attacker", "main", "renamed", true)], "main")
+                .is_none()
+        );
+        assert!(latest_session_rename(
+            &[rename_line("cyclopsd", "other", "renamed", true)],
+            "main"
+        )
+        .is_none());
+        assert!(
+            latest_session_rename(&[rename_line("cyclopsd", "main", "   ", true)], "main")
+                .is_none()
+        );
+        for target in ["renamed bad", "renamed:bad", "renamed.bad", "renamed\tbad"] {
+            let recovered =
+                latest_session_rename(&[rename_line("cyclopsd", "main", target, true)], "main")
+                    .expect("tmux accepts non-empty punctuation and whitespace names");
+            assert_eq!(recovered.name, target);
+        }
+        assert!(latest_session_rename(
+            &[rename_line("cyclopsd", "main", "renamed", false)],
+            "main"
+        )
+        .is_none());
+        let mut broken_chain = rename_line("cyclopsd", "wrong", "again", true);
+        broken_chain.seq = 2;
+        assert!(latest_session_rename(
+            &[
+                rename_line("cyclopsd", "main", "renamed", true),
+                broken_chain,
+            ],
+            "main"
+        )
+        .is_none());
     }
 
     #[test]

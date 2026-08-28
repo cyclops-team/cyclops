@@ -12,6 +12,7 @@ mod common;
 
 use common::*;
 use serde_json::json;
+use std::io::Write as _;
 use std::time::{Duration, Instant};
 
 /// Boot with nothing configured, watch a session created afterwards, and
@@ -188,6 +189,10 @@ async fn a_renamed_watched_session_keeps_one_slot_registry_and_ledger() {
         })
         .expect("rename fact in old-name ledger");
     assert!(
+        lines[rename_at]["data"]["identity"].is_object(),
+        "rename recovery requires an identity-bound system fact"
+    );
+    assert!(
         lines.iter().skip(rename_at + 1).any(|line| {
             line["kind"] == json!("state") && line["data"]["pane_id"] == json!(added_pane)
         }),
@@ -199,4 +204,214 @@ async fn a_renamed_watched_session_keeps_one_slot_registry_and_ledger() {
     );
 
     rig.shutdown().await;
+}
+
+/// A followed rename must remain the boot identity after a clean daemon
+/// restart. The config intentionally still names `main`: runtime following
+/// must persist the stable session identity without rewriting that file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_renamed_watched_session_is_followed_after_daemon_restart() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let rig = Rig::new("session-rename-restart", CAT_MANIFEST, "cat", "").await;
+    rig.tmux
+        .run_ok(&["rename-session", "-t", "=main", "renamed"]);
+
+    let mut rig = rig;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = rig.ctl.request("status", json!({})).await;
+        let sessions = status["result"]["sessions"].as_array().expect("sessions");
+        if sessions.len() == 1
+            && sessions[0]["name"] == json!("renamed")
+            && sessions[0]["attached"] == json!(true)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon never followed the runtime rename: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let config = std::fs::read_to_string(rig.home.join("config.toml")).expect("config readable");
+    assert!(
+        config.contains("sessions = [\"main\"]"),
+        "rename rewrote user config"
+    );
+
+    let mut rebooted = rig.reboot().await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        let status = rebooted.ctl.request("status", json!({})).await;
+        let sessions = status["result"]["sessions"].as_array().expect("sessions");
+        if sessions.len() == 1 && sessions[0]["attached"] == json!(true) {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not reattach the renamed session: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    let sessions = status["result"]["sessions"].as_array().expect("sessions");
+    assert_eq!(sessions[0]["name"], json!("renamed"), "{status}");
+    assert_ne!(
+        sessions[0]["name"],
+        json!("main"),
+        "old name is a ghost: {status}"
+    );
+    assert!(rebooted.ledger_path_for("main").exists());
+    assert!(!rebooted.ledger_path_for("renamed").exists());
+
+    rebooted.shutdown().await;
+}
+
+/// A syntactically valid rename fact with an identity that was never
+/// persisted by this daemon must not retarget boot to the renamed session.
+/// The configured root remains the safe fallback while the live session is
+/// still available under its configured name.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unpersisted_rename_identity_cannot_retarget_boot() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new("session-rename-unpersisted", CAT_MANIFEST, "cat", "").await;
+    let initial_status = rig.ctl.request("status", json!({})).await;
+    let live_identity = initial_status["result"]["sessions"][0]["identity"].clone();
+    assert!(live_identity.is_object(), "initial live identity");
+    let lines = rig.ledger_lines();
+    let mut forged = lines
+        .iter()
+        .find(|line| line["data"]["event"] == json!("boot"))
+        .cloned()
+        .expect("boot fact");
+    let next_seq = lines
+        .iter()
+        .filter_map(|line| line["seq"].as_u64())
+        .max()
+        .expect("ledger sequence")
+        + 1;
+    forged["seq"] = json!(next_seq);
+    forged["id"] = json!("e-forged-rename");
+    forged["data"] = json!({
+        "event": "renamed",
+        "old_name": "main",
+        "new_name": "forged",
+        "identity": live_identity,
+    });
+    forged["data"]["identity"]["session_instance_id"] =
+        json!("00000000-0000-0000-0000-000000000003");
+    let mut ledger = std::fs::OpenOptions::new()
+        .append(true)
+        .open(rig.ledger_path())
+        .expect("ledger append");
+    writeln!(
+        ledger,
+        "{}",
+        serde_json::to_string(&forged).expect("forged JSON")
+    )
+    .expect("append forged rename");
+
+    let mut rebooted = rig.reboot().await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        let status = rebooted.ctl.request("status", json!({})).await;
+        let sessions = status["result"]["sessions"].as_array().expect("sessions");
+        if sessions.len() == 1
+            && sessions[0]["name"] == json!("main")
+            && sessions[0]["attached"] == json!(true)
+        {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "forged identity retargeted boot: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_ne!(
+        status["result"]["sessions"][0]["name"],
+        json!("forged"),
+        "{status}"
+    );
+
+    rebooted.shutdown().await;
+}
+
+/// Two configured roots that resolve to the same verified tmux session must
+/// settle to one canonical live slot rather than two watcher routes.
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_configured_roots_coalesce_by_verified_session_identity() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let rig = Rig::new("session-duplicate-root", CAT_MANIFEST, "cat", "").await;
+    rig.tmux
+        .run_ok(&["rename-session", "-t", "=main", "renamed"]);
+
+    let mut rig = rig;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = rig.ctl.request("status", json!({})).await;
+        if status["result"]["sessions"][0]["name"] == json!("renamed") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon never followed rename: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    rig.sessions.push("renamed".into());
+    rig.rewrite_config("");
+    // Give both configured roots identity-bound rename evidence. The second
+    // root uses the same live binding under its own configured old name, so
+    // this exercises boot-time coalescing rather than runtime repair.
+    let mut duplicate_fact = rig
+        .ledger_lines()
+        .into_iter()
+        .find(|line| line["data"]["event"] == json!("renamed"))
+        .expect("runtime rename fact");
+    duplicate_fact["data"]["old_name"] = json!("renamed");
+    duplicate_fact["data"]["new_name"] = json!("renamed");
+    std::fs::write(
+        rig.ledger_path_for("renamed"),
+        format!(
+            "{}\n",
+            serde_json::to_string(&duplicate_fact).expect("duplicate rename JSON")
+        ),
+    )
+    .expect("write duplicate identity-bound history");
+    let mut rebooted = rig.reboot().await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        let status = rebooted.ctl.request("status", json!({})).await;
+        let sessions = status["result"]["sessions"].as_array().expect("sessions");
+        if sessions.len() == 1 && sessions[0]["attached"] == json!(true) {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "duplicate roots did not coalesce: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    let sessions = status["result"]["sessions"].as_array().expect("sessions");
+    assert_eq!(sessions[0]["name"], json!("renamed"), "{status}");
+    assert!(rebooted.ledger_path_for("renamed").exists());
+    assert!(
+        rebooted
+            .ledger_lines_for("renamed")
+            .iter()
+            .all(|line| line["data"]["event"] != json!("session_slot_aliased")),
+        "boot identity coalescing should retire the duplicate before a watcher starts"
+    );
+    rebooted.shutdown().await;
 }

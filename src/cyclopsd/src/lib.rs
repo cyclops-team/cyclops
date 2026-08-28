@@ -320,6 +320,10 @@ pub(crate) struct SessionSlot {
     /// one tmux session. Go through [`SessionSlot::name`] and
     /// [`SessionSlot::rename`] rather than the field directly.
     name: StdMutex<String>,
+    /// Stable tmux target used only for identity-bound boot recovery. Normal
+    /// runtime slots reconnect by their mutable display name.
+    boot_target: StdMutex<Option<String>>,
+    boot_identity: StdMutex<Option<SessionIdentityBinding>>,
     /// A rename can make a live runtime slot collide with a configured slot
     /// that was still waiting for that name. Indices are durable for the
     /// daemon's lifetime, so the losing slot cannot be removed from
@@ -377,6 +381,8 @@ impl SessionSlot {
         let (alias_changed, _) = watch::channel(None);
         SessionSlot {
             name: StdMutex::new(name),
+            boot_target: StdMutex::new(None),
+            boot_identity: StdMutex::new(None),
             alias_of: AtomicUsize::new(usize::MAX),
             alias_changed,
             #[cfg(test)]
@@ -387,6 +393,18 @@ impl SessionSlot {
         }
     }
 
+    fn with_boot_identity(
+        name: String,
+        ledger: Arc<LedgerWriter>,
+        target: String,
+        binding: SessionIdentityBinding,
+    ) -> Self {
+        let slot = Self::new(name, ledger);
+        *slot.boot_target.lock().expect("boot target lock") = Some(target);
+        *slot.boot_identity.lock().expect("boot identity lock") = Some(binding);
+        slot
+    }
+
     /// Current session name. `session_index` and every display surface
     /// (`status`, `history`) read this rather than the tmux `$id`: cyclops
     /// names sessions to humans, and the id is watcher-internal machinery
@@ -394,6 +412,21 @@ impl SessionSlot {
     /// `cyclops_tmux::SessionWatcher::session_id`).
     pub(crate) fn name(&self) -> String {
         self.name.lock().expect("session name lock").clone()
+    }
+
+    fn connect_target(&self) -> String {
+        self.boot_target
+            .lock()
+            .expect("boot target lock")
+            .clone()
+            .unwrap_or_else(|| self.name())
+    }
+
+    fn boot_identity(&self) -> Option<SessionIdentityBinding> {
+        self.boot_identity
+            .lock()
+            .expect("boot identity lock")
+            .clone()
     }
 
     /// Rename in place, in response to a followed `%session-renamed`. The
@@ -2992,10 +3025,11 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     .map_err(|error| anyhow::anyhow!("open mailbox directory: {error}"))?;
     let (manifests, manifest_dir) = load_manifests(&cfg);
     let mut sessions = Vec::with_capacity(cfg.sessions.len());
+    let mut boot_identities: Vec<(SessionIdentityBinding, usize)> = Vec::new();
     let mut replay_roots: Vec<(usize, String, Vec<LedgerLine>)> = Vec::new();
     let engine = delivery::Engine::new();
-    for (idx, name) in cfg.sessions.iter().enumerate() {
-        let descendant = PathBuf::from("ledger").join(format!("{name}.ndjson"));
+    for (idx, configured_name) in cfg.sessions.iter().enumerate() {
+        let descendant = PathBuf::from("ledger").join(format!("{configured_name}.ndjson"));
         let ledger = LedgerWriter::open(&state_root, &descendant, &boot_id).map_err(|error| {
             anyhow::anyhow!(
                 "open ledger {}: {error}",
@@ -3004,13 +3038,46 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         })?;
         // The roots and every rename-linked journal discovered from them
         // feed both id preload and restart-limbo settlement below.
+        let mut boot_name = configured_name.clone();
+        let mut boot_identity = None;
         match ledger.read_after(0) {
             Ok(lines) => {
-                replay_roots.push((idx, format!("{name}.ndjson"), lines));
+                if let Some(recovery) = history::latest_session_rename(&lines, configured_name) {
+                    if session_identities.contains_binding(&recovery.binding) {
+                        boot_name = recovery.name;
+                        boot_identity = Some(recovery.binding);
+                    } else {
+                        warn!(
+                            session = %configured_name,
+                            "ignoring rename without the matching persisted live identity"
+                        );
+                    }
+                }
+                replay_roots.push((idx, format!("{configured_name}.ndjson"), lines));
             }
-            Err(e) => warn!(session = %name, error = %e, "ledger replay for id preload failed"),
+            Err(e) => {
+                warn!(session = %configured_name, error = %e, "ledger replay for id preload failed")
+            }
         }
-        sessions.push(Arc::new(SessionSlot::new(name.clone(), Arc::new(ledger))));
+        let slot = Arc::new(match boot_identity {
+            Some(binding) => SessionSlot::with_boot_identity(
+                boot_name,
+                Arc::new(ledger),
+                binding.live_session_key().tmux_session_id().to_string(),
+                binding,
+            ),
+            None => SessionSlot::new(boot_name, Arc::new(ledger)),
+        });
+        if let Some(binding) = slot.boot_identity() {
+            if let Some((_, canonical_idx)) =
+                boot_identities.iter().find(|(known, _)| known == &binding)
+            {
+                slot.retire_as_alias(*canonical_idx);
+            } else {
+                boot_identities.push((binding, idx));
+            }
+        }
+        sessions.push(slot);
     }
     let replay = history::session_journal_replay(&state_root, replay_roots);
     // This is the first Engine use after construction, so every historical
@@ -3436,9 +3503,10 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
         // the name tmux actually calls this session now, not the name this
         // task started with.
         let name = slot.name();
+        let target = slot.connect_target();
         // tmux needs a pathname, but creation and cleanup stay anchored to
         // the held state root.
-        let mut ccfg = ControlConfig::attach(&name)
+        let mut ccfg = ControlConfig::attach(&target)
             .with_state_buffer_spool(Arc::clone(&inner.state_root), "spool");
         if let Some(sock) = &inner.cfg.tmux_socket {
             ccfg = ccfg.on_socket(sock.clone());
@@ -3465,6 +3533,22 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                         continue;
                     }
                 };
+                if slot
+                    .boot_identity()
+                    .is_some_and(|expected| expected != binding)
+                {
+                    warn!(
+                        configured = %name,
+                        target = %target,
+                        "identity-bound rename target resolved to a different live session"
+                    );
+                    watcher.shutdown().await;
+                    if reconnect_delay(&mut stop, backoff).await {
+                        return;
+                    }
+                    backoff = (backoff * 2).min(RECONNECT_MAX);
+                    continue;
+                }
                 if slot.alias_of().is_some() {
                     watcher.shutdown().await;
                     return;
@@ -3661,10 +3745,10 @@ fn session_lifecycle(inner: &Arc<Inner>, idx: usize, attached: bool) {
 /// notices the drift.
 ///
 /// `config.toml`'s `sessions` list is deliberately untouched: this mirrors
-/// [`watch_session`], which also never rewrites it (a session watched at
-/// runtime is not durable across a restart by design, and neither is a
-/// rename of one. A restart re-reads `sessions` and watches the OLD name
-/// again, same as it always has).
+/// [`watch_session`], which also never rewrites it. The identity-bearing
+/// rename fact is durable in the slot's existing ledger, so boot can recover
+/// the latest name and reconnect by stable tmux id without changing user
+/// configuration.
 fn rename_session_slot(inner: &Arc<Inner>, idx: usize, new_name: String) -> bool {
     rename_session_slot_with_identity(inner, idx, new_name, None)
 }
@@ -3725,11 +3809,14 @@ fn rename_session_slot_locked(
     // registration race and attached first, matching durable session identity
     // proves both watchers follow the same tmux session and wakes the loser so
     // it tears its duplicate connection down.
+    let source_binding = slot
+        .link
+        .lock()
+        .expect("session link lock")
+        .identity
+        .clone();
     let source_instance_id = observed_instance_id.or_else(|| {
-        slot.link
-            .lock()
-            .expect("session link lock")
-            .identity
+        source_binding
             .as_ref()
             .map(SessionIdentityBinding::session_instance_id)
     });
@@ -3845,17 +3932,17 @@ fn rename_session_slot_locked(
         );
         debug_assert_eq!(alias.alias_of(), Some(idx));
     }
+    let mut rename_data = json!({
+        "event": "renamed",
+        "old_name": old_name,
+        "new_name": new_name,
+    });
+    if let Some(binding) = source_binding {
+        rename_data["identity"] = serde_json::to_value(binding).expect("identity serializes");
+    }
     inner.append_line(
         idx,
-        daemon_line(
-            Kind::System,
-            inner.mint_event_id(),
-            json!({
-                "event": "renamed",
-                "old_name": old_name,
-                "new_name": new_name,
-            }),
-        ),
+        daemon_line(Kind::System, inner.mint_event_id(), rename_data),
     );
     true
 }
@@ -4018,6 +4105,60 @@ async fn run_session(
         .expect("session registration lock");
     if !slot.is_canonical() {
         return false;
+    }
+    // An already attached watcher is the established owner. Its slot may
+    // have a higher index when a runtime session was watched before a
+    // configured slot caught up, so numeric index order is not ownership.
+    if let Some((canonical_idx, canonical)) =
+        inner
+            .active_session_slots()
+            .into_iter()
+            .find(|(other_idx, other)| {
+                if *other_idx == idx {
+                    return false;
+                }
+                let link = other.link.lock().expect("session link lock");
+                link.attached && link.identity.as_ref() == Some(&binding)
+            })
+    {
+        let Some(canonical_journal) = canonical.journal_file_name() else {
+            warn!(
+                alias_idx = idx,
+                canonical_idx, "cannot coalesce duplicate session without canonical journal"
+            );
+            return false;
+        };
+        if inner
+            .append_line(
+                idx,
+                daemon_line(
+                    Kind::System,
+                    inner.mint_event_id(),
+                    json!({
+                        "event": "session_slot_aliased",
+                        "session": watcher.session(),
+                        "canonical_session_idx": canonical_idx,
+                        "canonical_journal": canonical_journal,
+                    }),
+                ),
+            )
+            .is_none()
+        {
+            warn!(
+                alias_idx = idx,
+                canonical_idx, "cannot record duplicate session coalescing"
+            );
+            return false;
+        }
+        if slot.retire_as_alias(canonical_idx) {
+            warn!(
+                alias_idx = idx,
+                canonical_idx,
+                session = %watcher.session(),
+                "coalesced duplicate configured session root by live identity"
+            );
+            return false;
+        }
     }
     if let Err(error) = publish_mailbox_transition(inner, &route, || {
         let mut link = slot.link.lock().expect("session link lock");
@@ -7300,18 +7441,25 @@ process_names = ["never"]
         rename_entered_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("runtime rename handler reaches the registration race");
+        // The existing runtime watcher is the owner even though the
+        // configured slot has the lower numeric index. The task must retire
+        // this duplicate before the paused rename handler is released; that
+        // makes the ownership decision independently testable.
         let configured_task = tokio::spawn(session_task(
             Arc::clone(&inner),
             configured_idx,
             inner.stop.clone(),
         ));
-        let configured_binding = wait_for_session_binding(&configured, None).await;
-        assert!(configured.link.lock().unwrap().attached);
-        assert_eq!(
-            configured_binding.session_instance_id(),
-            runtime_binding.session_instance_id(),
-            "both live watchers must be proven to follow the same tmux session"
-        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if configured.alias_of() == Some(runtime_idx) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("duplicate configured slot retires to the existing runtime owner");
         rename_release.wait();
 
         tokio::time::timeout(Duration::from_secs(10), async {

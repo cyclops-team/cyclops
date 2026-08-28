@@ -122,6 +122,15 @@ impl SessionIdentities {
             && left.tmux_server() == right.tmux_server()
     }
 
+    /// Whether a rename fact belongs to the exact persisted live identity.
+    /// A matching UUID alone is insufficient: the binding must still point
+    /// at the same workspace, boot, tmux server, and session id.
+    pub(crate) fn contains_binding(&self, binding: &SessionIdentityBinding) -> bool {
+        self.live
+            .instance_of(binding.live_session_key())
+            .is_some_and(|id| id == binding.session_instance_id())
+    }
+
     #[cfg(test)]
     pub(crate) fn instance_of(
         &self,
