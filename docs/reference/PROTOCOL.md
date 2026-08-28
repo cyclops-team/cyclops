@@ -359,7 +359,9 @@ That is the point of it (reconcile on doubt), but do not put it in a loop.
 
 ```
 -> {"id":4,"method":"msg.send","params":{"to":["reviewer"],
-    "subject":"Review the rate limiter","body":"gateway.rs:120 drops the burst path"}}
+    "subject":"Review the rate limiter",
+    "summary":"The rate limiter is ready for review. Check the burst path for regressions.",
+    "body":"gateway.rs:120 drops the burst path"}}
 <- {"id":4,"result":{"deliveries":[{"notification_state":"queued",
     "state":"queued","to":"reviewer"}],"inserted":true,
     "msg_id":"m-7fe0df","seq":7}}
@@ -373,7 +375,11 @@ and the daemon snapshots their current labels only for display. A rename cannot
 retarget a selected key. `reply_to` derives its recipient from the referenced
 message and therefore permits neither selector.
 
-Other optional params are `fyi` (an announcement), `client_key`
+`summary` is additive on the wire for compatibility but required by the
+`cyclops send` and `cyclops reply` CLIs. It must contain exactly two sentences
+on one line and no more than 240 characters. The daemon validates it before
+acceptance and includes it in the semantic request digest. Other optional
+params are `fyi` (an announcement), `client_key`
 (sender-scoped exact-retry key), and `supersedes` (one unclaimed message with
 the same sender, recipient, and thread). The deprecated `wait` field is retained
 in protocol v1 only so the daemon can reject old callers with
@@ -433,12 +439,11 @@ is equivalent proof. Any other notification state, `pre_write_cause`,
 unknown state exits 1. The message is already durably accepted, so that exit
 must not trigger an unkeyed resend.
 
-For a non-admin recipient, the daemon selects one transport at the terminal
-write boundary. An exact installed claim skill selects the content-free
-doorbell:
+For a non-admin recipient, a CLI-originated message with a summary selects
+Format 4 at the terminal write boundary:
 
 ```text
-cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
+[cyclops] FROM: implementer | The rate limiter is ready for review. Check the burst path for regressions. Claim: cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
 ```
 
 The 22-character URL-safe token encodes the complete 128-bit notification
@@ -448,9 +453,13 @@ characters. Older clients already accept it as a positional claim argument.
 Only the daemon's `inbox.claim` handler interprets the canonical locator; other
 message-id consumers do not. It resolves only the current attempt for that
 exact authenticated recipient and appends the claim under the same store lock.
-A delayed command for a replaced attempt cannot claim its replacement.
+A delayed command for a replaced attempt cannot claim its replacement. The
+preview is presentation only. The authenticated claim returns the immutable
+routing header and full technical body that the recipient must read before
+acting.
 
-Format 3 must fit one exact composer row. A pane narrower than 60 columns is
+The Format 4 claim instruction and Format 3 legacy command require a pane at
+least 60 columns wide. A narrower pane is
 recorded as `blocked_pre_write` with the compatible cause
 `write_readiness_changed`, plus its observed and required widths. Current
 clients render that evidence as `pane too narrow`. No paste occurs. A later
@@ -458,11 +467,10 @@ width observation meeting the recorded requirement may reopen that same
 attempt once. The operator may withdraw it while it remains provably
 pre-write.
 
-If that exact capability is absent, outdated, edited, unreadable, or changes
-before the write, the daemon submits the canonical full payload ending in
-`[cyclops:end <id>]`. A successful fallback appends
-`message_delivered_direct`; it does not append `message_claimed` and has no
-claimant.
+Summaryless legacy clients retain the Format 3 capability path and canonical
+direct-payload fallback. Current CLI sends and replies always queue Format 4;
+working state does not discard it, while human input or ambiguous composer
+evidence keeps it waiting before the write boundary.
 
 The compatibility wire states are `not_started`, `queued`, `gating`, `writing`,
 `staged`, `submitted`, `notified`, `attention_required`, and `superseded`. This
@@ -528,8 +536,9 @@ Admin has no pane route, so an accepted admin message reports `not_started` and
 remains in the durable admin inbox without a notification attempt.
 
 The Writing transition carries `transport: "doorbell" | "direct_payload"`
-beside `binding`. A current doorbell carries `doorbell_format: 3`, which fixes
-the reserved attempt-locator command bytes for later recovery. Format 2 is the
+beside `binding`. A current CLI notification carries `doorbell_format: 4`,
+which fixes the summary and reserved attempt-locator command bytes for later
+recovery. Format 3 is the summaryless exact attempt command. Format 2 is the
 older message id plus a lossless attempt-token comment. Format 1 is the older
 message-only compact claim command. Formats 1 and 2 replay with their original
 bytes. A missing format identifies the original verbose doorbell. Unknown
@@ -604,7 +613,9 @@ mailbox entry, and returns the immutable payload:
     "recipient_label":"reviewer",
     "sender":{"kind":"admin","workspace_id":"2863a6ef-0f58-46ad-a87d-7b4157ba8e6a"},
     "sender_label":"admin",
-    "subject":"Review the rate limiter","thread_root":"m-7fe0df"}}}
+    "subject":"Review the rate limiter",
+    "summary":"The rate limiter is ready for review. Check the burst path for regressions.",
+    "thread_root":"m-7fe0df"}}}
 ```
 
 `recipient_label` is the immutable label paired with the authenticated
@@ -721,7 +732,8 @@ and snapshot both carry a workspace sequence. An event at or below the
 snapshot sequence is already represented. A higher sequence requires one
 new snapshot.
 
-`msg.reply` takes `message_id`, `body`, and optional `client_key`. The daemon
+`msg.reply` takes `message_id`, optional wire `summary`, `body`, and optional
+`client_key`. The public CLI requires the validated two-sentence summary. The daemon
 derives the sole recipient, thread root, and `Re: ` subject from the visible
 parent. The `reply_to` field on `msg.send` uses the same validation. The default
 CLI reply exits 0 after this response proves durable acceptance; it does not

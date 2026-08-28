@@ -529,8 +529,12 @@ pub const DOORBELL_FORMAT_COMPACT_CLAIM: u32 = 1;
 pub const DOORBELL_FORMAT_ATTEMPT_CLAIM: u32 = 2;
 /// Single-row claim command carrying only the exact attempt token.
 pub const DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM: u32 = 3;
+/// Two-sentence preview beside the exact attempt claim command.
+pub const DOORBELL_FORMAT_SUMMARY_CLAIM: u32 = 4;
 /// Minimum pane width that can carry doorbell format 3 as one exact row.
 pub const DOORBELL_V3_MIN_PANE_WIDTH: u32 = 60;
+/// Minimum supported pane width for a format 4 summary claim.
+pub const DOORBELL_V4_MIN_PANE_WIDTH: u32 = 60;
 /// Message-shaped namespace reserved for exact notification-attempt claims.
 pub const NOTIFICATION_ATTEMPT_CLAIM_LOCATOR_PREFIX: &str = "m-att_";
 /// Current proof contract for a terminal-action resolution fact.
@@ -900,6 +904,18 @@ pub fn render_doorbell_v3(attempt_id: NotificationAttemptId) -> String {
     )
 }
 
+/// Rebuild the sender-named summary and exact-attempt notification format 4.
+pub fn render_doorbell_v4(
+    sender_label: &str,
+    summary: &str,
+    attempt_id: NotificationAttemptId,
+) -> String {
+    format!(
+        "[cyclops] FROM: {sender_label} | {summary} Claim: {}",
+        render_doorbell_v3(attempt_id)
+    )
+}
+
 /// Parse the exact message and attempt identities carried by doorbell v2.
 ///
 /// A single trailing newline is the only accepted transport normalization,
@@ -1001,7 +1017,11 @@ pub fn parse_doorbell_v3(payload: &str) -> Option<NotificationAttemptId> {
 pub const fn doorbell_format_names_exact_attempt(format: Option<u32>) -> bool {
     matches!(
         format,
-        Some(DOORBELL_FORMAT_ATTEMPT_CLAIM | DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM)
+        Some(
+            DOORBELL_FORMAT_ATTEMPT_CLAIM
+                | DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM
+                | DOORBELL_FORMAT_SUMMARY_CLAIM
+        )
     )
 }
 

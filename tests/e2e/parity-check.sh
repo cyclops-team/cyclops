@@ -486,7 +486,7 @@ run "$CYC" start --plain
 check "start builds the solo workspace"   '^✔ workspace ready · 1 agent$'
 check "and starts a daemon"               '^  started cyclopsd, logging to .*/cyclopsd\.log$'
 check "step 1 attaches"                   '^  1  tmux attach -t main +open the workspace and start your agents$'
-check "step 2 sends the first message"    '^  2  cyclops send implementer --subject "hello" +send the first message$'
+check "step 2 sends the first message"    '^  2  cyclops send implementer --subject "hello" --summary "Hello from Cyclops\. Reply when you are ready\." +send the first message$'
 # The heavy check is the load-bearing one. It means cyclopsd confirmed the
 # roster in this run, which is what starting the daemon here buys: before
 # it, the first run named nothing and a second was needed.
@@ -679,18 +679,18 @@ start_composer reviewer "$N2"
 run "$CYC" read reviewer --source detection --plain
 check "the reviewer composer is write-ready" 'decided by .* · write-ready$'
 
-agent_command implementer "$N1" 'send reviewer --subject "Release notes review" --body "Check the mailbox contract." --client-key parity-review --plain'
+agent_command implementer "$N1" 'send reviewer --subject "Release notes review" --summary "Review the release notes. Confirm the mailbox contract." --body "Check the mailbox contract." --client-key parity-review --plain'
 check "acceptance is separate from notification" '^accepted m-[[:xdigit:]]{32}$'
 check "the wake is a second fact" '^✓ accepted( · [0-9]+ ahead)? · wake (not started|queued|checking readiness|writing|staged|submitted|notified|withdrawn|needs attention|superseded)$'
 check_exit "mailbox acceptance exits 0" 0
 REVIEW_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
-wait_for "the reviewer mailbox doorbell" 100 pane_matches "$N2" '^❯ cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
+wait_for "the reviewer mailbox doorbell" 100 pane_matches "$N2" '^❯ \[cyclops\] FROM: implementer \| Review the release notes\. Confirm the mailbox contract\. Claim: cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 printf '\n$ tmux capture-pane -p -t %s\n' "$N2"
 tmx capture-pane -p -t "$N2" | grep -v '^$' > "$OUT"
 cat "$OUT"
-check "the recipient sees only the exact attempt doorbell" '^❯ cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
+check "the recipient sees the sender, summary, and exact attempt doorbell" '^❯ \[cyclops\] FROM: implementer \| Review the release notes\. Confirm the mailbox contract\. Claim: cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 check_absent "the pane does not receive the body" '^Check the mailbox contract\.$'
-REVIEW_LOCATOR="$(awk '/^❯ cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$/ { print $5; exit }' "$OUT")"
+REVIEW_LOCATOR="$(awk '/^❯ \[cyclops\] FROM: implementer \| Review the release notes\. Confirm the mailbox contract\. Claim: cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$/ { print $NF; exit }' "$OUT")"
 [ -n "$REVIEW_LOCATOR" ] || { echo "!! exact attempt locator was not captured" >&2; exit 1; }
 wait_for "the reviewer doorbell to be submitted" 100 notification_crossed_submit "$REVIEW_ID"
 
@@ -699,6 +699,7 @@ agent_command reviewer "$N2" "inbox list --plain"
 check "inbox list exposes metadata" "^$REVIEW_ID implementer · Release notes review\$"
 agent_command reviewer "$N2" "inbox claim $REVIEW_LOCATOR --plain"
 check "the displayed locator fetches the original envelope" "^\[cyclops $REVIEW_ID\] TO: reviewer  FROM: implementer  SUBJECT: Release notes review\$"
+check "the displayed locator fetches the summary" '^Summary: Review the release notes\. Confirm the mailbox contract\.$'
 check "the displayed locator fetches the body" '^Check the mailbox contract\.$'
 check "the displayed locator closes the exact envelope" "^\[cyclops:end $REVIEW_ID\]\$"
 agent_command reviewer "$N2" "inbox claim $REVIEW_LOCATOR --plain"
@@ -724,7 +725,7 @@ run "$CYC" wait reviewer --until idle --plain
 check "wait reports the state and how long" '^○ idle · waited [0-9]+s$'
 check_exit "a reached wait exits 0" 0
 
-run "$CYC" send --subject "nobody" --plain
+run "$CYC" send --subject "nobody" --summary "Name a recipient. Retry the send." --plain
 check "a send with no recipient says what to do" '^no recipient\. Name one'
 check_exit "a usage error exits 2" 2
 
@@ -775,11 +776,11 @@ echo "#### The handoff (docs/guides/QUICKSTART.md walks this)"
 # who the daemon says sent it. Identity is resolved by walking the caller's
 # process up to a watched pane; nothing in the request can claim a sender.
 start_composer reviewer "$N2"
-agent_command implementer "$N1" 'send reviewer --subject "Burst path fix, ready for review" --body "gateway.rs:120. Tests pass." --client-key parity-handoff --plain'
+agent_command implementer "$N1" 'send reviewer --subject "Burst path fix, ready for review" --summary "Review the burst path fix. Check the passing tests." --body "gateway.rs:120. Tests pass." --client-key parity-handoff --plain'
 check "the handoff is accepted from the pane" '^accepted m-[[:xdigit:]]{32}$'
 check_exit "the handoff exits 0" 0
 HANDOFF="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
-wait_for "the handoff doorbell" 100 pane_matches "$N2" '^❯ cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
+wait_for "the handoff doorbell" 100 pane_matches "$N2" '^❯ \[cyclops\] FROM: implementer \| Review the burst path fix\. Check the passing tests\. Claim: cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 wait_for "the handoff doorbell to be submitted" 100 notification_crossed_submit "$HANDOFF"
 
 stop_composer reviewer "$N2"
@@ -790,11 +791,11 @@ agent_command reviewer "$N2" "inbox claim $HANDOFF --plain"
 check "the reviewer claims the handoff body" '^gateway\.rs:120\. Tests pass\.$'
 
 start_composer implementer "$N1"
-agent_command reviewer "$N2" "reply $HANDOFF --body \"Approved. One nit in the retry path.\" --client-key parity-reply --plain"
+agent_command reviewer "$N2" "reply $HANDOFF --summary \"Approve the burst path fix. Note one retry issue.\" --body \"Approved. One nit in the retry path.\" --client-key parity-reply --plain"
 check "reply derives routing from the parent" '^accepted m-[[:xdigit:]]{32}$'
 check_exit "an accepted reply exits 0" 0
 REPLY_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
-wait_for "the reply doorbell" 100 pane_matches "$N1" '^❯ cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
+wait_for "the reply doorbell" 100 pane_matches "$N1" '^❯ \[cyclops\] FROM: reviewer \| Approve the burst path fix\. Note one retry issue\. Claim: cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 wait_for "the reply doorbell to be submitted" 100 notification_crossed_submit "$REPLY_ID"
 stop_composer implementer "$N1"
 agent_command implementer "$N1" "inbox claim $REPLY_ID --plain"
@@ -814,7 +815,7 @@ echo
 echo "#### The admin mailbox"
 
 # A pane agent can address admin, but admin has no pane and receives no wake.
-agent_command implementer "$N1" 'send admin --subject "Operator review" --body "The release note is ready." --client-key parity-admin --plain'
+agent_command implementer "$N1" 'send admin --subject "Operator review" --summary "Review the release note. Respond with an operator decision." --body "The release note is ready." --client-key parity-admin --plain'
 check "admin is a durable recipient" '^accepted m-[[:xdigit:]]{32}$'
 check "admin receives no pane wake" '^✓ accepted · wake not started$'
 check_exit "the admin send exits 0" 0
@@ -956,7 +957,7 @@ cat "$OUT"
 # the whole point of the order, and the glyph is what proves it happened.
 check "duo opens two panes"               '^✔ workspace ready · 2 agents$'
 check "step 1 attaches"                   '^  1  tmux attach -t main +open the workspace and start your agents$'
-check "step 2 names the first agent"      '^  2  cyclops send implementer --subject "hello" +send the first message$'
+check "step 2 names the first agent"      '^  2  cyclops send implementer --subject "hello" --summary "Hello from Cyclops\. Reply when you are ready\." +send the first message$'
 
 wait_for "the second daemon to attach" 60 duo_attached
 
@@ -1027,13 +1028,13 @@ wait_for "the second daemon to bind implementer" 100 duo_pane_bound_to "$D1" dem
 wait_for "the second daemon to bind reviewer" 100 duo_pane_bound_to "$D2" demo
 duo_start_composer reviewer "$D2"
 
-printf '\n$ cyclops send reviewer --subject "hello"\n'
-duo_agent_command implementer "$D1" 'send reviewer --subject "hello" --client-key parity-duo --plain'
+printf '\n$ cyclops send reviewer --subject "hello" --summary "Review the greeting. Reply when ready."\n'
+duo_agent_command implementer "$D1" 'send reviewer --subject "hello" --summary "Review the greeting. Reply when ready." --client-key parity-duo --plain'
 check "the first message is accepted"     '^accepted m-[[:xdigit:]]{32}$'
 check "and reports notification separately" '^✓ accepted( · [0-9]+ ahead)? · wake (not started|queued|checking readiness|writing|staged|submitted|notified|withdrawn|needs attention|superseded)$'
 check_exit "and accepted send exits 0" 0
 DUO_MESSAGE_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
-wait_for "the second rig reviewer doorbell" 100 duo_pane_matches "$D2" '^❯ cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
+wait_for "the second rig reviewer doorbell" 100 duo_pane_matches "$D2" '^❯ \[cyclops\] FROM: implementer \| Review the greeting\. Reply when ready\. Claim: cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 wait_for "the second rig doorbell to be submitted" 100 duo_notification_crossed_submit "$DUO_MESSAGE_ID"
 
 printf '\n$ cyclops history\n'
@@ -1194,15 +1195,15 @@ wait_for "the defaults daemon to bind implementer" 100 stock_pane_bound_to "$S1"
 wait_for "the defaults daemon to bind reviewer" 100 stock_pane_bound_to "$S2" demo
 stock_start_composer reviewer "$S2"
 
-stock_agent_command implementer "$S1" 'send reviewer --subject "bound hello" --body "private default body" --client-key parity-stock-bound --plain'
+stock_agent_command implementer "$S1" 'send reviewer --subject "bound hello" --summary "Review the bound greeting. Claim the private details." --body "private default body" --client-key parity-stock-bound --plain'
 check "the default bound send is accepted" '^accepted m-[[:xdigit:]]{32}$'
 check "its wake state is separate" '^✓ accepted( · [0-9]+ ahead)? · wake (not started|queued|checking readiness|writing|staged|submitted|notified|withdrawn|needs attention|superseded)$'
 check_exit "the default bound send exits 0" 0
 STOCK_BOUND_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
-wait_for "the defaults reviewer doorbell" 100 stock_pane_matches "$S2" '^❯ cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
+wait_for "the defaults reviewer doorbell" 100 stock_pane_matches "$S2" '^❯ \[cyclops\] FROM: implementer \| Review the bound greeting\. Claim the private details\. Claim: cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 wait_for "the defaults doorbell to be submitted" 100 stock_notification_crossed_submit "$STOCK_BOUND_ID"
 stock_tmx capture-pane -p -t "$S2" > "$OUT"
-check "the default pane gets the exact attempt doorbell" '^❯ cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
+check "the default pane gets the sender, summary, and exact attempt doorbell" '^❯ \[cyclops\] FROM: implementer \| Review the bound greeting\. Claim the private details\. Claim: cyclops inbox claim m-att_[A-Za-z0-9_-]{22}$'
 check_absent "the default pane does not get the body" '^private default body$'
 
 # History owns message facts, not standard notification badges.

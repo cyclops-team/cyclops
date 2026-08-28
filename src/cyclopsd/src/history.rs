@@ -1202,9 +1202,9 @@ mod tests {
     use crate::mailbox::{MailboxDirectory, MailboxSend, MailboxService, MessageStore};
     use cyclops_proto::{
         Delivery, DeliveryState, LiveSessionKey, MessageId, MessagePresentation, OsBootId,
-        ProcessInstanceId, RecipientPresentation, RequestDigest, SessionIdentityBinding,
-        SessionInstanceId, TmuxPaneId, TmuxSessionId, VerifiedBy, WorkspaceId,
-        CANONICAL_RECORD_VERSION,
+        ProcessInstanceId, RecipientPresentation, RequestContent, RequestDigest,
+        SessionIdentityBinding, SessionInstanceId, TmuxPaneId, TmuxSessionId, VerifiedBy,
+        WorkspaceId, CANONICAL_RECORD_VERSION,
     };
     use std::path::Path;
     use std::str::FromStr;
@@ -1522,14 +1522,18 @@ mod tests {
                     label: bob.label.clone(),
                 }],
             },
+            summary: None,
             thread_root: message_id,
             client_key: None,
             request_digest: RequestDigest::compute(
                 Kind::Msg,
                 alice.key,
                 &[bob.key],
-                Some("subject"),
-                Some("body"),
+                RequestContent {
+                    subject: Some("subject"),
+                    summary: None,
+                    body: Some("body"),
+                },
                 None,
                 None,
             )
@@ -2005,6 +2009,7 @@ mod tests {
                     addresses: vec![recipient.label.clone()],
                     recipient_keys: None,
                     subject: "canonical subject".into(),
+                    summary: None,
                     body: "canonical body".into(),
                     fyi: false,
                     client_key: None,

@@ -64,8 +64,8 @@ use `cyclops inbox next` or `cyclops inbox claim` over the socket. See
 
 An authenticated claim prints one framed message with immutable `TO`, `FROM`,
 and `SUBJECT` labels, the full durable body, an exact reply command, and a
-matching `[cyclops:end <message-id>]` marker. The short terminal wake remains
-body-free.
+matching `[cyclops:end <message-id>]` marker. The short terminal wake contains
+only the sender-authored preview and exact claim, never the full body.
 
 ## 4. Check the roster
 
@@ -85,7 +85,9 @@ cyclops name %1 reviewer
 ## 5. Send a message
 
 ```bash
-cyclops send implementer --subject "Summarize the README" --body "Call out the setup steps and test commands."
+cyclops send implementer --subject "Summarize the README" \
+  --summary "Summarize the project README. Call out setup and test commands." \
+  --body "Call out the setup steps and test commands."
 ```
 
 The receipt confirms durable acceptance and reports the current one-line wake

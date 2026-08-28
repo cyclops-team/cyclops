@@ -21,7 +21,7 @@ pub const RESTART_PREDATES_FIX: &str =
     "Stop and start it once by hand: cyclops daemon stop, then cyclops start.";
 
 pub const NO_RECIPIENT: &str =
-    "no recipient. Name one (cyclops send reviewer --subject \"...\"), or pass --to or --all.";
+    "no recipient. Name one (cyclops send reviewer --subject \"...\" --summary \"First sentence. Second sentence.\"), or pass --to or --all.";
 
 pub const ATTENTION_DIFF_UNAVAILABLE: &str =
     "diff unavailable: exact visible composer extraction failed";
@@ -253,8 +253,10 @@ pub fn in_flight(to: &str) -> String {
 /// it was scoped to so the suggested send goes somewhere real.
 pub fn no_messages(target: Option<&str>) -> String {
     match target {
-        Some(t) => format!("No messages with {t} yet. Send one: cyclops send {t} --subject ..."),
-        None => "No messages yet. Send one: cyclops send <target> --subject ...".to_string(),
+        Some(t) => format!(
+            "No messages with {t} yet. Send one: cyclops send {t} --subject ... --summary \"First sentence. Second sentence.\""
+        ),
+        None => "No messages yet. Send one: cyclops send <target> --subject ... --summary \"First sentence. Second sentence.\"".to_string(),
     }
 }
 
@@ -808,11 +810,11 @@ mod tests {
     fn empty_history_copy_invites_a_send() {
         assert_eq!(
             no_messages(None),
-            "No messages yet. Send one: cyclops send <target> --subject ..."
+            "No messages yet. Send one: cyclops send <target> --subject ... --summary \"First sentence. Second sentence.\""
         );
         assert_eq!(
             no_messages(Some("reviewer")),
-            "No messages with reviewer yet. Send one: cyclops send reviewer --subject ..."
+            "No messages with reviewer yet. Send one: cyclops send reviewer --subject ... --summary \"First sentence. Second sentence.\""
         );
     }
 

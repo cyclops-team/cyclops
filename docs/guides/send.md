@@ -2,14 +2,16 @@
 
 `cyclops send` records one immutable message in each recipient's durable
 mailbox and returns after acceptance. Terminal delivery is asynchronous. A
-recipient with the exact shipped claim skill gets a content-free doorbell. A
-recipient without that proof gets the full canonical payload through the same
-safe terminal gate.
+CLI send or reply queues a two-sentence preview and exact claim command through
+the safe terminal gate. The full technical body remains in the authenticated
+mailbox.
 
 ## Send
 
 ```console
-$ cyclops send reviewer --subject "Review the rate limiter" --body "gateway.rs:120"
+$ cyclops send reviewer --subject "Review the rate limiter" \
+    --summary "The rate limiter is ready for review. Check the burst path for regressions." \
+    --body "gateway.rs:120"
 accepted m-3f9c2a
 ✓ accepted · wake queued
 ```
@@ -78,31 +80,27 @@ after valid acceptance. Plain output prints the accepted message id and warns
 that the wake receipt state is unknown to this client; JSON preserves the raw
 response. An incomplete acceptance envelope exits 1 in both modes.
 
-The body and wake use different paths. Doorbell mode never pastes the message
-body. A terminal wake stages one `inbox claim` command, while a pull client may
-claim the same message through the authenticated socket without changing the
-composer. Both are valid. `cyclops messages` is the authoritative combined
-view of mailbox and wake state.
+The body and wake use different paths. The terminal wake stages the required
+two-sentence summary and one exact `inbox claim` command, never the full body.
+Working state does not discard the wake. Human input or an ambiguous composer
+makes it wait until the composer is proven available. A pull client may claim
+the same message through the authenticated socket without changing the
+composer. `cyclops messages` is the authoritative combined view of mailbox
+and wake state.
 
 ## Receive
 
-The preferred path is this content-free notification:
+CLI sends and replies use this summary-bearing notification:
 
 ```text
-cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
+[cyclops] FROM: implementer | The rate limiter is ready for review. Check the burst path for regressions. Claim: cyclops inbox claim m-att_--AAAAAAQACAAAAAAAAAAQ
 ```
 
-The daemon selects it only when `cyclops setup check` reports `mailbox
-doorbell`. The reserved locator remains valid positional-claim input for older
-clients. Its 22-character token losslessly identifies the exact current
-notification attempt. The daemon atomically resolves that attempt to its
-message and claims it for the authenticated recipient.
-
-If setup reports `mailbox direct payload`, Cyclops writes the full message
-envelope instead. This compatibility path exists for an absent, edited,
-outdated, unreadable, or changed claim skill. A successful direct delivery is
-recorded as `delivered_direct`, not as a claim, and the recipient does not run
-`inbox claim` for that message.
+The reserved locator remains valid positional-claim input. Its 22-character
+token losslessly identifies the exact current notification attempt. The daemon
+atomically resolves that attempt to its message and claims it for the
+authenticated recipient. Summaryless legacy wire clients retain their
+versioned Format 3 and direct-payload compatibility paths.
 
 Both shapes are written once, only after proving the pane occupant, manifest,
 and clean composer. An ambiguous write or submit raises attention. Cyclops does
@@ -149,7 +147,7 @@ Claim exactly the named message to fetch its immutable payload:
 $ cyclops inbox claim m-3f9c2a
 [cyclops m-3f9c2a] TO: reviewer  FROM: admin  SUBJECT: Review the rate limiter
 gateway.rs:120
-Reply: cyclops reply m-3f9c2a --body "..."
+Reply: cyclops reply m-3f9c2a --summary "First sentence. Second sentence." --body "..."
 [cyclops:end m-3f9c2a]
 ```
 
@@ -176,7 +174,9 @@ Reply using the message id so the daemon derives the recipient, thread, and
 subject from the visible parent:
 
 ```console
-$ cyclops reply m-3f9c2a --body "Reviewed. One issue in the retry path."
+$ cyclops reply m-3f9c2a \
+    --summary "The review found one retry issue. Update the backoff path before merging." \
+    --body "Reviewed. One issue in the retry path."
 accepted m-a912ef
 ```
 
@@ -195,7 +195,9 @@ and claim through the socket.
 An agent can send to it normally:
 
 ```console
-$ cyclops send admin --subject "Review needed" --body "Attempt n-42 is blocked."
+$ cyclops send admin --subject "Review needed" \
+    --summary "A notification attempt is blocked. Inspect attempt n-42 before requeueing." \
+    --body "Attempt n-42 is blocked."
 accepted m-c82d11
 ✓ accepted · wake not started
 ```
@@ -212,9 +214,13 @@ through its current watched pane. Broadcast `*` targets agent panes only; name
 ## Broadcast, reply, and supersession
 
 ```bash
-cyclops send --to implementer,reviewer --subject "Standup in 5" --fyi
-cyclops send --all --subject "Rebase landed" --fyi
-cyclops send reviewer --subject "Corrected handoff" --body-file note.txt \
+cyclops send --to implementer,reviewer --subject "Standup in 5" \
+  --summary "Standup begins in five minutes. Join when your current step is safe." --fyi
+cyclops send --all --subject "Rebase landed" \
+  --summary "The shared rebase has landed. Refresh before starting new work." --fyi
+cyclops send reviewer --subject "Corrected handoff" \
+  --summary "The handoff has been corrected. Use the attached note instead of the prior message." \
+  --body-file note.txt \
   --supersedes m-old
 ```
 

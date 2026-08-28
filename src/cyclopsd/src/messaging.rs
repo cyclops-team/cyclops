@@ -927,12 +927,13 @@ pub(crate) async fn send(
         return Err(crate::mailbox::MailboxDirectoryError::MixedRecipientSelectors.into());
     }
     let accepted = match params.reply_to {
-        Some(reference) => service.reply(
+        Some(reference) => service.reply_with_summary(
             sender,
             MessageId::new(reference)
                 .map_err(crate::mailbox::MailboxError::from)
                 .map_err(crate::mailbox::MessageStoreError::from)
                 .map_err(MailboxServiceError::from)?,
+            params.summary,
             params.body,
             params.client_key,
         )?,
@@ -942,6 +943,7 @@ pub(crate) async fn send(
                 addresses: params.to,
                 recipient_keys: params.recipient_keys,
                 subject: params.subject,
+                summary: params.summary,
                 body: params.body,
                 fyi: params.fyi,
                 client_key: params.client_key,
@@ -957,10 +959,11 @@ pub(crate) async fn reply(
     service: &Arc<MailboxService>,
     sender: MailboxIdentity,
     reference: MessageId,
+    summary: Option<String>,
     body: String,
     client_key: Option<String>,
 ) -> Result<MsgSendResult, MailboxServiceError> {
-    let accepted = service.reply(sender, reference, body, client_key)?;
+    let accepted = service.reply_with_summary(sender, reference, summary, body, client_key)?;
     finish_acceptance(inner, service, accepted, false).await
 }
 
@@ -1255,6 +1258,7 @@ mod tests {
                     addresses: addresses.iter().map(|address| (*address).into()).collect(),
                     recipient_keys: None,
                     subject: subject.into(),
+                    summary: None,
                     body: "Body".into(),
                     fyi: false,
                     client_key: None,
@@ -2271,6 +2275,7 @@ mod tests {
                     addresses: vec!["reviewer".into(), "observer".into()],
                     recipient_keys: None,
                     subject: "Broadcast".into(),
+                    summary: None,
                     body: "Body".into(),
                     fyi: false,
                     client_key: None,

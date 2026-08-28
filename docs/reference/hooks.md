@@ -1,8 +1,8 @@
 # Hooks
 
 Vendor hooks report authenticated lifecycle edges. Standard mailbox messaging
-uses them with pane detection to decide whether a content-free notification is
-safe to write. The legacy direct-delivery self-test also uses an acknowledgement
+uses them with pane detection to decide whether a summary-and-claim notification
+is safe to write. The legacy direct-delivery self-test also uses an acknowledgement
 hook to prove that its injected test payload arrived. A rendered config proves
 nothing until an edge actually arrives, so Cyclops splits the job into prepare,
 wire, and prove.

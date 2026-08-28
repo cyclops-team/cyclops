@@ -180,10 +180,10 @@ an agent. [panes.md](panes.md).
 
 ## 4. Wire the hooks
 
-Standard messaging prefers a content-free doorbell when the exact claim skill
-is installed. Without that capability proof it safely delivers the full
-payload instead. Hooks report authenticated lifecycle edges that help Cyclops
-distinguish a running turn from a clean composer on either path.
+Standard CLI messaging queues a concise two-sentence preview beside an exact
+claim command. The full body stays in the authenticated mailbox. Hooks report
+authenticated lifecycle edges that help Cyclops distinguish a running turn
+from a clean composer before it stages that notification.
 
 ```
 cyclops hooks install claude --agent reviewer   # renders config, prints wiring
@@ -201,7 +201,9 @@ natural-language flow this is the moment you said "send it to reviewer and
 ask for a review", and the implementer runs the command itself:
 
 ```
-$ cyclops send reviewer --subject "Burst path fix, ready for review" --body "gateway.rs:120. Tests pass."
+$ cyclops send reviewer --subject "Burst path fix, ready for review" \
+    --summary "The burst path fix is ready. Review gateway.rs before merging." \
+    --body "gateway.rs:120. Tests pass."
 accepted m-be0129
 ✓ accepted · wake queued
 ```
@@ -226,10 +228,12 @@ m-be0129 implementer · Burst path fix, ready for review
 $ cyclops inbox claim m-be0129
 [cyclops m-be0129] TO: reviewer  FROM: implementer  SUBJECT: Burst path fix, ready for review
 gateway.rs:120. Tests pass.
-Reply: cyclops reply m-be0129 --body "..."
+Reply: cyclops reply m-be0129 --summary "First sentence. Second sentence." --body "..."
 [cyclops:end m-be0129]
 
-$ cyclops reply m-be0129 --body "Approved. One nit in the retry path."
+$ cyclops reply m-be0129 \
+    --summary "The fix is approved with one nit. Check the retry path before merging." \
+    --body "Approved. One nit in the retry path."
 accepted m-a94c10
 ```
 

@@ -136,7 +136,9 @@ fn notification_prewrite_bookend(
     binding: &fusion::Binding,
     pane_width: u32,
 ) -> Option<String> {
-    if matches!(selected.transport, Some(NotificationTransport::Doorbell)) {
+    if matches!(selected.transport, Some(NotificationTransport::Doorbell))
+        && selected.doorbell_format != Some(cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM)
+    {
         let current =
             recipient
                 .zip(selected.capability.as_ref())
@@ -149,6 +151,11 @@ fn notification_prewrite_bookend(
     }
     if selected.doorbell_format == Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM)
         && pane_width < cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH
+    {
+        return Some(format!("pane_too_narrow:{pane_width}"));
+    }
+    if selected.doorbell_format == Some(cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM)
+        && pane_width < cyclops_proto::DOORBELL_V4_MIN_PANE_WIDTH
     {
         return Some(format!("pane_too_narrow:{pane_width}"));
     }
@@ -201,6 +208,24 @@ fn select_attempt_payload(
             &binding.manifest,
         )
     });
+    let message = notification.message_line()?;
+    let metadata = message.data.as_ref().and_then(|data| {
+        serde_json::from_value::<cyclops_proto::MessageMetadata>(data.clone()).ok()
+    });
+    if let Some(metadata) = metadata {
+        if let Some(summary) = metadata.summary {
+            return Ok(AttemptPayload {
+                bytes: cyclops_proto::render_doorbell_v4(
+                    &metadata.presentation.sender_label,
+                    &summary,
+                    notification.attempt_id(),
+                ),
+                transport: Some(NotificationTransport::Doorbell),
+                doorbell_format: Some(cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM),
+                capability: None,
+            });
+        }
+    }
     let reminder = notification.current_record()?.unclaimed_reminder_count > 0;
     if capability.is_some() || reminder {
         return Ok(AttemptPayload {
@@ -211,7 +236,6 @@ fn select_attempt_payload(
         });
     }
 
-    let message = notification.message_line()?;
     Ok(AttemptPayload {
         bytes: render_canonical_message_payload(&message),
         transport: Some(NotificationTransport::DirectPayload),
@@ -243,6 +267,21 @@ pub(crate) fn expected_notification_payload(
             Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM) => {
                 Some(cyclops_proto::render_doorbell_v3(record.attempt_id))
             }
+            Some(cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM) => message
+                .data
+                .as_ref()
+                .and_then(|data| {
+                    serde_json::from_value::<cyclops_proto::MessageMetadata>(data.clone()).ok()
+                })
+                .and_then(|metadata| {
+                    metadata.summary.map(|summary| {
+                        cyclops_proto::render_doorbell_v4(
+                            &metadata.presentation.sender_label,
+                            &summary,
+                            record.attempt_id,
+                        )
+                    })
+                }),
             Some(_) => None,
         },
         (NotificationTransport::DirectPayload, None) => {
@@ -2188,7 +2227,9 @@ pub fn render_payload(msg_id: &str, from: &str, subject: &str, body: &str, fyi: 
         lines.push(body.to_string());
     }
     if !fyi && from != cyclops_proto::label::ADMIN {
-        lines.push(format!("Reply: cyclops send {from} --subject \"...\""));
+        lines.push(format!(
+            "Reply: cyclops send {from} --subject \"...\" --summary \"First sentence. Second sentence.\""
+        ));
     }
     lines.push(sentinel_for(msg_id));
     lines.join("\n")
@@ -9663,6 +9704,7 @@ mod tests {
                     sender: admin,
                     recipients: vec![recipient],
                     subject: Some("Wake".into()),
+                    summary: None,
                     body: Some("Review the mailbox".into()),
                     client_key: None,
                     supersedes: None,
@@ -10870,6 +10912,7 @@ mod tests {
                     sender: RecipientKey::admin(recipient.workspace_id()),
                     recipients: vec![recipient],
                     subject: Some("Replacement".into()),
+                    summary: None,
                     body: None,
                     client_key: None,
                     supersedes: Some(message_id.clone()),
@@ -11218,7 +11261,10 @@ mod tests {
             "[cyclops m-3f9c2a] FROM: codex  SUBJECT: Review the rate limiter"
         );
         assert_eq!(lines[1], "please");
-        assert_eq!(lines[2], "Reply: cyclops send codex --subject \"...\"");
+        assert_eq!(
+            lines[2],
+            "Reply: cyclops send codex --subject \"...\" --summary \"First sentence. Second sentence.\""
+        );
         assert!(
             !p.ends_with('\n'),
             "no trailing newline; submit is separate"
@@ -12895,6 +12941,7 @@ composer_trailer_required_prefix = 1
                     addresses: vec!["reviewer".into()],
                     recipient_keys: None,
                     subject: "Wake".into(),
+                    summary: None,
                     body: "Review the mailbox".into(),
                     fyi: false,
                     client_key: None,

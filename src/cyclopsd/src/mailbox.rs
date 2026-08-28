@@ -21,9 +21,10 @@ use cyclops_proto::{
     NotificationResolution, NotificationResolutionConsumptionEvidence,
     NotificationResolutionConsumptionObservation, NotificationRouteEvidenceId, NotificationState,
     NotificationTransport, NotificationVerifyOutcome, ProcessInstanceId, RecipientKey,
-    RequestDigest, StatusBlockedNotification, StatusNextAction, TmuxPaneId, WorkspaceId,
-    CANONICAL_RECORD_VERSION, DOORBELL_FORMAT_ATTEMPT_CLAIM, DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM,
-    DOORBELL_FORMAT_COMPACT_CLAIM, NOTIFICATION_RESOLUTION_PROOF_VERSION,
+    RequestContent, RequestDigest, StatusBlockedNotification, StatusNextAction, TmuxPaneId,
+    WorkspaceId, CANONICAL_RECORD_VERSION, DOORBELL_FORMAT_ATTEMPT_CLAIM,
+    DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM, DOORBELL_FORMAT_COMPACT_CLAIM,
+    NOTIFICATION_RESOLUTION_PROOF_VERSION,
 };
 use cyclops_state::StateRoot;
 use tokio::sync::broadcast;
@@ -35,6 +36,7 @@ pub struct MessageDraft {
     pub sender: RecipientKey,
     pub recipients: Vec<RecipientKey>,
     pub subject: Option<String>,
+    pub summary: Option<String>,
     pub body: Option<String>,
     pub client_key: Option<String>,
     pub supersedes: Option<MessageId>,
@@ -72,6 +74,7 @@ pub(crate) struct BlockedNotificationSnapshot {
 pub struct ReplyDraft {
     pub sender: RecipientKey,
     pub reference: MessageId,
+    pub summary: Option<String>,
     pub body: Option<String>,
     pub client_key: Option<String>,
     pub sender_label: String,
@@ -88,6 +91,7 @@ struct CanonicalDraft {
     sender: RecipientKey,
     recipients: Vec<RecipientKey>,
     subject: Option<String>,
+    summary: Option<String>,
     body: Option<String>,
     reply_to: Option<MessageId>,
     client_key: Option<String>,
@@ -616,6 +620,7 @@ pub struct MailboxSend {
     pub addresses: Vec<String>,
     pub recipient_keys: Option<Vec<RecipientKey>>,
     pub subject: String,
+    pub summary: Option<String>,
     pub body: String,
     pub fyi: bool,
     pub client_key: Option<String>,
@@ -918,13 +923,19 @@ impl MailboxProjection {
             }
         }
         presentation_labels(&draft.recipients, &draft.presentation)?;
+        if let Some(summary) = draft.summary.as_deref() {
+            cyclops_proto::validate_message_summary(summary)?;
+        }
 
         let digest = RequestDigest::compute(
             draft.kind,
             draft.sender,
             &draft.recipients,
-            draft.subject.as_deref(),
-            draft.body.as_deref(),
+            RequestContent {
+                subject: draft.subject.as_deref(),
+                summary: draft.summary.as_deref(),
+                body: draft.body.as_deref(),
+            },
             draft.reply_to.as_ref(),
             draft.supersedes.as_ref(),
         )?;
@@ -1166,8 +1177,11 @@ impl MailboxProjection {
             line.kind,
             metadata.sender,
             &metadata.recipients,
-            line.subject.as_deref(),
-            line.body.as_deref(),
+            RequestContent {
+                subject: line.subject.as_deref(),
+                summary: metadata.summary.as_deref(),
+                body: line.body.as_deref(),
+            },
             reply_to.as_ref(),
             metadata.supersedes.as_ref(),
         )?;
@@ -4409,6 +4423,7 @@ fn inbox_message(line: &LedgerLine, claimant: RecipientKey) -> Result<InboxMessa
         sender: Some(metadata.sender),
         sender_label: metadata.presentation.sender_label,
         subject: line.subject.clone(),
+        summary: metadata.summary,
         body: line.body.clone(),
         reply_to: line.reply_to.as_deref().map(MessageId::new).transpose()?,
         thread_root: metadata.thread_root,
@@ -4749,6 +4764,7 @@ impl MailboxService {
             sender: sender.key,
             recipients: recipients.iter().map(|identity| identity.key).collect(),
             subject: Some(request.subject),
+            summary: request.summary,
             body: (!request.body.is_empty()).then_some(request.body),
             client_key: request.client_key,
             supersedes: request.supersedes,
@@ -5490,6 +5506,17 @@ impl MailboxService {
         body: String,
         client_key: Option<String>,
     ) -> Result<AcceptResult, MailboxServiceError> {
+        self.reply_with_summary(sender, reference, None, body, client_key)
+    }
+
+    pub fn reply_with_summary(
+        &self,
+        sender: MailboxIdentity,
+        reference: MessageId,
+        summary: Option<String>,
+        body: String,
+        client_key: Option<String>,
+    ) -> Result<AcceptResult, MailboxServiceError> {
         // Reply routing is the referenced message's immutable sender key,
         // never its presentation label. Keep the current directory read
         // through the append so a rename preserves the route while a
@@ -5509,6 +5536,7 @@ impl MailboxService {
             ReplyDraft {
                 sender: sender.key,
                 reference,
+                summary,
                 body: (!body.is_empty()).then_some(body),
                 client_key,
                 sender_label: sender.label,
@@ -6498,6 +6526,7 @@ impl MessageStore {
             sender: draft.sender,
             recipients: draft.recipients,
             subject: draft.subject,
+            summary: draft.summary,
             body: draft.body,
             reply_to: None,
             client_key: draft.client_key,
@@ -6530,6 +6559,7 @@ impl MessageStore {
             sender: draft.sender,
             recipients: vec![derived.recipient],
             subject: derived.subject,
+            summary: draft.summary,
             body: draft.body,
             reply_to: Some(draft.reference),
             client_key: draft.client_key,
@@ -6588,6 +6618,7 @@ impl MessageStore {
             sender: draft.sender,
             recipients: draft.recipients.clone(),
             presentation: draft.presentation.clone(),
+            summary: draft.summary.clone(),
             thread_root,
             client_key: draft.client_key.clone(),
             request_digest,
@@ -6658,7 +6689,7 @@ impl MessageStore {
             .notification_by_attempt(attempt_id)
             .cloned()
             .filter(|record| {
-                record.doorbell_format == Some(DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM)
+                doorbell_format_names_exact_attempt(record.doorbell_format)
                     && record.recipient == claimant
             })
             .ok_or(MailboxError::NotificationAttemptUnknown(attempt_id))?;
@@ -7000,6 +7031,7 @@ impl MessageStore {
                 DOORBELL_FORMAT_COMPACT_CLAIM
                     | DOORBELL_FORMAT_ATTEMPT_CLAIM
                     | DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM
+                    | cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM
             ) {
                 return Err(MailboxError::UnsupportedNotificationDoorbellFormat(format).into());
             }
@@ -7973,6 +8005,7 @@ mod tests {
             addresses: vec![address.into()],
             recipient_keys: None,
             subject: subject.into(),
+            summary: None,
             body: body.into(),
             fyi: false,
             client_key: None,
@@ -7990,6 +8023,7 @@ mod tests {
             addresses: Vec::new(),
             recipient_keys: Some(recipient_keys),
             subject: subject.into(),
+            summary: None,
             body: body.into(),
             fyi: false,
             client_key: client_key.map(str::to_string),
@@ -10462,6 +10496,7 @@ mod tests {
                     addresses: vec!["*".into()],
                     recipient_keys: None,
                     subject: "Broadcast".into(),
+                    summary: None,
                     body: String::new(),
                     fyi: false,
                     client_key: None,
@@ -10893,6 +10928,7 @@ mod tests {
             sender,
             recipients,
             subject: Some("Task".into()),
+            summary: None,
             body: Some(body.into()),
             client_key: client_key.map(str::to_string),
             supersedes: None,
@@ -10904,6 +10940,7 @@ mod tests {
         ReplyDraft {
             sender,
             reference,
+            summary: None,
             body: Some(body.into()),
             client_key: None,
             sender_label: "reply-sender".into(),
@@ -11633,8 +11670,11 @@ mod tests {
             kind,
             sender,
             &recipients,
-            Some("Task"),
-            Some(body),
+            RequestContent {
+                subject: Some("Task"),
+                summary: None,
+                body: Some(body),
+            },
             None,
             None,
         )
@@ -11656,6 +11696,7 @@ mod tests {
             sender,
             recipients: recipients.clone(),
             presentation,
+            summary: None,
             thread_root: msg_id,
             client_key: client_key.map(String::from),
             request_digest: digest,
@@ -11845,6 +11886,7 @@ mod tests {
             sender: admin,
             recipients: vec![bob],
             subject: Some("Task".into()),
+            summary: None,
             body: Some("B1".into()),
             reply_to: None,
             client_key: Some("key-1".into()),
@@ -11879,6 +11921,7 @@ mod tests {
             sender: admin,
             recipients: vec![bob],
             subject: Some("Task".into()),
+            summary: None,
             body: Some("B2_DIFF".into()),
             reply_to: None,
             client_key: Some("key-1".into()),
@@ -11887,6 +11930,31 @@ mod tests {
         };
         let err = active_proj.check_acceptance(&draft_conflict).unwrap_err();
         assert!(matches!(err, MailboxError::DuplicateIdempotencyKey { .. }));
+    }
+
+    #[test]
+    fn invalid_summary_is_refused_before_acceptance_changes_projection_state() {
+        let (workspace, admin, recipient, _) = test_context();
+        let projection = MailboxProjection::new(workspace);
+        let draft = CanonicalDraft {
+            kind: Kind::Msg,
+            sender: admin,
+            recipients: vec![recipient],
+            subject: Some("Review".into()),
+            summary: Some("Only one sentence.".into()),
+            body: Some("Private body".into()),
+            reply_to: None,
+            client_key: Some("invalid-summary".into()),
+            supersedes: None,
+            presentation: test_presentation(&[recipient]),
+        };
+
+        assert!(matches!(
+            projection.check_acceptance(&draft),
+            Err(MailboxError::Type(MailboxTypeError::InvalidMessageSummary))
+        ));
+        assert_eq!(projection.last_sequence(), None);
+        assert!(projection.get_pending(recipient).is_empty());
     }
 
     #[test]
@@ -12964,8 +13032,11 @@ mod tests {
             Kind::Msg,
             bob,
             &[carol],
-            wrong_target.subject.as_deref(),
-            wrong_target.body.as_deref(),
+            RequestContent {
+                subject: wrong_target.subject.as_deref(),
+                summary: metadata.summary.as_deref(),
+                body: wrong_target.body.as_deref(),
+            },
             Some(&root_id),
             None,
         )
@@ -12992,14 +13063,18 @@ mod tests {
             sender: bob,
             recipients: vec![admin],
             presentation,
+            summary: None,
             thread_root: root_id.clone(),
             client_key: None,
             request_digest: RequestDigest::compute(
                 Kind::Msg,
                 bob,
                 &[admin],
-                wrong_subject.subject.as_deref(),
-                wrong_subject.body.as_deref(),
+                RequestContent {
+                    subject: wrong_subject.subject.as_deref(),
+                    summary: None,
+                    body: wrong_subject.body.as_deref(),
+                },
                 Some(&root_id),
                 None,
             )

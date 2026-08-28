@@ -6,13 +6,15 @@ description: "Send work, broadcast announcements, wait for pane state, and revie
 ## Send one agent a request
 
 ```bash
-cyclops send reviewer --subject "Review the last commit" --body "Check correctness and test coverage."
+cyclops send reviewer --subject "Review the last commit" \
+  --summary "The last commit is ready for review. Check correctness and test coverage." \
+  --body "Check correctness and test coverage."
 ```
 
-Cyclops durably accepts the message before returning. When setup reports
-`mailbox doorbell`, it queues a content-free wake for the recipient pane. The
-receipt keeps those facts separate: `accepted` covers the mailbox record,
-while `wake <state>` reports the current notification attempt.
+Cyclops durably accepts the message before returning, then queues the summary
+and exact claim as the recipient's guarded pane notification. The receipt
+keeps those facts separate: `accepted` covers the mailbox record, while `wake
+<state>` reports the current notification attempt.
 
 A socket claim may complete without any body appearing in the composer. The
 Messages view records the mailbox and wake outcomes separately.
@@ -25,7 +27,9 @@ also list and claim by message id:
 cyclops inbox claim m-att_<22-character-attempt-token>
 cyclops inbox list
 cyclops inbox claim <message-id>
-cyclops reply <message-id> --body "Reviewed. One issue."
+cyclops reply <message-id> \
+  --summary "The review found one issue. Read the body for its exact location." \
+  --body "Reviewed. One issue."
 ```
 
 The terminal wake stays deliberately short so Cyclops can prove its exact
@@ -35,17 +39,16 @@ envelope instead:
 ```text
 [cyclops m-…] TO: reviewer  FROM: implementer  SUBJECT: Review the last commit
 <full durable body>
-Reply: cyclops reply m-… --body "..."
+Reply: cyclops reply m-… --summary "First sentence. Second sentence." --body "..."
 [cyclops:end m-…]
 ```
 
 The labels are the immutable presentation captured at acceptance time. A later
 pane rename changes neither the record nor this envelope.
 
-If claim-skill proof is absent, outdated, edited, unreadable, or changes before
-the write, Cyclops uses the visible full-payload compatibility path instead. It
-records that outcome as `delivered_direct`; the recipient does not claim that
-message again.
+Summaryless legacy clients retain the visible full-payload compatibility path.
+Current `cyclops send` and `cyclops reply` commands always use the summary and
+exact-claim notification.
 
 The wake is one-shot. An ambiguous terminal outcome raises one attention item
 and leaves the message claimable. Do not resend or requeue blindly. Follow
@@ -55,7 +58,8 @@ or discard, and provably pre-write withdrawal.
 ## Broadcast
 
 ```bash
-cyclops send --all --subject "Standup in 5" --fyi
+cyclops send --all --subject "Standup in 5" \
+  --summary "Standup begins in five minutes. Join when your current step is safe." --fyi
 ```
 
 A broadcast creates one immutable message with one mailbox entry and one wake

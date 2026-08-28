@@ -565,6 +565,7 @@ pub(crate) async fn selftest(
         recipient_keys: None,
         expected_caller: None,
         subject: "[cyclops] hook self-test".to_string(),
+        summary: None,
         body: "Reply not needed.".to_string(),
         fyi: true,
         client_key: None,

@@ -6,28 +6,27 @@ shapes belong to `src/cyclops-proto` and `docs/reference/PROTOCOL.md`.
 ## Mailbox transport decision
 
 `msg.send` always records the message and one mailbox entry per recipient
-before terminal delivery begins. Each recipient then gets exactly one of two
-transport shapes:
+before terminal delivery begins. The CLI requires a two-sentence summary and
+queues Format 4 for every non-admin recipient:
 
-- **Doorbell:** when the admitted agent's manifest declares a mailbox
-  capability file and that opened regular file exactly matches the claim skill
-  compiled into this release, Cyclops writes the exact content-free claim
-  command. The recipient runs it to read the durable payload.
-- **Direct payload fallback:** when that exact capability proof is absent,
-  unreadable, outdated, edited, or changes before the write, Cyclops rebuilds
-  the canonical full payload from the workspace journal and writes it through
-  the same gated terminal pipeline. Successful delivery appends
-  `message_delivered_direct`. It never forges `message_claimed`.
+- **Summary claim:** Cyclops stages the sender-authored preview and the exact
+  attempt claim command. The summary is for the human watching the pane. The
+  recipient claims and reads the authoritative body from the mailbox.
+- **Legacy compatibility:** summaryless wire clients retain Format 3 when the
+  exact claim skill is proven and the canonical direct-payload fallback when
+  it is not.
 
-Transport is selected per attempt, not per vendor. A target can move between
-the two paths as its installed skill changes. Capability evidence is rechecked
-with the exact recipient, process generation, manifest, and file digest at the
-terminal write boundary. Losing proof before the paste returns to gating and
-selects again. It never downgrades after any pane write.
+Legacy transport is selected per attempt, not per vendor. Capability evidence
+for a summaryless notification is rechecked with the exact recipient, process
+generation, manifest, and file digest at the terminal write boundary. Format 4
+is self-describing and does not depend on a seeded capability file. No format
+downgrades after any pane write.
 
 Transport is write metadata on the notification record. It is not part of the
 mailbox state and not part of the terminal occupant identity binding. Current
-doorbell writes keep `transport: "doorbell"` and add `doorbell_format: 3`.
+CLI writes keep `transport: "doorbell"` and add `doorbell_format: 4`. Format 4
+carries the two-sentence summary followed by the exact Format 3 attempt
+locator. Summaryless legacy doorbell writes keep `doorbell_format: 3`.
 Format 3 carries a lossless 128-bit attempt token under the reserved `m-att_`
 message-shaped namespace. This keeps the row runnable by older positional
 claim clients while only the new daemon interprets the locator.
@@ -83,7 +82,7 @@ The fallback and legacy direct paths use this exact shape:
 ```
 [cyclops m-3f9c2a] FROM: codex  SUBJECT: Review the rate limiter
 <body>
-Reply: cyclops send codex --subject "..."
+Reply: cyclops send codex --subject "..." --summary "First sentence. Second sentence."
 [cyclops:end m-3f9c2a]
 ```
 
@@ -193,8 +192,8 @@ timer. In order:
    admitted pid is the agent's, resolved fresh; a process table that
    cannot be read is `occupant_unprovable`, not a fallback to the pane's
    shell.
-5. Format 3 requires a pane width of at least 60 columns on that final row and
-   at the immediate pre-write bookend. A narrower pane becomes
+5. Formats 3 and 4 require a pane width of at least 60 columns on that final
+   row and at the immediate pre-write bookend. A narrower pane becomes
    `blocked_pre_write` with its content-free observed width and no paste. A
    later qualifying width observation from route or size evidence may reopen
    that attempt once.
