@@ -197,6 +197,12 @@ source.
 
 The Messages pane uses the same card language as agent panes: a complete
 muted border at rest and a double accent border while it has keyboard focus.
+Its top-left `⠿ Messages` header makes the local width handle visible; drag the
+`⠿` horizontally to resize the pane. The resting queue keeps rows compact.
+Press Enter on a message to open its authenticated detail, where the full body
+and available thread history wrap to the current pane width and scroll instead
+of being cut off. An inbound body is shown only after the exact recipient
+claim authorizes it.
 Its queue selection, detail scroll, composer, scopes, and shortcuts keep
 their state as the pane opens, closes, or changes width.
 

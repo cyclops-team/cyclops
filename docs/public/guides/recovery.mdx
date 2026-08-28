@@ -3,10 +3,10 @@ title: "Recover a notification"
 description: "Inspect and resolve a blocked or ambiguous one-shot notification safely."
 ---
 
-`cyclops send` returns after the message is durable. Its terminal wake is a
-separate one-shot notification. A wake is not a claim, and a claim is not task
-completion. The message remains available through the socket even when the
-terminal wake is blocked.
+`cyclops send` returns after the message is durable. Its two-sentence preview
+and exact claim are a separate one-shot terminal notification. A wake is not a
+claim, and a claim is not task completion. The full message remains available
+through the socket even when the terminal wake is blocked.
 
 ## Inspect the exact attempt
 

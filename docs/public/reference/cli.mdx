@@ -16,11 +16,11 @@ the same system to terminals and scripts.
 | `cyclops list` | Show every named agent, its state, and current detail. |
 | `cyclops name <pane> <label>` | Give a pane a stable address; `--clear` releases it. |
 | `cyclops read <agent>` | Read visible/recent pane output or the detection evidence. |
-| `cyclops send <agent> --subject ...` | Accept a durable message and print its wake receipt. |
+| `cyclops send <agent> --subject ... --summary ...` | Accept a durable message and print its wake receipt. |
 | `cyclops inbox list`; `cyclops inbox claim <id>` | List pending metadata or claim one exact message. |
 | `cyclops inbox next --timeout 30s` | Wait over the socket and claim at most one pending message without touching a composer. |
 | `cyclops messages` | Read body-free mailbox and notification state. |
-| `cyclops reply <message-id>` | Reply using the visible parent message. |
+| `cyclops reply <message-id> --summary ...` | Reply using the visible parent message. |
 | `cyclops requeue <message-id>` | Requeue eligible unresolved notification alarms for a message. |
 | `cyclops notification withdraw <attempt-id> --recipient <key>` | Withdraw one provably pre-write notification attempt. |
 | `cyclops alarm preview --older-than <age>`; `cyclops alarm clear` | Preview or clear exact durable alarm attempts. |
@@ -41,11 +41,15 @@ the same system to terminals and scripts.
 ## Sending
 
 ```bash
-cyclops send reviewer --subject "Review the diff" --body "Focus on retry ordering."
-cyclops send --all --subject "Standup in 5" --fyi
+cyclops send reviewer --subject "Review the diff" \
+  --summary "The diff is ready for review. Focus on retry ordering." \
+  --body "Focus on retry ordering."
+cyclops send --all --subject "Standup in 5" \
+  --summary "Standup begins in five minutes. Join when your current step is safe." --fyi
 ```
 
-`--to` adds recipients, `--body-file -` reads the body from stdin,
+`--summary` is required and must contain exactly two sentences on one line,
+with at most 240 characters. `--to` adds recipients, `--body-file -` reads the body from stdin,
 `--reply-to` links a reply, and `--all` broadcasts to every adopted agent.
 Name `admin` explicitly to send to the durable operator inbox. By default a
 durably accepted send exits 0 even when its optional terminal wake needs

@@ -8,8 +8,8 @@ description: Communicate with other AI agents running in tmux panes via the cycl
 Cyclops is the coordination layer for agents already running in tmux. It
 does not run your agent or type on your behalf outside a message you asked
 it to send: it names panes, durably accepts mailbox messages, writes a
-content-free notification when safe, and keeps append-only facts you can
-inspect.
+two-sentence preview plus an exact inbox claim when safe, and keeps
+append-only facts you can inspect.
 
 Everything here is `cyclops <subcommand>`. Confirm the exact flags on your
 machine before relying on a command in this page: `cyclops --help` and
@@ -113,7 +113,9 @@ not an agent, or a CLI cyclops has not been taught; see
 ## 2. Send a durable message
 
 ```
-cyclops send <agent> --subject "One line" --body "Details" [--reply-to <id>] [--fyi]
+cyclops send <agent> --subject "One line" \
+  --summary "What this message asks. What the recipient should do next." \
+  --body "Details" [--reply-to <id>] [--fyi]
 ```
 
 `send` records one immutable message in each recipient's mailbox and returns
@@ -121,7 +123,9 @@ after durable acceptance. The receipt separates that fact from the one-line
 pane notification:
 
 ```
-$ cyclops send implementer --subject "Run the tests" --body "make test"
+$ cyclops send implementer --subject "Run the tests" \
+    --summary "Run the focused test suite. Report any exact failure." \
+    --body "make test"
 accepted m-18bfdb
 ✓ accepted · wake queued
 ```
@@ -139,20 +143,41 @@ If the connection drops before the response arrives, inspect current state
 first. The request may already be durable. Repeat a send or reply only with the
 same explicit `--client-key`; an unkeyed retry can create a second message.
 
-With the exact shipped claim skill, Cyclops writes one content-free doorbell
-after proving a clean composer:
+`--summary` is mandatory for both `send` and `reply`. It must be exactly two
+sentences, on one line, and at most 240 characters. Write a useful human
+preview: what the message is about, then what should happen next. Do not copy
+the body or write two versions of the same sentence.
+
+Cyclops writes the summary beside one exact claim instruction after proving a
+clean composer:
 
 ```text
-cyclops inbox claim m-att_<22-character-attempt-token>
+[cyclops] FROM: codey-cyclops | Run the focused test suite. Report any exact failure. Claim: cyclops inbox claim m-att_<22-character-attempt-token>
 ```
+
+This is a two-surface contract:
+
+1. The pane notification is the human-readable front end. It is always queued
+   for a CLI send or reply, even while the recipient is working. Working does
+   not discard the wake. Human input or an ambiguous composer makes the worker
+   wait until the composer is proven available, then it stages the same
+   summary and exact claim once.
+2. The mailbox is the authoritative back end. The subject, routing header, and
+   complete technical body live there. The summary is only orientation. Run
+   the exact `cyclops inbox claim m-att_...` command, read the complete claimed
+   envelope, and work from that body before responding.
+
+Every `cyclops send` therefore supplies `--subject`, `--summary`, and either a
+`--body` or `--body-file` when technical detail is needed. Every `cyclops
+reply` supplies `--summary` and its reply body. Never act from the preview
+alone, and never treat seeing the preview as proof that the body was claimed.
 
 The reserved `m-att_` locator works with positional-claim clients while the
 daemon atomically resolves the exact current attempt. The returned envelope
-names the message id used for reply. If the exact skill proof is absent,
-outdated, edited, unreadable, or changes before the write, Cyclops instead
-writes the full canonical payload ending in `[cyclops:end <id>]`. That direct
-fallback is recorded as `delivered_direct`, not as a claim, so do not run
-`inbox claim` for a payload already delivered this way.
+names the message id used for reply. Older summaryless wire clients retain
+their versioned Format 3 notification and direct-payload compatibility paths;
+new `cyclops send` and `cyclops reply` commands always create the
+summary-bearing exact claim above.
 
 Both transports are one-shot. If the outcome is ambiguous, attention is
 raised. Never resend or requeue blindly. The full workflow and attention
@@ -181,7 +206,7 @@ and returns the immutable payload:
 $ cyclops inbox claim m-d7e4ba
 [cyclops m-d7e4ba] TO: reviewer  FROM: admin  SUBJECT: Review the rate limiter
 Please look at retry.rs before the next run.
-Reply: cyclops reply m-d7e4ba --body "..."
+Reply: cyclops reply m-d7e4ba --summary "The review is complete. No blockers remain." --body "..."
 [cyclops:end m-d7e4ba]
 ```
 
@@ -193,7 +218,9 @@ rename. Reply using the id so the daemon derives the recipient, thread, and
 subject from the parent:
 
 ```
-$ cyclops reply m-d7e4ba --body "Looked at retry.rs. Tests pass."
+$ cyclops reply m-d7e4ba \
+    --summary "The review is complete. No blockers remain." \
+    --body "Looked at retry.rs. Tests pass."
 accepted m-42b817
 ```
 

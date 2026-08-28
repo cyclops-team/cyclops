@@ -32,8 +32,8 @@ authorization, ordering, claim, or receipt. It can also overwrite text that a
 human is typing. Cyclops adds those missing boundaries:
 
 - A send is durably accepted before terminal notification begins.
-- Message bodies remain in the authenticated mailbox. Pane doorbells are
-  content-free claim commands.
+- Message bodies remain in the authenticated mailbox. CLI pane notifications
+  show a required two-sentence preview beside the exact claim command.
 - Notifications are FIFO per recipient and remain tied to stable pane and
   process identities.
 - Terminal writes require current composer evidence. Human input, a modal,
@@ -105,7 +105,9 @@ the workspace or watch UI does not discard accepted messages.
 
 ```bash
 cyclops name implementer --self
-cyclops send reviewer --subject "Review the parser" --body "Please review commit abc123."
+cyclops send reviewer --subject "Review the parser" \
+  --summary "The parser change is ready for review. Report any release blocker." \
+  --body "Please review commit abc123."
 ```
 
 A standard send returns after durable acceptance. Notification continues
@@ -114,16 +116,20 @@ stronger submitted or notified boundary:
 
 ```bash
 cyclops send reviewer --subject "Review the parser" \
+  --summary "The parser change is ready for review. Report any release blocker." \
   --body "Please review commit abc123." --require-wake
 ```
 
-The recipient sees a body-free Format 3 doorbell containing an exact
-`m-att_...` claim token. Claiming that token retrieves the authorized envelope,
-including TO, FROM, subject, body, and reply context:
+The recipient sees the two-sentence preview plus an exact `m-att_...` claim
+token. If the composer contains human input, the notification waits until the
+composer is proven available. Claiming the token retrieves the authorized
+envelope, including TO, FROM, subject, summary, full body, and reply context:
 
 ```bash
 cyclops inbox claim m-att_<token>
-cyclops reply <message-id> --body "Reviewed. No blockers."
+cyclops reply <message-id> \
+  --summary "The review is complete. No blockers remain." \
+  --body "Reviewed. No blockers."
 ```
 
 These are different facts:
@@ -215,7 +221,7 @@ Every command documents its structured and plain forms with `--help`.
 flowchart LR
     A[Agent or admin CLI] -->|NDJSON RPC| D[cyclopsd]
     D -->|fsync before acceptance| J[(append-only journal)]
-    D -->|content-free guarded wake| T[tmux pane]
+    D -->|summary plus guarded claim| T[tmux pane]
     T -->|exact m-att claim| D
     D -->|authorized envelope| R[Recipient]
     W[Optional workspace and watch UI] -->|snapshots and events| D

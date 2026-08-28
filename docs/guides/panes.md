@@ -90,11 +90,11 @@ carries the elided session names only when something was elided.
 
 A named pane is the unit everything else addresses:
 
-- `cyclops send reviewer --subject "..."` delivers to it.
+- `cyclops send reviewer --subject "..." --summary "First sentence. Second sentence."` delivers to it.
 - `cyclops wait reviewer --until idle` waits on it.
 - Messages FROM that pane are stamped with the name, resolved from the
   sender's process, never from what the sender claims.
-- `cyclops send --all` means every named pane and nothing else.
+- `cyclops send --all --subject "..." --summary "First sentence. Second sentence."` means every named pane and nothing else.
 
 Names are unique across every watched session, because they are
 addresses. `admin`, `*`, and anything starting with `%` are reserved.

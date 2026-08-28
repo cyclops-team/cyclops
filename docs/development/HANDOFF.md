@@ -14,9 +14,10 @@ stabilization campaign, not the current public starting point.
 Cyclops coordinates terminal coding agents that are already running in your
 tmux session. It watches panes, works out whether each agent is idle,
 working or blocked, accepts messages into durable workspace mailboxes, and
-writes a content-free notification into the recipient pane when safe. Mailbox
-facts use one append-only workspace journal. Pane state and legacy direct
-delivery use separate append-only session journals.
+writes a two-sentence preview and exact claim into the recipient pane when
+safe. The full body remains in the authenticated mailbox. Mailbox facts use
+one append-only workspace journal. Pane state and legacy direct delivery use
+separate append-only session journals.
 
 For current messaging, start with [send.md](../guides/send.md),
 [PROTOCOL.md](../reference/PROTOCOL.md), `src/cyclopsd/src/mailbox.rs`, and

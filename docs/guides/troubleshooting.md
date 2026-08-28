@@ -165,7 +165,7 @@ after the detection view, not instead of it:
 Standard send returns after the mailbox write:
 
 ```
-$ cyclops send reviewer --subject "hello"
+$ cyclops send reviewer --subject "hello" --summary "This is a connectivity check. Reply when it arrives."
 accepted m-<full-uuid-suffix>
 ✓ accepted · wake queued
 ```
@@ -201,7 +201,7 @@ before requeueing a worker failure.
 ## A receipt says `1 ahead`
 
 ```
-$ cyclops send implementer --subject "hello"
+$ cyclops send implementer --subject "hello" --summary "This is a connectivity check. Reply when it arrives."
 accepted m-<full-uuid-suffix>
 ✓ accepted · 1 ahead · wake queued
 ```
