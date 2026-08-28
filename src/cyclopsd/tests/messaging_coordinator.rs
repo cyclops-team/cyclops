@@ -1684,7 +1684,85 @@ async fn a_human_draft_holds_one_notification_attempt_until_its_turn_finishes() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_hidden_human_draft_is_not_mistaken_for_a_manual_clear() {
+async fn a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "workspace-backspaced-human-draft",
+        CAT_MANIFEST,
+        &composer_pane(),
+        "",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let draft = "erase this draft";
+    rig.tmux.run_ok(&["send-keys", "-l", "-t", &pane, draft]);
+    rig.tmux.wait_screen("main", draft);
+    wait_for_human_composer_evidence(&mut rig, &pane).await;
+
+    let sent = send_workspace_message(
+        &rig,
+        "backspaced-human-draft",
+        "Backspace release",
+        "body stays in the mailbox",
+    )
+    .await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    rig.ev
+        .wait_event(Duration::from_secs(8), |event| {
+            event["event"] == "gate"
+                && event["data"]["id"] == message_id.as_str()
+                && event["data"]["action"] == "hold"
+        })
+        .await;
+    let attempts_before = notification_attempts(&rig, &message_id);
+    assert_eq!(attempts_before.len(), 1);
+    assert!(!rig
+        .tmux
+        .capture(&pane)
+        .contains(&compact_doorbell(&rig, &message_id)));
+
+    for _ in 1..draft.chars().count() {
+        rig.tmux.run_ok(&["send-keys", "-t", &pane, "BSpace"]);
+    }
+    wait_for_human_composer_evidence(&mut rig, &pane).await;
+    assert!(!rig
+        .tmux
+        .capture(&pane)
+        .contains(&compact_doorbell(&rig, &message_id)));
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "BSpace"]);
+    let released = wait_for_doorbell(&rig, &pane, &message_id).await;
+    assert!(!released.contains(draft));
+    assert!(!released.contains("body stays in the mailbox"));
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::Staged).await;
+    assert_eq!(notification_attempts(&rig, &message_id), attempts_before);
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::Gating),
+        2,
+        "the same attempt gates once initially and once on release evidence"
+    );
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::Writing),
+        1
+    );
+    assert!(workspace_lines(&rig).iter().all(|line| {
+        line.id != message_id
+            || line
+                .data
+                .as_ref()
+                .is_none_or(|data| data["type"] != "notification_requeued")
+    }));
+
+    rig.daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transient_hidden_frame_does_not_bypass_the_active_human_hold() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -1705,9 +1783,9 @@ async fn a_hidden_human_draft_is_not_mistaken_for_a_manual_clear() {
     rig.tmux.wait_screen("main", "human draft stays private");
     wait_for_human_composer_evidence(&mut rig, &pane).await;
 
-    // The fixture keeps the bytes staged but stops drawing them. From the
-    // screen this is indistinguishable from a manually cleared composer, so
-    // repeated clean captures are not positive deletion evidence.
+    // The fixture keeps the bytes staged but stops drawing them. An immediate
+    // clean-looking frame is not the settled output boundary and cannot clear
+    // the active hold before this attempt gates.
     rig.tmux.run_ok(&["send-keys", "-t", &pane, "C-g"]);
     wait_pane_state(&mut rig, "idle").await;
     assert!(!rig
@@ -1718,7 +1796,7 @@ async fn a_hidden_human_draft_is_not_mistaken_for_a_manual_clear() {
     let pair = send_waiting_pair(&rig, "hidden-draft").await;
     wait_for_notification_state(&mut rig, &pair.first, NotificationState::BlockedPreWrite).await;
     let held = notification_transition(&rig, &pair.first, NotificationState::BlockedPreWrite)
-        .expect("the hidden draft remains a durable pre-write block");
+        .expect("the transient hidden frame remains a durable pre-write block");
     let held = held.data.as_ref().expect("blocked transition data");
     assert_eq!(
         held["pre_write_observation"]["write_block"], "composer_hold",

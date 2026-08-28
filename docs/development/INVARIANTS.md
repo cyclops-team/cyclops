@@ -477,13 +477,17 @@ these runtime rules weaken the clean-composer requirement above.
 
 One clean frame is not clean evidence either, once text has been seen in
 the composer. A screen rule reads one frame, and a pane holding somebody's
-half-typed message can render clean for a frame while it redraws, or while
-the text sits somewhere the rule does not look. So a pane observed holding
-text is refused (`composer_hold`) until a TURN proves the text left. That
-is the only positive evidence any vendor gives that a composer was
-emptied. Nothing releases it on elapsed time or on a hook that never
-arrived, and a person who clears their own draft by hand stays held until
-their next completed turn. Conservative, and named in the gate line.
+half-typed message can render clean while it redraws. So an ordinary capture
+never clears `composer_hold`. An unowned human draft may clear only when the
+existing output-settle boundary observes a fresh, exact `clean` composer rule
+for the same live pane. This lets a person erase their draft without starting
+a turn. Partial text, ghost suggestions, ambiguous frames, stale captures,
+pane modes, blocked states, replacement occupants, and daemon-owned staged or
+recovered payloads do not use this release. A submitted draft still releases
+through its real turn. Nothing releases merely on elapsed time or on a hook
+that never arrived. A vendor feature that hides undiscarded input behind the
+same exact empty-composer chrome is outside the generic screen contract; a
+manifest that needs to distinguish that state must expose a non-clean rule.
 
 The release reads the EVIDENCE, not the fused winner. The winner is one
 state chosen by priority, so a pane can win `idle` off a composer rule

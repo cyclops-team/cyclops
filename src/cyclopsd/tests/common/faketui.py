@@ -258,7 +258,11 @@ def main():
                     continue
             for kind, payload in stream.feed(chunk):
                 if kind == "text":
-                    staged += payload.decode("utf-8", "replace")
+                    for char in payload.decode("utf-8", "replace"):
+                        if char == "\x7f":
+                            staged = staged[:-1]
+                        else:
+                            staged += char
                     hidden = False
                     draw(transcript, staged, working=forced_working)
                 else:

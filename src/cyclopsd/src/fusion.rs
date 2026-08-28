@@ -4363,6 +4363,16 @@ async fn recompute_pane_with_evidence(
         let base_hold = carried.map(|entry| entry.hold).unwrap_or_default();
         let mut turn = carried.and_then(|entry| entry.turn.clone());
         let hold_owner = carried.and_then(|entry| entry.hold_owner.clone());
+        // Human input and runtime lifecycle are independent facts. Once a
+        // settled output burst proves the visible composer is exactly empty,
+        // an unowned human-input hold may retire without inventing a turn.
+        // Owned notification and restart-recovery barriers never use this
+        // path: their durable attempt owner still requires exact settlement.
+        let base_hold = if cause == "output_settled" && hold_owner.is_none() {
+            base_hold.release_after_settled_visible_empty(&detection)
+        } else {
+            base_hold
+        };
         let (base_hold, hold_owner, clear_turn, recovery_refusal) =
             crate::composer_recovery::merge_barrier(
                 recovery_action.as_ref(),
