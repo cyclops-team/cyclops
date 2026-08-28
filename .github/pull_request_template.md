@@ -2,6 +2,14 @@
 
 <!-- One or two sentences. Link an issue if there is one. -->
 
+## Reliability roadmap authority
+
+<!-- Required for reliability implementation PRs. Delete this section only
+     when the change is outside the reliability release. -->
+
+- Baseline commit: `ab0ccd98576445c32035d60d5e547c235fc1c8b2`
+- Roadmap SHA-256: `efa7b2f88eac7c25868a5b48aa354709d7fdc499b586a74085aba43cd1c79126`
+
 ## Testing
 
 - [ ] Behavior fix: added a test that fails before this change and passes after
