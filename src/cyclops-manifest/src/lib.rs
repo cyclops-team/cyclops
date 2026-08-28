@@ -784,25 +784,43 @@ fn compile_matcher(
     })
 }
 
-/// Remove CSI escape sequences (ESC [ ... final byte), i.e. the SGR styling
-/// a capture-pane -e capture carries. Used to judge line emptiness in the
-/// escaped capture the same way the plain capture does, so both region
-/// slices select the same screen rows.
+/// Remove CSI styling and OSC metadata from a `capture-pane -e` capture.
+///
+/// Tmux preserves both SGR and OSC 8 hyperlinks in the escaped capture. The
+/// hyperlink target is metadata, not visible composer text, so the plain
+/// sibling must discard it while retaining the linked label. This also keeps
+/// plain and escaped region slices on the same screen rows.
 pub fn strip_csi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\u{1b}' {
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                // Parameter and intermediate bytes end at the final byte @..~.
-                for n in chars.by_ref() {
-                    if ('\u{40}'..='\u{7e}').contains(&n) {
-                        break;
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    // Parameter and intermediate bytes end at the final byte @..~.
+                    for n in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
                     }
                 }
+                Some(']') => {
+                    chars.next();
+                    // OSC ends at BEL or the two-byte String Terminator ESC \\.
+                    while let Some(n) = chars.next() {
+                        if n == '\u{7}' {
+                            break;
+                        }
+                        if n == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
             }
-            // Bare ESC (or a non-CSI escape introducer) is dropped.
+            // Bare ESC (or another escape introducer) is dropped.
             continue;
         }
         out.push(c);
@@ -1441,7 +1459,7 @@ unsafe_states = ["blocked_modal"]
     }
 
     #[test]
-    fn strip_csi_removes_sgr_only() {
+    fn strip_csi_removes_capture_styling_and_hyperlinks() {
         assert_eq!(
             strip_csi("\u{1b}[1m›\u{1b}[0m \u{1b}[2mghost\u{1b}[0m"),
             "› ghost"
@@ -1450,6 +1468,13 @@ unsafe_states = ["blocked_modal"]
         assert_eq!(
             strip_csi("\u{1b}[38;2;246;226;183mcolor\u{1b}[39m"),
             "color"
+        );
+        assert_eq!(
+            strip_csi(
+                "52K used \u{1b}]8;id=test;https://example.invalid/session\u{1b}\\/rc\u{1b}]8;;\u{1b}\\"
+            ),
+            "52K used /rc",
+            "OSC 8 metadata is not visible composer text"
         );
     }
 

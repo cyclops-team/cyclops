@@ -1476,14 +1476,19 @@ fn claude_2_1_251_terminal_suffix_matches_the_current_trailer() {
     let claude = &shipped()["claude"];
     let rule_esc = format!("\u{1b}[38;5;244m{RULE_120}");
     let status_plain =
-        "  Sonnet 5 · low · ~ · Ctx: 95% · 5h: 100% · 7d: 1% · 1000K window · 52K used /rc";
-    let status_esc = "\u{1b}[39m  \u{1b}[38;5;174mSonnet 5\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;216mlow\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;230m~\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;72mCtx: 95%\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;181m5h: 100%\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;181m7d: 1%\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;180m1000K window\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;180m52K used\u{1b}[39m              \u{1b}[38;5;75m/rc\u{1b}[39m";
+        "  Sonnet 5 · low · ~ · Ctx: 95% · 5h: 100% · 7d: 1% · 1000K window · 52K used              /rc";
+    let status_esc = "\u{1b}[39m  \u{1b}[38;5;174mSonnet 5\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;216mlow\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;230m~\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;72mCtx: 95%\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;181m5h: 100%\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;181m7d: 1%\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;180m1000K window\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;180m52K used\u{1b}[39m              \u{1b}[38;5;75m\u{1b}]8;id=test;https://example.invalid/session\u{1b}\\/rc\u{1b}[39m\u{1b}]8;;\u{1b}\\";
     let trailer_plain = "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents";
     let trailer_esc = "  \u{1b}[38;5;210m⏵⏵ bypass permissions on\u{1b}[38;5;246m (shift+tab to cycle) · ← for agents\u{1b}[39m";
     let (plain, esc) = claude_frame(
         &[
             "⏺ Hey! What's up?",
             "✻ Cooked for 1s · done 2:48 PM",
+            "",
+            "",
+            "",
+            "",
+            "",
             RULE_120,
             "❯\u{a0}",
             RULE_120,
@@ -1493,6 +1498,11 @@ fn claude_2_1_251_terminal_suffix_matches_the_current_trailer() {
         &[
             "\u{1b}[38;5;231m⏺\u{1b}[39m Hey! What's up?",
             "\u{1b}[38;5;246m✻\u{1b}[39m \u{1b}[38;5;246mCooked for 1s · done 2:48 PM\u{1b}[39m",
+            "",
+            "",
+            "",
+            "",
+            "",
             &rule_esc,
             "\u{1b}[39m❯\u{a0}",
             &rule_esc,
@@ -1500,8 +1510,13 @@ fn claude_2_1_251_terminal_suffix_matches_the_current_trailer() {
             trailer_esc,
         ],
     );
+    let derived_plain = cyclops_manifest::strip_csi(&esc);
+    assert_eq!(
+        derived_plain, plain,
+        "the production escaped capture must reconstruct only visible text"
+    );
     let rule = claude
-        .evaluate_esc("\u{2733} Claude Code", &plain, Some(&esc))
+        .evaluate_esc("\u{2733} Claude Code", &derived_plain, Some(&esc))
         .expect("a rule matches");
     assert_eq!(
         rule.id, "composer_completed_terminal_suffix_2_1_246",
