@@ -270,6 +270,7 @@ async fn a_stuck_owner_reconcile_cannot_make_naming_unbounded() {
     ]);
     assert!(split.status.success(), "split failed: {split:?}");
     let pane = String::from_utf8_lossy(&split.stdout).trim().to_string();
+    rig.wait_attached(2).await;
 
     let started = Instant::now();
     let response = tokio::time::timeout(
