@@ -1991,6 +1991,10 @@ async fn a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt() 
     for _ in 1..draft.chars().count() {
         rig.tmux.run_ok(&["send-keys", "-t", &pane, "BSpace"]);
     }
+    // `send-keys` acceptance does not prove the pane has consumed every key.
+    // Pin the visible one-character boundary before the final deletion so the
+    // release observation cannot race an input backlog on a busy CI runner.
+    rig.tmux.wait_screen("main", "❯ e");
     wait_for_human_composer_evidence(&mut rig, &pane).await;
     assert!(!rig
         .tmux
