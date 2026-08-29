@@ -1,4 +1,8 @@
 //! Syntactic guard for the shared official daemon connection boundary.
+//!
+//! This guard becomes obsolete when module or crate visibility makes the raw
+//! daemon socket constructor unreachable to official callers, so a second
+//! connection path is impossible to compile instead of merely linted.
 
 use std::path::{Path, PathBuf};
 

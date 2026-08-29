@@ -457,7 +457,7 @@ pub(crate) const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 /// request the daemon never saw. The phases are split so silence before
 /// the write is reported as the knowledge it is.
 async fn call(sock: &Path, method: &str, params: Value) -> Result<Value, Failure> {
-    let mut client = AsyncClient::connect(sock, OPEN_TIMEOUT, OPEN_TIMEOUT)
+    let mut client = AsyncClient::connect(sock, OPEN_TIMEOUT)
         .await
         .map_err(|error| failure_from_client(error, method))?;
     client

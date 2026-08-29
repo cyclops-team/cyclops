@@ -358,12 +358,7 @@ async fn messages_follow(
 }
 
 async fn open_client(sock: &Path) -> Result<AsyncClient, ClientError> {
-    AsyncClient::connect(
-        sock,
-        crate::action_io::OPEN_TIMEOUT,
-        crate::action_io::OPEN_TIMEOUT,
-    )
-    .await
+    AsyncClient::connect(sock, crate::action_io::OPEN_TIMEOUT).await
 }
 
 /// The startup reconciliation, in the one order that can be right.

@@ -31,15 +31,6 @@ pub enum Certainty {
     StreamGap,
 }
 
-/// One refusal returned by the daemon, with machine-readable details intact.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Refusal {
-    pub code: String,
-    pub message: String,
-    pub targets: Vec<String>,
-    pub data: Value,
-}
-
 /// Shared transport outcomes. Presentation belongs to callers.
 #[derive(Debug)]
 pub enum ClientError {
@@ -49,6 +40,9 @@ pub enum ClientError {
     ReadTimeout(Duration),
     RequestFrameTooLarge,
     DaemonFrameTooLarge,
+    /// The daemon substituted a bounded error because the real response did
+    /// not fit. The request may already have taken effect.
+    OversizedResponse(String),
     InvalidHello(String),
     Server {
         code: String,
@@ -71,27 +65,11 @@ impl ClientError {
             | Self::InvalidHello(_)
             | Self::NotSent(_) => Certainty::KnownNotSent,
             Self::Server { .. } => Certainty::Refused,
-            Self::ReadTimeout(_) | Self::DaemonFrameTooLarge | Self::Unknown(_) => {
-                Certainty::OutcomeUnknown
-            }
+            Self::ReadTimeout(_)
+            | Self::DaemonFrameTooLarge
+            | Self::OversizedResponse(_)
+            | Self::Unknown(_) => Certainty::OutcomeUnknown,
             Self::Gap(_) => Certainty::StreamGap,
-        }
-    }
-
-    pub fn refusal(&self) -> Option<Refusal> {
-        match self {
-            Self::Server {
-                code,
-                message,
-                targets,
-                data,
-            } => Some(Refusal {
-                code: code.clone(),
-                message: message.clone(),
-                targets: targets.clone(),
-                data: data.clone(),
-            }),
-            _ => None,
         }
     }
 
@@ -117,6 +95,7 @@ impl ClientError {
                 "daemon frame exceeds the {}-byte JSON frame limit",
                 FrameContract::MAX_JSON_BYTES
             ),
+            Self::OversizedResponse(message) => message.clone(),
             Self::InvalidHello(cause) => format!("invalid daemon hello: {cause}"),
             Self::Server { message, .. }
             | Self::NotSent(message)
@@ -176,7 +155,7 @@ fn decode_incoming(
         let code = string_field(error, "code");
         let message = string_field(error, "message");
         if code == FrameContract::TOO_LARGE_CODE {
-            return Err(ClientError::Unknown(message));
+            return Err(ClientError::OversizedResponse(message));
         }
         return Err(ClientError::Server {
             code,
@@ -440,10 +419,7 @@ impl BlockingClient {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         let request = encode_request(id, method, params)?;
-        self.reader
-            .get_mut()
-            .write_all(&request)
-            .map_err(|error| ClientError::Unknown(format!("cannot write {method}: {error}")))?;
+        write_blocking_request(self.reader.get_mut(), method, &request)?;
         loop {
             let frame = match read_blocking_frame(&mut self.reader, self.read_timeout)? {
                 Some(frame) => frame,
@@ -490,15 +466,32 @@ impl BlockingClient {
         decode_event(frame)
     }
 
+    /// Remove the event-stream read deadline on a best-effort basis.
+    ///
+    /// On macOS, `setsockopt(SO_RCVTIMEO)` can return `EINVAL` after the peer
+    /// closes (F18). Buffered frames remain readable and the next read reports
+    /// the close, so surfacing this setter error would discard better evidence.
     pub fn clear_read_timeout(&mut self) {
         let _ = self.reader.get_ref().set_read_timeout(None);
         self.read_timeout = None;
     }
 
+    /// Replace the active read deadline on the same best-effort basis as
+    /// [`Self::clear_read_timeout`].
     pub fn set_read_timeout(&mut self, timeout: Duration) {
         let _ = self.reader.get_ref().set_read_timeout(Some(timeout));
         self.read_timeout = Some(timeout);
     }
+}
+
+fn write_blocking_request(
+    writer: &mut impl Write,
+    method: &str,
+    request: &[u8],
+) -> Result<(), ClientError> {
+    writer
+        .write_all(request)
+        .map_err(|error| ClientError::Unknown(format!("cannot write {method}: {error}")))
 }
 
 struct AsyncFrameReader<R> {
@@ -585,14 +578,14 @@ pub struct AsyncClient {
 }
 
 impl AsyncClient {
-    pub async fn connect(
-        path: &Path,
-        connect: Duration,
-        hello: Duration,
-    ) -> Result<Self, ClientError> {
-        let stream = tokio::time::timeout(connect, AsyncUnixStream::connect(path))
+    pub async fn connect(path: &Path, open: Duration) -> Result<Self, ClientError> {
+        // This is the caller's one pre-write deadline. Connecting and reading
+        // Hello are distinct certainty phases, but they do not each get a
+        // fresh copy of the budget.
+        let deadline = tokio::time::Instant::now() + open;
+        let stream = tokio::time::timeout_at(deadline, AsyncUnixStream::connect(path))
             .await
-            .map_err(|_| ClientError::ConnectTimeout(connect))?
+            .map_err(|_| ClientError::ConnectTimeout(open))?
             .map_err(|error| match error.kind() {
                 ErrorKind::NotFound | ErrorKind::ConnectionRefused => {
                     ClientError::NotRunning(error.to_string())
@@ -601,9 +594,9 @@ impl AsyncClient {
             })?;
         let (read, writer) = stream.into_split();
         let mut frames = AsyncFrameReader::new(read);
-        let frame = tokio::time::timeout(hello, frames.next_frame())
+        let frame = tokio::time::timeout_at(deadline, frames.next_frame())
             .await
-            .map_err(|_| ClientError::HelloTimeout(hello))?
+            .map_err(|_| ClientError::HelloTimeout(open))?
             .map_err(|error| {
                 if error.kind() == ErrorKind::InvalidData {
                     ClientError::NotSent(format!(
@@ -704,6 +697,11 @@ impl AsyncClient {
 
 #[cfg(test)]
 mod tests {
+    //! Shared-client contract evidence. This family becomes obsolete when the
+    //! official protocol stops being newline-delimited request/response plus
+    //! events, or when one mechanically shared IO adapter replaces both the
+    //! blocking and async paths and carries equivalent conformance evidence.
+
     use super::*;
     use std::io::{BufRead, Read, Write};
     use std::pin::Pin;
@@ -712,6 +710,28 @@ mod tests {
 
     struct PartialAsyncWriter {
         remaining: usize,
+    }
+
+    struct PartialBlockingWriter {
+        remaining: usize,
+    }
+
+    impl Write for PartialBlockingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(io::Error::new(
+                    ErrorKind::BrokenPipe,
+                    "simulated socket failure",
+                ));
+            }
+            let written = self.remaining.min(bytes.len());
+            self.remaining -= written;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     impl tokio::io::AsyncWrite for PartialAsyncWriter {
@@ -768,6 +788,27 @@ mod tests {
             ClientError::Gap("closed".into()).certainty(),
             Certainty::StreamGap
         );
+    }
+
+    #[test]
+    fn bounded_oversized_response_keeps_uncertainty_and_daemon_message() {
+        let frame = serde_json::to_vec(&json!({
+            "id": 7,
+            "error": {
+                "code": FrameContract::TOO_LARGE_CODE,
+                "message": "request exceeds the official frame limit"
+            }
+        }))
+        .unwrap();
+        let error = match decode_incoming(frame, 7, "message.send") {
+            Err(error) => error,
+            Ok(_) => panic!("the daemon refusal must not decode as a result"),
+        };
+        assert!(matches!(
+            error,
+            ClientError::OversizedResponse(message)
+                if message == "request exceeds the official frame limit"
+        ));
     }
 
     #[test]
@@ -858,7 +899,10 @@ mod tests {
 
         let refusal = client.request("deny", json!({})).unwrap_err();
         assert_eq!(refusal.certainty(), Certainty::Refused);
-        assert_eq!(refusal.refusal().unwrap().targets, vec!["reviewer"]);
+        assert!(matches!(
+            refusal,
+            ClientError::Server { targets, .. } if targets == vec!["reviewer"]
+        ));
 
         client.subscribe(json!({})).unwrap();
         daemon.join().unwrap();
@@ -886,6 +930,16 @@ mod tests {
         let error = client.request("maybe", json!({})).unwrap_err();
         assert_eq!(error.certainty(), Certainty::OutcomeUnknown);
         daemon.join().unwrap();
+    }
+
+    #[test]
+    fn blocking_partial_write_is_outcome_unknown() {
+        let mut writer = PartialBlockingWriter { remaining: 8 };
+        let error = write_blocking_request(&mut writer, "ping", b"0123456789\n").unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::Unknown(message) if message.contains("simulated socket failure")
+        ));
     }
 
     #[tokio::test]
@@ -952,10 +1006,9 @@ mod tests {
                 .unwrap();
         });
 
-        let mut client =
-            AsyncClient::connect(&socket, Duration::from_secs(1), Duration::from_secs(1))
-                .await
-                .unwrap();
+        let mut client = AsyncClient::connect(&socket, Duration::from_secs(1))
+            .await
+            .unwrap();
         assert_eq!(
             client
                 .request("ping", json!({}), Duration::from_secs(1))
@@ -972,7 +1025,10 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(refusal.certainty(), Certainty::Refused);
-        assert_eq!(refusal.refusal().unwrap().targets, vec!["reviewer"]);
+        assert!(matches!(
+            refusal,
+            ClientError::Server { targets, .. } if targets == vec!["reviewer"]
+        ));
 
         client
             .subscribe(json!({}), Duration::from_secs(1))
@@ -1003,10 +1059,9 @@ mod tests {
                 .unwrap();
             assert!(requests.next_line().await.unwrap().is_some());
         });
-        let mut client =
-            AsyncClient::connect(&socket, Duration::from_secs(1), Duration::from_secs(1))
-                .await
-                .unwrap();
+        let mut client = AsyncClient::connect(&socket, Duration::from_secs(1))
+            .await
+            .unwrap();
         let error = client
             .request("maybe", json!({}), Duration::from_secs(1))
             .await

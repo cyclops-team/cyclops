@@ -2120,6 +2120,11 @@ fn inbox_next_client_failed(cli: &Cli, error: &ClientError) -> i32 {
             copy::client_error(error, None),
             json!({"known_not_sent": false}),
         ),
+        ClientError::OversizedResponse(message) => (
+            cyclops_proto::FrameContract::TOO_LARGE_CODE,
+            message.clone(),
+            json!({"known_not_sent": false}),
+        ),
         ClientError::InvalidHello(_) => (
             "connection_lost",
             copy::client_error(error, None),

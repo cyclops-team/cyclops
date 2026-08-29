@@ -379,6 +379,9 @@ pub fn client_error(e: &ClientError, asked: Option<&str>) -> String {
             format!("{}. Nothing was sent.", frame_too_large("request"))
         }
         ClientError::DaemonFrameTooLarge => broken(&frame_too_large("daemon frame")),
+        // The daemon deliberately supplied this complete sentence because the
+        // real response would not fit. Preserve its honest uncertainty copy.
+        ClientError::OversizedResponse(message) => message.clone(),
         ClientError::InvalidHello(_) => broken("the hello line didn't parse"),
         ClientError::Server {
             code,
@@ -751,6 +754,13 @@ mod tests {
             data: serde_json::Value::Null,
         };
         assert_eq!(client_error(&bare, None), "cyclops refused: denied");
+    }
+
+    #[test]
+    fn oversized_response_preserves_the_daemons_uncertainty_sentence() {
+        let message = "daemon response was too large; request outcome is unknown";
+        let error = ClientError::OversizedResponse(message.into());
+        assert_eq!(client_error(&error, None), message);
     }
 
     #[test]
