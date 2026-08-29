@@ -3470,7 +3470,7 @@ mod tests {
     /// press raises rather than through a second implementation.
     #[test]
     fn clicking_a_word_in_the_action_strip_raises_that_verb() {
-        let area = Rect::new(160, 0, 40, 24);
+        let area = Rect::new(160, 0, 20, 24);
         let mut buf = Buffer::empty(area);
         let mut hits = HitMap::default();
         let paint = Paint::for_test();
@@ -3481,29 +3481,34 @@ mod tests {
             &mut hits, None,
         );
 
-        let content_w = (area.width - 1) as usize;
-        let (_, spans) = cyclops_ui::chat_action_strip(content_w, false);
-        assert!(!spans.is_empty(), "the strip must fit at forty columns");
-        for (action, start, _) in spans {
-            let x = area.x + 1 + start as u16;
-            let hit = (0..area.height).find_map(|y| match hits.hit(x, y) {
-                Some(HitTarget::MessagesAction(found)) => Some(*found),
-                _ => None,
-            });
-            assert_eq!(
-                hit,
-                Some(action),
-                "column {x} must answer for {action:?} and nothing else"
-            );
-            assert_eq!(
-                crate::action::route_mouse_click(
-                    &HitTarget::MessagesAction(action),
-                    MouseButton::Left
-                ),
-                Some(crate::action::Action::MessagesVerb(action)),
-                "a click on {action:?} routes to its own action"
-            );
+        let content_w = area.width.saturating_sub(2) as usize;
+        let strips = cyclops_ui::chat_action_strips(content_w, false);
+        assert!(strips.len() > 1, "the test must exercise wrapped rows");
+        let mut found_actions = Vec::new();
+        for (_, spans) in strips {
+            for (action, start, _) in spans {
+                let x = area.x + 1 + start as u16;
+                let hit = (0..area.height).find_map(|y| match hits.hit(x, y) {
+                    Some(HitTarget::MessagesAction(found)) if *found == action => Some(*found),
+                    _ => None,
+                });
+                assert_eq!(
+                    hit,
+                    Some(action),
+                    "column {x} must answer for wrapped action {action:?}"
+                );
+                assert_eq!(
+                    crate::action::route_mouse_click(
+                        &HitTarget::MessagesAction(action),
+                        MouseButton::Left
+                    ),
+                    Some(crate::action::Action::MessagesVerb(action)),
+                    "a click on {action:?} routes to its own action"
+                );
+                found_actions.push(action);
+            }
         }
+        assert_eq!(found_actions, cyclops_ui::chat_actions(false));
     }
 
     /// A footer button fills under the pointer, the way every other chrome
@@ -3515,7 +3520,7 @@ mod tests {
         let paint = Paint::for_test();
         let queue = cyclops_ui::HumanQueue::new();
         let registry = cyclops_ui::AvatarRegistry::default();
-        let content_w = (area.width - 1) as usize;
+        let content_w = area.width.saturating_sub(2) as usize;
         let (_, spans) = cyclops_ui::chat_action_strip(content_w, false);
         let (action, start, end) = spans[1];
         let x = area.x + 1 + start as u16;

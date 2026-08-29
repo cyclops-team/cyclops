@@ -73,6 +73,9 @@ pub struct WorkspacePrefs {
     /// Messages pane visibility on the right edge.
     pub messages_visible: bool,
     pub messages_width: u16,
+    /// Highest workspace message sequence the operator cleared from the
+    /// local Messages presentation. The daemon journal remains untouched.
+    pub messages_cleared_through_seq: u64,
     /// The sidebar tab last selected, restored on reopen like visibility
     /// and width.
     pub sidebar_tab: SidebarTab,
@@ -132,6 +135,7 @@ impl Default for WorkspacePrefs {
             sidebar_width: crate::render::SIDEBAR_DEFAULT_WIDTH,
             messages_visible: false,
             messages_width: crate::render::MESSAGES_DEFAULT_WIDTH,
+            messages_cleared_through_seq: 0,
             sidebar_tab: SidebarTab::default(),
             // Eight rows: a folder name, a way out, and six entries. Enough
             // to be a file tree on the 24-row terminal that is the floor,
@@ -203,6 +207,13 @@ pub fn load_prefs(home: &Path) -> WorkspacePrefs {
         .and_then(|v| u16::try_from(v).ok())
     {
         prefs.messages_width = v;
+    }
+    if let Some(v) = workspace
+        .get("messages_cleared_through_seq")
+        .and_then(|v| v.as_integer())
+        .and_then(|v| u64::try_from(v).ok())
+    {
+        prefs.messages_cleared_through_seq = v;
     }
     if let Some(v) = workspace
         .get("files_rows")
@@ -312,6 +323,10 @@ pub fn save_prefs(home: &Path, prefs: &WorkspacePrefs) -> std::io::Result<()> {
     workspace.insert(
         "messages_width".into(),
         toml::Value::Integer(prefs.messages_width as i64),
+    );
+    workspace.insert(
+        "messages_cleared_through_seq".into(),
+        toml::Value::Integer(i64::try_from(prefs.messages_cleared_through_seq).unwrap_or(i64::MAX)),
     );
     workspace.insert(
         "files_rows".into(),
@@ -468,6 +483,7 @@ mod tests {
             sidebar_width: 28,
             messages_visible: true,
             messages_width: 29,
+            messages_cleared_through_seq: 81,
             files_rows: 8,
             // An offered tab, so this pins the round trip and not the
             // coercion. `a_tab_no_longer_offered_loads_as_the_default`
@@ -610,6 +626,7 @@ mod tests {
             "sidebar_width",
             "messages_visible",
             "messages_width",
+            "messages_cleared_through_seq",
             "sidebar_tab",
             "tab_bar_visible",
             "motion",
@@ -650,6 +667,7 @@ mod tests {
                 sidebar_width: 31,
                 messages_visible: false,
                 messages_width: crate::render::MESSAGES_DEFAULT_WIDTH,
+                messages_cleared_through_seq: 0,
                 sidebar_tab: SidebarTab::Sessions,
                 tab_bar_visible: true,
                 motion: true,

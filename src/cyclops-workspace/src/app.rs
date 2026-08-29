@@ -4064,8 +4064,11 @@ async fn handle_app_msg(
             if accepted {
                 app.messages_refresh_error = None;
                 app.messages_caller = result.caller;
-                app.messages_queue
-                    .replace(cyclops_ui::messages::rows_from_snapshot(&result));
+                let snapshot = apply_messages_presentation_cutoff(
+                    cyclops_ui::messages::rows_from_snapshot(&result),
+                    app.prefs.messages_cleared_through_seq,
+                );
+                app.messages_queue.replace(snapshot);
                 finish_messages_reconcile(app);
             }
             pump_messages_refresh(app);
@@ -5417,6 +5420,22 @@ async fn handle_messages_key(
             app.messages_queue.set_scope(next);
             return Ok(Some(InputOutcome::Redraw));
         }
+        KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let through = app.messages_queue.watermark();
+            app.prefs.messages_cleared_through_seq =
+                app.prefs.messages_cleared_through_seq.max(through);
+            app.messages_queue.replace(cyclops_ui::Snapshot {
+                watermark: through,
+                rows: Vec::new(),
+            });
+            app.messages_detail = None;
+            app.save_prefs_or_log();
+            app.notice.show(
+                "Messages cleared from this view; durable history was preserved",
+                Instant::now(),
+            );
+            return Ok(Some(InputOutcome::Redraw));
+        }
         KeyCode::Char('t') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.messages_session_scoped = !app.messages_session_scoped;
             sync_messages_session_filter(app);
@@ -5426,6 +5445,14 @@ async fn handle_messages_key(
     }
 
     Ok(None)
+}
+
+fn apply_messages_presentation_cutoff(
+    mut snapshot: cyclops_ui::Snapshot,
+    cleared_through_seq: u64,
+) -> cyclops_ui::Snapshot {
+    snapshot.rows.retain(|row| row.seq > cleared_through_seq);
+    snapshot
 }
 
 /// The session filter the Messages pane should apply right now: the active
@@ -8298,6 +8325,59 @@ mod tests {
             reply_to: None,
             client_key,
         }
+    }
+
+    #[test]
+    fn a_messages_presentation_cutoff_keeps_only_later_sequences() {
+        let row = |seq| cyclops_ui::QueueRow {
+            seq,
+            ..cyclops_ui::QueueRow::default()
+        };
+        let filtered = apply_messages_presentation_cutoff(
+            cyclops_ui::Snapshot {
+                watermark: 9,
+                rows: vec![row(4), row(6), row(9)],
+            },
+            6,
+        );
+
+        assert_eq!(filtered.watermark, 9);
+        assert_eq!(
+            filtered.rows.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            vec![9]
+        );
+    }
+
+    #[tokio::test]
+    async fn c_clears_the_messages_view_and_persists_its_watermark() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let home = cyclops_proto::scratch::scratch_dir("workspace-messages-clear-view");
+        let _ = std::fs::remove_dir_all(&home);
+        let mut app = test_app(one_pane_model(), home.clone());
+        app.model.messages_visible = true;
+        app.messages_focused = true;
+        app.messages_queue.replace(cyclops_ui::Snapshot {
+            watermark: 17,
+            rows: vec![cyclops_ui::QueueRow {
+                seq: 11,
+                ..cyclops_ui::QueueRow::default()
+            }],
+        });
+
+        let outcome = handle_messages_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        )
+        .await
+        .expect("key handling");
+
+        assert!(matches!(outcome, Some(InputOutcome::Redraw)));
+        assert_eq!(app.messages_queue.watermark(), 17);
+        assert_eq!(app.messages_queue.counts().total, 0);
+        assert_eq!(app.prefs.messages_cleared_through_seq, 17);
+        assert_eq!(persist::load_prefs(&home).messages_cleared_through_seq, 17);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     fn direct_composer() -> cyclops_ui::ComposerState {

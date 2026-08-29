@@ -365,6 +365,7 @@ pub(super) async fn execute(
                 cyclops_ui::ChatAction::Announce => (KeyCode::Char('a'), KeyModifiers::NONE),
                 cyclops_ui::ChatAction::Open => (KeyCode::Enter, KeyModifiers::NONE),
                 cyclops_ui::ChatAction::Scope => (KeyCode::Char('s'), KeyModifiers::NONE),
+                cyclops_ui::ChatAction::Clear => (KeyCode::Char('c'), KeyModifiers::NONE),
                 cyclops_ui::ChatAction::Sessions => (KeyCode::Char('t'), KeyModifiers::NONE),
                 cyclops_ui::ChatAction::Retry => (KeyCode::Char('r'), KeyModifiers::CONTROL),
             };

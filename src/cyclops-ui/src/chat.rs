@@ -231,6 +231,9 @@ pub enum ChatAction {
     Announce,
     Open,
     Scope,
+    /// Clear the local presentation through its current durable sequence.
+    /// The mailbox and journal remain unchanged.
+    Clear,
     /// Flip the drawer between the messages of the session the operator is
     /// looking at and the messages of every watched session.
     Sessions,
@@ -247,6 +250,7 @@ impl ChatAction {
             ChatAction::Announce => "a announce",
             ChatAction::Open => "enter open",
             ChatAction::Scope => "s scope",
+            ChatAction::Clear => "c clear",
             ChatAction::Sessions => "t sessions",
             ChatAction::Retry => "^R retry",
         }
@@ -270,6 +274,7 @@ pub fn chat_actions(refresh_failed: bool) -> Vec<ChatAction> {
         ChatAction::Announce,
         ChatAction::Open,
         ChatAction::Scope,
+        ChatAction::Clear,
         ChatAction::Sessions,
     ];
     if refresh_failed {
@@ -278,62 +283,101 @@ pub fn chat_actions(refresh_failed: bool) -> Vec<ChatAction> {
     actions
 }
 
-/// The strip as text, and where each verb sits in it.
+/// One action and its half-open column span in a rendered footer row.
+pub type ChatActionSpan = (ChatAction, usize, usize);
+
+/// One rendered footer row and every action span it contains.
+pub type ChatActionStrip = (String, Vec<ChatActionSpan>);
+
+/// The first action row as text, and where each verb sits in it.
 ///
-/// Returns the rendered row plus one column span per button that actually
-/// fit. A button the width could not hold is absent from the spans rather
-/// than mapped to a truncated word, so a click can never land on half a
-/// verb and dispatch the whole one. The spans cover the padded button, not
-/// only its letters: the fill is the control, and its edge is clickable.
-pub fn chat_action_strip(
-    width: usize,
-    refresh_failed: bool,
-) -> (String, Vec<(ChatAction, usize, usize)>) {
-    let line = chat_action_line(width, refresh_failed);
-    let mut spans = Vec::new();
-    let mut col = 0usize;
-    for span in &line.spans {
-        let w = display_width(&span.text);
-        if let ChatInk::Button(action) = span.ink {
-            spans.push((action, col, col + w));
-        }
-        col += w;
-    }
-    (line.text(), spans)
+/// Kept as a compatibility view for callers that inspect a comfortably
+/// wide footer. Rendering uses [`chat_action_strips`] so narrow panes retain
+/// every action on wrapped rows.
+pub fn chat_action_strip(width: usize, refresh_failed: bool) -> ChatActionStrip {
+    chat_action_strips(width, refresh_failed)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| (String::new(), Vec::new()))
 }
 
-/// The strip as a styled line: every button that fits, centered in the row.
+/// Every wrapped action row as text plus its clickable column spans.
+pub fn chat_action_strips(width: usize, refresh_failed: bool) -> Vec<ChatActionStrip> {
+    chat_action_lines(width, refresh_failed)
+        .into_iter()
+        .map(|line| {
+            let mut spans = Vec::new();
+            let mut col = 0usize;
+            for span in &line.spans {
+                let w = display_width(&span.text);
+                if let ChatInk::Button(action) = span.ink {
+                    spans.push((action, col, col + w));
+                }
+                col += w;
+            }
+            (line.text(), spans)
+        })
+        .collect()
+}
+
+/// The first centered action row.
 ///
-/// Centered because the strip is a bar of controls, not a sentence. Left
-/// aligned it read as a caption under the timeline; centered it reads as
-/// the footer of a panel, which is what it is.
+/// Kept for callers whose layout already guarantees one row. New rendering
+/// should use [`chat_action_lines`] so actions are never discarded.
 pub fn chat_action_line(width: usize, refresh_failed: bool) -> ChatLine {
-    let mut buttons: Vec<(ChatAction, String)> = Vec::new();
+    chat_action_lines(width, refresh_failed)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| ChatLine::new(ChatLineKind::Strip).fitted(width))
+}
+
+/// The footer as centered wrapped rows. Every action is retained.
+///
+/// Rows are greedily packed in action order. If a pane becomes narrower than
+/// one complete button, that button still owns its own fitted row and remains
+/// clickable instead of silently disappearing.
+pub fn chat_action_lines(width: usize, refresh_failed: bool) -> Vec<ChatLine> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let mut rows: Vec<Vec<(ChatAction, String)>> = Vec::new();
+    let mut row: Vec<(ChatAction, String)> = Vec::new();
     let mut used = 0usize;
     for action in chat_actions(refresh_failed) {
         let button = action.button();
-        let gap = if buttons.is_empty() {
-            0
-        } else {
-            display_width(ACTION_GAP)
-        };
-        let w = display_width(&button);
-        if used + gap + w > width {
-            break;
+        let gap = usize::from(!row.is_empty()) * display_width(ACTION_GAP);
+        let button_width = display_width(&button);
+        if !row.is_empty() && used + gap + button_width > width {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
         }
-        used += gap + w;
-        buttons.push((action, button));
+        let gap = usize::from(!row.is_empty()) * display_width(ACTION_GAP);
+        used += gap + button_width;
+        row.push((action, button));
     }
-    let mut line = ChatLine::new(ChatLineKind::Strip);
-    let lead = width.saturating_sub(used) / 2;
-    line.push(" ".repeat(lead), ChatInk::Text);
-    for (i, (action, button)) in buttons.into_iter().enumerate() {
-        if i > 0 {
-            line.push(ACTION_GAP, ChatInk::Text);
-        }
-        line.push(button, ChatInk::Button(action));
+    if !row.is_empty() {
+        rows.push(row);
     }
-    line.fitted(width)
+
+    rows.into_iter()
+        .map(|buttons| {
+            let used = buttons
+                .iter()
+                .map(|(_, button)| display_width(button))
+                .sum::<usize>()
+                + buttons.len().saturating_sub(1) * display_width(ACTION_GAP);
+            let mut line = ChatLine::new(ChatLineKind::Strip);
+            line.push(" ".repeat(width.saturating_sub(used) / 2), ChatInk::Text);
+            for (index, (action, button)) in buttons.into_iter().enumerate() {
+                if index > 0 {
+                    line.push(ACTION_GAP, ChatInk::Text);
+                }
+                line.push(button, ChatInk::Button(action));
+            }
+            line.fitted(width)
+        })
+        .collect()
 }
 
 /// How one run of text in a drawer line is inked.
@@ -988,11 +1032,18 @@ pub fn render_chat_lines(
     }
     out.push(header.fitted(width));
 
-    // Reserve rows for status and composer at the bottom
+    // Reserve the exact footer height before slicing the timeline. The
+    // passive footer may wrap as the pane narrows, and every wrapped row is
+    // part of the fixed chrome rather than expendable message space.
+    let action_lines = if composer.is_some_and(|c| c.mode.is_some()) {
+        Vec::new()
+    } else {
+        chat_action_lines(width, retry_available)
+    };
     let composer_rows = if composer.is_some_and(|c| c.mode.is_some()) {
         4
     } else {
-        2
+        1 + action_lines.len()
     };
     let status_rows = usize::from(status.is_some());
     let timeline_height = height.saturating_sub(1 + composer_rows + status_rows);
@@ -1346,7 +1397,7 @@ pub fn render_chat_lines(
             let mut bar = ChatLine::new(ChatLineKind::Rule);
             bar.push(rule, ChatInk::Dim);
             out.push(bar.fitted(width));
-            out.push(chat_action_line(width, retry_available));
+            out.extend(action_lines);
         }
     }
 
@@ -1364,7 +1415,7 @@ mod strip_tests {
     #[test]
     fn every_reported_span_covers_exactly_its_own_verb() {
         let (row, spans) = chat_action_strip(80, false);
-        assert_eq!(spans.len(), 5, "{row}");
+        assert_eq!(spans.len(), 6, "{row}");
         for (action, start, end) in spans {
             assert_eq!(
                 &row[start..end],
@@ -1439,17 +1490,64 @@ mod strip_tests {
         assert_eq!(padded.spans.last().unwrap().ink, ChatInk::Text);
     }
 
-    /// A verb the width cannot hold is absent rather than truncated: a
-    /// half-printed word must never carry a whole action.
+    /// Narrow panes wrap controls onto more footer rows instead of dropping
+    /// the first verb that does not fit.
     #[test]
-    fn a_verb_that_does_not_fit_has_no_span() {
-        let (row, spans) = chat_action_strip(9, false);
+    fn narrow_footers_retain_every_action_in_order() {
+        let strips = chat_action_strips(14, false);
+        let actions = strips
+            .iter()
+            .flat_map(|(_, spans)| spans.iter().map(|(action, _, _)| *action))
+            .collect::<Vec<_>>();
         assert_eq!(
-            spans.iter().map(|(a, _, _)| *a).collect::<Vec<_>>(),
-            vec![ChatAction::Reply],
-            "only the first verb fits in nine columns: {row:?}"
+            actions,
+            chat_actions(false),
+            "every footer action must survive wrapping: {strips:?}"
         );
-        assert!(!row.contains("announce"), "{row:?}");
+        assert!(strips.len() > 1, "fourteen columns must exercise wrapping");
+        for (row, spans) in strips {
+            assert_eq!(display_width(&row), 14, "{row:?}");
+            let first = spans.first().map(|(_, start, _)| *start).unwrap();
+            let last = spans.last().map(|(_, _, end)| *end).unwrap();
+            assert!(
+                first.abs_diff(14 - last) <= 1,
+                "each wrapped row stays centered: {row:?}"
+            );
+        }
+    }
+
+    /// Even below a button's natural width, the action retains its own row
+    /// and clickable ink. The text is fitted because the cells do not exist,
+    /// but the control does not vanish.
+    #[test]
+    fn an_ultranarrow_footer_does_not_drop_actions() {
+        let actions = chat_action_lines(3, false)
+            .iter()
+            .flat_map(|line| {
+                line.spans.iter().filter_map(|span| match span.ink {
+                    ChatInk::Button(action) => Some(action),
+                    _ => None,
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actions, chat_actions(false));
+    }
+
+    /// The complete renderer reserves the wrapped footer before it slices
+    /// the timeline, so the last rows cannot be truncated away by height.
+    #[test]
+    fn rendered_narrow_footer_keeps_every_action() {
+        let registry = AvatarRegistry::default();
+        let queue = HumanQueue::new();
+        let rows = render_chat(&queue, ChatRenderContext::new(&registry), 14, 10);
+        assert_eq!(rows.len(), 10);
+        let rendered = rows.join("\n");
+        for action in chat_actions(false) {
+            assert!(
+                rendered.contains(action.label()),
+                "{action:?} must remain visible in the wrapped footer:\n{rendered}"
+            );
+        }
     }
 
     /// Retry is offered only when the caller owns a failed snapshot request,
