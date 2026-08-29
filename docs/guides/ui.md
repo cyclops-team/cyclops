@@ -63,11 +63,14 @@ Keyboard input has its own bounded lane and starts a fair rotation across
 input, action, snapshot, and event work. Every continuously ready lane is
 served within four items. Ordered events apply backpressure when one frame
 batch is already waiting, so a slow terminal cannot grow the queue without
-bound. Every daemon frame and ledger line is limited to 1 MiB. Malformed or
-oversized live input becomes a visible connection gap, keeps the last good
-snapshot stale, and requires an explicit reconnect plus a fresh whole snapshot
-before actions are enabled. Snapshot reads, durable follow pages, and action
-answers use separate bounded lanes.
+bound. The stream UI limits each encoded or decoded daemon JSON object to
+1,048,576 bytes, excluding the newline, and bounds its direct ledger backfill.
+The daemon and blocking CLI do not yet enforce that same end-to-end contract;
+the approved bounded-frame milestone closes that gap. Malformed or oversized
+live input becomes a visible connection gap, keeps the last good snapshot
+stale, and requires an explicit reconnect plus a fresh whole snapshot before
+actions are enabled. Snapshot reads, durable follow pages, and action answers
+use separate bounded lanes.
 
 `cyclops status` remains the compact live-pane view. A pane can be runtime
 idle while a notification is staged, so status prints a factual subrow when

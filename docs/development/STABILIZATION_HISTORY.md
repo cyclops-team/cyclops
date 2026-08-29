@@ -1,5 +1,7 @@
 # Stabilization history
 
+**Status:** Historical record, not current implementation authority
+
 This document records the stabilization run from PR 56 through PR 97. It is a
 technical history, not a list of release claims. A merged fix, a fixture proof,
 a live vendor observation, and an opt-in evidence component are different kinds

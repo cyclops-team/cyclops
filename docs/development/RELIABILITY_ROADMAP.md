@@ -1,6 +1,11 @@
 # Cyclops reliability roadmap
 
-Status: current normative implementation roadmap for the reliability release.
+**Status:** Historical, frozen stabilization roadmap
+
+**Authority:** Not current implementation authority. For current behavior, use
+the contracts linked from [HANDOFF.md](HANDOFF.md). For Messaging Beta Rework
+implementation, use the approved
+[Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) and [NEXT.md](NEXT.md).
 
 Frozen planning baseline:
 
@@ -8,29 +13,28 @@ Frozen planning baseline:
 - `RELIABILITY_ROADMAP.md` SHA-256 at that commit:
   `efa7b2f88eac7c25868a5b48aa354709d7fdc499b586a74085aba43cd1c79126`
 
-The baseline identifies the accepted release program before implementation.
-Later commits may update the contract owners and this one current normative
-roadmap as measured implementation facts are learned; they do not create a
-second roadmap. Every reliability implementation pull request names this
-baseline commit and roadmap hash so its authority is reviewable without a
-local task folder or handoff record.
+The baseline identified the accepted release program before its implementation.
+The instructions below describe that completed stabilization campaign in its
+historical context. They do not authorize current work.
 
-This document defines the remaining production-hardening work for Cyclops. It
-does not replace the stable contracts in:
+During the stabilization campaign, this document defined the remaining
+production-hardening work. It did not replace the stable contracts in:
 
 - `docs/development/ARCHITECTURE.md`
 - `docs/development/DELIVERY.md`
 - `docs/development/INVARIANTS.md`
 - `docs/reference/PROTOCOL.md`
 
-Those files own current behavior. This roadmap owns release order, acceptance
-gates, and the boundary between release work and later architecture work.
+Those files owned behavior. This roadmap owned release order, acceptance gates,
+and the boundary between release work and later architecture work for that
+campaign.
 
-This roadmap supersedes `PLAN.md` revision 17 from the August 2026 messaging
-redesign task as the current implementation authority. That plan, its earlier
+During that campaign, this roadmap superseded `PLAN.md` revision 17 from the
+August 2026 messaging redesign task. It no longer has current implementation
+authority. That plan, its earlier
 revisions, `OPTIMALITY.md`, `OPTIMAL_MESSAGING_HORIZONS.md`, discussion notes,
-reviews, and handoff records remain historical evidence. They do not add current
-scope or override this roadmap.
+reviews, and handoff records remain historical evidence. They did not add scope
+or override this roadmap during that campaign.
 
 The release program has exactly four implementation groups followed by one
 frozen validation campaign:

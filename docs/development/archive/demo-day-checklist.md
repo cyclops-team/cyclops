@@ -1,5 +1,7 @@
 # Archived: Cyclops Demo Day Public-Readiness Checklist
 
+**Status:** Historical archive, not a current release gate
+
 This checklist records the time-boxed public-readiness pass that preceded the
 current release baseline. It is retained for historical context and is not an
 active plan, release gate, or onboarding document.

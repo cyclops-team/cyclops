@@ -4,12 +4,26 @@ A map, not a summary. Where things live, where to start reading for the
 job you have been handed, and which decisions were deliberate so you do not
 spend a day undoing one.
 
-For current behavior, start with this map and the normative contracts it links.
+For current behavior, start with this map and the behavior contracts below.
+For implementation order in the Messaging Beta Rework, the approved
+[Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) controls and the
+thin [current execution queue](NEXT.md) states what runs next.
+
+The
+[messaging architecture review](../MESSAGING_ARCHITECTURE_REVIEW.md) and its
+[addendum](../ADDENDUM_REVIEW.md) are supporting design records. They explain
+the reasoning behind the approved charter, but the charter controls
+implementation when the documents differ. The
+[CI and test architecture review](CI_TEST_ARCHITECTURE_REVIEW.md) is a separate
+active proposal, not part of the messaging milestone queue. The reusable
+[architecture review method](ARCHITECTURE_REVIEW_PROCESS.md) is methodology,
+not a Cyclops behavior contract.
+
 The completed stabilization run is recorded in
-[STABILIZATION_HISTORY.md](STABILIZATION_HISTORY.md). The prioritized next
-architecture work is in [NEXT.md](NEXT.md). The
-[reliability roadmap](RELIABILITY_ROADMAP.md) is the frozen gate record for the
-stabilization campaign, not the current public starting point.
+[STABILIZATION_HISTORY.md](STABILIZATION_HISTORY.md). The
+[reliability roadmap](RELIABILITY_ROADMAP.md) is a frozen historical gate record,
+and [V5.md](V5.md) is a historical design record. Do not use them as current
+implementation authority.
 
 Cyclops coordinates terminal coding agents that are already running in your
 tmux session. It watches panes, works out whether each agent is idle,
@@ -34,8 +48,12 @@ contracts, and historical records separate:
 |---|---|---|
 | User operation | [User guides](../guides/README.md) | Install, message, monitor, recover, and use the workspace. |
 | Stable reference | [Technical reference](../reference/README.md) | Wire methods, manifests, hooks, and measured performance claims. |
-| Active contracts | [Architecture](ARCHITECTURE.md), [delivery](DELIVERY.md), [invariants](INVARIANTS.md), [goals](GOALS.md), and [style](STYLE.md) | Read before changing product behavior or tests. |
-| Prioritized work | [Next architecture work](NEXT.md) | Behavior-preserving work that is approved but not yet implemented. |
+| Current behavior contracts | [Architecture](ARCHITECTURE.md), [delivery](DELIVERY.md), [invariants](INVARIANTS.md), [protocol](../reference/PROTOCOL.md), [goals](GOALS.md), and [style](STYLE.md) | Read before changing product behavior, wire behavior, rendering, or tests. |
+| Approved implementation authority | [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) | Controls the Messaging Beta Rework when supporting records or historical plans differ. |
+| Current execution queue | [NEXT.md](NEXT.md) | Thin queue of the current branch, next milestones, and explicit exclusions. |
+| Supporting design records | [Messaging architecture review](../MESSAGING_ARCHITECTURE_REVIEW.md) and [addendum](../ADDENDUM_REVIEW.md) | Reasoning behind the charter, not independent implementation authority. |
+| Separate active proposal | [CI and test architecture review](CI_TEST_ARCHITECTURE_REVIEW.md) | Review independently from messaging milestones. |
+| General methodology | [Architecture review method](ARCHITECTURE_REVIEW_PROCESS.md) | Reusable audit process, not a Cyclops behavior contract. |
 | Frozen and historical records | [Reliability roadmap](RELIABILITY_ROADMAP.md), [stabilization history](STABILIZATION_HISTORY.md), [V5 line](V5.md), [changelog](../../CHANGELOG.md), and [findings](../../findings.md) | Preserve the reasoning and evidence behind the current system. Do not treat old plans as current behavior. |
 | Internal release material | [Media plan](../public/README.md) and [archived demo checklist](archive/demo-day-checklist.md) | Maintainer and historical material, not public onboarding. |
 | Repository instructions | [Agent entrypoint](../../AGENTS.md), [contributing](../../CONTRIBUTING.md), and [security](../../SECURITY.md) | Rules for automated contributors, human contributors, and vulnerability reports. |

@@ -14,7 +14,7 @@ second place, that is the bug: this page is where they live.
 |---|---|---|
 | [1](#1-a-payload-never-reaches-a-pane-the-gate-did-not-admit) | A payload never reaches a pane the gate did not admit | A shell executes the message |
 | [2](#2-a-modal-is-never-cleared-generically) | A modal is never cleared generically | Escape exits the agent CLI |
-| [3](#3-human-typing-always-wins) | Human typing always wins | The human's half-written sentence is sent as part of the message |
+| [3](#3-cyclops-writes-only-with-fresh-positive-composer-and-occupant-evidence) | Cyclops writes only with fresh positive composer and occupant evidence | The human's half-written sentence is sent as part of the message |
 | [4](#4-legacy-blocked_quota-parks-and-never-auto-retries) | Legacy `blocked_quota` parks and never auto-retries | A loop that cannot succeed, against a metered API |
 | [5](#5-every-delivery-ends-in-a-named-state) | Every delivery ends in a named state | Nobody chases what has no state |
 | [6](#6-the-sender-is-whoever-connected-not-whoever-says-so) | The sender is whoever connected, not whoever says so | The audit trail can be forged |
@@ -117,7 +117,7 @@ Declines are bounded, never looped.
   `src/cyclopsd/tests/m1_fixes.rs`,
   `decline_aborts_when_the_modal_changes_between_keys`.
 
-## 3. Human typing always wins
+## 3. Cyclops writes only with fresh positive composer and occupant evidence
 
 **A composer with text in it is `idle_with_input`, and `idle_with_input`
 holds.**
@@ -134,6 +134,13 @@ only discriminator is that the ghost text is SGR-dim and typed text is bare
 `capture-pane -e` capture, and the daemon supplies escaped captures at gate
 time whenever the bound manifest has such rules. Take that away and the
 gate reads a typing human as an idle agent.
+
+This is a strong guard, not an absolute exclusion guarantee. A person can type
+after the final observation and before the tmux write. The current transport
+has no cooperative input lease across that interval. Cyclops therefore uses
+fresh positive evidence, checks the exact occupant, records intent before the
+effect, and treats ambiguous outcomes conservatively. Do not weaken those
+guards or describe them as proof that concurrent input is impossible.
 
 - Enforced at: `src/cyclopsd/src/delivery.rs`, the `AgentState::
   IdleWithInput` arm of `gate`; `src/cyclopsd/src/fusion.rs` supplies

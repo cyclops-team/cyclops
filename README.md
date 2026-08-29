@@ -202,7 +202,11 @@ Cyclops never converts uncertainty into success.
 - Stable tmux and process identities prevent a renamed or replaced pane from
   inheriting another occupant's delivery.
 - Raw tmux remains an operator-controlled emergency path, not an automatic
-  fallback and not a source of synthetic receipts.
+  fallback and not a source of synthetic receipts. A human may authorize one
+  exact, labeled, unrecorded pane write only after confirming Cyclops is
+  unavailable or broken. Slow delivery, a safety hold, or an ambiguous daemon
+  outcome is not confirmation of failure. See the
+  [raw-tmux emergency doctrine](docs/development/DELIVERY.md#raw-tmux-emergency-doctrine).
 
 Start troubleshooting with `cyclops health`, `cyclops status`, and
 [`docs/guides/troubleshooting.md`](docs/guides/troubleshooting.md).
