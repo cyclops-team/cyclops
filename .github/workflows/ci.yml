@@ -6,6 +6,14 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A pull request can only merge its newest revision. Do not spend runner time
+# proving an older revision after a replacement commit arrives. Push and manual
+# evidence use the unique run id, so release or operator-triggered runs are
+# never cancelled by this rule.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
