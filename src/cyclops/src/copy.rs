@@ -371,8 +371,9 @@ pub fn wait_occupant_changed(target: &str) -> String {
 /// user typed, when the command had one.
 pub fn client_error(e: &ClientError, asked: Option<&str>) -> String {
     match e {
-        ClientError::NotRunning => NOT_RUNNING.into(),
+        ClientError::NotRunning(_) => NOT_RUNNING.into(),
         ClientError::ConnectTimeout(d) => connect_timeout(*d),
+        ClientError::HelloTimeout(d) => broken(&format!("no hello within {}", timeout_words(*d))),
         ClientError::ReadTimeout(d) => broken(&format!("no answer within {}", timeout_words(*d))),
         ClientError::RequestFrameTooLarge => {
             format!("{}. Nothing was sent.", frame_too_large("request"))
@@ -397,7 +398,9 @@ pub fn client_error(e: &ClientError, asked: Option<&str>) -> String {
                 message.clone()
             }
         }
-        ClientError::Broken(cause) => broken(cause),
+        ClientError::NotSent(cause) | ClientError::Unknown(cause) | ClientError::Gap(cause) => {
+            broken(cause)
+        }
     }
 }
 

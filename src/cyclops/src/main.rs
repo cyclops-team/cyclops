@@ -65,7 +65,7 @@ use serde_json::{json, Value};
 
 use client::{Client, ClientError};
 use cyclops_proto::{
-    delivery_needs_human, DeliveryReceipt, DeliveryState, Event, HistoryParams, HistoryResult,
+    delivery_needs_human, DeliveryReceipt, DeliveryState, HistoryParams, HistoryResult,
     MessageNotificationState, MsgSendParams, MsgSendResult, PaneReadParams, PaneReadResult,
     PaneReadSource, PaneStatus, StatusResult, SubscribeParams, ThreadResult, WaitUntil,
     PROTOCOL_VERSION,
@@ -1930,7 +1930,7 @@ fn cmd_inbox_next(c: &mut Client, cli: &Cli, timeout: &str, from: Option<&str>) 
         cursor: None,
     })
     .expect("events.subscribe params serialize");
-    if let Err(error) = c.request("events.subscribe", subscribe) {
+    if let Err(error) = c.subscribe(subscribe) {
         return match error {
             ClientError::ReadTimeout(_) => inbox_next_timed_out(cli, budget),
             error => inbox_next_client_failed(cli, &error),
@@ -2008,12 +2008,9 @@ fn cmd_inbox_next(c: &mut Client, cli: &Cli, timeout: &str, from: Option<&str>) 
         if let Err(code) = inbox_next_set_remaining(c, cli, budget, deadline) {
             return code;
         }
-        match c.next_line() {
-            Ok(line) => {
-                let Ok(event) = serde_json::from_str::<Event>(&line) else {
-                    continue;
-                };
-                if event.event != "messages.changed" {
+        match c.next_event() {
+            Ok(frame) => {
+                if frame.event.event != "messages.changed" {
                     continue;
                 }
             }
@@ -2097,9 +2094,14 @@ fn inbox_next_client_failed(cli: &Cli, error: &ClientError) -> i32 {
         );
     }
     let (code, message, data) = match error {
-        ClientError::NotRunning => ("not_running", copy::client_error(error, None), Value::Null),
+        ClientError::NotRunning(_) => ("not_running", copy::client_error(error, None), Value::Null),
         ClientError::ConnectTimeout(waited) => (
             "connect_timeout",
+            copy::client_error(error, None),
+            json!({"waited_ms": waited.as_millis() as u64}),
+        ),
+        ClientError::HelloTimeout(waited) => (
+            "read_timeout",
             copy::client_error(error, None),
             json!({"waited_ms": waited.as_millis() as u64}),
         ),
@@ -2129,7 +2131,7 @@ fn inbox_next_client_failed(cli: &Cli, error: &ClientError) -> i32 {
             data,
             ..
         } => (code.as_str(), message.clone(), data.clone()),
-        ClientError::Broken(_) => (
+        ClientError::NotSent(_) | ClientError::Unknown(_) | ClientError::Gap(_) => (
             "connection_lost",
             copy::client_error(error, None),
             Value::Null,
@@ -3315,7 +3317,7 @@ fn cmd_watch_json(c: &mut Client, cli: &Cli, style: &Style, kinds: &[String]) ->
         cursor: None,
     })
     .expect("events.subscribe params serialize");
-    if let Err(e) = c.request("events.subscribe", params) {
+    if let Err(e) = c.subscribe(params) {
         eprintln!("{}", copy::client_error(&e, None));
         return 1;
     }
@@ -3326,26 +3328,20 @@ fn cmd_watch_json(c: &mut Client, cli: &Cli, style: &Style, kinds: &[String]) ->
     // partial line behind.
     let mut stdout = std::io::stdout();
     loop {
-        let line = match c.next_line() {
-            Ok(l) => l,
+        let frame = match c.next_event() {
+            Ok(frame) => frame,
             Err(e) => {
                 eprintln!("{}", copy::client_error(&e, None));
                 return 1;
             }
         };
-        let Ok(v) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if v.get("event").is_none() {
-            continue;
-        }
         if cli.json {
-            let _ = writeln!(stdout, "{line}");
-        } else if let Ok(ev) = serde_json::from_value::<Event>(v) {
+            let _ = writeln!(stdout, "{}", frame.raw_text());
+        } else {
             let _ = writeln!(
                 stdout,
                 "{}",
-                render::render_event_line(&ev, style, render::now_ms())
+                render::render_event_line(&frame.event, style, render::now_ms())
             );
         }
         let _ = stdout.flush();

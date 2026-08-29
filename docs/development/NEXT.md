@@ -13,20 +13,22 @@ preserved behavior, stop conditions, and rollback requirements.
 
 ## Current milestone
 
-Milestone 1 runs on **beta/fix/frame-contract**. It implements only the bounded
-official daemon frame contract shared by the protocol, daemon server, blocking
-CLI, stream UI, and workspace clients. The documentation authority repair was
-merged first in PR #101.
+Milestone 2 runs on **beta/refactor/daemon-client**. It consolidates the
+Hello-first connection, bounded framing, request correlation, timeout classes,
+uncertainty, refusal, and stream-gap semantics used by the blocking CLI, stream
+UI, and workspace clients. Milestone 1 merged in PR #103 after the documentation
+authority repair in PR #101.
 
 Exit evidence:
 
-- every official ingress and egress uses the shared 1,048,576-byte JSON-object
-  limit with the newline excluded;
-- oversized requests are rejected before request bytes are written;
-- oversized daemon ingress is dropped before dispatch and oversized egress is
-  never emitted;
-- historical oversized journal rows remain readable and unchanged; and
-- focused frame tests and all required repository gates pass.
+- blocking and async callers use one Daemon Client Interface;
+- callers no longer own socket opening, Hello parsing, frame reads and writes,
+  response correlation, refusal decoding, or uncertainty classification;
+- blocking and async contract suites prove the same boundary, correlation,
+  refusal, gap, and post-write uncertainty rules;
+- CLI, stream UI, update replay, and workspace journeys retain their existing
+  presentation and caller-owned retry policy; and
+- focused client tests and all required repository gates pass.
 
 ## Milestone queue
 
@@ -71,17 +73,16 @@ provides measurable isolation, and the operator separately approves it.
   performance, migration, and user-journey audits before the final pull request
   from **beta/messaging-rework** into `main`.
 
-## Milestone 1 session boundary
+## Milestone 2 session boundary
 
-Start a fresh implementation session after the documentation pull request is
-accepted. Use this scope:
+Use this scope:
 
-> Implement only Milestone 1 from the approved Messaging Refactor Charter: the
-> end-to-end bounded official daemon frame contract. Do not begin Daemon Client
-> consolidation, WorkspaceMessaging extraction, crate extraction, UI redesign,
-> CI restructuring, legacy deletion, MCP work, or later milestones. Preserve
-> historical replay and honest uncertainty. Stop if any charter stop condition
-> is encountered.
+> Implement only Milestone 2 from the approved Messaging Refactor Charter: one
+> shared Daemon Client Interface for official transport semantics. Do not begin
+> WorkspaceMessaging extraction, crate extraction, UI redesign, broad CI
+> restructuring, legacy deletion, MCP work, or later milestones. Preserve
+> caller-owned presentation and product policy, historical replay, and honest
+> uncertainty. Stop if any charter stop condition is encountered.
 
 ## Release naming gate
 

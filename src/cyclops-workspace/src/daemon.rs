@@ -5,15 +5,11 @@
 //! confirmation, decoration, and naming from drifting into subtly different
 //! protocol clients.
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
-use cyclops_proto::{
-    FrameContract, FrameSize, Hello, PaneStatus, Request, Response, StatusParams, StatusResult,
-    SOCK_NAME,
-};
+use cyclops_proto::{PaneStatus, StatusParams, StatusResult, SOCK_NAME};
+use cyclops_ui::daemon_client::{BlockingClient, Certainty, ClientError};
 use serde_json::{json, Value};
 
 const IO_TIMEOUT: Duration = Duration::from_millis(250);
@@ -32,93 +28,19 @@ const IO_TIMEOUT: Duration = Duration::from_millis(250);
 /// thread; nothing on this deadline may ever be called from the draw loop.
 const SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
-fn connect(home: &Path) -> Result<BufReader<UnixStream>, String> {
+fn connect(home: &Path) -> Result<BlockingClient, String> {
     connect_with(home, IO_TIMEOUT)
 }
 
-fn connect_with(home: &Path, timeout: Duration) -> Result<BufReader<UnixStream>, String> {
+fn connect_with(home: &Path, timeout: Duration) -> Result<BlockingClient, String> {
     let path = home.join(SOCK_NAME);
-    let stream = UnixStream::connect(&path)
-        .map_err(|error| format!("cyclopsd is unavailable at {}: {error}", path.display()))?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|error| format!("cannot set cyclopsd read deadline: {error}"))?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|error| format!("cannot set cyclopsd write deadline: {error}"))?;
-    let mut reader = BufReader::new(stream);
-
-    let hello = read_value(&mut reader, "hello")?;
-    serde_json::from_value::<Hello>(hello)
-        .map_err(|error| format!("cyclopsd sent an unreadable hello: {error}"))?;
-    Ok(reader)
-}
-
-enum RequestWriteError {
-    NotSent(String),
-    Unknown(String),
-}
-
-fn write_request(
-    stream: &mut impl Write,
-    method: &str,
-    params: Value,
-) -> Result<(), RequestWriteError> {
-    let mut writer = BoundedJson::new();
-    let request = Request {
-        id: json!(1),
-        method: method.to_string(),
-        params,
-    };
-    if let Err(error) = serde_json::to_writer(&mut writer, &request) {
-        return Err(RequestWriteError::NotSent(if writer.oversized {
-            format!(
-                "{}; nothing was sent",
-                crate::copy::frame_too_large(&format!("{method} request"))
-            )
-        } else {
-            format!("cannot encode {method} request: {error}")
-        }));
-    }
-    writer.bytes.push(FrameContract::DELIMITER);
-    stream.write_all(&writer.bytes).map_err(|error| {
-        RequestWriteError::Unknown(format!("cannot write {method} request: {error}"))
+    BlockingClient::connect_path(path.clone(), timeout, timeout).map_err(|error| {
+        format!(
+            "cyclopsd is unavailable at {}: {}",
+            path.display(),
+            error.cause()
+        )
     })
-}
-
-struct BoundedJson {
-    bytes: Vec<u8>,
-    oversized: bool,
-}
-
-impl BoundedJson {
-    fn new() -> Self {
-        Self {
-            bytes: Vec::new(),
-            oversized: false,
-        }
-    }
-}
-
-impl Write for BoundedJson {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if matches!(
-            FrameContract::classify_json_bytes(self.bytes.len().saturating_add(bytes.len())),
-            FrameSize::TooLarge
-        ) {
-            self.oversized = true;
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "official daemon frame is too large",
-            ));
-        }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 /// One request on a fresh connection. Requests are infrequent user actions
@@ -157,72 +79,20 @@ pub(crate) fn set_force_submit_settings(
 /// The request/response half of [`request`], on an already-open
 /// connection. Split out because [`theme_reload`] has to tell "nothing
 /// answered on the socket" apart from "a daemon answered and refused".
-fn exchange(
-    reader: &mut BufReader<UnixStream>,
-    method: &str,
-    params: Value,
-) -> Result<Value, String> {
-    write_request(reader.get_mut(), method, params).map_err(|error| match error {
-        RequestWriteError::NotSent(message) | RequestWriteError::Unknown(message) => message,
-    })?;
-
-    // A fresh, unsubscribed connection has exactly one response after its
-    // Hello. Anything else is a protocol error; failing immediately keeps a
-    // malformed peer from extending this bounded request indefinitely.
-    let response = read_value(reader, method)?;
-    let response = serde_json::from_value::<Response>(response)
-        .map_err(|error| format!("cyclopsd sent an unreadable {method} response: {error}"))?;
-    if response.id != json!(1) {
-        return Err(format!(
-            "cyclopsd replied to {method} with the wrong request id"
-        ));
-    }
-    if let Some(error) = response.error {
-        return Err(error.message);
-    }
-    response
-        .result
-        .ok_or_else(|| format!("cyclopsd omitted the {method} result"))
+fn exchange(client: &mut BlockingClient, method: &str, params: Value) -> Result<Value, String> {
+    client
+        .request(method, params)
+        .map_err(|error| request_error(method, error))
 }
 
-fn read_value(reader: &mut BufReader<UnixStream>, context: &str) -> Result<Value, String> {
-    let line = read_bounded_line(reader, context)?;
-    serde_json::from_slice(&line)
-        .map_err(|error| format!("cyclopsd sent unreadable {context}: {error}"))
-}
-
-fn read_bounded_line(reader: &mut impl BufRead, context: &str) -> Result<Vec<u8>, String> {
-    let mut line = Vec::new();
-    loop {
-        let (take, complete) = {
-            let available = reader
-                .fill_buf()
-                .map_err(|error| format!("cannot read cyclopsd {context}: {error}"))?;
-            if available.is_empty() {
-                if line.is_empty() {
-                    return Err(format!("cyclopsd closed during {context}"));
-                }
-                return Err(format!(
-                    "cyclopsd closed during an unterminated {context} frame"
-                ));
-            }
-            let newline = available
-                .iter()
-                .position(|byte| *byte == FrameContract::DELIMITER);
-            let take = newline.unwrap_or(available.len());
-            if matches!(
-                FrameContract::classify_json_bytes(line.len().saturating_add(take)),
-                FrameSize::TooLarge
-            ) {
-                return Err(crate::copy::frame_too_large(&format!("cyclopsd {context}")));
-            }
-            line.extend_from_slice(&available[..take]);
-            (take + usize::from(newline.is_some()), newline.is_some())
-        };
-        reader.consume(take);
-        if complete {
-            return Ok(line);
-        }
+fn request_error(method: &str, error: ClientError) -> String {
+    match error {
+        ClientError::RequestFrameTooLarge => format!(
+            "{}; nothing was sent",
+            crate::copy::frame_too_large(&format!("{method} request"))
+        ),
+        ClientError::Server { message, .. } => message,
+        other => other.cause(),
     }
 }
 
@@ -360,41 +230,33 @@ fn send_message_request(home: &Path, request: MessageRequest<'_>) -> SendOutcome
             return SendOutcome::NotSent(format!("cannot encode the message: {error}"));
         }
     };
-    let mut reader = match connect_with(home, SEND_TIMEOUT) {
-        Ok(reader) => reader,
+    let mut client = match connect_with(home, SEND_TIMEOUT) {
+        Ok(client) => client,
         Err(error) => return SendOutcome::NotSent(error),
     };
-    if let Err(error) = write_request(reader.get_mut(), "msg.send", params) {
-        return match error {
-            RequestWriteError::NotSent(message) => SendOutcome::NotSent(message),
-            RequestWriteError::Unknown(message) => SendOutcome::Unknown(message),
-        };
-    }
-    let value = match read_value(&mut reader, "msg.send") {
+    let value = match client.request("msg.send", params) {
         Ok(value) => value,
-        Err(error) => return SendOutcome::Unknown(error),
-    };
-    let response = match serde_json::from_value::<Response>(value) {
-        Ok(response) => response,
+        Err(ClientError::Server {
+            code,
+            message,
+            data,
+            ..
+        }) => {
+            return SendOutcome::Rejected(DaemonRefusal {
+                code,
+                message,
+                data: (!data.is_null()).then_some(data),
+            });
+        }
         Err(error) => {
-            return SendOutcome::Unknown(format!(
-                "cyclopsd sent an unreadable msg.send response: {error}"
-            ));
+            let certainty = error.certainty();
+            let message = request_error("msg.send", error);
+            return match certainty {
+                Certainty::KnownNotSent => SendOutcome::NotSent(message),
+                Certainty::OutcomeUnknown | Certainty::StreamGap => SendOutcome::Unknown(message),
+                Certainty::Refused => unreachable!("daemon refusals were handled above"),
+            };
         }
-    };
-    if response.id != json!(1) {
-        return SendOutcome::Unknown(
-            "cyclopsd replied to msg.send with the wrong request id".to_string(),
-        );
-    }
-    if let Some(error) = response.error {
-        if error.code == FrameContract::TOO_LARGE_CODE {
-            return SendOutcome::Unknown(error.message);
-        }
-        return SendOutcome::Rejected(error.into());
-    }
-    let Some(value) = response.result else {
-        return SendOutcome::Unknown("cyclopsd omitted the msg.send result".to_string());
     };
     let result: cyclops_proto::MsgSendResult = match serde_json::from_value(value) {
         Ok(result) => result,
@@ -527,85 +389,9 @@ pub fn label_pane(home: &Path, pane_id: &str, label: &str) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cyclops_proto::FrameContract;
+    use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
-
-    struct PartialWriter {
-        remaining: usize,
-    }
-
-    impl Write for PartialWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if self.remaining == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "simulated socket failure",
-                ));
-            }
-            let written = self.remaining.min(bytes.len());
-            self.remaining -= written;
-            Ok(written)
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn response_lines_stop_before_allocating_past_the_envelope() {
-        let mut exact = vec![b'x'; FrameContract::MAX_JSON_BYTES];
-        exact.push(FrameContract::DELIMITER);
-        let mut reader = std::io::BufReader::new(std::io::Cursor::new(exact));
-        assert_eq!(
-            read_bounded_line(&mut reader, "test response")
-                .expect("the exact boundary is accepted")
-                .len(),
-            FrameContract::MAX_JSON_BYTES
-        );
-
-        let mut oversized = vec![b'x'; FrameContract::MAX_JSON_BYTES + 1];
-        oversized.push(FrameContract::DELIMITER);
-        let mut reader = std::io::BufReader::new(std::io::Cursor::new(oversized));
-        let error = read_bounded_line(&mut reader, "test response")
-            .expect_err("an oversized response must be refused");
-        assert!(error.contains("exceeds"), "{error}");
-        assert!(reader.buffer().len() <= FrameContract::MAX_JSON_BYTES);
-    }
-
-    #[test]
-    fn oversized_workspace_requests_are_known_not_sent() {
-        use std::io::Read as _;
-
-        let (mut client, mut daemon) = UnixStream::pair().unwrap();
-        let error = write_request(
-            &mut client,
-            "ping",
-            json!({"padding": "x".repeat(FrameContract::MAX_JSON_BYTES)}),
-        )
-        .expect_err("the oversized request must be rejected before writing");
-        let RequestWriteError::NotSent(message) = error else {
-            panic!("pre-write refusal was not classified as known-not-sent");
-        };
-        assert!(message.contains("nothing was sent"), "{message}");
-
-        daemon.set_nonblocking(true).unwrap();
-        let mut byte = [0u8; 1];
-        let read = daemon.read(&mut byte);
-        assert!(matches!(
-            read,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-        ));
-    }
-
-    #[test]
-    fn a_socket_failure_after_writing_begins_remains_outcome_unknown() {
-        let mut writer = PartialWriter { remaining: 8 };
-        let error = write_request(&mut writer, "ping", json!({}))
-            .expect_err("the simulated partial write must fail");
-        assert!(
-            matches!(error, RequestWriteError::Unknown(message) if message.contains("simulated socket failure"))
-        );
-    }
 
     #[test]
     fn an_oversized_message_is_not_sent_by_the_workspace() {

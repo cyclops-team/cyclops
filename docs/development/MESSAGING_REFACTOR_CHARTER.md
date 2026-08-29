@@ -191,7 +191,7 @@ All findings below were checked at the reviewed revision.
 
 | Finding | Current evidence | Classification |
 |---|---|---|
-| Official frame limits disagree | At the reviewed revision, `src/cyclops-ui/src/wire.rs` caps encoded and decoded frames at 1,048,576 JSON-object bytes. `src/cyclopsd/src/server.rs` uses unbounded `lines()` and unbounded response/event serialization. `src/cyclops/src/client.rs` uses unbounded `read_line`, and `src/cyclops/src/main.rs` reads complete stdin or files before validation. | Verified P1 interoperability and local resource defect |
+| Official frame limits disagree | At the reviewed revision, the then-current UI wire module capped encoded and decoded frames at 1,048,576 JSON-object bytes. That module has since been consolidated into `src/cyclops-ui/src/daemon_client.rs`. `src/cyclopsd/src/server.rs` then used unbounded `lines()` and unbounded response/event serialization. `src/cyclops/src/client.rs` then used unbounded `read_line`, and `src/cyclops/src/main.rs` read complete stdin or files before validation. | Verified P1 interoperability and local resource defect |
 | Terminal non-interference was overstated | At the reviewed revision, `INVARIANTS.md` said “Human typing always wins.” `src/cyclopsd/src/delivery.rs` documents an irreducible final proof-to-paste command interval and exposes `post_final_prewrite`. | Verified contract defect; this documentation pass corrects the wording while preserving useful guards |
 | Raw emergency doctrine is fragmented | `README.md` and `DELIVERY.md` already make raw tmux manual, unrecorded, and non-automatic. The active skill forbids autonomous bypass but does not state the operator-authorized confirmed-failure exception. | Verified authority and recovery gap; the literal contradiction was overstated |
 | Subscribe cursor is not honored | `src/cyclops-proto/src/wire.rs` promises replay after `SubscribeParams.cursor`; `src/cyclopsd/src/server.rs` explicitly ignores it. Public protocol prose does not advertise it and official UIs send no cursor. | Verified typed-contract mismatch, not evidence of current durable-message loss |
@@ -496,8 +496,9 @@ does not move mailbox or delivery policy.
 
 - `src/cyclops-proto/src/wire.rs` for one pure public size rule and error
   vocabulary;
-- `src/cyclops-ui/src/wire.rs` to consume that rule rather than own a local
-  number;
+- the then-current UI wire module, now
+  `src/cyclops-ui/src/daemon_client.rs`, to consume that rule rather than own a
+  local number;
 - `src/cyclops/src/client.rs` and the body-source handling in
   `src/cyclops/src/main.rs` for bounded pre-write encoding and bounded reads;
 - `src/cyclopsd/src/server.rs` for bounded ingress and egress before unbounded

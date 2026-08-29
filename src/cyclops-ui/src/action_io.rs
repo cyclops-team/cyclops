@@ -17,11 +17,9 @@ use std::time::Duration;
 
 use cyclops_proto::{MessageId, NotificationAttemptId};
 use serde_json::{json, Value};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::net::UnixStream;
 
+use crate::daemon_client::{AsyncClient, Certainty, ClientError};
 use crate::detail::{Check, Loaded, ThreadEntry};
-use crate::wire::{encode_json, FrameReader};
 
 /// What a request is doing, which decides how its silence is read.
 ///
@@ -459,147 +457,46 @@ pub(crate) const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 /// request the daemon never saw. The phases are split so silence before
 /// the write is reported as the knowledge it is.
 async fn call(sock: &Path, method: &str, params: Value) -> Result<Value, Failure> {
-    let connected = match tokio::time::timeout(OPEN_TIMEOUT, open(sock)).await {
-        Ok(result) => result?,
-        Err(_) => {
-            return Err(Failure::NotSent(format!(
-                "no connection within {}s",
-                OPEN_TIMEOUT.as_secs()
-            )))
+    let mut client = AsyncClient::connect(sock, OPEN_TIMEOUT, OPEN_TIMEOUT)
+        .await
+        .map_err(|error| failure_from_client(error, method))?;
+    client
+        .request(method, params, ANSWER_TIMEOUT)
+        .await
+        .map_err(|error| failure_from_client(error, method))
+}
+
+fn failure_from_client(error: ClientError, method: &str) -> Failure {
+    if let ClientError::Server { code, message, .. } = error {
+        return Failure::Refused { code, message };
+    }
+    let certainty = error.certainty();
+    let why = match error {
+        ClientError::ConnectTimeout(_) => {
+            format!("no connection within {}s", OPEN_TIMEOUT.as_secs())
         }
+        ClientError::ReadTimeout(_) => {
+            format!(
+                "{method} did not answer within {}s",
+                ANSWER_TIMEOUT.as_secs()
+            )
+        }
+        ClientError::NotRunning(cause) => format!("connect: {cause}"),
+        other => other.cause(),
     };
-    match tokio::time::timeout(ANSWER_TIMEOUT, ask(connected, method, params)).await {
-        Ok(result) => result,
-        Err(_) => Err(Failure::Uncertain(format!(
-            "{method} did not answer within {}s",
-            ANSWER_TIMEOUT.as_secs()
-        ))),
+    match certainty {
+        Certainty::KnownNotSent => Failure::NotSent(why),
+        Certainty::OutcomeUnknown | Certainty::StreamGap => Failure::Uncertain(why),
+        Certainty::Refused => unreachable!("daemon refusals were handled above"),
     }
-}
-
-/// Connect and read the hello. Nothing here writes a request, so every
-/// failure in this function is known-not-sent.
-type Connection = (
-    FrameReader<tokio::net::unix::OwnedReadHalf>,
-    tokio::net::unix::OwnedWriteHalf,
-);
-
-async fn open(sock: &Path) -> Result<Connection, Failure> {
-    let stream = UnixStream::connect(sock)
-        .await
-        .map_err(|e| Failure::NotSent(format!("connect: {e}")))?;
-    let (read, write) = stream.into_split();
-    let mut frames = FrameReader::new(read);
-    let frame = frames
-        .next_frame()
-        .await
-        .map_err(|e| Failure::NotSent(format!("hello: {e}")))?
-        .ok_or_else(|| Failure::NotSent("closed before the hello".into()))?;
-    match serde_json::from_slice::<cyclops_proto::Hello>(&frame) {
-        Ok(_) => Ok((frames, write)),
-        Err(_) => Err(Failure::NotSent("not a cyclops daemon".into())),
-    }
-}
-
-/// Write one request and read its answer.
-///
-/// Encoding failure is known-not-sent. Once the socket write begins, any
-/// transport failure is uncertain because the peer may have accepted the
-/// complete frame before the local error became visible.
-async fn ask(connection: Connection, method: &str, params: Value) -> Result<Value, Failure> {
-    let (mut frames, mut w) = connection;
-    write_request(&mut w, method, params).await?;
-
-    let frame = frames
-        .next_frame()
-        .await
-        .map_err(|e| Failure::Uncertain(format!("read: {e}")))?
-        .ok_or_else(|| Failure::Uncertain("connection closed before an answer".into()))?;
-    let response: cyclops_proto::Response = serde_json::from_slice(&frame)
-        .map_err(|e| Failure::Uncertain(format!("malformed {method} answer: {e}")))?;
-    if response.id != 1 {
-        return Err(Failure::Uncertain(format!(
-            "{method} returned the wrong response id"
-        )));
-    }
-    if let Some(error) = response.error {
-        if error.code == cyclops_proto::FrameContract::TOO_LARGE_CODE {
-            return Err(Failure::Uncertain(error.message));
-        }
-        return Err(Failure::Refused {
-            code: error.code,
-            message: error.message,
-        });
-    }
-    response
-        .result
-        .ok_or_else(|| Failure::Uncertain(format!("{method} returned no result")))
-}
-
-async fn write_request(
-    writer: &mut (impl AsyncWrite + Unpin),
-    method: &str,
-    params: Value,
-) -> Result<(), Failure> {
-    let request = json!({ "id": 1, "method": method, "params": params });
-    let mut request =
-        encode_json(&request).map_err(|e| Failure::NotSent(format!("encode request: {e}")))?;
-    request.push(b'\n');
-    writer
-        .write_all(&request)
-        .await
-        .map_err(|e| Failure::Uncertain(format!("send: {e}")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::pin::Pin;
     use std::str::FromStr;
-    use std::task::{Context, Poll};
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
-
-    struct PartialWriter {
-        remaining: usize,
-    }
-
-    impl AsyncWrite for PartialWriter {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            bytes: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
-            if self.remaining == 0 {
-                return Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "simulated socket failure",
-                )));
-            }
-            let written = self.remaining.min(bytes.len());
-            self.remaining -= written;
-            Poll::Ready(Ok(written))
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    #[tokio::test]
-    async fn a_partial_action_write_remains_outcome_uncertain() {
-        let mut writer = PartialWriter { remaining: 8 };
-        let error = write_request(&mut writer, "ping", json!({}))
-            .await
-            .expect_err("the simulated partial write must fail");
-        assert!(
-            matches!(error, Failure::Uncertain(message) if message.contains("simulated socket failure"))
-        );
-    }
 
     /// A real greeting. The client rejects anything else, so a fixture
     /// that fakes one is testing a daemon that does not exist.
