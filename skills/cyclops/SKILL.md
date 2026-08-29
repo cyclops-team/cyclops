@@ -27,7 +27,9 @@ $ cyclops status
 If you get `cyclops isn't running. Start it with: cyclops start`, someone
 needs to run `cyclops start` in that tmux session before any of this
 works. That is an operator action, not something you should route around
-(see Safety rules below).
+(see Safety rules below). The only exception is a human operator's explicit
+emergency authorization after confirming Cyclops is unavailable or broken.
+That exception is narrow, unrecorded, and never agent-authorized.
 
 Find your own name with `cyclops list --json`: the entry whose `pane_id`
 matches `$TMUX_PANE`, if you are inside tmux. The plain roster prints
@@ -348,6 +350,13 @@ and the proof).
   route around a hold. The selected doorbell or direct payload is admitted only after
   Cyclops proves the current occupant and a clean composer. Every message
   goes through `cyclops send`, even when a direct write looks faster.
+- **Raw tmux requires explicit human emergency authorization.** A slow
+  delivery, safety hold, ambiguous outcome, or inconvenient recipient state is
+  not coordinator failure. Only after a human confirms Cyclops is unavailable
+  or broken may that human authorize one exact target-pane write. Label it
+  unrecorded, do not claim any Cyclops acceptance, receipt, ordering, replay,
+  claim, reply, or completion fact, and return to Cyclops when it is available.
+  An agent never grants itself this authority.
 - **Never write the pane title.** It is a sensor cyclops (and the agent
   itself) reads to tell working from idle, not a place for your own
   decoration. If you want to announce a name or status, that is

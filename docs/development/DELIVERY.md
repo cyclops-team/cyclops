@@ -70,9 +70,26 @@ throughout the hold.
 
 The terminal write is only a notification transport. Mailbox acceptance,
 claim, reply, ordering, and replay do not depend on the full-screen workspace
-UI. Raw tmux injection remains a manual emergency path outside this contract:
-Cyclops never falls back to an unrecorded paste after an uncertain daemon
-outcome.
+UI.
+
+## Raw-tmux emergency doctrine
+
+Normal agent communication uses Cyclops. Raw tmux is outside the messaging
+contract and is never an automatic fallback.
+
+1. A slow delivery, safety hold, ambiguous daemon outcome, or inconvenient
+   recipient state does not authorize a bypass.
+2. Only a human operator may authorize an exact raw pane write, and only after
+   confirming that Cyclops is unavailable or broken. An agent cannot grant
+   itself this authority.
+3. Name the exact target pane and label the write unrecorded before acting.
+4. Do not claim a Cyclops receipt, durable acceptance, FIFO ordering, replay,
+   claim, reply ancestry, or completion for the raw write.
+5. Never retry an ambiguous Cyclops write through raw tmux without a new,
+   explicit human decision that accounts for possible duplication.
+
+This emergency lane changes terminal state but writes no Cyclops messaging
+fact. Return to Cyclops as soon as the coordinator is available.
 
 Current terminal-action settlements append `notification_resolved` with
 `proof_version: 1` and replay only after the exact intent, action, and required

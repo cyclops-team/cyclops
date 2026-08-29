@@ -1,79 +1,93 @@
-# Next architecture work
+# Current execution queue
 
-Cyclops is stabilized around a durable mailbox, guarded terminal notification,
-stable identity, and honest receipts. The next priority is to make that working
-delivery system easier to understand and change without altering its behavior.
+**Status:** Current execution queue
 
-## High priority: delivery core extraction
+**Implementation authority:**
+[Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md)
 
-`cyclopsd` currently combines pure delivery decisions with journal access,
-process evidence, tmux IO, timers, supervision, and RPC coordination. The main
-delivery and mailbox modules are large enough that a local change can require a
-repository-wide forensic pass before its ownership is clear.
+**Integration branch:** **beta/messaging-rework**
 
-Extract a sans-IO `cyclops-delivery-core` whose central operation is:
+Cyclops is executing the Messaging Beta Rework as independently verifiable
+milestones. This page states what runs next. The charter owns rationale,
+preserved behavior, stop conditions, and rollback requirements.
 
-```text
-(state, input) -> (state, effects)
-```
+## Current milestone
 
-The core should own semantic transitions and effect requests. It must not read
-tmux, spawn a process, open a socket, sleep, or append a journal. Adapters remain
-responsible for executing effects and returning new evidence.
+The documentation authority repair runs on
+**docs/messaging-refactor-authority**. It approves and repairs the charter,
+establishes [HANDOFF.md](HANDOFF.md) as the front door, restores the architecture
+review method, repairs documentation status and links, makes the shipped
+Cyclops skill the emergency-doctrine source of truth, and synchronizes the
+installed copy. Its only Rust source change is the current shipped-skill hash
+required by the existing seeding contract.
 
-Keep these boundaries explicit:
+Exit evidence:
 
-- mailbox persistence and replay remain the authority for durable facts;
-- fusion remains the authority for pane, screen, lifecycle, and process
-  evidence;
-- the daemon remains responsible for async workers, locks, timers, RPC, and
-  effect execution;
-- tmux interaction remains inside `cyclops-tmux`;
-- protocol and journal schemas remain in `cyclops-proto`.
+- the documentation checker reports zero broken references;
+- the documentation checker reports zero unindexed retained pages;
+- the diff contains no messaging runtime, command, journal, UI, workflow,
+  installer, or website behavior change; and
+- the pull request targets **beta/messaging-rework** and is not merged without
+  operator approval.
 
-The extraction is behavior-preserving. It is not permission to redesign the
-wire protocol, change receipts, weaken a gate, or replace the journal.
+## Milestone queue
 
-### Safe sequence
+1. **fix/beta-frame-contract**: implement only the end-to-end bounded official
+   daemon frame contract. The shared limit is 1,048,576 JSON-object bytes,
+   excluding the newline. This is a reliability prerequisite, not the
+   `WorkspaceMessaging` extraction.
+2. **refactor/beta-daemon-client**: consolidate official framing, correlation,
+   timeout, uncertainty, gap, reconnect, and recovery semantics only after
+   Milestone 1 is accepted.
+3. **refactor/beta-workspace-messaging**: introduce one narrow internal
+   `WorkspaceMessaging` operation family and prove that callers lose messaging
+   knowledge.
 
-1. Extract closed input, state, decision, and effect types while the existing
-   path remains authoritative.
-2. Move pure composer-hold transitions behind equivalence tests.
-3. Move pre-write gate ordering behind table and mutation tests.
-4. Move notification attempt and FIFO decisions behind replay tests.
-5. Move post-write verification and recovery decisions behind crash-boundary
-   tests.
-6. Route one narrow production path through the core at a time, retaining a
-   comparison seam until its evidence is green.
-7. Remove duplicated decisions only after the extracted path passes the full
-   workspace gate and the opt-in frozen evidence components.
+`cyclops-delivery-core` was an earlier name for the same modularity goal now
+called `WorkspaceMessaging`. It does not authorize a crate, a second messaging
+system, or an extraction debate. Do not create a crate unless the internal
+Module later proves that a crate deletes additional caller knowledge or
+provides measurable isolation, and the operator separately approves it.
 
-Every slice must preserve the invariants in [INVARIANTS.md](INVARIANTS.md), add
-no unbounded retry, hold no lock across IO, and keep ambiguous evidence
-non-successful. Small PRs are a design requirement, not process ceremony.
+## Branch and review rules
 
-## Medium priority
+- Do not develop the beta rework directly on `main`.
+- Do not make routine implementation commits directly on
+  **beta/messaging-rework**.
+- Give each milestone its own branch, pull request into the integration branch,
+  regression evidence, review, and rollback point.
+- Do not begin a later milestone inside an earlier pull request.
+- Keep the integration branch synchronized with `main` through reviewed merges.
+- Do not merge a pull request or publish a release without operator approval.
+- After the approved beta scope, run fresh architecture, regression,
+  performance, migration, and user-journey audits before the final pull request
+  from **beta/messaging-rework** into `main`.
 
-- Add an exact-attempt administrator `release_hold` action only if real use
-  shows a hold that cannot recover from visible input becoming settled and
-  exactly empty. The current automatic backspace-to-empty path covers the
-  normal operator workflow, so this is not a release blocker.
-- Continue reducing test wall time through measured removal of duplicated work
-  and event-driven synchronization. Do not narrow platform or relocated-root
-  coverage without mutation evidence for the defect classes it protects.
-- Review tracked planning summaries and historical benchmark artifacts once
-  their lasting documentation value can be judged independently of disk
-  cleanup.
+## Milestone 1 session boundary
 
-## Deferred
+Start a fresh implementation session after the documentation pull request is
+accepted. Use this scope:
 
-These are explicitly outside the current stabilization target:
+> Implement only Milestone 1 from the approved Messaging Refactor Charter: the
+> end-to-end bounded official daemon frame contract. Do not begin Daemon Client
+> consolidation, WorkspaceMessaging extraction, crate extraction, UI redesign,
+> CI restructuring, legacy deletion, MCP work, or later milestones. Preserve
+> historical replay and honest uncertainty. Stop if any charter stop condition
+> is encountered.
 
-- large-fleet supervisory UI and thread-folding features;
-- live Cursor evidence beyond the shipped conservative offline manifest;
-- automatic or polished raw-tmux fallback behavior;
-- distributed transport or mesh work;
-- general cancellation, supersession, and artifact retention systems.
+## Release naming gate
 
-Deferred work may not weaken mailbox durability, composer safety, stable
-identity, FIFO ownership, crash recovery, or receipt honesty.
+Verified on 2026-08-29: the newest remote tag is `v0.2.0-beta`, created
+2026-08-27; GitHub has no Release objects; and the repository-root `Cargo.toml`
+declares `0.1.0`. Reconcile the version, tag, and release authorities before
+assigning or publishing the final beta version number.
+
+## Not authorized by this queue
+
+No current milestone authorizes UI redesign, CI restructuring, legacy
+deletion, runner or host-adapter production work, MCP work, broad rewriting,
+automatic raw-tmux fallback, a complete data-lifecycle policy, or release
+publication. Preserve every currently readable journal format throughout this
+refactor. Until a complete lifecycle policy is approved, allow no silent
+deletion, truncation, or rewriting; a breaking migration requires an explicit
+export or migration path.

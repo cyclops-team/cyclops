@@ -76,7 +76,9 @@ invisible, on a record that never lies.
 - Never clear a modal generically: per-CLI vocabulary with explicit declines,
   or park + alert.
 - blocked_quota never auto-retries.
-- Human live typing always wins.
+- Cyclops writes terminal notifications only after fresh positive composer and
+  occupant evidence. This minimizes concurrent-input risk; it cannot eliminate
+  the final observation-to-write interval without cooperative input ownership.
 - Secrets never enter the ledger.
 - Vendor quirks are data, not code.
 
