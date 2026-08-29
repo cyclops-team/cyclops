@@ -102,7 +102,10 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
 
 fn frame_too_large(limit: usize) -> io::Error {
     let message = if limit == FrameContract::MAX_JSON_BYTES {
-        FrameContract::too_large_message("daemon frame")
+        format!(
+            "daemon frame exceeds the {}-byte JSON frame limit (newline excluded)",
+            FrameContract::MAX_JSON_BYTES
+        )
     } else {
         format!("daemon frame exceeds the {limit}-byte test limit")
     };

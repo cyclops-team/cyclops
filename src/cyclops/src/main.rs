@@ -3233,7 +3233,7 @@ fn read_bounded_body(reader: impl std::io::Read) -> Result<String, String> {
     if bytes.len() > cyclops_proto::FrameContract::MAX_JSON_BYTES {
         return Err(format!(
             "{}; nothing was sent",
-            cyclops_proto::FrameContract::too_large_message("message body")
+            copy::frame_too_large("message body")
         ));
     }
     String::from_utf8(bytes).map_err(|_| "message body is not UTF-8".to_string())

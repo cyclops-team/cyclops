@@ -47,14 +47,6 @@ impl FrameContract {
     pub const fn max_line_bytes() -> usize {
         Self::MAX_JSON_BYTES + 1
     }
-
-    /// Human-readable contract wording shared by client and daemon errors.
-    pub fn too_large_message(subject: &str) -> String {
-        format!(
-            "{subject} exceeds the {}-byte JSON frame limit (newline excluded)",
-            Self::MAX_JSON_BYTES
-        )
-    }
 }
 
 /// First line the server writes on every connection.

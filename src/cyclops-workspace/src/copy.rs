@@ -364,6 +364,13 @@ pub fn file_sent(reference: &str, pane: &str) -> String {
 pub const CONTROL_STREAM_GAP: &str =
     "the tmux event stream overflowed and the view was rebuilt; keys typed meanwhile were dropped, type them again";
 
+pub(crate) fn frame_too_large(subject: &str) -> String {
+    format!(
+        "{subject} exceeds the {}-byte JSON frame limit (newline excluded)",
+        cyclops_proto::FrameContract::MAX_JSON_BYTES
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

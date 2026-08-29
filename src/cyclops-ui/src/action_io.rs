@@ -532,6 +532,9 @@ async fn ask(connection: Connection, method: &str, params: Value) -> Result<Valu
         )));
     }
     if let Some(error) = response.error {
+        if error.code == cyclops_proto::FrameContract::TOO_LARGE_CODE {
+            return Err(Failure::Uncertain(error.message));
+        }
         return Err(Failure::Refused {
             code: error.code,
             message: error.message,
@@ -590,6 +593,50 @@ mod tests {
 
         let outcome = perform(&sock, request).await;
         (server.await.unwrap(), outcome)
+    }
+
+    #[tokio::test]
+    async fn a_bounded_oversized_response_error_remains_outcome_uncertain() {
+        let home = cyclops_proto::scratch::scratch_dir("ui-action-io-frame-too-large");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let sock = home.join(cyclops_proto::SOCK_NAME);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            write.write_all(hello_line().as_bytes()).await.unwrap();
+            let mut lines = BufReader::new(read).lines();
+            let asked: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let answer = json!({
+                "id": asked["id"],
+                "error": {
+                    "code": cyclops_proto::FrameContract::TOO_LARGE_CODE,
+                    "message": "daemon response was too large; request outcome is unknown"
+                }
+            });
+            write
+                .write_all(format!("{answer}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let outcome = perform(
+            &sock,
+            ActionRequest::AttentionComplete {
+                attempt_id: NotificationAttemptId::parse(
+                    "att-00000000-0000-4000-8000-000000000019",
+                )
+                .unwrap(),
+            },
+        )
+        .await;
+        server.await.unwrap();
+        match outcome {
+            ActionOutcome::Uncertain(why) => assert!(why.contains("outcome is unknown"), "{why}"),
+            other => panic!("oversized daemon response was misclassified: {other:?}"),
+        }
     }
 
     #[tokio::test]

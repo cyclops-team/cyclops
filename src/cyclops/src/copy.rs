@@ -374,13 +374,10 @@ pub fn client_error(e: &ClientError, asked: Option<&str>) -> String {
         ClientError::NotRunning => NOT_RUNNING.into(),
         ClientError::ConnectTimeout(d) => connect_timeout(*d),
         ClientError::ReadTimeout(d) => broken(&format!("no answer within {}", timeout_words(*d))),
-        ClientError::RequestFrameTooLarge => format!(
-            "{}. Nothing was sent.",
-            cyclops_proto::FrameContract::too_large_message("request")
-        ),
-        ClientError::DaemonFrameTooLarge => broken(
-            &cyclops_proto::FrameContract::too_large_message("daemon frame"),
-        ),
+        ClientError::RequestFrameTooLarge => {
+            format!("{}. Nothing was sent.", frame_too_large("request"))
+        }
+        ClientError::DaemonFrameTooLarge => broken(&frame_too_large("daemon frame")),
         ClientError::Server {
             code,
             message,
@@ -401,6 +398,13 @@ pub fn client_error(e: &ClientError, asked: Option<&str>) -> String {
         }
         ClientError::Broken(cause) => broken(cause),
     }
+}
+
+pub fn frame_too_large(subject: &str) -> String {
+    format!(
+        "{subject} exceeds the {}-byte JSON frame limit (newline excluded)",
+        cyclops_proto::FrameContract::MAX_JSON_BYTES
+    )
 }
 
 /// Under a scoped roster's header: the watched sessions the caller is

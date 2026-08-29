@@ -2212,11 +2212,7 @@ fn subscribe_decoration_once(
                 return;
             }
             Ok(BoundedLine::TooLong) => {
-                report_stream_gap(
-                    &stream_tx,
-                    &sig_tx,
-                    cyclops_proto::FrameContract::too_large_message("daemon event"),
-                );
+                report_stream_gap(&stream_tx, &sig_tx, copy::frame_too_large("daemon event"));
                 return;
             }
             Ok(BoundedLine::Complete) => {}

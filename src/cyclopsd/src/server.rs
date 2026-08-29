@@ -2605,6 +2605,13 @@ enum FrameEncodeError {
     Serialize(serde_json::Error),
 }
 
+fn frame_too_large(subject: &str) -> String {
+    format!(
+        "{subject} exceeds the {}-byte JSON frame limit (newline excluded)",
+        FrameContract::MAX_JSON_BYTES
+    )
+}
+
 fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, FrameEncodeError> {
     let mut writer = BoundedJson::new();
     match serde_json::to_writer(&mut writer, value) {
@@ -2626,7 +2633,7 @@ fn response_frame(response: &Response) -> Option<Vec<u8>> {
                 FrameContract::TOO_LARGE_CODE,
                 format!(
                     "{}; the request outcome is unknown, so inspect authoritative state before retrying",
-                    FrameContract::too_large_message("daemon response")
+                    frame_too_large("daemon response")
                 ),
             );
             encode_frame(&fallback).ok()
@@ -2664,7 +2671,7 @@ async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result<
             ) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    FrameContract::too_large_message("client request"),
+                    frame_too_large("client request"),
                 ));
             }
             bytes.extend_from_slice(&available[..delimiter]);
@@ -2682,7 +2689,7 @@ async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result<
         ) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                FrameContract::too_large_message("client request"),
+                frame_too_large("client request"),
             ));
         }
         bytes.extend_from_slice(available);
@@ -2792,6 +2799,44 @@ mod tests {
             .expect("the daemon must close an oversized frame")
             .unwrap();
         assert_eq!(read, 0, "oversized request reached dispatch: {response}");
+        task.await.unwrap();
+        drop(stop);
+    }
+
+    #[tokio::test]
+    async fn oversized_subscription_event_drops_instead_of_emitting_a_partial_frame() {
+        let mut inner = bare_inner();
+        let (stop, stop_rx) = watch::channel(false);
+        Arc::get_mut(&mut inner).unwrap().stop = stop_rx;
+        let events = inner.events.clone();
+        let (server, client) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(handle_conn(inner, server));
+        let mut client = BufReader::new(client);
+
+        let mut hello = String::new();
+        client.read_line(&mut hello).await.unwrap();
+        client
+            .get_mut()
+            .write_all(b"{\"id\":1,\"method\":\"events.subscribe\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        let mut acknowledgement = String::new();
+        client.read_line(&mut acknowledgement).await.unwrap();
+        assert!(acknowledgement.contains("subscribed"));
+
+        events
+            .send(Event {
+                event: "test.oversized".into(),
+                data: json!({"padding": "x".repeat(FrameContract::MAX_JSON_BYTES)}),
+                seq: None,
+            })
+            .unwrap();
+        let mut event = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(1), client.read_line(&mut event))
+            .await
+            .expect("the daemon must close after refusing oversized event egress")
+            .unwrap();
+        assert_eq!(read, 0, "daemon emitted event bytes: {event}");
         task.await.unwrap();
         drop(stop);
     }
