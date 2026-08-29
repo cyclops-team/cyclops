@@ -472,7 +472,7 @@ fn failure_from_client(error: ClientError, method: &str) -> Failure {
     }
     let certainty = error.certainty();
     let why = match error {
-        ClientError::ConnectTimeout(_) => {
+        ClientError::ConnectTimeout(_) | ClientError::HelloTimeout(_) => {
             format!("no connection within {}s", OPEN_TIMEOUT.as_secs())
         }
         ClientError::ReadTimeout(_) => {
@@ -497,6 +497,17 @@ mod tests {
     use std::str::FromStr;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
+
+    #[test]
+    fn hello_timeout_keeps_the_existing_open_phase_sentence() {
+        // Obsolete when action presentation intentionally distinguishes a
+        // connected socket from a completed pre-write daemon handshake.
+        let failure = failure_from_client(ClientError::HelloTimeout(OPEN_TIMEOUT), "ping");
+        assert!(matches!(
+            failure,
+            Failure::NotSent(message) if message == "no connection within 3s"
+        ));
+    }
 
     /// A real greeting. The client rejects anything else, so a fixture
     /// that fakes one is testing a daemon that does not exist.

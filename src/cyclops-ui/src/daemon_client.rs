@@ -557,6 +557,31 @@ fn frame_too_large() -> io::Error {
     io::Error::new(ErrorKind::InvalidData, "official daemon frame is too large")
 }
 
+async fn receive_async_hello<R: AsyncRead + Unpin>(
+    read: R,
+    deadline: tokio::time::Instant,
+    open: Duration,
+) -> Result<(AsyncFrameReader<R>, Hello), ClientError> {
+    let mut frames = AsyncFrameReader::new(read);
+    let frame = tokio::time::timeout_at(deadline, frames.next_frame())
+        .await
+        .map_err(|_| ClientError::HelloTimeout(open))?
+        .map_err(|error| {
+            if error.kind() == ErrorKind::InvalidData {
+                ClientError::NotSent(format!(
+                    "daemon hello exceeds the {}-byte JSON frame limit",
+                    FrameContract::MAX_JSON_BYTES
+                ))
+            } else {
+                ClientError::NotSent(format!("hello: {error}"))
+            }
+        })?
+        .ok_or_else(|| ClientError::NotSent("the connection closed before hello".into()))?;
+    let hello = serde_json::from_slice(&frame)
+        .map_err(|error| ClientError::InvalidHello(error.to_string()))?;
+    Ok((frames, hello))
+}
+
 async fn write_async_request(
     writer: &mut (impl tokio::io::AsyncWrite + Unpin),
     method: &str,
@@ -593,23 +618,7 @@ impl AsyncClient {
                 _ => ClientError::NotSent(error.to_string()),
             })?;
         let (read, writer) = stream.into_split();
-        let mut frames = AsyncFrameReader::new(read);
-        let frame = tokio::time::timeout_at(deadline, frames.next_frame())
-            .await
-            .map_err(|_| ClientError::HelloTimeout(open))?
-            .map_err(|error| {
-                if error.kind() == ErrorKind::InvalidData {
-                    ClientError::NotSent(format!(
-                        "daemon hello exceeds the {}-byte JSON frame limit",
-                        FrameContract::MAX_JSON_BYTES
-                    ))
-                } else {
-                    ClientError::NotSent(format!("hello: {error}"))
-                }
-            })?
-            .ok_or_else(|| ClientError::NotSent("the connection closed before hello".into()))?;
-        let hello = serde_json::from_slice(&frame)
-            .map_err(|error| ClientError::InvalidHello(error.to_string()))?;
+        let (frames, hello) = receive_async_hello(read, deadline, open).await?;
         Ok(Self {
             frames,
             writer,
@@ -951,6 +960,25 @@ mod tests {
         assert!(matches!(
             error,
             ClientError::Unknown(message) if message.contains("simulated socket failure")
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn async_connect_and_hello_consume_one_open_deadline() {
+        let open = Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + open;
+        let (read, _daemon) = tokio::io::duplex(64);
+
+        // Model a connect phase that already consumed most of the one caller
+        // budget, then prove Hello receives only what remains.
+        tokio::time::advance(Duration::from_secs(7)).await;
+        let receive = tokio::spawn(receive_async_hello(read, deadline, open));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+
+        assert!(matches!(
+            receive.await.unwrap(),
+            Err(ClientError::HelloTimeout(waited)) if waited == open
         ));
     }
 

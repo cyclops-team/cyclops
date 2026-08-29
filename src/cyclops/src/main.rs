@@ -2093,7 +2093,12 @@ fn inbox_next_client_failed(cli: &Cli, error: &ClientError) -> i32 {
             1,
         );
     }
-    let (code, message, data) = match error {
+    let (code, message, data) = inbox_next_client_error(error);
+    inbox_next_failed(cli, code, message, data, 1)
+}
+
+fn inbox_next_client_error(error: &ClientError) -> (&str, String, Value) {
+    match error {
         ClientError::NotRunning(_) => ("not_running", copy::client_error(error, None), Value::Null),
         ClientError::ConnectTimeout(waited) => (
             "connect_timeout",
@@ -2123,7 +2128,7 @@ fn inbox_next_client_failed(cli: &Cli, error: &ClientError) -> i32 {
         ClientError::OversizedResponse(message) => (
             cyclops_proto::FrameContract::TOO_LARGE_CODE,
             message.clone(),
-            json!({"known_not_sent": false}),
+            Value::Null,
         ),
         ClientError::InvalidHello(_) => (
             "connection_lost",
@@ -2141,8 +2146,7 @@ fn inbox_next_client_failed(cli: &Cli, error: &ClientError) -> i32 {
             copy::client_error(error, None),
             Value::Null,
         ),
-    };
-    inbox_next_failed(cli, code, message, data, 1)
+    }
 }
 
 enum InboxListOneError {
@@ -3356,6 +3360,18 @@ fn cmd_watch_json(c: &mut Client, cli: &Cli, style: &Style, kinds: &[String]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inbox_next_oversized_response_keeps_the_existing_json_shape() {
+        // Obsolete when inbox-next's documented machine error schema gains a
+        // typed uncertainty field for oversized daemon responses.
+        let message = "daemon response was too large; request outcome is unknown";
+        let error = ClientError::OversizedResponse(message.into());
+        let (code, rendered, data) = inbox_next_client_error(&error);
+        assert_eq!(code, cyclops_proto::FrameContract::TOO_LARGE_CODE);
+        assert_eq!(rendered, message);
+        assert_eq!(data, Value::Null);
+    }
 
     #[test]
     fn body_inputs_are_bounded_before_request_serialization() {

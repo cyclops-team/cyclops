@@ -373,7 +373,7 @@ pub fn client_error(e: &ClientError, asked: Option<&str>) -> String {
     match e {
         ClientError::NotRunning(_) => NOT_RUNNING.into(),
         ClientError::ConnectTimeout(d) => connect_timeout(*d),
-        ClientError::HelloTimeout(d) => broken(&format!("no hello within {}", timeout_words(*d))),
+        ClientError::HelloTimeout(d) => broken(&format!("no answer within {}", timeout_words(*d))),
         ClientError::ReadTimeout(d) => broken(&format!("no answer within {}", timeout_words(*d))),
         ClientError::RequestFrameTooLarge => {
             format!("{}. Nothing was sent.", frame_too_large("request"))
@@ -758,9 +758,22 @@ mod tests {
 
     #[test]
     fn oversized_response_preserves_the_daemons_uncertainty_sentence() {
+        // Obsolete when the daemon no longer substitutes a bounded uncertainty
+        // response for a result that exceeds the official frame contract.
         let message = "daemon response was too large; request outcome is unknown";
         let error = ClientError::OversizedResponse(message.into());
         assert_eq!(client_error(&error, None), message);
+    }
+
+    #[test]
+    fn hello_timeout_keeps_the_existing_read_timeout_sentence() {
+        // Obsolete when CLI presentation intentionally distinguishes the
+        // Hello read from later bounded daemon reads.
+        let waited = Duration::from_secs(5);
+        assert_eq!(
+            client_error(&ClientError::HelloTimeout(waited), None),
+            client_error(&ClientError::ReadTimeout(waited), None)
+        );
     }
 
     #[test]
