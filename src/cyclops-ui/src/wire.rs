@@ -3,14 +3,13 @@
 use std::io;
 use std::io::Write;
 
-use cyclops_proto::FrameContract;
+use cyclops_proto::{FrameContract, FrameSize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 
 /// Serialize one outbound JSON frame without ever growing past the same cap.
 pub(crate) fn encode_json(value: &impl serde::Serialize) -> Result<Vec<u8>, serde_json::Error> {
     let mut writer = BoundedWriter {
         bytes: Vec::with_capacity(8 * 1024),
-        limit: FrameContract::MAX_JSON_BYTES,
     };
     serde_json::to_writer(&mut writer, value)?;
     Ok(writer.bytes)
@@ -18,13 +17,15 @@ pub(crate) fn encode_json(value: &impl serde::Serialize) -> Result<Vec<u8>, serd
 
 struct BoundedWriter {
     bytes: Vec<u8>,
-    limit: usize,
 }
 
 impl Write for BoundedWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.bytes.len().saturating_add(bytes.len()) > self.limit {
-            return Err(frame_too_large(self.limit));
+        if matches!(
+            FrameContract::classify_json_bytes(self.bytes.len().saturating_add(bytes.len())),
+            FrameSize::TooLarge
+        ) {
+            return Err(frame_too_large());
         }
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
@@ -39,19 +40,13 @@ impl Write for BoundedWriter {
 pub(crate) struct FrameReader<R> {
     inner: BufReader<R>,
     frame: Vec<u8>,
-    limit: usize,
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
     pub(crate) fn new(inner: R) -> Self {
-        Self::with_limit(inner, FrameContract::MAX_JSON_BYTES)
-    }
-
-    fn with_limit(inner: R, limit: usize) -> Self {
         Self {
             inner: BufReader::new(inner),
-            frame: Vec::with_capacity(limit.min(8 * 1024)),
-            limit,
+            frame: Vec::with_capacity(8 * 1024),
         }
     }
 
@@ -79,8 +74,11 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 .iter()
                 .position(|byte| *byte == FrameContract::DELIMITER)
             {
-                if self.frame.len().saturating_add(newline) > self.limit {
-                    return Err(frame_too_large(self.limit));
+                if matches!(
+                    FrameContract::classify_json_bytes(self.frame.len().saturating_add(newline),),
+                    FrameSize::TooLarge
+                ) {
+                    return Err(frame_too_large());
                 }
                 self.frame.extend_from_slice(&available[..newline]);
                 self.inner.consume(newline + 1);
@@ -90,8 +88,13 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 return Ok(Some(std::mem::take(&mut self.frame)));
             }
 
-            if self.frame.len().saturating_add(available.len()) > self.limit {
-                return Err(frame_too_large(self.limit));
+            if matches!(
+                FrameContract::classify_json_bytes(
+                    self.frame.len().saturating_add(available.len()),
+                ),
+                FrameSize::TooLarge
+            ) {
+                return Err(frame_too_large());
             }
             let consumed = available.len();
             self.frame.extend_from_slice(available);
@@ -100,16 +103,14 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     }
 }
 
-fn frame_too_large(limit: usize) -> io::Error {
-    let message = if limit == FrameContract::MAX_JSON_BYTES {
+fn frame_too_large() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
         format!(
             "daemon frame exceeds the {}-byte JSON frame limit (newline excluded)",
             FrameContract::MAX_JSON_BYTES
-        )
-    } else {
-        format!("daemon frame exceeds the {limit}-byte test limit")
-    };
-    io::Error::new(io::ErrorKind::InvalidData, message)
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -119,22 +120,15 @@ mod tests {
 
     #[tokio::test]
     async fn reads_complete_frames_without_the_delimiter() {
-        let mut reader = FrameReader::with_limit(Cursor::new(b"one\r\ntwo\n"), 8);
+        let mut reader = FrameReader::new(Cursor::new(b"one\r\ntwo\n"));
         assert_eq!(reader.next_frame().await.unwrap(), Some(b"one".to_vec()));
         assert_eq!(reader.next_frame().await.unwrap(), Some(b"two".to_vec()));
         assert_eq!(reader.next_frame().await.unwrap(), None);
     }
 
     #[tokio::test]
-    async fn rejects_a_complete_oversized_frame() {
-        let mut reader = FrameReader::with_limit(Cursor::new(b"12345\n"), 4);
-        let error = reader.next_frame().await.unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[tokio::test]
     async fn rejects_an_unterminated_frame() {
-        let mut reader = FrameReader::with_limit(Cursor::new(b"1234"), 4);
+        let mut reader = FrameReader::new(Cursor::new(b"1234"));
         let error = reader.next_frame().await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }

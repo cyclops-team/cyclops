@@ -54,13 +54,16 @@ fn connect_with(home: &Path, timeout: Duration) -> Result<BufReader<UnixStream>,
     Ok(reader)
 }
 
-struct RequestNotSent(String);
+enum RequestWriteError {
+    NotSent(String),
+    Unknown(String),
+}
 
 fn write_request(
-    stream: &mut UnixStream,
+    stream: &mut impl Write,
     method: &str,
     params: Value,
-) -> Result<(), RequestNotSent> {
+) -> Result<(), RequestWriteError> {
     let mut writer = BoundedJson::new();
     let request = Request {
         id: json!(1),
@@ -68,7 +71,7 @@ fn write_request(
         params,
     };
     if let Err(error) = serde_json::to_writer(&mut writer, &request) {
-        return Err(RequestNotSent(if writer.oversized {
+        return Err(RequestWriteError::NotSent(if writer.oversized {
             format!(
                 "{}; nothing was sent",
                 crate::copy::frame_too_large(&format!("{method} request"))
@@ -78,9 +81,9 @@ fn write_request(
         }));
     }
     writer.bytes.push(FrameContract::DELIMITER);
-    stream
-        .write_all(&writer.bytes)
-        .map_err(|error| RequestNotSent(format!("cannot write {method} request: {error}")))
+    stream.write_all(&writer.bytes).map_err(|error| {
+        RequestWriteError::Unknown(format!("cannot write {method} request: {error}"))
+    })
 }
 
 struct BoundedJson {
@@ -159,7 +162,9 @@ fn exchange(
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
-    write_request(reader.get_mut(), method, params).map_err(|error| error.0)?;
+    write_request(reader.get_mut(), method, params).map_err(|error| match error {
+        RequestWriteError::NotSent(message) | RequestWriteError::Unknown(message) => message,
+    })?;
 
     // A fresh, unsubscribed connection has exactly one response after its
     // Hello. Anything else is a protocol error; failing immediately keeps a
@@ -360,7 +365,10 @@ fn send_message_request(home: &Path, request: MessageRequest<'_>) -> SendOutcome
         Err(error) => return SendOutcome::NotSent(error),
     };
     if let Err(error) = write_request(reader.get_mut(), "msg.send", params) {
-        return SendOutcome::NotSent(error.0);
+        return match error {
+            RequestWriteError::NotSent(message) => SendOutcome::NotSent(message),
+            RequestWriteError::Unknown(message) => SendOutcome::Unknown(message),
+        };
     }
     let value = match read_value(&mut reader, "msg.send") {
         Ok(value) => value,
@@ -521,6 +529,28 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
 
+    struct PartialWriter {
+        remaining: usize,
+    }
+
+    impl Write for PartialWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "simulated socket failure",
+                ));
+            }
+            let written = self.remaining.min(bytes.len());
+            self.remaining -= written;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn response_lines_stop_before_allocating_past_the_envelope() {
         let mut exact = vec![b'x'; FrameContract::MAX_JSON_BYTES];
@@ -553,7 +583,10 @@ mod tests {
             json!({"padding": "x".repeat(FrameContract::MAX_JSON_BYTES)}),
         )
         .expect_err("the oversized request must be rejected before writing");
-        assert!(error.0.contains("nothing was sent"), "{}", error.0);
+        let RequestWriteError::NotSent(message) = error else {
+            panic!("pre-write refusal was not classified as known-not-sent");
+        };
+        assert!(message.contains("nothing was sent"), "{message}");
 
         daemon.set_nonblocking(true).unwrap();
         let mut byte = [0u8; 1];
@@ -562,6 +595,16 @@ mod tests {
             read,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
         ));
+    }
+
+    #[test]
+    fn a_socket_failure_after_writing_begins_remains_outcome_unknown() {
+        let mut writer = PartialWriter { remaining: 8 };
+        let error = write_request(&mut writer, "ping", json!({}))
+            .expect_err("the simulated partial write must fail");
+        assert!(
+            matches!(error, RequestWriteError::Unknown(message) if message.contains("simulated socket failure"))
+        );
     }
 
     #[test]

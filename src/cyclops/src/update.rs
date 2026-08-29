@@ -2422,11 +2422,14 @@ fn prove_candidate_replay(
         if let Ok(stream) = std::os::unix::net::UnixStream::connect(&socket) {
             let client =
                 crate::client::Client::from_stream(stream, std::time::Duration::from_secs(2))
-                    .map_err(|error| {
-                        format!(
+                    .map_err(|error| match error {
+                        crate::client::ClientError::InvalidHello(cause) => {
+                            format!("decode candidate hello: {cause}")
+                        }
+                        error => format!(
                             "read candidate hello: {}",
                             crate::copy::client_error(&error, None)
-                        )
+                        ),
                     })?;
             break client.hello().clone();
         }

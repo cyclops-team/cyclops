@@ -378,6 +378,7 @@ pub fn client_error(e: &ClientError, asked: Option<&str>) -> String {
             format!("{}. Nothing was sent.", frame_too_large("request"))
         }
         ClientError::DaemonFrameTooLarge => broken(&frame_too_large("daemon frame")),
+        ClientError::InvalidHello(_) => broken("the hello line didn't parse"),
         ClientError::Server {
             code,
             message,

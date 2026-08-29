@@ -2118,6 +2118,11 @@ fn inbox_next_client_failed(cli: &Cli, error: &ClientError) -> i32 {
             copy::client_error(error, None),
             json!({"known_not_sent": false}),
         ),
+        ClientError::InvalidHello(_) => (
+            "connection_lost",
+            copy::client_error(error, None),
+            Value::Null,
+        ),
         ClientError::Server {
             code,
             message,

@@ -32,6 +32,8 @@ pub enum ClientError {
     /// The daemon sent a hello, response, or event outside the official frame
     /// envelope.
     DaemonFrameTooLarge,
+    /// The daemon's opening frame fit the envelope but was not a valid Hello.
+    InvalidHello(String),
     /// The daemon answered a request with a wire error.
     Server {
         code: String,
@@ -114,7 +116,7 @@ impl Client {
             }
         };
         let hello: Hello = serde_json::from_str(&line)
-            .map_err(|_| ClientError::Broken("the hello line didn't parse".into()))?;
+            .map_err(|error| ClientError::InvalidHello(error.to_string()))?;
         Ok(Client {
             reader,
             hello,

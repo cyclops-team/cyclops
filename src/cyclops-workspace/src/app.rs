@@ -2039,7 +2039,10 @@ fn read_bounded_line(
                 .iter()
                 .position(|byte| *byte == cyclops_proto::FrameContract::DELIMITER);
             let take = newline.unwrap_or(available.len());
-            if line.len().saturating_add(take) > cyclops_proto::FrameContract::MAX_JSON_BYTES {
+            if matches!(
+                cyclops_proto::FrameContract::classify_json_bytes(line.len().saturating_add(take),),
+                cyclops_proto::FrameSize::TooLarge
+            ) {
                 return Ok(BoundedLine::TooLong);
             }
             line.extend_from_slice(&available[..take]);
