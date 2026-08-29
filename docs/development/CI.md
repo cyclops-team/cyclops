@@ -1,8 +1,7 @@
-# CI evidence lanes
+# Current CI evidence and baseline
 
-The workflow keeps six stable check names while the beta CI rework changes
-which evidence runs for each change. A required check may later perform a fast
-not-applicable pass, but it does not disappear.
+The workflow exposes six stable check names. This page records the measured
+baseline and the responsibility of the evidence that runs today.
 
 ## Task 1 baseline
 
@@ -31,42 +30,35 @@ runs and are not counted as reruns.
 | Stable check | Baseline duration | Responsibility |
 |---|---:|---|
 | `test (ubuntu-latest)` | 10m 38s | Required pull-request correctness |
-| `test (macos-latest)` | 8m 58s | Required correctness plus platform evidence during Task 1 |
+| `test (macos-latest)` | 8m 58s | Required correctness plus platform evidence |
 | `installer (ubuntu-latest)` | 2m 49s | Conditional integration, currently run for every change |
 | `installer (macos-latest)` | 3m 27s | Conditional integration, currently run for every change |
 | `website` | 18s | Conditional integration, currently run for every change |
 | `tmux-head` | 6m 19s | Scheduled evidence, currently advisory on every change |
 
-No release-evidence job exists yet. Task 3 adds an explicit release entrypoint
-before moving broad evidence out of the ordinary pull-request path.
+No release-evidence job exists in the current workflow.
 
 ## Repeated evidence in the baseline
 
 Each operating-system test job runs the complete Rust evidence, then repeats
 the same non-daemon, daemon, and doctest commands under a relocated scratch
 root. The second execution attempts to prove only that test scratch paths honor
-`CYCLOPS_TEST_TMP`; Task 2 must replace it with focused path evidence before
-removing the duplicate run.
+`CYCLOPS_TEST_TMP`.
 
 The advisory `tmux-head` job builds upstream tmux and repeats nearly the same
-complete Rust gate a third time on Linux. Task 3 moves that compatibility risk
-to scheduled and path-relevant evidence only after the replacement lane works.
+complete Rust gate a third time on Linux.
 
 Installer and website jobs do not duplicate the Rust correctness suite, but
-they run for unrelated changes. Task 3 makes them path-aware without changing
-their stable check names.
+they currently run for unrelated changes.
 
 ## Current lane responsibilities
 
 1. **Required pull-request correctness:** formatting, Clippy, Rust tests,
    documentation paths, and exact-output parity in the two `test` checks.
-2. **Conditional integration:** website and installer checks. They remain
-   unconditional during Task 1 so this PR changes no coverage.
-3. **Scheduled evidence:** tmux HEAD. It remains on every pull request during
-   Task 1 until Task 3 supplies the schedule and manual entrypoint.
-4. **Release evidence:** not yet implemented. Task 3 must provide the full
-   clean-checkout and release-oriented entrypoint before ordinary CI sheds any
-   of that evidence.
+2. **Conditional integration:** website and installer checks. They currently
+   run for every change.
+3. **Scheduled evidence:** tmux HEAD. It currently runs on every pull request.
+4. **Release evidence:** no explicit release lane is implemented.
 
 ## Superseded-run cancellation
 

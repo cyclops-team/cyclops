@@ -18,9 +18,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Responsibility: conditional integration. Task 1 preserves the stable
-  # `website` check and its current always-run behavior; Task 3 will make the
-  # work path-aware while keeping the check present.
+  # Responsibility: conditional integration. The stable `website` check
+  # currently runs for every change.
   website:
     runs-on: ubuntu-latest
     steps:
@@ -110,8 +109,8 @@ jobs:
           cargo test --workspace --doc || status=$?
           exit "$status"
 
-  # Responsibility: conditional integration. Task 1 preserves both stable
-  # `installer (<os>)` checks and their current always-run behavior.
+  # Responsibility: conditional integration. Both stable `installer (<os>)`
+  # checks currently run for every change.
   #
   # The installer is what a stranger runs first, so it gets its own gate:
   # build, place the binaries, edit a shell profile, set the home up, then
@@ -136,9 +135,8 @@ jobs:
           if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y tmux; else brew install tmux; fi
       - run: ./tests/e2e/parity-check.sh --installer-only
 
-  # Responsibility: scheduled evidence. Task 1 leaves this advisory check on
-  # every pull request; Task 3 will route it after a scheduled replacement is
-  # available while keeping the stable `tmux-head` check present.
+  # Responsibility: scheduled evidence. This stable advisory check currently
+  # runs on every pull request.
   #
   # ADR-001 owns the tmux-churn risk by testing the adapter against tmux HEAD.
   # Failures here are early warning, not merge blockers.
