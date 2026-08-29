@@ -2025,6 +2025,10 @@ async fn a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt() 
         })
     });
     rig.tmux.run_ok(&["send-keys", "-t", &pane, "BSpace"]);
+    // tmux accepting the key is not evidence that the composer consumed it.
+    // Wait for the daemon's observable state to cross from human input back to
+    // the clean composer before asking whether the held attempt reopened.
+    wait_pane_state(&mut rig, "idle").await;
     tokio::time::timeout(Duration::from_secs(8), prewrite_rx.recv())
         .await
         .expect("final deletion released the human hold")
