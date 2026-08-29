@@ -378,17 +378,21 @@ unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]
 # the structural proof.
 # MEASURED 2026-08-22 at 60, 80, 100, and 125 columns: a long status
 # row keeps the model and effort fields, then ends one later field with ….
+# MEASURED 2026-08-29 on Claude Code 2.1.251 at 60 columns: the `/rc`
+# hyperlink may move onto its own painted row after the mode hint.
 composer_trailer_regex = [
   '^─+$',
   '^\s{0,4}(?:\S[^·]*(?: · [^·]+){2,} · \d+K window(?: · \d+K used)?(?:\s+/rc)?|(?:Opus|Sonnet|Haiku) \d+(?:\.\d+)?(?: \([^·]*\))? · (?:xhigh|high|medium|low)(?: · [^·]+)* · [^·]*…)\s*$',
   '^\s{0,4}paste again to expand\s*$',
   '^\s{0,4}(?:⏸|⏵⏵) [^·]*\b(?:on|off)\b(?: \([^)]*\))?(?: · .+)?\s*$',
+  '^\s*/rc\s*$',
 ]
 composer_trailer_regex_esc = [
   '^\x1b\[38;5;\d+m─',
   '^\x1b\[39m\s+\x1b\[38;5;\d+m\S',
   '^\s*\x1b\[38;5;\d+mpaste again to expand',
   '^(?:\x1b\[[0-9;:]*m)*\s+\x1b\[38;5;\d+m(?:⏸|⏵⏵)',
+  '\x1b\[38;5;\d+m.*\/rc',
 ]
 # Claude honors NO_COLOR and then paints no SGR at all. The box rule is a
 # structural boundary outside Claude's measured prompt and continuation rows,

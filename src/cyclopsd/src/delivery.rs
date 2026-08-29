@@ -14878,6 +14878,77 @@ composer_trailer_required_prefix = 1
     }
 
     #[test]
+    fn shipped_composers_verify_the_observed_sixty_column_notification_wraps() {
+        let shipped = |id: &str| {
+            let body = match id {
+                "claude" => include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../resources/manifests/claude.toml"
+                )),
+                "agy" => include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../resources/manifests/agy.toml"
+                )),
+                _ => unreachable!("unknown shipped manifest"),
+            };
+            Manifest::parse(body, std::path::Path::new(id)).expect("shipped manifest parses")
+        };
+        let attempt =
+            NotificationAttemptId::parse("att-485beb62-3287-47b9-9a5d-5f7303e91e54").unwrap();
+        let expected = cyclops_proto::render_doorbell_v4(
+            "chatty",
+            "Codex is checking that Cyclops messaging works. Please acknowledge receipt when you see this.",
+            attempt,
+        );
+        let parts = [
+            "[cyclops from chatty] Codex is checking that Cyclops",
+            "messaging works. Please acknowledge receipt when you see",
+            "this. | cyclops inbox claim",
+            "m-att_SFvrYjKHR7maXV9zA-keVA",
+        ];
+        assert_eq!(parts.join(" "), expected);
+        let padded = |part: &str, width: usize| format!("{part:<width$}");
+        let captures = [
+            (
+                shipped("claude"),
+                format!(
+                    "\x1b[39m❯\u{a0}{}\n  {}\n  {}\n  {}\n\x1b[38;5;244m{}\n\x1b[39m  \x1b[38;5;174mSonnet 5 · low · ~ · 5h: 100% · 7d: 1% · 1000K window\n  \x1b[38;5;174m⏵⏵ bypass permissions on (shift+tab to cycle)\n                                                       \x1b[38;5;75m\x1b]8;id=test;https://example.invalid/session\x1b\\/rc\x1b]8;;\x1b\\",
+                    padded(parts[0], 58),
+                    padded(parts[1], 58),
+                    padded(parts[2], 58),
+                    padded(parts[3], 58),
+                    "─".repeat(60),
+                ),
+            ),
+            (
+                shipped("agy"),
+                format!(
+                    "\x1b[94m>\x1b[39m {}\n{}\n{}\n{}\n\x1b[90m{}\n\x1b[38;2;174;198;207mGemini 3.7 Flash · High · ~ · Full · Ctx:",
+                    padded(parts[0], 58),
+                    padded(parts[1], 60),
+                    padded(parts[2], 60),
+                    padded(parts[3], 60),
+                    "─".repeat(60),
+                ),
+            ),
+        ];
+
+        for (manifest, capture) in captures {
+            assert_eq!(
+                exact_staging_proof(
+                    &manifest,
+                    &capture,
+                    StagingTarget::ExactRow(&expected),
+                    &expected,
+                ),
+                Some((true, expected.clone())),
+                "{} must verify the observed 60-column wrap",
+                manifest.agent.id,
+            );
+        }
+    }
+
+    #[test]
     fn collapsed_chip_is_representation_evidence_but_never_exact_ownership() {
         let m = claude();
         let staged = include_str!(concat!(
