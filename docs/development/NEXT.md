@@ -14,16 +14,19 @@ preserved behavior, stop conditions, and rollback requirements.
 ## Current milestone
 
 The documentation authority repair runs on
-**docs/messaging-refactor-authority** and changes no production code. It approves
-and repairs the charter, establishes [HANDOFF.md](HANDOFF.md) as the front door,
-restores the architecture review method, repairs documentation status and
-links, and synchronizes the installed Cyclops skill's emergency doctrine.
+**docs/messaging-refactor-authority**. It approves and repairs the charter,
+establishes [HANDOFF.md](HANDOFF.md) as the front door, restores the architecture
+review method, repairs documentation status and links, makes the shipped
+Cyclops skill the emergency-doctrine source of truth, and synchronizes the
+installed copy. Its only Rust source change is the current shipped-skill hash
+required by the existing seeding contract.
 
 Exit evidence:
 
 - the documentation checker reports zero broken references;
 - the documentation checker reports zero unindexed retained pages;
-- the diff contains no production-code change; and
+- the diff contains no messaging runtime, command, journal, UI, workflow,
+  installer, or website behavior change; and
 - the pull request targets **beta/messaging-rework** and is not merged without
   operator approval.
 

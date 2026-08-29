@@ -24,12 +24,14 @@ understand and change. It resolves the immediate packaging conflict, records
 the behavior that must survive, classifies the review proposals, separates CI
 work from messaging work, and specifies one later production tracer bullet.
 
-The first approved phase changes documentation only. It does not change
-production code, tests, the public command surface, durable data, or the running
-system. It approves and repairs this charter, rewrites [NEXT.md](NEXT.md),
-updates [HANDOFF.md](HANDOFF.md), repairs documentation authority and links,
-and synchronizes the installed Cyclops skill's emergency doctrine. It does not
-create `cyclops-delivery-core`, a runner, a host adapter, or an MCP adapter.
+The first approved phase changes documentation plus the shipped Cyclops skill
+and its required current-body seeding hash. It does not change messaging
+runtime behavior, tests, the public command surface, durable data, or the
+running system. It approves and repairs this charter, rewrites
+[NEXT.md](NEXT.md), updates [HANDOFF.md](HANDOFF.md), repairs documentation
+authority and links, makes the shipped skill the emergency-doctrine source of
+truth, and synchronizes the installed copy. It does not create
+`cyclops-delivery-core`, a runner, a host adapter, or an MCP adapter.
 
 The direct user goal is a messaging system that works without either UI, stays
 understandable to pane-only users, keeps activation optional, reports only facts
@@ -427,7 +429,8 @@ branch. Routine milestone commits do not go directly to that branch.
 
 1. **docs/messaging-refactor-authority** approves and repairs this charter,
    documentation authority, links, status, `NEXT.md`, `HANDOFF.md`, terminology,
-   and the installed skill. It changes no production code.
+   and the shipped and installed skill copies. Its only Rust source change is
+   the current shipped-skill hash required by the existing seeding contract.
 2. **fix/beta-frame-contract** implements only Milestone 1.
 3. **refactor/beta-daemon-client** consolidates official transport semantics only
    after Milestone 1 is accepted.
@@ -690,7 +693,7 @@ Explicit non-goals:
 
 At approval, the documentation checker reported 11 broken references and four
 unindexed pages. Authority and navigation must be coherent before production
-implementation. The documentation-only prerequisite is:
+implementation. The authority prerequisite is:
 
 1. record the approval decisions in this charter;
 2. fix heading, fact, and status inconsistencies;
@@ -700,11 +703,11 @@ implementation. The documentation-only prerequisite is:
 6. label supporting, proposed, historical, and superseded documents clearly;
 7. move unrelated Research Synthesis and Research Library material out of this
    repository;
-8. correct terminal-safety wording and publish one raw-tmux emergency doctrine,
-   then synchronize the separately installed Cyclops skill;
+8. correct terminal-safety wording, publish one raw-tmux emergency doctrine in
+   the shipped Cyclops skill, and synchronize the separately installed copy;
 9. run the documentation checker until it reports zero broken references and
    zero unindexed retained pages; and
-10. review and commit the documentation-only authority change.
+10. review and commit the authority and shipped-skill change.
 
 The architecture reviews remain supporting design records because they explain
 the reasoning behind this charter. Historical status metadata is preferred to
