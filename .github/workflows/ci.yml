@@ -143,6 +143,16 @@ jobs:
         run: |
           status=0
           cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast || status=$?
-          cargo test -p cyclopsd --all-targets --no-fail-fast || status=$?
+          # This regression drives sixteen real terminal keys through a 300ms
+          # output-settlement boundary. The upstream debug build is much
+          # slower than a released tmux, and running seven other private tmux
+          # rigs beside it can starve the final causal edge past the test's
+          # bounded wait. Keep the behavior covered against HEAD, but give its
+          # exact private rig the process budget it is meant to measure.
+          cargo test -p cyclopsd --all-targets --no-fail-fast -- \
+            --skip a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt || status=$?
+          cargo test -p cyclopsd --test messaging_coordinator \
+            a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt -- \
+            --exact || status=$?
           cargo test --workspace --doc || status=$?
           exit "$status"
