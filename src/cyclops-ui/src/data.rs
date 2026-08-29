@@ -949,7 +949,7 @@ fn next_ledger_frame(reader: &mut impl std::io::BufRead) -> std::io::Result<Opti
             };
         }
         if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
-            if frame.len().saturating_add(newline) > crate::wire::MAX_FRAME_BYTES {
+            if frame.len().saturating_add(newline) > cyclops_proto::FrameContract::MAX_JSON_BYTES {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "ledger frame exceeds the byte limit",
@@ -962,7 +962,9 @@ fn next_ledger_frame(reader: &mut impl std::io::BufRead) -> std::io::Result<Opti
             }
             return Ok(Some(frame));
         }
-        if frame.len().saturating_add(available.len()) > crate::wire::MAX_FRAME_BYTES {
+        if frame.len().saturating_add(available.len())
+            > cyclops_proto::FrameContract::MAX_JSON_BYTES
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "ledger frame exceeds the byte limit",

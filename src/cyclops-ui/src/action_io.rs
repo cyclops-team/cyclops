@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use cyclops_proto::{MessageId, NotificationAttemptId};
 use serde_json::{json, Value};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 use crate::detail::{Check, Loaded, ThreadEntry};
@@ -503,21 +503,12 @@ async fn open(sock: &Path) -> Result<Connection, Failure> {
 
 /// Write one request and read its answer.
 ///
-/// The request is written by a single write_all of one line ending in a
-/// newline. That matters for how its failure is read: the daemon parses
-/// per line, so a write that errors has either delivered a whole line or
-/// an unterminated fragment the daemon cannot act on. Neither case is a
-/// half-executed request, which is why a write error is reported as
-/// not-sent. Everything after the write is uncertain.
+/// Encoding failure is known-not-sent. Once the socket write begins, any
+/// transport failure is uncertain because the peer may have accepted the
+/// complete frame before the local error became visible.
 async fn ask(connection: Connection, method: &str, params: Value) -> Result<Value, Failure> {
     let (mut frames, mut w) = connection;
-    let request = json!({ "id": 1, "method": method, "params": params });
-    let mut request =
-        encode_json(&request).map_err(|e| Failure::NotSent(format!("encode request: {e}")))?;
-    request.push(b'\n');
-    w.write_all(&request)
-        .await
-        .map_err(|e| Failure::NotSent(format!("send: {e}")))?;
+    write_request(&mut w, method, params).await?;
 
     let frame = frames
         .next_frame()
@@ -532,6 +523,9 @@ async fn ask(connection: Connection, method: &str, params: Value) -> Result<Valu
         )));
     }
     if let Some(error) = response.error {
+        if error.code == cyclops_proto::FrameContract::TOO_LARGE_CODE {
+            return Err(Failure::Uncertain(error.message));
+        }
         return Err(Failure::Refused {
             code: error.code,
             message: error.message,
@@ -542,12 +536,70 @@ async fn ask(connection: Connection, method: &str, params: Value) -> Result<Valu
         .ok_or_else(|| Failure::Uncertain(format!("{method} returned no result")))
 }
 
+async fn write_request(
+    writer: &mut (impl AsyncWrite + Unpin),
+    method: &str,
+    params: Value,
+) -> Result<(), Failure> {
+    let request = json!({ "id": 1, "method": method, "params": params });
+    let mut request =
+        encode_json(&request).map_err(|e| Failure::NotSent(format!("encode request: {e}")))?;
+    request.push(b'\n');
+    writer
+        .write_all(&request)
+        .await
+        .map_err(|e| Failure::Uncertain(format!("send: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
     use std::str::FromStr;
+    use std::task::{Context, Poll};
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::UnixListener;
+
+    struct PartialWriter {
+        remaining: usize,
+    }
+
+    impl AsyncWrite for PartialWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.remaining == 0 {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "simulated socket failure",
+                )));
+            }
+            let written = self.remaining.min(bytes.len());
+            self.remaining -= written;
+            Poll::Ready(Ok(written))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_partial_action_write_remains_outcome_uncertain() {
+        let mut writer = PartialWriter { remaining: 8 };
+        let error = write_request(&mut writer, "ping", json!({}))
+            .await
+            .expect_err("the simulated partial write must fail");
+        assert!(
+            matches!(error, Failure::Uncertain(message) if message.contains("simulated socket failure"))
+        );
+    }
 
     /// A real greeting. The client rejects anything else, so a fixture
     /// that fakes one is testing a daemon that does not exist.
@@ -590,6 +642,50 @@ mod tests {
 
         let outcome = perform(&sock, request).await;
         (server.await.unwrap(), outcome)
+    }
+
+    #[tokio::test]
+    async fn a_bounded_oversized_response_error_remains_outcome_uncertain() {
+        let home = cyclops_proto::scratch::scratch_dir("ui-action-io-frame-too-large");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let sock = home.join(cyclops_proto::SOCK_NAME);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            write.write_all(hello_line().as_bytes()).await.unwrap();
+            let mut lines = BufReader::new(read).lines();
+            let asked: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let answer = json!({
+                "id": asked["id"],
+                "error": {
+                    "code": cyclops_proto::FrameContract::TOO_LARGE_CODE,
+                    "message": "daemon response was too large; request outcome is unknown"
+                }
+            });
+            write
+                .write_all(format!("{answer}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let outcome = perform(
+            &sock,
+            ActionRequest::AttentionComplete {
+                attempt_id: NotificationAttemptId::parse(
+                    "att-00000000-0000-4000-8000-000000000019",
+                )
+                .unwrap(),
+            },
+        )
+        .await;
+        server.await.unwrap();
+        match outcome {
+            ActionOutcome::Uncertain(why) => assert!(why.contains("outcome is unknown"), "{why}"),
+            other => panic!("oversized daemon response was misclassified: {other:?}"),
+        }
     }
 
     #[tokio::test]

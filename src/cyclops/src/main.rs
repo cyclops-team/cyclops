@@ -57,8 +57,7 @@ mod themeseed;
 mod update;
 mod workspace;
 
-use std::io::Write;
-use std::io::{BufRead, IsTerminal};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -2109,6 +2108,21 @@ fn inbox_next_client_failed(cli: &Cli, error: &ClientError) -> i32 {
             copy::client_error(error, None),
             json!({"waited_ms": waited.as_millis() as u64}),
         ),
+        ClientError::RequestFrameTooLarge => (
+            cyclops_proto::FrameContract::TOO_LARGE_CODE,
+            copy::client_error(error, None),
+            json!({"known_not_sent": true}),
+        ),
+        ClientError::DaemonFrameTooLarge => (
+            cyclops_proto::FrameContract::TOO_LARGE_CODE,
+            copy::client_error(error, None),
+            json!({"known_not_sent": false}),
+        ),
+        ClientError::InvalidHello(_) => (
+            "connection_lost",
+            copy::client_error(error, None),
+            Value::Null,
+        ),
         ClientError::Server {
             code,
             message,
@@ -3208,12 +3222,26 @@ fn cmd_thread(c: &mut Client, cli: &Cli, style: &Style, id: &str) -> i32 {
 /// the ledger records what was sent, not a cleaned-up version.
 fn read_body_file(path: &str) -> Result<String, String> {
     if path == "-" {
-        let mut s = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut s).map_err(|e| e.to_string())?;
-        Ok(s)
+        read_bounded_body(std::io::stdin())
     } else {
-        std::fs::read_to_string(path).map_err(|e| e.to_string())
+        let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+        read_bounded_body(file)
     }
+}
+
+fn read_bounded_body(reader: impl std::io::Read) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    reader
+        .take((cyclops_proto::FrameContract::MAX_JSON_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > cyclops_proto::FrameContract::MAX_JSON_BYTES {
+        return Err(format!(
+            "{}; nothing was sent",
+            copy::frame_too_large("message body")
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| "message body is not UTF-8".to_string())
 }
 
 struct MessageAcceptance {
@@ -3327,6 +3355,22 @@ fn cmd_watch_json(c: &mut Client, cli: &Cli, style: &Style, kinds: &[String]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_inputs_are_bounded_before_request_serialization() {
+        let exact = vec![b'x'; cyclops_proto::FrameContract::MAX_JSON_BYTES];
+        assert_eq!(
+            read_bounded_body(std::io::Cursor::new(exact))
+                .expect("the body boundary is readable")
+                .len(),
+            cyclops_proto::FrameContract::MAX_JSON_BYTES
+        );
+
+        let oversized = vec![b'x'; cyclops_proto::FrameContract::MAX_JSON_BYTES + 1];
+        let error = read_bounded_body(std::io::Cursor::new(oversized))
+            .expect_err("an oversized body must stop before request serialization");
+        assert!(error.contains("nothing was sent"), "{error}");
+    }
 
     #[test]
     fn durations_parse_human_forms() {

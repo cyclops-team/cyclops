@@ -10,14 +10,13 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
-use cyclops_proto::{Hello, PaneStatus, Request, Response, StatusParams, StatusResult, SOCK_NAME};
+use cyclops_proto::{
+    FrameContract, FrameSize, Hello, PaneStatus, Request, Response, StatusParams, StatusResult,
+    SOCK_NAME,
+};
 use serde_json::{json, Value};
 
 const IO_TIMEOUT: Duration = Duration::from_millis(250);
-/// Largest hello or response retained from the daemon. Status and action
-/// payloads share this envelope so a count-bounded app queue cannot receive
-/// one unbounded item.
-pub(crate) const DAEMON_LINE_MAX_BYTES: usize = 1 << 20;
 
 /// Deadline for a send, which is a different kind of request from every
 /// other one here.
@@ -55,17 +54,71 @@ fn connect_with(home: &Path, timeout: Duration) -> Result<BufReader<UnixStream>,
     Ok(reader)
 }
 
-fn write_request(stream: &mut UnixStream, method: &str, params: Value) -> Result<(), String> {
-    let mut line = serde_json::to_vec(&Request {
+enum RequestWriteError {
+    NotSent(String),
+    Unknown(String),
+}
+
+fn write_request(
+    stream: &mut impl Write,
+    method: &str,
+    params: Value,
+) -> Result<(), RequestWriteError> {
+    let mut writer = BoundedJson::new();
+    let request = Request {
         id: json!(1),
         method: method.to_string(),
         params,
+    };
+    if let Err(error) = serde_json::to_writer(&mut writer, &request) {
+        return Err(RequestWriteError::NotSent(if writer.oversized {
+            format!(
+                "{}; nothing was sent",
+                crate::copy::frame_too_large(&format!("{method} request"))
+            )
+        } else {
+            format!("cannot encode {method} request: {error}")
+        }));
+    }
+    writer.bytes.push(FrameContract::DELIMITER);
+    stream.write_all(&writer.bytes).map_err(|error| {
+        RequestWriteError::Unknown(format!("cannot write {method} request: {error}"))
     })
-    .map_err(|error| format!("cannot encode {method} request: {error}"))?;
-    line.push(b'\n');
-    stream
-        .write_all(&line)
-        .map_err(|error| format!("cannot write {method} request: {error}"))
+}
+
+struct BoundedJson {
+    bytes: Vec<u8>,
+    oversized: bool,
+}
+
+impl BoundedJson {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            oversized: false,
+        }
+    }
+}
+
+impl Write for BoundedJson {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if matches!(
+            FrameContract::classify_json_bytes(self.bytes.len().saturating_add(bytes.len())),
+            FrameSize::TooLarge
+        ) {
+            self.oversized = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "official daemon frame is too large",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// One request on a fresh connection. Requests are infrequent user actions
@@ -109,7 +162,9 @@ fn exchange(
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
-    write_request(reader.get_mut(), method, params)?;
+    write_request(reader.get_mut(), method, params).map_err(|error| match error {
+        RequestWriteError::NotSent(message) | RequestWriteError::Unknown(message) => message,
+    })?;
 
     // A fresh, unsubscribed connection has exactly one response after its
     // Hello. Anything else is a protocol error; failing immediately keeps a
@@ -147,17 +202,22 @@ fn read_bounded_line(reader: &mut impl BufRead, context: &str) -> Result<Vec<u8>
                 if line.is_empty() {
                     return Err(format!("cyclopsd closed during {context}"));
                 }
-                return Ok(line);
-            }
-            let newline = available.iter().position(|byte| *byte == b'\n');
-            let take = newline.map_or(available.len(), |index| index + 1);
-            if line.len().saturating_add(take) > DAEMON_LINE_MAX_BYTES {
                 return Err(format!(
-                    "cyclopsd {context} exceeded {DAEMON_LINE_MAX_BYTES} bytes"
+                    "cyclopsd closed during an unterminated {context} frame"
                 ));
             }
+            let newline = available
+                .iter()
+                .position(|byte| *byte == FrameContract::DELIMITER);
+            let take = newline.unwrap_or(available.len());
+            if matches!(
+                FrameContract::classify_json_bytes(line.len().saturating_add(take)),
+                FrameSize::TooLarge
+            ) {
+                return Err(crate::copy::frame_too_large(&format!("cyclopsd {context}")));
+            }
             line.extend_from_slice(&available[..take]);
-            (take, newline.is_some())
+            (take + usize::from(newline.is_some()), newline.is_some())
         };
         reader.consume(take);
         if complete {
@@ -305,7 +365,10 @@ fn send_message_request(home: &Path, request: MessageRequest<'_>) -> SendOutcome
         Err(error) => return SendOutcome::NotSent(error),
     };
     if let Err(error) = write_request(reader.get_mut(), "msg.send", params) {
-        return SendOutcome::Unknown(error);
+        return match error {
+            RequestWriteError::NotSent(message) => SendOutcome::NotSent(message),
+            RequestWriteError::Unknown(message) => SendOutcome::Unknown(message),
+        };
     }
     let value = match read_value(&mut reader, "msg.send") {
         Ok(value) => value,
@@ -325,6 +388,9 @@ fn send_message_request(home: &Path, request: MessageRequest<'_>) -> SendOutcome
         );
     }
     if let Some(error) = response.error {
+        if error.code == FrameContract::TOO_LARGE_CODE {
+            return SendOutcome::Unknown(error.message);
+        }
         return SendOutcome::Rejected(error.into());
     }
     let Some(value) = response.result else {
@@ -463,14 +529,120 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
 
+    struct PartialWriter {
+        remaining: usize,
+    }
+
+    impl Write for PartialWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "simulated socket failure",
+                ));
+            }
+            let written = self.remaining.min(bytes.len());
+            self.remaining -= written;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn response_lines_stop_before_allocating_past_the_envelope() {
-        let oversized = vec![b'x'; DAEMON_LINE_MAX_BYTES + 1];
+        let mut exact = vec![b'x'; FrameContract::MAX_JSON_BYTES];
+        exact.push(FrameContract::DELIMITER);
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(exact));
+        assert_eq!(
+            read_bounded_line(&mut reader, "test response")
+                .expect("the exact boundary is accepted")
+                .len(),
+            FrameContract::MAX_JSON_BYTES
+        );
+
+        let mut oversized = vec![b'x'; FrameContract::MAX_JSON_BYTES + 1];
+        oversized.push(FrameContract::DELIMITER);
         let mut reader = std::io::BufReader::new(std::io::Cursor::new(oversized));
         let error = read_bounded_line(&mut reader, "test response")
             .expect_err("an oversized response must be refused");
-        assert!(error.contains("exceeded"), "{error}");
-        assert!(reader.buffer().len() <= DAEMON_LINE_MAX_BYTES);
+        assert!(error.contains("exceeds"), "{error}");
+        assert!(reader.buffer().len() <= FrameContract::MAX_JSON_BYTES);
+    }
+
+    #[test]
+    fn oversized_workspace_requests_are_known_not_sent() {
+        use std::io::Read as _;
+
+        let (mut client, mut daemon) = UnixStream::pair().unwrap();
+        let error = write_request(
+            &mut client,
+            "ping",
+            json!({"padding": "x".repeat(FrameContract::MAX_JSON_BYTES)}),
+        )
+        .expect_err("the oversized request must be rejected before writing");
+        let RequestWriteError::NotSent(message) = error else {
+            panic!("pre-write refusal was not classified as known-not-sent");
+        };
+        assert!(message.contains("nothing was sent"), "{message}");
+
+        daemon.set_nonblocking(true).unwrap();
+        let mut byte = [0u8; 1];
+        let read = daemon.read(&mut byte);
+        assert!(matches!(
+            read,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn a_socket_failure_after_writing_begins_remains_outcome_unknown() {
+        let mut writer = PartialWriter { remaining: 8 };
+        let error = write_request(&mut writer, "ping", json!({}))
+            .expect_err("the simulated partial write must fail");
+        assert!(
+            matches!(error, RequestWriteError::Unknown(message) if message.contains("simulated socket failure"))
+        );
+    }
+
+    #[test]
+    fn an_oversized_message_is_not_sent_by_the_workspace() {
+        use std::io::Read as _;
+
+        let home = cyclops_proto::scratch::scratch_dir("workspace-send-frame-too-large");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("scratch home");
+        let listener = UnixListener::bind(home.join(SOCK_NAME)).expect("listen");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .write_all(b"{\"cyclops\":\"0.1.0\",\"proto\":1,\"boot_id\":\"b\"}\n")
+                .expect("hello");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let mut byte = [0u8; 1];
+            match stream.read(&mut byte) {
+                Ok(0) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                other => panic!("oversized request wrote socket bytes: {other:?}"),
+            }
+        });
+        let body = "x".repeat(FrameContract::MAX_JSON_BYTES);
+
+        let outcome = send_message(&home, "reviewer", "large", &body, "workspace-large-key");
+        match outcome {
+            SendOutcome::NotSent(why) => assert!(why.contains("nothing was sent"), "{why}"),
+            other => panic!("oversized request was misclassified: {other:?}"),
+        }
+        server.join().expect("server");
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
@@ -595,6 +767,44 @@ mod tests {
             outcome,
             SendOutcome::Rejected(DaemonRefusal::new("unknown_recipient", "no such recipient"))
         );
+        server.join().expect("server");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_frame_too_large_daemon_response_is_outcome_unknown() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-send-response-too-large");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("scratch home");
+        let listener = UnixListener::bind(home.join(SOCK_NAME)).expect("listen");
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut reader = BufReader::new(stream);
+            reader
+                .get_mut()
+                .write_all(b"{\"cyclops\":\"0.1.0\",\"proto\":1,\"boot_id\":\"b\"}\n")
+                .expect("hello");
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("request");
+            reader
+                .get_mut()
+                .write_all(
+                    b"{\"id\":1,\"error\":{\"code\":\"frame_too_large\",\"message\":\"daemon response was too large; request outcome is unknown\"}}\n",
+                )
+                .expect("response");
+        });
+
+        let outcome = send_message(
+            &home,
+            "reviewer",
+            "hello",
+            "hello",
+            "workspace-uncertain-key",
+        );
+        match outcome {
+            SendOutcome::Unknown(why) => assert!(why.contains("outcome is unknown"), "{why}"),
+            other => panic!("oversized response was misclassified: {other:?}"),
+        }
         server.join().expect("server");
         let _ = std::fs::remove_dir_all(home);
     }

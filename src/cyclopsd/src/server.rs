@@ -17,19 +17,20 @@ use cyclops_proto::TmuxPaneId;
 use cyclops_proto::{
     AdminNotifyParams, AgentWaitParams, AlarmClearParams, AlarmClearResult, AlarmPreviewParams,
     AlarmPreviewResult, AlarmSummary, AttentionResolveParams, AttentionShowParams,
-    ClaimDisposition, DaemonShutdownParams, DaemonShutdownResult, DeliveryState, Event, Hello,
-    InboxClaimParams, InboxClaimResult, InboxListParams, InboxListResult, InboxSummaryEntry,
-    MessagesFollowParams, MessagesSnapshotParams, MsgSendParams, NotificationAttemptId,
-    NotificationAttentionCause, NotificationRecord, NotificationResolution,
-    NotificationWithdrawParams, PaneReadParams, PaneReadResult, PaneReadSource, PingResult,
-    ProcessInstanceId, QuiesceParams, RecipientKey, ReplyParams, Request, RequeueParams,
-    RequeueResult, Response, SessionStatus, StateReportParams, StatusMailboxRoute, StatusParams,
-    StatusResult, SubscribeParams, WireError, PROTOCOL_VERSION,
+    ClaimDisposition, DaemonShutdownParams, DaemonShutdownResult, DeliveryState, Event,
+    FrameContract, FrameSize, Hello, InboxClaimParams, InboxClaimResult, InboxListParams,
+    InboxListResult, InboxSummaryEntry, MessagesFollowParams, MessagesSnapshotParams,
+    MsgSendParams, NotificationAttemptId, NotificationAttentionCause, NotificationRecord,
+    NotificationResolution, NotificationWithdrawParams, PaneReadParams, PaneReadResult,
+    PaneReadSource, PingResult, ProcessInstanceId, QuiesceParams, RecipientKey, ReplyParams,
+    Request, RequeueParams, RequeueResult, Response, SessionStatus, StateReportParams,
+    StatusMailboxRoute, StatusParams, StatusResult, SubscribeParams, WireError, PROTOCOL_VERSION,
 };
 use cyclops_state::{BoundSocketCleanup, StateRoot};
 use cyclops_tmux::SessionWatcher;
+use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, watch};
@@ -235,11 +236,14 @@ pub(crate) async fn handle_conn(inner: Arc<Inner>, stream: UnixStream) {
         proto: PROTOCOL_VERSION,
         boot_id: inner.boot_id.clone(),
     };
-    let hello_line = serde_json::to_string(&hello).expect("hello serializes");
-    if !write_line(&mut w, &hello_line).await {
+    let Ok(hello_frame) = encode_frame(&hello) else {
+        warn!("daemon hello exceeds the official frame contract");
+        return;
+    };
+    if !write_frame(&mut w, &hello_frame).await {
         return;
     }
-    let mut lines = BufReader::new(read_half).lines();
+    let mut reader = BufReader::new(read_half);
     let mut sub: Option<(broadcast::Receiver<Event>, Vec<String>)> = None;
     let mut stop = inner.stop.clone();
 
@@ -250,9 +254,9 @@ pub(crate) async fn handle_conn(inner: Arc<Inner>, stream: UnixStream) {
                 match &mut sub {
                     Some((rx, _)) => tokio::select! {
                         ev = rx.recv() => Pumped::Ev(ev),
-                        line = lines.next_line() => Pumped::Line(line),
+                        line = read_frame(&mut reader) => Pumped::Line(line),
                     },
-                    None => Pumped::Line(lines.next_line().await),
+                    None => Pumped::Line(read_frame(&mut reader).await),
                 }
             } => pumped,
         };
@@ -260,10 +264,18 @@ pub(crate) async fn handle_conn(inner: Arc<Inner>, stream: UnixStream) {
             Pumped::Ev(Ok(ev)) => {
                 let kinds = &sub.as_ref().expect("subscribed").1;
                 if kind_matches(kinds, &ev.event) {
-                    let Ok(line) = serde_json::to_string(&ev) else {
-                        continue;
+                    let frame = match encode_frame(&ev) {
+                        Ok(frame) => frame,
+                        Err(FrameEncodeError::TooLarge) => {
+                            warn!("event exceeds the official frame contract; dropping connection");
+                            return;
+                        }
+                        Err(FrameEncodeError::Serialize(error)) => {
+                            warn!(error = %error, "event serialization failed; dropping connection");
+                            return;
+                        }
                     };
-                    if !write_line(&mut w, &line).await {
+                    if !write_frame(&mut w, &frame).await {
                         return;
                     }
                 }
@@ -284,7 +296,11 @@ pub(crate) async fn handle_conn(inner: Arc<Inner>, stream: UnixStream) {
                 LineOutcome::Subscribed(kinds, rx) => sub = Some((rx, kinds)),
             },
             // EOF or read error: the client is gone.
-            Pumped::Line(_) => return,
+            Pumped::Line(Err(error)) => {
+                debug!(error = %error, "client frame rejected; dropping connection");
+                return;
+            }
+            Pumped::Line(Ok(None)) => return,
         }
     }
 }
@@ -304,8 +320,10 @@ async fn handle_line(
         Err(resp) => {
             // Malformed JSON answers with bad_request and a null id; the
             // connection stays open.
-            let text = serde_json::to_string(&resp).expect("response serializes");
-            return if write_line(w, &text).await {
+            let Some(frame) = response_frame(&resp) else {
+                return LineOutcome::Drop;
+            };
+            return if write_frame(w, &frame).await {
                 LineOutcome::Continue
             } else {
                 LineOutcome::Drop
@@ -322,16 +340,18 @@ async fn handle_line(
             .and_then(|result| result.get("stopping"))
             .and_then(Value::as_bool)
             == Some(true);
-    let text = serde_json::to_string(&resp).expect("response serializes");
+    let Some(frame) = response_frame(&resp) else {
+        return LineOutcome::Drop;
+    };
     if let Some(params) = subscribe {
         // Subscribe before writing the ack so no event can fall between.
         let rx = inner.events.subscribe();
-        if !write_line(w, &text).await {
+        if !write_frame(w, &frame).await {
             return LineOutcome::Drop;
         }
         return LineOutcome::Subscribed(params.kinds, rx);
     }
-    if write_line(w, &text).await {
+    if write_frame(w, &frame).await {
         if shutdown_after_write {
             inner.shutdown_request.send_replace(true);
             return LineOutcome::Drop;
@@ -2545,12 +2565,152 @@ fn known_panes(inner: &Inner) -> Vec<String> {
         .collect()
 }
 
-/// Write one line with the write timeout. False means drop the connection.
-async fn write_line(w: &mut OwnedWriteHalf, line: &str) -> bool {
-    let mut buf = String::with_capacity(line.len() + 1);
-    buf.push_str(line);
-    buf.push('\n');
-    match tokio::time::timeout(WRITE_TIMEOUT, w.write_all(buf.as_bytes())).await {
+struct BoundedJson {
+    bytes: Vec<u8>,
+    oversized: bool,
+}
+
+impl BoundedJson {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            oversized: false,
+        }
+    }
+}
+
+impl std::io::Write for BoundedJson {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if matches!(
+            FrameContract::classify_json_bytes(self.bytes.len().saturating_add(buf.len())),
+            FrameSize::TooLarge
+        ) {
+            self.oversized = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "official daemon frame is too large",
+            ));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+enum FrameEncodeError {
+    TooLarge,
+    Serialize(serde_json::Error),
+}
+
+fn frame_too_large(subject: &str) -> String {
+    format!(
+        "{subject} exceeds the {}-byte JSON frame limit (newline excluded)",
+        FrameContract::MAX_JSON_BYTES
+    )
+}
+
+fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, FrameEncodeError> {
+    let mut writer = BoundedJson::new();
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => Ok(writer.bytes),
+        Err(_) if writer.oversized => Err(FrameEncodeError::TooLarge),
+        Err(error) => Err(FrameEncodeError::Serialize(error)),
+    }
+}
+
+/// Preserve the request id when possible, but never emit a response outside
+/// the official envelope. A caller that receives this fallback knows the
+/// original outcome is uncertain and must inspect authoritative state.
+fn response_frame(response: &Response) -> Option<Vec<u8>> {
+    match encode_frame(response) {
+        Ok(frame) => Some(frame),
+        Err(FrameEncodeError::TooLarge) => {
+            let fallback = Response::err(
+                response.id.clone(),
+                FrameContract::TOO_LARGE_CODE,
+                format!(
+                    "{}; the request outcome is unknown, so inspect authoritative state before retrying",
+                    frame_too_large("daemon response")
+                ),
+            );
+            encode_frame(&fallback).ok()
+        }
+        Err(FrameEncodeError::Serialize(error)) => {
+            warn!(error = %error, "response serialization failed; dropping connection");
+            None
+        }
+    }
+}
+
+/// Read one newline-terminated frame without allocating beyond the shared
+/// JSON-object envelope. The delimiter is consumed but is not counted.
+async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if bytes.is_empty() {
+                Ok(None)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed during a daemon frame",
+                ))
+            };
+        }
+        if let Some(delimiter) = available
+            .iter()
+            .position(|byte| *byte == FrameContract::DELIMITER)
+        {
+            if matches!(
+                FrameContract::classify_json_bytes(bytes.len().saturating_add(delimiter)),
+                FrameSize::TooLarge
+            ) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    frame_too_large("client request"),
+                ));
+            }
+            bytes.extend_from_slice(&available[..delimiter]);
+            reader.consume(delimiter + 1);
+            return String::from_utf8(bytes).map(Some).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "client frame was not UTF-8",
+                )
+            });
+        }
+        if matches!(
+            FrameContract::classify_json_bytes(bytes.len().saturating_add(available.len())),
+            FrameSize::TooLarge
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                frame_too_large("client request"),
+            ));
+        }
+        bytes.extend_from_slice(available);
+        let consumed = available.len();
+        reader.consume(consumed);
+    }
+}
+
+/// Write one pre-encoded frame with the write timeout. False means drop the
+/// connection.
+async fn write_frame(w: &mut OwnedWriteHalf, frame: &[u8]) -> bool {
+    if matches!(
+        FrameContract::classify_json_bytes(frame.len()),
+        FrameSize::TooLarge
+    ) {
+        return false;
+    }
+    let mut bytes = Vec::with_capacity(frame.len() + 1);
+    bytes.extend_from_slice(frame);
+    bytes.push(FrameContract::DELIMITER);
+    match tokio::time::timeout(WRITE_TIMEOUT, w.write_all(&bytes)).await {
         Ok(Ok(())) => true,
         Ok(Err(e)) => {
             debug!(error = %e, "client write failed");
@@ -2564,6 +2724,11 @@ async fn write_line(w: &mut OwnedWriteHalf, line: &str) -> bool {
 }
 
 #[cfg(test)]
+async fn write_line(w: &mut OwnedWriteHalf, line: &str) -> bool {
+    write_frame(w, line.as_bytes()).await
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Config, DetEntry};
@@ -2573,11 +2738,163 @@ mod tests {
         TmuxSessionId, WorkspaceId,
     };
     use std::collections::{BTreeMap, HashMap};
+    use std::io::Cursor;
     use std::path::Path;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
     use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn daemon_ingress_boundary_excludes_the_newline_and_requires_it() {
+        let mut exact = vec![b'x'; FrameContract::MAX_JSON_BYTES];
+        exact.push(FrameContract::DELIMITER);
+        let mut reader = BufReader::new(Cursor::new(exact));
+        assert_eq!(
+            read_frame(&mut reader).await.unwrap().unwrap().len(),
+            FrameContract::MAX_JSON_BYTES
+        );
+
+        let mut oversized = vec![b'x'; FrameContract::MAX_JSON_BYTES + 1];
+        oversized.push(FrameContract::DELIMITER);
+        let mut reader = BufReader::new(Cursor::new(oversized));
+        assert_eq!(
+            read_frame(&mut reader).await.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        let mut reader = BufReader::new(Cursor::new(b"{}"));
+        assert_eq!(
+            read_frame(&mut reader).await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_ingress_is_dropped_before_dispatch() {
+        let mut inner = bare_inner();
+        let (stop, stop_rx) = watch::channel(false);
+        Arc::get_mut(&mut inner).unwrap().stop = stop_rx;
+        let (server, client) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(handle_conn(inner, server));
+        let mut client = BufReader::new(client);
+        let mut hello = String::new();
+        client.read_line(&mut hello).await.unwrap();
+        assert!(!hello.is_empty());
+
+        let mut request = serde_json::to_vec(&json!({
+            "id": 1,
+            "method": "ping",
+            "params": {
+                "padding": "x".repeat(cyclops_proto::FrameContract::MAX_JSON_BYTES)
+            }
+        }))
+        .unwrap();
+        request.push(b'\n');
+        client.get_mut().write_all(&request).await.unwrap();
+
+        let mut response = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(1), client.read_line(&mut response))
+            .await
+            .expect("the daemon must close an oversized frame")
+            .unwrap();
+        assert_eq!(read, 0, "oversized request reached dispatch: {response}");
+        task.await.unwrap();
+        drop(stop);
+    }
+
+    #[tokio::test]
+    async fn oversized_subscription_event_drops_instead_of_emitting_a_partial_frame() {
+        let mut inner = bare_inner();
+        let (stop, stop_rx) = watch::channel(false);
+        Arc::get_mut(&mut inner).unwrap().stop = stop_rx;
+        let events = inner.events.clone();
+        let (server, client) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(handle_conn(inner, server));
+        let mut client = BufReader::new(client);
+
+        let mut hello = String::new();
+        client.read_line(&mut hello).await.unwrap();
+        client
+            .get_mut()
+            .write_all(b"{\"id\":1,\"method\":\"events.subscribe\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        let mut acknowledgement = String::new();
+        client.read_line(&mut acknowledgement).await.unwrap();
+        assert!(acknowledgement.contains("subscribed"));
+
+        events
+            .send(Event {
+                event: "test.oversized".into(),
+                data: json!({"padding": "x".repeat(FrameContract::MAX_JSON_BYTES)}),
+                seq: None,
+            })
+            .unwrap();
+        let mut event = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(1), client.read_line(&mut event))
+            .await
+            .expect("the daemon must close after refusing oversized event egress")
+            .unwrap();
+        assert_eq!(read, 0, "daemon emitted event bytes: {event}");
+        task.await.unwrap();
+        drop(stop);
+    }
+
+    #[tokio::test]
+    async fn oversized_egress_is_never_written() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let (_, mut writer) = server.into_split();
+        let reader = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            client.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        });
+        let oversized = "x".repeat(cyclops_proto::FrameContract::MAX_JSON_BYTES + 1);
+
+        assert!(!write_line(&mut writer, &oversized).await);
+        drop(writer);
+        assert!(reader.await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn exact_egress_boundary_writes_the_delimiter_outside_the_json_count() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let (_, mut writer) = server.into_split();
+        let reader = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            client.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        });
+        let exact = "x".repeat(FrameContract::MAX_JSON_BYTES);
+
+        assert!(write_line(&mut writer, &exact).await);
+        drop(writer);
+        let bytes = reader.await.unwrap();
+        assert_eq!(bytes.len(), FrameContract::max_line_bytes());
+        assert_eq!(bytes.last(), Some(&FrameContract::DELIMITER));
+    }
+
+    #[test]
+    fn oversized_response_becomes_a_bounded_uncertainty_error() {
+        let response = Response::ok(
+            json!(7),
+            json!({"padding": "x".repeat(FrameContract::MAX_JSON_BYTES)}),
+        );
+
+        let frame = response_frame(&response).expect("a bounded fallback must fit");
+        assert!(frame.len() <= FrameContract::MAX_JSON_BYTES);
+        let fallback: Response = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(fallback.id, json!(7));
+        let error = fallback.error.expect("the fallback is a wire error");
+        assert_eq!(error.code, FrameContract::TOO_LARGE_CODE);
+        assert!(error.message.contains("outcome is unknown"));
+        assert!(fallback.result.is_none());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn status_refresh_has_one_budget_and_bounded_concurrency() {

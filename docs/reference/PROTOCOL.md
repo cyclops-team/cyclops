@@ -4,6 +4,16 @@ Anything the UI does, a script can do. The CLI is a thin client over one
 Unix socket at `$CYCLOPS_HOME/sock`, and the wire is NDJSON: one JSON object
 per line, in both directions.
 
+Every official socket adapter accepts at most 1,048,576 bytes for the JSON
+object. The terminating newline is required and is not part of that count. An
+official client rejects an oversized request before writing any request bytes,
+so that outcome is known not sent. The daemon drops an oversized inbound frame
+before dispatch. It never emits an oversized hello, response, or event. When a
+response result is too large but its correlation id still fits in a bounded
+error, the daemon returns `frame_too_large` and states that the request outcome
+is unknown; otherwise it closes the connection. Clients recover uncertain
+outcomes from authoritative state instead of guessing or retrying blindly.
+
 Examples show current protocol shapes. Additive optional fields may be omitted
 when they are not relevant to the behavior being explained.
 Message ids are abbreviated for readability. Newly minted ids use `m-`
@@ -73,6 +83,7 @@ Error codes are stable; messages are for humans. Common codes include:
 | `unknown_method` | no such method |
 | `unimplemented` | the method name is reserved but its milestone has not shipped |
 | `bad_request` | the params did not parse, or a value is not allowed |
+| `frame_too_large` | a response could not fit the official frame envelope; the request outcome is unknown until authoritative state is inspected |
 | `no_such_target` | no mailbox recipient or pane answers to that address |
 | `no_such_message` | the named message does not exist or is not visible to this caller |
 | `message_not_pending` | the named mailbox entry is no longer claimable, for example because it was superseded |

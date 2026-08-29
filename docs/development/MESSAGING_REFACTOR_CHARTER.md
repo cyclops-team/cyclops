@@ -427,22 +427,29 @@ The beta rework is developed through the existing repository and must not be
 developed directly on `main`. **beta/messaging-rework** is the remote integration
 branch. Routine milestone commits do not go directly to that branch.
 
-1. **docs/messaging-refactor-authority** approves and repairs this charter,
-   documentation authority, links, status, `NEXT.md`, `HANDOFF.md`, terminology,
-   and the shipped and installed skill copies. Its only Rust source change is
-   the current shipped-skill hash required by the existing seeding contract.
-2. **fix/beta-frame-contract** implements only Milestone 1.
-3. **refactor/beta-daemon-client** consolidates official transport semantics only
+1. **docs/messaging-refactor-authority** was the completed bootstrap exception
+   that approved and repaired this charter in PR #101.
+2. **beta/fix/frame-contract** implements only Milestone 1.
+3. **beta/refactor/daemon-client** consolidates official transport semantics only
    after Milestone 1 is accepted.
-4. **refactor/beta-workspace-messaging** introduces one narrow
+4. **beta/refactor/workspace-messaging** introduces one narrow
    `WorkspaceMessaging` operation family and proves that callers lose
    knowledge. It does not extract a crate without separate approval.
+5. **beta/refactor/observation-messaging** separates observation from messaging
+   responsibility.
+6. **beta/refactor/legacy-compatibility** quarantines compatibility-sensitive
+   legacy paths after their caller census.
+7. **beta/refactor/presentation-seams** makes snapshot, follow, event, and
+   presentation seams explicit.
+8. **beta/feat/collapsed-messages-cue** adds the missing collapsed-workspace
+   messaging cue.
 
 Each milestone gets its own pull request into **beta/messaging-rework**,
 regression evidence, review, and rollback point. Do not begin a later milestone
 inside an earlier pull request. Keep the integration branch synchronized with
-`main` through reviewed merges. Do not merge a pull request or publish a release
-without operator approval.
+`main` through reviewed merges. Milestone pull requests may merge when their
+required evidence, review, and CI are green. Do not merge the beta integration
+branch into `main` or publish a release without operator approval.
 
 After the approved beta scope is complete, run fresh architecture, regression,
 performance, migration, and user-journey audits. Then open one final pull
