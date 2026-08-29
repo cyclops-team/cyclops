@@ -6,10 +6,20 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A pull request can only merge its newest revision. Do not spend runner time
+# proving an older revision after a replacement commit arrives. Push and manual
+# evidence use the unique run id, so release or operator-triggered runs are
+# never cancelled by this rule.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Responsibility: conditional integration. The stable `website` check
+  # currently runs for every change.
   website:
     runs-on: ubuntu-latest
     steps:
@@ -27,6 +37,8 @@ jobs:
       - working-directory: website
         run: npm run build
 
+  # Responsibility: required pull-request correctness. The two matrix entries
+  # intentionally retain their stable `test (<os>)` check names.
   test:
     strategy:
       # One platform failing must not cancel the other. Cyclops has real
@@ -97,6 +109,9 @@ jobs:
           cargo test --workspace --doc || status=$?
           exit "$status"
 
+  # Responsibility: conditional integration. Both stable `installer (<os>)`
+  # checks currently run for every change.
+  #
   # The installer is what a stranger runs first, so it gets its own gate:
   # build, place the binaries, edit a shell profile, set the home up, then
   # uninstall and prove the profile came back byte for byte. Its own job
@@ -120,6 +135,9 @@ jobs:
           if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y tmux; else brew install tmux; fi
       - run: ./tests/e2e/parity-check.sh --installer-only
 
+  # Responsibility: scheduled evidence. This stable advisory check currently
+  # runs on every pull request.
+  #
   # ADR-001 owns the tmux-churn risk by testing the adapter against tmux HEAD.
   # Failures here are early warning, not merge blockers.
   tmux-head:

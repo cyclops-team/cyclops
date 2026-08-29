@@ -204,6 +204,8 @@ disk, and that is where the bugs were.
 `.github/workflows/ci.yml`, on ubuntu-latest and macos-latest, with
 `fail-fast: false` so one platform failing cannot cancel the other and
 throw away the signal that tells a portability bug from a real regression.
+The current lane responsibilities, stable check names, and measured beta
+baseline are recorded in [CI evidence lanes and baseline](docs/development/CI.md).
 
 | Step | Fails when |
 |---|---|
