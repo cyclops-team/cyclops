@@ -58,7 +58,10 @@ jobs:
         run: |
           status=0
           cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast || status=$?
-          cargo test -p cyclopsd --all-targets --no-fail-fast || status=$?
+          # One cyclopsd test binary owns several private tmux servers and
+          # socket-backed runtimes. Eight in-process tests can exceed macOS's
+          # 256-FD soft limit; four preserves parallelism without EMFILE.
+          cargo test -p cyclopsd --all-targets --no-fail-fast -- --test-threads=4 || status=$?
           cargo test --workspace --doc || status=$?
           exit "$status"
       # A path in a doc is checkable. Before this, ARCHITECTURE.md pointed
@@ -90,7 +93,7 @@ jobs:
           mkdir -p "$CYCLOPS_TEST_TMP"
           status=0
           cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast || status=$?
-          cargo test -p cyclopsd --all-targets --no-fail-fast || status=$?
+          cargo test -p cyclopsd --all-targets --no-fail-fast -- --test-threads=4 || status=$?
           cargo test --workspace --doc || status=$?
           exit "$status"
 
@@ -150,6 +153,7 @@ jobs:
           # bounded wait. Keep the behavior covered against HEAD, but give its
           # exact private rig the process budget it is meant to measure.
           cargo test -p cyclopsd --all-targets --no-fail-fast -- \
+            --test-threads=4 \
             --skip a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt || status=$?
           cargo test -p cyclopsd --test messaging_coordinator \
             a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt -- \

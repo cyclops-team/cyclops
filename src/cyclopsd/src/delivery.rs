@@ -8458,8 +8458,10 @@ fn exact_staging_proof(
 /// it over several visual composer rows.
 ///
 /// Codex, Claude, and AGY wrap at word boundaries themselves, so tmux `-J`
-/// cannot join those rows. The application may consume the one ASCII space at
-/// the boundary. No other byte may be added, removed, or reordered.
+/// cannot join those rows. They also repaint the unused suffix of each visual
+/// composer row with ASCII spaces. Those renderer-owned suffix cells and the
+/// one ASCII separator consumed at a wrap boundary are ignored. No other byte
+/// may be added, removed, or reordered.
 fn visible_single_line_payload_matches(visible: &str, expected: &str) -> bool {
     if visible == expected {
         return true;
@@ -8471,6 +8473,10 @@ fn visible_single_line_payload_matches(visible: &str, expected: &str) -> bool {
     let parts: Vec<&str> = visible.split('\n').collect();
     let mut offsets = vec![0usize];
     for (at, part) in parts.iter().enumerate() {
+        let part = part.trim_end_matches(' ');
+        if part.is_empty() {
+            return false;
+        }
         let mut next = Vec::with_capacity(offsets.len() * 2);
         for offset in offsets {
             let Some(remaining) = expected.get(offset..) else {
@@ -14802,27 +14808,28 @@ composer_trailer_required_prefix = 1
             "inbox claim m-att_ASNFZ4mrTe-BI0VniavN7w",
         ];
         assert_eq!(parts.join(" "), expected);
+        let padded = |part: &str, width: usize| format!("{part:<width$}");
 
         let captures = [
             (
                 shipped("codex"),
                 format!(
                     "\x1b[1m›\x1b[0m {}\n  {}\n  {}\n\n\x1b[38;2;246;226;183mgpt-5.6-sol xhigh · ~/work · Workspace",
-                    parts[0], parts[1], parts[2]
+                    padded(parts[0], 94), padded(parts[1], 94), parts[2]
                 ),
             ),
             (
                 shipped("claude"),
                 format!(
                     "\x1b[39m❯\u{a0}{}\n  {}\n  {}\n\x1b[38;5;244m{}\n\x1b[39m  \x1b[38;5;174mSonnet 5 · low · ~ · Ctx: 95% · 1000K window",
-                    parts[0], parts[1], parts[2], "─".repeat(96)
+                    padded(parts[0], 94), padded(parts[1], 94), parts[2], "─".repeat(96)
                 ),
             ),
             (
                 shipped("agy"),
                 format!(
                     "\x1b[94m>\x1b[39m {}\n{}\n{}\n\x1b[90m{}\n\x1b[38;2;174;198;207mGemini 3.7 Flash · High · /tmp/work · Full · Ctx:",
-                    parts[0], parts[1], parts[2], "─".repeat(96)
+                    padded(parts[0], 94), padded(parts[1], 96), padded(parts[2], 96), "─".repeat(96)
                 ),
             ),
         ];
@@ -14852,6 +14859,21 @@ composer_trailer_required_prefix = 1
                 "{} must reject changed wrapped content",
                 manifest.agent.id
             );
+
+            for suffix in ["\t", "\u{a0}"] {
+                let changed = capture.replacen(parts[1], &format!("{}{suffix}", parts[1]), 1);
+                assert!(
+                    exact_staging_proof(
+                        &manifest,
+                        &changed,
+                        StagingTarget::ExactRow(&expected),
+                        &expected,
+                    )
+                    .is_none(),
+                    "{} must not normalize non-ASCII-space input",
+                    manifest.agent.id
+                );
+            }
         }
     }
 
