@@ -7423,12 +7423,17 @@ process_names = ["never"]
             mutable.stop = stop_rx;
         }
 
+        // The workspace creates the tmux session before it registers that
+        // session with the daemon. Starting the watcher first would combine
+        // this retirement test with an unrelated missing-session reconnect
+        // race: the failed attach and this new-session command can reach the
+        // same tmux server concurrently under a loaded test runner.
+        server.run_ok(&["new-session", "-d", "-s", "ephemeral", "sleep 60"]);
         let (first_idx, added) = watch_session(&inner, "ephemeral")
             .await
             .expect("runtime session is watched");
         assert!(added);
         let first = inner.session(first_idx).expect("first slot");
-        server.run_ok(&["new-session", "-d", "-s", "ephemeral", "sleep 60"]);
         let first_binding = wait_for_session_binding(&first, None).await;
         let mut retired = first.retired_changed.subscribe();
 
