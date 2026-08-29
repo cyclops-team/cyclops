@@ -374,6 +374,13 @@ pub fn client_error(e: &ClientError, asked: Option<&str>) -> String {
         ClientError::NotRunning => NOT_RUNNING.into(),
         ClientError::ConnectTimeout(d) => connect_timeout(*d),
         ClientError::ReadTimeout(d) => broken(&format!("no answer within {}", timeout_words(*d))),
+        ClientError::RequestFrameTooLarge => format!(
+            "{}. Nothing was sent.",
+            cyclops_proto::FrameContract::too_large_message("request")
+        ),
+        ClientError::DaemonFrameTooLarge => broken(
+            &cyclops_proto::FrameContract::too_large_message("daemon frame"),
+        ),
         ClientError::Server {
             code,
             message,

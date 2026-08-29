@@ -115,10 +115,6 @@ const PASTE_MAX_BYTES: usize = 1 << 20;
 /// Pane output uses the same byte envelope as a terminal paste. Larger
 /// control-mode notifications are split without changing pane byte order.
 const OUTPUT_BATCH_MAX_BYTES: usize = 1 << 20;
-/// Daemon event lines are body-free in normal operation. A line larger
-/// than the paste envelope is treated as a stream gap and reconciled from
-/// the bounded journal tail instead of entering the app queue.
-const STREAM_EVENT_MAX_BYTES: usize = 1 << 20;
 
 enum AppMsg {
     /// A send started from the composer has an answer. Carries the
@@ -2025,26 +2021,29 @@ enum BoundedLine {
 fn read_bounded_line(
     reader: &mut impl std::io::BufRead,
     line: &mut Vec<u8>,
-    max_bytes: usize,
 ) -> std::io::Result<BoundedLine> {
     line.clear();
     loop {
         let (take, complete) = {
             let available = reader.fill_buf()?;
             if available.is_empty() {
-                return Ok(if line.is_empty() {
-                    BoundedLine::Eof
-                } else {
-                    BoundedLine::Complete
-                });
+                if line.is_empty() {
+                    return Ok(BoundedLine::Eof);
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "daemon frame ended without a newline",
+                ));
             }
-            let newline = available.iter().position(|byte| *byte == b'\n');
-            let take = newline.map_or(available.len(), |index| index + 1);
-            if line.len().saturating_add(take) > max_bytes {
+            let newline = available
+                .iter()
+                .position(|byte| *byte == cyclops_proto::FrameContract::DELIMITER);
+            let take = newline.unwrap_or(available.len());
+            if line.len().saturating_add(take) > cyclops_proto::FrameContract::MAX_JSON_BYTES {
                 return Ok(BoundedLine::TooLong);
             }
             line.extend_from_slice(&available[..take]);
-            (take, newline.is_some())
+            (take + usize::from(newline.is_some()), newline.is_some())
         };
         reader.consume(take);
         if complete {
@@ -2137,7 +2136,7 @@ fn subscribe_decoration_once(
     let mut reader = std::io::BufReader::new(stream);
     let mut hello = Vec::new();
     if !matches!(
-        read_bounded_line(&mut reader, &mut hello, STREAM_EVENT_MAX_BYTES),
+        read_bounded_line(&mut reader, &mut hello),
         Ok(BoundedLine::Complete)
     ) {
         log_err(home, &"cyclopsd sent an incomplete or oversized hello");
@@ -2156,7 +2155,7 @@ fn subscribe_decoration_once(
     }
     let mut acknowledgement = Vec::new();
     if !matches!(
-        read_bounded_line(&mut reader, &mut acknowledgement, STREAM_EVENT_MAX_BYTES),
+        read_bounded_line(&mut reader, &mut acknowledgement),
         Ok(BoundedLine::Complete)
     ) {
         log_err(
@@ -2199,7 +2198,7 @@ fn subscribe_decoration_once(
     let stream_tx = stream_tx.clone();
     std::thread::spawn(move || loop {
         let mut line = Vec::new();
-        match read_bounded_line(&mut reader, &mut line, STREAM_EVENT_MAX_BYTES) {
+        match read_bounded_line(&mut reader, &mut line) {
             Ok(BoundedLine::Eof) => {
                 report_stream_gap(&stream_tx, &sig_tx, "daemon event subscription closed");
                 return;
@@ -2216,7 +2215,7 @@ fn subscribe_decoration_once(
                 report_stream_gap(
                     &stream_tx,
                     &sig_tx,
-                    format!("daemon event exceeded {STREAM_EVENT_MAX_BYTES} bytes"),
+                    cyclops_proto::FrameContract::too_large_message("daemon event"),
                 );
                 return;
             }
@@ -10278,23 +10277,24 @@ mod tests {
 
     #[test]
     fn decoration_frames_stop_before_allocating_past_the_limit() {
-        let mut exact = vec![b'x'; STREAM_EVENT_MAX_BYTES];
-        exact[STREAM_EVENT_MAX_BYTES - 1] = b'\n';
+        let mut exact = vec![b'x'; cyclops_proto::FrameContract::MAX_JSON_BYTES];
+        exact.push(cyclops_proto::FrameContract::DELIMITER);
         let mut reader = std::io::BufReader::new(std::io::Cursor::new(exact));
         let mut line = Vec::new();
         assert!(matches!(
-            read_bounded_line(&mut reader, &mut line, STREAM_EVENT_MAX_BYTES).unwrap(),
+            read_bounded_line(&mut reader, &mut line).unwrap(),
             BoundedLine::Complete
         ));
-        assert_eq!(line.len(), STREAM_EVENT_MAX_BYTES);
+        assert_eq!(line.len(), cyclops_proto::FrameContract::MAX_JSON_BYTES);
 
-        let oversized = vec![b'x'; STREAM_EVENT_MAX_BYTES + 1];
+        let mut oversized = vec![b'x'; cyclops_proto::FrameContract::MAX_JSON_BYTES + 1];
+        oversized.push(cyclops_proto::FrameContract::DELIMITER);
         let mut reader = std::io::BufReader::new(std::io::Cursor::new(oversized));
         assert!(matches!(
-            read_bounded_line(&mut reader, &mut line, STREAM_EVENT_MAX_BYTES).unwrap(),
+            read_bounded_line(&mut reader, &mut line).unwrap(),
             BoundedLine::TooLong
         ));
-        assert!(line.len() <= STREAM_EVENT_MAX_BYTES);
+        assert!(line.len() <= cyclops_proto::FrameContract::MAX_JSON_BYTES);
     }
 
     /// L1: a burst of daemon events must collapse to exactly one status

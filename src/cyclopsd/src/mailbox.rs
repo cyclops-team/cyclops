@@ -8177,6 +8177,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn historical_message_rows_larger_than_the_socket_frame_remain_readable_and_unchanged() {
+        let scratch = StoreScratch::new("oversized-historical-row");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, _admin, bob, carol) = test_context();
+        let directory = MailboxDirectory::new(
+            workspace,
+            [
+                MailboxIdentity {
+                    key: bob,
+                    label: "reviewer".into(),
+                },
+                MailboxIdentity {
+                    key: carol,
+                    label: "observer".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let store = MessageStore::open(&root, journal, workspace, "boot-old").unwrap();
+        let service = MailboxService::new(directory, store);
+        let body = "x".repeat(cyclops_proto::FrameContract::MAX_JSON_BYTES + 1);
+        let accepted = service
+            .send(
+                MailboxIdentity {
+                    key: bob,
+                    label: "reviewer".into(),
+                },
+                mailbox_send("observer", "Historical large row", &body),
+            )
+            .unwrap();
+        let message_id = accepted.message_id.clone();
+        drop(service);
+
+        let path = root.path().join(journal);
+        let before = fs::read(&path).unwrap();
+        assert!(before.len() > cyclops_proto::FrameContract::MAX_JSON_BYTES);
+
+        let reopened = MessageStore::open(&root, journal, workspace, "boot-current").unwrap();
+        let replayed = reopened
+            .projection()
+            .get_message(&message_id)
+            .expect("the historical oversized row remains readable");
+        assert_eq!(replayed.body.as_deref(), Some(body.as_str()));
+        drop(reopened);
+        assert_eq!(
+            fs::read(path).unwrap(),
+            before,
+            "replay rewrote the journal"
+        );
+    }
+
     fn next_change(
         events: &mut broadcast::Receiver<Event>,
         expected_seq: u64,

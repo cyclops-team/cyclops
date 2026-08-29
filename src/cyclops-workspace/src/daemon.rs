@@ -10,14 +10,13 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
-use cyclops_proto::{Hello, PaneStatus, Request, Response, StatusParams, StatusResult, SOCK_NAME};
+use cyclops_proto::{
+    FrameContract, FrameSize, Hello, PaneStatus, Request, Response, StatusParams, StatusResult,
+    SOCK_NAME,
+};
 use serde_json::{json, Value};
 
 const IO_TIMEOUT: Duration = Duration::from_millis(250);
-/// Largest hello or response retained from the daemon. Status and action
-/// payloads share this envelope so a count-bounded app queue cannot receive
-/// one unbounded item.
-pub(crate) const DAEMON_LINE_MAX_BYTES: usize = 1 << 20;
 
 /// Deadline for a send, which is a different kind of request from every
 /// other one here.
@@ -56,16 +55,61 @@ fn connect_with(home: &Path, timeout: Duration) -> Result<BufReader<UnixStream>,
 }
 
 fn write_request(stream: &mut UnixStream, method: &str, params: Value) -> Result<(), String> {
-    let mut line = serde_json::to_vec(&Request {
+    let mut writer = BoundedJson::new();
+    let request = Request {
         id: json!(1),
         method: method.to_string(),
         params,
-    })
-    .map_err(|error| format!("cannot encode {method} request: {error}"))?;
-    line.push(b'\n');
+    };
+    if let Err(error) = serde_json::to_writer(&mut writer, &request) {
+        return Err(if writer.oversized {
+            format!(
+                "{}; nothing was sent",
+                FrameContract::too_large_message(&format!("{method} request"))
+            )
+        } else {
+            format!("cannot encode {method} request: {error}")
+        });
+    }
+    writer.bytes.push(FrameContract::DELIMITER);
     stream
-        .write_all(&line)
+        .write_all(&writer.bytes)
         .map_err(|error| format!("cannot write {method} request: {error}"))
+}
+
+struct BoundedJson {
+    bytes: Vec<u8>,
+    oversized: bool,
+}
+
+impl BoundedJson {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            oversized: false,
+        }
+    }
+}
+
+impl Write for BoundedJson {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if matches!(
+            FrameContract::classify_json_bytes(self.bytes.len().saturating_add(bytes.len())),
+            FrameSize::TooLarge
+        ) {
+            self.oversized = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "official daemon frame is too large",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// One request on a fresh connection. Requests are infrequent user actions
@@ -147,17 +191,24 @@ fn read_bounded_line(reader: &mut impl BufRead, context: &str) -> Result<Vec<u8>
                 if line.is_empty() {
                     return Err(format!("cyclopsd closed during {context}"));
                 }
-                return Ok(line);
-            }
-            let newline = available.iter().position(|byte| *byte == b'\n');
-            let take = newline.map_or(available.len(), |index| index + 1);
-            if line.len().saturating_add(take) > DAEMON_LINE_MAX_BYTES {
                 return Err(format!(
-                    "cyclopsd {context} exceeded {DAEMON_LINE_MAX_BYTES} bytes"
+                    "cyclopsd closed during an unterminated {context} frame"
                 ));
             }
+            let newline = available
+                .iter()
+                .position(|byte| *byte == FrameContract::DELIMITER);
+            let take = newline.unwrap_or(available.len());
+            if matches!(
+                FrameContract::classify_json_bytes(line.len().saturating_add(take)),
+                FrameSize::TooLarge
+            ) {
+                return Err(FrameContract::too_large_message(&format!(
+                    "cyclopsd {context}"
+                )));
+            }
             line.extend_from_slice(&available[..take]);
-            (take, newline.is_some())
+            (take + usize::from(newline.is_some()), newline.is_some())
         };
         reader.consume(take);
         if complete {
@@ -465,12 +516,45 @@ mod tests {
 
     #[test]
     fn response_lines_stop_before_allocating_past_the_envelope() {
-        let oversized = vec![b'x'; DAEMON_LINE_MAX_BYTES + 1];
+        let mut exact = vec![b'x'; FrameContract::MAX_JSON_BYTES];
+        exact.push(FrameContract::DELIMITER);
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(exact));
+        assert_eq!(
+            read_bounded_line(&mut reader, "test response")
+                .expect("the exact boundary is accepted")
+                .len(),
+            FrameContract::MAX_JSON_BYTES
+        );
+
+        let mut oversized = vec![b'x'; FrameContract::MAX_JSON_BYTES + 1];
+        oversized.push(FrameContract::DELIMITER);
         let mut reader = std::io::BufReader::new(std::io::Cursor::new(oversized));
         let error = read_bounded_line(&mut reader, "test response")
             .expect_err("an oversized response must be refused");
-        assert!(error.contains("exceeded"), "{error}");
-        assert!(reader.buffer().len() <= DAEMON_LINE_MAX_BYTES);
+        assert!(error.contains("exceeds"), "{error}");
+        assert!(reader.buffer().len() <= FrameContract::MAX_JSON_BYTES);
+    }
+
+    #[test]
+    fn oversized_workspace_requests_are_known_not_sent() {
+        use std::io::Read as _;
+
+        let (mut client, mut daemon) = UnixStream::pair().unwrap();
+        let error = write_request(
+            &mut client,
+            "ping",
+            json!({"padding": "x".repeat(FrameContract::MAX_JSON_BYTES)}),
+        )
+        .expect_err("the oversized request must be rejected before writing");
+        assert!(error.contains("nothing was sent"), "{error}");
+
+        daemon.set_nonblocking(true).unwrap();
+        let mut byte = [0u8; 1];
+        let read = daemon.read(&mut byte);
+        assert!(matches!(
+            read,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
     }
 
     #[test]

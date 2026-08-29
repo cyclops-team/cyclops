@@ -2420,12 +2420,15 @@ fn prove_candidate_replay(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let hello = loop {
         if let Ok(stream) = std::os::unix::net::UnixStream::connect(&socket) {
-            let mut line = String::new();
-            let mut reader = std::io::BufReader::new(stream);
-            std::io::BufRead::read_line(&mut reader, &mut line)
-                .map_err(|error| format!("read candidate hello: {error}"))?;
-            break serde_json::from_str::<cyclops_proto::Hello>(line.trim())
-                .map_err(|error| format!("decode candidate hello: {error}"))?;
+            let client =
+                crate::client::Client::from_stream(stream, std::time::Duration::from_secs(2))
+                    .map_err(|error| {
+                        format!(
+                            "read candidate hello: {}",
+                            crate::copy::client_error(&error, None)
+                        )
+                    })?;
+            break client.hello().clone();
         }
         if let Some(status) = child
             .child_mut()

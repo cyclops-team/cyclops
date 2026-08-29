@@ -3,20 +3,14 @@
 use std::io;
 use std::io::Write;
 
+use cyclops_proto::FrameContract;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
-
-/// Largest daemon frame the UI accepts, excluding its newline.
-///
-/// A frame is one complete protocol object. Keeping one shared limit means
-/// snapshots, events, status reads, and actions cannot disagree about which
-/// daemon output is safe to hold in memory.
-pub(crate) const MAX_FRAME_BYTES: usize = 1 << 20;
 
 /// Serialize one outbound JSON frame without ever growing past the same cap.
 pub(crate) fn encode_json(value: &impl serde::Serialize) -> Result<Vec<u8>, serde_json::Error> {
     let mut writer = BoundedWriter {
         bytes: Vec::with_capacity(8 * 1024),
-        limit: MAX_FRAME_BYTES,
+        limit: FrameContract::MAX_JSON_BYTES,
     };
     serde_json::to_writer(&mut writer, value)?;
     Ok(writer.bytes)
@@ -50,7 +44,7 @@ pub(crate) struct FrameReader<R> {
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
     pub(crate) fn new(inner: R) -> Self {
-        Self::with_limit(inner, MAX_FRAME_BYTES)
+        Self::with_limit(inner, FrameContract::MAX_JSON_BYTES)
     }
 
     fn with_limit(inner: R, limit: usize) -> Self {
@@ -81,7 +75,10 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 };
             }
 
-            if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+            if let Some(newline) = available
+                .iter()
+                .position(|byte| *byte == FrameContract::DELIMITER)
+            {
                 if self.frame.len().saturating_add(newline) > self.limit {
                     return Err(frame_too_large(self.limit));
                 }
@@ -104,10 +101,12 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
 }
 
 fn frame_too_large(limit: usize) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("daemon frame exceeds the {limit}-byte limit"),
-    )
+    let message = if limit == FrameContract::MAX_JSON_BYTES {
+        FrameContract::too_large_message("daemon frame")
+    } else {
+        format!("daemon frame exceeds the {limit}-byte test limit")
+    };
+    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 #[cfg(test)]
@@ -139,7 +138,26 @@ mod tests {
 
     #[test]
     fn outbound_json_stops_at_the_frame_limit() {
-        let value = serde_json::json!({"body": "x".repeat(MAX_FRAME_BYTES)});
+        let value = serde_json::json!({"body": "x".repeat(FrameContract::MAX_JSON_BYTES)});
         assert!(encode_json(&value).is_err());
+    }
+
+    #[tokio::test]
+    async fn official_boundary_counts_json_bytes_but_not_the_newline() {
+        let mut exact = vec![b'x'; FrameContract::MAX_JSON_BYTES];
+        exact.push(FrameContract::DELIMITER);
+        let mut reader = FrameReader::new(Cursor::new(exact));
+        assert_eq!(
+            reader.next_frame().await.unwrap().unwrap().len(),
+            FrameContract::MAX_JSON_BYTES
+        );
+
+        let mut oversized = vec![b'x'; FrameContract::MAX_JSON_BYTES + 1];
+        oversized.push(FrameContract::DELIMITER);
+        let mut reader = FrameReader::new(Cursor::new(oversized));
+        assert_eq!(
+            reader.next_frame().await.unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 }

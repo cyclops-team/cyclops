@@ -12,6 +12,51 @@ use serde_json::Value;
 
 use crate::state::{AgentState, ComposerProof, ComposerState};
 
+/// The size outcome for one official daemon JSON object.
+///
+/// The newline is framing, not part of the JSON-object byte count. Socket
+/// adapters use this decision before accepting or emitting a frame; the proto
+/// crate owns no reader, writer, or allocation policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameSize {
+    InEnvelope,
+    TooLarge,
+}
+
+/// One size contract shared by every official daemon socket adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameContract;
+
+impl FrameContract {
+    /// Largest JSON object accepted on the official daemon wire.
+    pub const MAX_JSON_BYTES: usize = 1_048_576;
+    /// NDJSON delimiter. This byte is not included in `MAX_JSON_BYTES`.
+    pub const DELIMITER: u8 = b'\n';
+    /// Stable wire-error code for a frame outside the official envelope.
+    pub const TOO_LARGE_CODE: &'static str = "frame_too_large";
+
+    pub const fn classify_json_bytes(bytes: usize) -> FrameSize {
+        if bytes <= Self::MAX_JSON_BYTES {
+            FrameSize::InEnvelope
+        } else {
+            FrameSize::TooLarge
+        }
+    }
+
+    /// Complete on-wire bytes for the largest accepted object and delimiter.
+    pub const fn max_line_bytes() -> usize {
+        Self::MAX_JSON_BYTES + 1
+    }
+
+    /// Human-readable contract wording shared by client and daemon errors.
+    pub fn too_large_message(subject: &str) -> String {
+        format!(
+            "{subject} exceeds the {}-byte JSON frame limit (newline excluded)",
+            Self::MAX_JSON_BYTES
+        )
+    }
+}
+
 /// First line the server writes on every connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
@@ -1537,6 +1582,25 @@ pub enum NotifyLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn official_frame_boundary_excludes_the_newline() {
+        let max = FrameContract::MAX_JSON_BYTES;
+        assert_eq!(
+            FrameContract::classify_json_bytes(max - 1),
+            FrameSize::InEnvelope
+        );
+        assert_eq!(
+            FrameContract::classify_json_bytes(max),
+            FrameSize::InEnvelope
+        );
+        assert_eq!(
+            FrameContract::classify_json_bytes(max + 1),
+            FrameSize::TooLarge
+        );
+        assert_eq!(FrameContract::DELIMITER, b'\n');
+        assert_eq!(FrameContract::max_line_bytes(), max + 1);
+    }
 
     #[test]
     fn turn_ended_is_canonical_while_done_remains_read_compatible() {
