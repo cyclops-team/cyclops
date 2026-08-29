@@ -1650,7 +1650,7 @@ separate delivery and receipt suites. The harness stays on its evidence branch
 because its live vendor launches and dated artifact rewrite are opt-in
 validation operations, not ordinary repository tests.
 
-## F67. Application-wrapped doorbells cannot pass exact staging proof
+## F67. Application-created wraps are distinct rows in a joined tmux capture
 
 MEASURED 2026-08-22 on macOS with tmux 3.6a and Claude Code 2.1.239. The
 installed `14dfc91` daemon wrote its 129-character verbose doorbell to a
@@ -1661,9 +1661,33 @@ break. Strict exact-row verification therefore withheld Enter and opened one
 
 The earlier stage-and-clear soak did not exercise this representation. Its
 Claude trials all used collapsed chips, with zero visible exact doorbells.
-Reconstructing a wrapped line would be unsafe because the capture cannot
-distinguish application wrapping from a newline typed by a person at the same
-boundary.
+At that release boundary Cyclops refused to reconstruct the row because the
+capture cannot distinguish application wrapping from a newline typed by a
+person at the same boundary.
+
+OBSERVED again 2026-08-28 with a summary-bearing Format 4 notification in a
+Codex pane: the complete preview and exact attempt claim were visibly staged
+over three composer rows, but the attempt ended in `verify_failed` and Enter
+was withheld. The integration test that claimed soft-wrap coverage used `cat`,
+so tmux itself wrapped the row and `capture-pane -J` joined it. It did not
+exercise Codex, Claude, or AGY drawing their own continuation rows.
+
+The current Format 4 contract keeps the summary, so verification now extracts
+the whole terminal composer through each shipped manifest and matches its
+visual rows against the one exact payload written by Cyclops. At a visual
+boundary it accepts either no missing byte or one consumed ASCII space, which
+is how the three applications wrap a word-delimited line. Any prefix, suffix,
+changed fragment, reordered fragment, additional space, hidden paste chip, or
+unrecognized composer/trailer shape still refuses. The same reconstruction is
+used by the immediate proof, both pre-Enter rechecks, recovery, and post-submit
+presence checks.
+
+Probe:
+`shipped_composers_verify_one_line_notifications_across_visual_wraps` drives
+the production proof with the shipped Codex, Claude, and AGY manifests. It
+uses the same three-part Format 4 payload for each vendor, proves the expected
+bytes, and then changes a middle fragment and requires refusal. The existing
+tmux integration test remains the physical-wrap check.
 
 The current doorbell is `cyclops inbox claim <id>`. It is 54 characters with a
 full generated message id and fits beside a two-cell prompt in the validated

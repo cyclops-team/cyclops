@@ -5463,13 +5463,8 @@ fn binding_unprovable_observation(
     }
 }
 
-fn composer_semantic_missing(manifest: &Manifest, detection: &Detection) -> bool {
-    detection
-        .readings
-        .iter()
-        .find(|reading| reading.sensor == Sensor::Screen && reading.state == AgentState::Idle)
-        .and_then(|reading| manifest.rules.iter().find(|rule| rule.id == reading.rule))
-        .is_some_and(|rule| rule.composer_semantic.is_none())
+fn composer_semantic_missing(detection: &Detection) -> bool {
+    detection.composer_semantic.is_none()
 }
 
 fn composer_semantic_observation(
@@ -6091,7 +6086,7 @@ async fn gate(
                             reading.sensor == Sensor::Screen && reading.state == AgentState::Idle
                         });
                         if handle.notification.is_some() && screen_reports_idle {
-                            if composer_semantic_missing(manifest, &det) {
+                            if composer_semantic_missing(&det) {
                                 if let Some(observation) =
                                     composer_semantic_observation(inner, handle, &row, &manifest_id)
                                 {
@@ -6231,7 +6226,7 @@ async fn gate(
                                     }
                                     (false, Some("no_write_safe_composer_evidence"))
                                         if handle.notification.is_some()
-                                            && composer_semantic_missing(manifest, &det) =>
+                                            && composer_semantic_missing(&det) =>
                                     {
                                         let Some(observation) = composer_semantic_observation(
                                             inner,
@@ -7276,10 +7271,18 @@ fn staged_representation(
             if exact_row_verified(manifest, screen, expected_row) {
                 return Some(StagedRepresentation::VisibleTarget);
             }
-            if marker_in_composer(manifest, screen) {
-                return Some(StagedRepresentation::CollapsedChip);
+            match exact_composer_content_from_joined_capture(manifest, screen) {
+                ComposerContentProof::Visible(content)
+                    if content.contains('\n')
+                        && visible_single_line_payload_matches(&content, expected_row) =>
+                {
+                    Some(StagedRepresentation::VisibleTarget)
+                }
+                ComposerContentProof::Hidden => Some(StagedRepresentation::CollapsedChip),
+                ComposerContentProof::Visible(_)
+                | ComposerContentProof::Unsupported
+                | ComposerContentProof::Unprovable => None,
             }
-            None
         }
     }
 }
@@ -8439,14 +8442,57 @@ fn exact_staging_proof(
         StagingTarget::ExactRow(_) => exact_composer_content_from_joined_capture(manifest, screen),
     };
     match content {
-        ComposerContentProof::Visible(content) if content == expected_payload => {
-            Some((true, content))
+        ComposerContentProof::Visible(content)
+            if visible_single_line_payload_matches(&content, expected_payload) =>
+        {
+            Some((true, expected_payload.to_string()))
         }
         ComposerContentProof::Visible(_)
         | ComposerContentProof::Hidden
         | ComposerContentProof::Unsupported
         | ComposerContentProof::Unprovable => None,
     }
+}
+
+/// Match one exact single-line payload after a terminal application has drawn
+/// it over several visual composer rows.
+///
+/// Codex, Claude, and AGY wrap at word boundaries themselves, so tmux `-J`
+/// cannot join those rows. The application may consume the one ASCII space at
+/// the boundary. No other byte may be added, removed, or reordered.
+fn visible_single_line_payload_matches(visible: &str, expected: &str) -> bool {
+    if visible == expected {
+        return true;
+    }
+    if expected.contains('\n') || !visible.contains('\n') {
+        return false;
+    }
+
+    let parts: Vec<&str> = visible.split('\n').collect();
+    let mut offsets = vec![0usize];
+    for (at, part) in parts.iter().enumerate() {
+        let mut next = Vec::with_capacity(offsets.len() * 2);
+        for offset in offsets {
+            let Some(remaining) = expected.get(offset..) else {
+                continue;
+            };
+            let Some(remaining) = remaining.strip_prefix(part) else {
+                continue;
+            };
+            let end = expected.len() - remaining.len();
+            next.push(end);
+            if at + 1 < parts.len() && expected.as_bytes().get(end) == Some(&b' ') {
+                next.push(end + 1);
+            }
+        }
+        next.sort_unstable();
+        next.dedup();
+        offsets = next;
+        if offsets.is_empty() {
+            return false;
+        }
+    }
+    offsets.binary_search(&expected.len()).is_ok()
 }
 
 /// Re-prove the same exact normalized composer bytes selected earlier.
@@ -14002,6 +14048,35 @@ line_regex_esc = ['^❯$']
     }
 
     #[test]
+    fn prewrite_uses_the_independent_composer_semantic_below_the_runtime_winner() {
+        let detection = Detection {
+            state: AgentState::Idle,
+            readings: vec![cyclops_proto::SensorReading {
+                sensor: Sensor::Screen,
+                state: AgentState::Idle,
+                rule: "runtime_idle".to_string(),
+                ts: 1,
+            }],
+            disagreement: false,
+            decided_by: "runtime_idle".to_string(),
+            unknown_reason: None,
+            stale: false,
+            write_ready: false,
+            write_block: Some("composer_hold".to_string()),
+            composer_semantic: Some(ComposerSemantic::HumanInput),
+        };
+
+        assert!(
+            !composer_semantic_missing(&detection),
+            "a lower-priority composer rule already proved human input"
+        );
+        assert!(composer_semantic_missing(&Detection {
+            composer_semantic: None,
+            ..detection
+        }));
+    }
+
+    #[test]
     fn pane_change_rechecks_and_resumes_a_frozen_receipt_clock() {
         let row = |dead| cyclops_tmux::PaneRow {
             pane_id: "%1".into(),
@@ -14695,28 +14770,89 @@ composer_trailer_required_prefix = 1
     }
 
     #[test]
-    fn application_wrapped_exact_row_remains_unverified() {
-        let m = sentinel_manifest();
-        let msg_id = MessageId::new("m-0123456789abcdef0123456789abcdef")
-            .expect("valid generated message id");
-        let doorbell = cyclops_proto::render_legacy_doorbell(&msg_id);
-        let split = doorbell
-            .find("m-0123456789abcdef0123456789abcdef'")
-            .expect("second message id");
-        let screen = format!(
-            "\u{1b}[39m❯ {}\n  {}\n{CHROME}",
-            doorbell[..split].trim_end(),
-            &doorbell[split..]
+    fn shipped_composers_verify_one_line_notifications_across_visual_wraps() {
+        let shipped = |id: &str| {
+            let body = match id {
+                "codex" => include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../resources/manifests/codex.toml"
+                )),
+                "claude" => include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../resources/manifests/claude.toml"
+                )),
+                "agy" => include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../resources/manifests/agy.toml"
+                )),
+                _ => unreachable!("unknown shipped manifest"),
+            };
+            Manifest::parse(body, std::path::Path::new(id)).expect("shipped manifest parses")
+        };
+        let attempt =
+            NotificationAttemptId::parse("att-01234567-89ab-4def-8123-456789abcdef").unwrap();
+        let expected = cyclops_proto::render_doorbell_v4(
+            "implementer",
+            "Cable-carrier rounding was restored to whole sections. Review the fix and regression tests.",
+            attempt,
         );
+        let parts = [
+            "[cyclops from implementer] Cable-carrier rounding was restored",
+            "to whole sections. Review the fix and regression tests. | cyclops",
+            "inbox claim m-att_ASNFZ4mrTe-BI0VniavN7w",
+        ];
+        assert_eq!(parts.join(" "), expected);
 
-        assert!(
-            !exact_row_verified(&m, &screen, &doorbell),
-            "application line breaks are not exact bytes and must fail closed"
-        );
-        assert_eq!(
-            staged_representation(&m, &screen, StagingTarget::ExactRow(&doorbell)),
-            None
-        );
+        let captures = [
+            (
+                shipped("codex"),
+                format!(
+                    "\x1b[1m›\x1b[0m {}\n  {}\n  {}\n\n\x1b[38;2;246;226;183mgpt-5.6-sol xhigh · ~/work · Workspace",
+                    parts[0], parts[1], parts[2]
+                ),
+            ),
+            (
+                shipped("claude"),
+                format!(
+                    "\x1b[39m❯\u{a0}{}\n  {}\n  {}\n\x1b[38;5;244m{}\n\x1b[39m  \x1b[38;5;174mSonnet 5 · low · ~ · Ctx: 95% · 1000K window",
+                    parts[0], parts[1], parts[2], "─".repeat(96)
+                ),
+            ),
+            (
+                shipped("agy"),
+                format!(
+                    "\x1b[94m>\x1b[39m {}\n{}\n{}\n\x1b[90m{}\n\x1b[38;2;174;198;207mGemini 3.7 Flash · High · /tmp/work · Full · Ctx:",
+                    parts[0], parts[1], parts[2], "─".repeat(96)
+                ),
+            ),
+        ];
+
+        for (manifest, capture) in captures {
+            assert_eq!(
+                exact_staging_proof(
+                    &manifest,
+                    &capture,
+                    StagingTarget::ExactRow(&expected),
+                    &expected,
+                ),
+                Some((true, expected.clone())),
+                "{} must preserve exact ownership across its visual composer wraps",
+                manifest.agent.id
+            );
+
+            let changed = capture.replacen(parts[1], &format!("{} changed", parts[1]), 1);
+            assert!(
+                exact_staging_proof(
+                    &manifest,
+                    &changed,
+                    StagingTarget::ExactRow(&expected),
+                    &expected,
+                )
+                .is_none(),
+                "{} must reject changed wrapped content",
+                manifest.agent.id
+            );
+        }
     }
 
     #[test]
