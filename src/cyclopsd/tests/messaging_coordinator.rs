@@ -2067,13 +2067,18 @@ async fn a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt() 
     )
     .await;
     let message_id = sent["msg_id"].as_str().unwrap().to_string();
-    rig.ev
+    let held = rig
+        .ev
         .wait_event(Duration::from_secs(8), |event| {
             event["event"] == "gate"
                 && event["data"]["id"] == message_id.as_str()
                 && event["data"]["action"] == "hold"
         })
         .await;
+    let held_cause = held["data"]["cause"]
+        .as_str()
+        .expect("the initial gate hold names its cause")
+        .to_string();
     let attempts_before = notification_attempts(&rig, &message_id);
     assert_eq!(attempts_before.len(), 1);
     assert!(!rig
@@ -2081,10 +2086,9 @@ async fn a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt() 
         .capture(&pane)
         .contains(&compact_doorbell(&rig, &message_id)));
 
-    // Subscribe after the gate confirms the hold and immediately before
-    // Backspace. This connection is a causal barrier: unlike the rig's
-    // long-lived event
-    // client, it cannot contain a positive readiness event from setup.
+    // Subscribe after the exact gate hold and immediately before Backspace.
+    // This is the causal barrier: the connection cannot contain a different
+    // gate decision from setup, but it is live before the release edge.
     let mut release_events = TestClient::connect(&rig.daemon.socket_path()).await;
     let subscribed = release_events.request("events.subscribe", json!({})).await;
     assert_eq!(subscribed["result"]["subscribed"], true);
@@ -2103,23 +2107,26 @@ async fn a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt() 
         })
         .await;
     assert_eq!(readiness["seq"], serde_json::Value::Null, "{readiness}");
-    // The gate's proceed event is the contract this regression protects: the
-    // Backspace readiness edge releases the same held attempt. Waiting for
-    // later terminal injection phases made this test depend on unrelated
-    // worker and tmux scheduling already covered by focused write-path tests.
-    release_events
+    // A new decision for the exact message proves the same attempt consumed
+    // the readiness edge and left the original hold. Foreground
+    // process binding is a later adapter decision: it may proceed or replace
+    // this hold with an honest occupant-unprovable hold without undoing the
+    // composer release this regression protects.
+    let released = release_events
         .wait_event(Duration::from_secs(8), |event| {
             event["event"] == "gate"
                 && event["data"]["id"] == message_id.as_str()
-                && event["data"]["action"] == "proceed"
+                && (event["data"]["action"] == "proceed"
+                    || event["data"]["cause"]
+                        .as_str()
+                        .is_some_and(|cause| cause != held_cause))
         })
         .await;
-    assert_eq!(notification_attempts(&rig, &message_id), attempts_before);
-    let gating_count = notification_state_count(&rig, &message_id, NotificationState::Gating);
-    assert!(
-        (1..=2).contains(&gating_count),
-        "the same attempt must gate once, with at most one release-evidence reopen: {gating_count}"
+    assert_ne!(
+        released["data"]["cause"], held["data"]["cause"],
+        "the gate must leave the composer-era hold"
     );
+    assert_eq!(notification_attempts(&rig, &message_id), attempts_before);
     assert!(workspace_lines(&rig).iter().all(|line| {
         line.id != message_id
             || line

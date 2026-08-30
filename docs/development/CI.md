@@ -135,6 +135,25 @@ before and 15.42s after locally, which is no meaningful wall-time change; the
 gain is removal of a false 20-second terminal-scheduling dependency. No defect
 class moved to scheduled or release evidence.
 
+Milestone 7 then reran the same daemon code in required run
+[33325229205](https://github.com/cyclops-team/cyclops/actions/runs/33325229205)
+and exposed one remaining false dependency. The narrowed regression still
+required `gate: proceed`, but that decision also requires a fresh foreground
+process binding after the composer hold has already been released. Binding
+doubt may honestly replace the composer-era hold with `occupant_unprovable`;
+it does not mean Backspace failed to release the same attempt.
+
+The revised regression establishes a fresh event subscription after the initial exact
+gate hold and immediately before Backspace. It requires the positive readiness
+edge and then a new gate decision for the same message that either proceeds or
+names a different downstream hold. Attempt identity must remain unchanged and
+no requeue fact may appear. A local simulation that forced only the later
+foreground-binding check to return unavailable passed through the honest new
+hold, while disabling the original settled-visible-empty release rule made the
+test fail. The restored proof passed 20 serial focused runs, 80 focused runs at
+eight-way process concurrency, and ten complete four-thread coordinator runs.
+It adds no sleep or timeout and moves no defect class.
+
 ## Task 3 representative pull-request comparison
 
 Messaging Milestone 3 provided the first post-merge product change whose diff
