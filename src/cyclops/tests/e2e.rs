@@ -1540,7 +1540,7 @@ fn inbox_next_json_reports_one_structured_claim_failure() {
 }
 
 #[test]
-fn inbox_next_names_an_uncertain_claim_instead_of_an_empty_timeout() {
+fn inbox_next_names_unknown_after_the_claim_connection_closes() {
     let home = scratch_home("inc");
     let mut step = 0_u8;
     serve_once(&home, hello(1), move |req| {
@@ -1567,23 +1567,25 @@ fn inbox_next_names_an_uncertain_claim_instead_of_an_empty_timeout() {
             3 => {
                 assert_eq!(req["method"], "inbox.claim");
                 assert_eq!(req["params"]["message_id"], "m-uncertain");
-                (Vec::new(), false)
+                // Close only after reading the claim. This is explicit
+                // unknown-after-send evidence, not a guessed response delay.
+                (Vec::new(), true)
             }
             _ => panic!("unexpected request {req}"),
         }
     });
 
-    let out = run_cyclops(&home, &["inbox", "next", "--timeout", "50ms", "--json"]);
+    let out = run_cyclops(&home, &["inbox", "next", "--timeout", "1s", "--json"]);
 
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stderr.is_empty());
     let value: Value = serde_json::from_slice(&out.stdout).expect("JSON uncertain answer");
     assert_eq!(value["code"], "claim_outcome_unknown");
     assert_eq!(value["data"]["message_id"], "m-uncertain");
-    assert!(value["message"]
-        .as_str()
-        .unwrap()
-        .contains("may already be claimed"));
+    assert_eq!(
+        value["message"],
+        "cyclops sent the claim for m-uncertain, but no usable answer arrived. The message may already be claimed. Inspect it with cyclops thread m-uncertain or cyclops inbox list before retrying."
+    );
     let _ = fs::remove_dir_all(&home);
 }
 

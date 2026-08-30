@@ -370,7 +370,7 @@ fn wait_for_attach(client: &mut Client, session: &str, built: &[String]) -> Watc
 fn daemon() -> Option<Client> {
     match Client::connect() {
         Ok(c) => Some(c),
-        Err(ClientError::NotRunning) => None,
+        Err(ClientError::NotRunning(_)) => None,
         // Anything else (a wedged accept queue, a broken hello) is also a
         // daemon we cannot ask. The verb says so in its own copy.
         Err(_) => None,

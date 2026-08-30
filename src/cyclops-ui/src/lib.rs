@@ -46,6 +46,7 @@ pub mod action_io;
 mod app;
 pub mod avatar;
 pub mod chat;
+pub mod daemon_client;
 mod data;
 pub mod detail;
 mod entry;
@@ -59,7 +60,6 @@ pub mod queue;
 mod stream;
 mod term;
 mod theme;
-mod wire;
 
 pub use action_io::{perform, ActionOutcome, ActionRequest, RequestKind, RequestToken};
 pub use app::{App, Command, Density, RosterRow, RowTarget, View};
