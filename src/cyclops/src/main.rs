@@ -63,7 +63,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 
-use client::{Client, ClientError};
+use client::{Certainty, Client, ClientError};
 use cyclops_proto::{
     delivery_needs_human, DeliveryReceipt, DeliveryState, HistoryParams, HistoryResult,
     MessageNotificationState, MsgSendParams, MsgSendResult, PaneReadParams, PaneReadResult,
@@ -1971,7 +1971,7 @@ fn cmd_inbox_next(c: &mut Client, cli: &Cli, timeout: &str, from: Option<&str>) 
             .expect("inbox.claim params serialize");
             let raw = match c.request("inbox.claim", params) {
                 Ok(value) => value,
-                Err(ClientError::ReadTimeout(_)) => {
+                Err(error) if error.certainty() == Certainty::OutcomeUnknown => {
                     return inbox_claim_outcome_unknown(cli, &message_id);
                 }
                 Err(ClientError::Server { code, .. }) if code == "message_not_pending" => {

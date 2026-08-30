@@ -1567,13 +1567,15 @@ fn inbox_next_names_an_uncertain_claim_instead_of_an_empty_timeout() {
             3 => {
                 assert_eq!(req["method"], "inbox.claim");
                 assert_eq!(req["params"]["message_id"], "m-uncertain");
-                (Vec::new(), false)
+                // Close only after reading the claim. This is explicit
+                // unknown-after-send evidence, not a guessed response delay.
+                (Vec::new(), true)
             }
             _ => panic!("unexpected request {req}"),
         }
     });
 
-    let out = run_cyclops(&home, &["inbox", "next", "--timeout", "50ms", "--json"]);
+    let out = run_cyclops(&home, &["inbox", "next", "--timeout", "1s", "--json"]);
 
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stderr.is_empty());
