@@ -3478,6 +3478,61 @@ pub(crate) struct PaneRecoveredTurnEvidence {
     pub(crate) since_ms: u64,
 }
 
+/// One exact dispatch start confirmed by immutable pane evidence.
+///
+/// Fusion owns the physical correlation. The composition root hands this
+/// body-free value to the retained delivery adapter after the cache commit and
+/// any state event, without giving observation access to delivery handles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PaneDispatchAckEvidence {
+    session_idx: usize,
+    pane_id: String,
+    reporter: crate::identity::ProcId,
+    reporter_manifest: String,
+    turn: turnkey::TurnKey,
+    accepted_ms: u64,
+}
+
+impl PaneDispatchAckEvidence {
+    fn new(
+        session_idx: usize,
+        pane_id: impl Into<String>,
+        reporter: crate::identity::ProcId,
+        reporter_manifest: impl Into<String>,
+        turn: turnkey::TurnKey,
+        accepted_ms: u64,
+    ) -> Self {
+        Self {
+            session_idx,
+            pane_id: pane_id.into(),
+            reporter,
+            reporter_manifest: reporter_manifest.into(),
+            turn,
+            accepted_ms,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        usize,
+        String,
+        crate::identity::ProcId,
+        String,
+        turnkey::TurnKey,
+        u64,
+    ) {
+        (
+            self.session_idx,
+            self.pane_id,
+            self.reporter,
+            self.reporter_manifest,
+            self.turn,
+            self.accepted_ms,
+        )
+    }
+}
+
 /// Composition-root boundary for the messaging decisions required while one
 /// pane observation is committed.
 ///
@@ -3573,11 +3628,12 @@ fn pane_messaging_observations(
     observations
 }
 
-/// A committed pane-cache result and all ordered immutable messaging evidence
-/// derived from that same observation. The fields stay private so callers can
-/// only consume the complete value.
+/// A committed pane-cache result and its ordered immutable post-commit
+/// evidence. The fields stay private so callers can only consume the complete
+/// value.
 pub(crate) struct PaneObservation {
     detection: Detection,
+    dispatch_acks: Vec<PaneDispatchAckEvidence>,
     messaging: Vec<PaneMessagingObservation>,
     repaint: bool,
     recompute_guard: tokio::sync::OwnedMutexGuard<()>,
@@ -3588,12 +3644,14 @@ impl PaneObservation {
         self,
     ) -> (
         Detection,
+        Vec<PaneDispatchAckEvidence>,
         Vec<PaneMessagingObservation>,
         bool,
         tokio::sync::OwnedMutexGuard<()>,
     ) {
         (
             self.detection,
+            self.dispatch_acks,
             self.messaging,
             self.repaint,
             self.recompute_guard,
@@ -3874,6 +3932,7 @@ async fn observe_pane_with_evidence(
         }
         return Some(PaneObservation {
             detection: det,
+            dispatch_acks: Vec::new(),
             messaging: messaging_observation.into_iter().collect(),
             repaint: false,
             recompute_guard,
@@ -3947,6 +4006,7 @@ async fn observe_pane_with_evidence(
                         }
                         return Some(PaneObservation {
                             detection: p,
+                            dispatch_acks: Vec::new(),
                             messaging: messaging_observation.into_iter().collect(),
                             repaint: false,
                             recompute_guard,
@@ -4543,22 +4603,25 @@ async fn observe_pane_with_evidence(
             working_confirmed,
         );
     }
-    for confirmed in confirmed_candidates {
-        crate::delivery::confirm_dispatch_ack(
-            inner,
-            session_idx,
-            pane_id,
-            confirmed.edge.agent,
-            &confirmed.edge.manifest,
-            &confirmed.edge.turn,
-            confirmed.accepted_ms,
-        );
-    }
+    let dispatch_acks = confirmed_candidates
+        .into_iter()
+        .map(|confirmed| {
+            PaneDispatchAckEvidence::new(
+                session_idx,
+                pane_id,
+                confirmed.edge.agent,
+                confirmed.edge.manifest,
+                confirmed.edge.turn,
+                confirmed.accepted_ms,
+            )
+        })
+        .collect();
     if !is_candidate_recheck_cause(cause) {
         schedule_lifecycle_recheck(inner, &PaneKey::new(session_idx, pane_id));
     }
     Some(PaneObservation {
         detection,
+        dispatch_acks,
         messaging: messaging_observations,
         repaint: changed,
         recompute_guard,

@@ -2841,6 +2841,7 @@ mod tests {
             ".reconcile_composer_recovery(",
             ".settle_composer_recovery_lifecycle(",
             ".merge_composer_recovery_barrier(",
+            "confirm_dispatch_ack(",
         ] {
             assert!(
                 !fusion.contains(forbidden),

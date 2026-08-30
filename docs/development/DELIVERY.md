@@ -418,6 +418,12 @@ delegates recovery, retirement, and coordinator decisions to
 records, recovery variants, or recovery locks. The returned body-free barrier
 update is merged before the cache becomes visible, preserving the prior
 fail-closed ordering without leaving messaging policy in observation.
+After that cache commit, confirmed dispatch starts leave fusion as exact,
+body-free ACK evidence. The composition root passes each item to the retained
+delivery mechanism after any state event and before ordered
+`WorkspaceMessaging` observations or any chrome await. A stalled or cancelled
+repaint therefore cannot consume a confirmed receipt, while fusion cannot
+reach delivery handles or commit delivery transitions itself.
 The immediate post-append reconciliation also reuses the current identity, so
 unchanged evidence is a no-op while an edge that raced ahead of the append is not
 lost. A later generation may reopen even when its complete process binding is

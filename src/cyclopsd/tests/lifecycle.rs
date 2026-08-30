@@ -226,7 +226,17 @@ async fn claude_unkeyed_dispatch_publishes_provisional_working_then_visual_recei
         "status promoted the provisional hook dispatch into a receipt"
     );
 
+    let repaint = rig.daemon.pause_next_chrome_repaint_for_test();
     send_fixture_key(&rig, &pane, "C-t");
+    tokio::time::timeout(Duration::from_secs(10), repaint.wait_until_entered())
+        .await
+        .expect("visual acceptance did not reach the post-commit chrome boundary");
+    assert_eq!(
+        rig.final_state(&id, "keyed").as_deref(),
+        Some("delivered_verified"),
+        "presentation began before the returned dispatch ACK was durable"
+    );
+    repaint.release();
     rig.ev
         .wait_event(Duration::from_secs(10), |event| {
             event["event"] == "state"

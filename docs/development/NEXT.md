@@ -105,11 +105,18 @@ a narrow composition-root boundary. Only
 `WorkspaceMessaging` reads durable probes or decides recovery, retirement, and
 coordinator policy; fusion receives a body-free barrier update inside the same
 serialized cache transaction. A deletion lint prevents fusion and the physical
-recovery helper from recovering the concrete messaging Module. The next
-focused pass runs on **beta/refactor/observation-messaging-ack-evidence** and
-moves confirmed ACK candidates through the composition root before the
-responsibility audit can close. Additional narrowly named completion branches
-remain allowed when one pull request would become broad. Milestone 5 put
+recovery helper from recovering the concrete messaging Module. The dispatch
+ACK correction on **beta/refactor/observation-messaging-ack-evidence** now
+returns exact route, process, manifest, turn, and causal-time evidence after
+the cache commit and any state event. The composition root confirms the
+retained delivery before ordered messaging observations or presentation, and
+a stalled chrome repaint cannot consume that durable receipt. A deletion lint
+prevents fusion from calling the ACK mechanism directly. A fresh Milestone 4
+responsibility audit is next; use
+**beta/refactor/observation-messaging-audit** only when that audit
+finds a material misplaced responsibility requiring a focused correction.
+Additional narrowly named completion branches remain allowed when one pull
+request would become broad. Milestone 5 put
 retained direct-delivery entry points, restart settlement, and session-journal
 traversal behind
 `src/cyclopsd/src/compatibility.rs`; its census preserves
