@@ -3345,19 +3345,17 @@ fn pane_recompute_gate(inner: &Arc<Inner>, pane: &PaneKey) -> Arc<tokio::sync::M
 /// `session_task`, a resolved recipient, a delivery handle).
 pub(crate) async fn observe_pane(
     inner: &Arc<Inner>,
-    session_idx: usize,
-    watcher: &SessionWatcher,
-    pane_id: &str,
+    target: PaneObservationTarget<'_>,
     force_screen: bool,
     cause: &str,
+    messaging: &dyn PaneMessagingBoundary,
 ) -> Option<PaneObservation> {
     observe_pane_with_evidence(
         inner,
-        session_idx,
-        watcher,
-        pane_id,
+        target,
         force_screen,
         cause,
+        messaging,
         RecomputeEvidence::default(),
     )
     .await
@@ -3369,20 +3367,18 @@ pub(crate) async fn observe_pane(
 /// reconciliation supplies the current token so it cannot create an edge.
 pub(crate) async fn observe_pane_for_route_evidence(
     inner: &Arc<Inner>,
-    session_idx: usize,
-    watcher: &SessionWatcher,
-    pane_id: &str,
+    target: PaneObservationTarget<'_>,
     force_screen: bool,
     cause: &str,
     route_evidence: &NotificationRouteEvidenceId,
+    messaging: &dyn PaneMessagingBoundary,
 ) -> Option<PaneObservation> {
     observe_pane_with_evidence(
         inner,
-        session_idx,
-        watcher,
-        pane_id,
+        target,
         force_screen,
         cause,
+        messaging,
         RecomputeEvidence {
             source_ms: None,
             route: Some(route_evidence),
@@ -3396,19 +3392,17 @@ pub(crate) async fn observe_pane_for_route_evidence(
 /// edge that arrived after the bytes which triggered it.
 pub(crate) async fn observe_pane_from_output(
     inner: &Arc<Inner>,
-    session_idx: usize,
-    watcher: &SessionWatcher,
-    pane_id: &str,
+    target: PaneObservationTarget<'_>,
     evidence_ms: u64,
     route_evidence: &NotificationRouteEvidenceId,
+    messaging: &dyn PaneMessagingBoundary,
 ) -> Option<PaneObservation> {
     observe_pane_with_evidence(
         inner,
-        session_idx,
-        watcher,
-        pane_id,
+        target,
         false,
         "output_settled",
+        messaging,
         RecomputeEvidence {
             source_ms: Some(evidence_ms),
             route: Some(route_evidence),
@@ -3417,10 +3411,98 @@ pub(crate) async fn observe_pane_from_output(
     .await
 }
 
+/// Stable identity and live sensor access for one pane observation.
+///
+/// Keeping these inseparable prevents helper signatures from accumulating
+/// independent route fields that callers could accidentally mix.
+#[derive(Clone, Copy)]
+pub(crate) struct PaneObservationTarget<'a> {
+    session_idx: usize,
+    watcher: &'a SessionWatcher,
+    pane_id: &'a str,
+}
+
+impl<'a> PaneObservationTarget<'a> {
+    pub(crate) fn new(session_idx: usize, watcher: &'a SessionWatcher, pane_id: &'a str) -> Self {
+        Self {
+            session_idx,
+            watcher,
+            pane_id,
+        }
+    }
+}
+
 #[derive(Default)]
 struct RecomputeEvidence<'a> {
     source_ms: Option<u64>,
     route: Option<&'a NotificationRouteEvidenceId>,
+}
+
+/// Opaque durable inputs for one physical composer observation.
+///
+/// The composition root obtains these from `WorkspaceMessaging`. Fusion may
+/// ask whether capture is required and return immutable physical evidence, but
+/// it cannot inspect journal records, projection variants, or recovery locks.
+pub(crate) struct PaneComposerMessagingContext {
+    recovery_probe: crate::messaging::MessagingComposerRecoveryProbe,
+    composer_probe: crate::messaging::MessagingComposerProjectionProbe,
+}
+
+impl PaneComposerMessagingContext {
+    pub(crate) fn new(
+        recovery_probe: crate::messaging::MessagingComposerRecoveryProbe,
+        composer_probe: crate::messaging::MessagingComposerProjectionProbe,
+    ) -> Self {
+        Self {
+            recovery_probe,
+            composer_probe,
+        }
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        crate::messaging::MessagingComposerRecoveryProbe,
+        crate::messaging::MessagingComposerProjectionProbe,
+    ) {
+        (self.recovery_probe, self.composer_probe)
+    }
+}
+
+/// One exact lifecycle start relevant to a previously recovered composer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PaneRecoveredTurnEvidence {
+    pub(crate) session_idx: usize,
+    pub(crate) pane_id: String,
+    pub(crate) turn: turnkey::TurnKey,
+    pub(crate) since_ms: u64,
+}
+
+/// Composition-root boundary for the messaging decisions required while one
+/// pane observation is committed.
+///
+/// Fusion owns physical evidence and cache serialization. The implementation
+/// owns every durable read, recovery decision, and recovery-coordinator lock.
+pub(crate) trait PaneMessagingBoundary: Sync {
+    fn composer_context(&self, recipient: Option<RecipientKey>) -> PaneComposerMessagingContext;
+
+    fn recovered_turn_observed(&self, evidence: PaneRecoveredTurnEvidence);
+
+    fn decide_composer_recovery(
+        &self,
+        recipient: Option<RecipientKey>,
+        probe: crate::messaging::MessagingComposerRecoveryProbe,
+        evidence: crate::messaging::MessagingComposerRecoveryObservation,
+        lifecycle_candidate: Option<NotificationAttemptId>,
+    ) -> Option<crate::messaging::MessagingComposerRecoveryPlan>;
+
+    fn merge_composer_recovery(
+        &self,
+        plan: Option<crate::messaging::MessagingComposerRecoveryPlan>,
+        base_hold: ComposerHold,
+        owner: Option<String>,
+        turn_running: bool,
+    ) -> crate::messaging::MessagingComposerBarrierUpdate;
 }
 
 /// One exact, immutable runtime observation relevant to durable messaging.
@@ -3521,13 +3603,17 @@ impl PaneObservation {
 
 async fn observe_pane_with_evidence(
     inner: &Arc<Inner>,
-    session_idx: usize,
-    watcher: &SessionWatcher,
-    pane_id: &str,
+    target: PaneObservationTarget<'_>,
     force_screen: bool,
     cause: &str,
+    messaging: &dyn PaneMessagingBoundary,
     evidence: RecomputeEvidence<'_>,
 ) -> Option<PaneObservation> {
+    let PaneObservationTarget {
+        session_idx,
+        watcher,
+        pane_id,
+    } = target;
     let route = PaneKey::new(session_idx, pane_id);
     let prior_working_confirmed = cached_working_confirmed(inner, session_idx, pane_id);
     // One pane has one observation timeline. The capture is part of the
@@ -3549,19 +3635,8 @@ async fn observe_pane_with_evidence(
     };
     let recovery_recipient =
         crate::composer_recovery::exact_recipient(inner, session_idx, watcher, &row);
-    let workspace_messaging = inner.workspace_messaging();
-    let recovery_probe = match (recovery_recipient, workspace_messaging.as_ref()) {
-        (Some(recipient), Some(messaging)) => messaging.composer_recovery_probe(recipient),
-        (Some(_), None) => crate::messaging::MessagingComposerRecoveryProbe::store_unavailable(),
-        (None, _) => crate::messaging::MessagingComposerRecoveryProbe::none(),
-    };
-    let composer_probe = match workspace_messaging.as_ref() {
-        Some(messaging) => messaging.composer_projection_probe(recovery_recipient),
-        None if recovery_recipient.is_some() => {
-            crate::messaging::MessagingComposerProjectionProbe::store_unavailable()
-        }
-        None => crate::messaging::MessagingComposerProjectionProbe::none(),
-    };
+    let (recovery_probe, composer_probe) =
+        messaging.composer_context(recovery_recipient).into_parts();
     let recovering = recovery_probe.is_recovering();
     let manifest = bind_manifest_for(inner, session_idx, &row);
     let manifest_id = manifest.map(|m| m.agent.id.clone());
@@ -4033,13 +4108,12 @@ async fn observe_pane_with_evidence(
                 &confirmed.edge.turn,
             );
         }
-        crate::composer_recovery::bind_post_recovery_turn(
-            inner,
+        messaging.recovered_turn_observed(PaneRecoveredTurnEvidence {
             session_idx,
-            pane_id,
-            confirmed.edge.turn.clone(),
-            confirmed.accepted_ms,
-        );
+            pane_id: pane_id.to_string(),
+            turn: confirmed.edge.turn.clone(),
+            since_ms: confirmed.accepted_ms,
+        });
     }
 
     // Hook sensor (agent.state.report): high-precision edges, incomplete
@@ -4136,30 +4210,23 @@ async fn observe_pane_with_evidence(
             &composer_capture,
         )
     });
-    let mut recovery_plan = match workspace_messaging.as_ref() {
-        Some(messaging) => {
-            let plan = messaging.reconcile_composer_recovery(
-                recovery_probe,
-                crate::messaging::MessagingComposerRecoveryObservation {
-                    binding: recovery_live.clone(),
-                    clean_composer: recovery_clean,
-                    legacy_composer_ready,
-                },
-            );
-            let lifecycle_candidate = crate::composer_recovery::exact_lifecycle_candidate(
-                inner,
-                session_idx,
-                pane_id,
-                recovery_live.as_ref(),
-                recovery_clean,
-            );
-            Some(messaging.settle_composer_recovery_lifecycle(plan, lifecycle_candidate))
-        }
-        None if recovery_recipient.is_some() => {
-            Some(crate::messaging::MessagingComposerRecoveryPlan::store_unavailable())
-        }
-        None => None,
-    };
+    let lifecycle_candidate = crate::composer_recovery::exact_lifecycle_candidate(
+        inner,
+        session_idx,
+        pane_id,
+        recovery_live.as_ref(),
+        recovery_clean,
+    );
+    let mut recovery_plan = messaging.decide_composer_recovery(
+        recovery_recipient,
+        recovery_probe,
+        crate::messaging::MessagingComposerRecoveryObservation {
+            binding: recovery_live.clone(),
+            clean_composer: recovery_clean,
+            legacy_composer_ready,
+        },
+        lifecycle_candidate,
+    );
 
     let working_confirmed =
         working_is_confirmed(inner, &route, &detection, admitted, manifest_id.as_deref());
@@ -4212,19 +4279,12 @@ async fn observe_pane_with_evidence(
             base_hold
         };
         let turn_running = detection.turn_running_at().is_some();
-        let recovery_update = match (workspace_messaging.as_ref(), recovery_plan.take()) {
-            (Some(messaging), Some(plan)) => {
-                messaging.merge_composer_recovery_barrier(plan, base_hold, hold_owner, turn_running)
-            }
-            (None, Some(plan)) => plan.merge_without_module(base_hold, hold_owner, turn_running),
-            (_, None) => crate::messaging::MessagingComposerBarrierUpdate {
-                hold: base_hold,
-                owner: hold_owner,
-                clear_turn: false,
-                refusal: None,
-                recovered_hold: None,
-            },
-        };
+        let recovery_update = messaging.merge_composer_recovery(
+            recovery_plan.take(),
+            base_hold,
+            hold_owner,
+            turn_running,
+        );
         let base_hold = recovery_update.hold;
         let hold_owner = recovery_update.owner;
         if recovery_update.clear_turn {

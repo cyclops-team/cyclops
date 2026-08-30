@@ -409,6 +409,15 @@ mutations mint the same evidence type and immediately pass it through the
 composition root. Fusion decides only whether the physical readiness edge
 exists; `WorkspaceMessaging` owns route reconciliation. Tokenless observations
 and unchanged negative causal observations still produce no messaging item.
+Composer recovery uses a synchronous evidence boundary because its result must
+stamp the same serialized pane-cache commit. Fusion supplies only immutable
+binding, clean-composer, legacy-readiness, and exact lifecycle-start evidence
+to the composition-root adapter. The adapter obtains opaque durable probes and
+delegates recovery, retirement, and coordinator decisions to
+`WorkspaceMessaging`; fusion cannot access the messaging Module, journal
+records, recovery variants, or recovery locks. The returned body-free barrier
+update is merged before the cache becomes visible, preserving the prior
+fail-closed ordering without leaving messaging policy in observation.
 The immediate post-append reconciliation also reuses the current identity, so
 unchanged evidence is a no-op while an edge that raced ahead of the append is not
 lost. A later generation may reopen even when its complete process binding is

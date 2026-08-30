@@ -339,52 +339,26 @@ pub(crate) fn clean_composer_for_binding(
     detection_manifest == Some(binding.manifest.as_str()) && clean_composer(det, in_mode)
 }
 
-/// Bind a turn start observed after a recovered barrier was restored.
+/// Name the recovered attempt which may consume one exact lifecycle start.
 ///
-/// `StagedDuringTurn` is excluded because the turn already running when the
-/// barrier was restored cannot prove it consumed the staged payload. Once it
-/// ends, the hold returns to `Staged` and the next exact start may bind.
-pub(crate) fn bind_post_recovery_turn(
-    inner: &std::sync::Arc<Inner>,
+/// This is physical cache evidence only. The composition root asks
+/// `WorkspaceMessaging` whether the attempt is still active before binding the
+/// turn. `StagedDuringTurn` is excluded because the turn already running when
+/// the barrier was restored cannot prove it consumed the staged payload.
+pub(crate) fn recovered_turn_candidate(
+    inner: &Inner,
     session_idx: usize,
     pane_id: &str,
-    turn: crate::turnkey::TurnKey,
-    since_ms: u64,
-) -> bool {
-    let attempt_id = {
-        let detections = inner.detections.lock().expect("detections lock");
-        let Some(entry) = detections.get(&crate::PaneKey::new(session_idx, pane_id)) else {
-            return false;
-        };
-        if !matches!(
-            entry.hold,
-            ComposerHold::Staged | ComposerHold::TurnStarted { .. }
-        ) {
-            return false;
-        }
-        let Some(owner) = entry.hold_owner.as_deref() else {
-            return false;
-        };
-        let Ok(attempt_id) = NotificationAttemptId::parse(owner) else {
-            return false;
-        };
-        attempt_id
-    };
-    if !inner
-        .workspace_messaging()
-        .is_some_and(|messaging| messaging.composer_recovery_contains(attempt_id))
-    {
-        return false;
+) -> Option<NotificationAttemptId> {
+    let detections = inner.detections.lock().expect("detections lock");
+    let entry = detections.get(&crate::PaneKey::new(session_idx, pane_id))?;
+    if !matches!(
+        entry.hold,
+        ComposerHold::Staged | ComposerHold::TurnStarted { .. }
+    ) {
+        return None;
     }
-    fusion::bind_turn(
-        inner,
-        session_idx,
-        pane_id,
-        &attempt_id.to_string(),
-        turn,
-        since_ms,
-    )
-    .is_some()
+    NotificationAttemptId::parse(entry.hold_owner.as_deref()?).ok()
 }
 
 /// Persist exact post-restart lifecycle evidence before fusion consumes it.

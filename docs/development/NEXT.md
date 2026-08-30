@@ -97,14 +97,21 @@ observation was running. The route-evidence correction now returns that causal
 token as the first typed item in the ordered pane result. Cache-only hold
 mutations produce the same type and pass it through the composition root, while
 tokenless and unchanged negative observations remain quiet. A deletion lint
-prevents fusion from invoking route or exact-owned policy directly. The next
-focused completion pass runs on
-**beta/refactor/observation-messaging-recovery-evidence** and separates
-composer-recovery decisions from physical observation. A later focused pass
-must also remove ACK messaging consequences from the observer before the
-responsibility audit can close. Additional narrowly named completion branches remain allowed
-when one pull request would become broad. Milestone 5 put retained direct-delivery entry
-points, restart settlement, and session-journal traversal behind
+prevents fusion from invoking route or exact-owned policy directly. The
+composer-recovery correction on
+**beta/refactor/observation-messaging-recovery-evidence** now passes immutable
+binding, clean-composer, legacy-readiness, and recovered-turn evidence through
+a narrow composition-root boundary. Only
+`WorkspaceMessaging` reads durable probes or decides recovery, retirement, and
+coordinator policy; fusion receives a body-free barrier update inside the same
+serialized cache transaction. A deletion lint prevents fusion and the physical
+recovery helper from recovering the concrete messaging Module. The next
+focused pass runs on **beta/refactor/observation-messaging-ack-evidence** and
+moves confirmed ACK candidates through the composition root before the
+responsibility audit can close. Additional narrowly named completion branches
+remain allowed when one pull request would become broad. Milestone 5 put
+retained direct-delivery entry points, restart settlement, and session-journal
+traversal behind
 `src/cyclopsd/src/compatibility.rs`; its census preserves
 `Daemon::deliver_payload` with support status unverified and preserves every
 currently readable journal shape. Milestone 4 moved positive quota-reset

@@ -177,6 +177,121 @@ pub(crate) fn apply_messaging_observation(
     }
 }
 
+/// Composition adapter for the durable decisions needed during one pane
+/// observation. Fusion receives only this narrow boundary and immutable
+/// evidence; it cannot recover the mailbox service or recovery coordinator.
+struct DaemonPaneMessagingBoundary<'a> {
+    inner: &'a Arc<Inner>,
+    messaging: Option<Arc<messaging::WorkspaceMessaging>>,
+}
+
+impl<'a> DaemonPaneMessagingBoundary<'a> {
+    fn new(inner: &'a Arc<Inner>) -> Self {
+        Self {
+            inner,
+            messaging: inner.workspace_messaging(),
+        }
+    }
+}
+
+impl fusion::PaneMessagingBoundary for DaemonPaneMessagingBoundary<'_> {
+    fn composer_context(
+        &self,
+        recipient: Option<cyclops_proto::RecipientKey>,
+    ) -> fusion::PaneComposerMessagingContext {
+        let (recovery, projection) = match (self.messaging.as_ref(), recipient) {
+            (Some(messaging), Some(recipient)) => (
+                messaging.composer_recovery_probe(recipient),
+                messaging.composer_projection_probe(Some(recipient)),
+            ),
+            (Some(messaging), None) => (
+                messaging::MessagingComposerRecoveryProbe::none(),
+                messaging.composer_projection_probe(None),
+            ),
+            (None, Some(_)) => (
+                messaging::MessagingComposerRecoveryProbe::store_unavailable(),
+                messaging::MessagingComposerProjectionProbe::store_unavailable(),
+            ),
+            (None, None) => (
+                messaging::MessagingComposerRecoveryProbe::none(),
+                messaging::MessagingComposerProjectionProbe::none(),
+            ),
+        };
+        fusion::PaneComposerMessagingContext::new(recovery, projection)
+    }
+
+    fn recovered_turn_observed(&self, evidence: fusion::PaneRecoveredTurnEvidence) {
+        apply_recovered_turn_evidence(self.inner, evidence);
+    }
+
+    fn decide_composer_recovery(
+        &self,
+        recipient: Option<cyclops_proto::RecipientKey>,
+        probe: messaging::MessagingComposerRecoveryProbe,
+        evidence: messaging::MessagingComposerRecoveryObservation,
+        lifecycle_candidate: Option<cyclops_proto::NotificationAttemptId>,
+    ) -> Option<messaging::MessagingComposerRecoveryPlan> {
+        recipient?;
+        let Some(messaging) = self.messaging.as_ref() else {
+            return Some(messaging::MessagingComposerRecoveryPlan::store_unavailable());
+        };
+        let plan = messaging.reconcile_composer_recovery(probe, evidence);
+        Some(messaging.settle_composer_recovery_lifecycle(plan, lifecycle_candidate))
+    }
+
+    fn merge_composer_recovery(
+        &self,
+        plan: Option<messaging::MessagingComposerRecoveryPlan>,
+        base_hold: cyclops_proto::ComposerHold,
+        owner: Option<String>,
+        turn_running: bool,
+    ) -> messaging::MessagingComposerBarrierUpdate {
+        match (self.messaging.as_ref(), plan) {
+            (Some(messaging), Some(plan)) => {
+                messaging.merge_composer_recovery_barrier(plan, base_hold, owner, turn_running)
+            }
+            (None, Some(plan)) => plan.merge_without_module(base_hold, owner, turn_running),
+            (_, None) => messaging::MessagingComposerBarrierUpdate {
+                hold: base_hold,
+                owner,
+                clear_turn: false,
+                refusal: None,
+                recovered_hold: None,
+            },
+        }
+    }
+}
+
+/// Apply one exact lifecycle start to a barrier that messaging still owns.
+///
+/// Reading the cached physical owner is adapter work. Deciding whether that
+/// owner remains an active recovered attempt belongs to `WorkspaceMessaging`.
+pub(crate) fn apply_recovered_turn_evidence(
+    inner: &Arc<Inner>,
+    evidence: fusion::PaneRecoveredTurnEvidence,
+) -> bool {
+    let Some(attempt_id) =
+        composer_recovery::recovered_turn_candidate(inner, evidence.session_idx, &evidence.pane_id)
+    else {
+        return false;
+    };
+    if !inner
+        .workspace_messaging()
+        .is_some_and(|messaging| messaging.composer_recovery_contains(attempt_id))
+    {
+        return false;
+    }
+    fusion::bind_turn(
+        inner,
+        evidence.session_idx,
+        &evidence.pane_id,
+        &attempt_id.to_string(),
+        evidence.turn,
+        evidence.since_ms,
+    )
+    .is_some()
+}
+
 /// Observe one pane, apply its typed messaging consequence, and return the
 /// ordinary fused detection expected by existing callers.
 pub(crate) async fn observe_pane(
@@ -187,8 +302,15 @@ pub(crate) async fn observe_pane(
     force_screen: bool,
     cause: &str,
 ) -> Option<Detection> {
-    let observed =
-        fusion::observe_pane(inner, session_idx, watcher, pane_id, force_screen, cause).await?;
+    let messaging = DaemonPaneMessagingBoundary::new(inner);
+    let observed = fusion::observe_pane(
+        inner,
+        fusion::PaneObservationTarget::new(session_idx, watcher, pane_id),
+        force_screen,
+        cause,
+        &messaging,
+    )
+    .await?;
     Some(apply_pane_observation(inner, session_idx, watcher, pane_id, observed).await)
 }
 
@@ -201,14 +323,14 @@ pub(crate) async fn observe_pane_for_route_evidence(
     cause: &str,
     route_evidence: &NotificationRouteEvidenceId,
 ) -> Option<Detection> {
+    let messaging = DaemonPaneMessagingBoundary::new(inner);
     let observed = fusion::observe_pane_for_route_evidence(
         inner,
-        session_idx,
-        watcher,
-        pane_id,
+        fusion::PaneObservationTarget::new(session_idx, watcher, pane_id),
         force_screen,
         cause,
         route_evidence,
+        &messaging,
     )
     .await?;
     Some(apply_pane_observation(inner, session_idx, watcher, pane_id, observed).await)
@@ -222,13 +344,13 @@ pub(crate) async fn observe_pane_from_output(
     evidence_ms: u64,
     route_evidence: &NotificationRouteEvidenceId,
 ) -> Option<Detection> {
+    let messaging = DaemonPaneMessagingBoundary::new(inner);
     let observed = fusion::observe_pane_from_output(
         inner,
-        session_idx,
-        watcher,
-        pane_id,
+        fusion::PaneObservationTarget::new(session_idx, watcher, pane_id),
         evidence_ms,
         route_evidence,
+        &messaging,
     )
     .await?;
     Some(apply_pane_observation(inner, session_idx, watcher, pane_id, observed).await)
