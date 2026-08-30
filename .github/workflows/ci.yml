@@ -135,6 +135,9 @@ jobs:
         run: |
           python3 scripts/check-doc-paths.py --selftest
           python3 scripts/check-doc-paths.py
+      - name: messaging documentation agrees
+        if: ${{ !cancelled() && needs.classify.outputs.docs == 'true' }}
+        run: ./tests/e2e/messaging-docs-parity.sh
       - name: docs and binaries agree
         if: ${{ !cancelled() && needs.classify.outputs.parity == 'true' }}
         run: ./tests/e2e/parity-check.sh
@@ -250,7 +253,6 @@ jobs:
       - name: Build tmux from master
         id: build_tmux_head
         if: ${{ needs.classify.outputs.tmux_head == 'true' }}
-        continue-on-error: true
         run: |
           sudo apt-get update
           sudo apt-get install -y libevent-dev ncurses-dev build-essential bison pkg-config autoconf automake
@@ -260,10 +262,9 @@ jobs:
           tmux -V
       - name: Focused adapter evidence against tmux HEAD
         if: ${{ needs.classify.outputs.tmux_head == 'true' && steps.build_tmux_head.outcome == 'success' }}
-        continue-on-error: true
         run: |
           cargo nextest run -p cyclops-tmux -p cyclops-workspace --no-fail-fast
           cargo test -p cyclopsd --test m0 m0_shadow_daemon_end_to_end -- --exact
       - name: tmux HEAD evidence unavailable
-        if: ${{ needs.classify.outputs.tmux_head == 'true' && steps.build_tmux_head.outcome != 'success' }}
+        if: ${{ !cancelled() && needs.classify.outputs.tmux_head == 'true' && steps.build_tmux_head.outcome != 'success' }}
         run: echo "tmux HEAD did not build; no fallback tmux evidence was reported"

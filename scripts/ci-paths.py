@@ -93,9 +93,10 @@ def classify(paths: list[str]) -> dict[str, bool]:
             "src/cyclops-ui/src/daemon_client.rs",
             "src/cyclopsd/src/server.rs",
             "src/cyclops/src/cleanup.rs",
+            "src/cyclops/src/daemon.rs",
             "src/cyclops/src/health.rs",
             "src/cyclops/src/update.rs",
-        }
+        } or under(path, "src/cyclops/tests/")
         result["tmux_head"] |= control or cargo or under(
             path,
             "src/cyclops-tmux/",
@@ -128,6 +129,9 @@ def selftest() -> None:
     assert not daemon["platform"]
     client = classify(["src/cyclops-ui/src/daemon_client.rs"])
     assert client["platform"]
+    assert classify(["src/cyclops/src/daemon.rs"])["platform"]
+    assert classify(["src/cyclops/tests/e2e.rs"])["platform"]
+    assert classify(["src/cyclops/tests/workspace_cli.rs"])["platform"]
     docs = classify(["docs/development/CI.md"])
     assert docs["docs"] and docs["parity"]
     assert not docs["rust"] and not docs["installer"]
