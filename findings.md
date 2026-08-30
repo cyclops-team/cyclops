@@ -1,5 +1,7 @@
 # Build findings
 
+**Status:** Current measured evidence
+
 Probe results where reality contradicted the brief or the research, found
 while implementing v2. Same discipline as the validation campaign: every
 entry is MEASURED (observed live on this machine) or READ (source/doc

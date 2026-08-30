@@ -9,6 +9,8 @@ The approved [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md)
 records Track A's scope and stop conditions. Its seven implementation
 milestones and focused acceptance corrections are complete, and the charter
 remains their behavior and compatibility authority.
+[Cyclops Beta Charter](CYCLOPS_BETA_CHARTER.md) controls the remaining
+whole-product beta scope, dependencies, stop conditions, and release boundary.
 [NEXT.md](NEXT.md) is the current whole-beta execution queue. The
 [Messaging Beta audit](MESSAGING_BETA_AUDIT.md) preserves the original
 completion evidence, the independently found gaps, and the evidence that
@@ -19,6 +21,10 @@ The
 [addendum](../ADDENDUM_REVIEW.md) are supporting design records. They explain
 the reasoning behind the approved charter, but the charter controls
 implementation when the documents differ. The
+[whole-system architecture review](../CYCLOPS_SYSTEM_ARCHITECTURE_REVIEW.md)
+is the supporting evidence behind the Cyclops Beta Charter. Its reviewed
+revision and measurements remain historical; the charter records current
+finding dispositions. The
 [CI and test architecture review](CI_TEST_ARCHITECTURE_REVIEW.md) is the
 supporting design record behind the implemented [current CI contract](CI.md),
 not messaging authority. The reusable
@@ -59,13 +65,14 @@ contracts, and historical records separate:
 | User operation | [User guides](../guides/README.md) | Install, message, monitor, recover, and use the workspace. |
 | Stable reference | [Technical reference](../reference/README.md) | Wire methods, manifests, hooks, and measured performance claims. |
 | Current behavior contracts | [Architecture](ARCHITECTURE.md), [delivery](DELIVERY.md), [invariants](INVARIANTS.md), [protocol](../reference/PROTOCOL.md), [goals](GOALS.md), and [style](STYLE.md) | Read before changing product behavior, wire behavior, rendering, or tests. |
-| Approved implementation authority | [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) | Controls accepted Track A behavior and compatibility when supporting records or historical plans differ. Track 0 will add the whole-product beta charter. |
+| Approved implementation authority | [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) and [Cyclops Beta Charter](CYCLOPS_BETA_CHARTER.md) | The messaging charter controls accepted Track A behavior. The beta charter controls remaining scope, dependencies, stop conditions, and release gates. |
 | Current execution queue | [NEXT.md](NEXT.md) | Active track, authorized order, release boundary, and explicit exclusions. |
 | Messaging beta audit | [Messaging Beta audit](MESSAGING_BETA_AUDIT.md) | Revision-bound architecture, regression, performance, migration, reliability, and journey evidence, including the focused Track A acceptance corrections. |
-| Supporting design records | [Messaging architecture review](../MESSAGING_ARCHITECTURE_REVIEW.md) and [addendum](../ADDENDUM_REVIEW.md) | Reasoning behind the charter, not independent implementation authority. |
+| Supporting design records | [Whole-system architecture review](../CYCLOPS_SYSTEM_ARCHITECTURE_REVIEW.md), [messaging architecture review](../MESSAGING_ARCHITECTURE_REVIEW.md), and [addendum](../ADDENDUM_REVIEW.md) | Revision-bound reasoning behind the charters, not independent implementation authority. |
 | CI design record | [CI and test architecture review](CI_TEST_ARCHITECTURE_REVIEW.md) | Evidence and rationale behind the implemented [CI contract](CI.md), not messaging authority. |
+| Measured evidence | [findings.md](../../findings.md) | Probe-backed constraints on current code. This is live evidence, not a roadmap or archive. |
 | General methodology | [Architecture review method](ARCHITECTURE_REVIEW_PROCESS.md) | Reusable audit process, not a Cyclops behavior contract. |
-| Frozen and historical records | [Reliability roadmap](RELIABILITY_ROADMAP.md), [stabilization history](STABILIZATION_HISTORY.md), [V5 line](V5.md), [changelog](../../CHANGELOG.md), and [findings](../../findings.md) | Preserve the reasoning and evidence behind the current system. Do not treat old plans as current behavior. |
+| Frozen and historical records | [Reliability roadmap](RELIABILITY_ROADMAP.md), [stabilization history](STABILIZATION_HISTORY.md), [V5 line](V5.md), and [changelog](../../CHANGELOG.md) | Preserve the reasoning behind the current system. Do not treat old plans as current behavior. |
 | Internal release material | [Media plan](../public/README.md) and [archived demo checklist](archive/demo-day-checklist.md) | Maintainer and historical material, not public onboarding. |
 | Repository instructions | [Agent entrypoint](../../AGENTS.md), [contributing](../../CONTRIBUTING.md), and [security](../../SECURITY.md) | Rules for automated contributors, human contributors, and vulnerability reports. |
 

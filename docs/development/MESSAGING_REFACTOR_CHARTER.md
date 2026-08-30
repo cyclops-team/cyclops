@@ -18,8 +18,8 @@ production work.
 
 Track A's seven milestones and focused acceptance corrections are complete.
 This charter remains the behavior and compatibility authority for that work;
-the whole-product beta charter established by Track 0 will control subsequent
-scope and sequencing without weakening these contracts.
+the [Cyclops Beta Charter](CYCLOPS_BETA_CHARTER.md) controls subsequent scope
+and sequencing without weakening these contracts.
 
 ## 1. Scope
 
