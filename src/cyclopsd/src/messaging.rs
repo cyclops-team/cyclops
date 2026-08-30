@@ -5,14 +5,14 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use cyclops_proto::{
-    AlarmClearResult, AlarmPreviewResult, AlarmSummary, ClaimDisposition, DeliveryReceipt,
-    DeliveryState, InboxClaimResult, InboxListResult, InboxSummaryEntry, MessageId,
-    MessageWakeBlock, MessagesFollowResult, MessagesSnapshotResult, MsgSendParams, MsgSendResult,
-    NotificationAttemptId, NotificationAttentionCause, NotificationBinding, NotificationManifestId,
-    NotificationRecord, NotificationResolution, NotificationResolutionConsumptionObservation,
-    NotificationRouteEvidenceId, NotificationState, NotificationWithdrawDisposition,
-    NotificationWithdrawResult, NotifyLevel, OpenDelivery, ProcessInstanceId, RecipientKey,
-    StatusBlockedNotification, StatusMailboxRoute,
+    AgentState, AlarmClearResult, AlarmPreviewResult, AlarmSummary, ClaimDisposition,
+    DeliveryReceipt, DeliveryState, InboxClaimResult, InboxListResult, InboxSummaryEntry,
+    MessageId, MessageWakeBlock, MessagesFollowResult, MessagesSnapshotResult, MsgSendParams,
+    MsgSendResult, NotificationAttemptId, NotificationAttentionCause, NotificationBinding,
+    NotificationManifestId, NotificationRecord, NotificationResolution,
+    NotificationResolutionConsumptionObservation, NotificationRouteEvidenceId, NotificationState,
+    NotificationWithdrawDisposition, NotificationWithdrawResult, NotifyLevel, OpenDelivery,
+    ProcessInstanceId, RecipientKey, StatusBlockedNotification, StatusMailboxRoute,
 };
 use cyclops_tmux::{PaneRow, SessionWatcher};
 use tokio::time::Instant;
@@ -170,6 +170,34 @@ pub(crate) struct MessagingComposerRuntimeFacts {
     pub(crate) clear_supported: bool,
 }
 
+/// One immutable, body-free observation of the current terminal route.
+///
+/// The daemon adapter observes these runtime facts. `WorkspaceMessaging`
+/// joins them to the durable notification head and decides whether the route
+/// is eligible for foreground-watch diagnosis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MessagingNotificationRouteObservation {
+    pub(crate) pane_id: String,
+    pub(crate) recipient_label: String,
+    pub(crate) pane_pid: i32,
+    pub(crate) agent_state: AgentState,
+}
+
+/// Body-free input for the foreground-watch process diagnostic.
+///
+/// Durable notification variants and route lookup stay inside
+/// `WorkspaceMessaging`; the process adapter receives only the exact attempt
+/// and pane facts it needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MessagingDeadlockCandidate {
+    pub(crate) message_id: MessageId,
+    pub(crate) notification_attempt: NotificationAttemptId,
+    pub(crate) recipient: RecipientKey,
+    pub(crate) recipient_label: String,
+    pub(crate) pane_id: String,
+    pub(crate) pane_pid: i32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MessagingComposerCandidate {
     record: NotificationRecord,
@@ -265,6 +293,7 @@ pub(crate) struct WorkspaceMessagingStatus {
     pub(crate) blocked_notifications_total: u64,
     unread_by_recipient: HashMap<RecipientKey, u64>,
     projection_readable: bool,
+    deadlock_candidates: Vec<MessagingDeadlockCandidate>,
     composer_candidates:
         Option<HashMap<RecipientKey, HashMap<NotificationAttemptId, MessagingComposerCandidate>>>,
 }
@@ -277,6 +306,10 @@ impl WorkspaceMessagingStatus {
                 .copied()
                 .unwrap_or(0),
         )
+    }
+
+    pub(crate) fn deadlock_candidates(&self) -> &[MessagingDeadlockCandidate] {
+        &self.deadlock_candidates
     }
 
     /// Join one immutable pane observation to the durable composer barriers.
@@ -477,6 +510,12 @@ pub(crate) trait WorkspaceMessagingEffects: Send + Sync {
         service: &MailboxService,
         recipient: RecipientKey,
     ) -> Result<Option<NotificationRoute>, MailboxServiceError>;
+
+    fn notification_route_observation(
+        &self,
+        service: &MailboxService,
+        recipient: RecipientKey,
+    ) -> Result<Option<MessagingNotificationRouteObservation>, MailboxServiceError>;
 
     fn composer_runtime_facts(
         &self,
@@ -1006,6 +1045,41 @@ impl WorkspaceMessaging {
             let blocked = service
                 .blocked_notification_snapshot(observed_at_ms, blocked_limit)
                 .unwrap_or_default();
+            let deadlock_candidates = match service.gating_notifications() {
+                Ok(records) => records
+                    .into_iter()
+                    .filter_map(|record| {
+                        let route = match messaging
+                            .effects
+                            .notification_route_observation(service, record.recipient)
+                        {
+                            Ok(Some(route)) => route,
+                            Ok(None) => return None,
+                            Err(error) => {
+                                error!(
+                                    %error,
+                                    "messaging status could not observe a notification route"
+                                );
+                                return None;
+                            }
+                        };
+                        (route.agent_state == AgentState::Working).then_some(
+                            MessagingDeadlockCandidate {
+                                message_id: record.message_id,
+                                notification_attempt: record.attempt_id,
+                                recipient: record.recipient,
+                                recipient_label: route.recipient_label,
+                                pane_id: route.pane_id,
+                                pane_pid: route.pane_pid,
+                            },
+                        )
+                    })
+                    .collect(),
+                Err(error) => {
+                    error!(%error, "messaging status could not read gating notifications");
+                    Vec::new()
+                }
+            };
             let composer_candidates =
                 service
                     .active_composer_notifications_snapshot()
@@ -1049,6 +1123,7 @@ impl WorkspaceMessaging {
                 blocked_notifications_total: blocked.total,
                 unread_by_recipient,
                 projection_readable,
+                deadlock_candidates,
                 composer_candidates,
             }
         })
@@ -1772,6 +1847,7 @@ mod tests {
         Schedule(RecipientKey),
         InvalidateUnread(RecipientKey),
         ResolvePane(RecipientKey),
+        ObserveNotificationRoute(RecipientKey),
         SettleClaim(NotificationAttemptId),
         ObserveClaimedComposer(RecipientKey, NotificationAttemptId),
         RecoverClaimedNotification(RecipientKey, NotificationAttemptId),
@@ -1787,6 +1863,7 @@ mod tests {
     struct RecordingEffects {
         events: broadcast::Sender<Event>,
         calls: StdMutex<Vec<RecordedEffect>>,
+        notification_routes: StdMutex<HashMap<RecipientKey, MessagingNotificationRouteObservation>>,
     }
 
     impl RecordingEffects {
@@ -1794,11 +1871,23 @@ mod tests {
             Self {
                 events,
                 calls: StdMutex::new(Vec::new()),
+                notification_routes: StdMutex::new(HashMap::new()),
             }
         }
 
         fn calls(&self) -> Vec<RecordedEffect> {
             self.calls.lock().expect("acceptance calls lock").clone()
+        }
+
+        fn set_notification_route(
+            &self,
+            recipient: RecipientKey,
+            route: MessagingNotificationRouteObservation,
+        ) {
+            self.notification_routes
+                .lock()
+                .expect("notification routes lock")
+                .insert(recipient, route);
         }
     }
 
@@ -1842,6 +1931,23 @@ mod tests {
                 .expect("acceptance calls lock")
                 .push(RecordedEffect::ResolvePane(recipient));
             Ok(None)
+        }
+
+        fn notification_route_observation(
+            &self,
+            _service: &MailboxService,
+            recipient: RecipientKey,
+        ) -> Result<Option<MessagingNotificationRouteObservation>, MailboxServiceError> {
+            self.calls
+                .lock()
+                .expect("acceptance calls lock")
+                .push(RecordedEffect::ObserveNotificationRoute(recipient));
+            Ok(self
+                .notification_routes
+                .lock()
+                .expect("notification routes lock")
+                .get(&recipient)
+                .cloned())
         }
 
         fn composer_runtime_facts(
@@ -2567,6 +2673,82 @@ mod tests {
         assert!(detailed.blocked_notifications.is_empty());
         assert_eq!(detailed.blocked_notifications_total, 0);
         assert!(effects.calls().is_empty());
+    }
+
+    // Obsolete if status diagnostics again read gating records, resolve routes,
+    // or interpret current agent state outside WorkspaceMessaging.
+    #[test]
+    fn workspace_messaging_owns_foreground_watch_candidate_selection() {
+        let (_scratch, service, events, reviewer, _) =
+            mailbox_service("workspace-messaging-deadlock-candidates", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            effects.clone(),
+        );
+        let (accepted, context, _) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        effects.set_notification_route(
+            reviewer,
+            MessagingNotificationRouteObservation {
+                pane_id: "%3".to_string(),
+                recipient_label: "reviewer".to_string(),
+                pane_pid: 4242,
+                agent_state: AgentState::Working,
+            },
+        );
+
+        let status = messaging.status_snapshot(false, u64::MAX, 32);
+        assert_eq!(
+            status.deadlock_candidates(),
+            &[MessagingDeadlockCandidate {
+                message_id: accepted.message_id,
+                notification_attempt: context.attempt_id(),
+                recipient: reviewer,
+                recipient_label: "reviewer".to_string(),
+                pane_id: "%3".to_string(),
+                pane_pid: 4242,
+            }]
+        );
+        assert_eq!(
+            effects.calls(),
+            vec![RecordedEffect::ObserveNotificationRoute(reviewer)]
+        );
+
+        effects.set_notification_route(
+            reviewer,
+            MessagingNotificationRouteObservation {
+                pane_id: "%3".to_string(),
+                recipient_label: "reviewer".to_string(),
+                pane_pid: 4242,
+                agent_state: AgentState::Idle,
+            },
+        );
+        assert!(messaging
+            .status_snapshot(false, u64::MAX, 32)
+            .deadlock_candidates()
+            .is_empty());
+    }
+
+    /// Syntactic architecture lint: process diagnosis consumes body-free
+    /// candidates and cannot regain durable messaging or daemon-root access.
+    #[test]
+    fn foreground_watch_diagnostics_cannot_read_messaging_internals() {
+        let source = include_str!("deadlock.rs");
+        for forbidden in [
+            "MailboxService",
+            "gating_notifications",
+            "notification_route",
+            "messaging_runtime",
+            "cached_state",
+            "crate::Inner",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "foreground-watch diagnostics recovered messaging knowledge: {forbidden}"
+            );
+        }
     }
 
     // Obsolete if fusion again commits quota-reset messaging state itself, or

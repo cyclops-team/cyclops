@@ -91,10 +91,14 @@ Daemon status receives one body-free `WorkspaceMessaging` projection containing
 mailbox routes, unread counts, held attention, and the bounded blocked-wake
 sample. The same projection owns active composer-candidate cardinality, durable
 binding comparison, mailbox-state mapping, recovery policy, and the finished
-next action. Status composition supplies only current content-free pane evidence
-and keeps the legacy session-ledger fold separate; it does not inspect mailbox
-variants, recovery variants, worker ownership, directory fallbacks, or
-notification indexes.
+next action. It also joins durable gating records to current route and
+working-state evidence, then exposes only body-free foreground-watch candidates
+to the process diagnostic. Status composition supplies only current
+content-free pane evidence and keeps the legacy session-ledger fold separate;
+it does not inspect mailbox variants, recovery variants, worker ownership,
+directory fallbacks, or notification indexes. The process diagnostic knows
+only candidate attempt and pane facts plus the operating-system process
+snapshot; it cannot read the mailbox, resolve a route, or traverse daemon state.
 The daemon composition root in `src/cyclopsd/src/lib.rs` constructs the Module
 and supplies those downstream actions through one narrow effects capability.
 Only that composition adapter may upgrade the non-owning daemon-root reference;

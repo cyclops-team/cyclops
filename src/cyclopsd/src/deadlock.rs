@@ -4,63 +4,21 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
-use cyclops_proto::{AgentState, StatusDiagnostic};
-use tracing::warn;
+use cyclops_proto::StatusDiagnostic;
 
-use crate::Inner;
+use crate::messaging::MessagingDeadlockCandidate;
 
 /// Report a notification that is gated by the same foreground `cyclops
 /// watch` process waiting to observe it. Durable route matching happens
 /// before process inspection, so a reused pane id cannot inherit the warning.
-pub(crate) fn status_diagnostics(inner: &Inner) -> Vec<StatusDiagnostic> {
-    let Some(service) = inner.mailbox.as_ref() else {
-        return Vec::new();
-    };
-    let records = match service.gating_notifications() {
-        Ok(records) => records,
-        Err(error) => {
-            warn!(%error, "deadlock diagnostic could not read notification state");
-            return Vec::new();
-        }
-    };
-
-    let mut candidates = Vec::new();
-    for record in records {
-        let route =
-            match crate::messaging_runtime::notification_route(inner, service, record.recipient) {
-                Ok(Some(route)) => route,
-                Ok(None) => continue,
-                Err(error) => {
-                    warn!(%error, "deadlock diagnostic could not resolve notification route");
-                    continue;
-                }
-            };
-        if inner.cached_state(route.session_idx, &route.pane_id) != AgentState::Working {
-            continue;
-        }
-        candidates.push(DeadlockCandidate {
-            message_id: record.message_id,
-            notification_attempt: record.attempt_id,
-            recipient: record.recipient,
-            recipient_label: route.label,
-            pane_id: route.pane_id,
-            pane_pid: route.row.pane_pid,
-        });
-    }
+pub(crate) fn status_diagnostics(
+    candidates: &[MessagingDeadlockCandidate],
+) -> Vec<StatusDiagnostic> {
     diagnostics_for_candidates(candidates, ProcessSnapshot::read)
 }
 
-struct DeadlockCandidate {
-    message_id: cyclops_proto::MessageId,
-    notification_attempt: cyclops_proto::NotificationAttemptId,
-    recipient: cyclops_proto::RecipientKey,
-    recipient_label: String,
-    pane_id: String,
-    pane_pid: i32,
-}
-
 fn diagnostics_for_candidates(
-    candidates: Vec<DeadlockCandidate>,
+    candidates: &[MessagingDeadlockCandidate],
     read_processes: impl FnOnce() -> Option<ProcessSnapshot>,
 ) -> Vec<StatusDiagnostic> {
     if candidates.is_empty() {
@@ -76,11 +34,11 @@ fn diagnostics_for_candidates(
             {
                 diagnostics.push(StatusDiagnostic {
                     code: "deadlock_risk".into(),
-                    message_id: candidate.message_id,
+                    message_id: candidate.message_id.clone(),
                     notification_attempt: candidate.notification_attempt,
                     recipient: candidate.recipient,
-                    recipient_label: candidate.recipient_label,
-                    pane_id: candidate.pane_id,
+                    recipient_label: candidate.recipient_label.clone(),
+                    pane_id: candidate.pane_id.clone(),
                 });
             }
         }
@@ -158,8 +116,8 @@ mod tests {
 
     use cyclops_proto::{MessageId, NotificationAttemptId, RecipientKey, WorkspaceId};
 
-    fn candidate() -> DeadlockCandidate {
-        DeadlockCandidate {
+    fn candidate() -> MessagingDeadlockCandidate {
+        MessagingDeadlockCandidate {
             message_id: MessageId::new("m-deadlock").unwrap(),
             notification_attempt: NotificationAttemptId::generate(),
             recipient: RecipientKey::admin(
@@ -173,7 +131,7 @@ mod tests {
 
     #[test]
     fn empty_candidates_skip_the_process_snapshot_read() {
-        let diagnostics = diagnostics_for_candidates(Vec::new(), || {
+        let diagnostics = diagnostics_for_candidates(&[], || {
             panic!("process snapshot must not be read without candidates")
         });
 
@@ -186,7 +144,7 @@ mod tests {
         processes.foreground_group_by_pid.insert(100, 220);
         processes.watch_groups.insert(220);
 
-        let diagnostics = diagnostics_for_candidates(vec![candidate()], || Some(processes));
+        let diagnostics = diagnostics_for_candidates(&[candidate()], || Some(processes));
 
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].code, "deadlock_risk");

@@ -492,6 +492,28 @@ impl messaging::WorkspaceMessagingEffects for DaemonWorkspaceMessagingEffects {
         messaging_runtime::notification_route(&inner, service, recipient)
     }
 
+    fn notification_route_observation(
+        &self,
+        service: &mailbox::MailboxService,
+        recipient: RecipientKey,
+    ) -> Result<
+        Option<messaging::MessagingNotificationRouteObservation>,
+        mailbox::MailboxServiceError,
+    > {
+        let Some(inner) = self.inner.upgrade() else {
+            return Ok(None);
+        };
+        let Some(route) = messaging_runtime::notification_route(&inner, service, recipient)? else {
+            return Ok(None);
+        };
+        Ok(Some(messaging::MessagingNotificationRouteObservation {
+            agent_state: inner.cached_state(route.session_idx, &route.pane_id),
+            pane_id: route.pane_id,
+            recipient_label: route.label,
+            pane_pid: route.row.pane_pid,
+        }))
+    }
+
     fn composer_runtime_facts(
         &self,
         recipient: RecipientKey,
