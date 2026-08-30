@@ -7,6 +7,14 @@ versions are unreleased until admin cuts a tag.
 
 ### Fixed
 
+- The Messages pane's current-session view told sessions apart by pane id
+  alone, so after a tmux server restart the new `main` showed the messages
+  of the `main` that died before it: tmux hands `%0`, `%1`, … out again,
+  and an old row addressed to `%1` matched the new session's pane set.
+  The view now addresses the session by the durable identity the daemon
+  bound to it together with its panes, on the sender, the recipient, and
+  the recipient's current route alike. The earlier session's rows are
+  untouched in the durable history and in the all-sessions view.
 - A workspace that owned two sessions, which is what reopening Cyclops
   from another terminal produces once it takes over `main` and reopens the
   last-active session, answered every `%layout-change` with another

@@ -5519,8 +5519,15 @@ fn apply_messages_presentation_cutoff(
 }
 
 /// The session filter the Messages pane should apply right now: the active
-/// workspace's name and the panes linked into its windows, or none when the
+/// workspace's name, the durable identity the daemon bound to its tmux
+/// session, and the panes linked into its windows; or none when the
 /// operator asked for every session.
+///
+/// The identity is what makes the filter a session and not a set of pane
+/// ids: tmux hands `%1` out again after a server restart, and the messages
+/// of the `main` that died before this one are addressed to its instance,
+/// not to this one. They stay in the durable history and in the
+/// all-sessions view; they are not this session's.
 ///
 /// Derived, never stored: tmux panes join and leave a session while the
 /// Messages pane is open, and a stored pane set would go stale the moment
@@ -5531,6 +5538,7 @@ fn messages_session_filter(app: &App) -> Option<cyclops_ui::SessionFilter> {
         return None;
     }
     let workspace = app.model.workspaces.get(app.model.active_workspace)?;
+    let session = app.decoration.sessions.get(&workspace.session_id).copied();
     let panes = app
         .decoration
         .panes
@@ -5539,6 +5547,7 @@ fn messages_session_filter(app: &App) -> Option<cyclops_ui::SessionFilter> {
         .map(|pane| pane.pane_id.clone());
     Some(cyclops_ui::SessionFilter::new(
         workspace.name.clone(),
+        session,
         panes,
     ))
 }
@@ -8506,6 +8515,62 @@ mod tests {
 
     /// A one-pane model for tests that need an `App` but never reach
     /// tmux, so the ids are inert.
+    /// The Messages current-session filter is addressed by the active
+    /// session's durable identity, taken from the daemon's status answer
+    /// under the session's tmux id, together with the panes in its
+    /// windows. Without that identity the filter names the session but
+    /// can hold no row, since nothing can be addressed in a session the
+    /// daemon has not identified.
+    #[test]
+    fn the_messages_session_filter_carries_the_sessions_durable_identity() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-messages-session-filter");
+        let mut app = test_app(one_pane_model(), home);
+        let decorated = |pane_id: &str, window_id: &str| crate::decoration::PaneDecoration {
+            pane_id: pane_id.into(),
+            window_id: window_id.into(),
+            label: Some("reviewer".into()),
+            manifest: None,
+            manifest_display_name: None,
+            state: cyclops_proto::AgentState::Idle,
+            needs_attention: false,
+        };
+        app.decoration
+            .panes
+            .insert("%0".into(), decorated("%0", "@0"));
+        // A pane in a window this workspace does not link.
+        app.decoration
+            .panes
+            .insert("%7".into(), decorated("%7", "@7"));
+
+        let filter = messages_session_filter(&app).expect("scoped by default");
+        assert_eq!(filter.name, "s");
+        assert_eq!(filter.session, None, "the daemon has not identified $0");
+        assert_eq!(
+            filter.panes,
+            std::collections::BTreeSet::from(["%0".to_string()])
+        );
+
+        let instance: cyclops_proto::SessionInstanceId =
+            "22222222-2222-4222-8222-222222222201".parse().unwrap();
+        app.decoration.sessions.insert("$0".into(), instance);
+        // Another session's identity is not this one's.
+        app.decoration.sessions.insert(
+            "$1".into(),
+            "22222222-2222-4222-8222-222222222202".parse().unwrap(),
+        );
+        assert_eq!(
+            messages_session_filter(&app),
+            Some(cyclops_ui::SessionFilter::new(
+                "s",
+                Some(instance),
+                ["%0".to_string()]
+            ))
+        );
+
+        app.messages_session_scoped = false;
+        assert_eq!(messages_session_filter(&app), None);
+    }
+
     fn one_pane_model() -> WorkspaceModel {
         let tab = crate::model::TabModel {
             window_id: "@0".into(),

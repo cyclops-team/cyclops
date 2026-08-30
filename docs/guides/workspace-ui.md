@@ -207,6 +207,13 @@ claim authorizes it.
 Its queue selection, detail scroll, composer, scopes, and shortcuts keep
 their state as the pane opens, closes, or changes width.
 
+Press `t` to flip the pane between the session you are looking at and every
+watched session. The current-session view is addressed by that session's
+durable identity together with its live panes, never by pane ids alone: tmux
+hands `%1` out again after a server restart, and a message sent to the `%1`
+of the `main` that died before this one belongs to that earlier session. Its
+history is not lost; the all-sessions view still shows it.
+
 When the Messages pane opens or widens, it follows the slack-first opening rule:
 it consumes any unused right-side columns before shrinking agent cards. On a
 follower client where the local terminal is wider than the driver-pinned tmux
