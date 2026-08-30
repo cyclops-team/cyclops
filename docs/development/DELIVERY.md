@@ -417,6 +417,14 @@ block and select reconciliation. Route-directory and daemon-replay lifecycle
 edges likewise report availability; the Module selects pending recipients,
 unclaimed reminders, and force-submit candidates before asking the retained
 runtime adapter to host the work.
+Participant-directory publication uses the same Module boundary. Adoption,
+clear, attach, rebind, and exact process replacement supply current physical
+routes and registry identities while `WorkspaceMessaging` owns durable
+directory replacement and the synchronization that authenticated reads share.
+This preserves the existing publish-before-attach and mutate-before-republish
+ordering without exposing the concrete mailbox service or publication lock to
+participant lifecycle code. Force-submit settings authenticate through this
+same boundary.
 Composer recovery uses a synchronous evidence boundary because its result must
 stamp the same serialized pane-cache commit. Fusion supplies only immutable
 binding, clean-composer, legacy-readiness, and exact lifecycle-start evidence

@@ -1846,13 +1846,11 @@ fn mailbox_panes(
         .collect()
 }
 
-fn replace_mailbox_directory_unlocked(
+fn publish_mailbox_directory(
     inner: &Inner,
+    messaging: &messaging::WorkspaceMessaging,
     proposed: Option<&MailboxRouteOverride<'_>>,
 ) -> Result<(), String> {
-    let Some(service) = inner.mailbox.as_ref() else {
-        return Ok(());
-    };
     let panes = mailbox_panes(inner, proposed);
     #[cfg(test)]
     let pause = inner
@@ -1892,37 +1890,50 @@ fn replace_mailbox_directory_unlocked(
     }
     let directory = mailbox::MailboxDirectory::new(inner.workspace_id, agents)
         .map_err(|error| error.to_string())?;
-    service
+    messaging
         .replace_directory(directory)
         .map_err(|error| error.to_string())
 }
 
+/// Run one route-state transition against the same participant publication
+/// seen by authenticated messaging callers. A daemon without durable
+/// messaging still performs the physical transition.
+fn with_messaging_publication<T>(
+    inner: &Arc<Inner>,
+    operation: impl FnOnce(Option<&messaging::WorkspaceMessaging>) -> T,
+) -> T {
+    match inner.workspace_messaging() {
+        Some(messaging) => messaging.with_published(|messaging| operation(Some(messaging))),
+        None => operation(None),
+    }
+}
+
 fn publish_mailbox_transition(
-    inner: &Inner,
+    inner: &Arc<Inner>,
     proposed: &MailboxRouteOverride<'_>,
     commit: impl FnOnce(),
 ) -> Result<(), String> {
-    let _publication = inner
-        .mailbox_publication
-        .lock()
-        .expect("mailbox publication lock");
-    replace_mailbox_directory_unlocked(inner, Some(proposed))?;
-    commit();
-    Ok(())
+    with_messaging_publication(inner, |messaging| {
+        if let Some(messaging) = messaging {
+            publish_mailbox_directory(inner, messaging, Some(proposed))?;
+        }
+        commit();
+        Ok(())
+    })
 }
 
-fn refresh_mailbox_directory_unlocked(inner: &Inner) -> bool {
-    if let Err(error) = replace_mailbox_directory_unlocked(inner, None) {
+fn refresh_mailbox_directory_published(
+    inner: &Inner,
+    messaging: &messaging::WorkspaceMessaging,
+) -> bool {
+    if let Err(error) = publish_mailbox_directory(inner, messaging, None) {
         error!(error = %error, "cannot refresh mailbox directory");
-        let Some(service) = inner.mailbox.as_ref() else {
-            return false;
-        };
         let empty = mailbox::MailboxDirectory::new(
             inner.workspace_id,
             std::iter::empty::<mailbox::MailboxIdentity>(),
         )
         .expect("an empty directory is valid");
-        if let Err(clear_error) = service.replace_directory(empty) {
+        if let Err(clear_error) = messaging.replace_directory(empty) {
             error!(error = %clear_error, "cannot close stale mailbox directory");
         }
         return false;
@@ -1930,21 +1941,17 @@ fn refresh_mailbox_directory_unlocked(inner: &Inner) -> bool {
     true
 }
 
-fn refresh_mailbox_directory(inner: &Inner) -> bool {
-    let _publication = inner
-        .mailbox_publication
-        .lock()
-        .expect("mailbox publication lock");
-    refresh_mailbox_directory_unlocked(inner)
+fn refresh_mailbox_directory(inner: &Arc<Inner>) -> bool {
+    with_messaging_publication(inner, |messaging| {
+        messaging.is_none_or(|messaging| refresh_mailbox_directory_published(inner, messaging))
+    })
 }
 
-fn update_mailbox_route(inner: &Inner, update: impl FnOnce()) -> bool {
-    let _publication = inner
-        .mailbox_publication
-        .lock()
-        .expect("mailbox publication lock");
-    update();
-    let published = refresh_mailbox_directory_unlocked(inner);
+fn update_mailbox_route(inner: &Arc<Inner>, update: impl FnOnce()) -> bool {
+    let published = with_messaging_publication(inner, |messaging| {
+        update();
+        messaging.is_none_or(|messaging| refresh_mailbox_directory_published(inner, messaging))
+    });
     if published {
         inner.emit("messages.route_changed", json!({}), None);
     }
@@ -2965,13 +2972,14 @@ fn conflicting_label_holder(
         .cloned()
 }
 
-/// Persist one adoption while the caller owns `mailbox_publication`.
+/// Persist one adoption during an atomic messaging publication.
 ///
 /// The earlier label check gives a fast refusal. This check is authoritative:
 /// two concurrent calls may both pass the earlier check, but only one may
 /// mutate the registry and publish the mailbox directory.
-fn commit_adoption_under_publication(
+fn commit_adoption_during_publication(
     inner: &Inner,
+    messaging: Option<&messaging::WorkspaceMessaging>,
     adoption: registry::Adoption,
     window: registry::WindowChrome,
 ) -> Result<(), WireError> {
@@ -2997,7 +3005,7 @@ fn commit_adoption_under_publication(
             data: None,
         });
     }
-    if !refresh_mailbox_directory_unlocked(inner) {
+    if messaging.is_some_and(|messaging| !refresh_mailbox_directory_published(inner, messaging)) {
         return Err(WireError {
             code: "internal".to_string(),
             message: "the name was recorded but its mailbox route could not be published"
@@ -3104,52 +3112,49 @@ async fn adopt_pane(
         },
         false => chrome::Snapshot::none(),
     };
-    let publication = inner
-        .mailbox_publication
-        .lock()
-        .expect("mailbox publication lock");
-    let Some((current_recipient, current_root, current_row)) =
-        adoption_route(inner, watcher, session_idx, pane_id)
-    else {
-        return Err(WireError {
-            code: "no_such_target".to_string(),
-            message: format!("target {target:?} changed during adoption"),
-            data: None,
-        });
-    };
-    if current_recipient != recipient
-        || current_root != pane_root
-        || current_row.window_id != row.window_id
-    {
-        return Err(WireError {
-            code: "no_such_target".to_string(),
-            message: format!("target {target:?} changed during adoption"),
-            data: None,
-        });
-    }
-    // 2. Write the registry.
-    let session = inner
-        .session(session_idx)
-        .expect("session_idx valid: caller resolved it")
-        .name();
-    let adoption = registry::Adoption {
-        session: session.clone(),
-        pane_id: pane_id.to_string(),
-        label: label.to_string(),
-        recipient: Some(recipient),
-        pane_root: Some(pane_root),
-        manifest: manifest.map(str::to_string),
-        pane_pid: row.pane_pid,
-        window_id: row.window_id.clone(),
-        border_format: known_format.unwrap_or(read.border_format),
-    };
-    let window = registry::WindowChrome {
-        session,
-        window_id: row.window_id.clone(),
-        border_status: known_status.unwrap_or(read.border_status),
-    };
-    commit_adoption_under_publication(inner, adoption, window)?;
-    drop(publication);
+    with_messaging_publication(inner, |messaging| {
+        let Some((current_recipient, current_root, current_row)) =
+            adoption_route(inner, watcher, session_idx, pane_id)
+        else {
+            return Err(WireError {
+                code: "no_such_target".to_string(),
+                message: format!("target {target:?} changed during adoption"),
+                data: None,
+            });
+        };
+        if current_recipient != recipient
+            || current_root != pane_root
+            || current_row.window_id != row.window_id
+        {
+            return Err(WireError {
+                code: "no_such_target".to_string(),
+                message: format!("target {target:?} changed during adoption"),
+                data: None,
+            });
+        }
+        // 2. Write the registry.
+        let session = inner
+            .session(session_idx)
+            .expect("session_idx valid: caller resolved it")
+            .name();
+        let adoption = registry::Adoption {
+            session: session.clone(),
+            pane_id: pane_id.to_string(),
+            label: label.to_string(),
+            recipient: Some(recipient),
+            pane_root: Some(pane_root),
+            manifest: manifest.map(str::to_string),
+            pane_pid: row.pane_pid,
+            window_id: row.window_id.clone(),
+            border_format: known_format.unwrap_or(read.border_format),
+        };
+        let window = registry::WindowChrome {
+            session,
+            window_id: row.window_id.clone(),
+            border_status: known_status.unwrap_or(read.border_status),
+        };
+        commit_adoption_during_publication(inner, messaging, adoption, window)
+    })?;
     // 3. Paint.
     paint_chrome(inner, session_idx, pane_id).await;
     // 4. Re-read.
@@ -3230,36 +3235,35 @@ async fn unadopt_pane(
     //    back, and the entry it could not drop still holds the ORIGINAL
     //    values, so the retry restores the same thing twice and nothing is
     //    poisoned.
-    let publication = inner
-        .mailbox_publication
-        .lock()
-        .expect("mailbox publication lock");
-    let cleared = inner
-        .registry
-        .lock()
-        .expect("registry lock")
-        .clear(recipient, pane_root)
-        .map_err(|e| WireError {
-            code: "internal".to_string(),
-            message: format!("cannot record the change: {e}"),
-            data: None,
-        })?;
-    if cleared.is_none() {
-        return Err(WireError {
-            code: "no_such_target".to_string(),
-            message: format!("target {pane_id:?} changed during clear"),
-            data: None,
-        });
-    }
-    if !refresh_mailbox_directory_unlocked(inner) {
-        return Err(WireError {
-            code: "internal".to_string(),
-            message: "the name was cleared but its mailbox route could not be republished"
-                .to_string(),
-            data: None,
-        });
-    }
-    drop(publication);
+    with_messaging_publication(inner, |messaging| {
+        let cleared = inner
+            .registry
+            .lock()
+            .expect("registry lock")
+            .clear(recipient, pane_root)
+            .map_err(|e| WireError {
+                code: "internal".to_string(),
+                message: format!("cannot record the change: {e}"),
+                data: None,
+            })?;
+        if cleared.is_none() {
+            return Err(WireError {
+                code: "no_such_target".to_string(),
+                message: format!("target {pane_id:?} changed during clear"),
+                data: None,
+            });
+        }
+        if messaging.is_some_and(|messaging| !refresh_mailbox_directory_published(inner, messaging))
+        {
+            return Err(WireError {
+                code: "internal".to_string(),
+                message: "the name was cleared but its mailbox route could not be republished"
+                    .to_string(),
+                data: None,
+            });
+        }
+        Ok(())
+    })?;
     apply_messaging_availability_change(inner);
     // 5. Re-read.
     if let Some(w) = watcher {
@@ -5148,53 +5152,51 @@ fn rebind_same_session_adoptions(
         return Ok(());
     }
 
-    let _publication = inner
-        .mailbox_publication
-        .lock()
-        .expect("mailbox publication lock");
-    let slot = inner
-        .session(session_idx)
-        .ok_or("adoption_rebind_session_missing")?;
-    for (recipient, old_root, new_root, row) in replacements {
-        let replacement_binding = fusion::admitted_binding(inner, session_idx, &row)
-            .as_ref()
-            .and_then(|binding| crate::composer_recovery::observed_binding(recipient, binding));
-        let mut registry = inner.registry.lock().expect("registry lock");
-        let Some(current_root) = registry
-            .for_recipient(recipient)
-            .and_then(|adoption| adoption.pane_root)
-        else {
-            return Err("adoption_rebind_route_changed");
-        };
-        if current_root != old_root && current_root != new_root {
-            return Err("adoption_rebind_route_changed");
-        }
-        if let Some(messaging) = inner.workspace_messaging() {
-            messaging.retire_replaced_composer_recipient(recipient, replacement_binding)?;
-        }
-        if current_root == old_root {
-            match registry.rebind_process(recipient, old_root, new_root) {
-                Ok(true) => {}
-                Ok(false) => return Err("adoption_rebind_route_changed"),
-                Err(error) => {
-                    error!(recipient = %recipient, error = %error, "cannot persist adoption process replacement");
-                    return Err("adoption_rebind_write_failed");
+    with_messaging_publication(inner, |messaging| {
+        let slot = inner
+            .session(session_idx)
+            .ok_or("adoption_rebind_session_missing")?;
+        for (recipient, old_root, new_root, row) in replacements {
+            let replacement_binding = fusion::admitted_binding(inner, session_idx, &row)
+                .as_ref()
+                .and_then(|binding| crate::composer_recovery::observed_binding(recipient, binding));
+            let mut registry = inner.registry.lock().expect("registry lock");
+            let Some(current_root) = registry
+                .for_recipient(recipient)
+                .and_then(|adoption| adoption.pane_root)
+            else {
+                return Err("adoption_rebind_route_changed");
+            };
+            if current_root != old_root && current_root != new_root {
+                return Err("adoption_rebind_route_changed");
+            }
+            if let Some(messaging) = messaging {
+                messaging.retire_replaced_composer_recipient(recipient, replacement_binding)?;
+            }
+            if current_root == old_root {
+                match registry.rebind_process(recipient, old_root, new_root) {
+                    Ok(true) => {}
+                    Ok(false) => return Err("adoption_rebind_route_changed"),
+                    Err(error) => {
+                        error!(recipient = %recipient, error = %error, "cannot persist adoption process replacement");
+                        return Err("adoption_rebind_write_failed");
+                    }
                 }
             }
+            drop(registry);
+            let pane_id = recipient
+                .pane_id()
+                .ok_or("adoption_rebind_recipient_invalid")?;
+            retire_pane_process_trust(inner, session_idx, &pane_id.to_string());
         }
-        drop(registry);
-        let pane_id = recipient
-            .pane_id()
-            .ok_or("adoption_rebind_recipient_invalid")?;
-        retire_pane_process_trust(inner, session_idx, &pane_id.to_string());
-    }
-    {
-        let mut last = slot.last_panes.lock().expect("last panes lock");
-        for pane in observed {
-            last.insert(pane.row.pane_id.clone(), pane.clone());
+        {
+            let mut last = slot.last_panes.lock().expect("last panes lock");
+            for pane in observed {
+                last.insert(pane.row.pane_id.clone(), pane.clone());
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Remove current facts authenticated by the process generation that exited.
@@ -5359,10 +5361,26 @@ fn replace_pane_process(
     pane_id: &str,
     row: &PaneRow,
 ) -> Result<bool, &'static str> {
-    let _publication = inner
-        .mailbox_publication
-        .lock()
-        .expect("mailbox publication lock");
+    with_messaging_publication(inner, |messaging| {
+        replace_pane_process_during_publication(
+            inner,
+            messaging,
+            session_idx,
+            watcher,
+            pane_id,
+            row,
+        )
+    })
+}
+
+fn replace_pane_process_during_publication(
+    inner: &Arc<Inner>,
+    messaging: Option<&messaging::WorkspaceMessaging>,
+    session_idx: usize,
+    watcher: &Arc<SessionWatcher>,
+    pane_id: &str,
+    row: &PaneRow,
+) -> Result<bool, &'static str> {
     let authoritative = watcher
         .pane(pane_id)
         .map(ObservedPane::capture)
@@ -5439,7 +5457,7 @@ fn replace_pane_process(
         match adopted_root {
             None => {}
             Some(current) if current == new_root || previous_root == Some(current) => {
-                if let Some(messaging) = inner.workspace_messaging() {
+                if let Some(messaging) = messaging {
                     messaging.retire_replaced_composer_recipient(recipient, replacement_binding)?;
                 }
                 if current != new_root {
@@ -5463,7 +5481,7 @@ fn replace_pane_process(
         let mut link = slot.link.lock().expect("session link lock");
         link.mailbox_panes.insert(pane_id.to_string(), replacement);
     }
-    if !refresh_mailbox_directory_unlocked(inner) {
+    if messaging.is_some_and(|messaging| !refresh_mailbox_directory_published(inner, messaging)) {
         return Err("pane_process_directory_publish_failed");
     }
     inner.emit("messages.route_changed", json!({}), None);
@@ -6166,7 +6184,13 @@ mod tests {
         slot
     }
 
-    fn set_test_label(inner: &Inner, session: &str, pane: TmuxPaneId, pane_pid: i32, label: &str) {
+    fn set_test_label(
+        inner: &Arc<Inner>,
+        session: &str,
+        pane: TmuxPaneId,
+        pane_pid: i32,
+        label: &str,
+    ) {
         let session_instance_id = inner
             .session_index(session)
             .and_then(|idx| inner.session(idx))
@@ -6582,22 +6606,24 @@ mod tests {
             border_status: None,
         };
 
-        let _publication = inner.mailbox_publication.lock().unwrap();
-        commit_adoption_under_publication(
-            &inner,
-            adoption("a", pane_a, recipient_a),
-            window("a", pane_a),
-        )
-        .unwrap();
-        let refused = commit_adoption_under_publication(
-            &inner,
-            adoption("b", pane_b, recipient_b),
-            window("b", pane_b),
-        )
-        .unwrap_err();
+        let refused = with_messaging_publication(&inner, |messaging| {
+            commit_adoption_during_publication(
+                &inner,
+                messaging,
+                adoption("a", pane_a, recipient_a),
+                window("a", pane_a),
+            )
+            .unwrap();
+            commit_adoption_during_publication(
+                &inner,
+                messaging,
+                adoption("b", pane_b, recipient_b),
+                window("b", pane_b),
+            )
+            .unwrap_err()
+        });
         assert_eq!(refused.code, "bad_request");
         assert!(refused.message.contains("already taken"));
-        drop(_publication);
 
         let adoptions = inner.registry.lock().unwrap().exact_adoptions();
         assert_eq!(adoptions.len(), 1);
@@ -7089,7 +7115,7 @@ process_names = ["never"]
     }
 
     fn assert_current_mailbox_route(
-        inner: &Inner,
+        inner: &Arc<Inner>,
         slot: &SessionSlot,
         binding: &SessionIdentityBinding,
     ) {

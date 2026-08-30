@@ -769,7 +769,7 @@ pub(crate) async fn dispatch(
             (Response::ok(id, json!({"saved": true})), None)
         }
         "notification.force_submit.get" => {
-            if let Err(error) = require_mailbox_admin(inner, peer) {
+            if let Err(error) = require_workspace_messaging_admin(inner, peer) {
                 return (
                     Response {
                         id,
@@ -793,7 +793,7 @@ pub(crate) async fn dispatch(
             )
         }
         "notification.force_submit.set" => {
-            if let Err(error) = require_mailbox_admin(inner, peer) {
+            if let Err(error) = require_workspace_messaging_admin(inner, peer) {
                 return (
                     Response {
                         id,
@@ -1280,8 +1280,8 @@ fn attention_resolve_error(error: crate::attention_resolution::AttentionResolveE
     }
 }
 
-fn require_mailbox_admin(inner: &Arc<Inner>, peer: Peer) -> Result<(), WireError> {
-    let (_, identity) = mailbox_caller(inner, peer)?;
+fn require_workspace_messaging_admin(inner: &Arc<Inner>, peer: Peer) -> Result<(), WireError> {
+    let (_, identity) = workspace_messaging_caller(inner, peer)?;
     if identity.key.is_admin() {
         Ok(())
     } else {
@@ -4218,24 +4218,26 @@ mod tests {
     fn workspace_messaging_caller_waits_for_route_publication() {
         let (inner, path) = inner_with_mailbox("workspace-messaging-publication");
         let peer = own_peer();
-        let publication = inner.mailbox_publication.lock().unwrap();
+        let messaging = inner.workspace_messaging().unwrap();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
 
         std::thread::scope(|scope| {
-            let inner = Arc::clone(&inner);
-            let reader = scope.spawn(move || {
-                started_tx.send(()).unwrap();
-                let _ = workspace_messaging_caller(&inner, peer);
-                done_tx.send(()).unwrap();
+            let reader = messaging.with_published(|_| {
+                let inner = Arc::clone(&inner);
+                let reader = scope.spawn(move || {
+                    started_tx.send(()).unwrap();
+                    let _ = workspace_messaging_caller(&inner, peer);
+                    done_tx.send(()).unwrap();
+                });
+                started_rx.recv().unwrap();
+                let overlapped = done_rx
+                    .recv_timeout(std::time::Duration::from_millis(100))
+                    .is_ok();
+                assert!(!overlapped, "mailbox caller observed a partial publication");
+                reader
             });
-            started_rx.recv().unwrap();
-            let overlapped = done_rx
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_ok();
-            drop(publication);
             reader.join().unwrap();
-            assert!(!overlapped, "mailbox caller observed a partial publication");
         });
         std::fs::remove_dir_all(path).ok();
     }
@@ -4789,6 +4791,30 @@ mod tests {
                     "{name} recovered forbidden messaging knowledge: {forbidden}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn force_submit_settings_authenticate_through_workspace_messaging() {
+        let source = include_str!("server.rs");
+        let settings = source
+            .split_once("        \"notification.force_submit.get\" => {")
+            .expect("force-submit get dispatch arm")
+            .1
+            .split_once("        method => {")
+            .expect("dispatch fallback after force-submit settings")
+            .0;
+        assert_eq!(
+            settings
+                .matches("require_workspace_messaging_admin(inner, peer)")
+                .count(),
+            2
+        );
+        for forbidden in ["require_mailbox_admin", "mailbox_caller", "inner.mailbox"] {
+            assert!(
+                !settings.contains(forbidden),
+                "force-submit settings recovered {forbidden}"
+            );
         }
     }
 

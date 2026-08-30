@@ -25,8 +25,8 @@ use crate::delivery;
 use crate::mailbox::UnclaimedReminderQueue;
 use crate::mailbox::{
     AcceptResult, AttentionConsumptionSignal, AttentionResolutionStart, AttentionTarget,
-    ClaimOutcome, ExactOwnedRecoveryAction, MailboxError, MailboxIdentity, MailboxSend,
-    MailboxService, MailboxServiceError, MessageStoreError,
+    ClaimOutcome, ExactOwnedRecoveryAction, MailboxDirectory, MailboxError, MailboxIdentity,
+    MailboxSend, MailboxService, MailboxServiceError, MessageStoreError,
 };
 use crate::notification_adapter::{NotificationAdapterError, NotificationContext};
 
@@ -1540,6 +1540,19 @@ impl WorkspaceMessaging {
     pub(crate) fn with_published<T>(&self, read: impl FnOnce(&Self) -> T) -> T {
         let _publication = self.publication.lock().expect("mailbox publication lock");
         read(self)
+    }
+
+    /// Publish the complete current participant directory.
+    ///
+    /// The daemon supplies observed physical identities while this Module owns
+    /// the durable projection replacement. Callers use [`Self::with_published`]
+    /// when route state and authenticated reads must move atomically with the
+    /// replacement.
+    pub(crate) fn replace_directory(
+        &self,
+        directory: MailboxDirectory,
+    ) -> Result<(), MailboxServiceError> {
+        self.service.replace_directory(directory)
     }
 
     pub(crate) fn identity_for_address(
@@ -4017,6 +4030,54 @@ mod tests {
                 "composition root is missing typed messaging handoff {required}"
             );
         }
+    }
+
+    /// Syntactic architecture lint: participant publication may observe daemon
+    /// routes and registry entries, but it cannot recover the concrete mailbox
+    /// service or its synchronization mechanism.
+    #[test]
+    fn participant_directory_callers_use_the_workspace_messaging_boundary() {
+        let source = include_str!("lib.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("daemon test boundary")
+            .0;
+        for (start, next) in [
+            (
+                "fn publish_mailbox_directory(",
+                "#[cfg(test)]\npub(crate) fn mailbox_recipient_for_origin(",
+            ),
+            (
+                "fn commit_adoption_during_publication(",
+                "/// The chrome restore `--clear` runs",
+            ),
+            (
+                "fn rebind_same_session_adoptions(",
+                "fn retire_pane_process_trust(",
+            ),
+            ("fn replace_pane_process(", "async fn handle_pane_event("),
+        ] {
+            let section = production
+                .split_once(start)
+                .unwrap_or_else(|| panic!("participant section {start}"))
+                .1
+                .split_once(next)
+                .unwrap_or_else(|| panic!("participant section after {start}"))
+                .0;
+            for forbidden in [
+                "mailbox_publication",
+                "inner.mailbox",
+                "service.replace_directory",
+            ] {
+                assert!(
+                    !section.contains(forbidden),
+                    "participant section {start} recovered {forbidden}"
+                );
+            }
+        }
+        assert!(production.contains("with_messaging_publication("));
+        assert!(production.contains("publish_mailbox_directory(inner, messaging"));
+        assert!(production.contains(".replace_directory(directory)"));
     }
 
     /// Syntactic architecture lint: the authenticated hook adapter proves one
