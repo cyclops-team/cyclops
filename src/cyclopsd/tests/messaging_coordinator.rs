@@ -294,9 +294,9 @@ async fn a_positive_quota_observation_commits_before_cancelled_chrome_repaint() 
     assert!(!screen.contains(&compact_doorbell(&rig, &message_id)));
     assert!(!screen.contains("body stays durable"));
 
-    // Leave the repaint stalled. Shutdown cancels that session task after its
-    // bounded grace period, proving presentation cancellation cannot consume
-    // the already-committed reset edge.
+    // Leave the repaint stalled. Shutdown cancels the owning daemon task,
+    // proving presentation cancellation cannot consume the already-committed
+    // reset edge.
     rig.daemon.shutdown().await;
     assert_eq!(
         notification_state_count(&rig, &message_id, NotificationState::QuotaResetObserved),

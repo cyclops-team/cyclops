@@ -132,13 +132,16 @@ async fn apply_pane_observation(
     pane_id: &str,
     observed: fusion::PaneObservation,
 ) -> Detection {
-    let (detection, messaging_observation, repaint) = observed.into_parts();
+    let (detection, messaging_observation, repaint, recompute_guard) = observed.into_parts();
     if let Some(observation) = messaging_observation {
         apply_messaging_observation(inner, observation);
     }
     if repaint {
         repaint_chrome(inner, session_idx, watcher, pane_id).await;
     }
+    // The same pane cannot commit or paint a newer observation until this
+    // complete durable-then-presentation sequence has finished.
+    drop(recompute_guard);
     detection
 }
 

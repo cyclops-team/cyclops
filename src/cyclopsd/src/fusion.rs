@@ -3715,11 +3715,24 @@ pub(crate) struct PaneObservation {
     detection: Detection,
     messaging: Option<PaneMessagingObservation>,
     repaint: bool,
+    recompute_guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl PaneObservation {
-    pub(crate) fn into_parts(self) -> (Detection, Option<PaneMessagingObservation>, bool) {
-        (self.detection, self.messaging, self.repaint)
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Detection,
+        Option<PaneMessagingObservation>,
+        bool,
+        tokio::sync::OwnedMutexGuard<()>,
+    ) {
+        (
+            self.detection,
+            self.messaging,
+            self.repaint,
+            self.recompute_guard,
+        )
     }
 }
 
@@ -3740,7 +3753,7 @@ async fn observe_pane_with_evidence(
     // The map keeps one stable gate per route for the daemon's lifetime so a
     // waiter can never race a newly-created replacement gate.
     let recompute_gate = pane_recompute_gate(inner, &route);
-    let _recompute_guard = recompute_gate.lock().await;
+    let recompute_guard = recompute_gate.lock_owned().await;
     let lifecycle_observation = LifecycleObservation::from_cause(cause);
     let Some(row) = watcher.pane(pane_id) else {
         inner
@@ -4012,6 +4025,7 @@ async fn observe_pane_with_evidence(
             detection: det,
             messaging: None,
             repaint: false,
+            recompute_guard,
         });
     }
 
@@ -4084,6 +4098,7 @@ async fn observe_pane_with_evidence(
                             detection: p,
                             messaging: None,
                             repaint: false,
+                            recompute_guard,
                         });
                     }
                     // Nothing cached describes whoever is in the pane now,
@@ -4763,6 +4778,7 @@ async fn observe_pane_with_evidence(
         detection,
         messaging: messaging_observation,
         repaint: changed,
+        recompute_guard,
     })
 }
 

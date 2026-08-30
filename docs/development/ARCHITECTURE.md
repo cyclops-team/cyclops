@@ -89,10 +89,12 @@ flowchart TD
     RC -->|"list-panes: the authoritative answer"| P["pane table, keyed by pane_id"]
     RW --> P
     P -->|"a row moved, a hook edge arrived,<br/>or a caller asked"| F["fusion"]
-    F -->|"the verdict moved"| O(["state event · ledger line · border repaint"])
+    F -->|"the verdict moved"| S(["state event · ledger line"])
     F -->|"a caller asked"| Q(["status · pane.read · agent.wait · the gate"])
-    F -->|"positive quota-reset evidence"| E["immutable messaging observation"]
-    E --> M["WorkspaceMessaging:<br/>durable reset fact + explicit notice"]
+    F -->|"verdict + optional immutable evidence"| A["apply_pane_observation"]
+    A -->|"first: positive quota-reset evidence"| E["WorkspaceMessaging:<br/>durable reset fact + notice decision"]
+    E --> N["composition root:<br/>durable explicit notice"]
+    A -->|"then, after the durable handoff:<br/>the verdict moved"| O(["border repaint"])
 ```
 
 Notifications are hints, not truth. Truth comes from `list-panes`, and the
