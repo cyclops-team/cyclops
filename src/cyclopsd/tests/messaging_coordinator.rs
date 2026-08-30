@@ -475,6 +475,28 @@ async fn wait_for_human_composer_evidence(rig: &mut Rig, pane: &str) {
     }
 }
 
+async fn wait_for_clean_composer_evidence(rig: &mut Rig, pane: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = rig.ctl.request("status", json!({})).await;
+        let clean = status["result"]["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|session| session["panes"].as_array())
+            .flatten()
+            .any(|row| row["pane_id"] == pane && row["composer"] == "composer_clean");
+        if clean {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pane {pane} did not record clean composer evidence: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn pane_pid(rig: &Rig, pane: &str) -> i64 {
     let output = rig
         .tmux
@@ -1961,7 +1983,11 @@ async fn a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt() 
     rig.label(&pane, "worker").await;
     wait_pane_state(&mut rig, "idle").await;
 
-    let draft = "erase this draft";
+    // One visible character is the smallest draft that exercises the contract:
+    // human input holds the attempt, and Backspace clears that same attempt.
+    // A longer draft made the test enqueue many independent tmux commands before
+    // reaching this boundary, which tested runner scheduling rather than release.
+    let draft = "e";
     rig.tmux.run_ok(&["send-keys", "-l", "-t", &pane, draft]);
     rig.tmux.wait_screen("main", draft);
     wait_for_human_composer_evidence(&mut rig, &pane).await;
@@ -1983,19 +2009,6 @@ async fn a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt() 
         .await;
     let attempts_before = notification_attempts(&rig, &message_id);
     assert_eq!(attempts_before.len(), 1);
-    assert!(!rig
-        .tmux
-        .capture(&pane)
-        .contains(&compact_doorbell(&rig, &message_id)));
-
-    for _ in 1..draft.chars().count() {
-        rig.tmux.run_ok(&["send-keys", "-t", &pane, "BSpace"]);
-    }
-    // `send-keys` acceptance does not prove the pane has consumed every key.
-    // Pin the visible one-character boundary before the final deletion so the
-    // release observation cannot race an input backlog on a busy CI runner.
-    rig.tmux.wait_screen("main", "❯ e");
-    wait_for_human_composer_evidence(&mut rig, &pane).await;
     assert!(!rig
         .tmux
         .capture(&pane)
@@ -2034,6 +2047,11 @@ async fn a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt() 
         })
     });
     rig.tmux.run_ok(&["send-keys", "-t", &pane, "BSpace"]);
+    // Runtime state can remain idle while the composer contains a human draft.
+    // Wait for the daemon's distinct composer projection to cross from
+    // `human_draft` to `composer_clean` before asking whether the held attempt
+    // reopened. Tmux command acceptance and runtime-idle are neither proof.
+    wait_for_clean_composer_evidence(&mut rig, &pane).await;
     tokio::time::timeout(Duration::from_secs(8), prewrite_rx.recv())
         .await
         .expect("final deletion released the human hold")
@@ -2051,7 +2069,10 @@ async fn a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt() 
         released.contains(&expected),
         "staged doorbell was not visible: {released}"
     );
-    assert!(!released.contains(draft));
+    assert!(
+        !released.contains("❯ e"),
+        "cleared human draft remained visible: {released}"
+    );
     assert!(!released.contains("body stays in the mailbox"));
     wait_for_notification_state(&mut rig, &message_id, NotificationState::Staged).await;
     assert_eq!(notification_attempts(&rig, &message_id), attempts_before);

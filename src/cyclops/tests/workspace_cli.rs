@@ -1477,7 +1477,7 @@ fn the_attach_step_follows_whether_you_are_inside_tmux() {
     let inside = Command::new(env!("CARGO_BIN_EXE_cyclops"))
         .env("CYCLOPS_HOME", &home)
         .env("NO_COLOR", "1")
-        .env("TMUX", "/tmp/tmux-501/default,12345,0")
+        .env("TMUX", "/tmp/tmux-501/default,12345,0") // scratch-path-lint: tmux context
         .args(["start"])
         .output()
         .expect("run cyclops");

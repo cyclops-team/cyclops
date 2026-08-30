@@ -6,10 +6,20 @@ on:
   pull_request:
   workflow_dispatch:
 
+# A pull request can only merge its newest revision. Do not spend runner time
+# proving an older revision after a replacement commit arrives. Push and manual
+# evidence use the unique run id, so release or operator-triggered runs are
+# never cancelled by this rule.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Responsibility: conditional integration. The stable `website` check
+  # currently runs for every change.
   website:
     runs-on: ubuntu-latest
     steps:
@@ -27,6 +37,8 @@ jobs:
       - working-directory: website
         run: npm run build
 
+  # Responsibility: required pull-request correctness. The two matrix entries
+  # intentionally retain their stable `test (<os>)` check names.
   test:
     strategy:
       # One platform failing must not cancel the other. Cyclops has real
@@ -80,23 +92,19 @@ jobs:
       - name: docs and binaries agree
         if: ${{ !cancelled() }}
         run: ./tests/e2e/parity-check.sh
-      # F24: every scratch path comes from cyclops_proto::scratch, so the
-      # whole suite has to run with that root relocated or the rule can rot
-      # unnoticed. The binaries are already built; this is a second test
-      # execution, not a second build. On macOS the relocated root is the
-      # code path Linux takes, which is the case that broke CI twice.
+      # F24: the override unit test proves root selection, a syntactic lint
+      # rejects direct temp APIs in real-tmux fixtures, and M0 crosses one
+      # real tmux + daemon socket + scratch-home journey. This replaces a full
+      # duplicate Rust execution that cost about 3m20s per operating system.
       - name: tests with the scratch root relocated
         if: ${{ !cancelled() }}
         env:
           CYCLOPS_TEST_TMP: ${{ runner.os == 'macOS' && '/private/var/tmp/cyc-relocated' || '/tmp/cyc-relocated' }}
-        run: |
-          mkdir -p "$CYCLOPS_TEST_TMP"
-          status=0
-          cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast || status=$?
-          cargo test -p cyclopsd --all-targets --no-fail-fast -- --test-threads=4 || status=$?
-          cargo test --workspace --doc || status=$?
-          exit "$status"
+        run: ./scripts/test-relocated-scratch.sh
 
+  # Responsibility: conditional integration. Both stable `installer (<os>)`
+  # checks currently run for every change.
+  #
   # The installer is what a stranger runs first, so it gets its own gate:
   # build, place the binaries, edit a shell profile, set the home up, then
   # uninstall and prove the profile came back byte for byte. Its own job
@@ -120,6 +128,9 @@ jobs:
           if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y tmux; else brew install tmux; fi
       - run: ./tests/e2e/parity-check.sh --installer-only
 
+  # Responsibility: scheduled evidence. This stable advisory check currently
+  # runs on every pull request.
+  #
   # ADR-001 owns the tmux-churn risk by testing the adapter against tmux HEAD.
   # Failures here are early warning, not merge blockers.
   tmux-head:

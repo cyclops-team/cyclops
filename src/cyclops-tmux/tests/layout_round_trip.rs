@@ -1,7 +1,7 @@
 //! Layouts against a real tmux server: build one, read it back, build the
 //! reading again.
 //!
-//! Every test runs on its own `-L cyc-<tag>-<pid>` server with
+//! Every test runs on its own `-L cyc-<tag>-<pid>-<sequence>` server with
 //! `-f /dev/null`, from `cyclops-testrig`, which also kills it and unlinks
 //! the socket on drop. Nothing here can touch the developer's tmux.
 

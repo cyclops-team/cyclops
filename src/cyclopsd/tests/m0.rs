@@ -2,7 +2,7 @@
 //! daemon booted in-process, an NDJSON client on the Unix socket.
 //!
 //! Never touches the user's tmux: every tmux call carries
-//! `-L cyc-m0-<pid> -f /dev/null` through cyclops-testrig, which kills
+//! `-L cyc-m0-<pid>-<sequence> -f /dev/null` through cyclops-testrig, which kills
 //! the server and unlinks its socket on drop.
 //! Skips cleanly when tmux is not on PATH.
 //!
