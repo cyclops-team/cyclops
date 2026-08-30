@@ -2,9 +2,11 @@
 //!
 //! Blocking CLI and workspace callers and async stream callers differ in how
 //! they wait, not in what socket facts mean. This module owns Hello-first
-//! connection, bounded NDJSON, request correlation, event buffering, refusal
-//! decoding, post-write uncertainty, and subscription gap classification.
-//! Callers choose timeout and reconnect policy and decode domain results.
+//! connection facts, bounded NDJSON, request correlation, event buffering,
+//! timeout classes and their certainty, refusal decoding, post-write
+//! uncertainty, and subscription gap classification. Callers choose or accept
+//! the shared default deadlines. Applications own retry and reconnect
+//! schedules, projection restoration, and domain-result presentation.
 
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};

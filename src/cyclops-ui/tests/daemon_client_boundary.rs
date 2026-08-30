@@ -1,5 +1,10 @@
 //! Structural guards for transport and reusable-presentation ownership.
 //!
+//! `cyclops-client` owns connection facts, framing, correlation, timeout
+//! classification, refusal decoding, post-write uncertainty, and gap signals.
+//! The applications retain retry schedules and projection restoration because
+//! those decisions depend on the state each application presents.
+//!
 //! This guard becomes obsolete when module or crate visibility makes the raw
 //! daemon socket constructor unreachable to official callers, so a second
 //! connection path is impossible to compile instead of merely linted.

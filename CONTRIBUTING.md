@@ -36,17 +36,17 @@ documentation and executed zero doctests.
 ./tests/e2e/messaging-docs-parity.sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+python3 scripts/check-doc-paths.py
 cargo nextest run --workspace -E 'not (package(cyclopsd) | binary_id(=cyclops-ui::perf) | binary_id(=cyclops-ui::queue_perf) | binary_id(=cyclops-workspace::perf_contract))' --no-fail-fast
 cargo test -p cyclopsd --all-targets --no-fail-fast
 cargo doc --workspace --no-deps
-python3 scripts/check-doc-paths.py
 ./tests/e2e/parity-check.sh
 ```
 
 Clippy and the test suite take a few minutes; the rest are usually quick.
 Run formatting and clippy while you work.
 
-One command runs all five in that order, cheapest first, with per-gate
+One command runs the complete gate in that order, cheapest first, with per-gate
 timing: `./scripts/check.sh`. Its `--fast` flag stops after the test
 suite, which is the right pass while iterating; the full run is for the
 moment before a push. Neither changes any flag CI uses.
@@ -92,7 +92,6 @@ $ cyclops start
 ✓ workspace ready · 1 agent
   wrote /private/tmp/cyclops-parity.tMpeYD/home/config.toml
 ...
-== 115/115 checks passed
 == docs and binaries agree
 ```
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The five CI gates, one command, cheapest first.
+# The complete required CI gate, one command, cheapest first.
 #
 # `./scripts/check.sh` is the full pre-push pass; `./scripts/check.sh
 # --fast` stops after the compile-and-test gate for the inner loop. The

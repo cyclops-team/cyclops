@@ -6,10 +6,12 @@ spend a day undoing one.
 
 For current behavior, start with this map and the behavior contracts below.
 The approved [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md)
-records the scope and stop conditions of the completed Messaging Beta Rework.
-[NEXT.md](NEXT.md) records the remaining operator gates, and the
-[Messaging Beta audit](MESSAGING_BETA_AUDIT.md) records the completion
-evidence.
+records Track A's scope and stop conditions. Its seven implementation
+milestones are integrated; focused acceptance corrections remain active.
+[NEXT.md](NEXT.md) is the current whole-beta execution queue. The
+[Messaging Beta audit](MESSAGING_BETA_AUDIT.md) preserves the original
+completion evidence and records the acceptance gaps found by independent
+review.
 
 The
 [messaging architecture review](../MESSAGING_ARCHITECTURE_REVIEW.md) and its
@@ -54,9 +56,9 @@ contracts, and historical records separate:
 | User operation | [User guides](../guides/README.md) | Install, message, monitor, recover, and use the workspace. |
 | Stable reference | [Technical reference](../reference/README.md) | Wire methods, manifests, hooks, and measured performance claims. |
 | Current behavior contracts | [Architecture](ARCHITECTURE.md), [delivery](DELIVERY.md), [invariants](INVARIANTS.md), [protocol](../reference/PROTOCOL.md), [goals](GOALS.md), and [style](STYLE.md) | Read before changing product behavior, wire behavior, rendering, or tests. |
-| Approved implementation authority | [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) | Controls the Messaging Beta Rework when supporting records or historical plans differ. |
-| Current state and operator gates | [NEXT.md](NEXT.md) | Completion status, remaining approvals, and explicit exclusions. |
-| Completed beta audit | [Messaging Beta audit](MESSAGING_BETA_AUDIT.md) | Final architecture, regression, performance, migration, reliability, and journey evidence plus the remaining operator gates. |
+| Approved implementation authority | [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) | Controls Track A when supporting records or historical plans differ. Track 0 will add the whole-product beta charter. |
+| Current execution queue | [NEXT.md](NEXT.md) | Active acceptance work, authorized track order, release boundary, and explicit exclusions. |
+| Messaging beta audit | [Messaging Beta audit](MESSAGING_BETA_AUDIT.md) | Revision-bound architecture, regression, performance, migration, reliability, and journey evidence plus independently found acceptance gaps. |
 | Supporting design records | [Messaging architecture review](../MESSAGING_ARCHITECTURE_REVIEW.md) and [addendum](../ADDENDUM_REVIEW.md) | Reasoning behind the charter, not independent implementation authority. |
 | CI design record | [CI and test architecture review](CI_TEST_ARCHITECTURE_REVIEW.md) | Evidence and rationale behind the implemented [CI contract](CI.md), not messaging authority. |
 | General methodology | [Architecture review method](ARCHITECTURE_REVIEW_PROCESS.md) | Reusable audit process, not a Cyclops behavior contract. |
@@ -115,7 +117,7 @@ are a rule implemented in a crate that should not have known about it.
 | `cyclops-tmux` | **Every tmux invocation in the product.** Control mode, reply correlation, flow control, the zero-polling pane table, layout capture and apply, focus | What an agent is. It has never heard of manifests, deliveries, or the ledger |
 | `cyclops-ledger` | Append, fsync, monotonic seq, torn-tail sealing, the cursor reader | What a line MEANS. The schema is `cyclops-proto`'s |
 | `cyclops-theme` | The semantic token vocabulary, the state-to-group mapping, theme files, selection, the reload rule | Painting. It resolves a token to a color; renderers turn colors into escape sequences |
-| `cyclops-client` | Hello-first daemon connections, bounded frames, request correlation, timeouts, refusal decoding, post-write uncertainty, and stream-gap classification | Domain policy, presentation, reconnect policy, or journal reads |
+| `cyclops-client` | Hello-first daemon connection facts, bounded frames, request correlation, shared timeout defaults and certainty, refusal decoding, post-write uncertainty, and stream-gap classification | Domain policy, presentation, application retry schedules, projection restoration, or journal reads |
 | `cyclopsd` | The daemon: fusion, durable mailboxes, the notification worker, the legacy direct-delivery pipeline, the socket server, sender identity, the adoption registry, pane border chrome, hooks self-test, and journal read side | tmux specifics (adapter), the wire schema (proto), the attention rule (proto). It renders exactly one string: the border format |
 | `cyclops` | The CLI: a thin NDJSON client plus rendering on the shared grid | Business logic. `cyclops list` asks `status` for the roster rather than holding a second one |
 | `cyclops-ui` | Pure stream and messaging presentation models plus the concrete terminal renderer for `cyclops watch` | Daemon framing, journal paths, or tmux effects; it consumes `cyclops-client`, `events.backfill`, and a launcher focus capability |
@@ -335,9 +337,9 @@ GOALS lists PTY hosting as an anti-goal.
 work around, and a lot of `findings.md` is that tax. Control-mode lines are
 not UTF-8 (F22). tmux sanitizes replies for non-UTF-8 clients (F14). Format
 subscriptions tick at 1Hz (F23). A per-pane subscription can never report
-that pane's death (F25). The mitigation is that all of it is confined to
-one adapter crate, and an advisory CI job builds tmux master so the next
-surprise arrives as a warning rather than a bug report.
+that pane's death (F25). The mitigation is that all of it is confined to one
+adapter crate. Focused tmux HEAD evidence runs when adapter-owned inputs change,
+and the complete tmux HEAD gate remains scheduled and available before release.
 
 ### Manifests are data files
 

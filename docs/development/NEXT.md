@@ -1,51 +1,64 @@
-# Current state and operator gates
+# Current beta execution queue
 
-**Status:** Awaiting operator gates
-
-**Implementation authority:**
-[Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md)
+**Status:** Whole-product beta implementation authorized
 
 **Integration branch:** **beta/messaging-rework**
 
-The charter owns rationale, preserved behavior, stop conditions, and rollback
-requirements. This page records the completed state, remaining operator gates,
-and preserved boundaries.
+The approved [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md)
+continues to control Track A behavior and stop conditions. The operator has
+authorized the rest of the whole-product beta program. Track 0 will record that
+authority in `CYCLOPS_BETA_CHARTER.md`; until then, this queue records the
+authorized sequence without reopening already approved Track A decisions.
 
-## Current state
+## Active work
 
-All seven messaging milestones and the three authorized CI tasks are
-integrated. The post-milestone architecture, regression, performance,
-migration, reliability, and user-journey results are recorded in the
-[Messaging Beta audit](MESSAGING_BETA_AUDIT.md).
+Track A's seven implementation milestones are integrated. Acceptance remains
+open for the focused corrections found by the post-completion review:
 
-There is no remaining authorized implementation milestone. The queue is now:
+1. repair source-boundary lints that stopped at early test-only items;
+2. make current status, CI, client responsibility, and evidence language agree;
+3. protect the body-free collapsed cue across detach and a fresh workspace
+   attachment;
+4. route current history and thread knowledge through `WorkspaceMessaging`,
+   keeping cross-journal history behind an explicit compatibility adapter; and
+5. obtain independent review of the corrected claims.
 
-1. reconcile the workspace version, remote tag, and GitHub Release authority;
-2. obtain operator review of the audit and retained release evidence;
-3. obtain explicit operator approval before opening a final pull request from
-   **beta/messaging-rework** into **main**, then obtain approval again before
-   merging it; and
-4. obtain separate operator approval before assigning a version, creating a
-   tag, or publishing a release.
+The active branch is **beta/fix/messaging-beta-audit-integrity**. The read-side
+production seam follows on **beta/refactor/messaging-history-seam** so audit
+repair and durable history behavior remain independent rollback points.
 
-## Branch and review rules
+## Authorized sequence after Track A
 
-- Do not develop directly on **main** or make routine commits directly on
-  **beta/messaging-rework**.
-- Any post-audit correction gets a focused pull request into the integration
-  branch, named regression evidence, review, and a rollback point.
-- Do not merge the beta integration branch into **main** or publish a release
-  without operator approval.
+1. **Track 0:** establish `CYCLOPS_BETA_CHARTER.md`, reconcile documentation
+   authority, and convert the whole-system review into an executable queue.
+2. **Direct user correctness:** non-default tmux focus context, product release
+   identity, and representative user journeys.
+3. **Track C:** workspace interaction and tmux continuity.
+4. **Track D:** presentation and user experience.
+5. **Track F:** CLI, headless use, installation entry path, and product front
+   door.
+6. **Track B:** runtime observation, identity, and attention.
+7. **Track E:** agent integration.
+8. **Track G:** installation, update, health, cleanup, and managed assets.
+9. **Track H:** configuration, durable state, and data lifecycle.
+10. **Track I:** CI, tests, performance, compatibility, and release evidence.
+11. Run the final whole-beta responsibility and user-journey audit.
 
-## Preserved boundaries
+Each slice starts from the latest integration branch, uses one focused beta
+branch and pull request, adds the smallest test that proves its contract,
+receives independent review, and merges only when required checks are green. A
+later track may overlap only when ownership and files do not conflict.
 
-`cyclops-delivery-core` is conceptual shorthand for the modular messaging core,
-not authorization for a crate. Preserve every currently readable journal
-format, `Daemon::deliver_payload` as compatibility-sensitive with support
-status unverified, honest uncertainty, and the interim no-silent-deletion rule.
-No milestone authorizes automatic raw-tmux fallback, a generic broker or
-workflow engine, MCP production work, or a broad rewrite.
+## Release boundary
 
-Release identity remains unresolved: the newest remote tag, GitHub Release
-objects, and the workspace version must be reconciled before naming or
-publishing the beta.
+Do not merge **beta/messaging-rework** into `main`, create or move a release
+tag, assign the final beta version, or publish a release without explicit
+operator approval. Release identity remains unresolved until the workspace
+version, remote tags, installer identity, daemon greeting, and GitHub Release
+authority agree.
+
+Preserve every currently readable journal format, honest uncertainty, the
+interim no-silent-deletion rule, `Daemon::deliver_payload` as
+compatibility-sensitive with public support status unverified, and all three
+messaging visibility choices. No track authorizes automatic raw-tmux fallback,
+a distributed broker, a generic workflow engine, or an unrelated rewrite.

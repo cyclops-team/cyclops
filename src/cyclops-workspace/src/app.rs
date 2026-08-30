@@ -1223,8 +1223,7 @@ pub async fn run_async() -> i32 {
     // model: a workspace quit collapsed would otherwise be declared one
     // sidebar wide and painted another, and the first reconcile would
     // fight the declaration. `chrome_for` is the one geometry both read.
-    model.sidebar_visible = prefs.sidebar_visible;
-    model.messages_visible = prefs.messages_visible;
+    apply_saved_workspace_visibility(&mut model, &prefs);
     let declared_client_size =
         declare_initial_client_size(term_size, &model, &prefs, &sizing, &client, &home).await;
     if declared_client_size.is_some() {
@@ -3905,10 +3904,7 @@ async fn handle_app_msg(
             arm(debounce);
         }
         AppMsg::DaemonReconnected => {
-            resync_daemon_state(app);
-            app.messages_gate.connected();
-            app.messages_gate.mark_dirty();
-            pump_messages_refresh(app);
+            apply_daemon_reconnected(app);
             arm(debounce);
         }
         // E2: per-event, not coalesced with the decoration burst above —
@@ -5993,6 +5989,18 @@ fn resync_daemon_state(app: &mut App) {
     }
 }
 
+/// Rebuild every daemon-owned projection after a new subscription connects.
+///
+/// A fresh workspace process has no prior Messages snapshot to retain, so the
+/// collapsed rail must request the same authenticated body-free projection as
+/// an already-running workspace recovering from a socket gap.
+fn apply_daemon_reconnected(app: &mut App) {
+    resync_daemon_state(app);
+    app.messages_gate.connected();
+    app.messages_gate.mark_dirty();
+    pump_messages_refresh(app);
+}
+
 async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_tmux::TmuxError> {
     let session = app.model.session.session.clone();
     let mut model = fetch_workspace_model(client, &session).await?;
@@ -6173,6 +6181,16 @@ fn install_reconciled_model(
     fresh.sidebar_visible = sidebar_visible;
     fresh.messages_visible = messages_visible;
     *current = fresh;
+}
+
+/// Restore the two visibility choices owned by workspace preferences.
+///
+/// Boot uses this before its first geometry declaration, so a workspace that
+/// was detached with the Messages pane collapsed does not briefly reserve or
+/// paint the expanded rail when it is attached again.
+fn apply_saved_workspace_visibility(model: &mut WorkspaceModel, prefs: &WorkspacePrefs) {
+    model.sidebar_visible = prefs.sidebar_visible;
+    model.messages_visible = prefs.messages_visible;
 }
 
 /// Forward one already-routed input event, retaining its exact target and
@@ -6576,6 +6594,14 @@ impl<B: Backend> RenderOwner<B> {
     }
 }
 
+fn messages_rail_cue(app: &App) -> Option<MessagesRailCue> {
+    app.messages_snapshot_counts.map(|counts| MessagesRailCue {
+        work_messages: counts.work_messages,
+        attention_entries: counts.open_attention_entries,
+        current: app.messages_gate.may_mutate(),
+    })
+}
+
 fn draw<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -6693,11 +6719,7 @@ fn draw<B: Backend>(
                 );
             }
             if let Some(messages_rail) = areas.messages_rail {
-                let cue = app.messages_snapshot_counts.map(|counts| MessagesRailCue {
-                    work_messages: counts.work_messages,
-                    attention_entries: counts.open_attention_entries,
-                    current: app.messages_gate.may_mutate(),
-                });
+                let cue = messages_rail_cue(app);
                 paint_messages_rail(
                     messages_rail,
                     f.buffer_mut(),
@@ -8315,6 +8337,124 @@ mod tests {
             "reconnecting forced the Messages pane open"
         );
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// Protects the body-free cue across a real control-client detach and
+    /// reattach, a fresh `App`, saved visibility restoration, and the actual
+    /// `AppMsg::DaemonReconnected` dispatch. This becomes obsolete when a
+    /// full-binary reattachment journey asserts the same snapshot, cue, and
+    /// visibility contract without broadening its failure meaning.
+    #[tokio::test]
+    async fn a_hidden_workspace_rebuilds_the_collapsed_cue_after_reattach() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-messages-reattach");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "/bin/sh",
+        ]);
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-reattached-messages-cue");
+
+        struct ScratchOwner(std::path::PathBuf);
+        impl Drop for ScratchOwner {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _scratch = ScratchOwner(home.clone());
+
+        let (first_client, _first_rx) = ControlClient::spawn(cfg.clone()).await.expect("attach");
+        let mut first = test_app(one_pane_model(), home.clone());
+        first.prefs.messages_visible = false;
+        first.prefs.messages_width = 41;
+        persist::save_prefs(&home, &first.prefs).expect("save collapsed visibility");
+        current_messages_gate(&mut first);
+        first.messages_snapshot_counts = Some(messages_snapshot(4, 5, 1).counts);
+        assert!(first.messages_gate.may_mutate());
+        first_client.shutdown().await;
+        drop(first);
+
+        let saved = load_prefs(&home);
+        assert_eq!(saved.messages_width, 41, "reattachment did not load prefs");
+        let mut reattached_model = one_pane_model();
+        apply_saved_workspace_visibility(&mut reattached_model, &saved);
+        let mut reattached = test_app(reattached_model, home.clone());
+        reattached.prefs = saved;
+        assert!(
+            !reattached.model.messages_visible,
+            "the fresh workspace preserves the collapsed visibility choice"
+        );
+        assert!(
+            reattached.messages_snapshot_counts.is_none(),
+            "a fresh App cannot reuse another instance's projection"
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        reattached.messages_snapshot_tx = Some(tx);
+
+        let (mut reattached_client, _reattached_rx) =
+            ControlClient::spawn(cfg).await.expect("reattach");
+        let mut debounce = None;
+        let mut reconnect_deadline = None;
+        let mut detached = false;
+        let mut pending_input = None;
+        assert!(
+            handle_app_msg(
+                Some(AppMsg::DaemonReconnected),
+                &mut reattached,
+                &mut reattached_client,
+                &mut debounce,
+                &mut reconnect_deadline,
+                &mut detached,
+                &mut pending_input,
+            )
+            .await,
+            "the reconnect event closed the app channel"
+        );
+        assert!(debounce.is_some(), "the reconnect did not schedule a frame");
+
+        let (request, bound) = rx
+            .try_recv()
+            .expect("reattachment must request the authenticated body-free snapshot");
+        assert_eq!(bound, 128);
+        assert!(install_messages_snapshot(
+            &mut reattached,
+            request,
+            messages_snapshot(9, 2, 1),
+        ));
+        let counts = reattached
+            .messages_snapshot_counts
+            .expect("reattached collapsed cue");
+        assert_eq!(counts.work_messages, 2);
+        assert_eq!(counts.open_attention_entries, 1);
+        assert!(reattached.messages_gate.may_mutate());
+        assert_eq!(
+            messages_rail_cue(&reattached),
+            Some(MessagesRailCue {
+                work_messages: 2,
+                attention_entries: 1,
+                current: true,
+            })
+        );
+        assert!(
+            !reattached.model.messages_visible,
+            "reattachment forced the Messages pane open"
+        );
+        reattached_client.shutdown().await;
     }
 
     fn messages_test_caller() -> cyclops_proto::RecipientKey {

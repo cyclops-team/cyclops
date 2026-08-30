@@ -107,10 +107,12 @@ projection maps, locks, worker topology, crash cuts, and compatibility state
 from ordinary callers. A Participant Directory supplies exact identities. A
 Pane Observer supplies immutable evidence. Optional runners and host adapters
 execute bounded activation work only after separate probes justify them. One
-Daemon Client contract supplies every official client with the same framing,
-correlation, timeout, uncertainty, gap, reconnect, and recovery semantics.
-Presentation derives authorized views without knowing journal paths, socket
-framing, tmux commands, or daemon locks.
+Daemon Client contract supplies every official client with the same connection
+facts, framing, correlation, timeout classes, uncertainty, and gap semantics.
+Callers choose or accept shared default deadlines. Applications own their retry
+schedules and authoritative projection restoration. Presentation derives
+authorized views without knowing journal paths, socket framing, tmux commands,
+or daemon locks.
 
 This target keeps complexity that answers a named failure: durable acceptance,
 idempotency, exact identity, recipient FIFO, strict replay, guarded external
@@ -161,7 +163,7 @@ type for every row.
 | Notification adapter | One guarded human-visible notification attempt and its explicit outcome | Mailbox truth, claim truth, model execution, or completion |
 | Agent Runner | Optional acquisition of body-free activation work and one bounded turn request | Message bodies, mailbox policy, caller identity invention, retry policy, or completion inference |
 | Agent Host Adapter | Translation of an exact activation request into one real host control path and only the outcomes and visibility that host proves | Durable policy, claims, replies, or generic workflow management |
-| Daemon Client | Connection, greeting, frame contract, correlation, timeout classes, known-not-sent versus unknown-after-send, gaps, reconnect, and authoritative recovery | Domain policy or presentation |
+| Daemon Client | Connection facts, greeting, frame contract, correlation, shared timeout defaults and classification, known-not-sent versus unknown-after-send, and gap signals | Domain policy, presentation, application retry schedules, or projection restoration |
 | Presentation | Reconstructable view models, explicit actions, full and compact views, and host-visible orientation | Journal paths, socket framing, tmux commands, daemon locks, or storage topology |
 | Raw emergency lane | Explicit operator-directed, exact-pane, unrecorded recovery outside the Cyclops contract | Automatic fallback, receipts, ordering, replay, claim, or completion |
 
@@ -181,7 +183,7 @@ Execution details stay inside adapters.
 | Activation intent | Exact recipient and host generation plus opt-in policy select one bounded attempt | Runner and host adapter report only proven host outcomes |
 | Recovery action | Intent is recorded before any external effect | Evidence settles the same attempt without erasing its history or inventing success |
 | Durable change | Commit remains authoritative | A body-free invalidation may wake clients; authorized snapshots or durable follow return truth |
-| Subscriber gap or reconnect | Client marks its projection stale | Daemon Client obtains an authoritative snapshot or durable follow page before re-enabling mutation |
+| Subscriber gap or reconnect | Daemon Client classifies the transport gap; the application marks its projection stale | The application obtains an authoritative snapshot or durable follow page before re-enabling mutation |
 
 These syncs allow one transaction where invariants require one. They do not
 require a distributed transaction protocol or generic event bus.
@@ -219,7 +221,7 @@ All findings below were checked at the reviewed revision.
 | Dispatch ACK confirmation leaves observation as immutable data | Fusion returns exact route, process, manifest, turn, and causal-time evidence after the cache commit and any state event. The composition root applies that body-free evidence through the retained delivery mechanism before ordered messaging observations and presentation. Fusion can no longer access delivery handles or confirm their state, and a deletion lint protects the boundary. | Verified behavior and post-commit ordering preserved by the Milestone 4 dispatch-ACK evidence correction |
 | Current and legacy delivery still coexist | Normal `msg.send` uses the mailbox path. Hook self-test and `Daemon::deliver_payload` cross the explicit compatibility boundary before the retained direct writer. | Repository and local-install census complete; external embedder use unverified |
 | Historical replay has real obligations | Formats 1 and 2, original doorbells, incomplete bindings, legacy direct payloads, and the replay-only historical `Staged` to `Submitted` transition remain readable under explicit restrictions. | Verified compatibility obligation |
-| Official transports share uncertainty knowledge | `cyclops-client` owns greeting, bounded frames, response correlation, timeout classes, refusal decoding, post-write uncertainty, and stream gaps for CLI, stream UI, and workspace callers. | Verified behavior preserved by Milestone 2 and physically isolated in Milestone 6 |
+| Official transports share uncertainty knowledge | `cyclops-client` owns greeting, bounded frames, response correlation, shared timeout defaults and classification, refusal decoding, post-write uncertainty, and stream gaps for CLI, stream UI, and workspace callers. Applications own retry schedules and projection restoration. | Verified behavior preserved by Milestone 2 and physically isolated in Milestone 6 |
 | Headless runtime and build independence differ | `cyclopsd` has no production UI dependency. The public `cyclops` binary depends on both UI crates. | Runtime independence verified; build independence incomplete |
 | Reusable presentation consumes named adapters | `cyclops-client` owns Unix-socket mechanics, `events.backfill` keeps journal traversal in the daemon, and the launcher supplies the stream UI's optional pane-focus effect. `cyclops-ui` has no production dependency on `cyclops-ledger`, `cyclops-state`, or `cyclops-tmux`; dependency and source lints protect the boundary. | Verified presentation seam corrected by Milestone 6 |
 | Hidden-view visibility has three intentional journeys | The full-screen workspace refreshes authenticated body-free message counts while hidden and projects Work, attention, and stale or unknown state on its collapsed rail without opening the pane. Adopted tmux panes retain their body-free `✉ N` border count. A deliberately chrome-free native view retains manual inbox inspection and no Cyclops chrome. | Verified behavior preserved by Milestone 7 |
@@ -435,18 +437,22 @@ No broad CI redesign is a prerequisite for the first messaging milestone. That
 milestone needs only its deterministic contract evidence and the existing
 repository gates. CI changes remain separately reviewable.
 
-| CI or test finding | Current classification | Decision for Milestone 1 |
+The Milestone 1 decision stayed deliberately narrow. The later CI workstream
+has since resolved or reclassified these findings as recorded in the current
+[CI contract](CI.md):
+
+| CI or test finding | Milestone 1 decision | Current disposition |
 |---|---|---|
-| Duplicate full suite under `CYCLOPS_TEST_TMP` | Independently actionable after replacement mutation evidence | Out of scope; do not delete the duplicate leg yet |
-| Superseded-run cancellation | Independently actionable CI improvement | Out of scope; may ship separately |
-| Interrupted fixture cleanup | Independently actionable CI improvement | Out of scope; add exact run-id ownership separately, never broad cleanup |
-| Semantic source-text scans | Later domain-test migration | Preserve simple syntactic lints; replace semantic scans only after an Interface makes duplication inaccessible |
-| Chronology-shaped test files | Later domain-test migration | No moves, merges, or deletion based on names |
-| Performance and soak in correctness lanes | Later migration plus scheduled evidence | Distinguish active correctness from measurement and true opt-in soak before moving anything |
-| Full macOS matrix | Measurement required | Preserve until a named portability set proves equal fault detection |
-| Zero doctests | Independently actionable CI improvement | Live bounded probe listed zero doctests; removal is still a separate gate/docs change |
-| Unconditional website, installer, and tmux-HEAD jobs | Independently actionable path-selectivity improvement | Out of scope; keep stable required status semantics if changed later |
-| Missing retained performance history | Scheduled evidence | Out of scope; add stable workload and environment facts later |
+| Duplicate full suite under `CYCLOPS_TEST_TMP` | Out of scope until focused replacement evidence existed | Removed after override, path-lint, and relocated daemon/socket/tmux contracts replaced it |
+| Superseded-run cancellation | Ship separately | Implemented for pull-request revisions; manual and push evidence use distinct non-cancelling keys |
+| Interrupted fixture cleanup | Add exact ownership separately, never broad cleanup | Each test executable has an external exact-name owner; interruption evidence proves cleanup without touching a neighboring server |
+| Semantic source-text scans | Preserve syntactic rules; do not present scans as runtime proof | Retained scans are labeled syntactic or explicitly limited; runtime contracts use domain and adapter evidence |
+| Chronology-shaped test files | Do not move or delete tests based on names | No blanket reorganization was performed; consolidation still requires a stronger contract with the same failure meaning |
+| Performance and soak in correctness lanes | Move only after replacement lanes exist | Ordinary nextest excludes performance executables; scheduled and release lanes own performance, soak, and repeated-race evidence |
+| Full macOS matrix | Preserve until named portability evidence exists | Named platform or tmux changes select macOS on pull requests; the full matrix runs on schedule and for release |
+| Zero doctests | Remove only with documentation-compilation replacement | `cargo test --doc` was replaced by `cargo doc --workspace --no-deps` |
+| Unconditional website, installer, and tmux-HEAD jobs | Keep stable required status semantics if made selective | Stable checks use path-aware execution and return explicit successful not-applicable results |
+| Missing retained performance history | Add stable workload and environment facts separately | Scheduled and release artifacts retain commit, environment, version, workload, and timing metadata |
 
 Tests may be removed only when a stronger, cheaper proof is demonstrated against
 the original defect or durable contract. Count, line count, and naming are not
@@ -460,7 +466,7 @@ Each milestone must leave the repository coherent if all later work stops.
 |---|---|---|
 | Documentation prerequisite | Repair authority, navigation, terminal-safety wording, and the raw emergency doctrine without production changes | Documentation checker reports zero broken references and zero unindexed retained pages; review proves no production file changed |
 | Milestone 1 | Enforce one bounded frame contract at every official ingress and egress | Fully specified in section 16 |
-| Milestone 2 | Consolidate greeting, framing, correlation, timeout, uncertainty, gap, and recovery semantics behind one Daemon Client Interface | Blocking and async contract suites plus unchanged CLI, stream, and workspace journeys |
+| Milestone 2 | Consolidate connection facts, greeting, framing, correlation, shared timeout defaults and classification, uncertainty, and gap semantics behind one Daemon Client Interface while applications retain retry schedules and projection restoration | Blocking and async contract suites plus unchanged CLI, stream, and workspace journeys |
 | Milestone 3 | Put one current durable operation family behind an internal `WorkspaceMessaging` Interface | Caller loses journal, projection, worker, and post-commit scheduling knowledge; current durable trace remains byte- and outcome-equivalent |
 | Milestone 4 | Move one observation-to-messaging consequence family out of fusion | Pane Observer returns immutable evidence; a domain trace proves the same durable consequences and tmux behavior |
 | Milestone 5 | Quarantine proven legacy writers and readers behind an explicit compatibility path | Caller census, replay fixtures, and restart traces define the supported history boundary |
@@ -641,22 +647,23 @@ then the existing protocol/client tests that exercise hello, request, response,
 event, snapshot, and follow framing. Demonstrate that the new tests fail against
 the old uncapped daemon and CLI for the intended reason.
 
-**Repository gates.** After narrow evidence is green, run the existing five
-gates in repository order:
+**Repository gates.** After narrow evidence is green, run the current local
+gate in repository order. [CONTRIBUTING.md](../../CONTRIBUTING.md) and the
+[CI contract](CI.md) are the operational authorities when commands change:
 
 ```bash
-cargo fmt --all
+./tests/e2e/messaging-docs-parity.sh
+cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
-cargo test -p cyclopsd --all-targets --no-fail-fast
-cargo test --workspace --doc
 python3 scripts/check-doc-paths.py
+cargo nextest run --workspace -E 'not (package(cyclopsd) | binary_id(=cyclops-ui::perf) | binary_id(=cyclops-ui::queue_perf) | binary_id(=cyclops-workspace::perf_contract))' --no-fail-fast
+cargo test -p cyclopsd --all-targets --no-fail-fast
+cargo doc --workspace --no-deps
 ./tests/e2e/parity-check.sh
 ```
 
-The listed commands reflect the repository’s current split gate even though it
-is commonly described as five core gates. Installer parity is required only if
-an installer changes, which this milestone forbids.
+Installer parity is required only if an installer changes, which this milestone
+forbids.
 
 **Rollback condition.** Revert the complete milestone if any in-envelope
 official request changes meaning, an accepted row becomes unreadable after
@@ -685,11 +692,13 @@ crate, or implement a runner, host adapter, or MCP adapter.
 
 ## 17. Regression evidence and repository gates
 
-Every later milestone must name one durable or user-visible contract, show the
-new evidence failing against the pre-change implementation for the intended
-reason, and use the least expensive honest seam. Pure decisions do not boot
-tmux. Tmux claims use an isolated real tmux server. Race claims use existing
-fault cuts or explicit events rather than sleeps.
+Every later milestone must name one durable or user-visible contract and use
+the least expensive honest seam. Record fail-before evidence when it exists.
+Otherwise explain how the current regression protects the original defect or
+durable contract, and use a small local simulation when practical without
+building general mutation infrastructure. Pure decisions do not boot tmux.
+Tmux claims use an isolated real tmux server. Race claims use existing fault
+cuts or explicit events rather than sleeps.
 
 The minimum evidence stack is:
 
@@ -701,17 +710,18 @@ The minimum evidence stack is:
 5. existing documentation parity when exact output or command shapes changed.
 
 Each retained test must have one reason to fail, own every resource it creates,
-and state what would make it obsolete. A test is not deleted until its
-replacement is demonstrated against the original defect.
+and state what would make it obsolete. A test is not deleted until replacement
+evidence protects the original defect or durable contract.
 
-After narrow tests, production milestones run the repository gates quoted in
-section 16 with `--no-fail-fast`. Tmux tests run outside tmux. A change to either
-installer also requires byte-identical installer copies and parity with
-`--with-installer`. Website checks apply only to an explicitly approved website
-change.
+After narrow tests, production milestones run the current repository gate from
+[CONTRIBUTING.md](../../CONTRIBUTING.md) with `--no-fail-fast`. Tmux tests run
+outside tmux. A change to either installer also requires byte-identical
+installer copies and parity with `--with-installer`. Website checks apply only
+to an explicitly approved website change.
 
-No full product suite was run to produce this charter. The only live Cargo probe
-listed doctests and reported zero across the workspace.
+No full product suite was run to produce this charter. At charter approval, the
+only live Cargo probe listed zero doctests. The implemented CI contract now uses
+`cargo doc --workspace --no-deps` for documentation compilation.
 
 ## 18. Rollback and stop conditions
 

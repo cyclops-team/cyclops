@@ -4693,36 +4693,35 @@ fn quota_reset_probe_needed(prior_screen_clear: bool, current: &Detection) -> bo
     !prior_screen_clear && positive_quota_reset_observation(current)
 }
 
-/// Hold recovered runtime state until its retirement fact is durable.
-///
-/// The only transition allowed before then ends a turn that was already
-/// running when the barrier was restored. That turn cannot consume the staged
-/// payload, so recovery waits in `Staged` for the next exact start.
-#[cfg(test)]
-fn recovery_hold_before_durable_retirement(
-    action: Option<&crate::composer_recovery::RecoveryAction>,
-    hold: ComposerHold,
-    detection: &Detection,
-) -> Option<ComposerHold> {
-    let action = action?;
-    Some(
-        if matches!(action, crate::composer_recovery::RecoveryAction::Restore(_))
-            && hold == ComposerHold::StagedDuringTurn
-            && detection.turn_running_at().is_none()
-        {
-            ComposerHold::Staged
-        } else {
-            hold
-        },
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::StdMutex;
     use std::collections::HashMap;
     use std::path::Path;
+
+    /// Hold recovered runtime state until its retirement fact is durable.
+    ///
+    /// The only transition allowed before then ends a turn that was already
+    /// running when the barrier was restored. That turn cannot consume the
+    /// staged payload, so recovery waits in `Staged` for the next exact start.
+    fn recovery_hold_before_durable_retirement(
+        action: Option<&crate::composer_recovery::RecoveryAction>,
+        hold: ComposerHold,
+        detection: &Detection,
+    ) -> Option<ComposerHold> {
+        let action = action?;
+        Some(
+            if matches!(action, crate::composer_recovery::RecoveryAction::Restore(_))
+                && hold == ComposerHold::StagedDuringTurn
+                && detection.turn_running_at().is_none()
+            {
+                ComposerHold::Staged
+            } else {
+                hold
+            },
+        )
+    }
 
     fn pane() -> PaneKey {
         PaneKey::new(0, "%1")
