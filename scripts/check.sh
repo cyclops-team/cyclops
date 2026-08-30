@@ -29,13 +29,16 @@ stage() {
     printf '   %ss\n' "$(( $(date +%s) - start ))"
 }
 
-# Both halves of the Rust gate run even when the first fails, so one pass
-# reports every failure; the stage fails if either did. Same as CI.
+# All parts of the Rust gate run even when an earlier part fails, so one pass
+# reports every failure; the stage fails if any did. Same as CI. Performance
+# executables belong to the retained scheduled and release evidence lanes.
 rust_tests() {
     status=0
-    cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast || status=$?
+    cargo nextest run --workspace \
+        -E 'not (package(cyclopsd) | binary_id(=cyclops-ui::perf) | binary_id(=cyclops-ui::queue_perf) | binary_id(=cyclops-workspace::perf_contract))' \
+        --no-fail-fast || status=$?
     cargo test -p cyclopsd --all-targets --no-fail-fast || status=$?
-    cargo test --workspace --doc || status=$?
+    cargo doc --workspace --no-deps || status=$?
     return "$status"
 }
 

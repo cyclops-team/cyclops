@@ -26,16 +26,19 @@ cargo install cargo-nextest --locked --version 0.9.100
 
 ## The loop
 
-Five gates, in this order. They are the same five core CI gates, so a green
-run here is a green run there. The Rust test gate uses nextest for executable
-tests and Cargo for doctests, which nextest does not run.
+The full local gate runs the same required correctness contracts as CI.
+Performance executables are retained in scheduled and release evidence instead
+of running as ordinary correctness tests. The Rust documentation step compiles
+the complete workspace directly; the former doctest command built the same
+documentation and executed zero doctests.
 
 ```bash
-cargo fmt --all
+./tests/e2e/messaging-docs-parity.sh
+cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
+cargo nextest run --workspace -E 'not (package(cyclopsd) | binary_id(=cyclops-ui::perf) | binary_id(=cyclops-ui::queue_perf) | binary_id(=cyclops-workspace::perf_contract))' --no-fail-fast
 cargo test -p cyclopsd --all-targets --no-fail-fast
-cargo test --workspace --doc
+cargo doc --workspace --no-deps
 python3 scripts/check-doc-paths.py
 ./tests/e2e/parity-check.sh
 ```
@@ -204,29 +207,32 @@ disk, and that is where the bugs were.
 
 ## What CI runs
 
-`.github/workflows/ci.yml`, on ubuntu-latest and macos-latest, with
-`fail-fast: false` so one platform failing cannot cancel the other and
-throw away the signal that tells a portability bug from a real regression.
-The current lane responsibilities, stable check names, and measured beta
-baseline are recorded in [CI evidence lanes and baseline](docs/development/CI.md).
+`.github/workflows/ci.yml` keeps six stable pull-request check names. A path
+classifier sends each change to the cheapest honest evidence and makes every
+conditional check report a successful not-applicable result when its inputs did
+not change. The full matrix and expensive reliability work remain inspectable
+in the scheduled and release workflows. Responsibilities, commands, and the
+measured beta baseline are recorded in
+[CI evidence lanes and baseline](docs/development/CI.md).
 
 | Step | Fails when |
 |---|---|
 | `cargo fmt --all --check` | Formatting drifted |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Any lint fires, including in tests |
-| `cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast` | Any parallel-safe test fails, on either OS |
+| `cargo nextest run --workspace` with the normal-PR filter | Any parallel-safe correctness test fails; retained performance executables are excluded |
 | `cargo test -p cyclopsd --all-targets --no-fail-fast` | Any daemon test fails under its process-isolated rig contract |
-| `cargo test --workspace --doc` | A Rust doctest fails |
+| `cargo doc --workspace --no-deps` | Workspace Rust documentation fails to compile |
 | `python3 scripts/check-doc-paths.py` | A doc points at a file this repo does not have, or a page exists that no front door links to. `--selftest` proves the checker still catches, so a green run cannot mean it stopped looking |
+| `./tests/e2e/messaging-docs-parity.sh` | Messaging authority or terminology drifts into a known stale or contradictory form |
 | `./tests/e2e/parity-check.sh` | A doc quotes output the binaries no longer print |
 | `./scripts/test-relocated-scratch.sh` with `CYCLOPS_TEST_TMP` set | Root selection broke, a real-tmux fixture bypassed the helper, or the relocated tmux/daemon/socket journey failed (F24) |
 | `./tests/e2e/parity-check.sh --with-installer` | `scripts/install.sh` stopped doing what install.md says, or left a shell profile changed after `--uninstall`. Its own job: it does a release build |
 | `cmp scripts/install.sh website/static/install.sh`, then `npm run check` and `npm run build` in `website/` | The hosted installer drifted from the tested installer, or the website no longer type-checks or builds |
 
-Another job builds tmux from master and runs the suite against it. It is
-`continue-on-error`, so it warns rather than blocks: tmux is not this
-repo's to fix. It has earned its keep once already (F25), so when it goes
-red, read it rather than assuming it is the usual noise.
+The stable `tmux-head` pull-request check runs a focused adapter contract when
+tmux-owned inputs change. The scheduled workflow builds tmux from master and
+runs the full fast gate. The pull-request check remains advisory because tmux
+is not this repo's to fix, but a red result still needs inspection (F25).
 
 Local green plus red CI is not a flaky-CI story until the logs say so.
 
