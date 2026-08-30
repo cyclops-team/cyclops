@@ -398,3 +398,14 @@ No defect class is silently discarded. Performance, soak, repeated-race, full
 matrix, and full tmux HEAD evidence move to scheduled or release ownership.
 Ordinary pull requests keep the cheapest evidence that can honestly fail for
 their changed contract.
+
+The final Messaging Milestone 7 pull-request run
+[33329987959](https://github.com/cyclops-team/cyclops/actions/runs/33329987959)
+completed in 7m47s wall time and 15m16s runner time. Against the Task 1
+baseline, that is 26.8% less wall time and 53.0% fewer runner minutes. The
+post-merge scheduled run
+[33330374062](https://github.com/cyclops-team/cyclops/actions/runs/33330374062)
+then passed the full platform matrix, tmux HEAD, performance, repeated-race,
+soak, cleanup, and long-history lanes at exact integration commit `7de5ac8a`.
+The [Messaging Beta audit](MESSAGING_BETA_AUDIT.md) records the final product
+and release evidence.
