@@ -2420,7 +2420,7 @@ fn wake_readiness(
     det: &Detection,
     route_evidence: Option<&NotificationRouteEvidenceId>,
 ) {
-    let decision = readiness_wake_decision(prior.as_ref(), &now);
+    let decision = readiness_wake_plan(prior.as_ref(), &now, route_evidence.is_some());
     if decision.emit_public {
         inner.emit(
             "readiness",
@@ -2486,6 +2486,23 @@ fn readiness_wake_decision(
         emit_public: public_changed,
         reconcile_route: prior.is_none() || public_changed || staged_changed,
     }
+}
+
+fn readiness_wake_plan(
+    prior: Option<&ReadinessKey>,
+    now: &ReadinessKey,
+    has_route_evidence: bool,
+) -> ReadinessWakeDecision {
+    let mut decision = readiness_wake_decision(prior, now);
+    // A tokenless observer may publish a positive tuple before the causal
+    // source's serialized recompute reaches this point. The supplied source
+    // token is still new positive evidence even when that earlier observer
+    // made the tuple look unchanged. Durable route reconciliation is
+    // idempotent under the token, so never let the cache ordering consume a
+    // write-ready or owned-staged source edge. Unchanged negative observations
+    // remain quiet.
+    decision.reconcile_route = has_route_evidence && (decision.reconcile_route || now.0 || now.2);
+    decision
 }
 
 /// Keep a pane's last verdict after its capture failed, as a refusal.
@@ -5012,6 +5029,27 @@ line_regex = ['^ACTIVE']
 
         wake_readiness_after_mutation(&inner, 0, pane_id, held, ready_key, &ready);
         assert_eq!(inner.route_evidence_id(0, pane_id).generation, 1);
+    }
+
+    #[test]
+    fn causal_route_evidence_survives_an_earlier_tokenless_readiness_observation() {
+        let held: ReadinessKey = (false, Some("composer_hold".to_string()), false);
+        let ready: ReadinessKey = (true, None, false);
+
+        let tokenless = readiness_wake_plan(Some(&held), &ready, false);
+        assert!(tokenless.emit_public);
+        assert!(!tokenless.reconcile_route);
+
+        let causal_follow_up = readiness_wake_plan(Some(&ready), &ready, true);
+        assert!(!causal_follow_up.emit_public);
+        assert!(
+            causal_follow_up.reconcile_route,
+            "a causal source token must not be consumed by an earlier tokenless observer"
+        );
+
+        let unchanged_negative = readiness_wake_plan(Some(&held), &held, true);
+        assert!(!unchanged_negative.emit_public);
+        assert!(!unchanged_negative.reconcile_route);
     }
 
     #[test]

@@ -99,6 +99,18 @@ between re-evaluations remain buffered. The focused Backspace regression passed
 contains no timing sleep; the 20-second phase timeout only bounds a missing
 contract event under four concurrent isolated rigs on a cold shared runner.
 
+A later required Linux run exposed a distinct ordering race in the same
+regression. A tokenless observer could publish the positive readiness tuple
+before the serialized source recompute carrying the Backspace route token. The
+source recompute then saw an unchanged tuple and suppressed reconciliation,
+leaving the durable attempt held forever. The wake plan now preserves positive
+write-ready or owned-staged causal route evidence while tokenless observers
+remain observational and unchanged negative observations remain quiet. A
+focused two-observation unit regression simulates that ordering without
+timing, tmux, or a mutation framework. After the repair, the real Backspace
+journey passed 40 bounded concurrent repetitions and the current 41-test
+messaging coordinator passed 10 bounded four-thread repetitions.
+
 ## Task 3 representative pull-request comparison
 
 Messaging Milestone 3 provided the first post-merge product change whose diff

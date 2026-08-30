@@ -388,6 +388,12 @@ includes a `CurrentCommand` edge when an exec-in-place changes the foreground
 command or selected manifest without changing the pane root or readiness tuple.
 Tokenless lifecycle, status, and inspection recomputes may publish a readiness
 change, but they neither advance route evidence nor reconcile delivery.
+When a later serialized source recompute supplies its causal token, a positive
+write-ready or owned-staged observation still reconciles the route even if the
+tokenless observer already made the cached readiness tuple identical. The
+durable token comparison makes this idempotent and prevents observation
+ordering from consuming the positive source edge. An unchanged negative
+observation remains quiet.
 The immediate post-append reconciliation also reuses the current identity, so
 unchanged evidence is a no-op while an edge that raced ahead of the append is not
 lost. A later generation may reopen even when its complete process binding is
