@@ -190,6 +190,28 @@ focused test passed 50 bounded repetitions. No timeout increased, no sleep was
 added, and renderer coverage remains in the renderer and workspace journey
 suites that own it.
 
+Required macOS runs
+[33326744941](https://github.com/cyclops-team/cyclops/actions/runs/33326744941)
+and
+[33329043584](https://github.com/cyclops-team/cyclops/actions/runs/33329043584)
+exposed a second repeated false dependency in
+`selftest_verifies_with_simulated_hook_edge`. The self-test had already
+recorded and verified the simulated hook edge, but its final assertion called
+the socket `status` command. That command first attempts a separately bounded
+250 ms live tmux refresh and correctly returns
+`status_refresh_incomplete` when the refresh cannot finish. Treating that
+honest uncertainty as a missing hook edge coupled the regression to unrelated
+runner scheduling.
+
+The regression now reads the daemon's cached status projection directly for
+the `hooks_verified` assertion. The existing `hooks.verify` request still
+checks the public hook-liveness path. A small local simulation that forced the
+cached projection to report `hooks_verified = false` made the replacement
+fail at the intended assertion. Restored, the focused self-test passed 100
+bounded runs at 16-way process concurrency, and the complete five-test hook
+suite passed 20 bounded runs at four-way process concurrency. No production
+code changed, no timeout increased, and no sleep was added.
+
 ## Task 3 representative pull-request comparison
 
 Messaging Milestone 3 provided the first post-merge product change whose diff

@@ -116,8 +116,13 @@ async fn selftest_verifies_with_simulated_hook_edge() {
     // runnable `cyclops hooks install <manifest> --agent <target>`.
     assert_eq!(result["manifest"], "fix", "{result}");
 
-    // Liveness flipped: status and verify both see the edge now.
-    let status = rig.ctl.request("status", json!({})).await;
+    // Liveness flipped: the cached status projection and verify both see the
+    // edge now. Use the in-process status projection here because the socket
+    // `status` command first performs a separately bounded live tmux refresh.
+    // An overloaded runner may honestly refuse that refresh with
+    // `status_refresh_incomplete`; that says nothing about whether the hook
+    // edge was recorded.
+    let status = json!({"result": rig.daemon.status(false)});
     assert_eq!(status_pane(&status)["hooks_verified"], true, "{status}");
     let verify = rig
         .ctl
