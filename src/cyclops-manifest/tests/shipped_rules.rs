@@ -33,6 +33,7 @@ fn shipped_composer_semantics_match_measured_rules_only() {
         ("codex", "approval_cancelled_terminal", GhostSuggestion),
         ("codex", "composer_empty_or_ghost", Ambiguous),
         ("cursor", "composer_typed_input", HumanInput),
+        ("cursor", "composer_clean_idle", Clean),
         ("cursor", "composer_ghost_or_empty", Ambiguous),
         ("cursor", "composer_plain_fallback", Ambiguous),
         ("agy", "composer_empty", Clean),
@@ -949,6 +950,82 @@ fn cursor_working_outranks_the_live_composer_placeholder() {
     assert!(working.priority > ghost.priority);
 }
 
+/// MEASURED 2026-08-30 (cursor-agent 2026.08.25-3e8eec8, live 49x15 pane):
+/// a runtime-idle Cursor pane at a clean 'Add a follow-up' composer read
+/// `ambiguous` from composer_ghost_or_empty and the daemon held its wake on
+/// no_write_safe_composer_evidence forever — a reviewer → tests handoff sat
+/// pending against a visibly idle pane. This exact capture is the repro.
+/// composer_clean_idle must win it, and must carry `clean`: an end-anchored
+/// escaped rule proves the composer line holds nothing but the dim
+/// placeholder frame and background paint.
+///
+/// The counter-half is just as load-bearing: mid-turn Cursor paints
+/// 'ctrl+c to stop' on the SAME composer line, and mid-turn injection is
+/// unmeasured, so the clean rule must NOT match the working capture — those
+/// frames stay on composer_ghost_or_empty's `ambiguous`, fail-closed.
+#[test]
+fn cursor_clean_idle_composer_is_write_safe_and_never_matches_mid_turn() {
+    let all = shipped();
+    let cursor = &all["cursor"];
+    let plain = include_str!("fixtures/cursor_clean_idle_composer_plain.txt");
+    let esc = include_str!("fixtures/cursor_clean_idle_composer_esc.txt");
+
+    let r = cursor
+        .evaluate_esc("Test Verification Agent", plain, Some(esc))
+        .expect("clean idle capture must resolve");
+    assert_eq!(r.id, "composer_clean_idle");
+    assert_eq!(r.state, AgentState::Idle);
+    assert_eq!(
+        r.composer_semantic,
+        Some(ComposerSemantic::Clean),
+        "the clean idle composer is the write-safe evidence the wake gate needs"
+    );
+
+    // Without the escaped capture the clean rule fails closed: the plain
+    // glyph cannot separate a placeholder from typed text, and the fallback
+    // stays ambiguous.
+    let r = cursor
+        .evaluate("Test Verification Agent", plain)
+        .expect("plain capture must still resolve");
+    assert_eq!(r.id, "composer_plain_fallback");
+    assert_eq!(r.composer_semantic, Some(ComposerSemantic::Ambiguous));
+
+    // The pre-first-turn placeholder ('Plan, search, build anything') is the
+    // same styling frame; the clean rule must survive the text change.
+    let ghost_plain = include_str!("fixtures/cursor_ghost_composer_plain.txt");
+    let ghost_esc = include_str!("fixtures/cursor_ghost_composer_esc.txt");
+    let clean = cursor
+        .rules
+        .iter()
+        .find(|r| r.id == "composer_clean_idle")
+        .expect("composer_clean_idle rule");
+    assert!(clean.matches_esc(
+        ghost_plain,
+        &non_empty(ghost_plain),
+        Some(&non_empty(ghost_esc))
+    ));
+
+    // Mid-turn: the working capture's composer line carries the dim
+    // placeholder AND 'ctrl+c to stop'; the end anchor must refuse it so a
+    // generating pane never gains write-safe composer evidence.
+    let working_plain = include_str!("fixtures/cursor_working_composer_plain.txt");
+    let working_esc = include_str!("fixtures/cursor_working_composer_esc.txt");
+    assert!(!clean.matches_esc(
+        working_plain,
+        &non_empty(working_plain),
+        Some(&non_empty(working_esc))
+    ));
+
+    // And the typed draft never matches: its glyph is not dim.
+    let typed_plain = include_str!("fixtures/cursor_typed_composer_plain.txt");
+    let typed_esc = include_str!("fixtures/cursor_typed_composer_esc.txt");
+    assert!(!clean.matches_esc(
+        typed_plain,
+        &non_empty(typed_plain),
+        Some(&non_empty(typed_esc))
+    ));
+}
+
 /// MEASURED 2026-08-05, SAFETY: answering Cursor's workspace-trust dialog
 /// does NOT clear it from the screen. "Do you trust the contents of this
 /// directory?" is still on the pane long after the agent is idle and taking
@@ -1031,10 +1108,14 @@ fn cursor_ghost_vs_typed_probed_fixtures() {
     let typed_plain = include_str!("fixtures/cursor_typed_composer_plain.txt");
     let typed_esc = include_str!("fixtures/cursor_typed_composer_esc.txt");
 
+    // Since composer_clean_idle (2026-08-30) the at-rest placeholder screen
+    // resolves to the end-anchored clean rule; composer_ghost_or_empty is the
+    // fail-closed net for mid-turn frames and renderings the anchor cannot
+    // prove.
     let r = cursor
         .evaluate_esc("Cursor Agent", ghost_plain, Some(ghost_esc))
         .unwrap();
-    assert_eq!(r.id, "composer_ghost_or_empty");
+    assert_eq!(r.id, "composer_clean_idle");
     assert_eq!(r.state, AgentState::Idle);
 
     let r = cursor

@@ -7,6 +7,18 @@ versions are unreleased until admin cuts a tag.
 
 ### Fixed
 
+- A clean idle Cursor Agent composer could never prove itself write-safe:
+  the manifest's dim-placeholder rule carried `composer_semantic =
+  "ambiguous"`, so every wake to an idle Cursor pane was held on
+  `no_write_safe_composer_evidence` forever — a reviewer → tests handoff
+  sat "checking readiness" for 16+ hours against a visibly idle pane. A
+  new `composer_clean_idle` rule now proves the composer empty AND at
+  rest with an end-anchored escaped match: Cursor paints its `ctrl+c to
+  stop` hint on the composer line for exactly the duration of a turn, so
+  the anchor cannot match a working frame, and mid-turn frames — where
+  Cursor injection is unmeasured — keep failing closed on the ambiguous
+  rule below it. Locked against the live capture in
+  `cursor_clean_idle_composer_esc.txt` (cursor-agent 2026.08.25-3e8eec8).
 - Detaching or quitting the workspace left the theme's ground on the
   shell underneath on terminals that honor an OSC 11 background *set* but
   ignore the OSC 110/111 *reset* — Apple Terminal is the common one, where
