@@ -42,10 +42,10 @@ scheduled and release lanes, not as ordinary correctness tests.
 ./tests/e2e/messaging-docs-parity.sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+python3 scripts/check-doc-paths.py
 cargo nextest run --workspace -E 'not (package(cyclopsd) | binary_id(=cyclops-ui::perf) | binary_id(=cyclops-ui::queue_perf) | binary_id(=cyclops-workspace::perf_contract))' --no-fail-fast
 cargo test -p cyclopsd --all-targets --no-fail-fast
 cargo doc --workspace --no-deps
-python3 scripts/check-doc-paths.py
 ./tests/e2e/parity-check.sh
 ```
 

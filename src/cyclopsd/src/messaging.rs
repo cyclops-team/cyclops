@@ -2833,16 +2833,49 @@ mod tests {
 
     use crate::mailbox::{MailboxDirectory, MessageStore};
 
+    /// Return the source prefix before the file's primary test module.
+    ///
+    /// Some source files contain small `#[cfg(test)]` helpers before later
+    /// production items. Stopping at the first test attribute would hide that
+    /// production from an architecture lint. The primary test module is last
+    /// in every file passed here, so this prefix keeps the later production
+    /// region in those audited files visible.
+    fn source_before_primary_tests<'a>(source: &'a str, file: &str) -> &'a str {
+        let boundary = ["#[cfg(test)]", "mod tests"].join("\n");
+        source
+            .split_once(&boundary)
+            .unwrap_or_else(|| panic!("{file} primary test boundary"))
+            .0
+    }
+
+    /// Obsolete when these lints select Rust items structurally instead of
+    /// finding the production prefix with a textual module boundary.
+    #[test]
+    #[should_panic(expected = "simulated source recovered forbidden_dependency")]
+    fn source_boundary_lint_rejects_a_forbidden_reference_after_an_early_test_item() {
+        let source = r#"
+fn before() {}
+#[cfg(test)]
+use crate::test_support;
+fn later_production() { forbidden_dependency(); }
+#[cfg(test)]
+mod tests {}
+"#;
+        let production = source_before_primary_tests(source, "simulated source");
+
+        assert!(
+            !production.contains("forbidden_dependency"),
+            "simulated source recovered forbidden_dependency"
+        );
+    }
+
     /// Syntactic architecture lint: the durable operation Module may request
     /// named effects, but its construction and daemon-root adapter belong to
     /// the composition root.
     #[test]
     fn workspace_messaging_core_cannot_recover_the_daemon_root() {
         let source = include_str!("messaging.rs");
-        let production = source
-            .split_once("#[cfg(test)]")
-            .expect("WorkspaceMessaging test boundary")
-            .0;
+        let production = source_before_primary_tests(source, "messaging.rs");
 
         for forbidden in [
             "Inner",
@@ -2871,10 +2904,7 @@ mod tests {
     /// coordinator state remain private to WorkspaceMessaging.
     #[test]
     fn composer_recovery_policy_cannot_leak_back_into_runtime_callers() {
-        let fusion = include_str!("fusion.rs")
-            .split_once("#[cfg(test)]")
-            .expect("fusion test boundary")
-            .0;
+        let fusion = source_before_primary_tests(include_str!("fusion.rs"), "fusion.rs");
         for forbidden in [
             "composer_recovery::RecoveryAction",
             "composer_recovery::persist",
@@ -2888,10 +2918,10 @@ mod tests {
             );
         }
 
-        let recovery = include_str!("composer_recovery.rs")
-            .split_once("#[cfg(test)]")
-            .expect("composer recovery test boundary")
-            .0;
+        let recovery = source_before_primary_tests(
+            include_str!("composer_recovery.rs"),
+            "composer_recovery.rs",
+        );
         for forbidden in ["inner.mailbox", ".composer_recovery\n"] {
             assert!(
                 !recovery.contains(forbidden),
@@ -2915,10 +2945,7 @@ mod tests {
     /// but the composition root is the only handoff to messaging policy.
     #[test]
     fn pane_observation_cannot_apply_messaging_policy_directly() {
-        let fusion = include_str!("fusion.rs")
-            .split_once("#[cfg(test)]")
-            .expect("fusion test boundary")
-            .0;
+        let fusion = source_before_primary_tests(include_str!("fusion.rs"), "fusion.rs");
         for forbidden in [
             ".exact_owned_evidence_changed(",
             ".route_evidence_observed(",
@@ -2936,10 +2963,10 @@ mod tests {
             );
         }
 
-        let recovery = include_str!("composer_recovery.rs")
-            .split_once("#[cfg(test)]")
-            .expect("composer recovery test boundary")
-            .0;
+        let recovery = source_before_primary_tests(
+            include_str!("composer_recovery.rs"),
+            "composer_recovery.rs",
+        );
         assert!(
             !recovery.contains("workspace_messaging()"),
             "physical composer evidence reached the messaging Module directly"
@@ -3393,7 +3420,7 @@ mod tests {
     #[test]
     fn fusion_cannot_recover_runtime_composer_projection_internals() {
         let source = include_str!("fusion.rs");
-        let production = source.split_once("#[cfg(test)]").unwrap().0;
+        let production = source_before_primary_tests(source, "fusion.rs");
         for forbidden in [
             "ActiveComposerNotification",
             "active_composer_notifications(",
@@ -4038,10 +4065,7 @@ mod tests {
     #[test]
     fn participant_directory_callers_use_the_workspace_messaging_boundary() {
         let source = include_str!("lib.rs");
-        let production = source
-            .split_once("#[cfg(test)]\nmod tests")
-            .expect("daemon test boundary")
-            .0;
+        let production = source_before_primary_tests(source, "lib.rs");
         for (start, next) in [
             (
                 "fn publish_mailbox_directory(",
@@ -4086,10 +4110,7 @@ mod tests {
     #[test]
     fn authenticated_hook_cannot_access_messaging_internals() {
         let source = include_str!("ack.rs");
-        let production = source
-            .split_once("#[cfg(test)]\nmod tests")
-            .expect("authenticated hook test boundary")
-            .0;
+        let production = source_before_primary_tests(source, "ack.rs");
 
         assert!(
             production.contains("MessagingAttentionConsumptionObservation::new"),
@@ -4114,10 +4135,7 @@ mod tests {
     #[test]
     fn delivery_cannot_own_the_prewrite_transaction() {
         let source = include_str!("delivery.rs");
-        let production = source
-            .split_once("#[cfg(test)]\nmod tests")
-            .expect("delivery test boundary")
-            .0;
+        let production = source_before_primary_tests(source, "delivery.rs");
 
         for required in [
             "record_notification_prewrite_block(",
