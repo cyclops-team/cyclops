@@ -1,6 +1,11 @@
 name: release evidence
 
 on:
+  # workflow_dispatch is registered only after this file reaches the default
+  # branch. Until then, pushing the exact beta integration commit to this
+  # disposable branch exercises the same release evidence without publishing.
+  push:
+    branches: [beta/test/release-evidence]
   workflow_dispatch:
 
 permissions:
@@ -77,6 +82,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install tmux
         run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Build real binaries used by workspace performance contracts
+        run: cargo build -p cyclops -p cyclopsd --bins
       - name: Run stable workloads with environment metadata
         run: python3 scripts/ci-performance.py artifacts/performance.json
       - uses: actions/upload-artifact@v4

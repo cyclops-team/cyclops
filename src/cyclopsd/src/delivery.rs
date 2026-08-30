@@ -5960,10 +5960,15 @@ async fn gate(
     // the configured threshold pings the admin exactly once.
     let mut hold_since: Option<Instant> = None;
     let mut hold_notified = false;
+    // Subscribe once before the first evaluation and retain this receiver for
+    // the gate's whole lifetime. Replacing it between re-evaluations leaves a
+    // gap where a settled readiness edge can be published after an early pane
+    // wake but before the next receiver exists, stranding a now-clean pane.
+    let mut ev_rx = inner.events.subscribe();
     'gate: loop {
-        // Subscribe before evaluating so nothing published mid-evaluation
-        // is lost; evaluation itself is authoritative.
-        let mut ev_rx = inner.events.subscribe();
+        // The event receiver predates every evaluation, so events published
+        // mid-evaluation or between iterations remain buffered. Evaluation
+        // itself is still authoritative.
         let watcher = watcher_for_handle(inner, handle);
         let mut pane_rx = watcher.as_ref().map(|w| w.subscribe());
 

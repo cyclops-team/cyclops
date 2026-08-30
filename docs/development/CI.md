@@ -80,9 +80,49 @@ architecture lints. `src/cyclops-proto/tests/one_place.rs` remains a semantic
 tripwire whose own header states what source shapes it cannot recognize. It does
 not replace domain tests or review.
 
-The named backspace regression now waits for the distinct `composer_clean`
-projection instead of assuming runtime-idle also means a human draft is gone.
-It passed 30 focused local repetitions without an added sleep.
+The named backspace regression waits for the positive `write_ready` event that
+actually wakes the held attempt. Waiting only for the weaker `composer_clean`
+projection failed once under the release suite because screen settlement had
+not yet produced write permission. A fresh event subscription is established
+after the gate reports the hold and immediately before Backspace, so setup
+events cannot satisfy the release condition. The test then waits on explicit
+injected pre-write and staged phase events.
+
+That evidence exposed a second product race under the complete Linux suite.
+The delivery gate recreated its readiness receiver between re-evaluations. An
+early pane event could trigger one re-evaluation, then the settled positive
+readiness edge could land in the gap before the next receiver existed. The gate
+now owns one receiver for its full lifetime, so events published during or
+between re-evaluations remain buffered. The focused Backspace regression passed
+40 bounded repetitions and the complete 40-test messaging coordinator passed
+10 bounded four-thread repetitions after the repair. This synchronization
+contains no timing sleep; the 20-second phase timeout only bounds a missing
+contract event under four concurrent isolated rigs on a cold shared runner.
+
+## Task 3 representative pull-request comparison
+
+Messaging Milestone 3 provided the first post-merge product change whose diff
+did not alter CI control files. GitHub Actions run
+[33286752920](https://github.com/cyclops-team/cyclops/actions/runs/33286752920),
+first attempt, at commit `3774217fd544add6800fb7c22e6812d3116d5895`,
+is the representative routed result. Reproduce it with:
+
+```bash
+python3 scripts/ci-baseline.py 33286752920 --attempt 1
+```
+
+| Measure | Task 1 baseline | Task 3 routed result | Change |
+|---|---:|---:|---:|
+| Pull-request wall time | 10m 38s | 8m 46s | 1m 52s less (17.6%) |
+| Total runner time | 32m 29s | 16m 15s | 16m 14s less (50.0%) |
+
+The required Ubuntu lane ran for 8m36s. The conditional website, tmux HEAD,
+and installer checks each returned an explicit successful not-applicable result
+in three to five seconds. The macOS correctness lane ran for 7m16s because the
+workflow still allocated a macOS runner before evaluating applicability. The
+follow-up runner expression preserves the stable `test (macos-latest)` and
+`installer (macos-latest)` names while routing their not-applicable steps to
+Linux; substantive macOS evidence remains on macOS.
 
 ## Normal pull-request workflow
 
@@ -162,13 +202,18 @@ macOS matrix, the full fast gate against tmux master, retained performance
 workloads, repeated race evidence, forced-cleanup evidence, soak tests, and
 long-history workloads.
 
+While the workflow exists only on the beta branch, merging into
+**beta/messaging-rework** triggers every scheduled lane. GitHub registers
+`workflow_dispatch` only after the workflow reaches the default branch. After
+that final integration, dispatch all lanes manually with:
+
 ```bash
 gh workflow run scheduled-evidence.yml \
   --ref beta/messaging-rework \
   -f lane=all
 ```
 
-For a focused manual run, replace `all` with `matrix`, `tmux-head`,
+For a focused post-main manual run, replace `all` with `matrix`, `tmux-head`,
 `performance`, or `reliability`. The reliability command is also runnable
 locally with a bounded repeat count:
 
@@ -183,10 +228,40 @@ retains the JSON artifact for 90 days under a commit-specific name.
 
 ## Release evidence
 
-`.github/workflows/release-evidence.yml` is manual and does not merge, tag, or
-publish anything. It owns full clean-checkout validation on Linux and macOS,
+`.github/workflows/release-evidence.yml` does not merge, tag, or publish
+anything. It owns full clean-checkout validation on Linux and macOS,
 strict and lenient journal replay, daemon historical replay, installer
 lifecycle, real parity journeys, and a retained performance comparison.
+
+GitHub registers `workflow_dispatch` only from the default branch. Until this
+beta workflow reaches `main`, exercise the release lane by creating its
+disposable beta trigger branch at the exact integration commit:
+
+```bash
+git fetch origin beta/messaging-rework
+release_sha="$(git rev-parse refs/remotes/origin/beta/messaging-rework)"
+git push origin "$release_sha":refs/heads/beta/test/release-evidence
+```
+
+Identify, watch, and inspect the resulting `release evidence` run before
+removing the trigger branch:
+
+```bash
+release_run="$(gh run list \
+  --branch beta/test/release-evidence \
+  --limit 20 \
+  --json databaseId,headSha,workflowName \
+  --jq "[.[] | select(.workflowName == \"release evidence\" and .headSha == \"$release_sha\")][0].databaseId")"
+if [ -z "$release_run" ]; then
+  echo "release evidence for $release_sha is not registered yet" >&2
+  exit 1
+fi
+gh run watch "$release_run" --exit-status
+gh run view "$release_run"
+git push origin --delete beta/test/release-evidence
+```
+
+After the workflow reaches the default branch, use the ordinary manual form:
 
 ```bash
 gh workflow run release-evidence.yml --ref beta/messaging-rework
@@ -196,14 +271,15 @@ The final `beta release evidence complete` job becomes green only when every
 release responsibility succeeds. Operator approval is still required before
 merging **beta/messaging-rework** into **main** or publishing a release.
 
-## Final comparison protocol
+## Final comparison record
 
-The evidence-lanes pull request changes the workflow itself, so it correctly
-selects every lane and cannot represent an ordinary path-routed pull request.
-Measure the first post-merge messaging pull request whose diff does not change
-CI control files, then compare it to run 33275472898 with `scripts/ci-baseline.py`.
-Record wall time, total runner time, per-job duration, and every successful
-not-applicable check. This is the final Task 3 before-and-after measurement.
+The representative comparison above fulfills the final Task 3 measurement: it
+uses the first post-merge messaging pull request whose diff did not change CI
+control files. An earlier workflow-control run at commit `5f96cc4`,
+[33288631738](https://github.com/cyclops-team/cyclops/actions/runs/33288631738)
+correctly selected every lane because it changed the workflow itself. That
+control run completed in 6m44s wall time and 21m13s runner time, but it is proof
+of the routing expressions rather than the ordinary path-routed comparison.
 
 No defect class is silently discarded. Performance, soak, repeated-race, full
 matrix, and full tmux HEAD evidence move to scheduled or release ownership.
