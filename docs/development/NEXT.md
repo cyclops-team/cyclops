@@ -14,7 +14,7 @@ preserved behavior, stop conditions, and rollback requirements.
 ## Current milestone
 
 The next focused completion pass runs on
-**beta/refactor/workspace-messaging-recovery**. The first Milestone 3
+**beta/refactor/observation-messaging-evidence**. The first Milestone 3
 family proved the internal seam. The read-and-claim pass then moved inbox listing,
 claiming, message snapshots, and durable follow pages behind
 `WorkspaceMessaging`; the Module owns retained claim-locator interpretation,
@@ -81,11 +81,17 @@ persistence, writer-uncertainty handling, and lifecycle, replacement, and
 pane-loss settlement behind `WorkspaceMessaging`. Fusion now supplies physical
 binding, screen, and exact-turn evidence and carries one opaque recovery plan.
 Runtime adapters can track or settle only an exact attempt through named
-Module operations. The next correction moves fusion's remaining raw
-active-composer candidate join and projection behind the Module.
-Additional narrowly named completion branches remain allowed when one pull
-request would become broad. The corresponding observation completion pass
-follows before Milestone 6. Milestone 5 put retained direct-delivery entry
+Module operations. The composer-projection correction then moved fusion's
+remaining active-candidate lookup, durable cardinality and binding join,
+notification payload reconstruction, and submission-state interpretation
+behind an opaque `WorkspaceMessaging` probe. Fusion now supplies only
+immutable terminal facts and receives one body-free projection; deletion
+evidence prevents raw candidate records or durable projection policy from
+returning. The fresh observation audit found that fusion still invokes the
+exact-owned evidence consequence directly after a state or composer edge. The
+next correction makes that edge immutable observation output and applies it
+after observation completes. Additional narrowly named completion branches
+remain allowed when one pull request would become broad. Milestone 5 put retained direct-delivery entry
 points, restart settlement, and session-journal traversal behind
 `src/cyclopsd/src/compatibility.rs`; its census preserves
 `Daemon::deliver_payload` with support status unverified and preserves every
