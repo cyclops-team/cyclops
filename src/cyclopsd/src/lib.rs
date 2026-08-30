@@ -83,7 +83,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cyclops_ledger::LedgerWriter;
@@ -174,6 +174,11 @@ pub(crate) struct Inner {
     /// while this lock is held; the lock is never held across an await.
     pub(crate) session_identities: StdMutex<sessionstore::SessionIdentities>,
     pub(crate) mailbox: Option<Arc<mailbox::MailboxService>>,
+    /// The internal durable messaging Module. It is initialized on first use
+    /// after `Inner` exists so its daemon-effects adapter can hold only a
+    /// `Weak<Inner>` rather than creating a second owner of the composition
+    /// root.
+    pub(crate) workspace_messaging: OnceLock<Arc<messaging::WorkspaceMessaging>>,
     /// Boot-scoped reconciliation state for barriers derived from the
     /// canonical workspace projection.
     pub(crate) composer_recovery: StdMutex<composer_recovery::RecoveryCoordinator>,
@@ -1663,15 +1668,16 @@ impl Daemon {
                 data: None,
             });
         }
-        let service = self.inner.mailbox.as_ref().ok_or_else(|| WireError {
+        let messaging = self.inner.workspace_messaging().ok_or_else(|| WireError {
             code: "mailbox_unavailable".to_string(),
             message: "durable workspace identity is not connected".to_string(),
             data: None,
         })?;
-        let sender = service
+        let sender = messaging
             .identity_for_address(from)
             .map_err(server::mailbox_service_error)?;
-        let result = messaging::send(&self.inner, service, sender, params)
+        let result = messaging
+            .send(sender, params)
             .await
             .map_err(server::mailbox_service_error)?;
         serde_json::to_value(result).map_err(|error| WireError {
@@ -3257,6 +3263,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         workspace_id,
         session_identities: StdMutex::new(session_identities),
         mailbox: Some(mailbox),
+        workspace_messaging: OnceLock::new(),
         composer_recovery: StdMutex::new(composer_recovery::RecoveryCoordinator::new(
             recovered_barrier_ids,
         )),
@@ -5401,6 +5408,7 @@ mod tests {
             workspace_id,
             session_identities: StdMutex::new(session_identities),
             mailbox: None,
+            workspace_messaging: OnceLock::new(),
             composer_recovery: StdMutex::new(composer_recovery::RecoveryCoordinator::default()),
             mailbox_publication: StdMutex::new(()),
             unread_projection_gate: tokio::sync::Mutex::new(()),

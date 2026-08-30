@@ -10511,6 +10511,7 @@ regex = ['^IDLE']
             workspace_id,
             session_identities: StdMutex::new(session_identities),
             mailbox: None,
+            workspace_messaging: std::sync::OnceLock::new(),
             composer_recovery: StdMutex::new(
                 crate::composer_recovery::RecoveryCoordinator::default(),
             ),

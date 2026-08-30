@@ -1,7 +1,7 @@
 //! Coordinates the durable mailbox with the existing pane notification worker.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use cyclops_proto::{
@@ -98,6 +98,229 @@ fn receipt_with_schedule_truth(
 struct AcceptanceSchedule {
     outcomes: HashMap<RecipientKey, RecipientScheduleOutcome>,
     unavailable: HashSet<RecipientKey>,
+}
+
+/// Narrow post-commit capabilities needed by durable message acceptance.
+///
+/// `WorkspaceMessaging` deliberately cannot reach through `Inner`. The daemon
+/// adapter below is the only bridge from accepted durable facts to notification
+/// scheduling, unread invalidation, message-change observation, and pane receipt
+/// metadata.
+trait WorkspaceMessagingEffects: Send + Sync {
+    fn subscribe_messages_changed(&self) -> tokio::sync::broadcast::Receiver<cyclops_proto::Event>;
+
+    fn schedule_notification(
+        &self,
+        service: &Arc<MailboxService>,
+        recipient: RecipientKey,
+    ) -> Result<RecipientScheduleOutcome, MailboxServiceError>;
+
+    fn invalidate_unread(&self, recipient: RecipientKey);
+
+    fn notification_pane(
+        &self,
+        service: &MailboxService,
+        recipient: RecipientKey,
+    ) -> Result<Option<String>, MailboxServiceError>;
+
+    fn receipt_block(&self) -> Duration;
+}
+
+struct DaemonMessagingEffects {
+    inner: Weak<Inner>,
+    events: tokio::sync::broadcast::Sender<cyclops_proto::Event>,
+    receipt_block: Duration,
+}
+
+impl DaemonMessagingEffects {
+    fn new(inner: &Arc<Inner>) -> Self {
+        Self {
+            inner: Arc::downgrade(inner),
+            events: inner.events.clone(),
+            receipt_block: Duration::from_millis(inner.cfg.receipt_block_ms),
+        }
+    }
+}
+
+impl WorkspaceMessagingEffects for DaemonMessagingEffects {
+    fn subscribe_messages_changed(&self) -> tokio::sync::broadcast::Receiver<cyclops_proto::Event> {
+        self.events.subscribe()
+    }
+
+    fn schedule_notification(
+        &self,
+        service: &Arc<MailboxService>,
+        recipient: RecipientKey,
+    ) -> Result<RecipientScheduleOutcome, MailboxServiceError> {
+        let Some(inner) = self.inner.upgrade() else {
+            return Err(MailboxServiceError::NotificationSchedule(
+                "daemon messaging effects are unavailable".to_string(),
+            ));
+        };
+        schedule_recipient(&inner, service, recipient)
+    }
+
+    fn invalidate_unread(&self, recipient: RecipientKey) {
+        if let Some(inner) = self.inner.upgrade() {
+            crate::schedule_recipient_unread(&inner, recipient);
+        }
+    }
+
+    fn notification_pane(
+        &self,
+        service: &MailboxService,
+        recipient: RecipientKey,
+    ) -> Result<Option<String>, MailboxServiceError> {
+        let Some(inner) = self.inner.upgrade() else {
+            return Ok(None);
+        };
+        Ok(notification_route(&inner, service, recipient)?.map(|route| route.pane_id))
+    }
+
+    fn receipt_block(&self) -> Duration {
+        self.receipt_block
+    }
+}
+
+/// Internal messaging Module for one workspace.
+///
+/// The module owns durable send/reply acceptance and every post-commit action
+/// that follows it. Callers supply an authenticated identity and request; they
+/// do not receive the journal, projection, worker, unread scheduler, or daemon
+/// composition root.
+pub(crate) struct WorkspaceMessaging {
+    service: Arc<MailboxService>,
+    effects: Arc<dyn WorkspaceMessagingEffects>,
+}
+
+impl WorkspaceMessaging {
+    fn new(service: Arc<MailboxService>, effects: Arc<dyn WorkspaceMessagingEffects>) -> Self {
+        Self { service, effects }
+    }
+
+    pub(crate) fn identity_for_address(
+        &self,
+        address: &str,
+    ) -> Result<MailboxIdentity, MailboxServiceError> {
+        self.service.identity_for_address(address)
+    }
+
+    async fn finish_acceptance(
+        &self,
+        accepted: AcceptResult,
+        require_wake: bool,
+    ) -> Result<MsgSendResult, MailboxServiceError> {
+        // Subscribe before scheduling. A worker may commit its first
+        // disposition before enqueue returns; the immediate projection read
+        // below remains the authority, and this receiver prevents losing a
+        // later commit.
+        let events = self.effects.subscribe_messages_changed();
+        let schedule = schedule_accepted_notifications(&accepted, |recipient| {
+            self.effects.schedule_notification(&self.service, recipient)
+        });
+        // The journal append is the acceptance boundary. Pane chrome is a
+        // best-effort projection of that truth and must never hold the response
+        // behind a slow tmux server. One daemon-owned worker coalesces
+        // dirtiness per recipient and re-derives the current durable count.
+        for recipient in accepted.recipient_keys.iter().copied() {
+            self.effects.invalidate_unread(recipient);
+        }
+        let deadline = Instant::now() + self.effects.receipt_block();
+        let dispositions = observe_first_durable_dispositions(
+            &self.service,
+            &accepted.message_id,
+            &schedule.outcomes,
+            events,
+            deadline,
+            require_wake,
+        )
+        .await?;
+        Ok(MsgSendResult {
+            msg_id: accepted.message_id.to_string(),
+            seq: accepted.seq,
+            deliveries: dispositions
+                .into_iter()
+                .map(|disposition| {
+                    let recipient = disposition.recipient;
+                    let pane = self
+                        .effects
+                        .notification_pane(&self.service, disposition.recipient)?;
+                    Ok(receipt_with_schedule_truth(
+                        disposition,
+                        pane,
+                        schedule.unavailable.contains(&recipient),
+                    ))
+                })
+                .collect::<Result<Vec<_>, MailboxServiceError>>()?,
+            inserted: Some(accepted.inserted),
+        })
+    }
+
+    pub(crate) async fn send(
+        &self,
+        sender: MailboxIdentity,
+        params: MsgSendParams,
+    ) -> Result<MsgSendResult, MailboxServiceError> {
+        let require_wake = params.require_wake;
+        if params.reply_to.is_some() && (!params.to.is_empty() || params.recipient_keys.is_some()) {
+            return Err(crate::mailbox::MailboxDirectoryError::ReplyRecipientSelectors.into());
+        }
+        if params.recipient_keys.is_some() && !params.to.is_empty() {
+            return Err(crate::mailbox::MailboxDirectoryError::MixedRecipientSelectors.into());
+        }
+        let accepted = match params.reply_to {
+            Some(reference) => self.service.reply_with_summary(
+                sender,
+                MessageId::new(reference)
+                    .map_err(crate::mailbox::MailboxError::from)
+                    .map_err(crate::mailbox::MessageStoreError::from)
+                    .map_err(MailboxServiceError::from)?,
+                params.summary,
+                params.body,
+                params.client_key,
+            )?,
+            None => self.service.send(
+                sender,
+                MailboxSend {
+                    addresses: params.to,
+                    recipient_keys: params.recipient_keys,
+                    subject: params.subject,
+                    summary: params.summary,
+                    body: params.body,
+                    fyi: params.fyi,
+                    client_key: params.client_key,
+                    supersedes: params.supersedes,
+                },
+            )?,
+        };
+        self.finish_acceptance(accepted, require_wake).await
+    }
+
+    pub(crate) async fn reply(
+        &self,
+        sender: MailboxIdentity,
+        reference: MessageId,
+        summary: Option<String>,
+        body: String,
+        client_key: Option<String>,
+    ) -> Result<MsgSendResult, MailboxServiceError> {
+        let accepted = self
+            .service
+            .reply_with_summary(sender, reference, summary, body, client_key)?;
+        self.finish_acceptance(accepted, false).await
+    }
+}
+
+impl Inner {
+    pub(crate) fn workspace_messaging(self: &Arc<Self>) -> Option<Arc<WorkspaceMessaging>> {
+        let service = self.mailbox.clone()?;
+        Some(Arc::clone(self.workspace_messaging.get_or_init(|| {
+            Arc::new(WorkspaceMessaging::new(
+                service,
+                Arc::new(DaemonMessagingEffects::new(self)),
+            ))
+        })))
+    }
 }
 
 /// Resolve a durable recipient only when its exact session instance is attached.
@@ -937,57 +1160,6 @@ async fn observe_first_durable_dispositions_with(
     }
 }
 
-async fn finish_acceptance(
-    inner: &Arc<Inner>,
-    service: &Arc<MailboxService>,
-    accepted: AcceptResult,
-    require_wake: bool,
-) -> Result<MsgSendResult, MailboxServiceError> {
-    // Subscribe before scheduling. A worker may commit its first disposition
-    // before enqueue returns; the immediate projection read below remains the
-    // authority, and this receiver prevents losing a later commit.
-    let events = inner.events.subscribe();
-    let schedule = schedule_accepted_notifications(&accepted, |recipient| {
-        schedule_recipient(inner, service, recipient)
-    });
-    // The journal append is the acceptance boundary. Pane chrome is a
-    // best-effort projection of that truth and must never hold the response
-    // behind a slow tmux server. One daemon-owned worker coalesces dirtiness
-    // per recipient and re-derives the current durable count after every
-    // blocked write; msg.send neither waits nor allocates one task per fact.
-    for recipient in accepted.recipient_keys.iter().copied() {
-        crate::schedule_recipient_unread(inner, recipient);
-    }
-    let deadline = Instant::now() + Duration::from_millis(inner.cfg.receipt_block_ms);
-    let dispositions = observe_first_durable_dispositions(
-        service,
-        &accepted.message_id,
-        &schedule.outcomes,
-        events,
-        deadline,
-        require_wake,
-    )
-    .await?;
-    Ok(MsgSendResult {
-        msg_id: accepted.message_id.to_string(),
-        seq: accepted.seq,
-        deliveries: dispositions
-            .into_iter()
-            .map(|disposition| {
-                let recipient = disposition.recipient;
-                let pane = notification_route(inner, service, disposition.recipient)?
-                    .map(|route| route.pane_id);
-                Ok(receipt_with_schedule_truth(
-                    disposition,
-                    pane,
-                    schedule.unavailable.contains(&recipient),
-                ))
-            })
-            .collect::<Result<Vec<_>, MailboxServiceError>>()?,
-        inserted: Some(accepted.inserted),
-    })
-}
-
 /// Attempt every broadcast recipient without revoking durable acceptance.
 ///
 /// A scheduling error occurs after the message append has been synced. Keep
@@ -1011,60 +1183,6 @@ fn schedule_accepted_notifications(
         }
     }
     report
-}
-
-pub(crate) async fn send(
-    inner: &Arc<Inner>,
-    service: &Arc<MailboxService>,
-    sender: MailboxIdentity,
-    params: MsgSendParams,
-) -> Result<MsgSendResult, MailboxServiceError> {
-    let require_wake = params.require_wake;
-    if params.reply_to.is_some() && (!params.to.is_empty() || params.recipient_keys.is_some()) {
-        return Err(crate::mailbox::MailboxDirectoryError::ReplyRecipientSelectors.into());
-    }
-    if params.recipient_keys.is_some() && !params.to.is_empty() {
-        return Err(crate::mailbox::MailboxDirectoryError::MixedRecipientSelectors.into());
-    }
-    let accepted = match params.reply_to {
-        Some(reference) => service.reply_with_summary(
-            sender,
-            MessageId::new(reference)
-                .map_err(crate::mailbox::MailboxError::from)
-                .map_err(crate::mailbox::MessageStoreError::from)
-                .map_err(MailboxServiceError::from)?,
-            params.summary,
-            params.body,
-            params.client_key,
-        )?,
-        None => service.send(
-            sender,
-            MailboxSend {
-                addresses: params.to,
-                recipient_keys: params.recipient_keys,
-                subject: params.subject,
-                summary: params.summary,
-                body: params.body,
-                fyi: params.fyi,
-                client_key: params.client_key,
-                supersedes: params.supersedes,
-            },
-        )?,
-    };
-    finish_acceptance(inner, service, accepted, require_wake).await
-}
-
-pub(crate) async fn reply(
-    inner: &Arc<Inner>,
-    service: &Arc<MailboxService>,
-    sender: MailboxIdentity,
-    reference: MessageId,
-    summary: Option<String>,
-    body: String,
-    client_key: Option<String>,
-) -> Result<MsgSendResult, MailboxServiceError> {
-    let accepted = service.reply_with_summary(sender, reference, summary, body, client_key)?;
-    finish_acceptance(inner, service, accepted, false).await
 }
 
 pub(crate) fn claim(
@@ -1412,6 +1530,141 @@ mod tests {
             events.clone(),
         ));
         (scratch, service, events, recipient, observer)
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum AcceptanceEffect {
+        Subscribe,
+        Schedule(RecipientKey),
+        InvalidateUnread(RecipientKey),
+        ResolvePane(RecipientKey),
+    }
+
+    struct RecordingAcceptanceEffects {
+        events: broadcast::Sender<Event>,
+        calls: StdMutex<Vec<AcceptanceEffect>>,
+    }
+
+    impl RecordingAcceptanceEffects {
+        fn new(events: broadcast::Sender<Event>) -> Self {
+            Self {
+                events,
+                calls: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<AcceptanceEffect> {
+            self.calls.lock().expect("acceptance calls lock").clone()
+        }
+    }
+
+    impl WorkspaceMessagingEffects for RecordingAcceptanceEffects {
+        fn subscribe_messages_changed(
+            &self,
+        ) -> tokio::sync::broadcast::Receiver<cyclops_proto::Event> {
+            self.calls
+                .lock()
+                .expect("acceptance calls lock")
+                .push(AcceptanceEffect::Subscribe);
+            self.events.subscribe()
+        }
+
+        fn schedule_notification(
+            &self,
+            _service: &Arc<MailboxService>,
+            recipient: RecipientKey,
+        ) -> Result<RecipientScheduleOutcome, MailboxServiceError> {
+            self.calls
+                .lock()
+                .expect("acceptance calls lock")
+                .push(AcceptanceEffect::Schedule(recipient));
+            Ok(RecipientScheduleOutcome::NoWakeNeeded)
+        }
+
+        fn invalidate_unread(&self, recipient: RecipientKey) {
+            self.calls
+                .lock()
+                .expect("acceptance calls lock")
+                .push(AcceptanceEffect::InvalidateUnread(recipient));
+        }
+
+        fn notification_pane(
+            &self,
+            _service: &MailboxService,
+            recipient: RecipientKey,
+        ) -> Result<Option<String>, MailboxServiceError> {
+            self.calls
+                .lock()
+                .expect("acceptance calls lock")
+                .push(AcceptanceEffect::ResolvePane(recipient));
+            Ok(None)
+        }
+
+        fn receipt_block(&self) -> Duration {
+            Duration::ZERO
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_messaging_owns_acceptance_and_the_post_commit_trace_without_inner() {
+        let (scratch, service, events, reviewer, _) =
+            mailbox_service("workspace-messaging-boundary", 8);
+        let effects = Arc::new(RecordingAcceptanceEffects::new(events));
+        let messaging = WorkspaceMessaging::new(Arc::clone(&service), effects.clone());
+
+        let result = messaging
+            .send(
+                service.admin(),
+                MsgSendParams {
+                    to: vec!["reviewer".to_string()],
+                    recipient_keys: None,
+                    expected_caller: None,
+                    subject: "Boundary".to_string(),
+                    summary: Some("Keep the durable trace. Remove caller knowledge.".to_string()),
+                    body: "The module owns this acceptance.".to_string(),
+                    fyi: false,
+                    client_key: Some("workspace-messaging-boundary".to_string()),
+                    reply_to: None,
+                    supersedes: None,
+                    wait: None,
+                    require_wake: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.inserted, Some(true));
+        assert_eq!(result.deliveries.len(), 1);
+        assert_eq!(result.deliveries[0].to, "reviewer");
+        assert_eq!(
+            effects.calls(),
+            vec![
+                AcceptanceEffect::Subscribe,
+                AcceptanceEffect::Schedule(reviewer),
+                AcceptanceEffect::InvalidateUnread(reviewer),
+                AcceptanceEffect::ResolvePane(reviewer),
+            ]
+        );
+
+        let journal = fs::read_to_string(
+            scratch
+                .0
+                .join("workspaces")
+                .join("current")
+                .join("messages.ndjson"),
+        )
+        .unwrap();
+        assert!(journal.ends_with('\n'));
+        let lines: Vec<_> = journal.lines().collect();
+        assert_eq!(lines.len(), 1, "one send remains one durable message fact");
+        let line: cyclops_proto::LedgerLine = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(line.kind, cyclops_proto::Kind::Msg);
+        assert_eq!(line.id, result.msg_id);
+        assert_eq!(line.seq, result.seq);
+        assert_eq!(line.to, vec!["reviewer"]);
+        let metadata: cyclops_proto::MessageMetadata =
+            serde_json::from_value(line.data.unwrap()).unwrap();
+        assert_eq!(metadata.recipients, vec![reviewer]);
     }
 
     fn queued_attempt(

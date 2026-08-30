@@ -922,7 +922,7 @@ async fn msg_send(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> R
             "send wait is not supported for mailbox notifications",
         );
     }
-    let (service, sender) = match mailbox_caller(inner, peer) {
+    let (messaging, sender) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
@@ -943,7 +943,7 @@ async fn msg_send(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> R
             "a reply cannot be an announcement or supersede another message",
         );
     }
-    match crate::messaging::send(inner, &service, sender, params).await {
+    match messaging.send(sender, params).await {
         Ok(result) => Response::ok(
             id,
             serde_json::to_value(result).expect("message acceptance serializes"),
@@ -957,20 +957,19 @@ async fn msg_reply(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> 
         Ok(params) => params,
         Err(response) => return response,
     };
-    let (service, sender) = match mailbox_caller(inner, peer) {
+    let (messaging, sender) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    match crate::messaging::reply(
-        inner,
-        &service,
-        sender,
-        params.message_id,
-        params.summary,
-        params.body,
-        params.client_key,
-    )
-    .await
+    match messaging
+        .reply(
+            sender,
+            params.message_id,
+            params.summary,
+            params.body,
+            params.client_key,
+        )
+        .await
     {
         Ok(result) => Response::ok(
             id,
@@ -1473,6 +1472,25 @@ pub(crate) fn mailbox_caller(
         identity::PeerOrigin::Unprovable => return Err(mailbox_origin_denied()),
     };
     Ok((service, caller))
+}
+
+fn workspace_messaging_caller(
+    inner: &Arc<Inner>,
+    peer: Peer,
+) -> Result<
+    (
+        Arc<crate::messaging::WorkspaceMessaging>,
+        crate::mailbox::MailboxIdentity,
+    ),
+    WireError,
+> {
+    let (_service, caller) = mailbox_caller(inner, peer)?;
+    let messaging = inner.workspace_messaging().ok_or_else(|| WireError {
+        code: "mailbox_unavailable".to_string(),
+        message: "durable workspace identity is not connected".to_string(),
+        data: None,
+    })?;
+    Ok((messaging, caller))
 }
 
 fn mailbox_origin_denied() -> WireError {
@@ -3260,6 +3278,7 @@ mod tests {
             workspace_id,
             session_identities: StdMutex::new(session_identities),
             mailbox: None,
+            workspace_messaging: std::sync::OnceLock::new(),
             composer_recovery: StdMutex::new(
                 crate::composer_recovery::RecoveryCoordinator::default(),
             ),

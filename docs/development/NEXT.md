@@ -13,19 +13,20 @@ preserved behavior, stop conditions, and rollback requirements.
 
 ## Current milestone
 
-Milestone 3 runs on **beta/refactor/workspace-messaging**. It places one current
-durable operation family behind an internal `WorkspaceMessaging` Interface.
-Milestone 2 consolidated official transport semantics in PR #104. Milestone 1
-merged in PR #103 after the documentation authority repair in PR #101.
+Milestone 4 runs on **beta/refactor/observation-messaging**. It separates one
+observation-to-messaging consequence family without changing durable or tmux
+behavior. Milestone 3 put send and reply acceptance behind the internal
+`WorkspaceMessaging` Module. Milestone 2 consolidated official transport
+semantics in PR #104, and Milestone 1 merged in PR #103 after the documentation
+authority repair in PR #101.
 
 Exit evidence:
 
-- one current durable operation family enters through the internal
-  `WorkspaceMessaging` Interface;
-- its caller loses journal, projection, worker, and post-commit scheduling
-  knowledge;
-- the current durable trace remains byte- and outcome-equivalent;
-- no crate is extracted; and
+- Pane Observer returns immutable evidence rather than committing messaging
+  consequences itself;
+- one `WorkspaceMessaging` operation decides the durable consequences of that
+  evidence;
+- a domain trace proves the same durable facts and tmux behavior; and
 - focused boundary tests and all required repository gates pass.
 
 ## Milestone queue
@@ -71,15 +72,14 @@ provides measurable isolation, and the operator separately approves it.
   performance, migration, and user-journey audits before the final pull request
   from **beta/messaging-rework** into `main`.
 
-## Milestone 3 session boundary
+## Milestone 4 session boundary
 
 Use this scope:
 
-> Implement only Milestone 3 from the approved Messaging Refactor Charter: put
-> one current durable operation family behind an internal WorkspaceMessaging
-> Interface. Prove that the caller loses journal, projection, worker, and
-> post-commit scheduling knowledge while the durable trace stays byte- and
-> outcome-equivalent. Do not extract a crate or begin observation separation,
+> Implement only Milestone 4 from the approved Messaging Refactor Charter: move
+> one observation-to-messaging consequence family out of fusion. Pane Observer
+> returns immutable evidence, and WorkspaceMessaging decides the durable
+> consequences. Prove the same durable facts and tmux behavior. Do not begin
 > legacy quarantine, presentation work, UI redesign, broad CI restructuring,
 > MCP work, or later milestones. Preserve historical replay and honest
 > uncertainty. Stop if any charter stop condition is encountered.
