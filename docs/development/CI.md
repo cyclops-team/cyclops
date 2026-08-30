@@ -183,10 +183,28 @@ retains the JSON artifact for 90 days under a commit-specific name.
 
 ## Release evidence
 
-`.github/workflows/release-evidence.yml` is manual and does not merge, tag, or
-publish anything. It owns full clean-checkout validation on Linux and macOS,
+`.github/workflows/release-evidence.yml` does not merge, tag, or publish
+anything. It owns full clean-checkout validation on Linux and macOS,
 strict and lenient journal replay, daemon historical replay, installer
 lifecycle, real parity journeys, and a retained performance comparison.
+
+GitHub registers `workflow_dispatch` only from the default branch. Until this
+beta workflow reaches `main`, exercise the release lane by creating its
+disposable beta trigger branch at the exact integration commit:
+
+```bash
+git fetch origin beta/messaging-rework
+git push origin \
+  refs/remotes/origin/beta/messaging-rework:refs/heads/beta/test/release-evidence
+```
+
+Inspect the resulting `release evidence` run, then remove the trigger branch:
+
+```bash
+git push origin --delete beta/test/release-evidence
+```
+
+After the workflow reaches the default branch, use the ordinary manual form:
 
 ```bash
 gh workflow run release-evidence.yml --ref beta/messaging-rework

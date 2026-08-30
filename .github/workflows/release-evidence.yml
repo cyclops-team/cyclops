@@ -1,6 +1,11 @@
 name: release evidence
 
 on:
+  # workflow_dispatch is registered only after this file reaches the default
+  # branch. Until then, pushing the exact beta integration commit to this
+  # disposable branch exercises the same release evidence without publishing.
+  push:
+    branches: [beta/test/release-evidence]
   workflow_dispatch:
 
 permissions:
