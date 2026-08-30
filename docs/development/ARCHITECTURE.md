@@ -1,5 +1,7 @@
 # How a message gets from one pane to another
 
+**Status:** Current behavior contract
+
 Cyclops v2 is a tmux-backed coordination daemon for terminal coding agents.
 This page follows one message end to end and names, at every fork, the file
 that decides. Read it once and you can put your finger on where any

@@ -4,70 +4,33 @@
 
 **Integration branch:** **beta/messaging-rework**
 
-The approved [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md)
-continues to control accepted Track A behavior and stop conditions. The
-operator has authorized the rest of the whole-product beta program. Track 0
-will record that authority in `CYCLOPS_BETA_CHARTER.md`; until then, this queue
-records the authorized sequence without reopening Track A decisions.
+The [Cyclops Beta Charter](CYCLOPS_BETA_CHARTER.md) controls remaining scope,
+dependencies, stop conditions, and release gates. The
+[Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) continues to
+control accepted Track A behavior.
 
-## Accepted Track A
+## Current implementation set
 
-Track A's seven implementation milestones and its focused acceptance
-corrections are complete. The correction pass:
+The primary tracer is **beta/fix/tmux-focus-context**. The independent
+**beta/fix/version-identity** slice may run in parallel. Work in flight is
+reported by its pull request and checks rather than copied into this page.
 
-1. repaired source-boundary lints that stopped at early test-only items;
-2. made current status, CI, client responsibility, and evidence language agree;
-3. protected the body-free collapsed cue across detach and a fresh workspace
-   attachment;
-4. routed current history, thread, redaction, and legacy-collision ownership
-   through `WorkspaceMessaging`;
-5. confined cross-journal discovery and replay to the narrow
-   `CompatibilityHistoryAdapter`; and
-6. received independent review of the corrected claims.
+After direct user correctness, continue through Tracks C, D, F, B, E, G, H,
+and I, then run the final whole-beta responsibility and user-journey audit. The
+charter records their responsibilities and dependencies.
 
-The audit-integrity correction and the production history seam remain separate
-rollback points. Current messaging contracts, readable journals, authorization,
-redaction, paging, replay, and all three visibility choices remain preserved.
+## Working rule
 
-## Active work
-
-Create **beta/docs/whole-beta-authority** from the latest
-**beta/messaging-rework** and complete Track 0. Establish the whole-product beta
-charter, reconcile the documentation hierarchy, and name
-**beta/fix/tmux-focus-context** as the first production tracer.
-
-## Authorized sequence after Track A
-
-1. **Track 0:** establish `CYCLOPS_BETA_CHARTER.md`, reconcile documentation
-   authority, and convert the whole-system review into an executable queue.
-2. **Direct user correctness:** non-default tmux focus context, product release
-   identity, and representative user journeys.
-3. **Track C:** workspace interaction and tmux continuity.
-4. **Track D:** presentation and user experience.
-5. **Track F:** CLI, headless use, installation entry path, and product front
-   door.
-6. **Track B:** runtime observation, identity, and attention.
-7. **Track E:** agent integration.
-8. **Track G:** installation, update, health, cleanup, and managed assets.
-9. **Track H:** configuration, durable state, and data lifecycle.
-10. **Track I:** CI, tests, performance, compatibility, and release evidence.
-11. Run the final whole-beta responsibility and user-journey audit.
-
-Each slice starts from the latest integration branch, uses one focused beta
-branch and pull request, adds the smallest test that proves its contract,
-receives independent review, and merges only when required checks are green. A
-later track may overlap only when ownership and files do not conflict.
+Use one focused branch, worktree, and pull request per coherent slice. Parallel
+work is welcome when owners, files, and unsettled interfaces do not overlap.
+Serialize shared invariants and merge each slice only after focused regression
+evidence, independent review, and required checks are green. Update this queue
+at merge boundaries, not during routine implementation.
 
 ## Release boundary
 
-Do not merge **beta/messaging-rework** into `main`, create or move a release
-tag, assign the final beta version, or publish a release without explicit
-operator approval. Release identity remains unresolved until the workspace
-version, remote tags, installer identity, daemon greeting, and GitHub Release
-authority agree.
-
-Preserve every currently readable journal format, honest uncertainty, the
-interim no-silent-deletion rule, `Daemon::deliver_payload` as
-compatibility-sensitive with public support status unverified, and all three
-messaging visibility choices. No track authorizes automatic raw-tmux fallback,
-a distributed broker, a generic workflow engine, or an unrelated rewrite.
+Do not merge **beta/messaging-rework** into `main`, create or move a tag, choose
+the final public beta version, or publish a release without explicit operator
+approval. Preserve readable journals, honest uncertainty, no-silent-loss,
+`Daemon::deliver_payload` compatibility, all three messaging visibility modes,
+and the prohibition on automatic raw-tmux fallback.

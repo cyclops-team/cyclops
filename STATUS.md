@@ -9,8 +9,9 @@ Track A, the Messaging Beta Rework, is accepted. `WorkspaceMessaging` now owns
 current durable messaging policy. Retained session-journal discovery and replay
 go through the narrow compatibility-history adapter.
 
-Track 0 is next: it establishes the whole-product beta charter. No final
-version or release name has been assigned.
+The [Cyclops Beta Charter](docs/development/CYCLOPS_BETA_CHARTER.md) authorizes
+the remaining whole-product beta work. Direct user-correctness slices are next;
+no final version or release name has been assigned.
 
 ## Built
 
@@ -125,8 +126,8 @@ head has already rerun every campaign.
   | Cursor Agent CLI | 2026.07.23-e383d2b | No installed binary on the evidence host | Installed current binary, full matrix, and paired start and end hook payloads |
 
   The soak proves staging verification and cleanup only. It does not promote a
-  whole manifest to the newer version. Detection gaps remain tracked in
-  [issue #7](https://github.com/cyclops-team/cyclops/issues/7).
+  whole manifest to the newer version. Track E owns the remaining current
+  vendor-capability evidence and conservative manifest updates.
 
 For the repository map and design boundaries, read
 [docs/development/HANDOFF.md](docs/development/HANDOFF.md). For user-facing
