@@ -1605,6 +1605,8 @@ mod tests {
         }
     }
 
+    // Obsolete if durable acceptance and its post-commit effects no longer form one
+    // WorkspaceMessaging operation.
     #[tokio::test]
     async fn workspace_messaging_owns_acceptance_and_the_post_commit_trace_without_inner() {
         let (scratch, service, events, reviewer, _) =
