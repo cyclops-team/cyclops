@@ -129,6 +129,19 @@ pub(crate) struct MessagingRouteEvidence {
     pub(crate) evidence_id: NotificationRouteEvidenceId,
 }
 
+/// One Module-owned decision for an elected exact-attention worker.
+///
+/// The runtime adapter owns task execution. It does not inspect the mailbox
+/// projection, recovery policy, or boot-local election locks.
+pub(crate) enum ExactAttentionWork {
+    Retire,
+    Recheck,
+    Resolve {
+        target: Box<AttentionTarget>,
+        resolution: NotificationResolution,
+    },
+}
+
 impl MessagingRouteEvidence {
     pub(crate) fn new(
         session_idx: usize,
@@ -234,7 +247,7 @@ pub(crate) trait WorkspaceMessagingEffects: Send + Sync {
 
     fn cancel_notification(&self, attempt_id: NotificationAttemptId);
 
-    fn reconcile_claimed_recipient(&self, claimant: RecipientKey);
+    fn spawn_exact_attention_worker(&self, attempt_id: NotificationAttemptId);
 
     fn reconcile_route_evidence(&self, evidence: MessagingRouteEvidence);
 
@@ -383,7 +396,7 @@ impl WorkspaceMessaging {
         if let Some(attempt_id) = withdrawn {
             self.effects.cancel_notification(attempt_id);
         }
-        self.effects.reconcile_claimed_recipient(claimant);
+        self.exact_owned_evidence_changed(claimant);
         if claimed_ack_timeout.is_none() {
             if let Err(error) = self.effects.schedule_notification(&self.service, claimant) {
                 error!(%claimant, %error, "cannot schedule mailbox notification after claim");
@@ -514,8 +527,96 @@ impl WorkspaceMessaging {
         if !record.needs_exact_owned_reconciliation() {
             return;
         }
-        self.effects.reconcile_claimed_recipient(record.recipient);
+        self.exact_owned_evidence_changed(record.recipient);
         self.effects.schedule_force_submit(record);
+    }
+
+    /// Apply one relevant composer or claim evidence edge.
+    ///
+    /// Candidate selection, exact-owned policy, and worker election stay
+    /// inside the messaging Module. The runtime receives only elected attempt
+    /// ids to execute.
+    pub(crate) fn exact_owned_evidence_changed(&self, recipient: RecipientKey) {
+        let candidates = match self.service.active_composer_notifications(recipient) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                debug!(%recipient, %error, "cannot select exact-attention reconciliation work");
+                return;
+            }
+        };
+        for attempt_id in candidates
+            .into_iter()
+            .filter(|candidate| candidate.record.needs_exact_owned_reconciliation())
+            .map(|candidate| candidate.record.attempt_id)
+        {
+            match self.service.request_exact_reconciliation(attempt_id) {
+                Ok(true) => self.effects.spawn_exact_attention_worker(attempt_id),
+                Ok(false) => {}
+                Err(error) => debug!(%attempt_id, %error, "cannot elect exact-attention worker"),
+            }
+        }
+    }
+
+    /// Re-elect work parked behind an explicit resolution reservation.
+    pub(crate) fn resume_exact_attention_reconciliation(&self, attempt_id: NotificationAttemptId) {
+        match self.service.resume_exact_reconciliation(attempt_id) {
+            Ok(true) => self.effects.spawn_exact_attention_worker(attempt_id),
+            Ok(false) => {}
+            Err(error) => debug!(%attempt_id, %error, "cannot resume exact-attention worker"),
+        }
+    }
+
+    /// Consume one elected evidence edge and return only the exact action the
+    /// runtime may attempt. Projection lookup and automatic policy stay here.
+    pub(crate) fn next_exact_attention_work(
+        &self,
+        attempt_id: NotificationAttemptId,
+    ) -> ExactAttentionWork {
+        match self.service.take_exact_reconciliation_request(attempt_id) {
+            Ok(false) => return ExactAttentionWork::Retire,
+            Ok(true) => {}
+            Err(error) => {
+                debug!(%attempt_id, %error, "cannot consume exact-attention work");
+                return ExactAttentionWork::Retire;
+            }
+        }
+        let target = match self.service.attention_target(&attempt_id.to_string()) {
+            Ok(target) => target,
+            Err(error) => {
+                debug!(%attempt_id, %error, "exact-attention target is no longer actionable");
+                return ExactAttentionWork::Recheck;
+            }
+        };
+        match self.service.automatic_attention_resolution(&target) {
+            Ok(Some(resolution)) => ExactAttentionWork::Resolve {
+                target: Box::new(target),
+                resolution,
+            },
+            Ok(None) => ExactAttentionWork::Recheck,
+            Err(error) => {
+                debug!(%attempt_id, %error, "cannot select exact-attention resolution");
+                ExactAttentionWork::Recheck
+            }
+        }
+    }
+
+    /// Preserve an evidence edge that collided with an explicit resolver.
+    /// True means the current runtime worker remains elected and should
+    /// continue; false means the reservation owner will re-elect it later.
+    pub(crate) fn park_exact_attention_after_conflict(
+        &self,
+        attempt_id: NotificationAttemptId,
+    ) -> bool {
+        match self
+            .service
+            .park_exact_reconciliation_after_conflict(attempt_id)
+        {
+            Ok(continue_running) => continue_running,
+            Err(error) => {
+                debug!(%attempt_id, %error, "cannot park exact-attention work");
+                false
+            }
+        }
     }
 
     /// Arm the optional reminder only for the first proven doorbell.
@@ -1466,7 +1567,9 @@ fn schedule_route_reconciliation_with_evidence(
     {
         error!(%recipient, %error, "cannot reopen blocked mailbox notification");
     }
-    crate::attention_resolution::schedule_exact_owned_reconciliation(inner, recipient);
+    if let Some(workspace_messaging) = inner.workspace_messaging() {
+        workspace_messaging.exact_owned_evidence_changed(recipient);
+    }
 }
 
 /// Reconsider a durable width block after one actual pane-size edge.
@@ -2160,7 +2263,7 @@ mod tests {
         ObserveClaimedComposer(RecipientKey, NotificationAttemptId),
         RecoverClaimedNotification(RecipientKey, NotificationAttemptId),
         CancelNotification(NotificationAttemptId),
-        ReconcileClaimedRecipient(RecipientKey),
+        SpawnExactAttentionWorker(NotificationAttemptId),
         ReconcileRouteEvidence(MessagingRouteEvidence),
         ReconcileCurrentRoute(usize, String),
         ScheduleUnclaimedReminder(NotificationAttemptId),
@@ -2267,11 +2370,11 @@ mod tests {
                 .push(RecordedEffect::CancelNotification(attempt_id));
         }
 
-        fn reconcile_claimed_recipient(&self, claimant: RecipientKey) {
+        fn spawn_exact_attention_worker(&self, attempt_id: NotificationAttemptId) {
             self.calls
                 .lock()
                 .expect("acceptance calls lock")
-                .push(RecordedEffect::ReconcileClaimedRecipient(claimant));
+                .push(RecordedEffect::SpawnExactAttentionWorker(attempt_id));
         }
 
         fn reconcile_route_evidence(&self, evidence: MessagingRouteEvidence) {
@@ -2424,7 +2527,6 @@ mod tests {
         assert_eq!(
             effects.calls(),
             vec![
-                RecordedEffect::ReconcileClaimedRecipient(reviewer),
                 RecordedEffect::Schedule(reviewer),
                 RecordedEffect::InvalidateUnread(reviewer),
             ]
@@ -2599,10 +2701,49 @@ mod tests {
         assert_eq!(
             effects.calls(),
             vec![
-                RecordedEffect::ReconcileClaimedRecipient(reviewer),
+                RecordedEffect::SpawnExactAttentionWorker(attention.attempt_id),
                 RecordedEffect::ScheduleForceSubmit(attention.attempt_id),
             ]
         );
+        match messaging.next_exact_attention_work(attention.attempt_id) {
+            ExactAttentionWork::Resolve { target, resolution } => {
+                assert_eq!(target.record.attempt_id, attention.attempt_id);
+                assert_eq!(target.record.recipient, reviewer);
+                assert_eq!(resolution, NotificationResolution::Complete);
+            }
+            ExactAttentionWork::Retire | ExactAttentionWork::Recheck => {
+                panic!("elected exact-owned attempt did not produce its durable policy")
+            }
+        }
+        assert!(matches!(
+            messaging.next_exact_attention_work(attention.attempt_id),
+            ExactAttentionWork::Retire
+        ));
+    }
+
+    /// Syntactic architecture lint: the exact terminal mechanism performs one
+    /// requested action. It cannot select projection candidates, manipulate
+    /// election locks, or spawn messaging workers.
+    #[test]
+    fn attention_terminal_mechanism_cannot_recover_worker_topology() {
+        let compact: String = include_str!("attention_resolution.rs")
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect();
+        for forbidden in [
+            "active_composer_notifications(",
+            "request_exact_reconciliation(",
+            "take_exact_reconciliation_request(",
+            "automatic_attention_resolution(",
+            "park_exact_reconciliation_after_conflict(",
+            "resume_exact_reconciliation(",
+            "spawn_descendant_task(",
+        ] {
+            assert!(
+                !compact.contains(forbidden),
+                "terminal mechanism recovered messaging worker topology: {forbidden}"
+            );
+        }
     }
 
     /// Syntactic architecture lint: delivery and terminal mechanisms report a

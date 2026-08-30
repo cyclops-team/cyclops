@@ -4745,7 +4745,9 @@ async fn observe_pane_with_evidence(
     let changed = state_changed || certainty_changed;
     if state_changed || composer_changed {
         if let Some(recipient) = recovery_recipient {
-            crate::attention_resolution::schedule_exact_owned_reconciliation(inner, recipient);
+            if let Some(workspace_messaging) = inner.workspace_messaging() {
+                workspace_messaging.exact_owned_evidence_changed(recipient);
+            }
         }
     }
     if changed {

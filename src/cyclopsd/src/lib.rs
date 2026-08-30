@@ -530,10 +530,68 @@ impl messaging::WorkspaceMessagingEffects for DaemonWorkspaceMessagingEffects {
         }
     }
 
-    fn reconcile_claimed_recipient(&self, claimant: RecipientKey) {
-        if let Some(inner) = self.inner.upgrade() {
-            attention_resolution::schedule_exact_owned_reconciliation(&inner, claimant);
+    fn spawn_exact_attention_worker(&self, attempt_id: NotificationAttemptId) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let Some(messaging) = inner.workspace_messaging() else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
         }
+        let task_inner = Arc::clone(&inner);
+        inner.engine.spawn_descendant_task(async move {
+            loop {
+                let (target, resolution) = match messaging.next_exact_attention_work(attempt_id) {
+                    messaging::ExactAttentionWork::Retire => return,
+                    messaging::ExactAttentionWork::Recheck => continue,
+                    messaging::ExactAttentionWork::Resolve { target, resolution } => {
+                        (target, resolution)
+                    }
+                };
+                delivery::inject_pause(&task_inner, "automatic_attention_before_resolve").await;
+                match attention_resolution::resolve_automatic(
+                    &task_inner,
+                    &messaging,
+                    &target,
+                    resolution,
+                )
+                .await
+                {
+                    Ok(result) => tracing::info!(
+                        %attempt_id,
+                        resolution = ?result.resolution,
+                        "exact-owned composer notification reconciled"
+                    ),
+                    Err(attention_resolution::AttentionActionError::Evidence(_)) => {}
+                    Err(attention_resolution::AttentionActionError::ForceRefused(_)) => {}
+                    Err(attention_resolution::AttentionActionError::Uncertain) => tracing::warn!(
+                        %attempt_id,
+                        "exact-owned composer reconciliation remains uncertain"
+                    ),
+                    Err(attention_resolution::AttentionActionError::DiscardUnsupported) => {
+                        tracing::warn!(
+                            %attempt_id,
+                            "exact-owned composer cannot be cleared by this manifest"
+                        )
+                    }
+                    Err(attention_resolution::AttentionActionError::Store(error)) => {
+                        if error.notification_resolution_in_progress() {
+                            if messaging.park_exact_attention_after_conflict(attempt_id) {
+                                continue;
+                            }
+                            return;
+                        }
+                        tracing::debug!(
+                            %attempt_id,
+                            %error,
+                            "exact-owned composer reconciliation did not start"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     fn reconcile_route_evidence(&self, evidence: messaging::MessagingRouteEvidence) {
