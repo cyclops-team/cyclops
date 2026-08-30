@@ -80,9 +80,37 @@ architecture lints. `src/cyclops-proto/tests/one_place.rs` remains a semantic
 tripwire whose own header states what source shapes it cannot recognize. It does
 not replace domain tests or review.
 
-The named backspace regression now waits for the distinct `composer_clean`
-projection instead of assuming runtime-idle also means a human draft is gone.
-It passed 30 focused local repetitions without an added sleep.
+The named backspace regression waits for the positive `write_ready` event that
+actually wakes or reopens the held attempt. Waiting only for the weaker
+`composer_clean` projection failed once under the release suite because screen
+settlement had not yet produced write permission. The event synchronization
+contains no timing sleep; the bounded timeout only turns a missing contract
+event into a useful failure.
+
+## Task 3 representative pull-request comparison
+
+Messaging Milestone 3 provided the first post-merge product change whose diff
+did not alter CI control files. GitHub Actions run
+[33286752920](https://github.com/cyclops-team/cyclops/actions/runs/33286752920),
+first attempt, at commit `3774217fd544add6800fb7c22e6812d3116d5895`,
+is the representative routed result. Reproduce it with:
+
+```bash
+python3 scripts/ci-baseline.py 33286752920 --attempt 1
+```
+
+| Measure | Task 1 baseline | Task 3 routed result | Change |
+|---|---:|---:|---:|
+| Pull-request wall time | 10m 38s | 8m 46s | 1m 52s less (17.6%) |
+| Total runner time | 32m 29s | 16m 15s | 16m 14s less (50.0%) |
+
+The required Ubuntu lane ran for 8m36s. The conditional website, tmux HEAD,
+and installer checks each returned an explicit successful not-applicable result
+in three to five seconds. The macOS correctness lane ran for 7m16s because the
+workflow still allocated a macOS runner before evaluating applicability. The
+follow-up runner expression preserves the stable `test (macos-latest)` and
+`installer (macos-latest)` names while routing their not-applicable steps to
+Linux; substantive macOS evidence remains on macOS.
 
 ## Normal pull-request workflow
 
@@ -162,13 +190,18 @@ macOS matrix, the full fast gate against tmux master, retained performance
 workloads, repeated race evidence, forced-cleanup evidence, soak tests, and
 long-history workloads.
 
+While the workflow exists only on the beta branch, merging into
+**beta/messaging-rework** triggers every scheduled lane. GitHub registers
+`workflow_dispatch` only after the workflow reaches the default branch. After
+that final integration, dispatch all lanes manually with:
+
 ```bash
 gh workflow run scheduled-evidence.yml \
   --ref beta/messaging-rework \
   -f lane=all
 ```
 
-For a focused manual run, replace `all` with `matrix`, `tmux-head`,
+For a focused post-main manual run, replace `all` with `matrix`, `tmux-head`,
 `performance`, or `reliability`. The reliability command is also runnable
 locally with a bounded repeat count:
 
@@ -198,9 +231,17 @@ git push origin \
   refs/remotes/origin/beta/messaging-rework:refs/heads/beta/test/release-evidence
 ```
 
-Inspect the resulting `release evidence` run, then remove the trigger branch:
+Identify, watch, and inspect the resulting `release evidence` run before
+removing the trigger branch:
 
 ```bash
+release_run="$(gh run list \
+  --branch beta/test/release-evidence \
+  --limit 20 \
+  --json databaseId,workflowName \
+  --jq '[.[] | select(.workflowName == "release evidence")][0].databaseId')"
+gh run watch "$release_run" --exit-status
+gh run view "$release_run"
 git push origin --delete beta/test/release-evidence
 ```
 
