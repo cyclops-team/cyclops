@@ -157,9 +157,10 @@ To wait for one durable sender, copy its canonical `sender` key from
 $ cyclops inbox next --from 'agent:<workspace-id>/<session-instance-id>/%12' --timeout 30s
 ```
 
-If the claim request is sent but its answer misses the deadline, JSON reports
-`claim_outcome_unknown`. Inspect the named message before retrying because the
-claim may already be durable.
+If the claim request is sent but no usable answer arrives, JSON reports
+`claim_outcome_unknown`. This includes a deadline, connection loss, or an
+unreadable bounded answer. Inspect the named message before retrying because
+the claim may already be durable.
 
 Claim exactly the named message to fetch its immutable payload:
 

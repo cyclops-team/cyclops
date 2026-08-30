@@ -323,7 +323,7 @@ pub fn inbox_next_timeout(d: Duration) -> String {
 
 pub fn inbox_claim_outcome_unknown(message_id: &str) -> String {
     format!(
-        "cyclops sent the claim for {message_id}, but the daemon did not answer before the deadline. The message may already be claimed. Inspect it with cyclops thread {message_id} or cyclops inbox list before retrying."
+        "cyclops sent the claim for {message_id}, but no usable answer arrived. The message may already be claimed. Inspect it with cyclops thread {message_id} or cyclops inbox list before retrying."
     )
 }
 
