@@ -2510,11 +2510,17 @@ impl WorkspaceMessaging {
         &self,
         observation: crate::fusion::PaneMessagingObservation,
     ) -> Result<ObservationApplication, MailboxServiceError> {
-        let crate::fusion::PaneMessagingObservation::QuotaResetObserved {
-            recipient,
-            session_idx,
-            pane_id,
-        } = observation;
+        let (recipient, session_idx, pane_id) = match observation {
+            crate::fusion::PaneMessagingObservation::QuotaResetObserved {
+                recipient,
+                session_idx,
+                pane_id,
+            } => (recipient, session_idx, pane_id),
+            crate::fusion::PaneMessagingObservation::ExactOwnedEvidenceChanged { recipient } => {
+                self.exact_owned_evidence_changed(recipient);
+                return Ok(ObservationApplication::default());
+            }
+        };
         let observed = self.service.observe_quota_reset(recipient)?;
         if observed.is_empty() {
             return Ok(ObservationApplication::default());
@@ -2783,6 +2789,7 @@ mod tests {
             "composer_recovery::persist",
             "active_notification_barriers",
             "exact_recipient_claimed_after_write",
+            ".exact_owned_evidence_changed(",
             ".composer_recovery",
         ] {
             assert!(
@@ -4538,6 +4545,40 @@ mod tests {
             after_first
         );
         assert_eq!(effects.calls(), calls_after_first);
+    }
+
+    // Obsolete if fusion again invokes exact-owned messaging policy directly
+    // instead of returning immutable evidence to the composition root.
+    #[test]
+    fn workspace_messaging_applies_an_exact_owned_pane_observation() {
+        let (_scratch, service, events, reviewer, _) =
+            mailbox_service("workspace-messaging-exact-owned-observation", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            effects.clone(),
+        );
+        let (_accepted, context, _) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        record_doorbell_write(&context);
+        let attention = context
+            .record_verify_attention(NotificationVerifyOutcome::ambiguous())
+            .unwrap();
+
+        let application = messaging
+            .apply_observation(PaneMessagingObservation::exact_owned_evidence_changed(
+                reviewer,
+            ))
+            .unwrap();
+
+        assert_eq!(application, ObservationApplication::default());
+        assert_eq!(
+            effects.calls(),
+            vec![RecordedEffect::SpawnExactAttentionWorker(
+                attention.attempt_id
+            )]
+        );
     }
 
     #[test]

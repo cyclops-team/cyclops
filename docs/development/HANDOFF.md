@@ -163,7 +163,7 @@ Read in this order:
    operation boundary, acceptance, claim, requeue, and exact pre-write
    withdrawal coordination, body-free inbox, snapshot, follow, alarm, and
    attention-selection reads, the body-free status projection, and durable
-   consequences of typed pane observations.
+   consequences of ordered typed pane observations.
 4. `src/cyclopsd/src/mailbox.rs` for the durable projection and mutations owned
    behind that boundary.
 5. `src/cyclopsd/src/notification_adapter.rs` and the notification path in

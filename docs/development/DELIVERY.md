@@ -394,6 +394,15 @@ tokenless observer already made the cached readiness tuple identical. The
 durable token comparison makes this idempotent and prevents observation
 ordering from consuming the positive source edge. An unchanged negative
 observation remains quiet.
+A fresh pane observation returns every messaging-relevant fact as an ordered,
+immutable collection. The daemon composition root applies that collection
+before presentation and before releasing the pane recompute guard. A state or
+composer edge therefore reaches `WorkspaceMessaging` as exact-owned evidence
+instead of letting fusion select candidates or elect a worker. A simultaneous
+quota-reset edge remains a separate observation in the same collection, so
+neither consequence suppresses the other. Exact-owned evidence is applied
+first, preserving the ordering of the earlier direct handoff without exposing
+its policy to the observer.
 The immediate post-append reconciliation also reuses the current identity, so
 unchanged evidence is a no-op while an edge that raced ahead of the append is not
 lost. A later generation may reopen even when its complete process binding is
