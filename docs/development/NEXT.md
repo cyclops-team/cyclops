@@ -14,7 +14,7 @@ preserved behavior, stop conditions, and rollback requirements.
 ## Current milestone
 
 The next focused completion pass runs on
-**beta/refactor/workspace-messaging-audit**. The first Milestone 3
+**beta/refactor/workspace-messaging-prewrite**. The first Milestone 3
 family proved the internal seam. The read-and-claim pass then moved inbox listing,
 claiming, message snapshots, and durable follow pages behind
 `WorkspaceMessaging`; the Module owns retained claim-locator interpretation,
@@ -64,9 +64,14 @@ moved the foreground-watch diagnostic's durable gating projection, route
 resolution, and working-state join behind `WorkspaceMessaging`. Deadlock
 detection now consumes body-free candidates and inspects only operating-system
 process state; a deletion lint prevents it from recovering mailbox, route, or
-daemon-root knowledge. The next pass is the fresh Milestone 3 responsibility
-and locality audit. It may include one final focused correction if the audit
-finds a material durable messaging decision in an ordinary caller.
+daemon-root knowledge. The fresh Milestone 3 responsibility and locality audit
+found that authenticated hook handling still reached the mailbox service to
+match boot-local attention candidates. The first audit correction now sends
+one immutable authenticated observation through `WorkspaceMessaging`; the
+Module owns exact registered-candidate lookup, payload and durable-binding
+comparison, and the one-shot signal. The next correction moves delivery
+pre-write publication synchronization, durable block transition, and
+terminal-state classification behind the Module.
 Additional narrowly named completion branches remain allowed when one pull
 request would become broad. The corresponding observation completion pass
 follows before Milestone 6. Milestone 5 put retained direct-delivery entry

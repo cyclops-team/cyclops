@@ -114,9 +114,12 @@ themselves. Fusion and authenticated ACK handling now publish immutable route
 evidence, while delivery and socket code invoke named Module operations after
 durable pre-write, notification, attention, and force-submit-setting changes.
 Those callers no longer choose route reconciliation, reminder, or force-submit
-workers. The retained runtime mechanisms are reachable only through the
-physically separate composition adapter. Durable messaging operations cannot
-use their daemon-root capabilities.
+workers. Authenticated receipt hooks also publish one immutable attention
+consumption observation. The Module owns exact candidate lookup, durable
+binding and payload comparison, and the one-shot signal; hook handling cannot
+reach the mailbox service or candidate storage. The retained runtime mechanisms
+are reachable only through the physically separate composition adapter.
+Durable messaging operations cannot use their daemon-root capabilities.
 
 The append and sync inside `MailboxService` are still the acceptance boundary.
 Notification and pane chrome remain effects of that durable fact, never a
