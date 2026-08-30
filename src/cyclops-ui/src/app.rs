@@ -6,7 +6,7 @@
 //! calm/firehose decision) is not this file's. [`crate::stream::Record`]
 //! owns it, backend-neutral, so a future workspace panel reads the same
 //! ordering and the same judgement. `App` holds one and is otherwise this
-//! renderer's own state: the sidebar roster and the focus-jump map (both
+//! renderer's own state: the sidebar roster and the pane-focus map (both
 //! navigation, not the record), and the key handling that turns keyboard
 //! and mouse input into that state moving.
 
@@ -113,7 +113,7 @@ impl RosterRow {
 pub enum RowTarget {
     #[default]
     Nothing,
-    /// A sidebar agent row: click jumps focus to the pane.
+    /// A sidebar agent row: click focuses the pane.
     Agent(String),
     /// A stream entry row: click selects it.
     Entry(u64),
@@ -176,7 +176,7 @@ pub enum Command {
     /// Open a fresh event subscription. Only ever from a keystroke: the
     /// UI does not retry a dead socket on its own.
     Reconnect,
-    /// Jump focus to this pane id or agent label.
+    /// Focus this pane id or agent label.
     Focus(String),
 }
 
@@ -218,7 +218,7 @@ pub struct App {
     record: Record,
     eye: Eye,
     /// Agent label -> exact route, harvested from status and events only
-    /// (zero polling). Backs the focus jump.
+    /// (zero polling). Backs pane focus.
     panes: HashMap<String, PaneRoute>,
     /// Every watched pane, keyed by exact route: the sidebar's rows. Seeded
     /// from the one status answer, then moved by live events alone, the
@@ -757,7 +757,7 @@ impl App {
 
     /// One live event from the daemon: it goes on the record AND moves the
     /// register ([`crate::stream::Record::live`]). This renderer's own
-    /// navigation state (the sidebar row and the focus-jump map) moves
+    /// navigation state (the sidebar row and the pane-focus map) moves
     /// on the same live edge, and only live: a replayed line is old news
     /// and must not restart anyone's clock.
     ///
@@ -793,7 +793,7 @@ impl App {
     }
 
     /// Harvest the label -> pane map from a State entry, replayed or live
-    /// alike: a replayed line may still be the freshest naming the jump
+    /// alike: a replayed line may still be the freshest naming the pane
     /// has. The seed lands after the replayed tail and live events after
     /// the seed, so the newest naming always wins.
     fn observe_pane_name(&mut self, e: &Entry) {
@@ -851,7 +851,7 @@ impl App {
     /// Startup reconciliation from the daemon's one status answer.
     ///
     /// This renderer's own navigation state first: the sidebar roster (1)
-    /// and the focus-jump map (2) are seeded fresh from the same answer,
+    /// and the pane-focus map (2) are seeded fresh from the same answer,
     /// for the same reason the register is replaced whole rather than
     /// merged (anything the answer does not list is gone). Replacing the
     /// register and writing the lines and clearances every count on
@@ -895,7 +895,7 @@ impl App {
                 )
             })
             .collect();
-        // 2. Refresh the jump map, which outlives the roster: a label the
+        // 2. Refresh the pane-focus map, which outlives the roster: a label the
         //    answer still names points at the pane the answer named.
         for p in &seed.roster {
             self.panes
@@ -1314,7 +1314,7 @@ impl App {
             }
             Key::Char('a') => self.show_roster = !self.show_roster,
             // A click means what the clicked cell means: a sidebar agent
-            // jumps focus (the act the sidebar exists for), a stream entry
+            // focuses the pane (the act the sidebar exists for), a stream entry
             // becomes the selection, dead space does nothing. The frame
             // wrote row_targets as it laid the screen out, so the mouse
             // and the eye agree about what is where; x picks the half.
@@ -1363,7 +1363,7 @@ impl App {
                 }
                 // Resolution may have left a more specific notice already.
                 if self.notice.is_none() {
-                    self.notice = Some("nothing to jump to on this line".into());
+                    self.notice = Some("no pane to focus on this line".into());
                 }
             }
             _ => {}
@@ -2059,7 +2059,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_jumps_via_the_harvested_pane_map() {
+    fn enter_focuses_via_the_harvested_pane_map() {
         let mut a = app();
         a.view = View::Firehose;
         a.seed_status(seed(&[("codex", "%7", AgentState::Idle)], Vec::new()));

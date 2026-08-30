@@ -70,7 +70,7 @@ pub use chat::{
     TimelineItem,
 };
 pub use cyclops_proto::{Attention, AttentionItem, Eye, PaneSnapshot};
-pub use data::{project_backfill, BackfillReport, StreamProjection, UiMsg};
+pub use data::{project_backfill, BackfillReport, FocusPane, StreamProjection, UiMsg};
 pub use detail::{Action, Back, Check, Detail, Draft, Loaded, Request, Stage, ThreadEntry};
 pub use frame::{build, messages_help};
 pub use health::BuildHealth;
@@ -117,7 +117,7 @@ pub struct UiOptions {
     pub backfill: usize,
     /// Launcher-owned terminal focus effect. None keeps rows readable but
     /// reports that focus is unavailable when the user asks for it.
-    pub focus: Option<data::FocusPane>,
+    pub focus: Option<FocusPane>,
 }
 
 impl UiOptions {
@@ -136,7 +136,7 @@ impl UiOptions {
 /// A color preference is deliberately not here. NO_COLOR reaches
 /// `Theme::detect` instead, which turns the paint off and leaves the whole
 /// UI standing: every state pairs a glyph with a word, so the eye, the
-/// firehose toggle, filters, scrolling, the cheatsheet and the jump all
+/// firehose toggle, filters, scrolling, the cheatsheet and pane focus all
 /// read fine uncolored. GOALS lists the two as separate obligations.
 fn wants_plain(opts: &UiOptions, tty: bool) -> bool {
     opts.plain || !tty
@@ -228,7 +228,7 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
         snapshots: snapshot_tx,
         actions: action_tx,
     };
-    let io = data::spawn_io(&sinks, home, opts.backfill, opts.focus);
+    let io = data::spawn_io(&sinks, home, opts.backfill, opts.focus.clone());
     let (key_tx, mut key_rx) = mpsc::channel(INPUT_CAPACITY);
     input::spawn_reader(key_tx);
 
@@ -403,10 +403,10 @@ fn handle(
                 match focus.try_send(pane) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
-                        app.notice = Some("jump already in progress".into());
+                        app.notice = Some("pane focus already in progress".into());
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
-                        app.notice = Some("can't jump: focus worker stopped".into());
+                        app.notice = Some("can't focus pane: focus worker stopped".into());
                     }
                 }
             }
@@ -687,7 +687,7 @@ mod tests {
     /// GOALS lists the plain screen-reader mode and honoring NO_COLOR as
     /// two separate obligations. Treating them as one cost a user who
     /// expressed a COLOR preference the eye, the firehose toggle, filters,
-    /// scrolling, the cheatsheet and the jump. Screen mode answers to
+    /// scrolling, the cheatsheet and pane focus. Screen mode answers to
     /// --plain and to having a terminal; nothing else.
     ///
     /// Run this with NO_COLOR set in the environment; the color half is

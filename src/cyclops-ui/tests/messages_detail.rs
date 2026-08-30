@@ -1194,7 +1194,7 @@ mod loop_journey {
     fn enter_opens_and_a_confirmed_action_reaches_the_daemon() {
         let mut app = app_with(vec![wire_row("m-001", true)], 9);
 
-        // Enter in Messages opens the row rather than jumping a pane.
+        // Enter in Messages opens the row rather than focusing a pane.
         app.handle_key(Key::Enter);
         assert!(app.detail.is_some(), "Enter did not open the detail");
         assert!(app.detail_read_owed(), "the loop was owed no read");

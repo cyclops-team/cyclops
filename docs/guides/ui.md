@@ -146,10 +146,13 @@ make room. `--plain` has no panel: that mode is a line-by-line follow.
 
 ## Mouse
 
-Click an agent in the panel and tmux focus jumps to its pane, the same
-jump `enter` makes from a stream entry. Click a stream entry to select
-it; the wheel scrolls three rows a notch, and scrolling up unpins from
-the tail exactly like `↑`. Everything the mouse does has a key, so a
+Click an agent in the panel to focus its pane, the same action `enter`
+makes from a stream entry. Both `cyclops watch` and the full workspace use
+the `tmux_socket` and `tmux_config` in Cyclops's config. If the pane is gone
+or tmux refuses the request, the view reports that focus failed and stays
+open so you can refresh the route or try again. Click a stream entry to
+select it; the wheel scrolls three rows a notch, and scrolling up unpins
+from the tail exactly like `↑`. Everything the mouse does has a key, so a
 terminal with no mouse reporting loses convenience and nothing else.
 
 ## Stream keys
@@ -158,7 +161,7 @@ terminal with no mouse reporting loses convenience and nothing else.
 tab      admin stream / firehose / messages
 a        agents panel on / off (wide terminals)
 w f t    filter with / from / to (enter applies, esc cancels, empty clears)
-enter    jump tmux focus to the pane behind the selected entry
+enter    focus the pane behind the selected entry
 up down  scroll; scrolling up unpins from the tail
 end      back to the tail
 c        density: comfortable or compact
@@ -187,7 +190,7 @@ instead of opening the row that took its place.
 Filters mirror the history flags: `with` is either direction, `from` and
 `to` one each, and `with` replaces the other two. While pinned to the
 tail, arrivals scroll into view; once you scroll up, the viewport holds
-still and arrivals append below it. `enter` jumps to the entry's pane:
+still and arrivals append below it. `enter` focuses the entry's pane:
 the sender of a message, the recipient of a delivery or gate line, the
 agent of a state line. While pinned it takes the newest entry.
 
@@ -349,8 +352,8 @@ here: the machine stream is `cyclops watch --json`.
 ## No color
 
 A non-empty `NO_COLOR` turns the paint off and changes nothing else: the
-eye, the firehose toggle, filters, scrolling, the cheatsheet and the
-jump all stay. Every state renders as a glyph plus a word, so the screen
+eye, the firehose toggle, filters, scrolling, the cheatsheet and pane
+focus all stay. Every state renders as a glyph plus a word, so the screen
 reads the same uncolored. Use `--plain` when you want the line-oriented
 follow instead.
 

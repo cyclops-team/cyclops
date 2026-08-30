@@ -512,7 +512,7 @@ impl Entry {
         }
     }
 
-    /// The pane a focus jump should land on, when the entry names one.
+    /// The pane a focus request should select, when the entry names one.
     pub fn focus_target(&self) -> Option<&str> {
         match &self.kind {
             EntryKind::Msg { from, .. } => Some(from),
@@ -520,10 +520,10 @@ impl Entry {
             EntryKind::State {
                 pane_id, target, ..
             } => Some(pane_id.as_deref().unwrap_or(target)),
-            // A clearance jumps where its alarm row jumped: the pane it
+            // A clearance focuses where its alarm row focused: the pane it
             // was about, or the delivery's recipient. Except when the pane
             // is the thing that went away, which is the same reason
-            // PaneGone offers no jump: tmux has retired that id.
+            // PaneGone offers no focus target: tmux has retired that id.
             EntryKind::Cleared {
                 how: Clearance::PaneGone,
                 ..
@@ -532,7 +532,7 @@ impl Entry {
                 AttentionItem::Agent { pane_id, .. } => pane_id,
                 AttentionItem::Delivery { to, .. } => to,
             }),
-            // No jump for a pane that is gone; the notice would be the
+            // No focus request for a pane that is gone; the notice would be the
             // whole answer, so say nothing instead.
             _ => None,
         }

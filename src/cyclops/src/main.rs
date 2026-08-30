@@ -1220,9 +1220,7 @@ fn cmd_ui(cli: &Cli, args: &UiArgs) -> i32 {
 }
 
 fn run_stream_ui(cli: &Cli, args: &UiArgs, filters: cyclops_ui::Filter) -> i32 {
-    fn focus_pane(target: &str) -> Result<(), String> {
-        cyclops_tmux::focus_pane(None, None, target).map_err(|error| error.to_string())
-    }
+    let home = cyclops_proto::cyclops_home();
 
     cyclops_ui::run(cyclops_ui::UiOptions {
         plain: cli.plain,
@@ -1231,7 +1229,7 @@ fn run_stream_ui(cli: &Cli, args: &UiArgs, filters: cyclops_ui::Filter) -> i32 {
         from: filters.from,
         to: filters.to,
         backfill: args.backfill,
-        focus: Some(focus_pane),
+        focus: Some(workspace::focus_adapter(&home)),
     })
 }
 
@@ -3366,6 +3364,181 @@ fn cmd_watch_json(c: &mut Client, cli: &Cli, style: &Style, kinds: &[String]) ->
 mod tests {
     use super::*;
 
+    fn tmux_text(server: &cyclops_testrig::TmuxServer, args: &[&str]) -> String {
+        let output = server.run(args);
+        assert!(
+            output.status.success(),
+            "tmux {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn two_window_server(server: &cyclops_testrig::TmuxServer, session: &str) -> (String, String) {
+        server.run_ok(&["new-session", "-d", "-s", session, "/bin/sh"]);
+        server.run_ok(&["new-window", "-d", "-t", session, "/bin/sh"]);
+        let panes: Vec<String> = tmux_text(server, &["list-panes", "-a", "-F", "#{pane_id}"])
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(panes.len(), 2, "expected two panes on isolated server");
+        (panes[0].clone(), panes[1].clone())
+    }
+
+    fn active_pane(server: &cyclops_testrig::TmuxServer, session: &str) -> String {
+        tmux_text(
+            server,
+            &["display-message", "-p", "-t", session, "#{pane_id}"],
+        )
+    }
+
+    fn focus_child(home: &std::path::Path, target: &str) -> std::process::Command {
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("test executable"));
+        child
+            .args([
+                "--ignored",
+                "--exact",
+                "tests::stream_focus_adapter_child",
+                "--nocapture",
+            ])
+            .env("CYCLOPS_STREAM_FOCUS_CHILD_HOME", home)
+            .env("CYCLOPS_STREAM_FOCUS_CHILD_TARGET", target);
+        child
+    }
+
+    #[test]
+    #[ignore = "invoked by the parent focus test with isolated tmux context"]
+    fn stream_focus_adapter_child() {
+        let Some(home) = std::env::var_os("CYCLOPS_STREAM_FOCUS_CHILD_HOME") else {
+            return;
+        };
+        let target = std::env::var("CYCLOPS_STREAM_FOCUS_CHILD_TARGET")
+            .expect("parent supplied focus target");
+        workspace::focus_adapter(std::path::Path::new(&home))
+            .focus(&target)
+            .expect("focus through configured launcher adapter");
+    }
+
+    #[test]
+    fn stream_focus_uses_the_configured_server_and_leaves_the_ambient_server_alone() {
+        if !cyclops_testrig::tmux_available() {
+            return;
+        }
+        // cyclops-ui separately proves that the selected displayed row emits
+        // its exact pane id. This test starts at the launcher boundary and
+        // proves where that semantic request is performed.
+        let configured = cyclops_testrig::TmuxServer::new("watch-focus-configured");
+        let ambient = cyclops_testrig::TmuxServer::new("watch-focus-ambient");
+        let (configured_first, configured_target) = two_window_server(&configured, "shown");
+        let (ambient_first, ambient_target) = two_window_server(&ambient, "ambient");
+        assert_eq!(
+            configured_target, ambient_target,
+            "the control server must carry the same pane id"
+        );
+        assert_eq!(active_pane(&configured, "shown"), configured_first);
+        assert_eq!(active_pane(&ambient, "ambient"), ambient_first);
+
+        let home = tempfile::Builder::new()
+            .prefix("cyclops-watch-focus-")
+            .tempdir_in(cyclops_proto::scratch::scratch_root())
+            .expect("create owned scratch home");
+        let config_file = home.path().join("tmux.conf");
+        std::fs::write(&config_file, "set -g @cyclops-focus-test loaded\n")
+            .expect("write isolated tmux config");
+        std::fs::write(
+            home.path().join("config.toml"),
+            format!(
+                "tmux_socket = {:?}\ntmux_config = {:?}\n",
+                configured.socket(),
+                config_file
+            ),
+        )
+        .expect("write launcher config");
+
+        let ambient_path = ambient.socket_path().expect("ambient server socket path");
+        let ambient_pid = tmux_text(&ambient, &["display-message", "-p", "#{pid}"]);
+        let output = focus_child(home.path(), &configured_target)
+            .env(
+                "TMUX",
+                format!("{},{ambient_pid},0", ambient_path.display()),
+            )
+            .output()
+            .expect("run isolated focus child");
+        assert!(
+            output.status.success(),
+            "focus child failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert_eq!(
+            (
+                active_pane(&configured, "shown"),
+                active_pane(&ambient, "ambient")
+            ),
+            (configured_target, ambient_first),
+            "focus must move only the configured server's target pane"
+        );
+    }
+
+    #[test]
+    fn stream_focus_forwards_the_configured_socket_and_config_to_tmux() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::Builder::new()
+            .prefix("cyclops-watch-focus-command-")
+            .tempdir_in(cyclops_proto::scratch::scratch_root())
+            .expect("create owned scratch root");
+        let home = root.path().join("home");
+        let bin = root.path().join("bin");
+        std::fs::create_dir_all(&home).expect("create isolated home");
+        std::fs::create_dir(&bin).expect("create isolated executable directory");
+
+        let config_file = root.path().join("focus config.conf");
+        std::fs::write(&config_file, "set -g @cyclops-focus-test loaded\n")
+            .expect("write isolated tmux config");
+        std::fs::write(
+            home.join("config.toml"),
+            format!(
+                "tmux_socket = \"focus-configured\"\ntmux_config = {:?}\n",
+                config_file
+            ),
+        )
+        .expect("write launcher config");
+
+        let calls = root.path().join("tmux.calls");
+        let fake_tmux = bin.join("tmux");
+        std::fs::write(
+            &fake_tmux,
+            "#!/bin/sh\nprintf 'call' >> \"$CYCLOPS_FOCUS_ARGS\"\nfor arg in \"$@\"; do printf '\\t%s' \"$arg\" >> \"$CYCLOPS_FOCUS_ARGS\"; done\nprintf '\\n' >> \"$CYCLOPS_FOCUS_ARGS\"\n",
+        )
+        .expect("write tmux argument recorder");
+        std::fs::set_permissions(&fake_tmux, std::fs::Permissions::from_mode(0o700))
+            .expect("make tmux argument recorder executable");
+
+        let output = focus_child(&home, "%7")
+            .env("PATH", &bin)
+            .env("CYCLOPS_FOCUS_ARGS", &calls)
+            .output()
+            .expect("run focus command-boundary child");
+        assert!(
+            output.status.success(),
+            "focus child failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let config = config_file.display();
+        assert_eq!(
+            std::fs::read_to_string(&calls).expect("read recorded tmux arguments"),
+            format!(
+                "call\t-u\t-L\tfocus-configured\t-f\t{config}\tselect-window\t-t\t%7\n\
+                 call\t-u\t-L\tfocus-configured\t-f\t{config}\tselect-pane\t-t\t%7\n"
+            )
+        );
+    }
+
     #[test]
     fn inbox_next_oversized_response_keeps_the_existing_json_shape() {
         // Obsolete when inbox-next's documented machine error schema gains a
@@ -3451,7 +3624,7 @@ mod tests {
                 apply: false,
             }) if assets == [cleanup::AssetClass::BuildCache, cleanup::AssetClass::UpdateScratch]
         ));
-        assert!(Cli::try_parse_from(["cyclops", "cleanup", "/tmp"]).is_err());
+        assert!(Cli::try_parse_from(["cyclops", "cleanup", "/tmp"]).is_err()); // scratch-path-lint: rejected CLI input, not an owned path.
         assert!(Cli::try_parse_from(["cyclops", "cleanup"]).is_err());
     }
 

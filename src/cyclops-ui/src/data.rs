@@ -21,6 +21,7 @@
 //! a caller with a different transport gets the same guarantee.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use cyclops_proto::{Event, MessagesChangedData, StatusResult, StreamBackfillResult};
 use tokio::sync::mpsc;
@@ -116,7 +117,33 @@ pub type MessagesRefresh = mpsc::Sender<RefreshRequest>;
 
 /// Concrete launcher-owned pane focus effect. Presentation emits a target;
 /// the terminal adapter decides how that target is reached.
-pub type FocusPane = fn(&str) -> Result<(), String>;
+type FocusEffect = dyn Fn(&str) -> Result<(), String> + Send + Sync;
+
+#[derive(Clone)]
+pub struct FocusPane {
+    focus: Arc<FocusEffect>,
+}
+
+impl FocusPane {
+    /// Wrap the launcher's pane-focus effect without exposing its terminal
+    /// connection details to the view.
+    pub fn new(focus: impl Fn(&str) -> Result<(), String> + Send + Sync + 'static) -> FocusPane {
+        FocusPane {
+            focus: Arc::new(focus),
+        }
+    }
+
+    /// Ask the launcher to focus one exact pane id.
+    pub fn focus(&self, target: &str) -> Result<(), String> {
+        (self.focus)(target)
+    }
+}
+
+impl std::fmt::Debug for FocusPane {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("FocusPane(..)")
+    }
+}
 
 /// Spawn the IO tasks. `home` supplies the daemon socket location.
 pub fn spawn_io(sinks: &UiSinks, home: &Path, backfill: usize, focus: Option<FocusPane>) -> Io {
@@ -177,12 +204,12 @@ async fn focus_task(
 ) {
     while let Some(pane) = rx.recv().await {
         let target = pane.clone();
-        let result = match focus {
-            Some(focus) => tokio::task::spawn_blocking(move || focus(&target)).await,
+        let result = match focus.clone() {
+            Some(focus) => tokio::task::spawn_blocking(move || focus.focus(&target)).await,
             None => {
                 if tx
                     .send(UiMsg::Notice(format!(
-                        "can't jump to {pane}: this launcher has no pane-focus adapter"
+                        "can't focus {pane}: this launcher has no pane-focus adapter"
                     )))
                     .await
                     .is_err()
@@ -194,8 +221,8 @@ async fn focus_task(
         };
         let notice = match result {
             Ok(Ok(())) => continue,
-            Ok(Err(error)) => format!("can't jump to {pane}: {error}"),
-            Err(error) => format!("can't jump to {pane}: focus worker failed: {error}"),
+            Ok(Err(error)) => format!("can't focus {pane}: {error}"),
+            Err(error) => format!("can't focus {pane}: focus worker failed: {error}"),
         };
         if tx.send(UiMsg::Notice(notice)).await.is_err() {
             return;
@@ -600,7 +627,7 @@ async fn forward_event(tx: &mpsc::Sender<UiMsg>, ev: Event) -> Result<bool, Stri
 }
 
 /// One status request at startup: the sessions the daemon watches, the
-/// label -> pane map behind the focus jump, where every pane stands, and
+/// label -> pane map behind the focus request, where every pane stands, and
 /// the deliveries still waiting on a human. A failed or malformed answer is
 /// visible because it changes the scope and freshness of the read model.
 async fn status_seed(sock: &Path) -> Result<StatusSeed, UiError> {
@@ -711,6 +738,43 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn a_failed_focus_is_reported_and_the_worker_accepts_the_next_request() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let focus = FocusPane::new(move |target| {
+            let attempt = observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match attempt {
+                0 => Err("configured tmux server refused the pane".into()),
+                1 => Ok(()),
+                _ => Err(format!("later failure for {target}")),
+            }
+        });
+        let (notice_tx, mut notice_rx) = mpsc::channel(4);
+        let (focus_tx, focus_rx) = mpsc::channel(4);
+        let worker = tokio::spawn(focus_task(notice_tx, focus_rx, Some(focus)));
+
+        focus_tx.send("%7".into()).await.unwrap();
+        match notice_rx.recv().await.unwrap() {
+            UiMsg::Notice(notice) => assert_eq!(
+                notice,
+                "can't focus %7: configured tmux server refused the pane"
+            ),
+            _ => panic!("focus failure did not remain visible"),
+        }
+
+        focus_tx.send("%8".into()).await.unwrap();
+        focus_tx.send("%9".into()).await.unwrap();
+        match notice_rx.recv().await.unwrap() {
+            UiMsg::Notice(notice) => assert_eq!(notice, "can't focus %9: later failure for %9"),
+            _ => panic!("focus worker did not continue after a failed request"),
+        }
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        drop(focus_tx);
+        worker.await.unwrap();
+    }
 
     /// A real greeting; the reader rejects anything else.
     fn test_hello() -> String {

@@ -31,7 +31,7 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
         snapshots: snapshot_tx,
         actions: action_tx,
     };
-    let io = data::spawn_io(&sinks, home, opts.backfill, opts.focus);
+    let io = data::spawn_io(&sinks, home, opts.backfill, opts.focus.clone());
     let view = if opts.firehose {
         View::Firehose
     } else {
