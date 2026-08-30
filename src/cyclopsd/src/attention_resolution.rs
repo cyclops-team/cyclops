@@ -16,7 +16,7 @@ use crate::mailbox::{
     MailboxServiceError,
 };
 use crate::messaging::{MessagingAttentionError, WorkspaceMessaging};
-use crate::{delivery, fusion, messaging, unix_ms, Inner};
+use crate::{delivery, fusion, unix_ms, Inner};
 
 // Bound terminal-action settlement while allowing slower terminal clients to
 // render the clean composer that proves the exact action took effect.
@@ -629,11 +629,18 @@ async fn settle_resolution(
     }
     delivery::inject_pause(inner, "attention_after_resolution").await;
     resolve_staged_hold(inner, target, &route).await;
-    if let Err(error) = messaging::schedule_recipient(inner, service, target.record.recipient) {
+    if let Some(workspace_messaging) = inner.workspace_messaging() {
+        if let Err(error) = workspace_messaging.notification_head_changed(target.record.recipient) {
+            tracing::error!(
+                recipient = %target.record.recipient,
+                %error,
+                "cannot schedule mailbox notification after attention resolution"
+            );
+        }
+    } else {
         tracing::error!(
             recipient = %target.record.recipient,
-            %error,
-            "cannot schedule mailbox notification after attention resolution"
+            "cannot schedule mailbox notification after attention resolution without workspace messaging"
         );
     }
     Ok(AttentionResolveResult {
@@ -873,11 +880,18 @@ fn withdraw_pre_key(
         return Err(AttentionActionError::Uncertain);
     }
     service.cancel_attention_resolution(target.record.attempt_id)?;
-    if let Err(error) = messaging::schedule_recipient(inner, service, target.record.recipient) {
+    if let Some(workspace_messaging) = inner.workspace_messaging() {
+        if let Err(error) = workspace_messaging.notification_head_changed(target.record.recipient) {
+            tracing::error!(
+                recipient = %target.record.recipient,
+                %error,
+                "cannot schedule mailbox notification after attention intent withdrawal"
+            );
+        }
+    } else {
         tracing::error!(
             recipient = %target.record.recipient,
-            %error,
-            "cannot schedule mailbox notification after attention intent withdrawal"
+            "cannot schedule mailbox notification after attention intent withdrawal without workspace messaging"
         );
     }
     Ok(())
