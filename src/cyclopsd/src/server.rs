@@ -5,7 +5,7 @@
 //! own broadcast receiver, a lagged receiver is dropped with a warning,
 //! and writes carry a timeout so a wedged client costs one connection.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
@@ -1870,27 +1870,6 @@ async fn run_status_refresh_jobs(
     incomplete
 }
 
-type ComposerCandidateIndex = HashMap<
-    RecipientKey,
-    HashMap<NotificationAttemptId, crate::mailbox::ActiveComposerNotification>,
->;
-
-fn composer_candidate_index(inner: &Inner) -> Option<ComposerCandidateIndex> {
-    let candidates = inner
-        .mailbox
-        .as_ref()?
-        .active_composer_notifications_snapshot()
-        .ok()?;
-    let mut grouped = HashMap::new();
-    for candidate in candidates {
-        grouped
-            .entry(candidate.record.recipient)
-            .or_insert_with(HashMap::new)
-            .insert(candidate.record.attempt_id, candidate);
-    }
-    Some(grouped)
-}
-
 fn refuse_incomplete_status(pane: &mut cyclops_proto::PaneStatus) {
     pane.manifest = None;
     pane.manifest_display_name = None;
@@ -1902,7 +1881,7 @@ fn refuse_incomplete_status(pane: &mut cyclops_proto::PaneStatus) {
     pane.composer_proof = cyclops_proto::ComposerProof::Unprovable;
     pane.composer_reason = Some(STATUS_REFRESH_INCOMPLETE.to_string());
     if pane.notification_attempt.is_some() || pane.composer_candidates > 0 {
-        pane.next_action = Some(operator_next_action(
+        pane.next_action = Some(crate::messaging::operator_composer_next_action(
             pane.notification_state,
             pane.notification_attempt.is_some(),
         ));
@@ -1911,83 +1890,6 @@ fn refuse_incomplete_status(pane: &mut cyclops_proto::PaneStatus) {
     }
     pane.working_confirmed = None;
     pane.hooks_verified = None;
-}
-
-fn operator_next_action(
-    notification: Option<cyclops_proto::NotificationState>,
-    has_exact_attempt: bool,
-) -> cyclops_proto::ComposerNextAction {
-    use cyclops_proto::{ComposerNextAction, NotificationState};
-
-    match notification {
-        Some(NotificationState::AttentionRequired) if has_exact_attempt => {
-            ComposerNextAction::InspectAttention
-        }
-        Some(
-            NotificationState::Writing
-            | NotificationState::Staged
-            | NotificationState::Submitting
-            | NotificationState::Submitted
-            | NotificationState::Notified
-            | NotificationState::WithdrawnAfterStaging,
-        ) if has_exact_attempt => ComposerNextAction::CheckHealth,
-        _ => ComposerNextAction::InspectMessages,
-    }
-}
-
-fn composer_next_action(
-    composer: cyclops_proto::ComposerState,
-    notification: cyclops_proto::NotificationState,
-    message: Option<cyclops_proto::ComposerMessageState>,
-    recovery_action: crate::mailbox::ExactOwnedRecoveryAction,
-    clear_supported: bool,
-    active_worker_owns: bool,
-) -> cyclops_proto::ComposerNextAction {
-    use cyclops_proto::{
-        ComposerMessageState, ComposerNextAction, ComposerState, NotificationState,
-    };
-
-    let exact_composer = matches!(
-        composer,
-        ComposerState::CyclopsNotificationStaged | ComposerState::CyclopsNotificationSubmitted
-    );
-    if exact_composer && notification == NotificationState::AttentionRequired {
-        return match recovery_action {
-            crate::mailbox::ExactOwnedRecoveryAction::Submit => ComposerNextAction::AutomaticSubmit,
-            crate::mailbox::ExactOwnedRecoveryAction::Clear if clear_supported => {
-                ComposerNextAction::AutomaticReconcile
-            }
-            crate::mailbox::ExactOwnedRecoveryAction::Reconcile => {
-                ComposerNextAction::AutomaticReconcile
-            }
-            crate::mailbox::ExactOwnedRecoveryAction::Ineligible
-            | crate::mailbox::ExactOwnedRecoveryAction::Clear
-            | crate::mailbox::ExactOwnedRecoveryAction::Inspect => {
-                ComposerNextAction::InspectAttention
-            }
-        };
-    }
-    if !exact_composer || !active_worker_owns {
-        return operator_next_action(Some(notification), true);
-    }
-    match (composer, notification, message) {
-        (
-            ComposerState::CyclopsNotificationStaged,
-            NotificationState::Staged,
-            Some(ComposerMessageState::Pending),
-        ) => ComposerNextAction::AutomaticSubmit,
-        (
-            ComposerState::CyclopsNotificationStaged,
-            NotificationState::Staged,
-            Some(ComposerMessageState::Claimed),
-        ) => ComposerNextAction::AutomaticReconcile,
-        (
-            ComposerState::CyclopsNotificationStaged | ComposerState::CyclopsNotificationSubmitted,
-            NotificationState::Submitting | NotificationState::Submitted,
-            _,
-        ) => ComposerNextAction::AutomaticReconcile,
-        _ => operator_next_action(Some(notification), true),
-    }
 }
 
 /// Assemble StatusResult from the session slots and the detection cache.
@@ -2034,7 +1936,6 @@ fn status_result_with_refresh(
         .exact_adoptions();
     let mut diagnostics = crate::deadlock::status_diagnostics(inner);
     diagnostics.extend(inner.engine.notification_worker_diagnostics());
-    let composer_candidates = composer_candidate_index(inner);
     // Status joins durable notification state below. Clone the content-free
     // fusion stamps first so no journal read runs under the detection lock.
     let detections = inner.detections.lock().expect("detections lock").clone();
@@ -2096,12 +1997,11 @@ fn status_result_with_refresh(
                         // From the same cached verdict as the state itself,
                         // so the word and the reason for it can never come
                         // from two different moments.
-                        ps.unknown_reason =
-                            entry.and_then(|e| e.detection.unknown_reason.clone());
+                        ps.unknown_reason = entry.and_then(|e| e.detection.unknown_reason.clone());
                         ps.working_confirmed = (ps.state == cyclops_proto::AgentState::Working)
                             .then_some(entry.is_some_and(|e| e.working_confirmed));
-                        ps.unread = recipient
-                            .and_then(|recipient| messaging_status.unread_for(recipient));
+                        ps.unread =
+                            recipient.and_then(|recipient| messaging_status.unread_for(recipient));
                         if let Some(entry) = entry {
                             ps.composer = entry.composer.state;
                             ps.composer_proof = entry.composer.proof;
@@ -2109,120 +2009,33 @@ fn status_result_with_refresh(
                             ps.composer_reason = entry.composer.reason.map(str::to_string);
                             ps.composer_candidates = entry.composer.candidate_count;
                         }
-                        if let Some(durable_candidates) = recipient.and_then(|recipient| {
-                            composer_candidates.as_ref()?.get(&recipient)
-                        }) {
-                            let durable_count = durable_candidates.len();
-                            ps.composer_candidates =
-                                u32::try_from(durable_count).unwrap_or(u32::MAX);
-                            ps.notification_attempt = if durable_count == 1 {
-                                durable_candidates.keys().next().copied()
-                            } else {
-                                None
-                            };
-                        }
-                        if let Some(attempt) = ps.notification_attempt {
-                            let candidate = recipient.and_then(|recipient| {
-                                composer_candidates.as_ref()?.get(&recipient)?.get(&attempt)
-                            });
-                            match candidate {
-                                Some(candidate) => {
-                                    ps.notification_state = Some(candidate.record.state);
-                                    ps.message_state = candidate
-                                        .entry_state
-                                        .as_ref()
-                                        .map(cyclops_proto::ComposerMessageState::from);
-                                    let cached_binding =
-                                        entry.and_then(|entry| entry.composer.binding.as_ref());
-                                    let durable_binding_complete = candidate
-                                        .record
-                                        .binding
-                                        .as_ref()
-                                        .is_some_and(|binding| {
-                                            binding.pane_root.is_some() && binding.leader.is_some()
-                                        });
-                                    let binding_unprovable = pane_root.is_none()
-                                        || cached_binding.is_none()
-                                        || !durable_binding_complete;
-                                    let binding_matches = recipient.is_some_and(|recipient| {
-                                        cached_binding.is_some_and(|binding| {
-                                            ProcessInstanceId::new(
-                                                binding.pane_root.pid,
-                                                binding.pane_root.birth,
-                                            )
-                                            .ok()
-                                            .is_some_and(|cached_root| {
-                                                pane_root == Some(cached_root)
-                                            }) && fusion::notification_binding_matches(
-                                                &candidate.record,
-                                                recipient,
-                                                binding,
-                                            )
-                                        })
-                                    });
-                                    if matches!(
-                                        ps.composer,
-                                        cyclops_proto::ComposerState::CyclopsNotificationStaged
-                                            | cyclops_proto::ComposerState::CyclopsNotificationSubmitted
-                                    ) && !binding_matches
-                                    {
-                                        ps.composer =
-                                            cyclops_proto::ComposerState::ComposerAmbiguous;
-                                        if binding_unprovable {
-                                            ps.composer_proof =
-                                                cyclops_proto::ComposerProof::Unprovable;
-                                            ps.composer_reason =
-                                                Some("binding_unprovable".to_string());
-                                        } else {
-                                            ps.composer_proof =
-                                                cyclops_proto::ComposerProof::Ambiguous;
-                                            ps.composer_reason =
-                                                Some("binding_mismatch".to_string());
-                                        }
-                                        ps.next_action = Some(operator_next_action(
-                                            ps.notification_state,
-                                            ps.notification_attempt.is_some(),
-                                        ));
-                                    } else {
-                                        let active_worker_owns =
-                                            inner.engine.notification_worker_owns(
-                                                candidate.record.recipient,
-                                                candidate.record.attempt_id,
-                                            );
-                                        let clear_supported = candidate
-                                            .record
-                                            .binding
-                                            .as_ref()
-                                            .and_then(|binding| {
-                                                inner.manifests.get(binding.manifest.as_str())
-                                            })
-                                            .is_some_and(|manifest| {
-                                                !manifest.injection.clear_keys.is_empty()
-                                            });
-                                        ps.next_action = Some(composer_next_action(
-                                            ps.composer,
-                                            candidate.record.state,
-                                            ps.message_state,
-                                            candidate.recovery_action,
-                                            clear_supported,
-                                            active_worker_owns,
-                                        ));
-                                    }
-                                }
-                                None => {
-                                    // A retired or unreadable durable barrier cannot inherit a
-                                    // prior exact status stamp. Status is evidence, not authority.
-                                    ps.composer = cyclops_proto::ComposerState::ComposerAmbiguous;
-                                    ps.composer_proof = cyclops_proto::ComposerProof::Unprovable;
-                                    ps.next_action = Some(operator_next_action(
-                                        ps.notification_state,
-                                        ps.notification_attempt.is_some(),
-                                    ));
-                                }
-                            }
-                        } else if ps.composer_candidates > 0 {
-                            ps.next_action = Some(cyclops_proto::ComposerNextAction::InspectMessages);
-                        }
+                        let binding = recipient.and_then(|recipient| {
+                            entry?
+                                .composer
+                                .binding
+                                .as_ref()?
+                                .notification_evidence(recipient)
+                        });
+                        let composer_status = messaging_status.composer_status(
+                            recipient,
+                            crate::messaging::MessagingComposerObservation {
+                                composer: ps.composer,
+                                proof: ps.composer_proof,
+                                reason: ps.composer_reason,
+                                detected_attempt: ps.notification_attempt,
+                                detected_candidate_count: ps.composer_candidates,
+                                pane_root,
+                                binding,
+                            },
+                        );
+                        ps.composer = composer_status.composer;
+                        ps.composer_proof = composer_status.proof;
+                        ps.composer_reason = composer_status.reason;
+                        ps.composer_candidates = composer_status.candidate_count;
+                        ps.notification_attempt = composer_status.attempt;
+                        ps.notification_state = composer_status.notification_state;
+                        ps.message_state = composer_status.message_state;
+                        ps.next_action = composer_status.next_action;
                         // Hook liveness (amendment c): adopted panes whose
                         // manifest declares hooks carry the verified bit,
                         // scoped to the current occupant (edges from a
@@ -4334,156 +4147,6 @@ mod tests {
         std::fs::remove_dir_all(path).ok();
     }
 
-    #[test]
-    fn status_never_advertises_a_second_submit_after_submit_intent() {
-        use crate::mailbox::ExactOwnedRecoveryAction;
-        use cyclops_proto::{
-            ComposerMessageState, ComposerNextAction, ComposerState, NotificationState,
-        };
-
-        assert_eq!(
-            composer_next_action(
-                ComposerState::CyclopsNotificationStaged,
-                NotificationState::Staged,
-                Some(ComposerMessageState::Pending),
-                ExactOwnedRecoveryAction::Ineligible,
-                false,
-                true,
-            ),
-            ComposerNextAction::AutomaticSubmit
-        );
-        assert_eq!(
-            composer_next_action(
-                ComposerState::CyclopsNotificationStaged,
-                NotificationState::Staged,
-                Some(ComposerMessageState::Claimed),
-                ExactOwnedRecoveryAction::Ineligible,
-                false,
-                true,
-            ),
-            ComposerNextAction::AutomaticReconcile
-        );
-        assert_eq!(
-            composer_next_action(
-                ComposerState::CyclopsNotificationStaged,
-                NotificationState::AttentionRequired,
-                Some(ComposerMessageState::Pending),
-                ExactOwnedRecoveryAction::Submit,
-                false,
-                false,
-            ),
-            ComposerNextAction::AutomaticSubmit
-        );
-        assert_eq!(
-            composer_next_action(
-                ComposerState::CyclopsNotificationStaged,
-                NotificationState::AttentionRequired,
-                Some(ComposerMessageState::Pending),
-                ExactOwnedRecoveryAction::Inspect,
-                false,
-                false,
-            ),
-            ComposerNextAction::InspectAttention
-        );
-        assert_eq!(
-            composer_next_action(
-                ComposerState::CyclopsNotificationStaged,
-                NotificationState::AttentionRequired,
-                Some(ComposerMessageState::Claimed),
-                ExactOwnedRecoveryAction::Clear,
-                true,
-                false,
-            ),
-            ComposerNextAction::AutomaticReconcile
-        );
-        assert_eq!(
-            composer_next_action(
-                ComposerState::CyclopsNotificationStaged,
-                NotificationState::AttentionRequired,
-                Some(ComposerMessageState::Claimed),
-                ExactOwnedRecoveryAction::Clear,
-                false,
-                false,
-            ),
-            ComposerNextAction::InspectAttention
-        );
-        for message in [ComposerMessageState::Pending, ComposerMessageState::Claimed] {
-            assert_eq!(
-                composer_next_action(
-                    ComposerState::CyclopsNotificationStaged,
-                    NotificationState::Staged,
-                    Some(message),
-                    ExactOwnedRecoveryAction::Ineligible,
-                    false,
-                    false,
-                ),
-                ComposerNextAction::CheckHealth,
-                "{message:?}"
-            );
-        }
-        for state in [NotificationState::Submitting, NotificationState::Submitted] {
-            assert_eq!(
-                composer_next_action(
-                    ComposerState::CyclopsNotificationStaged,
-                    state,
-                    Some(ComposerMessageState::Pending),
-                    ExactOwnedRecoveryAction::Ineligible,
-                    false,
-                    true,
-                ),
-                ComposerNextAction::AutomaticReconcile,
-                "{state:?}"
-            );
-            assert_eq!(
-                composer_next_action(
-                    ComposerState::CyclopsNotificationStaged,
-                    state,
-                    Some(ComposerMessageState::Pending),
-                    ExactOwnedRecoveryAction::Ineligible,
-                    false,
-                    false,
-                ),
-                ComposerNextAction::CheckHealth,
-                "{state:?}"
-            );
-        }
-        for (state, expected) in [
-            (NotificationState::Notified, ComposerNextAction::CheckHealth),
-            (
-                NotificationState::AttentionRequired,
-                ComposerNextAction::InspectAttention,
-            ),
-            (
-                NotificationState::WithdrawnAfterStaging,
-                ComposerNextAction::CheckHealth,
-            ),
-        ] {
-            assert_eq!(
-                composer_next_action(
-                    ComposerState::CyclopsNotificationStaged,
-                    state,
-                    Some(ComposerMessageState::Claimed),
-                    ExactOwnedRecoveryAction::Ineligible,
-                    false,
-                    true,
-                ),
-                expected,
-                "{state:?}"
-            );
-        }
-        assert_eq!(
-            composer_next_action(
-                ComposerState::ComposerAmbiguous,
-                NotificationState::Staged,
-                Some(ComposerMessageState::Pending),
-                ExactOwnedRecoveryAction::Ineligible,
-                false,
-                true,
-            ),
-            ComposerNextAction::CheckHealth
-        );
-    }
-
     async fn call(tag: &str, method: &str, params: Value) -> Response {
         let (inner, path) = inner_with_mailbox(&format!("operator-{tag}"));
         let request = Request {
@@ -5139,8 +4802,15 @@ mod tests {
             .expect("handler after status composition")
             .0;
         assert!(status.contains("messaging.status_snapshot("));
+        assert!(status.contains("messaging_status.composer_status("));
         for forbidden in [
             "inner.mailbox",
+            "ActiveComposerNotification",
+            "ExactOwnedRecoveryAction",
+            "active_composer_notifications_snapshot",
+            "composer_candidate_index",
+            "composer_next_action",
+            "notification_worker_owns",
             ".pending_count(",
             ".pending_recipients(",
             ".recipient_label(",

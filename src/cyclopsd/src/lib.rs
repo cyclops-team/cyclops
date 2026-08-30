@@ -92,9 +92,10 @@ use cyclops_ledger::LedgerWriter;
 use cyclops_manifest::Manifest;
 use cyclops_proto::{
     AdminNotifyParams, AgentState, Detection, Event, Kind, LedgerLine, MessageId,
-    MessagesSnapshotResult, MsgSendParams, NotificationAttemptId, NotificationRouteEvidenceId,
-    NotificationWithdrawResult, ProcessInstanceId, RecipientKey, SessionIdentityBinding,
-    SessionInstanceId, StateReportParams, TmuxPaneId, TmuxSessionId, WireError, WorkspaceId,
+    MessagesSnapshotResult, MsgSendParams, NotificationAttemptId, NotificationManifestId,
+    NotificationRouteEvidenceId, NotificationWithdrawResult, ProcessInstanceId, RecipientKey,
+    SessionIdentityBinding, SessionInstanceId, StateReportParams, TmuxPaneId, TmuxSessionId,
+    WireError, WorkspaceId,
 };
 use cyclops_state::{RepairSummary, StateRoot};
 use cyclops_tmux::{
@@ -488,6 +489,23 @@ impl messaging::WorkspaceMessagingEffects for DaemonWorkspaceMessagingEffects {
             return Ok(None);
         };
         messaging::notification_route(&inner, service, recipient)
+    }
+
+    fn composer_runtime_facts(
+        &self,
+        recipient: RecipientKey,
+        attempt_id: NotificationAttemptId,
+        manifest: Option<&NotificationManifestId>,
+    ) -> messaging::MessagingComposerRuntimeFacts {
+        let Some(inner) = self.inner.upgrade() else {
+            return messaging::MessagingComposerRuntimeFacts::default();
+        };
+        messaging::MessagingComposerRuntimeFacts {
+            active_worker_owns: inner.engine.notification_worker_owns(recipient, attempt_id),
+            clear_supported: manifest
+                .and_then(|manifest| inner.manifests.get(manifest.as_str()))
+                .is_some_and(|manifest| !manifest.injection.clear_keys.is_empty()),
+        }
     }
 
     fn settle_notification_claim(&self, attempt_id: NotificationAttemptId) {
