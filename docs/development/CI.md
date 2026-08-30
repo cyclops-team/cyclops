@@ -81,14 +81,23 @@ tripwire whose own header states what source shapes it cannot recognize. It does
 not replace domain tests or review.
 
 The named backspace regression waits for the positive `write_ready` event that
-actually wakes or reopens the held attempt. Waiting only for the weaker
-`composer_clean` projection failed once under the release suite because screen
-settlement had not yet produced write permission. A fresh event subscription is
-established after the durable hold and immediately before Backspace, so setup
+actually wakes the held attempt. Waiting only for the weaker `composer_clean`
+projection failed once under the release suite because screen settlement had
+not yet produced write permission. A fresh event subscription is established
+after the gate reports the hold and immediately before Backspace, so setup
 events cannot satisfy the release condition. The test then waits on explicit
-injected pre-write and staged phase events. This synchronization contains no
-timing sleep; the 20-second phase timeout only bounds a missing contract event
-under four concurrent isolated rigs on a cold shared runner.
+injected pre-write and staged phase events.
+
+That evidence exposed a second product race under the complete Linux suite.
+The delivery gate recreated its readiness receiver between re-evaluations. An
+early pane event could trigger one re-evaluation, then the settled positive
+readiness edge could land in the gap before the next receiver existed. The gate
+now owns one receiver for its full lifetime, so events published during or
+between re-evaluations remain buffered. The focused Backspace regression passed
+40 bounded repetitions and the complete 40-test messaging coordinator passed
+10 bounded four-thread repetitions after the repair. This synchronization
+contains no timing sleep; the 20-second phase timeout only bounds a missing
+contract event under four concurrent isolated rigs on a cold shared runner.
 
 ## Task 3 representative pull-request comparison
 
