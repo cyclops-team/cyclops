@@ -479,6 +479,7 @@ impl NotificationContext {
     }
 
     /// Stop this exact attempt after proving that no terminal write occurred.
+    #[cfg(test)]
     pub(crate) fn record_pre_write_block(
         &self,
         cause: NotificationPreWriteCause,

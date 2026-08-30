@@ -71,7 +71,14 @@ pre-write withdrawal also stay atomic at this boundary: the Module commits the
 durable mutation, then owns notification scheduling, exact cancellation, FIFO
 advance, and unread invalidation. Publication synchronization is owned inside
 the Module and exposed only through Module operations that require one
-consistent transaction.
+consistent transaction. Delivery supplies immutable pre-write observations to
+the Module and receives only a body-free recorded-or-obsolete result. The
+Module synthesizes a content-free route baseline when readiness changed without
+one, selects the wake-block policy, commits the durable transition, classifies
+benign obsolete work, converts exhausted supervisors into a durable block, and
+publishes the first route consequence. Delivery retains physical route
+re-observation and faults its worker when storage is uncertain; it does not
+receive the publication lock or interpret journal states.
 The Module also owns body-free alarm summaries, administrator clearance, exact
 attention-target selection, ambiguity, and recipient visibility. The separate
 attention-resolution mechanism receives the selected attempt through a narrow
