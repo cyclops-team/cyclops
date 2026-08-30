@@ -773,19 +773,26 @@ impl TestClient {
 
     /// Next event matching `pred`, scanning buffered then incoming lines.
     pub async fn wait_event<F: Fn(&Value) -> bool>(&mut self, within: Duration, pred: F) -> Value {
+        self.wait_event_named(within, "matching event", pred).await
+    }
+
+    /// Next event matching `pred`, with the contract boundary named on timeout.
+    pub async fn wait_event_named<F: Fn(&Value) -> bool>(
+        &mut self,
+        within: Duration,
+        what: &str,
+        pred: F,
+    ) -> Value {
         if let Some(i) = self.pending_events.iter().position(&pred) {
             return self.pending_events.remove(i).unwrap();
         }
         let deadline = Instant::now() + within;
         loop {
-            assert!(
-                Instant::now() < deadline,
-                "no matching event within {within:?}"
-            );
+            assert!(Instant::now() < deadline, "no {what} within {within:?}");
             let remaining = deadline.saturating_duration_since(Instant::now());
             let v = tokio::time::timeout(remaining, self.next_line())
                 .await
-                .unwrap_or_else(|_| panic!("no matching event within {within:?}"));
+                .unwrap_or_else(|_| panic!("no {what} within {within:?}"));
             if v.get("event").is_some() {
                 if pred(&v) {
                     return v;
