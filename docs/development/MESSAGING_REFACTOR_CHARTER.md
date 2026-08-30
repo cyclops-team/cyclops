@@ -53,8 +53,9 @@ When sources conflict, use this order:
 4. The
    [messaging architecture review](../MESSAGING_ARCHITECTURE_REVIEW.md) and
    [addendum](../ADDENDUM_REVIEW.md) as supporting design records.
-5. The [CI review](CI_TEST_ARCHITECTURE_REVIEW.md) as a separate active
-   proposal, not a messaging milestone.
+5. The implemented [CI contract](CI.md) for current CI behavior. Its supporting
+   [CI review](CI_TEST_ARCHITECTURE_REVIEW.md) records the evidence and
+   rationale. Neither document is a messaging milestone.
 6. Historical records and superseded plans, which are never current
    implementation authority.
 

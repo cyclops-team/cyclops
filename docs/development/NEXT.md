@@ -1,6 +1,6 @@
-# Current execution queue
+# Current state and operator gates
 
-**Status:** Current execution queue
+**Status:** Awaiting operator gates
 
 **Implementation authority:**
 [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md)
@@ -8,61 +8,32 @@
 **Integration branch:** **beta/messaging-rework**
 
 The charter owns rationale, preserved behavior, stop conditions, and rollback
-requirements. This page names only the active work and what follows it.
+requirements. This page records the completed state, remaining operator gates,
+and preserved boundaries.
 
-## Active milestone
+## Current state
 
-Milestone 7 runs on **beta/feat/collapsed-messages-cue**.
+All seven messaging milestones and the three authorized CI tasks are
+integrated. The post-milestone architecture, regression, performance,
+migration, reliability, and user-journey results are recorded in the
+[Messaging Beta audit](MESSAGING_BETA_AUDIT.md).
 
-This milestone completes the full-workspace hidden messaging journey without
-changing the other two approved visibility choices. The collapsed one-column
-Messages rail projects authenticated, body-free snapshot state:
+There is no remaining authorized implementation milestone. The queue is now:
 
-- `✉` plus `1` through `9`, or `+` for ten or more, reports Work messages;
-- `!` reports open attention; and
-- `?` reports that no authenticated snapshot exists or the retained one is
-  stale.
-
-The cue refreshes after body-free `messages.changed` invalidation and reconnect
-without opening the pane. Opening the pane still refreshes the detailed
-projection before actions become available. It does not create a second unread
-queue, broadcast content, resize the rail, or turn ordinary pane decoration
-updates into message reads.
-
-Milestone 7 exits when:
-
-- hidden invalidations fetch an authorized body-free snapshot without forcing
-  either panel open;
-- current, attention, stale, and unknown rail states have focused rendering
-  evidence;
-- the existing adopted-tmux body-free count is unchanged;
-- native tmux remains intentionally chrome-free with manual inbox inspection;
-  and
-- full workspace and repository gates pass.
-
-## Remaining product queue
-
-1. Run fresh beta architecture, regression, performance, migration, and
-   user-journey audits.
-2. Report beta readiness and stop for operator approval before any pull request
-   from **beta/messaging-rework** into **main** or any release publication.
-
-Milestones 1 through 6 are integrated. The Milestones 3 and 4 continuation
-passes completed the charter's responsibility audit: `WorkspaceMessaging` owns
-the assigned durable decisions, observation returns immutable evidence, and
-ordinary callers no longer coordinate messaging projections, locks, workers,
-or post-commit scheduling. The three authorized CI branches are also
-integrated: **beta/ci/foundation**, **beta/ci/deterministic-tests**, and
-**beta/ci/evidence-lanes**.
+1. reconcile the workspace version, remote tag, and GitHub Release authority;
+2. obtain operator review of the audit and retained release evidence;
+3. obtain explicit operator approval before opening a final pull request from
+   **beta/messaging-rework** into **main**, then obtain approval again before
+   merging it; and
+4. obtain separate operator approval before assigning a version, creating a
+   tag, or publishing a release.
 
 ## Branch and review rules
 
 - Do not develop directly on **main** or make routine commits directly on
   **beta/messaging-rework**.
-- Each remaining milestone gets a focused pull request into the integration
-  branch, regression evidence, review, and rollback point.
-- Merge a milestone pull request when required evidence, review, and CI are
-  green, then continue directly.
+- Any post-audit correction gets a focused pull request into the integration
+  branch, named regression evidence, review, and a rollback point.
 - Do not merge the beta integration branch into **main** or publish a release
   without operator approval.
 

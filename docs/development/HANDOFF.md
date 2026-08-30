@@ -5,17 +5,20 @@ job you have been handed, and which decisions were deliberate so you do not
 spend a day undoing one.
 
 For current behavior, start with this map and the behavior contracts below.
-For implementation order in the Messaging Beta Rework, the approved
-[Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) controls and the
-thin [current execution queue](NEXT.md) states what runs next.
+The approved [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md)
+records the scope and stop conditions of the completed Messaging Beta Rework.
+[NEXT.md](NEXT.md) records the remaining operator gates, and the
+[Messaging Beta audit](MESSAGING_BETA_AUDIT.md) records the completion
+evidence.
 
 The
 [messaging architecture review](../MESSAGING_ARCHITECTURE_REVIEW.md) and its
 [addendum](../ADDENDUM_REVIEW.md) are supporting design records. They explain
 the reasoning behind the approved charter, but the charter controls
 implementation when the documents differ. The
-[CI and test architecture review](CI_TEST_ARCHITECTURE_REVIEW.md) is a separate
-active proposal, not part of the messaging milestone queue. The reusable
+[CI and test architecture review](CI_TEST_ARCHITECTURE_REVIEW.md) is the
+supporting design record behind the implemented [current CI contract](CI.md),
+not messaging authority. The reusable
 [architecture review method](ARCHITECTURE_REVIEW_PROCESS.md) is methodology,
 not a Cyclops behavior contract.
 
@@ -52,9 +55,10 @@ contracts, and historical records separate:
 | Stable reference | [Technical reference](../reference/README.md) | Wire methods, manifests, hooks, and measured performance claims. |
 | Current behavior contracts | [Architecture](ARCHITECTURE.md), [delivery](DELIVERY.md), [invariants](INVARIANTS.md), [protocol](../reference/PROTOCOL.md), [goals](GOALS.md), and [style](STYLE.md) | Read before changing product behavior, wire behavior, rendering, or tests. |
 | Approved implementation authority | [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) | Controls the Messaging Beta Rework when supporting records or historical plans differ. |
-| Current execution queue | [NEXT.md](NEXT.md) | Thin queue of the current branch, next milestones, and explicit exclusions. |
+| Current state and operator gates | [NEXT.md](NEXT.md) | Completion status, remaining approvals, and explicit exclusions. |
+| Completed beta audit | [Messaging Beta audit](MESSAGING_BETA_AUDIT.md) | Final architecture, regression, performance, migration, reliability, and journey evidence plus the remaining operator gates. |
 | Supporting design records | [Messaging architecture review](../MESSAGING_ARCHITECTURE_REVIEW.md) and [addendum](../ADDENDUM_REVIEW.md) | Reasoning behind the charter, not independent implementation authority. |
-| Separate active proposal | [CI and test architecture review](CI_TEST_ARCHITECTURE_REVIEW.md) | Review independently from messaging milestones. |
+| CI design record | [CI and test architecture review](CI_TEST_ARCHITECTURE_REVIEW.md) | Evidence and rationale behind the implemented [CI contract](CI.md), not messaging authority. |
 | General methodology | [Architecture review method](ARCHITECTURE_REVIEW_PROCESS.md) | Reusable audit process, not a Cyclops behavior contract. |
 | Frozen and historical records | [Reliability roadmap](RELIABILITY_ROADMAP.md), [stabilization history](STABILIZATION_HISTORY.md), [V5 line](V5.md), [changelog](../../CHANGELOG.md), and [findings](../../findings.md) | Preserve the reasoning and evidence behind the current system. Do not treat old plans as current behavior. |
 | Internal release material | [Media plan](../public/README.md) and [archived demo checklist](archive/demo-day-checklist.md) | Maintainer and historical material, not public onboarding. |

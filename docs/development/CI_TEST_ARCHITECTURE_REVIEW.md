@@ -4,7 +4,9 @@
 
 **Code reviewed:** `ead57c1691371a1deca5afeb89e90e8340accb69`
 
-**Status:** Separate active proposal, not current behavior or messaging authority
+**Status:** Supporting design record. The implemented [CI contract](CI.md)
+controls current behavior; this review remains evidence and rationale, not
+messaging authority.
 
 **Primary evidence run:** [GitHub Actions run 33241643555](https://github.com/cyclops-team/cyclops/actions/runs/33241643555)
 
