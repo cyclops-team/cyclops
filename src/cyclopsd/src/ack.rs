@@ -674,16 +674,18 @@ pub(crate) async fn handle_report(
             if let Some(field) = &m.hooks.ack_payload_field {
                 if let Some(text) = params.payload.get(field).and_then(Value::as_str) {
                     if m.hooks.ack_evidence == AckEvidence::Receipt {
-                        if let Some(service) = inner.mailbox.as_ref() {
-                            matched |= service.confirm_attention_consumption_hook(
-                                session_idx,
-                                &pane_id,
-                                origin.recipient_key,
-                                origin.pane_root,
-                                origin.agent,
-                                &m.agent.id,
-                                text,
-                                edge_ms,
+                        if let Some(messaging) = inner.workspace_messaging() {
+                            matched |= messaging.attention_consumption_observed(
+                                crate::messaging::MessagingAttentionConsumptionObservation::new(
+                                    session_idx,
+                                    &pane_id,
+                                    origin.recipient_key,
+                                    origin.pane_root,
+                                    origin.agent,
+                                    &m.agent.id,
+                                    text,
+                                    edge_ms,
+                                ),
                             );
                         }
                     }

@@ -132,6 +132,49 @@ pub(crate) struct MessagingRouteEvidence {
     pub(crate) evidence_id: NotificationRouteEvidenceId,
 }
 
+/// One immutable authenticated hook observation for an exact attention
+/// consumption candidate.
+///
+/// Hook handling proves the process and payload facts. `WorkspaceMessaging`
+/// owns candidate lookup, exact durable-binding comparison, and the one-shot
+/// consumption signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MessagingAttentionConsumptionObservation {
+    session_idx: usize,
+    pane_id: String,
+    recipient: RecipientKey,
+    pane_root: crate::identity::ProcId,
+    agent: crate::identity::ProcId,
+    manifest: String,
+    prompt: String,
+    observed_at_ms: u64,
+}
+
+impl MessagingAttentionConsumptionObservation {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        session_idx: usize,
+        pane_id: impl Into<String>,
+        recipient: RecipientKey,
+        pane_root: crate::identity::ProcId,
+        agent: crate::identity::ProcId,
+        manifest: impl Into<String>,
+        prompt: impl Into<String>,
+        observed_at_ms: u64,
+    ) -> Self {
+        Self {
+            session_idx,
+            pane_id: pane_id.into(),
+            recipient,
+            pane_root,
+            agent,
+            manifest: manifest.into(),
+            prompt: prompt.into(),
+            observed_at_ms,
+        }
+    }
+}
+
 /// Current pane evidence supplied to the body-free messaging status operation.
 ///
 /// The status adapter observes these facts. It does not join them to durable
@@ -1208,6 +1251,25 @@ impl WorkspaceMessaging {
                     signal,
                 })
             })
+    }
+
+    /// Match one authenticated hook observation to an exact registered
+    /// attention candidate without exposing candidate storage or durable
+    /// binding rules to the hook adapter.
+    pub(crate) fn attention_consumption_observed(
+        &self,
+        observation: MessagingAttentionConsumptionObservation,
+    ) -> bool {
+        self.service.confirm_attention_consumption_hook(
+            observation.session_idx,
+            &observation.pane_id,
+            observation.recipient,
+            observation.pane_root,
+            observation.agent,
+            &observation.manifest,
+            &observation.prompt,
+            observation.observed_at_ms,
+        )
     }
 
     /// Reserve one exact attention attempt and classify its durable recovery
@@ -2428,6 +2490,34 @@ mod tests {
         }
     }
 
+    /// Syntactic architecture lint: the authenticated hook adapter proves one
+    /// immutable observation. Candidate storage and matching stay inside the
+    /// messaging Module.
+    #[test]
+    fn authenticated_hook_cannot_access_messaging_internals() {
+        let source = include_str!("ack.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("authenticated hook test boundary")
+            .0;
+
+        assert!(
+            production.contains("MessagingAttentionConsumptionObservation::new"),
+            "authenticated hook stopped publishing its immutable observation"
+        );
+        for forbidden in [
+            "inner.mailbox",
+            "confirm_attention_consumption_hook",
+            "attention_consumption_candidates",
+            "MailboxService",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "authenticated hook recovered messaging internals through {forbidden}"
+            );
+        }
+    }
+
     // Obsolete if alarm or attention adapters again inspect notification
     // records, resolve ambiguous targets, or decide recipient visibility.
     #[test]
@@ -2563,8 +2653,8 @@ mod tests {
             .unwrap();
     }
 
-    // Obsolete if terminal code again reads message rows or owns boot-local
-    // consumption-candidate cleanup through MailboxService.
+    // Obsolete if terminal or hook code again reads message rows, matches
+    // durable bindings, or owns boot-local consumption candidates.
     #[test]
     fn workspace_messaging_owns_attention_payload_and_consumption_registration() {
         let (_scratch, service, events, _reviewer, _) =
@@ -2590,6 +2680,40 @@ mod tests {
             .register_attention_consumption(&target, 0, pane_id.clone(), expected.clone(), 0)
             .unwrap()
             .expect("exact-attempt doorbells register consumption");
+        let signal = registration.signal();
+        let binding = target
+            .record
+            .binding
+            .as_ref()
+            .expect("written doorbell retains its exact durable binding");
+        let pane_root = binding
+            .pane_root
+            .expect("written doorbell retains its pane root");
+        assert!(messaging.attention_consumption_observed(
+            MessagingAttentionConsumptionObservation::new(
+                0,
+                pane_id.clone(),
+                target.record.recipient,
+                crate::identity::ProcId {
+                    pid: pane_root.pid(),
+                    birth: pane_root.birth(),
+                },
+                crate::identity::ProcId {
+                    pid: binding.agent.pid(),
+                    birth: binding.agent.birth(),
+                },
+                binding.manifest.as_str(),
+                expected.clone(),
+                1,
+            ),
+        ));
+        assert_eq!(
+            signal.observation(),
+            Some(NotificationResolutionConsumptionObservation {
+                evidence: cyclops_proto::NotificationResolutionConsumptionEvidence::ExactHookPrompt,
+                observed_at_ms: 1,
+            })
+        );
         assert!(messaging
             .register_attention_consumption(&target, 0, pane_id.clone(), expected.clone(), 0)
             .is_err());
