@@ -13,8 +13,8 @@ preserved behavior, stop conditions, and rollback requirements.
 
 ## Current milestone
 
-The next focused completion pass runs on
-**beta/refactor/observation-messaging-evidence**. The first Milestone 3
+The current responsibility-audit correction runs on
+**beta/refactor/observation-messaging-audit**. The first Milestone 3
 family proved the internal seam. The read-and-claim pass then moved inbox listing,
 claiming, message snapshots, and durable follow pages behind
 `WorkspaceMessaging`; the Module owns retained claim-locator interpretation,
@@ -111,10 +111,17 @@ returns exact route, process, manifest, turn, and causal-time evidence after
 the cache commit and any state event. The composition root confirms the
 retained delivery before ordered messaging observations or presentation, and
 a stalled chrome repaint cannot consume that durable receipt. A deletion lint
-prevents fusion from calling the ACK mechanism directly. A fresh Milestone 4
-responsibility audit is next; use
-**beta/refactor/observation-messaging-audit** only when that audit
-finds a material misplaced responsibility requiring a focused correction.
+prevents fusion from calling the ACK mechanism directly. The fresh Milestones
+3–4 audit then found that daemon lifecycle and tmux event sources still chose
+the pending-recipient, route-evidence, width-block, replay-reminder, and
+force-submit schedulers directly. The current audit correction makes those
+sources publish route, pane-size, or availability evidence instead.
+`WorkspaceMessaging` now owns durable candidate selection and decides which
+retained mechanism runs; a deletion lint confines direct route scheduling to
+the effects adapter. The next focused correction is the participant-directory
+publication and caller-authentication boundary on
+**beta/refactor/workspace-messaging-directory-boundary**. Milestone 6 owns the
+separate history and presentation findings from this audit.
 Additional narrowly named completion branches remain allowed when one pull
 request would become broad. Milestone 5 put
 retained direct-delivery entry points, restart settlement, and session-journal

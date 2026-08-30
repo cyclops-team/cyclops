@@ -131,6 +131,23 @@ pub(crate) struct MessagingRouteEvidence {
     pub(crate) evidence_id: NotificationRouteEvidenceId,
 }
 
+/// One immutable pane-size edge joined to the exact durable recipient.
+///
+/// The tmux event source proves the physical edge and identity. Durable width
+/// block lookup and the decision to reconcile remain inside
+/// `WorkspaceMessaging`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MessagingPaneSizeEvidence {
+    recipient: RecipientKey,
+    route: MessagingRouteEvidence,
+}
+
+impl MessagingPaneSizeEvidence {
+    pub(crate) fn new(recipient: RecipientKey, route: MessagingRouteEvidence) -> Self {
+        Self { recipient, route }
+    }
+}
+
 /// Body-free result of one durable pre-write block transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MessagingPreWriteBlock {
@@ -1165,8 +1182,6 @@ pub(crate) trait WorkspaceMessagingEffects: Send + Sync {
 
     fn schedule_force_submit(&self, record: NotificationRecord);
 
-    fn schedule_force_submit_candidates(&self);
-
     fn receipt_block(&self) -> Duration;
 }
 
@@ -1740,6 +1755,54 @@ impl WorkspaceMessaging {
         self.effects.reconcile_route_evidence(evidence);
     }
 
+    /// Reconsider only a recipient whose durable head is blocked on pane width.
+    ///
+    /// The event source supplies immutable physical evidence. It does not read
+    /// mailbox projections or choose the retained reconciliation mechanism.
+    pub(crate) fn pane_size_observed(
+        &self,
+        evidence: MessagingPaneSizeEvidence,
+    ) -> Result<(), MailboxServiceError> {
+        if self
+            .service
+            .oldest_notification_has_width_block(evidence.recipient)?
+        {
+            self.effects.reconcile_route_evidence(evidence.route);
+        }
+        Ok(())
+    }
+
+    /// Resume every durable FIFO that may now have a route.
+    ///
+    /// Directory and lifecycle callers report availability; this Module owns
+    /// the pending-recipient projection and post-commit scheduling choice.
+    pub(crate) fn availability_changed(&self) {
+        let recipients = match self.service.pending_recipients() {
+            Ok(recipients) => recipients,
+            Err(error) => {
+                error!(%error, "cannot inspect pending mailbox notifications");
+                return;
+            }
+        };
+        for recipient in recipients {
+            if let Err(error) = self.effects.schedule_notification(&self.service, recipient) {
+                error!(%recipient, %error, "cannot schedule mailbox notification");
+            }
+        }
+    }
+
+    /// Restore exact reminder timers from durable replay state.
+    pub(crate) fn restore_unclaimed_reminders(&self) {
+        match self.service.unclaimed_reminder_candidates() {
+            Ok(records) => {
+                for record in records {
+                    self.effects.schedule_unclaimed_reminder(record);
+                }
+            }
+            Err(error) => error!(%error, "cannot inspect unclaimed reminder candidates"),
+        }
+    }
+
     /// Persist one known pre-write refusal and publish its route consequence
     /// without exposing the journal lock or terminal-state variants.
     pub(crate) fn record_notification_prewrite_block(
@@ -1949,7 +2012,14 @@ impl WorkspaceMessaging {
     /// force-submit. The server persists the setting; messaging owns the work
     /// that follows from it.
     pub(crate) fn force_submit_enabled(&self) {
-        self.effects.schedule_force_submit_candidates();
+        match self.service.force_submit_candidates() {
+            Ok(records) => {
+                for record in records {
+                    self.effects.schedule_force_submit(record);
+                }
+            }
+            Err(error) => error!(%error, "cannot inspect force-submit candidates"),
+        }
     }
 
     pub(crate) fn alarm_preview(
@@ -2513,6 +2583,10 @@ impl WorkspaceMessaging {
         let (recipient, session_idx, pane_id) = match observation {
             crate::fusion::PaneMessagingObservation::RouteEvidenceObserved { evidence } => {
                 self.route_evidence_observed(evidence);
+                return Ok(ObservationApplication::default());
+            }
+            crate::fusion::PaneMessagingObservation::PaneSizeChanged { evidence } => {
+                self.pane_size_observed(evidence)?;
                 return Ok(ObservationApplication::default());
             }
             crate::fusion::PaneMessagingObservation::QuotaResetObserved {
@@ -3340,7 +3414,6 @@ mod tests {
         ReconcileCurrentRoute(usize, String),
         ScheduleUnclaimedReminder(NotificationAttemptId),
         ScheduleForceSubmit(NotificationAttemptId),
-        ScheduleForceSubmitCandidates,
     }
 
     struct RecordingEffects {
@@ -3517,13 +3590,6 @@ mod tests {
                 .lock()
                 .expect("acceptance calls lock")
                 .push(RecordedEffect::ScheduleForceSubmit(record.attempt_id));
-        }
-
-        fn schedule_force_submit_candidates(&self) {
-            self.calls
-                .lock()
-                .expect("acceptance calls lock")
-                .push(RecordedEffect::ScheduleForceSubmitCandidates);
         }
 
         fn receipt_block(&self) -> Duration {
@@ -3753,6 +3819,12 @@ mod tests {
                 generation: 9,
             },
         );
+        let (_accepted, context, _) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        record_doorbell_write(&context);
+        let attention = context
+            .record_verify_attention(NotificationVerifyOutcome::ambiguous())
+            .unwrap();
 
         messaging.route_evidence_observed(route.clone());
         messaging.notification_prewrite_blocked(2, "%7");
@@ -3763,7 +3835,7 @@ mod tests {
             vec![
                 RecordedEffect::ReconcileRouteEvidence(route),
                 RecordedEffect::ReconcileCurrentRoute(2, "%7".to_string()),
-                RecordedEffect::ScheduleForceSubmitCandidates,
+                RecordedEffect::ScheduleForceSubmit(attention.attempt_id),
             ]
         );
     }
@@ -3908,6 +3980,42 @@ mod tests {
                     "{name} recovered direct messaging-worker knowledge through {forbidden}"
                 );
             }
+        }
+    }
+
+    /// Syntactic architecture lint: daemon lifecycle and tmux event sources
+    /// publish typed observations or named availability changes. Only the
+    /// `WorkspaceMessagingEffects` adapter may invoke retained schedulers.
+    #[test]
+    fn composition_event_sources_cannot_bypass_workspace_messaging() {
+        let source = include_str!("lib.rs");
+        assert_eq!(
+            source
+                .matches("messaging_runtime::schedule_route_evidence(")
+                .count(),
+            1,
+            "route scheduling must remain confined to the effects adapter"
+        );
+        for forbidden in [
+            "messaging_runtime::schedule_available(",
+            "messaging_runtime::schedule_pane_size_changed(",
+            "messaging_runtime::schedule_unclaimed_reminders(",
+            "messaging_runtime::schedule_force_submit_candidates(",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "composition event source bypasses WorkspaceMessaging through {forbidden}"
+            );
+        }
+        for required in [
+            "apply_messaging_availability_change(",
+            "PaneMessagingObservation::route_evidence(",
+            "PaneMessagingObservation::pane_size_changed(",
+        ] {
+            assert!(
+                source.contains(required),
+                "composition root is missing typed messaging handoff {required}"
+            );
         }
     }
 
@@ -4648,6 +4756,96 @@ mod tests {
         assert_eq!(
             effects.calls(),
             vec![RecordedEffect::ReconcileRouteEvidence(evidence)]
+        );
+    }
+
+    // Obsolete if a tmux size event regains durable projection knowledge or
+    // directly chooses the route-reconciliation mechanism.
+    #[test]
+    fn workspace_messaging_reconciles_a_size_edge_only_for_a_durable_width_block() {
+        let (_scratch, service, events, reviewer, _) =
+            mailbox_service("workspace-messaging-size-observation", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            effects.clone(),
+        );
+        let route = MessagingRouteEvidence::new(
+            2,
+            "%7",
+            NotificationRouteEvidenceId {
+                boot_id: "boot".to_string(),
+                generation: 9,
+            },
+        );
+
+        messaging
+            .apply_observation(PaneMessagingObservation::pane_size_changed(
+                MessagingPaneSizeEvidence::new(reviewer, route.clone()),
+            ))
+            .unwrap();
+        assert!(effects.calls().is_empty());
+
+        let (_accepted, context, _) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        let mut narrow = durable_observation(reviewer);
+        narrow.pane_width = Some(39);
+        narrow.required_pane_width = Some(40);
+        context
+            .record_pre_write_block(
+                NotificationPreWriteCause::WriteReadinessChanged,
+                Some(narrow),
+            )
+            .unwrap();
+
+        messaging
+            .apply_observation(PaneMessagingObservation::pane_size_changed(
+                MessagingPaneSizeEvidence::new(reviewer, route.clone()),
+            ))
+            .unwrap();
+        assert_eq!(
+            effects.calls(),
+            vec![RecordedEffect::ReconcileRouteEvidence(route)]
+        );
+    }
+
+    // Obsolete if daemon lifecycle code regains pending-recipient projection
+    // knowledge or directly loops the notification scheduler.
+    #[test]
+    fn workspace_messaging_owns_availability_and_replay_candidate_selection() {
+        let (_scratch, service, events, reviewer, _) =
+            mailbox_service("workspace-messaging-availability", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            effects.clone(),
+        );
+        send_to(&service, &["reviewer"], "Available");
+
+        messaging.availability_changed();
+
+        assert_eq!(effects.calls(), vec![RecordedEffect::Schedule(reviewer)]);
+
+        let (_scratch, service, events, _reviewer, _) =
+            mailbox_service("workspace-messaging-reminder-replay", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            effects.clone(),
+        );
+        let (_accepted, context, _) = queued_attempt(&service);
+        let notified = record_notified_doorbell(&context);
+
+        messaging.restore_unclaimed_reminders();
+
+        assert_eq!(
+            effects.calls(),
+            vec![RecordedEffect::ScheduleUnclaimedReminder(
+                notified.attempt_id
+            )]
         );
     }
 

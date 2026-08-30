@@ -467,56 +467,6 @@ fn schedule_route_reconciliation_with_evidence(
     }
 }
 
-/// Reconsider a durable width block after one actual pane-size edge.
-///
-/// Size-only events remain irrelevant to normal delivery and state fusion.
-/// Once the exact blocked attempt reopens, later size events are no-ops.
-pub(crate) fn schedule_pane_size_changed(
-    inner: &Arc<Inner>,
-    session_idx: usize,
-    pane_id: &str,
-    route_evidence: &NotificationRouteEvidenceId,
-) {
-    let Some(service) = inner.mailbox.as_ref() else {
-        return;
-    };
-    let Some(recipient) = inner.recipient_key(session_idx, pane_id) else {
-        return;
-    };
-    match service.oldest_notification_has_width_block(recipient) {
-        Ok(true) => {
-            if let Err(error) =
-                schedule_recipient_after_route_evidence(inner, service, recipient, route_evidence)
-            {
-                error!(%recipient, %error, "cannot reopen width-blocked mailbox notification");
-            }
-        }
-        Ok(false) => {}
-        Err(error) => {
-            error!(%recipient, %error, "cannot inspect width-blocked mailbox notification");
-        }
-    }
-}
-
-/// Resume queued work after a route appears or a daemon restarts.
-pub(crate) fn schedule_available(inner: &Arc<Inner>) {
-    let Some(service) = inner.mailbox.as_ref() else {
-        return;
-    };
-    let recipients = match service.pending_recipients() {
-        Ok(recipients) => recipients,
-        Err(error) => {
-            error!(%error, "cannot inspect pending mailbox notifications");
-            return;
-        }
-    };
-    for recipient in recipients {
-        if let Err(error) = schedule_recipient(inner, service, recipient) {
-            error!(%recipient, %error, "cannot schedule mailbox notification");
-        }
-    }
-}
-
 /// Arm one exact-attempt, one-shot reminder after a proven doorbell.
 ///
 /// The deadline wakes once. If the prior write barrier is still active, the
@@ -633,21 +583,6 @@ pub(crate) async fn wait_and_queue_unclaimed_reminder(
     }
 }
 
-/// Re-arm pending exact reminders after journal replay.
-pub(crate) fn schedule_unclaimed_reminders(inner: &Arc<Inner>) {
-    let Some(service) = inner.mailbox.as_ref() else {
-        return;
-    };
-    match service.unclaimed_reminder_candidates() {
-        Ok(records) => {
-            for record in records {
-                schedule_unclaimed_reminder(inner, record);
-            }
-        }
-        Err(error) => error!(%error, "cannot inspect unclaimed reminder candidates"),
-    }
-}
-
 /// Arm the explicit post-paste escape hatch for one exact verify-failed
 /// doorbell. Multiple callers may arm the same attempt; durable resolution
 /// intent elects one key and makes every competing timer a no-op.
@@ -727,25 +662,6 @@ pub(crate) fn schedule_force_submit(inner: &Arc<Inner>, record: cyclops_proto::N
             ),
         };
     });
-}
-
-/// Re-arm unresolved exact attempts after daemon replay or when the operator
-/// enables or shortens the setting at runtime.
-pub(crate) fn schedule_force_submit_candidates(inner: &Arc<Inner>) {
-    if !inner.force_submit.get().0 {
-        return;
-    }
-    let Some(service) = inner.mailbox.as_ref() else {
-        return;
-    };
-    match service.force_submit_candidates() {
-        Ok(records) => {
-            for record in records {
-                schedule_force_submit(inner, record);
-            }
-        }
-        Err(error) => error!(%error, "cannot inspect force-submit candidates"),
-    }
 }
 
 /// Reconcile one exact doorbell barrier against a fresh post-claim screen.
