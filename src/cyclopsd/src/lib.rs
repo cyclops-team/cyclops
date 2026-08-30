@@ -60,6 +60,7 @@ pub mod identity;
 mod livesession;
 pub mod mailbox;
 mod messaging;
+mod messaging_runtime;
 mod notification_adapter;
 mod registry;
 mod selftest;
@@ -471,7 +472,7 @@ impl messaging::WorkspaceMessagingEffects for DaemonWorkspaceMessagingEffects {
         service: &Arc<mailbox::MailboxService>,
         recipient: RecipientKey,
     ) -> Result<messaging::RecipientScheduleOutcome, mailbox::MailboxServiceError> {
-        messaging::schedule_recipient(&self.inner()?, service, recipient)
+        messaging_runtime::schedule_recipient(&self.inner()?, service, recipient)
     }
 
     fn invalidate_unread(&self, recipient: RecipientKey) {
@@ -488,7 +489,7 @@ impl messaging::WorkspaceMessagingEffects for DaemonWorkspaceMessagingEffects {
         let Some(inner) = self.inner.upgrade() else {
             return Ok(None);
         };
-        messaging::notification_route(&inner, service, recipient)
+        messaging_runtime::notification_route(&inner, service, recipient)
     }
 
     fn composer_runtime_facts(
@@ -520,7 +521,7 @@ impl messaging::WorkspaceMessagingEffects for DaemonWorkspaceMessagingEffects {
         claimant: RecipientKey,
         attempt_id: NotificationAttemptId,
     ) -> Result<(), mailbox::MailboxServiceError> {
-        messaging::schedule_claimed_composer_observation(
+        messaging_runtime::schedule_claimed_composer_observation(
             &self.inner()?,
             service,
             claimant,
@@ -534,7 +535,7 @@ impl messaging::WorkspaceMessagingEffects for DaemonWorkspaceMessagingEffects {
         claimant: RecipientKey,
         attempt_id: NotificationAttemptId,
     ) -> Result<(), mailbox::MailboxServiceError> {
-        messaging::schedule_claimed_notification_recovery(
+        messaging_runtime::schedule_claimed_notification_recovery(
             &self.inner()?,
             service,
             claimant,
@@ -614,7 +615,7 @@ impl messaging::WorkspaceMessagingEffects for DaemonWorkspaceMessagingEffects {
 
     fn reconcile_route_evidence(&self, evidence: messaging::MessagingRouteEvidence) {
         if let Some(inner) = self.inner.upgrade() {
-            messaging::schedule_route_evidence(
+            messaging_runtime::schedule_route_evidence(
                 &inner,
                 evidence.session_idx,
                 &evidence.pane_id,
@@ -625,25 +626,25 @@ impl messaging::WorkspaceMessagingEffects for DaemonWorkspaceMessagingEffects {
 
     fn reconcile_current_route(&self, session_idx: usize, pane_id: String) {
         if let Some(inner) = self.inner.upgrade() {
-            messaging::schedule_route_reconciliation(&inner, session_idx, &pane_id);
+            messaging_runtime::schedule_route_reconciliation(&inner, session_idx, &pane_id);
         }
     }
 
     fn schedule_unclaimed_reminder(&self, record: cyclops_proto::NotificationRecord) {
         if let Some(inner) = self.inner.upgrade() {
-            messaging::schedule_unclaimed_reminder(&inner, record);
+            messaging_runtime::schedule_unclaimed_reminder(&inner, record);
         }
     }
 
     fn schedule_force_submit(&self, record: cyclops_proto::NotificationRecord) {
         if let Some(inner) = self.inner.upgrade() {
-            messaging::schedule_force_submit(&inner, record);
+            messaging_runtime::schedule_force_submit(&inner, record);
         }
     }
 
     fn schedule_force_submit_candidates(&self) {
         if let Some(inner) = self.inner.upgrade() {
-            messaging::schedule_force_submit_candidates(&inner);
+            messaging_runtime::schedule_force_submit_candidates(&inner);
         }
     }
 
@@ -1748,7 +1749,7 @@ fn update_mailbox_route(inner: &Inner, update: impl FnOnce()) -> bool {
 
 fn refresh_mailbox_and_schedule(inner: &Arc<Inner>) {
     if refresh_mailbox_directory(inner) {
-        messaging::schedule_available(inner);
+        messaging_runtime::schedule_available(inner);
     }
 }
 
@@ -2155,7 +2156,7 @@ impl Daemon {
     /// terminal action for the exact attempt.
     #[doc(hidden)]
     pub fn schedule_force_submit_candidates_for_test(&self) {
-        messaging::schedule_force_submit_candidates(&self.inner);
+        messaging_runtime::schedule_force_submit_candidates(&self.inner);
     }
 
     /// Test seam for a body-free mailbox snapshot with an already-resolved
@@ -2957,7 +2958,7 @@ async fn adopt_pane(
         &route_evidence,
     )
     .await;
-    messaging::schedule_route_evidence(inner, session_idx, pane_id, &route_evidence);
+    messaging_runtime::schedule_route_evidence(inner, session_idx, pane_id, &route_evidence);
     Ok(())
 }
 
@@ -3053,7 +3054,7 @@ async fn unadopt_pane(
         });
     }
     drop(publication);
-    messaging::schedule_available(inner);
+    messaging_runtime::schedule_available(inner);
     // 5. Re-read.
     if let Some(w) = watcher {
         let route_evidence = inner.advance_route_evidence(session_idx, pane_id);
@@ -3067,7 +3068,7 @@ async fn unadopt_pane(
             &route_evidence,
         )
         .await;
-        messaging::schedule_route_evidence(inner, session_idx, pane_id, &route_evidence);
+        messaging_runtime::schedule_route_evidence(inner, session_idx, pane_id, &route_evidence);
     }
     Ok(())
 }
@@ -3745,8 +3746,8 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     // Any delivery the previous run left unresolved gets a named ending now.
     compatibility::recover_direct_deliveries(&inner, &replayed);
     drop(replayed);
-    messaging::schedule_unclaimed_reminders(&inner);
-    messaging::schedule_force_submit_candidates(&inner);
+    messaging_runtime::schedule_unclaimed_reminders(&inner);
+    messaging_runtime::schedule_force_submit_candidates(&inner);
 
     let mut tasks = Vec::new();
     for idx in 0..inner.session_count() {
@@ -4117,7 +4118,7 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                     drop(link);
                     *slot.last_panes.lock().expect("last panes lock") = panes;
                 });
-                messaging::schedule_available(&inner);
+                messaging_runtime::schedule_available(&inner);
                 session_lifecycle(&inner, idx, false);
                 // Detached panes have no live sensors, so their runtime
                 // verdict goes: serving a stale one would let a reader
@@ -4219,7 +4220,7 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                             link.identity = None;
                             link.mailbox_panes.clear();
                         });
-                        messaging::schedule_available(&inner);
+                        messaging_runtime::schedule_available(&inner);
                         if slot.retire_if_runtime() {
                             info!(
                                 session = %name,
@@ -4749,7 +4750,7 @@ async fn run_session(
             &route_evidence,
         )
         .await;
-        messaging::schedule_route_evidence(inner, idx, &row.pane_id, &route_evidence);
+        messaging_runtime::schedule_route_evidence(inner, idx, &row.pane_id, &route_evidence);
     }
     // Per-pane debounce kickers for output activity.
     let mut debounce: HashMap<String, watch::Sender<u64>> = HashMap::new();
@@ -4805,7 +4806,7 @@ async fn run_session(
                             "lag_reconcile",
                             &route_evidence,
                         ).await;
-                        messaging::schedule_route_evidence(
+                        messaging_runtime::schedule_route_evidence(
                             inner,
                             idx,
                             &row.pane_id,
@@ -5297,7 +5298,12 @@ async fn handle_pane_event(
                 &route_evidence,
             )
             .await;
-            messaging::schedule_route_evidence(inner, session_idx, &row.pane_id, &route_evidence);
+            messaging_runtime::schedule_route_evidence(
+                inner,
+                session_idx,
+                &row.pane_id,
+                &route_evidence,
+            );
             false
         }
         PaneEvent::PaneRemoved(id) => {
@@ -5426,7 +5432,7 @@ async fn handle_pane_event(
                     .retain(|(cached, _), _| cached != &pane);
                 inner.hook_liveness.close(&pane);
             }
-            messaging::schedule_available(inner);
+            messaging_runtime::schedule_available(inner);
             // The source session's last transition for this pane. The pane
             // may still exist under another session after a route transfer.
             // A client counting what needs a human takes its roster from
@@ -5501,10 +5507,20 @@ async fn handle_pane_event(
                     &route_evidence,
                 )
                 .await;
-                messaging::schedule_route_evidence(inner, session_idx, &id, &route_evidence);
+                messaging_runtime::schedule_route_evidence(
+                    inner,
+                    session_idx,
+                    &id,
+                    &route_evidence,
+                );
             }
             if size_changed {
-                messaging::schedule_pane_size_changed(inner, session_idx, &id, &route_evidence);
+                messaging_runtime::schedule_pane_size_changed(
+                    inner,
+                    session_idx,
+                    &id,
+                    &route_evidence,
+                );
             }
             // A move does not touch agent state, but it does move half the
             // chrome: the pane carries its own options and the window's
@@ -5569,7 +5585,12 @@ async fn handle_pane_event(
                     &route_evidence,
                 )
                 .await;
-                messaging::schedule_route_evidence(inner, session_idx, &pane_id, &route_evidence);
+                messaging_runtime::schedule_route_evidence(
+                    inner,
+                    session_idx,
+                    &pane_id,
+                    &route_evidence,
+                );
             }
             false
         }
@@ -5646,7 +5667,7 @@ async fn debounce_task(
             &route_evidence,
         )
         .await;
-        messaging::schedule_route_evidence(&inner, session_idx, &pane_id, &route_evidence);
+        messaging_runtime::schedule_route_evidence(&inner, session_idx, &pane_id, &route_evidence);
         if rx.changed().await.is_err() {
             return;
         }

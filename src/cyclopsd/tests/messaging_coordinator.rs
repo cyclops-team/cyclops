@@ -3275,13 +3275,28 @@ async fn typed_composer_hold_is_a_durable_prewrite_block_until_a_real_turn() {
 
     // A ghost redraw alone cannot clear the durable block, even across a
     // transient process-table identity lapse during the shell transition.
+    // Subscribe at this causal boundary so the assertion cannot run against
+    // the prior idle-with-input cache while the redraw is still in flight.
+    let mut ghost_events = TestClient::connect(&rig.daemon.socket_path()).await;
+    let subscribed = ghost_events.request("events.subscribe", json!({})).await;
+    assert_eq!(subscribed["result"]["subscribed"], true);
     rig.daemon.fail_next_admitted_binding_observation();
     rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
-    wait_pane_state(&mut rig, "idle").await;
+    ghost_events
+        .wait_event(Duration::from_secs(10), |event| {
+            event["event"] == "state"
+                && event["data"]["pane_id"] == pane.as_str()
+                && event["data"]["state"] == "idle"
+        })
+        .await;
     assert_eq!(
         notification_state_count(&rig, &third_id, NotificationState::Gating),
         1,
-        "a ghost redraw must not reopen the attempt"
+        "a ghost redraw must not reopen the attempt: {:#?}",
+        workspace_lines(&rig)
+            .into_iter()
+            .filter(|line| line.id == third_id)
+            .collect::<Vec<_>>()
     );
 
     // A genuine start and end is the only causal edge that retires the hold.

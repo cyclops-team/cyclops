@@ -26,14 +26,15 @@ pub(crate) fn status_diagnostics(inner: &Inner) -> Vec<StatusDiagnostic> {
 
     let mut candidates = Vec::new();
     for record in records {
-        let route = match crate::messaging::notification_route(inner, service, record.recipient) {
-            Ok(Some(route)) => route,
-            Ok(None) => continue,
-            Err(error) => {
-                warn!(%error, "deadlock diagnostic could not resolve notification route");
-                continue;
-            }
-        };
+        let route =
+            match crate::messaging_runtime::notification_route(inner, service, record.recipient) {
+                Ok(Some(route)) => route,
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!(%error, "deadlock diagnostic could not resolve notification route");
+                    continue;
+                }
+            };
         if inner.cached_state(route.session_idx, &route.pane_id) != AgentState::Working {
             continue;
         }
