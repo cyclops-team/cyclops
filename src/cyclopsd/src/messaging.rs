@@ -6,20 +6,21 @@ use std::time::Duration;
 
 use cyclops_proto::{
     AgentState, AlarmClearResult, AlarmPreviewResult, AlarmSummary, ClaimDisposition, ComposerHold,
-    ComposerProof, ComposerSemantic, ComposerState, DeliveryReceipt, DeliveryState,
-    InboxClaimResult, InboxListResult, InboxSummaryEntry, MessageId, MessageWakeBlock,
-    MessagesFollowResult, MessagesSnapshotResult, MsgSendParams, MsgSendResult,
+    ComposerProof, ComposerSemantic, ComposerState, DeliveryReceipt, DeliveryState, HistoryParams,
+    HistoryResult, InboxClaimResult, InboxListResult, InboxSummaryEntry, MessageId,
+    MessageWakeBlock, MessagesFollowResult, MessagesSnapshotResult, MsgSendParams, MsgSendResult,
     NotificationAttemptId, NotificationAttentionCause, NotificationBarrierRetirementCause,
     NotificationBinding, NotificationManifestId, NotificationPreWriteCause,
     NotificationPreWriteObservation, NotificationRecord, NotificationResolution,
     NotificationResolutionConsumptionObservation, NotificationRouteEvidenceId, NotificationState,
     NotificationWithdrawDisposition, NotificationWithdrawResult, NotifyLevel, OpenDelivery,
-    ProcessInstanceId, RecipientKey, StatusBlockedNotification, StatusMailboxRoute,
+    ProcessInstanceId, RecipientKey, StatusBlockedNotification, StatusMailboxRoute, ThreadResult,
 };
 use cyclops_tmux::{PaneRow, SessionWatcher};
 use tokio::time::Instant;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
+use crate::compatibility::CompatibilityHistorySources;
 use crate::delivery;
 #[cfg(test)]
 use crate::mailbox::UnclaimedReminderQueue;
@@ -1540,6 +1541,86 @@ impl WorkspaceMessaging {
     pub(crate) fn with_published<T>(&self, read: impl FnOnce(&Self) -> T) -> T {
         let _publication = self.publication.lock().expect("mailbox publication lock");
         read(self)
+    }
+
+    /// Read the authorized workspace-first history projection.
+    ///
+    /// The caller supplies an authenticated durable identity and the immutable
+    /// sources returned by `CompatibilityHistoryAdapter`. Current journal
+    /// access, collision rules, visibility, and body release remain inside
+    /// this module. The publication lock is deliberately not held across replay.
+    pub(crate) fn history(
+        &self,
+        caller: MailboxIdentity,
+        params: HistoryParams,
+        cursor2: Option<String>,
+        compatibility: CompatibilityHistorySources,
+    ) -> Result<HistoryResult, cyclops_proto::WireError> {
+        let reader = crate::history::HistoryReader::workspace(caller.label.clone(), caller.key);
+        let record = self.history_record(compatibility);
+        let mut result = crate::history::query_history(&record, params, cursor2, Some(&reader))?;
+        crate::mailbox::redact_message_bodies(
+            Some(&self.service),
+            Some(caller.key),
+            &mut result.lines,
+        );
+        Ok(result)
+    }
+
+    /// Read one authorized workspace-first message thread.
+    pub(crate) fn thread(
+        &self,
+        caller: MailboxIdentity,
+        id: &str,
+        compatibility: CompatibilityHistorySources,
+    ) -> Result<ThreadResult, cyclops_proto::WireError> {
+        let reader = crate::history::HistoryReader::workspace(caller.label.clone(), caller.key);
+        let record = self.history_record(compatibility);
+        let mut result = crate::history::query_thread(&record, id, Some(&reader))?;
+        crate::mailbox::redact_message_bodies(
+            Some(&self.service),
+            Some(caller.key),
+            &mut result.lines,
+        );
+        Ok(result)
+    }
+
+    /// Fold open direct-delivery records with current-workspace collision rules
+    /// without exposing workspace message IDs to the status caller.
+    pub(crate) fn retained_open_deliveries(
+        &self,
+        compatibility: CompatibilityHistorySources,
+    ) -> Vec<OpenDelivery> {
+        let record = self.history_record(compatibility);
+        let mut open = crate::history::open_from_record(&record);
+        if !record.has_workspace_source() {
+            let workspace_ids = match self.service.workspace_message_ids() {
+                Ok(ids) => ids,
+                Err(error) => {
+                    warn!(error = %error, "open delivery ownership is unreadable");
+                    return Vec::new();
+                }
+            };
+            open.retain(|delivery| !workspace_ids.contains(&delivery.id));
+        }
+        open
+    }
+
+    fn history_record(
+        &self,
+        compatibility: CompatibilityHistorySources,
+    ) -> crate::history::HistoryRecord {
+        let workspace = match self.service.journal_lines() {
+            Ok(lines) if !lines.is_empty() => {
+                Some((format!("workspace:{}", self.service.workspace_id()), lines))
+            }
+            Ok(_) => None,
+            Err(error) => {
+                warn!(error = %error, "workspace message history is unreadable");
+                None
+            }
+        };
+        crate::history::HistoryRecord::new(workspace, compatibility)
     }
 
     /// Publish the complete current participant directory.
@@ -3635,6 +3716,223 @@ mod tests {}
         fn receipt_block(&self) -> Duration {
             Duration::ZERO
         }
+    }
+
+    fn history_params(limit: u32, cursor: Option<u64>) -> HistoryParams {
+        HistoryParams {
+            with: None,
+            from: None,
+            to: None,
+            limit,
+            cursor,
+        }
+    }
+
+    #[test]
+    fn workspace_messaging_owns_history_visibility_redaction_and_collision_precedence() {
+        let (_scratch, service, events, reviewer, observer) =
+            mailbox_service("workspace-messaging-history", 8);
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            Arc::new(RecordingEffects::new(events)),
+        );
+        let accepted = send_to(&service, &["reviewer"], "canonical subject");
+        let current = service
+            .journal_lines()
+            .unwrap()
+            .into_iter()
+            .find(|line| line.id == accepted.message_id.as_str())
+            .expect("current message");
+        let mut collision = current.clone();
+        collision.boot_id = "legacy".into();
+        collision.subject = Some("legacy collision".into());
+        collision.body = Some("legacy collision body".into());
+        collision.data = None;
+        let mut legacy_only = collision.clone();
+        legacy_only.id = "m-legacy-only".into();
+        legacy_only.seq = legacy_only.seq.saturating_add(1);
+        legacy_only.from = "reviewer".into();
+        legacy_only.to = vec!["observer".into()];
+        legacy_only.subject = Some("legacy only".into());
+        legacy_only.body = Some("legacy private body".into());
+        let compatibility = || CompatibilityHistorySources {
+            files: vec![(
+                "session-journal:legacy.ndjson".into(),
+                vec![collision.clone(), legacy_only.clone()],
+            )],
+            unreadable_sources: 0,
+        };
+
+        let admin = messaging
+            .history(
+                service.admin(),
+                history_params(10, None),
+                None,
+                compatibility(),
+            )
+            .unwrap();
+        let canonical = admin
+            .lines
+            .iter()
+            .find(|line| line.id == accepted.message_id.as_str())
+            .expect("canonical message");
+        assert_eq!(canonical.subject.as_deref(), Some("canonical subject"));
+        assert_eq!(canonical.body.as_deref(), Some("Body"));
+        let legacy = admin
+            .lines
+            .iter()
+            .find(|line| line.id == "m-legacy-only")
+            .expect("legacy metadata remains visible to admin");
+        assert_eq!(legacy.body, None);
+
+        let reviewer_identity = service
+            .identity_for_recipient(reviewer)
+            .unwrap()
+            .expect("reviewer identity");
+        let before_claim = messaging
+            .history(
+                reviewer_identity.clone(),
+                history_params(10, None),
+                None,
+                compatibility(),
+            )
+            .unwrap();
+        assert_eq!(before_claim.lines.len(), 1);
+        assert_eq!(before_claim.lines[0].id, accepted.message_id.as_str());
+        assert_eq!(before_claim.lines[0].body, None);
+
+        let observer_identity = service
+            .identity_for_recipient(observer)
+            .unwrap()
+            .expect("observer identity");
+        let outsider = messaging
+            .history(
+                observer_identity.clone(),
+                history_params(10, None),
+                None,
+                compatibility(),
+            )
+            .unwrap();
+        assert!(outsider.lines.is_empty());
+        let error = messaging
+            .thread(
+                observer_identity,
+                accepted.message_id.as_str(),
+                compatibility(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "no_such_message");
+
+        service
+            .claim(reviewer, accepted.message_id.clone())
+            .unwrap();
+        let after_claim = messaging
+            .history(
+                reviewer_identity.clone(),
+                history_params(10, None),
+                None,
+                compatibility(),
+            )
+            .unwrap();
+        assert_eq!(after_claim.lines[0].body.as_deref(), Some("Body"));
+        let thread = messaging
+            .thread(
+                reviewer_identity,
+                accepted.message_id.as_str(),
+                compatibility(),
+            )
+            .unwrap();
+        assert_eq!(thread.lines[0].body.as_deref(), Some("Body"));
+        assert!(thread
+            .lines
+            .iter()
+            .all(|line| line.body.as_deref() != Some("legacy collision body")));
+    }
+
+    #[test]
+    fn current_workspace_ownership_hides_a_legacy_open_delivery_copy() {
+        let (_scratch, service, events, _, _) =
+            mailbox_service("workspace-messaging-open-collision", 8);
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            Arc::new(RecordingEffects::new(events)),
+        );
+        let accepted = send_to(&service, &["reviewer"], "canonical owner");
+        let mut legacy = service.journal_lines().unwrap();
+        let legacy_message = legacy
+            .iter_mut()
+            .find(|line| line.id == accepted.message_id.as_str())
+            .expect("legacy message copy");
+        legacy_message.ts = legacy_message.ts.saturating_add(10_000);
+        legacy_message.deliveries = vec![cyclops_proto::Delivery {
+            to: "reviewer".into(),
+            state: DeliveryState::AttentionRequired,
+            verified_by: None,
+            attempts: 1,
+            ts: legacy_message.ts,
+            cause: Some("legacy_ghost".into()),
+        }];
+        assert_eq!(
+            crate::history::open_from(&[legacy.clone()], None).len(),
+            1,
+            "the legacy copy must be open when read without its current owner"
+        );
+
+        let open = messaging.retained_open_deliveries(CompatibilityHistorySources {
+            files: vec![("session-journal:legacy.ndjson".into(), legacy)],
+            unreadable_sources: 0,
+        });
+        assert!(
+            open.is_empty(),
+            "the current workspace owns the colliding ID and hides the legacy copy"
+        );
+    }
+
+    #[test]
+    fn an_empty_workspace_keeps_the_single_compatibility_cursor_contract() {
+        let (_scratch, service, events, _, _) = mailbox_service("history-empty-workspace", 8);
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            Arc::new(RecordingEffects::new(events)),
+        );
+        let line = |seq: u64, id: &str| cyclops_proto::LedgerLine {
+            seq,
+            boot_id: "legacy".into(),
+            id: id.into(),
+            ts: seq,
+            kind: cyclops_proto::Kind::Msg,
+            from: "legacy-sender".into(),
+            to: vec!["legacy-recipient".into()],
+            subject: Some(format!("legacy {seq}")),
+            body: Some("legacy body".into()),
+            reply_to: None,
+            deliveries: Vec::new(),
+            data: None,
+        };
+        let compatibility = CompatibilityHistorySources {
+            files: vec![(
+                "session-journal:only.ndjson".into(),
+                vec![line(1, "m-first"), line(2, "m-second")],
+            )],
+            unreadable_sources: 0,
+        };
+
+        let result = messaging
+            .history(
+                service.admin(),
+                history_params(1, None),
+                None,
+                compatibility,
+            )
+            .unwrap();
+        assert_eq!(result.lines.len(), 1);
+        assert_eq!(result.lines[0].id, "m-second");
+        assert_eq!(result.lines[0].body, None);
+        assert_eq!(result.next_cursor, Some(2));
+        assert_eq!(result.next_cursor2, None);
     }
 
     // Obsolete if durable acceptance and its post-commit effects no longer form one
