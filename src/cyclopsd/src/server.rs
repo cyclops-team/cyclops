@@ -19,8 +19,8 @@ use cyclops_proto::{
     MessagesSnapshotParams, MsgSendParams, NotificationAttemptId, NotificationResolution,
     NotificationWithdrawParams, PaneReadParams, PaneReadResult, PaneReadSource, PingResult,
     ProcessInstanceId, QuiesceParams, RecipientKey, ReplyParams, Request, RequeueParams,
-    RequeueResult, Response, SessionStatus, StateReportParams, StatusMailboxRoute, StatusParams,
-    StatusResult, SubscribeParams, WireError, PROTOCOL_VERSION,
+    RequeueResult, Response, SessionStatus, StateReportParams, StatusParams, StatusResult,
+    SubscribeParams, WireError, PROTOCOL_VERSION,
 };
 #[cfg(test)]
 use cyclops_proto::{AlarmPreviewResult, NotificationAttentionCause, TmuxPaneId};
@@ -1993,95 +1993,36 @@ fn composer_next_action(
 /// `open_deliveries` adds the ledger-folded backlog of deliveries still
 /// waiting on a human. It is opt-in because it reads the session files,
 /// and only a client reconciling attention at startup needs it.
-pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResult {
+pub(crate) fn status_result(inner: &Arc<Inner>, open_deliveries: bool) -> StatusResult {
     status_result_with_refresh(inner, open_deliveries, &HashSet::new())
 }
 
 fn status_result_with_refresh(
-    inner: &Inner,
+    inner: &Arc<Inner>,
     open_deliveries: bool,
     incomplete_refreshes: &HashSet<crate::PaneKey>,
 ) -> StatusResult {
     // The ledger fold happens before the state locks are taken: it reads
     // files, and the fusion engine wants those locks back promptly.
     // Two halves, kept apart: the legacy session-ledger fold, and the
-    // durable mailbox rows the projection serves (the same rows a
-    // messages.snapshot carries), including the pre-write blocks that
-    // blocked_notifications below also details; the renderer dedups that
-    // detailed row by attempt id so one attempt prints once.
-    let (open_deliveries, mailbox_attention) = if open_deliveries {
-        let open = crate::history::open_deliveries(inner);
-        let mailbox = inner
-            .mailbox
-            .as_ref()
-            .and_then(|service| service.mailbox_attention_rows().ok())
-            .unwrap_or_default();
-        (open, mailbox)
+    // durable WorkspaceMessaging status projection. The latter includes
+    // the pre-write blocks that blocked_notifications below also details;
+    // the renderer dedups that detailed row by attempt id so one attempt
+    // prints once.
+    let include_mailbox_attention = open_deliveries;
+    let open_deliveries = if include_mailbox_attention {
+        crate::history::open_deliveries(inner)
     } else {
-        (Vec::new(), Vec::new())
+        Vec::new()
     };
-    let admin_unread = inner
-        .mailbox
-        .as_ref()
-        .and_then(|service| service.pending_count(service.admin().key).ok())
-        .unwrap_or(0) as u64;
-    let mailbox_routes = inner
-        .mailbox
-        .as_ref()
-        .map(|service| {
-            let mut routes: Vec<StatusMailboxRoute> = service
-                .routes()
-                .ok()
-                .map(|routes| {
-                    routes
-                        .into_iter()
-                        .map(|identity| {
-                            let unread = service.pending_count(identity.key).ok().map(|c| c as u64);
-                            StatusMailboxRoute {
-                                recipient: identity.key,
-                                label: identity.label,
-                                unread,
-                            }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if let Ok(pending) = service.pending_recipients() {
-                for key in pending {
-                    if !routes.iter().any(|r| r.recipient == key) {
-                        let unread = service.pending_count(key).ok().map(|c| c as u64);
-                        if unread.unwrap_or(0) > 0 {
-                            let label = service
-                                .recipient_label(key)
-                                .ok()
-                                .flatten()
-                                .or_else(|| {
-                                    service
-                                        .identity_for_recipient(key)
-                                        .ok()
-                                        .flatten()
-                                        .map(|id| id.label)
-                                })
-                                .unwrap_or_else(|| key.to_string());
-                            routes.push(StatusMailboxRoute {
-                                recipient: key,
-                                label,
-                                unread,
-                            });
-                        }
-                    }
-                }
-            }
-            routes
-        })
-        .unwrap_or_default();
-    let blocked_notifications = inner
-        .mailbox
-        .as_ref()
-        .and_then(|service| {
-            service
-                .blocked_notification_snapshot(unix_ms(), STATUS_BLOCKED_NOTIFICATION_LIMIT)
-                .ok()
+    let messaging_status = inner
+        .workspace_messaging()
+        .map(|messaging| {
+            messaging.status_snapshot(
+                include_mailbox_attention,
+                unix_ms(),
+                STATUS_BLOCKED_NOTIFICATION_LIMIT,
+            )
         })
         .unwrap_or_default();
     let adoptions = inner
@@ -2157,13 +2098,8 @@ fn status_result_with_refresh(
                             entry.and_then(|e| e.detection.unknown_reason.clone());
                         ps.working_confirmed = (ps.state == cyclops_proto::AgentState::Working)
                             .then_some(entry.is_some_and(|e| e.working_confirmed));
-                        ps.unread = recipient.and_then(|recipient| {
-                            inner
-                                .mailbox
-                                .as_ref()
-                                .and_then(|m| m.pending_count(recipient).ok())
-                                .map(|c| c as u64)
-                        });
+                        ps.unread = recipient
+                            .and_then(|recipient| messaging_status.unread_for(recipient));
                         if let Some(entry) = entry {
                             ps.composer = entry.composer.state;
                             ps.composer_proof = entry.composer.proof;
@@ -2343,12 +2279,12 @@ fn status_result_with_refresh(
         tmux_version: inner.tmux_version.clone(),
         workspace_id: Some(inner.workspace_id),
         sessions,
-        mailbox_routes,
-        admin_unread,
+        mailbox_routes: messaging_status.mailbox_routes,
+        admin_unread: messaging_status.admin_unread,
         open_deliveries,
         diagnostics,
-        blocked_notifications: blocked_notifications.rows,
-        blocked_notifications_total: blocked_notifications.total,
+        blocked_notifications: messaging_status.blocked_notifications,
+        blocked_notifications_total: messaging_status.blocked_notifications_total,
         // Always answered, empty set included: "I loaded none" is the fact
         // a client needs to explain an unknown pane, and it is exactly the
         // fact an omitted field would hide.
@@ -2358,7 +2294,7 @@ fn status_result_with_refresh(
         }),
         // The one process that can say this without guessing.
         pid: Some(std::process::id()),
-        mailbox_attention,
+        mailbox_attention: messaging_status.mailbox_attention,
     }
 }
 
@@ -5187,6 +5123,34 @@ mod tests {
                     "{name} recovered forbidden messaging knowledge: {forbidden}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn status_composition_does_not_recover_mailbox_projection_knowledge() {
+        let source = include_str!("server.rs");
+        let status = source
+            .split_once("fn status_result_with_refresh(")
+            .expect("status composition")
+            .1
+            .split_once("fn pane_read(")
+            .expect("handler after status composition")
+            .0;
+        assert!(status.contains("messaging.status_snapshot("));
+        for forbidden in [
+            "inner.mailbox",
+            ".pending_count(",
+            ".pending_recipients(",
+            ".recipient_label(",
+            ".identity_for_recipient(",
+            ".routes(",
+            ".mailbox_attention_rows(",
+            ".blocked_notification_snapshot(",
+        ] {
+            assert!(
+                !status.contains(forbidden),
+                "status composition recovered mailbox knowledge through {forbidden}"
+            );
         }
     }
 

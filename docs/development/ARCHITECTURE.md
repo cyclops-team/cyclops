@@ -78,6 +78,11 @@ attention-resolution mechanism receives the selected attempt through a narrow
 internal handoff because it must inspect the terminal and may execute one
 manifest key; the socket adapter never receives the mailbox record or decides
 who may inspect it.
+Daemon status receives one body-free `WorkspaceMessaging` projection containing
+mailbox routes, unread counts, held attention, and the bounded blocked-wake
+sample. Status composition keeps the legacy session-ledger fold separate, but
+does not inspect mailbox variants, directory fallbacks, or notification
+indexes.
 The daemon composition root supplies those downstream actions through one
 narrow effects capability. The Module does not wrap `Arc<Inner>`, and it remains
 internal to `cyclopsd`; no messaging crate has been extracted.

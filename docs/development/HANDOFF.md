@@ -162,8 +162,8 @@ Read in this order:
 3. `src/cyclopsd/src/messaging.rs` for the internal `WorkspaceMessaging`
    operation boundary, acceptance, claim, requeue, and exact pre-write
    withdrawal coordination, body-free inbox, snapshot, follow, alarm, and
-   attention-selection reads, and durable consequences of typed pane
-   observations.
+   attention-selection reads, the body-free status projection, and durable
+   consequences of typed pane observations.
 4. `src/cyclopsd/src/mailbox.rs` for the durable projection and mutations owned
    behind that boundary.
 5. `src/cyclopsd/src/notification_adapter.rs` and the notification path in
