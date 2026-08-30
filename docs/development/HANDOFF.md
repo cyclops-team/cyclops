@@ -157,8 +157,10 @@ Read in this order:
 1. [send.md](../guides/send.md) for acceptance, claim, reply, notification, and recovery.
 2. [PROTOCOL.md](../reference/PROTOCOL.md) for `msg.send`, `inbox.list`,
    `inbox.claim`, `msg.reply`, and `messages.snapshot`.
-3. `src/cyclopsd/src/mailbox.rs` for the durable projection and mutations.
-4. `src/cyclopsd/src/messaging.rs` for acceptance-to-notification coordination.
+3. `src/cyclopsd/src/messaging.rs` for the internal `WorkspaceMessaging`
+   operation boundary and acceptance-to-notification coordination.
+4. `src/cyclopsd/src/mailbox.rs` for the durable projection and mutations owned
+   behind that boundary.
 5. `src/cyclopsd/src/notification_adapter.rs` and the notification path in
    `src/cyclopsd/src/delivery.rs` for the content-free wake.
 

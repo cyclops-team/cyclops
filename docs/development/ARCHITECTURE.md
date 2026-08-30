@@ -48,6 +48,25 @@ The sender is never in the request. The daemon resolves it from the peer
 credentials on the socket and walks that pid up to a watched pane, so
 nothing in a body can forge the header a recipient reads.
 
+## Current mailbox messaging: the durable operation boundary
+
+`src/cyclopsd/src/messaging.rs` contains the internal `WorkspaceMessaging`
+Module. The socket handlers authenticate the caller, then hand this Module an
+identity and a send or reply request. They do not receive the workspace journal,
+mailbox projection, notification worker, unread scheduler, or pane route.
+
+`WorkspaceMessaging` owns the durable acceptance call and the complete
+post-commit sequence: subscribe before worker scheduling, schedule every exact
+recipient without revoking an accepted message, invalidate unread projections,
+observe the bounded durable receipt state, and resolve body-free pane metadata.
+The daemon composition root supplies those downstream actions through one
+narrow effects capability. The Module does not wrap `Arc<Inner>`, and it remains
+internal to `cyclopsd`; no messaging crate has been extracted.
+
+The append and sync inside `MailboxService` are still the acceptance boundary.
+Notification and pane chrome remain effects of that durable fact, never a
+condition for whether the message exists.
+
 ## Watching: how the daemon knows what a pane is doing
 
 ```mermaid
