@@ -76,8 +76,11 @@ The Module also owns body-free alarm summaries, administrator clearance, exact
 attention-target selection, ambiguity, and recipient visibility. The separate
 attention-resolution mechanism receives the selected attempt through a narrow
 internal handoff because it must inspect the terminal and may execute one
-manifest key; the socket adapter never receives the mailbox record or decides
-who may inspect it.
+manifest key. Resolution reservation, durable intent, accepted-action,
+consumption, final settlement, and pre-key withdrawal cross back through
+`WorkspaceMessaging`; terminal code does not append those facts itself. The
+socket adapter never receives the mailbox record or decides who may inspect
+it.
 Daemon status receives one body-free `WorkspaceMessaging` projection containing
 mailbox routes, unread counts, held attention, and the bounded blocked-wake
 sample. Status composition keeps the legacy session-ledger fold separate, but
