@@ -646,22 +646,26 @@ pub(crate) async fn handle_report(
         }
     }
     if let Some(start) = &start_confirmed_by_end {
-        crate::composer_recovery::bind_post_recovery_turn(
+        crate::apply_recovered_turn_evidence(
             inner,
-            origin.session_idx,
-            &pane_id,
-            start.turn.clone(),
-            start.edge_ms,
+            fusion::PaneRecoveredTurnEvidence {
+                session_idx: origin.session_idx,
+                pane_id: pane_id.clone(),
+                turn: start.turn.clone(),
+                since_ms: start.edge_ms,
+            },
         );
     }
     if is_turn_start && lifecycle_confirmed {
         if let Some(turnkey::TurnCorrelation::Exact(turn)) = &correlation {
-            crate::composer_recovery::bind_post_recovery_turn(
+            crate::apply_recovered_turn_evidence(
                 inner,
-                origin.session_idx,
-                &pane_id,
-                turn.clone(),
-                edge_ms,
+                fusion::PaneRecoveredTurnEvidence {
+                    session_idx: origin.session_idx,
+                    pane_id: pane_id.clone(),
+                    turn: turn.clone(),
+                    since_ms: edge_ms,
+                },
             );
         }
     }

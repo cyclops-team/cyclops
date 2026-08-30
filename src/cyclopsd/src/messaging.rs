@@ -742,6 +742,7 @@ impl MessagingComposerRecoveryProbe {
 ///
 /// Process, screen, and manifest adapters prove these facts. The messaging
 /// Module decides how they join to an active durable barrier.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MessagingComposerRecoveryObservation {
     pub(crate) binding: Option<NotificationBinding>,
     pub(crate) clean_composer: bool,
@@ -2834,12 +2835,27 @@ mod tests {
         for forbidden in [
             ".exact_owned_evidence_changed(",
             ".route_evidence_observed(",
+            "workspace_messaging()",
+            ".composer_recovery_probe(",
+            ".composer_projection_probe(",
+            ".reconcile_composer_recovery(",
+            ".settle_composer_recovery_lifecycle(",
+            ".merge_composer_recovery_barrier(",
         ] {
             assert!(
                 !fusion.contains(forbidden),
                 "fusion applied messaging policy directly: {forbidden}"
             );
         }
+
+        let recovery = include_str!("composer_recovery.rs")
+            .split_once("#[cfg(test)]")
+            .expect("composer recovery test boundary")
+            .0;
+        assert!(
+            !recovery.contains("workspace_messaging()"),
+            "physical composer evidence reached the messaging Module directly"
+        );
     }
 
     struct Scratch(PathBuf);
