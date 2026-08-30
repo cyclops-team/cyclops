@@ -258,14 +258,15 @@ The final `beta release evidence complete` job becomes green only when every
 release responsibility succeeds. Operator approval is still required before
 merging **beta/messaging-rework** into **main** or publishing a release.
 
-## Final comparison protocol
+## Final comparison record
 
-The evidence-lanes pull request changes the workflow itself, so it correctly
-selects every lane and cannot represent an ordinary path-routed pull request.
-Measure the first post-merge messaging pull request whose diff does not change
-CI control files, then compare it to run 33275472898 with `scripts/ci-baseline.py`.
-Record wall time, total runner time, per-job duration, and every successful
-not-applicable check. This is the final Task 3 before-and-after measurement.
+The representative comparison above fulfills the final Task 3 measurement: it
+uses the first post-merge messaging pull request whose diff did not change CI
+control files. The evidence-lanes exact-head run
+[33288631738](https://github.com/cyclops-team/cyclops/actions/runs/33288631738)
+correctly selected every lane because it changed the workflow itself. That
+control run completed in 6m44s wall time and 21m13s runner time, but it is proof
+of the routing expressions rather than the ordinary path-routed comparison.
 
 No defect class is silently discarded. Performance, soak, repeated-race, full
 matrix, and full tmux HEAD evidence move to scheduled or release ownership.
