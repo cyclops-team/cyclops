@@ -2067,18 +2067,17 @@ async fn a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt() 
     )
     .await;
     let message_id = sent["msg_id"].as_str().unwrap().to_string();
-    let held = rig
-        .ev
-        .wait_event(Duration::from_secs(8), |event| {
-            event["event"] == "gate"
-                && event["data"]["id"] == message_id.as_str()
-                && event["data"]["action"] == "hold"
-        })
+    rig.ev
+        .wait_event_named(
+            Duration::from_secs(8),
+            "initial composer gate hold",
+            |event| {
+                event["event"] == "gate"
+                    && event["data"]["id"] == message_id.as_str()
+                    && event["data"]["action"] == "hold"
+            },
+        )
         .await;
-    let held_cause = held["data"]["cause"]
-        .as_str()
-        .expect("the initial gate hold names its cause")
-        .to_string();
     let attempts_before = notification_attempts(&rig, &message_id);
     assert_eq!(attempts_before.len(), 1);
     assert!(!rig
@@ -2098,34 +2097,28 @@ async fn a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt() 
     // wakes or reopens the held attempt, so wait for it rather than polling a
     // weaker projection or guessing how long settlement takes.
     let readiness = release_events
-        .wait_event(Duration::from_secs(8), |event| {
-            event["event"] == "readiness"
-                && event["data"]["session_idx"] == 0
-                && event["data"]["pane_id"] == pane.as_str()
-                && event["data"]["write_ready"] == true
-                && event["data"]["write_block"].is_null()
-        })
+        .wait_event_named(
+            Duration::from_secs(8),
+            "positive readiness after Backspace",
+            |event| {
+                event["event"] == "readiness"
+                    && event["data"]["session_idx"] == 0
+                    && event["data"]["pane_id"] == pane.as_str()
+                    && event["data"]["write_ready"] == true
+                    && event["data"]["write_block"].is_null()
+            },
+        )
         .await;
     assert_eq!(readiness["seq"], serde_json::Value::Null, "{readiness}");
-    // A new decision for the exact message proves the same attempt consumed
-    // the readiness edge and left the original hold. Foreground
-    // process binding is a later adapter decision: it may proceed or replace
-    // this hold with an honest occupant-unprovable hold without undoing the
-    // composer release this regression protects.
-    let released = release_events
-        .wait_event(Duration::from_secs(8), |event| {
-            event["event"] == "gate"
-                && event["data"]["id"] == message_id.as_str()
-                && (event["data"]["action"] == "proceed"
-                    || event["data"]["cause"]
-                        .as_str()
-                        .is_some_and(|cause| cause != held_cause))
-        })
-        .await;
-    assert_ne!(
-        released["data"]["cause"], held["data"]["cause"],
-        "the gate must leave the composer-era hold"
-    );
+    // This real-tmux adapter journey stops at the physical edge it owns.
+    // Deterministic tests below it protect the rest of the chain:
+    // `causal_route_evidence_survives_an_earlier_tokenless_readiness_observation`
+    // carries the source edge, `workspace_messaging_applies_a_readiness_route_observation`
+    // crosses the Module boundary, and
+    // `blocked_readiness_reopens_once_only_after_positive_exact_route_evidence`
+    // reopens this same durable attempt. Waiting here for another ephemeral
+    // gate event duplicated those contracts and made runner scheduling part of
+    // the proof.
     assert_eq!(notification_attempts(&rig, &message_id), attempts_before);
     assert!(workspace_lines(&rig).iter().all(|line| {
         line.id != message_id
