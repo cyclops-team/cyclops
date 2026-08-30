@@ -132,6 +132,16 @@ The append and sync inside `MailboxService` are still the acceptance boundary.
 Notification and pane chrome remain effects of that durable fact, never a
 condition for whether the message exists.
 
+The full workspace's collapsed Messages rail is a body-free projection of the
+same authenticated snapshot as its open queue. It retains only snapshot counts,
+uses the shared refresh gate to distinguish current state from stale or unknown
+state, and refreshes on `messages.changed` even while the pane stays closed.
+It never opens the pane, stores another unread queue, or receives message
+content. Opening the pane requests a fresh detailed projection before enabling
+actions. This local rail does not replace the daemon-owned adopted-tmux border
+count, and direct native tmux remains intentionally chrome-free with manual
+inbox inspection.
+
 Fresh pane observation and durable messaging also meet at this boundary for
 the first extracted consequence family. Fusion commits the pane cache and
 returns an immutable quota-reset observation containing the exact recipient,

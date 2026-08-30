@@ -1732,6 +1732,7 @@ mod tests {
             sidebar_tab: SidebarTab::default(),
             record: cyclops_ui::Record::new(),
             messages_queue: cyclops_ui::HumanQueue::default(),
+            messages_snapshot_counts: None,
             messages_caller: None,
             messages_detail: None,
             messages_composer: cyclops_ui::ComposerState::default(),

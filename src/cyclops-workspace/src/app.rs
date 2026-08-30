@@ -60,6 +60,7 @@ use crate::persist::{self, load_prefs, set_last_active, SidebarTab, WorkspacePre
 use crate::render::{
     paint_dialog, paint_menu, paint_messages, paint_messages_rail, paint_messages_resize_feedback,
     paint_sidebar, paint_sidebar_rail, paint_sidebar_resize_feedback, paint_tab_bar, paint_window,
+    MessagesRailCue,
 };
 use crate::resilience::{self, LinkState};
 use crate::selection::{self, SelectionState};
@@ -503,6 +504,10 @@ struct App {
     record: cyclops_ui::Record,
     /// The shared Cyclops watch Messages model (HumanQueue).
     messages_queue: cyclops_ui::HumanQueue,
+    /// Last authenticated body-free counts for the collapsed Messages rail.
+    /// Freshness is owned by `messages_gate`; these are never mutated as a
+    /// second unread queue.
+    messages_snapshot_counts: Option<cyclops_proto::MessagesSnapshotCounts>,
     /// Authenticated mailbox identity that produced the current snapshot.
     /// Absent means the Messages pane is read-only.
     messages_caller: Option<cyclops_proto::RecipientKey>,
@@ -1309,6 +1314,7 @@ pub async fn run_async() -> i32 {
         files_root_pending: true,
         record: cyclops_ui::Record::new(),
         messages_queue: cyclops_ui::HumanQueue::default(),
+        messages_snapshot_counts: None,
         messages_caller: None,
         messages_detail: None,
         messages_composer: cyclops_ui::ComposerState::default(),
@@ -3656,9 +3662,6 @@ fn request_messages_snapshot(app: &mut App) {
 /// Pump the Messages pane refresh gate, issuing a snapshot fetch if one is
 /// owed and none is in flight.
 fn pump_messages_refresh(app: &mut App) {
-    if !app.model.messages_visible {
-        return;
-    }
     if let Some(req) = app.messages_gate.begin() {
         let sent = if let Some(tx) = &app.messages_snapshot_tx {
             tx.try_send((req, 128)).is_ok()
@@ -3669,6 +3672,29 @@ fn pump_messages_refresh(app: &mut App) {
             app.messages_gate.finish_failure(req);
         }
     }
+}
+
+/// Install one authenticated body-free snapshot for both the Messages pane
+/// and its collapsed rail. The refresh gate rejects replies made stale by a
+/// newer invalidation, so retaining these counts never invents current state.
+fn install_messages_snapshot(
+    app: &mut App,
+    request: cyclops_ui::RefreshRequest,
+    result: cyclops_proto::MessagesSnapshotResult,
+) -> bool {
+    if !app.messages_gate.finish_snapshot(request, &result) {
+        return false;
+    }
+    app.messages_refresh_error = None;
+    app.messages_caller = result.caller;
+    app.messages_snapshot_counts = Some(result.counts);
+    let snapshot = apply_messages_presentation_cutoff(
+        cyclops_ui::messages::rows_from_snapshot(&result),
+        app.prefs.messages_cleared_through_seq,
+    );
+    app.messages_queue.replace(snapshot);
+    finish_messages_reconcile(app);
+    true
 }
 
 /// Handle one app message. Returns false when the channel closed.
@@ -3867,8 +3893,15 @@ async fn handle_app_msg(
         }
         AppMsg::DecorationChanged(snapshot) => {
             apply_decoration_snapshot(app, snapshot);
-            app.messages_gate.mark_dirty();
-            pump_messages_refresh(app);
+            // Route chrome changes invalidate the detailed open view. The
+            // collapsed cue contains only durable snapshot counts, so it does
+            // not turn every pane-state repaint into a message fetch or a
+            // false uncertainty marker. Reopening explicitly refreshes the
+            // detailed projection before enabling actions.
+            if app.model.messages_visible {
+                app.messages_gate.mark_dirty();
+                pump_messages_refresh(app);
+            }
             arm(debounce);
         }
         AppMsg::DaemonReconnected => {
@@ -3952,17 +3985,7 @@ async fn handle_app_msg(
         // arms (the theme_watch refresh in `run_async`).
         AppMsg::ThemeChanged => arm(debounce),
         AppMsg::MessagesSnapshotLoaded { request, result } => {
-            let accepted = app.messages_gate.finish_snapshot(request, &result);
-            if accepted {
-                app.messages_refresh_error = None;
-                app.messages_caller = result.caller;
-                let snapshot = apply_messages_presentation_cutoff(
-                    cyclops_ui::messages::rows_from_snapshot(&result),
-                    app.prefs.messages_cleared_through_seq,
-                );
-                app.messages_queue.replace(snapshot);
-                finish_messages_reconcile(app);
-            }
+            install_messages_snapshot(app, request, result);
             pump_messages_refresh(app);
             arm(debounce);
         }
@@ -6670,11 +6693,17 @@ fn draw<B: Backend>(
                 );
             }
             if let Some(messages_rail) = areas.messages_rail {
+                let cue = app.messages_snapshot_counts.map(|counts| MessagesRailCue {
+                    work_messages: counts.work_messages,
+                    attention_entries: counts.open_attention_entries,
+                    current: app.messages_gate.may_mutate(),
+                });
                 paint_messages_rail(
                     messages_rail,
                     f.buffer_mut(),
                     &app.paint,
                     &mut app.hit_map,
+                    cue,
                     app.hover,
                 );
             }
@@ -8010,6 +8039,7 @@ mod tests {
             files_root_pending: true,
             record: cyclops_ui::Record::new(),
             messages_queue: cyclops_ui::HumanQueue::default(),
+            messages_snapshot_counts: None,
             messages_caller: None,
             messages_detail: None,
             messages_composer: cyclops_ui::ComposerState::default(),
@@ -8157,35 +8187,134 @@ mod tests {
         let _ = std::fs::remove_dir_all(home);
     }
 
-    fn current_messages_gate(app: &mut App) {
+    fn messages_snapshot(
+        workspace_seq: u64,
+        work_messages: u64,
+        attention_entries: u64,
+    ) -> cyclops_proto::MessagesSnapshotResult {
         let workspace_id = "00000000-0000-0000-0000-000000000001"
             .parse()
             .expect("workspace id");
-        let snapshot = cyclops_proto::MessagesSnapshotResult {
+        cyclops_proto::MessagesSnapshotResult {
             workspace_id,
             caller: Some(cyclops_proto::RecipientKey::admin(workspace_id)),
-            workspace_seq: 1,
+            workspace_seq,
             counts: cyclops_proto::MessagesSnapshotCounts {
-                visible_messages: 0,
+                visible_messages: work_messages,
                 returned_messages: 0,
-                inbox_messages: 0,
+                inbox_messages: work_messages,
                 outbound_messages: 0,
-                work_messages: 0,
-                active_messages: 0,
+                work_messages,
+                active_messages: work_messages,
                 settled_messages: 0,
-                pending_entries: 0,
+                pending_entries: work_messages,
                 claimed_entries: 0,
-                open_attention_entries: 0,
+                open_attention_entries: attention_entries,
             },
             rows: Vec::new(),
             mailbox_attention: Vec::new(),
-        };
+        }
+    }
+
+    fn current_messages_gate(app: &mut App) {
+        let snapshot = messages_snapshot(1, 0, 0);
         app.messages_gate.connected();
         app.messages_gate.mark_dirty();
         let request = app.messages_gate.begin().expect("snapshot request");
         assert!(app.messages_gate.finish_snapshot(request, &snapshot));
         app.messages_caller = snapshot.caller;
         assert!(app.messages_gate.may_mutate());
+    }
+
+    #[test]
+    fn a_hidden_messages_invalidation_fetches_without_opening_the_pane() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-hidden-messages-cue");
+        let mut app = test_app(one_pane_model(), home.clone());
+        assert!(!app.model.messages_visible, "the fixture starts collapsed");
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        app.messages_snapshot_tx = Some(tx);
+        app.messages_gate.connected();
+
+        let workspace_id = "00000000-0000-0000-0000-000000000001"
+            .parse()
+            .expect("workspace id");
+        app.messages_gate
+            .messages_changed(&cyclops_proto::MessagesChangedData {
+                workspace_id,
+                workspace_seq: 7,
+                changed: [cyclops_proto::MessagesChangedArea::Messages]
+                    .into_iter()
+                    .collect(),
+            });
+        pump_messages_refresh(&mut app);
+
+        let (request, bound) = rx
+            .try_recv()
+            .expect("the body-free invalidation must fetch an authorized snapshot");
+        assert_eq!(bound, 128);
+        assert!(install_messages_snapshot(
+            &mut app,
+            request,
+            messages_snapshot(7, 3, 1),
+        ));
+        assert_eq!(
+            app.messages_snapshot_counts,
+            Some(cyclops_proto::MessagesSnapshotCounts {
+                visible_messages: 3,
+                returned_messages: 0,
+                inbox_messages: 3,
+                outbound_messages: 0,
+                work_messages: 3,
+                active_messages: 3,
+                settled_messages: 0,
+                pending_entries: 3,
+                claimed_entries: 0,
+                open_attention_entries: 1,
+            })
+        );
+        assert!(
+            app.messages_gate.may_mutate(),
+            "the installed cue is current"
+        );
+        assert!(
+            !app.model.messages_visible,
+            "an arrival forced the Messages pane open"
+        );
+        let accepted_counts = app.messages_snapshot_counts;
+        app.messages_gate.mark_dirty();
+        assert_eq!(
+            app.messages_snapshot_counts, accepted_counts,
+            "uncertainty retains the last authenticated body-free counts"
+        );
+        assert!(
+            !app.messages_gate.may_mutate(),
+            "the retained cue must be labeled stale"
+        );
+
+        app.messages_gate.disconnected();
+        app.messages_gate.connected();
+        pump_messages_refresh(&mut app);
+        let (reconnect_request, reconnect_bound) = rx
+            .try_recv()
+            .expect("a hidden reconnect must rebuild the authorized cue");
+        assert_eq!(reconnect_bound, 128);
+        assert!(install_messages_snapshot(
+            &mut app,
+            reconnect_request,
+            messages_snapshot(8, 2, 0),
+        ));
+        assert_eq!(
+            app.messages_snapshot_counts
+                .expect("reconnected counts")
+                .work_messages,
+            2
+        );
+        assert!(app.messages_gate.may_mutate());
+        assert!(
+            !app.model.messages_visible,
+            "reconnecting forced the Messages pane open"
+        );
+        let _ = std::fs::remove_dir_all(home);
     }
 
     fn messages_test_caller() -> cyclops_proto::RecipientKey {

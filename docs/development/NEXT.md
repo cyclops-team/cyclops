@@ -12,44 +12,42 @@ requirements. This page names only the active work and what follows it.
 
 ## Active milestone
 
-Milestone 6 runs on **beta/refactor/presentation-seams**.
+Milestone 7 runs on **beta/feat/collapsed-messages-cue**.
 
-This milestone must leave three honest, distinct recovery paths:
+This milestone completes the full-workspace hidden messaging journey without
+changing the other two approved visibility choices. The collapsed one-column
+Messages rail projects authenticated, body-free snapshot state:
 
-- `events.subscribe` is ephemeral push and invalidation only;
-- authoritative snapshots rebuild current projections; and
-- `messages.follow` pages durable mailbox progress.
+- `✉` plus `1` through `9`, or `+` for ten or more, reports Work messages;
+- `!` reports open attention; and
+- `?` reports that no authenticated snapshot exists or the retained one is
+  stale.
 
-The current slice adds daemon-owned, body-free `events.backfill` for each
-stream connection epoch, moves the shared blocking and async transport into
-`cyclops-client`, and supplies pane focus as a launcher-owned terminal effect.
-Reusable presentation no longer opens journal paths, constructs Unix sockets,
-or invokes tmux. Existing backfill ordering, visible gap reporting, message
-snapshot/follow recovery, and both UI journeys remain protected by focused
-tests.
+The cue refreshes after body-free `messages.changed` invalidation and reconnect
+without opening the pane. Opening the pane still refreshes the detailed
+projection before actions become available. It does not create a second unread
+queue, broadcast content, resize the rail, or turn ordinary pane decoration
+updates into message reads.
 
-Milestone 6 exits when:
+Milestone 7 exits when:
 
-- both UIs rebuild authorized state through daemon projections and durable
-  follow pages;
-- slow or disconnected subscribers recover without treating ephemeral events
-  as truth;
-- reusable presentation owns no socket, journal, tmux, or messaging mechanism;
-- legacy subscribe cursor input remains wire-tolerant without promising replay;
+- hidden invalidations fetch an authorized body-free snapshot without forcing
+  either panel open;
+- current, attention, stale, and unknown rail states have focused rendering
+  evidence;
+- the existing adopted-tmux body-free count is unchanged;
+- native tmux remains intentionally chrome-free with manual inbox inspection;
   and
-- full, compact, reconnect, gap, and startup-race regression evidence passes.
+- full workspace and repository gates pass.
 
 ## Remaining product queue
 
-1. **beta/feat/collapsed-messages-cue**: add the missing stateful cue to the
-   collapsed full-workspace rail while preserving the existing body-free tmux
-   border count and intentionally chrome-free manual-inbox journey.
-2. Run fresh beta architecture, regression, performance, migration, and
+1. Run fresh beta architecture, regression, performance, migration, and
    user-journey audits.
-3. Report beta readiness and stop for operator approval before any pull request
+2. Report beta readiness and stop for operator approval before any pull request
    from **beta/messaging-rework** into **main** or any release publication.
 
-Milestones 1 through 5 are integrated. The Milestones 3 and 4 continuation
+Milestones 1 through 6 are integrated. The Milestones 3 and 4 continuation
 passes completed the charter's responsibility audit: `WorkspaceMessaging` owns
 the assigned durable decisions, observation returns immutable evidence, and
 ordinary callers no longer coordinate messaging projections, locks, workers,
