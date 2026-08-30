@@ -17,8 +17,9 @@ Milestone 5 runs on **beta/refactor/legacy-compatibility**. It quarantines only
 the proven compatibility-sensitive legacy writers and readers after completing
 their caller census and focused replay evidence. Milestone 4 moved positive
 quota-reset consequences out of fusion: pane observation now returns immutable
-evidence, while `WorkspaceMessaging` alone commits the durable reset facts and
-explicit administrator notices in PR #109. Milestone 3 put send and reply
+evidence, while `WorkspaceMessaging` commits the durable reset facts and decides
+the explicit administrator notices that the daemon composition root commits in
+PR #109. Milestone 3 put send and reply
 acceptance behind the internal `WorkspaceMessaging` Module. Milestone 2
 consolidated official transport semantics in PR #104, and Milestone 1 merged in
 PR #103 after the documentation authority repair in PR #101.

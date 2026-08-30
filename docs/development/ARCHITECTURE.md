@@ -70,10 +70,10 @@ condition for whether the message exists.
 Fresh pane observation and durable messaging also meet at this boundary for
 the first extracted consequence family. Fusion commits the pane cache and
 returns an immutable quota-reset observation containing the exact recipient,
-pane, session slot, and route-evidence generation. `WorkspaceMessaging` alone
-turns that observation into `QuotaResetObserved` journal facts and explicit
-administrator notices. The observer does not append those facts, and reset
-observation never requeues or writes to the terminal.
+pane, and session slot. `WorkspaceMessaging` turns that observation into
+`QuotaResetObserved` journal facts and decides the explicit administrator
+notice that the daemon composition root commits. The observer does not append
+those facts, and reset observation never requeues or writes to the terminal.
 
 ## Watching: how the daemon knows what a pane is doing
 
@@ -102,7 +102,7 @@ core). `src/cyclops-tmux/src/watcher.rs` owns this loop.
 
 ### Fusion: which sensor decides
 
-`src/cyclopsd/src/fusion.rs`, `recompute_pane`. Manifest rules are sorted by
+`src/cyclopsd/src/fusion.rs`, `observe_pane`. Manifest rules are sorted by
 priority once at load; every tier below picks the first rule that matches,
 and the fused verdict is whichever tier's winner sits earlier in that one
 order.

@@ -120,6 +120,101 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 /// client still lags out and is dropped by the server.
 const EVENT_BUFFER: usize = 8192;
 
+/// Apply the messaging portion of one pane observation, then return its
+/// ordinary fused detection to the caller.
+fn apply_pane_observation(inner: &Arc<Inner>, observed: fusion::PaneObservation) -> Detection {
+    let (detection, messaging_observation) = observed.into_parts();
+    if let Some(observation) = messaging_observation {
+        apply_messaging_observation(inner, observation);
+    }
+    detection
+}
+
+/// Composition-root handoff from immutable pane evidence to durable messaging.
+pub(crate) fn apply_messaging_observation(
+    inner: &Arc<Inner>,
+    observation: fusion::PaneMessagingObservation,
+) {
+    let Some(messaging) = inner.workspace_messaging() else {
+        return;
+    };
+    match messaging.apply_observation(observation) {
+        Ok(application) => {
+            for notice in application.notices {
+                delivery::admin_notify(
+                    inner,
+                    notice.level,
+                    &notice.subject,
+                    &notice.body,
+                    Some(notice.message_id.as_str()),
+                    Some(notice.session_idx),
+                    delivery::About::delivery(&notice.recipient_label),
+                );
+            }
+        }
+        Err(error) => {
+            error!(%error, "cannot apply pane observation to workspace messaging");
+        }
+    }
+}
+
+/// Observe one pane, apply its typed messaging consequence, and return the
+/// ordinary fused detection expected by existing callers.
+pub(crate) async fn observe_pane(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    watcher: &SessionWatcher,
+    pane_id: &str,
+    force_screen: bool,
+    cause: &str,
+) -> Option<Detection> {
+    fusion::observe_pane(inner, session_idx, watcher, pane_id, force_screen, cause)
+        .await
+        .map(|observed| apply_pane_observation(inner, observed))
+}
+
+pub(crate) async fn observe_pane_for_route_evidence(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    watcher: &SessionWatcher,
+    pane_id: &str,
+    force_screen: bool,
+    cause: &str,
+    route_evidence: &NotificationRouteEvidenceId,
+) -> Option<Detection> {
+    fusion::observe_pane_for_route_evidence(
+        inner,
+        session_idx,
+        watcher,
+        pane_id,
+        force_screen,
+        cause,
+        route_evidence,
+    )
+    .await
+    .map(|observed| apply_pane_observation(inner, observed))
+}
+
+pub(crate) async fn observe_pane_from_output(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    watcher: &SessionWatcher,
+    pane_id: &str,
+    evidence_ms: u64,
+    route_evidence: &NotificationRouteEvidenceId,
+) -> Option<Detection> {
+    fusion::observe_pane_from_output(
+        inner,
+        session_idx,
+        watcher,
+        pane_id,
+        evidence_ms,
+        route_evidence,
+    )
+    .await
+    .map(|observed| apply_pane_observation(inner, observed))
+}
+
 /// Test seam: an async pause awaited inside the delivery injection path at
 /// a named phase ("pre_paste", "pre_submit"), installed via
 /// [`Daemon::set_inject_pause`]. Always None in production.
@@ -2552,7 +2647,7 @@ async fn adopt_pane(
     paint_chrome(inner, session_idx, pane_id).await;
     // 4. Re-read.
     let route_evidence = inner.advance_route_evidence(session_idx, pane_id);
-    messaging::observe_pane_for_route_evidence(
+    observe_pane_for_route_evidence(
         inner,
         session_idx,
         watcher,
@@ -2662,7 +2757,7 @@ async fn unadopt_pane(
     // 5. Re-read.
     if let Some(w) = watcher {
         let route_evidence = inner.advance_route_evidence(session_idx, pane_id);
-        messaging::observe_pane_for_route_evidence(
+        observe_pane_for_route_evidence(
             inner,
             session_idx,
             w,
@@ -4334,7 +4429,7 @@ async fn run_session(
     reconcile_adoptions(inner, idx, watcher, &kept).await;
     for row in watcher.snapshot() {
         let route_evidence = inner.advance_route_evidence(idx, &row.pane_id);
-        messaging::observe_pane_for_route_evidence(
+        observe_pane_for_route_evidence(
             inner,
             idx,
             watcher,
@@ -4391,7 +4486,7 @@ async fn run_session(
                     }
                     for row in watcher.snapshot() {
                         let route_evidence = inner.advance_route_evidence(idx, &row.pane_id);
-                        messaging::observe_pane_for_route_evidence(
+                        observe_pane_for_route_evidence(
                             inner,
                             idx,
                             watcher,
@@ -4882,7 +4977,7 @@ async fn handle_pane_event(
                     .insert(row.pane_id.clone(), ObservedPane::capture(row.clone()));
             });
             let route_evidence = inner.advance_route_evidence(session_idx, &row.pane_id);
-            messaging::observe_pane_for_route_evidence(
+            observe_pane_for_route_evidence(
                 inner,
                 session_idx,
                 watcher,
@@ -5086,7 +5181,7 @@ async fn handle_pane_event(
                 inner.route_evidence_id(session_idx, &id)
             };
             if route_changed {
-                messaging::observe_pane_for_route_evidence(
+                observe_pane_for_route_evidence(
                     inner,
                     session_idx,
                     watcher,
@@ -5154,7 +5249,7 @@ async fn handle_pane_event(
             }
             for pane_id in outcome.changed_panes {
                 let route_evidence = inner.advance_route_evidence(session_idx, &pane_id);
-                messaging::observe_pane_for_route_evidence(
+                observe_pane_for_route_evidence(
                     inner,
                     session_idx,
                     watcher,
@@ -5232,7 +5327,7 @@ async fn debounce_task(
             return;
         };
         let route_evidence = inner.advance_route_evidence(session_idx, &pane_id);
-        messaging::observe_pane_from_output(
+        observe_pane_from_output(
             &inner,
             session_idx,
             &watcher,

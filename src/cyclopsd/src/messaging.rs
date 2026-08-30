@@ -5,11 +5,11 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use cyclops_proto::{
-    DeliveryReceipt, DeliveryState, Detection, MessageId, MessageWakeBlock, MsgSendParams,
-    MsgSendResult, NotificationAttemptId, NotificationBinding, NotificationManifestId,
-    NotificationPreWriteCause, NotificationPreWriteObservation, NotificationRouteEvidenceId,
-    NotificationState, NotificationWithdrawDisposition, NotificationWithdrawResult, NotifyLevel,
-    ProcessInstanceId, RecipientKey,
+    DeliveryReceipt, DeliveryState, MessageId, MessageWakeBlock, MsgSendParams, MsgSendResult,
+    NotificationAttemptId, NotificationBinding, NotificationManifestId, NotificationPreWriteCause,
+    NotificationPreWriteObservation, NotificationRouteEvidenceId, NotificationState,
+    NotificationWithdrawDisposition, NotificationWithdrawResult, NotifyLevel, ProcessInstanceId,
+    RecipientKey,
 };
 use cyclops_tmux::{PaneRow, SessionWatcher};
 use tokio::time::Instant;
@@ -101,53 +101,22 @@ struct AcceptanceSchedule {
     unavailable: HashSet<RecipientKey>,
 }
 
-/// One exact, immutable runtime observation relevant to durable messaging.
-///
-/// The pane observer supplies identity and route provenance at the moment it
-/// commits its cache. `WorkspaceMessaging` never reaches back into fusion to
-/// guess what was seen later.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PaneMessagingObservation {
-    QuotaResetObserved {
-        recipient: RecipientKey,
-        session_idx: usize,
-        pane_id: String,
-        route_evidence: NotificationRouteEvidenceId,
-    },
-}
-
-impl PaneMessagingObservation {
-    pub(crate) fn quota_reset(
-        recipient: RecipientKey,
-        session_idx: usize,
-        pane_id: impl Into<String>,
-        route_evidence: NotificationRouteEvidenceId,
-    ) -> Self {
-        Self::QuotaResetObserved {
-            recipient,
-            session_idx,
-            pane_id: pane_id.into(),
-            route_evidence,
-        }
-    }
-}
-
 /// One explicit post-commit effect requested by an observation application.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct MessagingAdminNotice {
-    level: NotifyLevel,
-    subject: String,
-    body: String,
-    message_id: MessageId,
-    session_idx: usize,
-    recipient_label: String,
+pub(crate) struct MessagingAdminNotice {
+    pub(crate) level: NotifyLevel,
+    pub(crate) subject: String,
+    pub(crate) body: String,
+    pub(crate) message_id: MessageId,
+    pub(crate) session_idx: usize,
+    pub(crate) recipient_label: String,
 }
 
 /// Durable transitions and requested effects produced by one observation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ObservationApplication {
     durable_messages: Vec<MessageId>,
-    notices: Vec<MessagingAdminNotice>,
+    pub(crate) notices: Vec<MessagingAdminNotice>,
 }
 
 /// Narrow post-commit capabilities needed by durable message acceptance.
@@ -364,27 +333,23 @@ impl WorkspaceMessaging {
     ///
     /// This operation never captures a pane, resolves a live route, schedules
     /// a delivery, or requeues a quota hold. It commits only the transitions
-    /// justified by the supplied evidence and emits explicit post-commit
-    /// notices through the narrow effects capability.
+    /// justified by the supplied evidence and decides which explicit
+    /// post-commit notices the daemon composition root must commit.
     pub(crate) fn apply_observation(
         &self,
-        observation: PaneMessagingObservation,
+        observation: crate::fusion::PaneMessagingObservation,
     ) -> Result<ObservationApplication, MailboxServiceError> {
-        let PaneMessagingObservation::QuotaResetObserved {
+        let crate::fusion::PaneMessagingObservation::QuotaResetObserved {
             recipient,
             session_idx,
             pane_id,
-            route_evidence: _,
         } = observation;
         let observed = self.service.observe_quota_reset(recipient)?;
         if observed.is_empty() {
             return Ok(ObservationApplication::default());
         }
-        let label = self
-            .service
-            .identity_for_recipient(recipient)?
-            .map(|identity| identity.label)
-            .unwrap_or(pane_id);
+        let label =
+            quota_reset_recipient_label(self.service.identity_for_recipient(recipient), pane_id);
         let notices: Vec<_> = observed
             .iter()
             .map(|record| MessagingAdminNotice {
@@ -422,102 +387,21 @@ fn quota_reset_notice(message_id: &MessageId) -> String {
     format!("message {message_id} remains held; run `cyclops requeue {message_id}`")
 }
 
-/// Apply the messaging portion of one pane observation, then return its
-/// ordinary fused detection to the caller.
-fn apply_pane_observation(
-    inner: &Arc<Inner>,
-    observed: crate::fusion::PaneObservation,
-) -> Detection {
-    let (detection, messaging_observation) = observed.into_parts();
-    if let Some(observation) = messaging_observation {
-        apply_messaging_observation(inner, observation);
-    }
-    detection
-}
-
-/// Composition-root handoff from immutable pane evidence to durable messaging.
-pub(crate) fn apply_messaging_observation(
-    inner: &Arc<Inner>,
-    observation: PaneMessagingObservation,
-) {
-    let Some(messaging) = inner.workspace_messaging() else {
-        return;
-    };
-    match messaging.apply_observation(observation) {
-        Ok(application) => {
-            for notice in application.notices {
-                delivery::admin_notify(
-                    inner,
-                    notice.level,
-                    &notice.subject,
-                    &notice.body,
-                    Some(notice.message_id.as_str()),
-                    Some(notice.session_idx),
-                    delivery::About::delivery(&notice.recipient_label),
-                );
-            }
-        }
+/// Preserve the post-commit recovery cue even when current identity metadata
+/// is absent or temporarily unreadable. The immutable observation's pane ID is
+/// less friendly than a current label, but it still names the held recipient.
+fn quota_reset_recipient_label(
+    identity: Result<Option<MailboxIdentity>, MailboxServiceError>,
+    pane_id: String,
+) -> String {
+    match identity {
+        Ok(Some(identity)) => identity.label,
+        Ok(None) => pane_id,
         Err(error) => {
-            error!(%error, "cannot apply pane observation to workspace messaging");
+            error!(%error, %pane_id, "cannot resolve quota-reset recipient label");
+            pane_id
         }
     }
-}
-
-/// Observe one pane, apply its typed messaging consequence, and return the
-/// ordinary fused detection expected by existing callers.
-pub(crate) async fn observe_pane(
-    inner: &Arc<Inner>,
-    session_idx: usize,
-    watcher: &SessionWatcher,
-    pane_id: &str,
-    force_screen: bool,
-    cause: &str,
-) -> Option<Detection> {
-    crate::fusion::observe_pane(inner, session_idx, watcher, pane_id, force_screen, cause)
-        .await
-        .map(|observed| apply_pane_observation(inner, observed))
-}
-
-pub(crate) async fn observe_pane_for_route_evidence(
-    inner: &Arc<Inner>,
-    session_idx: usize,
-    watcher: &SessionWatcher,
-    pane_id: &str,
-    force_screen: bool,
-    cause: &str,
-    route_evidence: &NotificationRouteEvidenceId,
-) -> Option<Detection> {
-    crate::fusion::observe_pane_for_route_evidence(
-        inner,
-        session_idx,
-        watcher,
-        pane_id,
-        force_screen,
-        cause,
-        route_evidence,
-    )
-    .await
-    .map(|observed| apply_pane_observation(inner, observed))
-}
-
-pub(crate) async fn observe_pane_from_output(
-    inner: &Arc<Inner>,
-    session_idx: usize,
-    watcher: &SessionWatcher,
-    pane_id: &str,
-    evidence_ms: u64,
-    route_evidence: &NotificationRouteEvidenceId,
-) -> Option<Detection> {
-    crate::fusion::observe_pane_from_output(
-        inner,
-        session_idx,
-        watcher,
-        pane_id,
-        evidence_ms,
-        route_evidence,
-    )
-    .await
-    .map(|observed| apply_pane_observation(inner, observed))
 }
 
 /// Resolve a durable recipient only when its exact session instance is attached.
@@ -1101,7 +985,7 @@ async fn reconcile_due_unclaimed_reminder_barrier(
     let Ok(Some(route)) = notification_route(inner, service, recipient) else {
         return;
     };
-    crate::messaging::observe_pane(
+    crate::observe_pane(
         inner,
         route.session_idx,
         &route.watcher,
@@ -1485,7 +1369,7 @@ fn schedule_claimed_composer_observation(
     let pane_id = route.pane_id.clone();
     let watcher = Arc::clone(&route.watcher);
     inner.engine.spawn_descendant_task(async move {
-        crate::messaging::observe_pane(
+        crate::observe_pane(
             &task_inner,
             session_idx,
             &watcher,
@@ -1539,7 +1423,7 @@ fn schedule_claimed_notification_recovery(
     }
     let task_inner = Arc::clone(inner);
     inner.engine.spawn_descendant_task(async move {
-        crate::messaging::observe_pane(
+        crate::observe_pane(
             &task_inner,
             session_idx,
             &watcher,
@@ -1602,6 +1486,8 @@ pub(crate) fn withdraw_notification(
 
 #[cfg(test)]
 mod tests {
+    use crate::fusion::PaneMessagingObservation;
+
     use super::*;
     use std::fs;
     use std::io::Write;
@@ -1884,18 +1770,8 @@ mod tests {
             .join("current")
             .join("messages.ndjson");
         let before_lines = fs::read_to_string(&journal_path).unwrap().lines().count();
-        let route_evidence = NotificationRouteEvidenceId {
-            boot_id: "boot-observation".to_string(),
-            generation: 7,
-        };
-
         let application = messaging
-            .apply_observation(PaneMessagingObservation::quota_reset(
-                reviewer,
-                2,
-                "%7",
-                route_evidence,
-            ))
+            .apply_observation(PaneMessagingObservation::quota_reset(reviewer, 2, "%7"))
             .unwrap();
 
         assert_eq!(
@@ -1939,15 +1815,7 @@ mod tests {
         let after_first = fs::read_to_string(&journal_path).unwrap().lines().count();
         let calls_after_first = effects.calls();
         let repeated = messaging
-            .apply_observation(PaneMessagingObservation::quota_reset(
-                reviewer,
-                2,
-                "%7",
-                NotificationRouteEvidenceId {
-                    boot_id: "boot-observation".to_string(),
-                    generation: 8,
-                },
-            ))
+            .apply_observation(PaneMessagingObservation::quota_reset(reviewer, 2, "%7"))
             .unwrap();
         assert_eq!(repeated, ObservationApplication::default());
         assert_eq!(
@@ -1955,6 +1823,14 @@ mod tests {
             after_first
         );
         assert_eq!(effects.calls(), calls_after_first);
+    }
+
+    #[test]
+    fn a_directory_read_failure_cannot_suppress_the_quota_reset_recovery_cue() {
+        assert_eq!(
+            quota_reset_recipient_label(Err(MailboxServiceError::Poisoned), "%7".to_string()),
+            "%7"
+        );
     }
 
     fn queued_attempt(

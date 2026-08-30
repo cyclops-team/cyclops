@@ -3436,7 +3436,7 @@ async fn persist_notification_prewrite_block(
         crate::messaging::schedule_route_reconciliation(inner, handle.session_idx, &handle.pane_id);
         if let Some(watcher) = inner.watcher_of(handle.session_idx) {
             let route_evidence = inner.route_evidence_id(handle.session_idx, &handle.pane_id);
-            crate::messaging::observe_pane_for_route_evidence(
+            crate::observe_pane_for_route_evidence(
                 inner,
                 handle.session_idx,
                 &watcher,
@@ -4250,7 +4250,7 @@ async fn attempt_delivery(
     // notice: same pane, same pid, same manifest, new draft. So the
     // readiness rule is asked again here, against a capture taken now,
     // immediately before the write that cannot be taken back.
-    match crate::messaging::observe_pane(
+    match crate::observe_pane(
         inner,
         handle.session_idx,
         &watcher,
@@ -5809,7 +5809,7 @@ async fn park_recipient(
         if let Some(observation) =
             fusion::quota_reset_observation_now(inner, handle.session_idx, &handle.pane_id)
         {
-            crate::messaging::apply_messaging_observation(inner, observation);
+            crate::apply_messaging_observation(inner, observation);
         }
         return;
     }
@@ -6028,7 +6028,7 @@ async fn gate(
                                 observation: Box::new(observation),
                             };
                         }
-                        let Some(det) = crate::messaging::observe_pane(
+                        let Some(det) = crate::observe_pane(
                             inner,
                             handle.session_idx,
                             w,
@@ -7968,7 +7968,7 @@ async fn receipt_checkpoint_pass(
     let Some(watcher) = inner.watcher_of(handle.session_idx) else {
         return ReceiptStep::Freeze;
     };
-    let detection = crate::messaging::observe_pane(
+    let detection = crate::observe_pane(
         inner,
         handle.session_idx,
         &watcher,
@@ -9438,7 +9438,7 @@ pub(crate) async fn wait_pinned(
     let watcher = inner.watcher_of(session_idx);
     let mut pane_rx = watcher.as_ref().map(|w| w.subscribe());
     if let Some(watcher) = watcher.as_ref() {
-        crate::messaging::observe_pane(
+        crate::observe_pane(
             inner,
             session_idx,
             watcher,

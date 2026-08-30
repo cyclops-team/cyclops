@@ -532,7 +532,7 @@ async fn lifecycle_recheck_worker(
             return;
         };
         let cause = work.cause();
-        let Some(_detection) = crate::messaging::observe_pane(
+        let Some(_detection) = crate::observe_pane(
             &inner,
             pane.session_idx,
             &watcher,
@@ -3680,21 +3680,44 @@ struct RecomputeEvidence<'a> {
     route: Option<&'a NotificationRouteEvidenceId>,
 }
 
+/// One exact, immutable runtime observation relevant to durable messaging.
+///
+/// The pane observer supplies the exact durable recipient identity at the
+/// moment it commits its cache. `WorkspaceMessaging` never reaches back into
+/// fusion to guess what was seen later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PaneMessagingObservation {
+    QuotaResetObserved {
+        recipient: RecipientKey,
+        session_idx: usize,
+        pane_id: String,
+    },
+}
+
+impl PaneMessagingObservation {
+    pub(crate) fn quota_reset(
+        recipient: RecipientKey,
+        session_idx: usize,
+        pane_id: impl Into<String>,
+    ) -> Self {
+        Self::QuotaResetObserved {
+            recipient,
+            session_idx,
+            pane_id: pane_id.into(),
+        }
+    }
+}
+
 /// A committed pane-cache result and any immutable messaging evidence derived
 /// from that same observation. The fields stay private so callers can only
 /// consume the complete value.
 pub(crate) struct PaneObservation {
     detection: Detection,
-    messaging: Option<crate::messaging::PaneMessagingObservation>,
+    messaging: Option<PaneMessagingObservation>,
 }
 
 impl PaneObservation {
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        Detection,
-        Option<crate::messaging::PaneMessagingObservation>,
-    ) {
+    pub(crate) fn into_parts(self) -> (Detection, Option<PaneMessagingObservation>) {
         (self.detection, self.messaging)
     }
 }
@@ -4682,15 +4705,10 @@ async fn observe_pane_with_evidence(
     let messaging_observation = probe_quota_reset
         .then(|| {
             let recipient = inner.recipient_key(session_idx, pane_id)?;
-            let route_evidence = evidence
-                .route
-                .cloned()
-                .unwrap_or_else(|| inner.route_evidence_id(session_idx, pane_id));
-            Some(crate::messaging::PaneMessagingObservation::quota_reset(
+            Some(PaneMessagingObservation::quota_reset(
                 recipient,
                 session_idx,
                 pane_id,
-                route_evidence,
             ))
         })
         .flatten();
@@ -4785,7 +4803,7 @@ pub(crate) fn quota_reset_observation_now(
     inner: &Inner,
     session_idx: usize,
     pane_id: &str,
-) -> Option<crate::messaging::PaneMessagingObservation> {
+) -> Option<PaneMessagingObservation> {
     let observed = inner
         .detections
         .lock()
@@ -4795,11 +4813,10 @@ pub(crate) fn quota_reset_observation_now(
     if !observed {
         return None;
     }
-    Some(crate::messaging::PaneMessagingObservation::quota_reset(
+    Some(PaneMessagingObservation::quota_reset(
         inner.recipient_key(session_idx, pane_id)?,
         session_idx,
         pane_id,
-        inner.route_evidence_id(session_idx, pane_id),
     ))
 }
 
