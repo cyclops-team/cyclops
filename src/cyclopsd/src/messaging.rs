@@ -115,6 +115,32 @@ pub(crate) struct MessagingAdminNotice {
     pub(crate) recipient_label: String,
 }
 
+/// One immutable causal token proving that a pane route was freshly
+/// observed.
+///
+/// Fusion and authenticated hook handling produce this evidence. They do not
+/// decide which durable notification or attention work follows from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MessagingRouteEvidence {
+    pub(crate) session_idx: usize,
+    pub(crate) pane_id: String,
+    pub(crate) evidence_id: NotificationRouteEvidenceId,
+}
+
+impl MessagingRouteEvidence {
+    pub(crate) fn new(
+        session_idx: usize,
+        pane_id: impl Into<String>,
+        evidence_id: NotificationRouteEvidenceId,
+    ) -> Self {
+        Self {
+            session_idx,
+            pane_id: pane_id.into(),
+            evidence_id,
+        }
+    }
+}
+
 /// Durable transitions and requested effects produced by one observation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ObservationApplication {
@@ -207,6 +233,16 @@ pub(crate) trait WorkspaceMessagingEffects: Send + Sync {
     fn cancel_notification(&self, attempt_id: NotificationAttemptId);
 
     fn reconcile_claimed_recipient(&self, claimant: RecipientKey);
+
+    fn reconcile_route_evidence(&self, evidence: MessagingRouteEvidence);
+
+    fn reconcile_current_route(&self, session_idx: usize, pane_id: String);
+
+    fn schedule_unclaimed_reminder(&self, record: NotificationRecord);
+
+    fn schedule_force_submit(&self, record: NotificationRecord);
+
+    fn schedule_force_submit_candidates(&self);
 
     fn receipt_block(&self) -> Duration;
 }
@@ -450,6 +486,51 @@ impl WorkspaceMessaging {
     ) -> Result<(), MailboxServiceError> {
         self.effects.invalidate_unread(recipient);
         self.notification_head_changed(recipient)
+    }
+
+    /// Apply one immutable route observation without exposing reconciliation
+    /// or worker topology to the observer.
+    pub(crate) fn route_evidence_observed(&self, evidence: MessagingRouteEvidence) {
+        self.effects.reconcile_route_evidence(evidence);
+    }
+
+    /// Reconsider the current route after a durable pre-write block commits.
+    ///
+    /// This uses the already-minted route generation and never invents a new
+    /// observation edge.
+    pub(crate) fn notification_prewrite_blocked(
+        &self,
+        session_idx: usize,
+        pane_id: impl Into<String>,
+    ) {
+        self.effects
+            .reconcile_current_route(session_idx, pane_id.into());
+    }
+
+    /// Apply post-commit policy for one durable attention record.
+    pub(crate) fn notification_attention_recorded(&self, record: NotificationRecord) {
+        if !record.needs_exact_owned_reconciliation() {
+            return;
+        }
+        self.effects.reconcile_claimed_recipient(record.recipient);
+        self.effects.schedule_force_submit(record);
+    }
+
+    /// Arm the optional reminder only for the first proven doorbell.
+    pub(crate) fn notification_became_notified(&self, record: NotificationRecord) {
+        if record.state == NotificationState::Notified
+            && record.transport == cyclops_proto::NotificationTransport::Doorbell
+            && record.unclaimed_reminder_count == 0
+        {
+            self.effects.schedule_unclaimed_reminder(record);
+        }
+    }
+
+    /// Reconsider existing exact attention attempts after the operator enables
+    /// force-submit. The server persists the setting; messaging owns the work
+    /// that follows from it.
+    pub(crate) fn force_submit_enabled(&self) {
+        self.effects.schedule_force_submit_candidates();
     }
 
     pub(crate) fn alarm_preview(
@@ -1948,6 +2029,11 @@ mod tests {
         RecoverClaimedNotification(RecipientKey, NotificationAttemptId),
         CancelNotification(NotificationAttemptId),
         ReconcileClaimedRecipient(RecipientKey),
+        ReconcileRouteEvidence(MessagingRouteEvidence),
+        ReconcileCurrentRoute(usize, String),
+        ScheduleUnclaimedReminder(NotificationAttemptId),
+        ScheduleForceSubmit(NotificationAttemptId),
+        ScheduleForceSubmitCandidates,
     }
 
     struct RecordingEffects {
@@ -2054,6 +2140,41 @@ mod tests {
                 .lock()
                 .expect("acceptance calls lock")
                 .push(RecordedEffect::ReconcileClaimedRecipient(claimant));
+        }
+
+        fn reconcile_route_evidence(&self, evidence: MessagingRouteEvidence) {
+            self.calls
+                .lock()
+                .expect("acceptance calls lock")
+                .push(RecordedEffect::ReconcileRouteEvidence(evidence));
+        }
+
+        fn reconcile_current_route(&self, session_idx: usize, pane_id: String) {
+            self.calls
+                .lock()
+                .expect("acceptance calls lock")
+                .push(RecordedEffect::ReconcileCurrentRoute(session_idx, pane_id));
+        }
+
+        fn schedule_unclaimed_reminder(&self, record: NotificationRecord) {
+            self.calls
+                .lock()
+                .expect("acceptance calls lock")
+                .push(RecordedEffect::ScheduleUnclaimedReminder(record.attempt_id));
+        }
+
+        fn schedule_force_submit(&self, record: NotificationRecord) {
+            self.calls
+                .lock()
+                .expect("acceptance calls lock")
+                .push(RecordedEffect::ScheduleForceSubmit(record.attempt_id));
+        }
+
+        fn schedule_force_submit_candidates(&self) {
+            self.calls
+                .lock()
+                .expect("acceptance calls lock")
+                .push(RecordedEffect::ScheduleForceSubmitCandidates);
         }
 
         fn receipt_block(&self) -> Duration {
@@ -2264,6 +2385,94 @@ mod tests {
         );
     }
 
+    // Obsolete if runtime observers or adapters again choose reconciliation,
+    // reminder, or force-submit workers themselves.
+    #[test]
+    fn workspace_messaging_owns_runtime_evidence_consequences_without_inner() {
+        let (_scratch, service, events, _reviewer, _) =
+            mailbox_service("workspace-messaging-runtime-evidence", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            effects.clone(),
+        );
+        let route = MessagingRouteEvidence::new(
+            2,
+            "%7",
+            NotificationRouteEvidenceId {
+                boot_id: "boot".to_string(),
+                generation: 9,
+            },
+        );
+
+        messaging.route_evidence_observed(route.clone());
+        messaging.notification_prewrite_blocked(2, "%7");
+        messaging.force_submit_enabled();
+
+        assert_eq!(
+            effects.calls(),
+            vec![
+                RecordedEffect::ReconcileRouteEvidence(route),
+                RecordedEffect::ReconcileCurrentRoute(2, "%7".to_string()),
+                RecordedEffect::ScheduleForceSubmitCandidates,
+            ]
+        );
+    }
+
+    // Obsolete if delivery interprets durable notification variants to choose
+    // reminder, attention reconciliation, or force-submit scheduling.
+    #[test]
+    fn workspace_messaging_owns_durable_notification_follow_up_policy() {
+        let (_scratch, service, events, _reviewer, _) =
+            mailbox_service("workspace-messaging-notified-policy", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            effects.clone(),
+        );
+        let (_accepted, context, _) = queued_attempt(&service);
+        let notified = record_notified_doorbell(&context);
+
+        messaging.notification_became_notified(notified.clone());
+        messaging.notification_became_notified(notified);
+
+        assert_eq!(
+            effects.calls(),
+            vec![
+                RecordedEffect::ScheduleUnclaimedReminder(context.attempt_id()),
+                RecordedEffect::ScheduleUnclaimedReminder(context.attempt_id()),
+            ],
+            "repeated mechanism calls remain safe because the runtime helper and durable queue are idempotent"
+        );
+
+        let (_scratch, service, events, reviewer, _) =
+            mailbox_service("workspace-messaging-attention-policy", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            effects.clone(),
+        );
+        let (_accepted, context, _) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        record_doorbell_write(&context);
+        let attention = context
+            .record_verify_attention(NotificationVerifyOutcome::ambiguous())
+            .unwrap();
+
+        messaging.notification_attention_recorded(attention.clone());
+
+        assert_eq!(
+            effects.calls(),
+            vec![
+                RecordedEffect::ReconcileClaimedRecipient(reviewer),
+                RecordedEffect::ScheduleForceSubmit(attention.attempt_id),
+            ]
+        );
+    }
+
     /// Syntactic architecture lint: delivery and terminal mechanisms report a
     /// committed recipient change to WorkspaceMessaging; they cannot call the
     /// scheduler with a mailbox projection themselves.
@@ -2279,6 +2488,24 @@ mod tests {
             assert!(
                 !source.contains("messaging::schedule_recipient("),
                 "{name} recovered direct recipient scheduling knowledge"
+            );
+        }
+    }
+
+    /// Syntactic architecture lint: runtime callers publish evidence or invoke
+    /// a named WorkspaceMessaging operation; only the composition adapter may
+    /// choose one of the retained scheduling mechanisms.
+    #[test]
+    fn runtime_callers_cannot_schedule_messaging_work_directly() {
+        for (name, source) in [
+            ("fusion", include_str!("fusion.rs")),
+            ("authenticated ACK", include_str!("ack.rs")),
+            ("delivery", include_str!("delivery.rs")),
+            ("socket server", include_str!("server.rs")),
+        ] {
+            assert!(
+                !source.contains("messaging::schedule_"),
+                "{name} recovered direct messaging-worker knowledge"
             );
         }
     }

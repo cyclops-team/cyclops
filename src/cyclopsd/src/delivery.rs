@@ -3442,7 +3442,9 @@ async fn persist_notification_prewrite_block(
         // only Gating. Reconcile once after the durable block exists so that
         // edge is not lost. The mailbox projection enforces the one-reopen
         // limit and exact binding checks.
-        crate::messaging::schedule_route_reconciliation(inner, handle.session_idx, &handle.pane_id);
+        if let Some(messaging) = inner.workspace_messaging() {
+            messaging.notification_prewrite_blocked(handle.session_idx, &handle.pane_id);
+        }
         if let Some(watcher) = inner.watcher_of(handle.session_idx) {
             let route_evidence = inner.route_evidence_id(handle.session_idx, &handle.pane_id);
             crate::observe_pane_for_route_evidence(
@@ -3455,11 +3457,9 @@ async fn persist_notification_prewrite_block(
                 &route_evidence,
             )
             .await;
-            crate::messaging::schedule_route_reconciliation(
-                inner,
-                handle.session_idx,
-                &handle.pane_id,
-            );
+            if let Some(messaging) = inner.workspace_messaging() {
+                messaging.notification_prewrite_blocked(handle.session_idx, &handle.pane_id);
+            }
         }
     }
 }
@@ -5631,12 +5631,8 @@ async fn fail_attempt(
                 };
                 match result {
                     Ok(record) => {
-                        if record.needs_exact_owned_reconciliation() {
-                            crate::attention_resolution::schedule_exact_owned_reconciliation(
-                                inner,
-                                record.recipient,
-                            );
-                            crate::messaging::schedule_force_submit(inner, record);
+                        if let Some(messaging) = inner.workspace_messaging() {
+                            messaging.notification_attention_recorded(record);
                         }
                     }
                     Err(NotificationAdapterError::TerminalConflict(_)) => return false,
@@ -6757,7 +6753,9 @@ fn record_notification_notified(
                     );
                 }
             } else {
-                crate::messaging::schedule_unclaimed_reminder(inner, record);
+                if let Some(messaging) = inner.workspace_messaging() {
+                    messaging.notification_became_notified(record);
+                }
             }
             Ok(true)
         }

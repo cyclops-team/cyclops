@@ -835,7 +835,9 @@ pub(crate) async fn dispatch(
             }
             inner.force_submit.set(params.enabled, delay_ms);
             if params.enabled {
-                crate::messaging::schedule_force_submit_candidates(inner);
+                if let Some(messaging) = inner.workspace_messaging() {
+                    messaging.force_submit_enabled();
+                }
             }
             let result = cyclops_proto::ForceSubmitSettings {
                 enabled: params.enabled,

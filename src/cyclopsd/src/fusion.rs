@@ -2451,7 +2451,13 @@ fn wake_readiness(
     }
     if decision.reconcile_route {
         if let Some(route_evidence) = route_evidence {
-            crate::messaging::schedule_route_evidence(inner, session_idx, pane_id, route_evidence);
+            if let Some(messaging) = inner.workspace_messaging() {
+                messaging.route_evidence_observed(crate::messaging::MessagingRouteEvidence::new(
+                    session_idx,
+                    pane_id,
+                    route_evidence.clone(),
+                ));
+            }
         }
     }
 }

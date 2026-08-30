@@ -536,6 +536,41 @@ impl messaging::WorkspaceMessagingEffects for DaemonWorkspaceMessagingEffects {
         }
     }
 
+    fn reconcile_route_evidence(&self, evidence: messaging::MessagingRouteEvidence) {
+        if let Some(inner) = self.inner.upgrade() {
+            messaging::schedule_route_evidence(
+                &inner,
+                evidence.session_idx,
+                &evidence.pane_id,
+                &evidence.evidence_id,
+            );
+        }
+    }
+
+    fn reconcile_current_route(&self, session_idx: usize, pane_id: String) {
+        if let Some(inner) = self.inner.upgrade() {
+            messaging::schedule_route_reconciliation(&inner, session_idx, &pane_id);
+        }
+    }
+
+    fn schedule_unclaimed_reminder(&self, record: cyclops_proto::NotificationRecord) {
+        if let Some(inner) = self.inner.upgrade() {
+            messaging::schedule_unclaimed_reminder(&inner, record);
+        }
+    }
+
+    fn schedule_force_submit(&self, record: cyclops_proto::NotificationRecord) {
+        if let Some(inner) = self.inner.upgrade() {
+            messaging::schedule_force_submit(&inner, record);
+        }
+    }
+
+    fn schedule_force_submit_candidates(&self) {
+        if let Some(inner) = self.inner.upgrade() {
+            messaging::schedule_force_submit_candidates(&inner);
+        }
+    }
+
     fn receipt_block(&self) -> Duration {
         self.receipt_block
     }

@@ -781,7 +781,13 @@ pub(crate) async fn handle_report(
             &route_evidence,
         )
         .await;
-        crate::messaging::schedule_route_evidence(inner, session_idx, &pane_id, &route_evidence);
+        if let Some(messaging) = inner.workspace_messaging() {
+            messaging.route_evidence_observed(crate::messaging::MessagingRouteEvidence::new(
+                session_idx,
+                &pane_id,
+                route_evidence,
+            ));
+        }
     }
     if is_turn_end && lifecycle_confirmed {
         if let (Some(turn), Some(manifest)) = (exact_turn.as_ref(), origin.manifest.as_deref()) {
