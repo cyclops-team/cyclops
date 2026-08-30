@@ -295,7 +295,7 @@ pub(crate) struct Inner {
     /// canonical workspace projection.
     pub(crate) composer_recovery: StdMutex<composer_recovery::RecoveryCoordinator>,
     /// Serializes route state, directory replacement, and authenticated reads.
-    pub(crate) mailbox_publication: StdMutex<()>,
+    pub(crate) mailbox_publication: Arc<StdMutex<()>>,
     /// Serializes unread badge derivations and tmux writes across concurrent sync requests.
     ///
     /// (1) Global scope is deliberate because badge writes are rare and short,
@@ -1895,12 +1895,12 @@ impl Daemon {
         claimant: &str,
         message_id: &str,
     ) -> Result<(), WireError> {
-        let service = self.inner.mailbox.as_ref().ok_or_else(|| WireError {
+        let messaging = self.inner.workspace_messaging().ok_or_else(|| WireError {
             code: "mailbox_unavailable".to_string(),
             message: "durable workspace identity is not connected".to_string(),
             data: None,
         })?;
-        let claimant = service
+        let claimant = messaging
             .identity_for_address(claimant)
             .map_err(server::mailbox_service_error)?;
         let message_id = MessageId::new(message_id).map_err(|error| WireError {
@@ -1908,7 +1908,8 @@ impl Daemon {
             message: error.to_string(),
             data: None,
         })?;
-        messaging::claim(&self.inner, service, claimant.key, message_id)
+        messaging
+            .claim(claimant.key, message_id)
             .map_err(server::mailbox_service_error)?;
         Ok(())
     }
@@ -1935,15 +1936,15 @@ impl Daemon {
         caller: &str,
         recent_settled: u32,
     ) -> Result<MessagesSnapshotResult, WireError> {
-        let service = self.inner.mailbox.as_ref().ok_or_else(|| WireError {
+        let messaging = self.inner.workspace_messaging().ok_or_else(|| WireError {
             code: "mailbox_unavailable".to_string(),
             message: "durable workspace identity is not connected".to_string(),
             data: None,
         })?;
-        let caller = service
+        let caller = messaging
             .identity_for_address(caller)
             .map_err(server::mailbox_service_error)?;
-        service
+        messaging
             .messages_snapshot(caller.key, recent_settled)
             .map_err(server::mailbox_service_error)
     }
@@ -3433,7 +3434,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         composer_recovery: StdMutex::new(composer_recovery::RecoveryCoordinator::new(
             recovered_barrier_ids,
         )),
-        mailbox_publication: StdMutex::new(()),
+        mailbox_publication: Arc::new(StdMutex::new(())),
         unread_projection_gate: tokio::sync::Mutex::new(()),
         unread_projection_pending: StdMutex::new(HashSet::new()),
         unread_projection_wake: Notify::new(),
@@ -5577,7 +5578,7 @@ mod tests {
             mailbox: None,
             workspace_messaging: OnceLock::new(),
             composer_recovery: StdMutex::new(composer_recovery::RecoveryCoordinator::default()),
-            mailbox_publication: StdMutex::new(()),
+            mailbox_publication: Arc::new(StdMutex::new(())),
             unread_projection_gate: tokio::sync::Mutex::new(()),
             unread_projection_pending: StdMutex::new(HashSet::new()),
             unread_projection_wake: Notify::new(),

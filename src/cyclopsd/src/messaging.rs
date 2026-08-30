@@ -5,11 +5,12 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use cyclops_proto::{
-    DeliveryReceipt, DeliveryState, MessageId, MessageWakeBlock, MsgSendParams, MsgSendResult,
-    NotificationAttemptId, NotificationBinding, NotificationManifestId, NotificationPreWriteCause,
-    NotificationPreWriteObservation, NotificationRouteEvidenceId, NotificationState,
-    NotificationWithdrawDisposition, NotificationWithdrawResult, NotifyLevel, ProcessInstanceId,
-    RecipientKey,
+    ClaimDisposition, DeliveryReceipt, DeliveryState, InboxClaimResult, InboxListResult,
+    InboxSummaryEntry, MessageId, MessageWakeBlock, MessagesFollowResult, MessagesSnapshotResult,
+    MsgSendParams, MsgSendResult, NotificationAttemptId, NotificationBinding,
+    NotificationManifestId, NotificationPreWriteCause, NotificationPreWriteObservation,
+    NotificationRouteEvidenceId, NotificationState, NotificationWithdrawDisposition,
+    NotificationWithdrawResult, NotifyLevel, ProcessInstanceId, RecipientKey,
 };
 use cyclops_tmux::{PaneRow, SessionWatcher};
 use tokio::time::Instant;
@@ -142,6 +143,26 @@ trait WorkspaceMessagingEffects: Send + Sync {
         recipient: RecipientKey,
     ) -> Result<Option<String>, MailboxServiceError>;
 
+    fn settle_notification_claim(&self, attempt_id: NotificationAttemptId);
+
+    fn observe_claimed_composer(
+        &self,
+        service: &Arc<MailboxService>,
+        claimant: RecipientKey,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<(), MailboxServiceError>;
+
+    fn recover_claimed_notification(
+        &self,
+        service: &Arc<MailboxService>,
+        claimant: RecipientKey,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<(), MailboxServiceError>;
+
+    fn cancel_notification(&self, attempt_id: NotificationAttemptId);
+
+    fn reconcile_claimed_recipient(&self, claimant: RecipientKey);
+
     fn receipt_block(&self) -> Duration;
 }
 
@@ -196,6 +217,52 @@ impl WorkspaceMessagingEffects for DaemonMessagingEffects {
         Ok(notification_route(&inner, service, recipient)?.map(|route| route.pane_id))
     }
 
+    fn settle_notification_claim(&self, attempt_id: NotificationAttemptId) {
+        if let Some(inner) = self.inner.upgrade() {
+            crate::delivery::settle_notification_claim(&inner, attempt_id);
+        }
+    }
+
+    fn observe_claimed_composer(
+        &self,
+        service: &Arc<MailboxService>,
+        claimant: RecipientKey,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<(), MailboxServiceError> {
+        let Some(inner) = self.inner.upgrade() else {
+            return Err(MailboxServiceError::NotificationSchedule(
+                "daemon messaging effects are unavailable".to_string(),
+            ));
+        };
+        schedule_claimed_composer_observation(&inner, service, claimant, attempt_id)
+    }
+
+    fn recover_claimed_notification(
+        &self,
+        service: &Arc<MailboxService>,
+        claimant: RecipientKey,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<(), MailboxServiceError> {
+        let Some(inner) = self.inner.upgrade() else {
+            return Err(MailboxServiceError::NotificationSchedule(
+                "daemon messaging effects are unavailable".to_string(),
+            ));
+        };
+        schedule_claimed_notification_recovery(&inner, service, claimant, attempt_id)
+    }
+
+    fn cancel_notification(&self, attempt_id: NotificationAttemptId) {
+        if let Some(inner) = self.inner.upgrade() {
+            inner.engine.cancel_notification(attempt_id);
+        }
+    }
+
+    fn reconcile_claimed_recipient(&self, claimant: RecipientKey) {
+        if let Some(inner) = self.inner.upgrade() {
+            crate::attention_resolution::schedule_exact_owned_reconciliation(&inner, claimant);
+        }
+    }
+
     fn receipt_block(&self) -> Duration {
         self.receipt_block
     }
@@ -203,18 +270,35 @@ impl WorkspaceMessagingEffects for DaemonMessagingEffects {
 
 /// Internal messaging Module for one workspace.
 ///
-/// The module owns durable send/reply acceptance and every post-commit action
-/// that follows it. Callers supply an authenticated identity and request; they
-/// do not receive the journal, projection, worker, unread scheduler, or daemon
-/// composition root.
+/// The module owns durable send/reply acceptance, inbox and message reads,
+/// claims, and the post-commit actions that follow acceptance or claiming.
+/// Callers supply an authenticated identity and request; they do not receive
+/// the journal, projection, publication lock, worker, unread scheduler, or
+/// daemon composition root.
 pub(crate) struct WorkspaceMessaging {
     service: Arc<MailboxService>,
+    publication: Arc<StdMutex<()>>,
     effects: Arc<dyn WorkspaceMessagingEffects>,
 }
 
 impl WorkspaceMessaging {
-    fn new(service: Arc<MailboxService>, effects: Arc<dyn WorkspaceMessagingEffects>) -> Self {
-        Self { service, effects }
+    fn new(
+        service: Arc<MailboxService>,
+        publication: Arc<StdMutex<()>>,
+        effects: Arc<dyn WorkspaceMessagingEffects>,
+    ) -> Self {
+        Self {
+            service,
+            publication,
+            effects,
+        }
+    }
+
+    /// Read the current directory and its matching daemon route publication as
+    /// one transaction without exposing the synchronization mechanism.
+    pub(crate) fn with_published<T>(&self, read: impl FnOnce(&Self) -> T) -> T {
+        let _publication = self.publication.lock().expect("mailbox publication lock");
+        read(self)
     }
 
     pub(crate) fn identity_for_address(
@@ -222,6 +306,142 @@ impl WorkspaceMessaging {
         address: &str,
     ) -> Result<MailboxIdentity, MailboxServiceError> {
         self.service.identity_for_address(address)
+    }
+
+    pub(crate) fn admin_identity(&self) -> MailboxIdentity {
+        self.service.admin()
+    }
+
+    pub(crate) fn identity_for_recipient(
+        &self,
+        recipient: RecipientKey,
+    ) -> Result<Option<MailboxIdentity>, MailboxServiceError> {
+        self.service.identity_for_recipient(recipient)
+    }
+
+    pub(crate) fn inbox_list(
+        &self,
+        caller: RecipientKey,
+        sender: Option<RecipientKey>,
+        limit: Option<u32>,
+    ) -> Result<InboxListResult, MailboxServiceError> {
+        let entries = self
+            .service
+            .list(caller, sender, limit)?
+            .into_iter()
+            .map(|item| InboxSummaryEntry {
+                message_id: item.entry.message_id,
+                sender: Some(item.sender),
+                sender_label: item.sender_label,
+                subject: item.subject,
+                ts: item.entry.created_at,
+                thread_root: item.thread_root,
+            })
+            .collect();
+        Ok(InboxListResult { entries })
+    }
+
+    pub(crate) fn claim(
+        &self,
+        claimant: RecipientKey,
+        message_id: MessageId,
+    ) -> Result<InboxClaimResult, MailboxServiceError> {
+        // Only this operation interprets the reserved locator. Every other
+        // message-id consumer keeps treating the same bytes as a literal
+        // historical id.
+        let outcome = match cyclops_proto::parse_notification_attempt_claim_locator(&message_id) {
+            Some(attempt_id) => self
+                .service
+                .claim_notification_locator(claimant, message_id, attempt_id)?,
+            None => self.service.claim(claimant, message_id)?,
+        };
+        self.finish_claim(claimant, outcome)
+    }
+
+    fn finish_claim(
+        &self,
+        claimant: RecipientKey,
+        outcome: ClaimOutcome,
+    ) -> Result<InboxClaimResult, MailboxServiceError> {
+        let (withdrawn, consumed_doorbell, claimed_ack_timeout) = match &outcome {
+            ClaimOutcome::Claimed {
+                withdrawn_attempt,
+                consumed_doorbell_attempt,
+                claimed_ack_timeout_attempt,
+                ..
+            }
+            | ClaimOutcome::AlreadyClaimed {
+                withdrawn_attempt,
+                consumed_doorbell_attempt,
+                claimed_ack_timeout_attempt,
+                ..
+            } => (
+                *withdrawn_attempt,
+                *consumed_doorbell_attempt,
+                *claimed_ack_timeout_attempt,
+            ),
+        };
+        if let Some(attempt_id) = consumed_doorbell {
+            self.effects.settle_notification_claim(attempt_id);
+            if let Err(error) =
+                self.effects
+                    .observe_claimed_composer(&self.service, claimant, attempt_id)
+            {
+                error!(%claimant, %error, "cannot observe claimed notification composer");
+            }
+        }
+        if let Some(attempt_id) = claimed_ack_timeout {
+            if let Err(error) =
+                self.effects
+                    .recover_claimed_notification(&self.service, claimant, attempt_id)
+            {
+                error!(%claimant, %error, "cannot schedule claimed notification recovery");
+            }
+        }
+        if let Some(attempt_id) = withdrawn {
+            self.effects.cancel_notification(attempt_id);
+        }
+        self.effects.reconcile_claimed_recipient(claimant);
+        if claimed_ack_timeout.is_none() {
+            if let Err(error) = self.effects.schedule_notification(&self.service, claimant) {
+                error!(%claimant, %error, "cannot schedule mailbox notification after claim");
+            }
+        }
+        self.effects.invalidate_unread(claimant);
+
+        Ok(match outcome {
+            ClaimOutcome::Claimed {
+                message,
+                skipped_oldest,
+                ..
+            } => InboxClaimResult {
+                disposition: ClaimDisposition::Claimed,
+                message,
+                skipped_oldest,
+            },
+            ClaimOutcome::AlreadyClaimed { message, .. } => InboxClaimResult {
+                disposition: ClaimDisposition::AlreadyClaimed,
+                message,
+                skipped_oldest: None,
+            },
+        })
+    }
+
+    pub(crate) fn messages_snapshot(
+        &self,
+        caller: RecipientKey,
+        recent_settled: u32,
+    ) -> Result<MessagesSnapshotResult, MailboxServiceError> {
+        self.service.messages_snapshot(caller, recent_settled)
+    }
+
+    pub(crate) fn messages_follow(
+        &self,
+        caller: RecipientKey,
+        after_seq: u64,
+        limit: u32,
+    ) -> Result<MessagesFollowResult, MailboxServiceError> {
+        self.service.messages_follow(caller, after_seq, limit)
     }
 
     async fn finish_acceptance(
@@ -377,6 +597,7 @@ impl Inner {
         Some(Arc::clone(self.workspace_messaging.get_or_init(|| {
             Arc::new(WorkspaceMessaging::new(
                 service,
+                Arc::clone(&self.mailbox_publication),
                 Arc::new(DaemonMessagingEffects::new(self)),
             ))
         })))
@@ -1266,79 +1487,6 @@ fn schedule_accepted_notifications(
     report
 }
 
-pub(crate) fn claim(
-    inner: &Arc<Inner>,
-    service: &Arc<MailboxService>,
-    claimant: RecipientKey,
-    message_id: MessageId,
-) -> Result<ClaimOutcome, MailboxServiceError> {
-    let outcome = service.claim(claimant, message_id)?;
-    finish_claim(inner, service, claimant, outcome)
-}
-
-pub(crate) fn claim_notification_locator(
-    inner: &Arc<Inner>,
-    service: &Arc<MailboxService>,
-    claimant: RecipientKey,
-    locator: MessageId,
-    attempt_id: cyclops_proto::NotificationAttemptId,
-) -> Result<ClaimOutcome, MailboxServiceError> {
-    let outcome = service.claim_notification_locator(claimant, locator, attempt_id)?;
-    finish_claim(inner, service, claimant, outcome)
-}
-
-fn finish_claim(
-    inner: &Arc<Inner>,
-    service: &Arc<MailboxService>,
-    claimant: RecipientKey,
-    outcome: ClaimOutcome,
-) -> Result<ClaimOutcome, MailboxServiceError> {
-    let (withdrawn, consumed_doorbell, claimed_ack_timeout) = match &outcome {
-        ClaimOutcome::Claimed {
-            withdrawn_attempt,
-            consumed_doorbell_attempt,
-            claimed_ack_timeout_attempt,
-            ..
-        }
-        | ClaimOutcome::AlreadyClaimed {
-            withdrawn_attempt,
-            consumed_doorbell_attempt,
-            claimed_ack_timeout_attempt,
-            ..
-        } => (
-            *withdrawn_attempt,
-            *consumed_doorbell_attempt,
-            *claimed_ack_timeout_attempt,
-        ),
-    };
-    if let Some(attempt_id) = consumed_doorbell {
-        crate::delivery::settle_notification_claim(inner, attempt_id);
-        if let Err(error) =
-            schedule_claimed_composer_observation(inner, service, claimant, attempt_id)
-        {
-            error!(%claimant, %error, "cannot observe claimed notification composer");
-        }
-    }
-    if let Some(attempt_id) = claimed_ack_timeout {
-        if let Err(error) =
-            schedule_claimed_notification_recovery(inner, service, claimant, attempt_id)
-        {
-            error!(%claimant, %error, "cannot schedule claimed notification recovery");
-        }
-    }
-    if let Some(attempt_id) = withdrawn {
-        inner.engine.cancel_notification(attempt_id);
-    }
-    crate::attention_resolution::schedule_exact_owned_reconciliation(inner, claimant);
-    if claimed_ack_timeout.is_none() {
-        if let Err(error) = schedule_recipient(inner, service, claimant) {
-            error!(%claimant, %error, "cannot schedule mailbox notification after claim");
-        }
-    }
-    crate::schedule_recipient_unread(inner, claimant);
-    Ok(outcome)
-}
-
 /// Reconcile one exact doorbell barrier against a fresh post-claim screen.
 ///
 /// A claim can move Submitted to Notified after its delivery handle has
@@ -1616,19 +1764,24 @@ mod tests {
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
-    enum AcceptanceEffect {
+    enum RecordedEffect {
         Subscribe,
         Schedule(RecipientKey),
         InvalidateUnread(RecipientKey),
         ResolvePane(RecipientKey),
+        SettleClaim(NotificationAttemptId),
+        ObserveClaimedComposer(RecipientKey, NotificationAttemptId),
+        RecoverClaimedNotification(RecipientKey, NotificationAttemptId),
+        CancelNotification(NotificationAttemptId),
+        ReconcileClaimedRecipient(RecipientKey),
     }
 
-    struct RecordingAcceptanceEffects {
+    struct RecordingEffects {
         events: broadcast::Sender<Event>,
-        calls: StdMutex<Vec<AcceptanceEffect>>,
+        calls: StdMutex<Vec<RecordedEffect>>,
     }
 
-    impl RecordingAcceptanceEffects {
+    impl RecordingEffects {
         fn new(events: broadcast::Sender<Event>) -> Self {
             Self {
                 events,
@@ -1636,19 +1789,19 @@ mod tests {
             }
         }
 
-        fn calls(&self) -> Vec<AcceptanceEffect> {
+        fn calls(&self) -> Vec<RecordedEffect> {
             self.calls.lock().expect("acceptance calls lock").clone()
         }
     }
 
-    impl WorkspaceMessagingEffects for RecordingAcceptanceEffects {
+    impl WorkspaceMessagingEffects for RecordingEffects {
         fn subscribe_messages_changed(
             &self,
         ) -> tokio::sync::broadcast::Receiver<cyclops_proto::Event> {
             self.calls
                 .lock()
                 .expect("acceptance calls lock")
-                .push(AcceptanceEffect::Subscribe);
+                .push(RecordedEffect::Subscribe);
             self.events.subscribe()
         }
 
@@ -1660,7 +1813,7 @@ mod tests {
             self.calls
                 .lock()
                 .expect("acceptance calls lock")
-                .push(AcceptanceEffect::Schedule(recipient));
+                .push(RecordedEffect::Schedule(recipient));
             Ok(RecipientScheduleOutcome::NoWakeNeeded)
         }
 
@@ -1668,7 +1821,7 @@ mod tests {
             self.calls
                 .lock()
                 .expect("acceptance calls lock")
-                .push(AcceptanceEffect::InvalidateUnread(recipient));
+                .push(RecordedEffect::InvalidateUnread(recipient));
         }
 
         fn notification_pane(
@@ -1679,8 +1832,54 @@ mod tests {
             self.calls
                 .lock()
                 .expect("acceptance calls lock")
-                .push(AcceptanceEffect::ResolvePane(recipient));
+                .push(RecordedEffect::ResolvePane(recipient));
             Ok(None)
+        }
+
+        fn settle_notification_claim(&self, attempt_id: NotificationAttemptId) {
+            self.calls
+                .lock()
+                .expect("acceptance calls lock")
+                .push(RecordedEffect::SettleClaim(attempt_id));
+        }
+
+        fn observe_claimed_composer(
+            &self,
+            _service: &Arc<MailboxService>,
+            claimant: RecipientKey,
+            attempt_id: NotificationAttemptId,
+        ) -> Result<(), MailboxServiceError> {
+            self.calls
+                .lock()
+                .expect("acceptance calls lock")
+                .push(RecordedEffect::ObserveClaimedComposer(claimant, attempt_id));
+            Ok(())
+        }
+
+        fn recover_claimed_notification(
+            &self,
+            _service: &Arc<MailboxService>,
+            claimant: RecipientKey,
+            attempt_id: NotificationAttemptId,
+        ) -> Result<(), MailboxServiceError> {
+            self.calls.lock().expect("acceptance calls lock").push(
+                RecordedEffect::RecoverClaimedNotification(claimant, attempt_id),
+            );
+            Ok(())
+        }
+
+        fn cancel_notification(&self, attempt_id: NotificationAttemptId) {
+            self.calls
+                .lock()
+                .expect("acceptance calls lock")
+                .push(RecordedEffect::CancelNotification(attempt_id));
+        }
+
+        fn reconcile_claimed_recipient(&self, claimant: RecipientKey) {
+            self.calls
+                .lock()
+                .expect("acceptance calls lock")
+                .push(RecordedEffect::ReconcileClaimedRecipient(claimant));
         }
 
         fn receipt_block(&self) -> Duration {
@@ -1694,8 +1893,12 @@ mod tests {
     async fn workspace_messaging_owns_acceptance_and_the_post_commit_trace_without_inner() {
         let (scratch, service, events, reviewer, _) =
             mailbox_service("workspace-messaging-boundary", 8);
-        let effects = Arc::new(RecordingAcceptanceEffects::new(events));
-        let messaging = WorkspaceMessaging::new(Arc::clone(&service), effects.clone());
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            effects.clone(),
+        );
 
         let result = messaging
             .send(
@@ -1724,10 +1927,10 @@ mod tests {
         assert_eq!(
             effects.calls(),
             vec![
-                AcceptanceEffect::Subscribe,
-                AcceptanceEffect::Schedule(reviewer),
-                AcceptanceEffect::InvalidateUnread(reviewer),
-                AcceptanceEffect::ResolvePane(reviewer),
+                RecordedEffect::Subscribe,
+                RecordedEffect::Schedule(reviewer),
+                RecordedEffect::InvalidateUnread(reviewer),
+                RecordedEffect::ResolvePane(reviewer),
             ]
         );
 
@@ -1752,14 +1955,72 @@ mod tests {
         assert_eq!(metadata.recipients, vec![reviewer]);
     }
 
+    // Obsolete if inbox reads or claim coordination escape the
+    // WorkspaceMessaging interface and callers again need projection types or
+    // post-commit scheduling knowledge.
+    #[test]
+    fn workspace_messaging_owns_inbox_reads_claim_and_follow_up_effects_without_inner() {
+        let (scratch, service, events, reviewer, _) =
+            mailbox_service("workspace-messaging-claim", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            effects.clone(),
+        );
+        let accepted = send_to(&service, &["reviewer"], "Claim boundary");
+
+        let listed = messaging.inbox_list(reviewer, None, None).unwrap();
+        assert_eq!(listed.entries.len(), 1);
+        assert_eq!(listed.entries[0].message_id, accepted.message_id);
+
+        let snapshot = messaging.messages_snapshot(reviewer, 20).unwrap();
+        assert_eq!(snapshot.rows.len(), 1);
+        assert_eq!(snapshot.rows[0].message_id, accepted.message_id);
+
+        let followed = messaging.messages_follow(reviewer, 0, 8).unwrap();
+        assert_eq!(followed.rows.len(), 1);
+        assert_eq!(followed.rows[0].message_id, accepted.message_id);
+
+        let journal_path = scratch
+            .0
+            .join("workspaces")
+            .join("current")
+            .join("messages.ndjson");
+        let before_claim = fs::read_to_string(&journal_path).unwrap().lines().count();
+        let claimed = messaging
+            .claim(reviewer, accepted.message_id.clone())
+            .unwrap();
+
+        assert_eq!(claimed.disposition, ClaimDisposition::Claimed);
+        assert_eq!(claimed.message.message_id, accepted.message_id);
+        assert_eq!(
+            effects.calls(),
+            vec![
+                RecordedEffect::ReconcileClaimedRecipient(reviewer),
+                RecordedEffect::Schedule(reviewer),
+                RecordedEffect::InvalidateUnread(reviewer),
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(&journal_path).unwrap().lines().count(),
+            before_claim + 1,
+            "one claim remains one durable mailbox fact"
+        );
+    }
+
     // Obsolete if fusion again commits quota-reset messaging state itself, or
     // if reset observation begins to requeue held work without operator action.
     #[test]
     fn workspace_messaging_owns_the_quota_reset_transition_and_notice_without_inner() {
         let (scratch, service, events, reviewer, _) =
             mailbox_service("workspace-messaging-quota-reset", 8);
-        let effects = Arc::new(RecordingAcceptanceEffects::new(events));
-        let messaging = WorkspaceMessaging::new(Arc::clone(&service), effects.clone());
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            effects.clone(),
+        );
         let (accepted, context, _) = queued_attempt(&service);
         context.record_gating().unwrap();
         context.record_quota_held().unwrap();

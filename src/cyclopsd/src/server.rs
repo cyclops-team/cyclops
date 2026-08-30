@@ -17,9 +17,8 @@ use cyclops_proto::TmuxPaneId;
 use cyclops_proto::{
     AdminNotifyParams, AgentWaitParams, AlarmClearParams, AlarmClearResult, AlarmPreviewParams,
     AlarmPreviewResult, AlarmSummary, AttentionResolveParams, AttentionShowParams,
-    ClaimDisposition, DaemonShutdownParams, DaemonShutdownResult, DeliveryState, Event,
-    FrameContract, FrameSize, Hello, InboxClaimParams, InboxClaimResult, InboxListParams,
-    InboxListResult, InboxSummaryEntry, MessagesFollowParams, MessagesSnapshotParams,
+    DaemonShutdownParams, DaemonShutdownResult, DeliveryState, Event, FrameContract, FrameSize,
+    Hello, InboxClaimParams, InboxListParams, MessagesFollowParams, MessagesSnapshotParams,
     MsgSendParams, NotificationAttemptId, NotificationAttentionCause, NotificationRecord,
     NotificationResolution, NotificationWithdrawParams, PaneReadParams, PaneReadResult,
     PaneReadSource, PingResult, ProcessInstanceId, QuiesceParams, RecipientKey, ReplyParams,
@@ -984,28 +983,15 @@ fn inbox_list(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Respo
         Ok(params) => params,
         Err(response) => return response,
     };
-    let (service, caller) = match mailbox_caller(inner, peer) {
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    match service.list(caller.key, params.sender, params.limit) {
-        Ok(entries) => {
-            let entries = entries
-                .into_iter()
-                .map(|item| InboxSummaryEntry {
-                    message_id: item.entry.message_id,
-                    sender: Some(item.sender),
-                    sender_label: item.sender_label,
-                    subject: item.subject,
-                    ts: item.entry.created_at,
-                    thread_root: item.thread_root,
-                })
-                .collect();
-            Response::ok(
-                id,
-                serde_json::to_value(InboxListResult { entries }).expect("inbox list serializes"),
-            )
-        }
+    match messaging.inbox_list(caller.key, params.sender, params.limit) {
+        Ok(result) => Response::ok(
+            id,
+            serde_json::to_value(result).expect("inbox list serializes"),
+        ),
         Err(error) => wire_error_response(id, mailbox_service_error(error)),
     }
 }
@@ -1015,38 +1001,12 @@ fn inbox_claim(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Resp
         Ok(params) => params,
         Err(response) => return response,
     };
-    let (service, caller) = match mailbox_caller(inner, peer) {
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    // Only inbox.claim interprets the reserved locator. Every other message-id
-    // consumer keeps treating the same bytes as a literal historical id.
-    let outcome = match cyclops_proto::parse_notification_attempt_claim_locator(&params.message_id)
-    {
-        Some(attempt_id) => crate::messaging::claim_notification_locator(
-            inner,
-            &service,
-            caller.key,
-            params.message_id,
-            attempt_id,
-        ),
-        None => crate::messaging::claim(inner, &service, caller.key, params.message_id),
-    };
-    let result = match outcome {
-        Ok(crate::mailbox::ClaimOutcome::Claimed {
-            message,
-            skipped_oldest,
-            ..
-        }) => InboxClaimResult {
-            disposition: ClaimDisposition::Claimed,
-            message,
-            skipped_oldest,
-        },
-        Ok(crate::mailbox::ClaimOutcome::AlreadyClaimed { message, .. }) => InboxClaimResult {
-            disposition: ClaimDisposition::AlreadyClaimed,
-            message,
-            skipped_oldest: None,
-        },
+    let result = match messaging.claim(caller.key, params.message_id) {
+        Ok(result) => result,
         Err(error) => return wire_error_response(id, mailbox_service_error(error)),
     };
     Response::ok(
@@ -1068,11 +1028,11 @@ fn messages_snapshot(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -
             format!("recent_settled cannot exceed {MAX_RECENT_SETTLED_MESSAGES}"),
         );
     }
-    let (service, caller) = match mailbox_caller(inner, peer) {
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    match service.messages_snapshot(caller.key, params.recent_settled) {
+    match messaging.messages_snapshot(caller.key, params.recent_settled) {
         Ok(snapshot) => Response::ok(
             id,
             serde_json::to_value(snapshot).expect("messages snapshot serializes"),
@@ -1093,11 +1053,11 @@ fn messages_follow(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> 
             format!("limit must be between 1 and {MAX_FOLLOW_MESSAGES}"),
         );
     }
-    let (service, caller) = match mailbox_caller(inner, peer) {
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    match service.messages_follow(caller.key, params.after_seq, params.limit) {
+    match messaging.messages_follow(caller.key, params.after_seq, params.limit) {
         Ok(page) => Response::ok(
             id,
             serde_json::to_value(page).expect("messages follow page serializes"),
@@ -1418,12 +1378,29 @@ pub(crate) fn mailbox_caller(
     ),
     WireError,
 > {
-    let (uid, pid) = daemon_peer(peer)?;
+    let credentials = daemon_peer(peer)?;
     let _publication = inner
         .mailbox_publication
         .lock()
         .expect("mailbox publication lock");
     let service = mailbox_service(inner)?;
+    let caller = resolve_mailbox_identity(inner, credentials, service.admin(), |recipient| {
+        service.identity_for_recipient(recipient)
+    })?;
+    Ok((service, caller))
+}
+
+fn resolve_mailbox_identity(
+    inner: &Arc<Inner>,
+    (uid, pid): (u32, i32),
+    admin: crate::mailbox::MailboxIdentity,
+    identity_for_recipient: impl FnOnce(
+        RecipientKey,
+    ) -> Result<
+        Option<crate::mailbox::MailboxIdentity>,
+        crate::mailbox::MailboxServiceError,
+    >,
+) -> Result<crate::mailbox::MailboxIdentity, WireError> {
     let panes = report_panes(inner);
     let observed: Vec<_> = panes
         .iter()
@@ -1434,7 +1411,7 @@ pub(crate) fn mailbox_caller(
         crate::fusion::is_vendor_now(inner, process)
     });
     let caller = match origin {
-        identity::PeerOrigin::Admin => service.admin(),
+        identity::PeerOrigin::Admin => admin,
         identity::PeerOrigin::Pane {
             pane_id,
             pane_root,
@@ -1445,8 +1422,7 @@ pub(crate) fn mailbox_caller(
             // agent vendor. Labels are mutable display data and cannot grant
             // or revoke administrative authority.
             if !vendor_below {
-                let admin = service.admin();
-                return Ok((service, admin));
+                return Ok(admin);
             }
             let Some(route) = report_pane_at(&panes, &pane_id, pane_root) else {
                 // An unconfigured vendor cannot acquire administrative
@@ -1464,14 +1440,13 @@ pub(crate) fn mailbox_caller(
             {
                 return Err(mailbox_origin_denied());
             }
-            service
-                .identity_for_recipient(route.recipient_key)
+            identity_for_recipient(route.recipient_key)
                 .map_err(mailbox_service_error)?
                 .ok_or_else(mailbox_origin_denied)?
         }
         identity::PeerOrigin::Unprovable => return Err(mailbox_origin_denied()),
     };
-    Ok((service, caller))
+    Ok(caller)
 }
 
 fn workspace_messaging_caller(
@@ -1484,11 +1459,19 @@ fn workspace_messaging_caller(
     ),
     WireError,
 > {
-    let (_service, caller) = mailbox_caller(inner, peer)?;
+    let credentials = daemon_peer(peer)?;
     let messaging = inner.workspace_messaging().ok_or_else(|| WireError {
         code: "mailbox_unavailable".to_string(),
         message: "durable workspace identity is not connected".to_string(),
         data: None,
+    })?;
+    let caller = messaging.with_published(|messaging| {
+        resolve_mailbox_identity(
+            inner,
+            credentials,
+            messaging.admin_identity(),
+            |recipient| messaging.identity_for_recipient(recipient),
+        )
     })?;
     Ok((messaging, caller))
 }
@@ -3282,7 +3265,7 @@ mod tests {
             composer_recovery: StdMutex::new(
                 crate::composer_recovery::RecoveryCoordinator::default(),
             ),
-            mailbox_publication: StdMutex::new(()),
+            mailbox_publication: Arc::new(StdMutex::new(())),
             unread_projection_gate: tokio::sync::Mutex::new(()),
             unread_projection_pending: StdMutex::new(HashSet::new()),
             unread_projection_wake: tokio::sync::Notify::new(),
@@ -4733,8 +4716,8 @@ mod tests {
     }
 
     #[test]
-    fn mailbox_caller_waits_for_route_publication() {
-        let inner = bare_inner();
+    fn workspace_messaging_caller_waits_for_route_publication() {
+        let (inner, path) = inner_with_mailbox("workspace-messaging-publication");
         let peer = own_peer();
         let publication = inner.mailbox_publication.lock().unwrap();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -4744,7 +4727,7 @@ mod tests {
             let inner = Arc::clone(&inner);
             let reader = scope.spawn(move || {
                 started_tx.send(()).unwrap();
-                let _ = mailbox_caller(&inner, peer);
+                let _ = workspace_messaging_caller(&inner, peer);
                 done_tx.send(()).unwrap();
             });
             started_rx.recv().unwrap();
@@ -4755,6 +4738,7 @@ mod tests {
             reader.join().unwrap();
             assert!(!overlapped, "mailbox caller observed a partial publication");
         });
+        std::fs::remove_dir_all(path).ok();
     }
 
     #[test]
@@ -5252,6 +5236,47 @@ mod tests {
                 !arm.contains(forbidden),
                 "health snapshot entered mutating path {forbidden}"
             );
+        }
+    }
+
+    /// Syntactic architecture lint: these wire adapters may validate and
+    /// serialize protocol values, but durable reads, locator interpretation,
+    /// claim transitions, and post-commit work belong to WorkspaceMessaging.
+    #[test]
+    fn inbox_and_message_read_handlers_do_not_recover_mailbox_implementation_knowledge() {
+        let source = include_str!("server.rs");
+        for (name, next) in [
+            ("inbox_list", "inbox_claim"),
+            ("inbox_claim", "messages_snapshot"),
+            ("messages_snapshot", "messages_follow"),
+            ("messages_follow", "msg_requeue"),
+        ] {
+            let marker = format!("fn {name}(");
+            let next_marker = format!("fn {next}(");
+            let handler = source
+                .split_once(&marker)
+                .unwrap_or_else(|| panic!("handler {name}"))
+                .1
+                .split_once(&next_marker)
+                .unwrap_or_else(|| panic!("handler after {name}"))
+                .0;
+            assert!(
+                handler.contains("workspace_messaging_caller"),
+                "{name} bypasses WorkspaceMessaging"
+            );
+            for forbidden in [
+                "mailbox_caller",
+                "mailbox_publication",
+                "MailboxService",
+                "crate::mailbox::",
+                "parse_notification_attempt_claim_locator",
+                "schedule_recipient",
+            ] {
+                assert!(
+                    !handler.contains(forbidden),
+                    "{name} recovered forbidden messaging knowledge: {forbidden}"
+                );
+            }
         }
     }
 
