@@ -130,7 +130,7 @@ fn spawn_daemon(home: &Path, exe: &Path) -> Result<SpawnedDaemon, String> {
         .map_err(|e| format!("start {}: {e}", exe.display()))?;
     wait_for_spawned_daemon(child, &log, BOOT_WAIT, || match Client::connect() {
         Ok(client) => Ok(BootSocket::Answering(client.hello().daemon_process)),
-        Err(ClientError::NotRunning | ClientError::ConnectTimeout(_)) => Ok(BootSocket::Absent),
+        Err(ClientError::NotRunning(_) | ClientError::ConnectTimeout(_)) => Ok(BootSocket::Absent),
         Err(error) => Err(crate::copy::client_error(&error, None)),
     })
 }
@@ -597,7 +597,7 @@ fn stop_for_pair_change_expected(
         Duration::from_millis(QUIESCE_ASK_MS + 5_000),
     ) {
         Ok(client) => client,
-        Err(ClientError::NotRunning) => return Ok(None),
+        Err(ClientError::NotRunning(_)) => return Ok(None),
         Err(error) => {
             return Err(RestartRefusal::Failed(crate::copy::client_error(
                 &error, None,
@@ -674,7 +674,7 @@ pub fn stop() -> Result<u32, String> {
             Err(AuthenticationError::Predates) => return Err(GENERATION_REQUIRED.to_string()),
             Err(AuthenticationError::Failed(error)) => return Err(error),
         },
-        Err(ClientError::NotRunning) => return Err("cyclopsd is not running.".to_string()),
+        Err(ClientError::NotRunning(_)) => return Err("cyclopsd is not running.".to_string()),
         Err(e) => return Err(crate::copy::client_error(&e, None)),
     };
     if !generation_matches(running.process, observe_process(running.process.pid())) {

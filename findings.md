@@ -25,7 +25,7 @@ than a measurement.
 | F15 | Anything reading pane output accepts `%extended-output` as well as `%output` | binds |
 | F16 | Reply correlation accepts a terminator only when the `%begin` command number matches, so pane text cannot truncate a reply | binds |
 | F17 | Bracketed paste cannot be the gate; post-paste composer verification is | binds |
-| F18 | Code adjusting socket timeouts mid-connection on macOS tolerates EINVAL once the peer has closed | binds |
+| F18 | Code applying or adjusting socket timeouts on macOS tolerates EINVAL once the peer has closed | binds |
 | F19 | Typed text versus ghost text is an SGR distinction, so the delivery gate reads escaped captures | binds |
 | F20 | A dialog whose own text says Escape cancels never receives Escape; trust prompts hold for a human | binds |
 | F21 | Manifest binding falls back to argv basenames when the kernel comm name is a version string | binds |
@@ -123,13 +123,17 @@ round-trip test proves byte-exact delivery (quotes, backslashes, tabs, UTF-8,
 embedded newlines) with mode 2004 on. Confirms amendment b's stance: the
 paste path cannot be gated on bracketing; composer verification is the gate.
 
-## F18. macOS setsockopt(SO_RCVTIMEO) fails with EINVAL once the peer closed (MEASURED)
+## F18. macOS socket timeout options fail with EINVAL once the peer closed (MEASURED)
 
-Reproduced in the CLI e2e tests: set_read_timeout(None) on a UnixStream
-whose peer already closed fails with EINVAL while buffered lines remain
-readable. The CLI swallows the error and lets the next read report the
-close. Anything adjusting socket timeouts mid-connection on macOS must
-tolerate this or it will hide readable data behind a misnamed error.
+Reproduced in the CLI e2e and Daemon Client tests: `set_read_timeout(None)`,
+`set_read_timeout(Some(_))`, and `set_write_timeout(Some(_))` on a UnixStream
+whose peer already closed can fail with EINVAL while buffered lines remain
+readable. During initial connection setup, the client swallows only that macOS
+closed-peer error and lets the next IO report the buffered line or close.
+Later event-stream timeout adjustments are explicitly best effort and ignore
+setter errors so buffered frames remain authoritative. Anything applying or
+adjusting socket timeouts mid-connection on macOS must tolerate this or it will
+hide readable data behind a misnamed error.
 
 ## F19. codex ghost text is SGR-dim; typed text is bare (MEASURED)
 

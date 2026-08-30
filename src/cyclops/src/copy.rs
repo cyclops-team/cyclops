@@ -323,7 +323,7 @@ pub fn inbox_next_timeout(d: Duration) -> String {
 
 pub fn inbox_claim_outcome_unknown(message_id: &str) -> String {
     format!(
-        "cyclops sent the claim for {message_id}, but the daemon did not answer before the deadline. The message may already be claimed. Inspect it with cyclops thread {message_id} or cyclops inbox list before retrying."
+        "cyclops sent the claim for {message_id}, but no usable answer arrived. The message may already be claimed. Inspect it with cyclops thread {message_id} or cyclops inbox list before retrying."
     )
 }
 
@@ -371,13 +371,17 @@ pub fn wait_occupant_changed(target: &str) -> String {
 /// user typed, when the command had one.
 pub fn client_error(e: &ClientError, asked: Option<&str>) -> String {
     match e {
-        ClientError::NotRunning => NOT_RUNNING.into(),
+        ClientError::NotRunning(_) => NOT_RUNNING.into(),
         ClientError::ConnectTimeout(d) => connect_timeout(*d),
+        ClientError::HelloTimeout(d) => broken(&format!("no answer within {}", timeout_words(*d))),
         ClientError::ReadTimeout(d) => broken(&format!("no answer within {}", timeout_words(*d))),
         ClientError::RequestFrameTooLarge => {
             format!("{}. Nothing was sent.", frame_too_large("request"))
         }
         ClientError::DaemonFrameTooLarge => broken(&frame_too_large("daemon frame")),
+        // The daemon deliberately supplied this complete sentence because the
+        // real response would not fit. Preserve its honest uncertainty copy.
+        ClientError::OversizedResponse(message) => message.clone(),
         ClientError::InvalidHello(_) => broken("the hello line didn't parse"),
         ClientError::Server {
             code,
@@ -397,7 +401,9 @@ pub fn client_error(e: &ClientError, asked: Option<&str>) -> String {
                 message.clone()
             }
         }
-        ClientError::Broken(cause) => broken(cause),
+        ClientError::NotSent(cause) | ClientError::Unknown(cause) | ClientError::Gap(cause) => {
+            broken(cause)
+        }
     }
 }
 
@@ -748,6 +754,26 @@ mod tests {
             data: serde_json::Value::Null,
         };
         assert_eq!(client_error(&bare, None), "cyclops refused: denied");
+    }
+
+    #[test]
+    fn oversized_response_preserves_the_daemons_uncertainty_sentence() {
+        // Obsolete when the daemon no longer substitutes a bounded uncertainty
+        // response for a result that exceeds the official frame contract.
+        let message = "daemon response was too large; request outcome is unknown";
+        let error = ClientError::OversizedResponse(message.into());
+        assert_eq!(client_error(&error, None), message);
+    }
+
+    #[test]
+    fn hello_timeout_keeps_the_existing_read_timeout_sentence() {
+        // Obsolete when CLI presentation intentionally distinguishes the
+        // Hello read from later bounded daemon reads.
+        let waited = Duration::from_secs(5);
+        assert_eq!(
+            client_error(&ClientError::HelloTimeout(waited), None),
+            client_error(&ClientError::ReadTimeout(waited), None)
+        );
     }
 
     #[test]

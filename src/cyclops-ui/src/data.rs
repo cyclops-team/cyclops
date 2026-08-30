@@ -23,16 +23,13 @@ use std::path::Path;
 
 use cyclops_proto::{Event, MessagesChangedData, StatusResult};
 use cyclops_state::StateRoot;
-use serde_json::Value;
-use tokio::io::AsyncWriteExt;
-use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
+use crate::daemon_client::{AsyncClient, ClientError};
 use crate::input::Key;
 use crate::messages::RefreshRequest;
 use crate::stream::Entry;
 use crate::stream::StatusSeed;
-use crate::wire::{encode_json, FrameReader};
 
 type UiError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -311,95 +308,14 @@ async fn messages_task(
 /// good snapshot stays on screen either way. They are split so there is
 /// one timeout contract to reason about rather than two.
 async fn messages_snapshot(sock: &Path) -> Result<cyclops_proto::MessagesSnapshotResult, UiError> {
-    let open = tokio::time::timeout(crate::action_io::OPEN_TIMEOUT, snapshot_open(sock));
-    let (mut lines, mut w) = match open.await {
-        Ok(opened) => opened?,
-        Err(_) => {
-            return Err(format!(
-                "no connection within {}s",
-                crate::action_io::OPEN_TIMEOUT.as_secs()
-            )
-            .into())
-        }
-    };
-    let answer = tokio::time::timeout(
-        crate::action_io::ANSWER_TIMEOUT,
-        snapshot_ask(&mut lines, &mut w),
-    );
-    match answer.await {
-        Ok(result) => result,
-        Err(_) => Err(format!(
-            "no answer within {}s",
-            crate::action_io::ANSWER_TIMEOUT.as_secs()
+    let mut client = open_client(sock).await?;
+    let result = client
+        .request(
+            "messages.snapshot",
+            serde_json::json!({}),
+            crate::action_io::ANSWER_TIMEOUT,
         )
-        .into()),
-    }
-}
-
-async fn messages_follow(
-    sock: &Path,
-    request: crate::messages::FollowRequest,
-) -> Result<cyclops_proto::MessagesFollowResult, UiError> {
-    let open = tokio::time::timeout(crate::action_io::OPEN_TIMEOUT, snapshot_open(sock));
-    let (mut lines, mut w) = match open.await {
-        Ok(opened) => opened?,
-        Err(_) => {
-            return Err(format!(
-                "no connection within {}s",
-                crate::action_io::OPEN_TIMEOUT.as_secs()
-            )
-            .into())
-        }
-    };
-    let answer = tokio::time::timeout(
-        crate::action_io::ANSWER_TIMEOUT,
-        follow_ask(&mut lines, &mut w, request),
-    );
-    match answer.await {
-        Ok(result) => result,
-        Err(_) => Err(format!(
-            "no answer within {}s",
-            crate::action_io::ANSWER_TIMEOUT.as_secs()
-        )
-        .into()),
-    }
-}
-
-type SnapshotReader = FrameReader<tokio::net::unix::OwnedReadHalf>;
-
-/// Connect and read the greeting. Nothing has been asked for yet.
-async fn snapshot_open(
-    sock: &Path,
-) -> Result<(SnapshotReader, tokio::net::unix::OwnedWriteHalf), UiError> {
-    let stream = UnixStream::connect(sock).await?;
-    let (r, w) = stream.into_split();
-    let mut frames = FrameReader::new(r);
-    // Same rule as action_io: the greeting has to be one. A socket that
-    // closes before greeting, or something else listening on the path,
-    // is a failed read and says so, rather than a snapshot request
-    // written into whatever is on the other end.
-    match frames.next_frame().await? {
-        Some(frame) => {
-            serde_json::from_slice::<cyclops_proto::Hello>(&frame)
-                .map_err(|_| "not a cyclops daemon")?;
-        }
-        None => return Err("closed before the hello".into()),
-    }
-    Ok((frames, w))
-}
-
-/// Ask, then read until the answer rather than an event.
-async fn snapshot_ask(
-    frames: &mut SnapshotReader,
-    w: &mut tokio::net::unix::OwnedWriteHalf,
-) -> Result<cyclops_proto::MessagesSnapshotResult, UiError> {
-    w.write_all(b"{\"id\":1,\"method\":\"messages.snapshot\",\"params\":{}}\n")
         .await?;
-    let frame = frames
-        .next_frame()
-        .await?
-        .ok_or("messages.snapshot connection closed before an answer")?;
-    let result = response_result(&frame, "messages.snapshot")?;
     let snapshot: cyclops_proto::MessagesSnapshotResult = serde_json::from_value(result)?;
     let queue_rows = snapshot.rows.iter().fold(0usize, |count, row| {
         count.saturating_add(row.recipients.len())
@@ -414,27 +330,21 @@ async fn snapshot_ask(
     Ok(snapshot)
 }
 
-async fn follow_ask(
-    frames: &mut SnapshotReader,
-    w: &mut tokio::net::unix::OwnedWriteHalf,
+async fn messages_follow(
+    sock: &Path,
     request: crate::messages::FollowRequest,
 ) -> Result<cyclops_proto::MessagesFollowResult, UiError> {
-    let request_line = serde_json::json!({
-        "id": 1,
-        "method": "messages.follow",
-        "params": {
-            "after_seq": request.after_seq(),
-            "limit": request.limit(),
-        }
-    });
-    let mut request_line = encode_json(&request_line)?;
-    request_line.push(b'\n');
-    w.write_all(&request_line).await?;
-    let frame = frames
-        .next_frame()
-        .await?
-        .ok_or("messages.follow returned no answer")?;
-    let result = response_result(&frame, "messages.follow")?;
+    let mut client = open_client(sock).await?;
+    let result = client
+        .request(
+            "messages.follow",
+            serde_json::json!({
+                "after_seq": request.after_seq(),
+                "limit": request.limit(),
+            }),
+            crate::action_io::ANSWER_TIMEOUT,
+        )
+        .await?;
     let page: cyclops_proto::MessagesFollowResult = serde_json::from_value(result)?;
     if page.rows.len() > request.limit() as usize {
         return Err(format!(
@@ -447,18 +357,8 @@ async fn follow_ask(
     Ok(page)
 }
 
-fn response_result(frame: &[u8], method: &str) -> Result<Value, UiError> {
-    let response: cyclops_proto::Response = serde_json::from_slice(frame)
-        .map_err(|error| format!("{method} returned malformed JSON: {error}"))?;
-    if response.id != 1 {
-        return Err(format!("{method} returned the wrong response id").into());
-    }
-    if let Some(error) = response.error {
-        return Err(format!("{method} {}: {}", error.code, error.message).into());
-    }
-    response
-        .result
-        .ok_or_else(|| format!("{method} returned no result").into())
+async fn open_client(sock: &Path) -> Result<AsyncClient, ClientError> {
+    AsyncClient::connect(sock, crate::action_io::OPEN_TIMEOUT).await
 }
 
 /// The startup reconciliation, in the one order that can be right.
@@ -551,100 +451,31 @@ fn broken_words(cause: &str) -> String {
 }
 
 async fn subscribe_loop(tx: &mpsc::Sender<UiMsg>, sock: &Path) -> Result<(), String> {
-    let opened = tokio::time::timeout(crate::action_io::OPEN_TIMEOUT, subscribe_open(sock))
-        .await
-        .map_err(|_| {
-            format!(
-                "no connection within {}s",
-                crate::action_io::OPEN_TIMEOUT.as_secs()
-            )
-        })??;
-    let (mut frames, mut w, hello) = opened;
+    let mut client = open_client(sock).await.map_err(client_words)?;
     // Hello first (S2). The protocol remains tolerant, but build drift is
     // persistent UI health rather than a warning lost before raw mode starts.
     if tx
         .send(UiMsg::BuildHealth(crate::health::BuildHealth::from_hello(
-            &hello,
+            client.hello(),
         )))
         .await
         .is_err()
     {
         return Ok(());
     }
-    w.write_all(b"{\"id\":1,\"method\":\"events.subscribe\",\"params\":{}}\n")
+    client
+        .subscribe(serde_json::json!({}), crate::action_io::ANSWER_TIMEOUT)
         .await
-        .map_err(|e| e.to_string())?;
-    tokio::time::timeout(crate::action_io::ANSWER_TIMEOUT, subscribe_ack(&mut frames))
-        .await
-        .map_err(|_| {
-            format!(
-                "events.subscribe did not answer within {}s",
-                crate::action_io::ANSWER_TIMEOUT.as_secs()
-            )
-        })??;
+        .map_err(client_words)?;
     if tx.send(UiMsg::Subscribed).await.is_err() {
         return Ok(());
     }
-    while let Some(frame) = frames.next_frame().await.map_err(|e| e.to_string())? {
-        let ev: Event = serde_json::from_slice(&frame)
-            .map_err(|error| format!("malformed event frame: {error}"))?;
-        if !forward_event(tx, ev).await? {
+    loop {
+        let frame = client.next_event().await.map_err(client_words)?;
+        if !forward_event(tx, frame.event).await? {
             return Ok(());
         }
     }
-    Ok(())
-}
-
-async fn subscribe_open(
-    sock: &Path,
-) -> Result<
-    (
-        FrameReader<tokio::net::unix::OwnedReadHalf>,
-        tokio::net::unix::OwnedWriteHalf,
-        cyclops_proto::Hello,
-    ),
-    String,
-> {
-    let stream = UnixStream::connect(sock).await.map_err(connect_words)?;
-    let (r, w) = stream.into_split();
-    let mut frames = FrameReader::new(r);
-    let frame = frames
-        .next_frame()
-        .await
-        .map_err(|error| format!("hello: {error}"))?
-        .ok_or_else(|| "the connection closed before hello".to_string())?;
-    let hello = serde_json::from_slice(&frame).map_err(|_| "not a cyclops daemon".to_string())?;
-    Ok((frames, w, hello))
-}
-
-async fn subscribe_ack(
-    frames: &mut FrameReader<tokio::net::unix::OwnedReadHalf>,
-) -> Result<(), String> {
-    let frame = frames
-        .next_frame()
-        .await
-        .map_err(|error| format!("events.subscribe: {error}"))?
-        .ok_or_else(|| "the connection closed before the subscribe acknowledgement".to_string())?;
-    let response: cyclops_proto::Response = serde_json::from_slice(&frame)
-        .map_err(|error| format!("events.subscribe returned malformed JSON: {error}"))?;
-    if response.id != 1 {
-        return Err("events.subscribe returned the wrong response id".into());
-    }
-    if let Some(error) = response.error {
-        return Err(format!(
-            "events.subscribe {}: {}",
-            error.code, error.message
-        ));
-    }
-    if response
-        .result
-        .as_ref()
-        .and_then(|result| result.get("subscribed"))
-        != Some(&Value::Bool(true))
-    {
-        return Err("events.subscribe returned no acknowledgement".into());
-    }
-    Ok(())
 }
 
 /// Forward one typed event. Invalidation edges wake the queue but never
@@ -674,24 +505,21 @@ async fn forward_event(tx: &mpsc::Sender<UiMsg>, ev: Event) -> Result<bool, Stri
 /// the deliveries still waiting on a human. A failed or malformed answer is
 /// visible because it changes the scope and freshness of the read model.
 async fn status_seed(sock: &Path) -> Result<StatusSeed, UiError> {
-    let open = tokio::time::timeout(crate::action_io::OPEN_TIMEOUT, snapshot_open(sock));
-    let (mut frames, mut w) = match open.await {
-        Ok(opened) => opened?,
-        Err(_) => return Err("status connection timed out before hello".into()),
-    };
+    let mut client = open_client(sock).await?;
 
     // Any surface that shows the eye must ask for the delivery half; it
     // is half the rule (cyclops_proto::attention). open_deliveries is an
     // additive param: a daemon that predates it ignores it and answers
     // without the field, which decodes as an empty backlog. Tolerant
     // protocol, both directions.
-    w.write_all(b"{\"id\":1,\"method\":\"status\",\"params\":{\"open_deliveries\":true}}\n")
-        .await?;
-    let frame = tokio::time::timeout(crate::action_io::ANSWER_TIMEOUT, frames.next_frame())
+    let result = client
+        .request(
+            "status",
+            serde_json::json!({"open_deliveries": true}),
+            crate::action_io::ANSWER_TIMEOUT,
+        )
         .await
-        .map_err(|_| "status answer timed out")??
-        .ok_or("status connection closed early")?;
-    let result = response_result(&frame, "status")?;
+        .map_err(|error| -> UiError { Box::new(error) })?;
     let status: StatusResult = serde_json::from_value(result)?;
     let status_items = status
         .sessions
@@ -981,12 +809,10 @@ fn next_ledger_frame(reader: &mut impl std::io::BufRead) -> std::io::Result<Opti
 /// The sentence is cyclops_proto's, not a copy of it. A copy lived here
 /// and would have gone on naming `cyclopsd &` after `cyclops start` took
 /// over starting the daemon.
-fn connect_words(e: std::io::Error) -> String {
-    match e.kind() {
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
-            cyclops_proto::NOT_RUNNING.to_string()
-        }
-        _ => e.to_string(),
+fn client_words(error: ClientError) -> String {
+    match error {
+        ClientError::NotRunning(_) => cyclops_proto::NOT_RUNNING.to_string(),
+        other => other.cause(),
     }
 }
 
@@ -995,10 +821,11 @@ mod tests {
     use super::*;
     use crate::messages::RefreshGate;
     use crate::stream::EntryKind;
+    use serde_json::Value;
     use std::io::Write as _;
     use std::str::FromStr;
     use std::time::Duration;
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
     /// A real greeting; the reader rejects anything else.

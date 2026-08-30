@@ -13,20 +13,20 @@ preserved behavior, stop conditions, and rollback requirements.
 
 ## Current milestone
 
-Milestone 1 runs on **beta/fix/frame-contract**. It implements only the bounded
-official daemon frame contract shared by the protocol, daemon server, blocking
-CLI, stream UI, and workspace clients. The documentation authority repair was
-merged first in PR #101.
+Milestone 3 runs on **beta/refactor/workspace-messaging**. It places one current
+durable operation family behind an internal `WorkspaceMessaging` Interface.
+Milestone 2 consolidated official transport semantics in PR #104. Milestone 1
+merged in PR #103 after the documentation authority repair in PR #101.
 
 Exit evidence:
 
-- every official ingress and egress uses the shared 1,048,576-byte JSON-object
-  limit with the newline excluded;
-- oversized requests are rejected before request bytes are written;
-- oversized daemon ingress is dropped before dispatch and oversized egress is
-  never emitted;
-- historical oversized journal rows remain readable and unchanged; and
-- focused frame tests and all required repository gates pass.
+- one current durable operation family enters through the internal
+  `WorkspaceMessaging` Interface;
+- its caller loses journal, projection, worker, and post-commit scheduling
+  knowledge;
+- the current durable trace remains byte- and outcome-equivalent;
+- no crate is extracted; and
+- focused boundary tests and all required repository gates pass.
 
 ## Milestone queue
 
@@ -71,17 +71,18 @@ provides measurable isolation, and the operator separately approves it.
   performance, migration, and user-journey audits before the final pull request
   from **beta/messaging-rework** into `main`.
 
-## Milestone 1 session boundary
+## Milestone 3 session boundary
 
-Start a fresh implementation session after the documentation pull request is
-accepted. Use this scope:
+Use this scope:
 
-> Implement only Milestone 1 from the approved Messaging Refactor Charter: the
-> end-to-end bounded official daemon frame contract. Do not begin Daemon Client
-> consolidation, WorkspaceMessaging extraction, crate extraction, UI redesign,
-> CI restructuring, legacy deletion, MCP work, or later milestones. Preserve
-> historical replay and honest uncertainty. Stop if any charter stop condition
-> is encountered.
+> Implement only Milestone 3 from the approved Messaging Refactor Charter: put
+> one current durable operation family behind an internal WorkspaceMessaging
+> Interface. Prove that the caller loses journal, projection, worker, and
+> post-commit scheduling knowledge while the durable trace stays byte- and
+> outcome-equivalent. Do not extract a crate or begin observation separation,
+> legacy quarantine, presentation work, UI redesign, broad CI restructuring,
+> MCP work, or later milestones. Preserve historical replay and honest
+> uncertainty. Stop if any charter stop condition is encountered.
 
 ## Release naming gate
 

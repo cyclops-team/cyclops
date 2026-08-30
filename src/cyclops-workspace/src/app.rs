@@ -34,6 +34,9 @@ use cyclops_tmux::sizing::ClientIdentity;
 use cyclops_tmux::{
     ControlClient, ControlConfig, InputCapacity, Notification, NotificationReceiver, TmuxError,
 };
+use cyclops_ui::daemon_client::{
+    BlockingClient, ClientError, DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT,
+};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::Rect;
 use ratatui::Terminal;
@@ -2009,52 +2012,6 @@ enum SubscribeEnd {
     SinkGone,
 }
 
-enum BoundedLine {
-    Eof,
-    Complete,
-    TooLong,
-}
-
-/// Read one blocking socket line without allocating past the consumer's
-/// frame envelope. The caller closes the connection on `TooLong`, so there is
-/// no need to retain or drain the rest of that frame.
-fn read_bounded_line(
-    reader: &mut impl std::io::BufRead,
-    line: &mut Vec<u8>,
-) -> std::io::Result<BoundedLine> {
-    line.clear();
-    loop {
-        let (take, complete) = {
-            let available = reader.fill_buf()?;
-            if available.is_empty() {
-                if line.is_empty() {
-                    return Ok(BoundedLine::Eof);
-                }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "daemon frame ended without a newline",
-                ));
-            }
-            let newline = available
-                .iter()
-                .position(|byte| *byte == cyclops_proto::FrameContract::DELIMITER);
-            let take = newline.unwrap_or(available.len());
-            if matches!(
-                cyclops_proto::FrameContract::classify_json_bytes(line.len().saturating_add(take),),
-                cyclops_proto::FrameSize::TooLarge
-            ) {
-                return Ok(BoundedLine::TooLong);
-            }
-            line.extend_from_slice(&available[..take]);
-            (take + usize::from(newline.is_some()), newline.is_some())
-        };
-        reader.consume(take);
-        if complete {
-            return Ok(BoundedLine::Complete);
-        }
-    }
-}
-
 /// The forwarder's whole life: subscribe, forward until the connection
 /// ends, reconnect on a bounded backoff, repeat. Unlike the tmux link
 /// there is no give-up state: the workspace works without its daemon and
@@ -2131,61 +2088,30 @@ fn subscribe_decoration_once(
     control_tx: &mpsc::Sender<AppMsg>,
     stream_tx: &mpsc::Sender<AppMsg>,
 ) -> SubscribeEnd {
-    use std::io::Write;
     let socket = home.join(cyclops_proto::SOCK_NAME);
-    let Ok(stream) = std::os::unix::net::UnixStream::connect(socket) else {
-        return SubscribeEnd::ConnectFailed;
-    };
-    let mut reader = std::io::BufReader::new(stream);
-    let mut hello = Vec::new();
-    if !matches!(
-        read_bounded_line(&mut reader, &mut hello),
-        Ok(BoundedLine::Complete)
-    ) {
-        log_err(home, &"cyclopsd sent an incomplete or oversized hello");
-        return SubscribeEnd::ConnectFailed;
-    }
-    if let Err(error) = serde_json::from_slice::<cyclops_proto::Hello>(&hello) {
-        log_err(home, &format!("cyclopsd sent an unreadable hello: {error}"));
-        return SubscribeEnd::ConnectFailed;
-    }
-    if reader
-        .get_mut()
-        .write_all(b"{\"id\":1,\"method\":\"events.subscribe\",\"params\":{}}\n")
-        .is_err()
-    {
-        return SubscribeEnd::ConnectFailed;
-    }
-    let mut acknowledgement = Vec::new();
-    if !matches!(
-        read_bounded_line(&mut reader, &mut acknowledgement),
-        Ok(BoundedLine::Complete)
-    ) {
+    let mut client =
+        match BlockingClient::connect_path(socket, DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT) {
+            Ok(client) => client,
+            Err(ClientError::NotRunning(_)) => return SubscribeEnd::ConnectFailed,
+            Err(error) => {
+                log_err(
+                    home,
+                    &format!("cyclopsd event subscription could not connect: {error}"),
+                );
+                return SubscribeEnd::ConnectFailed;
+            }
+        };
+    if let Err(error) = client.subscribe(serde_json::json!({})) {
         log_err(
             home,
-            &"cyclopsd sent an incomplete or oversized subscription acknowledgement",
+            &format!("cyclopsd did not establish the event subscription: {error}"),
         );
         return SubscribeEnd::ConnectFailed;
     }
-    let acknowledgement = match serde_json::from_slice::<serde_json::Value>(&acknowledgement) {
-        Ok(value) => value,
-        Err(error) => {
-            log_err(
-                home,
-                &format!("cyclopsd sent an unreadable subscription acknowledgement: {error}"),
-            );
-            return SubscribeEnd::ConnectFailed;
-        }
-    };
-    if acknowledgement
-        .get("id")
-        .and_then(serde_json::Value::as_u64)
-        != Some(1)
-        || acknowledgement.pointer("/result/subscribed") != Some(&serde_json::Value::Bool(true))
-    {
-        log_err(home, &"cyclopsd did not acknowledge the event subscription");
-        return SubscribeEnd::ConnectFailed;
-    }
+    // Subscriptions are idle by design. Request deadlines protect the
+    // handshake above; after acknowledgement, EOF or a malformed frame is the
+    // evidence of a gap, not the absence of traffic for five seconds.
+    client.clear_read_timeout();
     // Subscribed. Ask the app to resync before any event arrives on this
     // connection: everything that changed while nothing was subscribed
     // produced no event, so without this a state flip during the outage
@@ -2200,61 +2126,31 @@ fn subscribe_decoration_once(
     let (sig_tx, sig_rx) = std::sync::mpsc::sync_channel::<DecorationSignal>(1);
     let stream_tx = stream_tx.clone();
     std::thread::spawn(move || loop {
-        let mut line = Vec::new();
-        match read_bounded_line(&mut reader, &mut line) {
-            Ok(BoundedLine::Eof) => {
-                report_stream_gap(&stream_tx, &sig_tx, "daemon event subscription closed");
-                return;
-            }
+        let ev = match client.next_event() {
+            Ok(frame) => frame.event,
             Err(error) => {
-                report_stream_gap(
-                    &stream_tx,
-                    &sig_tx,
-                    format!("daemon event read failed: {error}"),
-                );
-                return;
-            }
-            Ok(BoundedLine::TooLong) => {
-                report_stream_gap(&stream_tx, &sig_tx, copy::frame_too_large("daemon event"));
-                return;
-            }
-            Ok(BoundedLine::Complete) => {}
-        }
-        let value = match serde_json::from_slice::<serde_json::Value>(&line) {
-            Ok(value) => value,
-            Err(error) => {
-                report_stream_gap(
-                    &stream_tx,
-                    &sig_tx,
-                    format!("malformed daemon event JSON: {error}"),
-                );
+                let why = match &error {
+                    ClientError::Gap(cause) if cause == "the connection closed" => {
+                        "daemon event subscription closed".to_string()
+                    }
+                    ClientError::Gap(cause) if cause.starts_with("malformed event frame: ") => {
+                        cause.replacen(
+                            "malformed event frame: ",
+                            "malformed daemon event JSON: ",
+                            1,
+                        )
+                    }
+                    _ => error.cause(),
+                };
+                report_stream_gap(&stream_tx, &sig_tx, why);
                 return;
             }
         };
-        if value.get("event").is_none() {
-            report_stream_gap(
-                &stream_tx,
-                &sig_tx,
-                "daemon event stream sent a non-event record",
-            );
-            return;
-        }
         // E2: normalize this same line onto the shared stream model
         // before the decoration signal below. Cheap (no IO) and
         // per-event on purpose. It must never wait for or extend the
         // coalescing deadline that follows. An unreadable event closes
         // this subscription so the app reconciles before reconnecting.
-        let ev = match serde_json::from_value::<cyclops_proto::Event>(value) {
-            Ok(event) => event,
-            Err(error) => {
-                report_stream_gap(
-                    &stream_tx,
-                    &sig_tx,
-                    format!("unreadable daemon event: {error}"),
-                );
-                return;
-            }
-        };
         // A theme reload is not a fact about the record; the CLI stream
         // drops it the same way (`cyclops_ui`'s own subscribe loop). It
         // still becomes a wake-only `ThemeChanged`. Every other vocabulary,
@@ -10272,28 +10168,6 @@ mod tests {
         ));
         drop(rx);
         assert!(!signal_decoration_event(&tx));
-    }
-
-    #[test]
-    fn decoration_frames_stop_before_allocating_past_the_limit() {
-        let mut exact = vec![b'x'; cyclops_proto::FrameContract::MAX_JSON_BYTES];
-        exact.push(cyclops_proto::FrameContract::DELIMITER);
-        let mut reader = std::io::BufReader::new(std::io::Cursor::new(exact));
-        let mut line = Vec::new();
-        assert!(matches!(
-            read_bounded_line(&mut reader, &mut line).unwrap(),
-            BoundedLine::Complete
-        ));
-        assert_eq!(line.len(), cyclops_proto::FrameContract::MAX_JSON_BYTES);
-
-        let mut oversized = vec![b'x'; cyclops_proto::FrameContract::MAX_JSON_BYTES + 1];
-        oversized.push(cyclops_proto::FrameContract::DELIMITER);
-        let mut reader = std::io::BufReader::new(std::io::Cursor::new(oversized));
-        assert!(matches!(
-            read_bounded_line(&mut reader, &mut line).unwrap(),
-            BoundedLine::TooLong
-        ));
-        assert!(line.len() <= cyclops_proto::FrameContract::MAX_JSON_BYTES);
     }
 
     /// L1: a burst of daemon events must collapse to exactly one status

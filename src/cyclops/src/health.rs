@@ -971,7 +971,7 @@ fn inspect_daemon(home: &Path, state: &StateReport) -> DaemonReport {
 
     let mut client = match Client::connect() {
         Ok(client) => client,
-        Err(ClientError::NotRunning) => return daemon_stale_socket(),
+        Err(ClientError::NotRunning(_)) => return daemon_stale_socket(),
         Err(error) => return daemon_unproven(crate::copy::client_error(&error, None)),
     };
     let hello = client.hello().clone();

@@ -22,6 +22,7 @@ use crate::client::ClientError;
 use crate::copy;
 use cyclops_proto::StateReportParams;
 use cyclops_state::StateRoot;
+use cyclops_ui::daemon_client::BlockingHello;
 
 /// Optional sequence namespace for label-free generated hook commands.
 const AGENT_ENV: &str = "CYCLOPS_AGENT";
@@ -144,8 +145,8 @@ fn send_once(params: &Value, deadline: Instant) -> Result<Outcome, String> {
     let answer = connect_hello_request(
         deadline,
         Instant::now,
-        Client::connect_stream,
-        Client::from_stream,
+        Client::connect_for_hello,
+        BlockingHello::receive,
         |mut c, read| {
             c.set_read_timeout(read);
             c.request("agent.state.report", params.clone())
@@ -682,7 +683,7 @@ mod tests {
         let result = connect_hello_request(
             deadline,
             move || ticks.next().expect("one clock read"),
-            |_| Err::<(), ClientError>(ClientError::NotRunning),
+            |_| Err::<(), ClientError>(ClientError::NotRunning("missing".into())),
             |(), _| {
                 later_started.set(true);
                 Ok::<(), ClientError>(())
@@ -694,7 +695,7 @@ mod tests {
         );
         assert!(!later_started.get(), "a failed connect ends the sequence");
         assert!(
-            matches!(result, Ok(Err(ClientError::NotRunning))),
+            matches!(result, Ok(Err(ClientError::NotRunning(_)))),
             "a connect failure is classified, not budgeted"
         );
     }

@@ -2419,19 +2419,27 @@ fn prove_candidate_replay(
     let socket = probe_home.join(cyclops_proto::SOCK_NAME);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let hello = loop {
-        if let Ok(stream) = std::os::unix::net::UnixStream::connect(&socket) {
-            let client =
-                crate::client::Client::from_stream(stream, std::time::Duration::from_secs(2))
-                    .map_err(|error| match error {
-                        crate::client::ClientError::InvalidHello(cause) => {
-                            format!("decode candidate hello: {cause}")
-                        }
-                        error => format!(
-                            "read candidate hello: {}",
-                            crate::copy::client_error(&error, None)
-                        ),
-                    })?;
-            break client.hello().clone();
+        match crate::client::Client::connect_path(
+            &socket,
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(2),
+        ) {
+            Ok(client) => break client.hello().clone(),
+            Err(
+                crate::client::ClientError::NotRunning(_)
+                | crate::client::ClientError::ConnectTimeout(_),
+            ) => {}
+            Err(error) => {
+                return Err(match error {
+                    crate::client::ClientError::InvalidHello(cause) => {
+                        format!("decode candidate hello: {cause}")
+                    }
+                    error => format!(
+                        "read candidate hello: {}",
+                        crate::copy::client_error(&error, None)
+                    ),
+                });
+            }
         }
         if let Some(status) = child
             .child_mut()
