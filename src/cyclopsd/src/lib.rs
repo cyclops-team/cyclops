@@ -126,9 +126,10 @@ const EVENT_BUFFER: usize = 8192;
 
 /// Commit all consequences of one pane observation before optional tmux chrome.
 ///
-/// The cache commit already happened in fusion. Durable messaging must follow
-/// it before the first presentation await so a stalled or cancelled border
-/// write cannot consume an immutable observation without recording it.
+/// The cache commit and any state event already happened in fusion. Returned
+/// delivery ACKs commit first, followed by ordered messaging observations,
+/// before the first presentation await. A stalled or cancelled border write
+/// therefore cannot consume any immutable post-commit evidence.
 async fn apply_pane_observation(
     inner: &Arc<Inner>,
     session_idx: usize,
@@ -136,7 +137,11 @@ async fn apply_pane_observation(
     pane_id: &str,
     observed: fusion::PaneObservation,
 ) -> Detection {
-    let (detection, messaging_observations, repaint, recompute_guard) = observed.into_parts();
+    let (detection, dispatch_acks, messaging_observations, repaint, recompute_guard) =
+        observed.into_parts();
+    for evidence in dispatch_acks {
+        apply_dispatch_ack_evidence(inner, evidence);
+    }
     for observation in messaging_observations {
         apply_messaging_observation(inner, observation);
     }
@@ -147,6 +152,22 @@ async fn apply_pane_observation(
     // complete durable-then-presentation sequence has finished.
     drop(recompute_guard);
     detection
+}
+
+/// Composition-root handoff from immutable pane evidence to the retained
+/// delivery ACK mechanism.
+fn apply_dispatch_ack_evidence(inner: &Arc<Inner>, evidence: fusion::PaneDispatchAckEvidence) {
+    let (session_idx, pane_id, reporter, reporter_manifest, turn, accepted_ms) =
+        evidence.into_parts();
+    delivery::confirm_dispatch_ack(
+        inner,
+        session_idx,
+        &pane_id,
+        reporter,
+        &reporter_manifest,
+        &turn,
+        accepted_ms,
+    );
 }
 
 /// Composition-root handoff from immutable pane evidence to durable messaging.
