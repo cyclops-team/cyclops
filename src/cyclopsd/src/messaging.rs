@@ -22,8 +22,8 @@ use tracing::{debug, error};
 use crate::delivery;
 use crate::mailbox::{
     AcceptResult, AttentionConsumptionSignal, AttentionResolutionStart, AttentionTarget,
-    ClaimOutcome, MailboxError, MailboxIdentity, MailboxSend, MailboxService, MailboxServiceError,
-    MessageStoreError, UnclaimedReminderQueue,
+    ClaimOutcome, ExactOwnedRecoveryAction, MailboxError, MailboxIdentity, MailboxSend,
+    MailboxService, MailboxServiceError, MessageStoreError, UnclaimedReminderQueue,
 };
 use crate::notification_adapter::NotificationContext;
 use crate::{Inner, PaneKey};
@@ -129,6 +129,52 @@ pub(crate) struct MessagingRouteEvidence {
     pub(crate) evidence_id: NotificationRouteEvidenceId,
 }
 
+/// Current pane evidence supplied to the body-free messaging status operation.
+///
+/// The status adapter observes these facts. It does not join them to durable
+/// notification records or decide recovery policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MessagingComposerObservation {
+    pub(crate) composer: cyclops_proto::ComposerState,
+    pub(crate) proof: cyclops_proto::ComposerProof,
+    pub(crate) reason: Option<String>,
+    pub(crate) detected_attempt: Option<NotificationAttemptId>,
+    pub(crate) detected_candidate_count: u32,
+    pub(crate) pane_root: Option<ProcessInstanceId>,
+    pub(crate) binding: Option<NotificationBinding>,
+}
+
+/// Finished body-free messaging decision copied onto one pane status row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MessagingComposerStatus {
+    pub(crate) composer: cyclops_proto::ComposerState,
+    pub(crate) proof: cyclops_proto::ComposerProof,
+    pub(crate) reason: Option<String>,
+    pub(crate) candidate_count: u32,
+    pub(crate) attempt: Option<NotificationAttemptId>,
+    pub(crate) notification_state: Option<NotificationState>,
+    pub(crate) message_state: Option<cyclops_proto::ComposerMessageState>,
+    pub(crate) next_action: Option<cyclops_proto::ComposerNextAction>,
+}
+
+/// Boot-local facts supplied by the daemon composition adapter.
+///
+/// WorkspaceMessaging asks for these named capabilities while it still owns
+/// the durable record. Callers never receive the record or recovery variant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MessagingComposerRuntimeFacts {
+    pub(crate) active_worker_owns: bool,
+    pub(crate) clear_supported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MessagingComposerCandidate {
+    record: NotificationRecord,
+    message_state: Option<cyclops_proto::ComposerMessageState>,
+    recovery_action: ExactOwnedRecoveryAction,
+    runtime: MessagingComposerRuntimeFacts,
+}
+
 /// One Module-owned decision for an elected exact-attention worker.
 ///
 /// The runtime adapter owns task execution. It does not inspect the mailbox
@@ -216,6 +262,8 @@ pub(crate) struct WorkspaceMessagingStatus {
     pub(crate) blocked_notifications_total: u64,
     unread_by_recipient: HashMap<RecipientKey, u64>,
     projection_readable: bool,
+    composer_candidates:
+        Option<HashMap<RecipientKey, HashMap<NotificationAttemptId, MessagingComposerCandidate>>>,
 }
 
 impl WorkspaceMessagingStatus {
@@ -226,6 +274,181 @@ impl WorkspaceMessagingStatus {
                 .copied()
                 .unwrap_or(0),
         )
+    }
+
+    /// Join one immutable pane observation to the durable composer barriers.
+    ///
+    /// This is the only operation that interprets candidate cardinality,
+    /// durable bindings, mailbox entry variants, recovery variants, or worker
+    /// ownership for status presentation.
+    pub(crate) fn composer_status(
+        &self,
+        recipient: Option<RecipientKey>,
+        observation: MessagingComposerObservation,
+    ) -> MessagingComposerStatus {
+        let mut status = MessagingComposerStatus {
+            composer: observation.composer,
+            proof: observation.proof,
+            reason: observation.reason,
+            candidate_count: observation.detected_candidate_count,
+            attempt: observation.detected_attempt,
+            notification_state: None,
+            message_state: None,
+            next_action: None,
+        };
+
+        if let Some(candidates) =
+            recipient.and_then(|recipient| self.composer_candidates.as_ref()?.get(&recipient))
+        {
+            status.candidate_count = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
+            status.attempt = if candidates.len() == 1 {
+                candidates.keys().next().copied()
+            } else {
+                None
+            };
+        }
+
+        let Some(attempt_id) = status.attempt else {
+            if status.candidate_count > 0 {
+                status.next_action = Some(cyclops_proto::ComposerNextAction::InspectMessages);
+            }
+            return status;
+        };
+
+        let candidate = recipient.and_then(|recipient| {
+            self.composer_candidates
+                .as_ref()?
+                .get(&recipient)?
+                .get(&attempt_id)
+        });
+        let Some(candidate) = candidate else {
+            // A retired or unreadable durable barrier cannot inherit a prior
+            // exact status stamp. Status is evidence, not authority.
+            status.composer = cyclops_proto::ComposerState::ComposerAmbiguous;
+            status.proof = cyclops_proto::ComposerProof::Unprovable;
+            status.next_action = Some(operator_composer_next_action(
+                status.notification_state,
+                true,
+            ));
+            return status;
+        };
+
+        status.notification_state = Some(candidate.record.state);
+        status.message_state = candidate.message_state;
+        let durable_binding_complete = candidate
+            .record
+            .binding
+            .as_ref()
+            .is_some_and(|binding| binding.pane_root.is_some() && binding.leader.is_some());
+        let binding_unprovable = observation.pane_root.is_none()
+            || observation.binding.is_none()
+            || !durable_binding_complete;
+        let binding_matches = recipient.is_some_and(|recipient| {
+            candidate.record.recipient == recipient
+                && observation.binding.as_ref().is_some_and(|binding| {
+                    binding.pane_root == observation.pane_root
+                        && candidate.record.binding.as_ref() == Some(binding)
+                })
+        });
+        if matches!(
+            status.composer,
+            cyclops_proto::ComposerState::CyclopsNotificationStaged
+                | cyclops_proto::ComposerState::CyclopsNotificationSubmitted
+        ) && !binding_matches
+        {
+            status.composer = cyclops_proto::ComposerState::ComposerAmbiguous;
+            if binding_unprovable {
+                status.proof = cyclops_proto::ComposerProof::Unprovable;
+                status.reason = Some("binding_unprovable".to_string());
+            } else {
+                status.proof = cyclops_proto::ComposerProof::Ambiguous;
+                status.reason = Some("binding_mismatch".to_string());
+            }
+            status.next_action = Some(operator_composer_next_action(
+                status.notification_state,
+                true,
+            ));
+            return status;
+        }
+
+        status.next_action = Some(composer_next_action(
+            status.composer,
+            candidate.record.state,
+            status.message_state,
+            candidate.recovery_action,
+            candidate.runtime,
+        ));
+        status
+    }
+}
+
+pub(crate) fn operator_composer_next_action(
+    notification: Option<NotificationState>,
+    has_exact_attempt: bool,
+) -> cyclops_proto::ComposerNextAction {
+    use cyclops_proto::ComposerNextAction;
+
+    match notification {
+        Some(NotificationState::AttentionRequired) if has_exact_attempt => {
+            ComposerNextAction::InspectAttention
+        }
+        Some(
+            NotificationState::Writing
+            | NotificationState::Staged
+            | NotificationState::Submitting
+            | NotificationState::Submitted
+            | NotificationState::Notified
+            | NotificationState::WithdrawnAfterStaging,
+        ) if has_exact_attempt => ComposerNextAction::CheckHealth,
+        _ => ComposerNextAction::InspectMessages,
+    }
+}
+
+fn composer_next_action(
+    composer: cyclops_proto::ComposerState,
+    notification: NotificationState,
+    message: Option<cyclops_proto::ComposerMessageState>,
+    recovery_action: ExactOwnedRecoveryAction,
+    runtime: MessagingComposerRuntimeFacts,
+) -> cyclops_proto::ComposerNextAction {
+    use cyclops_proto::{ComposerMessageState, ComposerNextAction, ComposerState};
+
+    let exact_composer = matches!(
+        composer,
+        ComposerState::CyclopsNotificationStaged | ComposerState::CyclopsNotificationSubmitted
+    );
+    if exact_composer && notification == NotificationState::AttentionRequired {
+        return match recovery_action {
+            ExactOwnedRecoveryAction::Submit => ComposerNextAction::AutomaticSubmit,
+            ExactOwnedRecoveryAction::Clear if runtime.clear_supported => {
+                ComposerNextAction::AutomaticReconcile
+            }
+            ExactOwnedRecoveryAction::Reconcile => ComposerNextAction::AutomaticReconcile,
+            ExactOwnedRecoveryAction::Ineligible
+            | ExactOwnedRecoveryAction::Clear
+            | ExactOwnedRecoveryAction::Inspect => ComposerNextAction::InspectAttention,
+        };
+    }
+    if !exact_composer || !runtime.active_worker_owns {
+        return operator_composer_next_action(Some(notification), true);
+    }
+    match (composer, notification, message) {
+        (
+            ComposerState::CyclopsNotificationStaged,
+            NotificationState::Staged,
+            Some(ComposerMessageState::Pending),
+        ) => ComposerNextAction::AutomaticSubmit,
+        (
+            ComposerState::CyclopsNotificationStaged,
+            NotificationState::Staged,
+            Some(ComposerMessageState::Claimed),
+        ) => ComposerNextAction::AutomaticReconcile,
+        (
+            ComposerState::CyclopsNotificationStaged | ComposerState::CyclopsNotificationSubmitted,
+            NotificationState::Submitting | NotificationState::Submitted,
+            _,
+        ) => ComposerNextAction::AutomaticReconcile,
+        _ => operator_composer_next_action(Some(notification), true),
     }
 }
 
@@ -251,6 +474,13 @@ pub(crate) trait WorkspaceMessagingEffects: Send + Sync {
         service: &MailboxService,
         recipient: RecipientKey,
     ) -> Result<Option<NotificationRoute>, MailboxServiceError>;
+
+    fn composer_runtime_facts(
+        &self,
+        recipient: RecipientKey,
+        attempt_id: NotificationAttemptId,
+        manifest: Option<&NotificationManifestId>,
+    ) -> MessagingComposerRuntimeFacts;
 
     fn settle_notification_claim(&self, attempt_id: NotificationAttemptId);
 
@@ -773,6 +1003,40 @@ impl WorkspaceMessaging {
             let blocked = service
                 .blocked_notification_snapshot(observed_at_ms, blocked_limit)
                 .unwrap_or_default();
+            let composer_candidates =
+                service
+                    .active_composer_notifications_snapshot()
+                    .ok()
+                    .map(|candidates| {
+                        let mut grouped = HashMap::new();
+                        for candidate in candidates {
+                            let runtime = messaging.effects.composer_runtime_facts(
+                                candidate.record.recipient,
+                                candidate.record.attempt_id,
+                                candidate
+                                    .record
+                                    .binding
+                                    .as_ref()
+                                    .map(|binding| &binding.manifest),
+                            );
+                            grouped
+                                .entry(candidate.record.recipient)
+                                .or_insert_with(HashMap::new)
+                                .insert(
+                                    candidate.record.attempt_id,
+                                    MessagingComposerCandidate {
+                                        record: candidate.record,
+                                        message_state: candidate
+                                            .entry_state
+                                            .as_ref()
+                                            .map(cyclops_proto::ComposerMessageState::from),
+                                        recovery_action: candidate.recovery_action,
+                                        runtime,
+                                    },
+                                );
+                        }
+                        grouped
+                    });
 
             WorkspaceMessagingStatus {
                 mailbox_routes,
@@ -782,6 +1046,7 @@ impl WorkspaceMessaging {
                 blocked_notifications_total: blocked.total,
                 unread_by_recipient,
                 projection_readable,
+                composer_candidates,
             }
         })
     }
@@ -2394,6 +2659,18 @@ mod tests {
             Ok(None)
         }
 
+        fn composer_runtime_facts(
+            &self,
+            _recipient: RecipientKey,
+            _attempt_id: NotificationAttemptId,
+            _manifest: Option<&NotificationManifestId>,
+        ) -> MessagingComposerRuntimeFacts {
+            MessagingComposerRuntimeFacts {
+                active_worker_owns: true,
+                clear_supported: true,
+            }
+        }
+
         fn settle_notification_claim(&self, attempt_id: NotificationAttemptId) {
             self.calls
                 .lock()
@@ -3258,6 +3535,244 @@ mod tests {
         );
         context.record_submitted().unwrap();
         context.record_notified().unwrap()
+    }
+
+    fn composer_runtime(
+        active_worker_owns: bool,
+        clear_supported: bool,
+    ) -> MessagingComposerRuntimeFacts {
+        MessagingComposerRuntimeFacts {
+            active_worker_owns,
+            clear_supported,
+        }
+    }
+
+    #[test]
+    fn workspace_messaging_owns_composer_recovery_policy() {
+        use cyclops_proto::{
+            ComposerMessageState, ComposerNextAction, ComposerState, NotificationState,
+        };
+
+        assert_eq!(
+            composer_next_action(
+                ComposerState::CyclopsNotificationStaged,
+                NotificationState::Staged,
+                Some(ComposerMessageState::Pending),
+                ExactOwnedRecoveryAction::Ineligible,
+                composer_runtime(true, false),
+            ),
+            ComposerNextAction::AutomaticSubmit
+        );
+        assert_eq!(
+            composer_next_action(
+                ComposerState::CyclopsNotificationStaged,
+                NotificationState::Staged,
+                Some(ComposerMessageState::Claimed),
+                ExactOwnedRecoveryAction::Ineligible,
+                composer_runtime(true, false),
+            ),
+            ComposerNextAction::AutomaticReconcile
+        );
+        assert_eq!(
+            composer_next_action(
+                ComposerState::CyclopsNotificationStaged,
+                NotificationState::AttentionRequired,
+                Some(ComposerMessageState::Pending),
+                ExactOwnedRecoveryAction::Submit,
+                composer_runtime(false, false),
+            ),
+            ComposerNextAction::AutomaticSubmit
+        );
+        assert_eq!(
+            composer_next_action(
+                ComposerState::CyclopsNotificationStaged,
+                NotificationState::AttentionRequired,
+                Some(ComposerMessageState::Pending),
+                ExactOwnedRecoveryAction::Inspect,
+                composer_runtime(false, false),
+            ),
+            ComposerNextAction::InspectAttention
+        );
+        assert_eq!(
+            composer_next_action(
+                ComposerState::CyclopsNotificationStaged,
+                NotificationState::AttentionRequired,
+                Some(ComposerMessageState::Claimed),
+                ExactOwnedRecoveryAction::Clear,
+                composer_runtime(false, true),
+            ),
+            ComposerNextAction::AutomaticReconcile
+        );
+        assert_eq!(
+            composer_next_action(
+                ComposerState::CyclopsNotificationStaged,
+                NotificationState::AttentionRequired,
+                Some(ComposerMessageState::Claimed),
+                ExactOwnedRecoveryAction::Clear,
+                composer_runtime(false, false),
+            ),
+            ComposerNextAction::InspectAttention
+        );
+        for message in [ComposerMessageState::Pending, ComposerMessageState::Claimed] {
+            assert_eq!(
+                composer_next_action(
+                    ComposerState::CyclopsNotificationStaged,
+                    NotificationState::Staged,
+                    Some(message),
+                    ExactOwnedRecoveryAction::Ineligible,
+                    composer_runtime(false, false),
+                ),
+                ComposerNextAction::CheckHealth,
+                "{message:?}"
+            );
+        }
+        for state in [NotificationState::Submitting, NotificationState::Submitted] {
+            assert_eq!(
+                composer_next_action(
+                    ComposerState::CyclopsNotificationStaged,
+                    state,
+                    Some(ComposerMessageState::Pending),
+                    ExactOwnedRecoveryAction::Ineligible,
+                    composer_runtime(true, false),
+                ),
+                ComposerNextAction::AutomaticReconcile,
+                "{state:?}"
+            );
+            assert_eq!(
+                composer_next_action(
+                    ComposerState::CyclopsNotificationStaged,
+                    state,
+                    Some(ComposerMessageState::Pending),
+                    ExactOwnedRecoveryAction::Ineligible,
+                    composer_runtime(false, false),
+                ),
+                ComposerNextAction::CheckHealth,
+                "{state:?}"
+            );
+        }
+        for (state, expected) in [
+            (NotificationState::Notified, ComposerNextAction::CheckHealth),
+            (
+                NotificationState::AttentionRequired,
+                ComposerNextAction::InspectAttention,
+            ),
+            (
+                NotificationState::WithdrawnAfterStaging,
+                ComposerNextAction::CheckHealth,
+            ),
+        ] {
+            assert_eq!(
+                composer_next_action(
+                    ComposerState::CyclopsNotificationStaged,
+                    state,
+                    Some(ComposerMessageState::Claimed),
+                    ExactOwnedRecoveryAction::Ineligible,
+                    composer_runtime(true, false),
+                ),
+                expected,
+                "{state:?}"
+            );
+        }
+        assert_eq!(
+            composer_next_action(
+                ComposerState::ComposerAmbiguous,
+                NotificationState::Staged,
+                Some(ComposerMessageState::Pending),
+                ExactOwnedRecoveryAction::Ineligible,
+                composer_runtime(true, false),
+            ),
+            ComposerNextAction::CheckHealth
+        );
+    }
+
+    #[test]
+    fn workspace_messaging_joins_composer_evidence_without_exposing_candidates() {
+        use cyclops_proto::{ComposerNextAction, ComposerProof, ComposerState};
+
+        let (_scratch, service, _events, recipient, _) =
+            mailbox_service("composer-status-ownership", 8);
+        send_to(&service, &["reviewer"], "Composer status");
+        let (_record, context) = prepare_context(&service, recipient);
+        context.record_gating().unwrap();
+        record_doorbell_write(&context);
+        context.record_staged().unwrap();
+        let active = service
+            .active_composer_notifications_snapshot()
+            .unwrap()
+            .pop()
+            .expect("one active composer candidate");
+        let attempt_id = active.record.attempt_id;
+        let binding = active.record.binding.clone().expect("complete binding");
+        let candidate = MessagingComposerCandidate {
+            record: active.record,
+            message_state: active
+                .entry_state
+                .as_ref()
+                .map(cyclops_proto::ComposerMessageState::from),
+            recovery_action: active.recovery_action,
+            runtime: composer_runtime(true, true),
+        };
+        let mut candidates = HashMap::new();
+        candidates.insert(attempt_id, candidate.clone());
+        let status = WorkspaceMessagingStatus {
+            composer_candidates: Some(HashMap::from([(recipient, candidates)])),
+            ..WorkspaceMessagingStatus::default()
+        };
+        let observation = MessagingComposerObservation {
+            composer: ComposerState::CyclopsNotificationStaged,
+            proof: ComposerProof::ExactNotification,
+            reason: None,
+            detected_attempt: Some(attempt_id),
+            detected_candidate_count: 1,
+            pane_root: binding.pane_root,
+            binding: Some(binding.clone()),
+        };
+
+        let exact = status.composer_status(Some(recipient), observation.clone());
+        assert_eq!(exact.attempt, Some(attempt_id));
+        assert_eq!(exact.candidate_count, 1);
+        assert_eq!(exact.next_action, Some(ComposerNextAction::AutomaticSubmit));
+
+        let mut mismatched = observation.clone();
+        mismatched.binding.as_mut().unwrap().manifest =
+            NotificationManifestId::new("other").unwrap();
+        let mismatched = status.composer_status(Some(recipient), mismatched);
+        assert_eq!(mismatched.composer, ComposerState::ComposerAmbiguous);
+        assert_eq!(mismatched.proof, ComposerProof::Ambiguous);
+        assert_eq!(mismatched.reason.as_deref(), Some("binding_mismatch"));
+
+        let mut unprovable = observation.clone();
+        unprovable.binding = None;
+        let unprovable = status.composer_status(Some(recipient), unprovable);
+        assert_eq!(unprovable.proof, ComposerProof::Unprovable);
+        assert_eq!(unprovable.reason.as_deref(), Some("binding_unprovable"));
+
+        let missing = WorkspaceMessagingStatus::default()
+            .composer_status(Some(recipient), observation.clone());
+        assert_eq!(missing.composer, ComposerState::ComposerAmbiguous);
+        assert_eq!(missing.proof, ComposerProof::Unprovable);
+        assert_eq!(
+            missing.next_action,
+            Some(ComposerNextAction::InspectMessages)
+        );
+
+        let second_attempt = NotificationAttemptId::generate();
+        let mut multiple = HashMap::new();
+        multiple.insert(attempt_id, candidate.clone());
+        let mut second = candidate;
+        second.record.attempt_id = second_attempt;
+        multiple.insert(second_attempt, second);
+        let status = WorkspaceMessagingStatus {
+            composer_candidates: Some(HashMap::from([(recipient, multiple)])),
+            ..WorkspaceMessagingStatus::default()
+        };
+        let multiple = status.composer_status(Some(recipient), observation);
+        assert_eq!(multiple.candidate_count, 2);
+        assert_eq!(multiple.attempt, None);
+        assert_eq!(
+            multiple.next_action,
+            Some(ComposerNextAction::InspectMessages)
+        );
     }
 
     #[test]

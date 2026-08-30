@@ -1592,35 +1592,21 @@ pub(crate) struct Binding {
     pub(crate) manifest: String,
 }
 
-/// Match a durable notification binding to one current process observation.
-///
-/// Older incomplete records remain replayable but cannot authorize composer
-/// ownership or a terminal action.
-pub(crate) fn notification_binding_matches(
-    record: &cyclops_proto::NotificationRecord,
-    recipient: RecipientKey,
-    current: &Binding,
-) -> bool {
-    let Some(expected) = record.binding.as_ref() else {
-        return false;
-    };
-    let Ok(pane_root) = ProcessInstanceId::new(current.pane_root.pid, current.pane_root.birth)
-    else {
-        return false;
-    };
-    let Ok(leader) = ProcessInstanceId::new(current.leader.pid, current.leader.birth) else {
-        return false;
-    };
-    let Ok(agent) = ProcessInstanceId::new(current.agent.pid, current.agent.birth) else {
-        return false;
-    };
-
-    expected.recipient == record.recipient
-        && recipient == record.recipient
-        && expected.pane_root == Some(pane_root)
-        && expected.leader == Some(leader)
-        && expected.agent == agent
-        && expected.manifest.as_str() == current.manifest
+impl Binding {
+    /// Convert one complete current process observation into immutable
+    /// content-free evidence for WorkspaceMessaging.
+    pub(crate) fn notification_evidence(
+        &self,
+        recipient: RecipientKey,
+    ) -> Option<cyclops_proto::NotificationBinding> {
+        Some(cyclops_proto::NotificationBinding {
+            recipient,
+            pane_root: Some(ProcessInstanceId::new(self.pane_root.pid, self.pane_root.birth).ok()?),
+            leader: Some(ProcessInstanceId::new(self.leader.pid, self.leader.birth).ok()?),
+            agent: ProcessInstanceId::new(self.agent.pid, self.agent.birth).ok()?,
+            manifest: cyclops_proto::NotificationManifestId::new(&self.manifest).ok()?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
