@@ -263,6 +263,7 @@ jobs:
       - name: Focused adapter evidence against tmux HEAD
         if: ${{ needs.classify.outputs.tmux_head == 'true' && steps.build_tmux_head.outcome == 'success' }}
         run: |
+          cargo build -p cyclops -p cyclopsd --bins
           cargo nextest run -p cyclops-tmux -p cyclops-workspace --no-fail-fast
           cargo test -p cyclopsd --test m0 m0_shadow_daemon_end_to_end -- --exact
       - name: tmux HEAD evidence unavailable
