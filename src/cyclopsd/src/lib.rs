@@ -2233,6 +2233,12 @@ impl Daemon {
         server::status_result(&self.inner, open_deliveries)
     }
 
+    /// In-process body-free stream backfill, identical to the projection the
+    /// `events.backfill` socket method serves.
+    pub fn stream_backfill(&self, limit: u32) -> cyclops_proto::StreamBackfillResult {
+        history::stream_backfill(&self.inner, cyclops_proto::StreamBackfillParams { limit })
+    }
+
     /// In-process workspace message send with an already-resolved sender.
     /// The socket path resolves the sender from peer credentials first.
     pub async fn msg_send(&self, from: &str, params: MsgSendParams) -> Result<Value, WireError> {
@@ -7023,6 +7029,74 @@ process_names = ["never"]
         assert_eq!(mailbox_recipient_for_origin(&inner, pane, stale_root), None);
         assert_eq!(service.list(old_key, None, None).unwrap().len(), 1);
         assert_eq!(service.list(new_key, None, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stream_backfill_is_body_free_bounded_and_daemon_owned() {
+        let inner = bare_inner("cyc-stream-backfill");
+        let ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/main.ndjson"),
+            &inner.boot_id,
+        )
+        .unwrap();
+        let slot = Arc::new(SessionSlot::new("main".into(), Arc::new(ledger)));
+        let mut oversized = daemon_line(
+            Kind::System,
+            "e-large".into(),
+            json!({
+                "event": "legacy_large_fact",
+                "padding": "x".repeat(cyclops_proto::FrameContract::MAX_JSON_BYTES),
+            }),
+        );
+        oversized.ts = 1;
+        slot.ledger.append(oversized).unwrap();
+        let mut legacy = daemon_line(
+            Kind::System,
+            "e-legacy".into(),
+            json!({
+                "event": "legacy_fact",
+                "body": "private legacy body",
+                "nested": {"body": "private nested body", "kept": true},
+            }),
+        );
+        legacy.ts = 2;
+        slot.ledger.append(legacy).unwrap();
+        let mut message = daemon_line(Kind::Msg, "m-kept".into(), Value::Null);
+        message.ts = 3;
+        message.from = "admin".into();
+        message.to = vec!["reviewer".into()];
+        message.subject = Some("inspect the durable seam".into());
+        message.body = Some("private body".into());
+        message.data = Some(json!({"internal_route": "%9"}));
+        slot.ledger.append(message).unwrap();
+        inner.sessions.lock().unwrap().push(slot);
+
+        let result =
+            history::stream_backfill(&inner, cyclops_proto::StreamBackfillParams { limit: 10 });
+        assert_eq!(result.lines.len(), 2);
+        assert_eq!(result.lines[0].id, "e-legacy");
+        assert_eq!(
+            result.lines[0].data.as_ref().unwrap()["nested"]["kept"],
+            true
+        );
+        assert_eq!(result.lines[1].id, "m-kept");
+        assert_eq!(result.lines[1].body, None);
+        assert_eq!(result.lines[1].data, None);
+        assert_eq!(result.max_seq, Some(3));
+        assert_eq!(
+            result.gap,
+            Some(cyclops_proto::StreamBackfillGap {
+                unreadable_sources: 0,
+                omitted_rows: 1,
+            })
+        );
+        let encoded = serde_json::to_vec(&result).unwrap();
+        assert!(encoded.len() < cyclops_proto::FrameContract::MAX_JSON_BYTES);
+        assert!(
+            !String::from_utf8(encoded).unwrap().contains("private"),
+            "a nested historical body crossed the presentation boundary"
+        );
     }
 
     #[test]

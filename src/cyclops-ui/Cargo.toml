@@ -2,21 +2,21 @@
 name = "cyclops-ui"
 version.workspace = true
 edition.workspace = true
-description = "The Cyclops stream UI: admin view, firehose, the eye. Reads the socket and the ledger only."
+description = "Cyclops stream presentation and terminal application over authorized daemon projections."
 
 [dependencies]
+cyclops-client.workspace = true
 cyclops-proto.workspace = true
 uuid.workspace = true
-cyclops-ledger.workspace = true
-cyclops-state.workspace = true
 cyclops-theme.workspace = true
-cyclops-tmux.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+cyclops-ledger.workspace = true
+cyclops-state.workspace = true
 tempfile = "3"
 # test-util only: lets the snapshot timeout test advance a paused clock
 # instead of actually waiting out ANSWER_TIMEOUT.

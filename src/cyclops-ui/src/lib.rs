@@ -12,7 +12,7 @@
 //! crates. The rendering itself is pure (frame.rs), so the backend is a
 //! thin seam.
 //!
-//! Zero polling: the subscription pushes, backfill reads once, the eye
+//! Zero polling: the subscription pushes, daemon backfill runs once, the eye
 //! arms a single one-shot timer per transition. No intervals anywhere.
 //!
 //! ## What it owns beyond the stream
@@ -37,16 +37,15 @@
 //!   accepts and asks it for the count.
 //! - Any color value. Every paint names a `cyclops-theme` token, and the
 //!   state-to-group mapping is that crate's too.
-//! - The daemon. It reads `events.subscribe`, one `status`, and whole
-//!   `messages.snapshot` answers after content-free change edges. Focus
-//!   jumps through `cyclops_tmux::focus_pane`, which is the only tmux call
-//!   anywhere near it.
+//! - The daemon. It reads `events.subscribe`, one `status`, one bounded
+//!   `events.backfill`, and whole
+//!   `messages.snapshot` answers after content-free change edges. Focus is a
+//!   target description handed to the launcher-provided terminal adapter.
 
 pub mod action_io;
 mod app;
 pub mod avatar;
 pub mod chat;
-pub mod daemon_client;
 mod data;
 pub mod detail;
 mod entry;
@@ -71,7 +70,7 @@ pub use chat::{
     TimelineItem,
 };
 pub use cyclops_proto::{Attention, AttentionItem, Eye, PaneSnapshot};
-pub use data::{read_backfill, read_backfill_report, BackfillReport, UiMsg};
+pub use data::{project_backfill, BackfillReport, StreamProjection, UiMsg};
 pub use detail::{Action, Back, Check, Detail, Draft, Loaded, Request, Stage, ThreadEntry};
 pub use frame::{build, messages_help};
 pub use health::BuildHealth;
@@ -116,6 +115,9 @@ pub struct UiOptions {
     pub to: Option<EndpointFilter>,
     /// Ledger tail length for backfill.
     pub backfill: usize,
+    /// Launcher-owned terminal focus effect. None keeps rows readable but
+    /// reports that focus is unavailable when the user asks for it.
+    pub focus: Option<data::FocusPane>,
 }
 
 impl UiOptions {
@@ -226,7 +228,7 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
         snapshots: snapshot_tx,
         actions: action_tx,
     };
-    let io = data::spawn_io(&sinks, home, opts.backfill);
+    let io = data::spawn_io(&sinks, home, opts.backfill, opts.focus);
     let (key_tx, mut key_rx) = mpsc::channel(INPUT_CAPACITY);
     input::spawn_reader(key_tx);
 
@@ -415,12 +417,16 @@ fn handle(
                 app.live(e);
             }
         }
-        UiMsg::Backfill { entries, max_seq } => {
-            // The startup order, and it is the whole correctness story:
-            // the replayed tail is history, the seed is the daemon's
-            // answer about now, and the live entries that queued behind
-            // them are newer than both.
-            let landed = intake.backfill(entries, max_seq);
+        UiMsg::StreamProjection(projection) => {
+            // One whole replacement per connection epoch. The replayed tail is
+            // history, the seed is the daemon's answer about now, and live
+            // entries buffered behind the subscription are newer than both.
+            app.clear_stream_projection();
+            *intake = Intake::new();
+            if let Some(seed) = projection.seed {
+                let _ = intake.status(seed);
+            }
+            let landed = intake.backfill(projection.entries, projection.max_seq);
             for e in landed.replayed {
                 app.replay(e);
             }
@@ -430,10 +436,8 @@ fn handle(
             for e in landed.live {
                 app.live(e);
             }
-        }
-        UiMsg::Status(seed) => {
-            if let Some(seed) = intake.status(seed) {
-                seed_status(app, *seed);
+            if let Some(warning) = projection.warning {
+                app.notice = Some(warning);
             }
         }
         // The acknowledgement closes the startup race: only now may the
@@ -801,6 +805,20 @@ mod tests {
     #[test]
     fn a_visible_stream_gap_requires_and_accepts_a_whole_snapshot_rebuild() {
         let mut app = App::new(Theme::none(), View::Messages, Filter::default());
+        app.live(Entry {
+            uid: 0,
+            ts: 1,
+            seq: None,
+            id: Some("stale-before-gap".into()),
+            kind: EntryKind::State {
+                target: "reviewer".into(),
+                recipient: None,
+                session_idx: 0,
+                pane_id: Some("%1".into()),
+                state: cyclops_proto::AgentState::BlockedPermission,
+            },
+        });
+        assert!(!app.is_empty());
         app.queue.replace(Snapshot {
             watermark: 17,
             rows: Vec::new(),
@@ -824,6 +842,33 @@ mod tests {
             "stale state still allowed actions"
         );
         assert_eq!(app.handle_key(Key::Char('R')), Some(Command::Reconnect));
+
+        assert!(!handle(
+            &mut app,
+            &mut intake,
+            &mut message_follower,
+            &mut tick_armed,
+            &focus,
+            UiMsg::StreamProjection(Box::new(StreamProjection {
+                seed: Some(Box::new(StatusSeed::default())),
+                entries: Vec::new(),
+                max_seq: None,
+                warning: None,
+            })),
+        ));
+        assert!(
+            app.is_empty(),
+            "the stale stream projection survived reconnect"
+        );
+        assert!(
+            intake.is_backfilled(),
+            "the replacement projection did not land"
+        );
+        assert_eq!(
+            app.queue.watermark(),
+            17,
+            "stream recovery replaced the independent mailbox snapshot"
+        );
 
         assert!(!handle(
             &mut app,

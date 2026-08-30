@@ -87,13 +87,12 @@ flowchart LR
     data["resources/manifests/ resources/themes/<br/>resources/layouts/ resources/hooks/"]
     cli -->|"one request per command,<br/>held open until the daemon answers"| sock
     ws -->|"control mode: panes,<br/>layout, send-keys"| tmux
-    ui -->|"events.subscribe once;<br/>messages.snapshot after change edges;<br/>never polls"| sock
+    ui -->|"events.subscribe once;<br/>events.backfill at startup;<br/>messages.snapshot after change edges;<br/>never polls"| sock
     hk -->|"the vendor CLI fired a turn edge:<br/>agent.state.report"| sock
     sock -->|"one JSON object per line,<br/>hello line first"| daemon
     daemon -->|"every tmux call the daemon makes"| ad
     ad -->|"one tmux -C control client<br/>per watched session"| tmux
     daemon -->|"each fact appended<br/>to its owning journal"| led
-    ui -.->|"tail once at startup,<br/>then ride the push"| led
     data -.->|"data, never code: manifests once at boot,<br/>themes re-read when a repaint is already due"| daemon
 ```
 
@@ -112,9 +111,10 @@ are a rule implemented in a crate that should not have known about it.
 | `cyclops-tmux` | **Every tmux invocation in the product.** Control mode, reply correlation, flow control, the zero-polling pane table, layout capture and apply, focus | What an agent is. It has never heard of manifests, deliveries, or the ledger |
 | `cyclops-ledger` | Append, fsync, monotonic seq, torn-tail sealing, the cursor reader | What a line MEANS. The schema is `cyclops-proto`'s |
 | `cyclops-theme` | The semantic token vocabulary, the state-to-group mapping, theme files, selection, the reload rule | Painting. It resolves a token to a color; renderers turn colors into escape sequences |
+| `cyclops-client` | Hello-first daemon connections, bounded frames, request correlation, timeouts, refusal decoding, post-write uncertainty, and stream-gap classification | Domain policy, presentation, reconnect policy, or journal reads |
 | `cyclopsd` | The daemon: fusion, durable mailboxes, the notification worker, the legacy direct-delivery pipeline, the socket server, sender identity, the adoption registry, pane border chrome, hooks self-test, and journal read side | tmux specifics (adapter), the wire schema (proto), the attention rule (proto). It renders exactly one string: the border format |
 | `cyclops` | The CLI: a thin NDJSON client plus rendering on the shared grid | Business logic. `cyclops list` asks `status` for the roster rather than holding a second one |
-| `cyclops-ui` | The Admin, Firehose, and Messages views, filters, backfill, and the terminal backend (`cyclops watch`) |
+| `cyclops-ui` | Pure stream and messaging presentation models plus the concrete terminal renderer for `cyclops watch` | Daemon framing, journal paths, or tmux effects; it consumes `cyclops-client`, `events.backfill`, and a launcher focus capability |
 | `cyclops-workspace` | The full-screen workspace (`cyclops`): sidebar, tabs, pane canvas, mouse | The attention rule (reads proto), tmux (one focus helper in the adapter) |
 | `cyclops-testrig` | The isolated tmux server and its teardown rule, in one place | Anything shipped. `publish = false`, test-only |
 

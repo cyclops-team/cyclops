@@ -20,9 +20,9 @@ use serde_json::{json, Value};
 use crate::client::Client;
 use crate::client::ClientError;
 use crate::copy;
+use cyclops_client::BlockingHello;
 use cyclops_proto::StateReportParams;
 use cyclops_state::StateRoot;
-use cyclops_ui::daemon_client::BlockingHello;
 
 /// Optional sequence namespace for label-free generated hook commands.
 const AGENT_ENV: &str = "CYCLOPS_AGENT";

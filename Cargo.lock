@@ -382,6 +382,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "cyclops-client",
  "cyclops-manifest",
  "cyclops-proto",
  "cyclops-state",
@@ -396,6 +397,16 @@ dependencies = [
  "sha2",
  "tempfile",
  "toml",
+]
+
+[[package]]
+name = "cyclops-client"
+version = "0.1.0"
+dependencies = [
+ "cyclops-proto",
+ "libc",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -478,11 +489,11 @@ dependencies = [
 name = "cyclops-ui"
 version = "0.1.0"
 dependencies = [
+ "cyclops-client",
  "cyclops-ledger",
  "cyclops-proto",
  "cyclops-state",
  "cyclops-theme",
- "cyclops-tmux",
  "libc",
  "serde",
  "serde_json",
@@ -497,6 +508,7 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "crossterm",
+ "cyclops-client",
  "cyclops-proto",
  "cyclops-state",
  "cyclops-testrig",

@@ -64,13 +64,14 @@ input, action, snapshot, and event work. Every continuously ready lane is
 served within four items. Ordered events apply backpressure when one frame
 batch is already waiting, so a slow terminal cannot grow the queue without
 bound. The stream UI limits each encoded or decoded daemon JSON object to
-1,048,576 bytes, excluding the newline, and bounds its direct ledger backfill.
-The daemon and blocking CLI do not yet enforce that same end-to-end contract;
-the approved bounded-frame milestone closes that gap. Malformed or oversized
+1,048,576 bytes, excluding the newline. The daemon-owned stream backfill fits
+that same envelope and reports any rows it must omit. Malformed or oversized
 live input becomes a visible connection gap, keeps the last good snapshot
-stale, and requires an explicit reconnect plus a fresh whole snapshot before
-actions are enabled. Snapshot reads, durable follow pages, and action answers
-use separate bounded lanes.
+stale, and requires an explicit reconnect. The acknowledged connection first
+replaces the stream from current status plus daemon-owned bounded backfill;
+the independent mailbox snapshot must also rebuild before actions are enabled.
+Snapshot reads, durable follow pages, and action answers use separate bounded
+lanes.
 
 `cyclops status` remains the compact live-pane view. A pane can be runtime
 idle while a notification is staged, so status prints a factual subrow when
@@ -302,14 +303,10 @@ Startup runs in one order:
 1. One `status` request, asking for the deliveries too. It names the
    sessions the daemon watches, where every pane stands, and the
    deliveries still waiting on a human.
-2. Backfill replays the tail of THOSE sessions' ledgers under
-   `~/.cyclops/ledger/` (default 200 lines, `--backfill N`). The reader
-   retains at most 10,000 entries and 16 MiB across at most 256 files. Any
-   malformed line or bound that truncates the requested history is shown as
-   a stream gap. A ledger
-   file from a session nobody watches is not replayed: the daemon counts
-   the sessions it watches, so a line from anywhere else would be one no
-   count owns and no event can ever clear.
+2. `events.backfill` asks the daemon for a body-free tail from its retained
+   session-history sources (default 200 lines, `--backfill N`). The client
+   receives facts, not journal paths. An unreadable source or a frame-size
+   truncation is shown as a stream gap.
 3. The three groups apply oldest claim first: the replayed tail, then
    the `status` answer, then the live entries that queued behind them.
    The answer outranks history that is older by construction, and a live
@@ -323,15 +320,17 @@ With one watched session, replayed lines and the live stream dedupe
 exactly by ledger seq; with several, a line landing in the exact startup
 window can show twice on screen (the record itself never duplicates).
 
-If the daemon does not answer, the backfill falls back to up to 256 ledger
-files on disk so the screen is not empty, and nothing is counted. Any omitted
-files are reported as a stream gap. A
-daemon that predates the open-delivery field answers without it: the eye
+If the daemon does not answer, both startup projections are unavailable and
+the UI reports the gap instead of opening storage behind the daemon. Use
+`cyclops history` for the durable record. A daemon that predates the
+open-delivery field answers without it: the eye
 then counts blocked panes plus whatever the live push reports, and
 misses a delivery that parked before the UI started.
 
 If the connection dies later, the full screen keeps what it has and the
-header says `connection lost`.
+header says `connection lost`. An explicit reconnect replaces that projection
+from the daemon before live events resume; it does not pretend the ephemeral
+subscription retained the gap.
 
 ## Plain mode
 

@@ -9,7 +9,7 @@
 //! second, and both should read this module rather than keep a private
 //! copy of any of the five things it owns:
 //!
-//! - initial backfill and live `events.subscribe` ordering ([`Intake`]);
+//! - connection-epoch backfill and live `events.subscribe` ordering ([`Intake`]);
 //! - entry normalization and resolution rows ([`Entry::from_event`],
 //!   [`Entry::from_ledger`], [`Entry::cleared`] — the append-only second
 //!   line an alarm gets when it ends, `docs/development/INVARIANTS.md` rule 8);
@@ -25,7 +25,7 @@
 //! attention register (`cyclops_proto::attention`), and the uid counter,
 //! and its three verbs are the only way anything enters it — [`Record::
 //! replay`] for a line from history, [`Record::live`] for the daemon's
-//! push, [`Record::seed`] for the one-time startup reconciliation. A
+//! push, [`Record::seed`] for an authoritative epoch reconciliation. A
 //! renderer's own UI state (scrolling, selection, a sidebar, key
 //! bindings) stays out of it; `App` in app.rs holds one and delegates.
 
@@ -40,7 +40,7 @@ use serde_json::Value;
 
 use crate::grid;
 
-/// The one-shot startup reconciliation: which sessions the daemon watches,
+/// One authoritative connection-epoch reconciliation: which sessions the daemon watches,
 /// where every pane stands right now, and every delivery it still counts
 /// as needing a human.
 ///
@@ -905,7 +905,7 @@ pub struct Backfilled {
 /// Three verbs are the only way anything enters it, one per source, which
 /// is what lets [`Record::admits`] answer for a line without asking what
 /// produced it: [`Record::replay`] for history, [`Record::live`] for the
-/// daemon's push, [`Record::seed`] for the one-time startup reconciliation.
+/// daemon's push, [`Record::seed`] for an authoritative epoch reconciliation.
 /// What needs a human is NOT decided anywhere else: the register and the
 /// rule live in `cyclops_proto::attention`, and this only ever feeds it
 /// the daemon's snapshot and live events, never a replayed line

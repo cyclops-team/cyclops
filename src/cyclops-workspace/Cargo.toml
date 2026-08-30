@@ -6,6 +6,7 @@ description = "Cyclops terminal workspace: pane VT runtimes and the full-screen 
 
 [dependencies]
 alacritty_terminal = "0.26"
+cyclops-client.workspace = true
 cyclops-proto.workspace = true
 cyclops-state.workspace = true
 cyclops-theme.workspace = true

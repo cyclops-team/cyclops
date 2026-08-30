@@ -8,8 +8,8 @@
 use std::path::Path;
 use std::time::Duration;
 
+use cyclops_client::{BlockingClient, Certainty, ClientError};
 use cyclops_proto::{PaneStatus, StatusParams, StatusResult, SOCK_NAME};
-use cyclops_ui::daemon_client::{BlockingClient, Certainty, ClientError};
 use serde_json::{json, Value};
 
 const IO_TIMEOUT: Duration = Duration::from_millis(250);
@@ -48,6 +48,16 @@ fn connect_with(home: &Path, timeout: Duration) -> Result<BlockingClient, String
 /// safer than sharing the daemon subscription's stream.
 pub(crate) fn request(home: &Path, method: &str, params: Value) -> Result<Value, String> {
     exchange(&mut connect(home)?, method, params)
+}
+
+pub(crate) fn stream_backfill(
+    home: &Path,
+    limit: usize,
+) -> Result<cyclops_proto::StreamBackfillResult, String> {
+    let limit = u32::try_from(limit).unwrap_or(u32::MAX);
+    let value = request(home, "events.backfill", json!({"limit": limit}))?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("cyclopsd sent an unreadable stream backfill: {error}"))
 }
 
 pub(crate) fn force_submit_settings(

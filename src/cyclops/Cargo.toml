@@ -14,6 +14,7 @@ cyclops-testrig.workspace = true
 tempfile = "3"
 
 [dependencies]
+cyclops-client.workspace = true
 cyclops-proto.workspace = true
 cyclops-state.workspace = true
 # The CLI ships the detection manifests as text and seeds them. It reads

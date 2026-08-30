@@ -625,9 +625,66 @@ pub struct SubscribeParams {
     /// Event name prefixes to receive; empty means everything.
     #[serde(default)]
     pub kinds: Vec<String>,
-    /// Replay ledger-backed events after this seq before going live.
+    /// Retained compatibility input. Subscriptions are ephemeral and never
+    /// replay; durable recovery uses a snapshot or a domain follow cursor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<u64>,
+}
+
+fn default_stream_backfill_limit() -> u32 {
+    200
+}
+
+/// One bounded daemon-owned history projection for the event stream.
+///
+/// This is not an event-subscription cursor. It is a one-shot authorized
+/// snapshot of presentable compatibility facts; live progress still arrives
+/// through `events.subscribe`, while durable mailbox progress uses
+/// `messages.follow`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamBackfillParams {
+    #[serde(default = "default_stream_backfill_limit")]
+    pub limit: u32,
+}
+
+impl Default for StreamBackfillParams {
+    fn default() -> Self {
+        Self {
+            limit: default_stream_backfill_limit(),
+        }
+    }
+}
+
+/// Explicit loss facts for a bounded stream-history projection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamBackfillGap {
+    /// Retained journal sources that could not be read whole.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub unreadable_sources: u32,
+    /// Rows inside the requested tail omitted by an internal item or frame-size bound.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub omitted_rows: u64,
+}
+
+impl StreamBackfillGap {
+    pub fn is_empty(&self) -> bool {
+        self.unreadable_sources == 0 && self.omitted_rows == 0
+    }
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+/// Body-free session-history rows used to seed an event-stream presentation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamBackfillResult {
+    pub lines: Vec<crate::ledger::LedgerLine>,
+    /// Highest retained seq only when one journal source supplied the page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap: Option<StreamBackfillGap>,
 }
 
 /// `workspace_ui.get` params. Additive; older daemons omit the method.

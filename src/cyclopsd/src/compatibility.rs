@@ -46,6 +46,13 @@ pub(crate) struct SessionJournalReplay {
     pub(crate) files: Vec<(String, Vec<LedgerLine>)>,
     /// One causally ordered stream per unambiguous configured root.
     pub(crate) recovery: Vec<(usize, Vec<LedgerLine>)>,
+    /// Sources named by the retained history graph that were not readable.
+    pub(crate) unreadable_sources: usize,
+}
+
+pub(crate) struct HistorySources {
+    pub(crate) files: Vec<(String, Vec<LedgerLine>)>,
+    pub(crate) unreadable_sources: usize,
 }
 
 struct SessionJournalNode {
@@ -61,23 +68,36 @@ struct SessionJournalNode {
 /// current reader does not need to know how old session journals are named or
 /// linked.
 pub(crate) fn history_sources(inner: &Inner) -> Vec<(String, Vec<LedgerLine>)> {
+    history_sources_report(inner).files
+}
+
+/// The retained history sources plus explicit read loss for presentation.
+///
+/// Ordinary history keeps its compatibility behavior, while a bounded UI
+/// projection can tell the operator that a named source was unreadable.
+pub(crate) fn history_sources_report(inner: &Inner) -> HistorySources {
+    let mut unreadable_sources = 0;
     let roots = inner
         .session_slots()
         .into_iter()
         .enumerate()
         .map(|(idx, slot)| {
-            (
-                idx,
-                slot.journal_file_name().unwrap_or_default(),
-                read_session(&slot),
-            )
+            let (lines, unreadable) = read_session(&slot);
+            unreadable_sources += usize::from(unreadable);
+            (idx, slot.journal_file_name().unwrap_or_default(), lines)
         })
         .collect();
-    session_journal_replay(&inner.state_root, roots)
+    let replay = session_journal_replay(&inner.state_root, roots);
+    unreadable_sources = unreadable_sources.saturating_add(replay.unreadable_sources);
+    let files = replay
         .files
         .into_iter()
         .map(|(journal, lines)| (format!("session-journal:{journal}"), lines))
-        .collect()
+        .collect();
+    HistorySources {
+        files,
+        unreadable_sources,
+    }
 }
 
 /// Root session journals plus every rename-linked journal they reach.
@@ -92,6 +112,7 @@ pub(crate) fn session_journal_replay(
     state_root: &StateRoot,
     roots: Vec<(usize, String, Vec<LedgerLine>)>,
 ) -> SessionJournalReplay {
+    let mut unreadable_sources = 0;
     let mut nodes = Vec::<SessionJournalNode>::new();
     let mut by_journal = HashMap::<String, usize>::new();
     let mut root_nodes = Vec::new();
@@ -131,6 +152,7 @@ pub(crate) fn session_journal_replay(
                         Ok(lines) => lines,
                         Err(read_error) => {
                             warn!(journal = linked, error = %read_error, "linked session journal is unreadable");
+                            unreadable_sources += 1;
                             Vec::new()
                         }
                     };
@@ -223,7 +245,11 @@ pub(crate) fn session_journal_replay(
             (node.journal, node.lines)
         })
         .collect();
-    SessionJournalReplay { files, recovery }
+    SessionJournalReplay {
+        files,
+        recovery,
+        unreadable_sources,
+    }
 }
 
 fn linked_session_journals(lines: &[LedgerLine]) -> Vec<String> {
@@ -253,12 +279,12 @@ fn valid_session_journal_file(file: &str) -> bool {
         .is_some_and(|extension| extension == "ndjson")
 }
 
-fn read_session(slot: &SessionSlot) -> Vec<LedgerLine> {
+fn read_session(slot: &SessionSlot) -> (Vec<LedgerLine>, bool) {
     match slot.ledger.read_after(0) {
-        Ok(lines) => lines,
+        Ok(lines) => (lines, false),
         Err(error) => {
             warn!(session = %slot.name(), error = %error, "compatibility history read failed; treating as empty");
-            Vec::new()
+            (Vec::new(), true)
         }
     }
 }

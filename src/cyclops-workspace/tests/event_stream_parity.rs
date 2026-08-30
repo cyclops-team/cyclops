@@ -123,8 +123,9 @@ fn transcript() -> Vec<Step> {
     ]
 }
 
-/// `cyclops watch`'s own feed: the `UiMsg::Entry`, `UiMsg::Status`, and
-/// `UiMsg::Backfill` arms of `src/cyclops-ui/src/plain.rs`, verbatim.
+/// `cyclops watch`'s own feed: the live-entry and replacement-projection
+/// handling in `src/cyclops-ui/src/plain.rs`, expanded into its three ordered
+/// steps so the boundary stays directly testable.
 fn feed_like_watch(record: &mut Record, intake: &mut Intake, step: Step) {
     match step {
         Step::Live(e) => {

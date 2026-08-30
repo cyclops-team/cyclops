@@ -90,7 +90,7 @@ def classify(paths: list[str]) -> dict[str, bool]:
             "website/static/install.sh",
         ) or path in {
             "src/cyclops-proto/src/scratch.rs",
-            "src/cyclops-ui/src/daemon_client.rs",
+            "src/cyclops-client/src/lib.rs",
             "src/cyclopsd/src/server.rs",
             "src/cyclops/src/cleanup.rs",
             "src/cyclops/src/daemon.rs",
@@ -127,7 +127,7 @@ def selftest() -> None:
     daemon = classify(["src/cyclopsd/src/messaging.rs"])
     assert daemon["rust"] and daemon["tmux"] and daemon["parity"]
     assert not daemon["platform"]
-    client = classify(["src/cyclops-ui/src/daemon_client.rs"])
+    client = classify(["src/cyclops-client/src/lib.rs"])
     assert client["platform"]
     assert classify(["src/cyclops/src/daemon.rs"])["platform"]
     assert classify(["src/cyclops/tests/e2e.rs"])["platform"]

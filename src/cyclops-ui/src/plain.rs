@@ -31,7 +31,7 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
         snapshots: snapshot_tx,
         actions: action_tx,
     };
-    let io = data::spawn_io(&sinks, home, opts.backfill);
+    let io = data::spawn_io(&sinks, home, opts.backfill, opts.focus);
     let view = if opts.firehose {
         View::Firehose
     } else {
@@ -102,12 +102,15 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
                     live(&mut app, e, &mut stdout);
                 }
             }
-            UiMsg::Backfill { entries, max_seq } => {
-                // The startup order, and it is the whole correctness
-                // story: the replayed tail is history, the seed is the
-                // daemon's answer about now, and the live entries that
-                // queued behind them are newer than both.
-                let landed = intake.backfill(entries, max_seq);
+            UiMsg::StreamProjection(projection) => {
+                // One whole replacement per connection epoch. Plain mode exits
+                // on a lost connection, but shares the exact initial contract.
+                app.clear_stream_projection();
+                intake = Intake::new();
+                if let Some(seed) = projection.seed {
+                    let _ = intake.status(seed);
+                }
+                let landed = intake.backfill(projection.entries, projection.max_seq);
                 for e in landed.replayed {
                     replay(&mut app, e, &mut stdout);
                 }
@@ -117,10 +120,8 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
                 for e in landed.live {
                     live(&mut app, e, &mut stdout);
                 }
-            }
-            UiMsg::Status(seed) => {
-                if let Some(seed) = intake.status(seed) {
-                    seed_status(&mut app, *seed, &mut stdout);
+                if let Some(warning) = projection.warning {
+                    eprintln!("{warning}");
                 }
             }
             UiMsg::ConnLost(text) => {

@@ -20,6 +20,7 @@ fact to an NDJSON ledger. A generated knowledge base with diagrams lives at
 | `src/cyclops-manifest` | Detection-manifest schema and evaluation | Vendor CLI behavior is TOML data in `resources/manifests/`, never Rust |
 | `src/cyclops-ledger` | Append-only NDJSON writer/reader | Never rewritten; corrections are new lines |
 | `src/cyclops-theme` | Semantic color tokens | Renderers use tokens, never raw colors |
+| `src/cyclops-client` | Shared blocking and async daemon transport | Owns greeting, framing, correlation, timeout, and uncertainty; no presentation or domain policy |
 | `src/cyclopsd` | The daemon: fusion, delivery, socket, identity | Library + thin binary so tests boot it in-process |
 | `src/cyclops` | The CLI | Thin client; business rules stay in proto/daemon. User-facing sentences live in `src/cyclops/src/copy.rs` |
 | `src/cyclops-ui` | The stream TUI (`cyclops watch`) | Its `grid` module is the CLI/stream rendering vocabulary |
