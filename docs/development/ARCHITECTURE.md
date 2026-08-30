@@ -67,6 +67,14 @@ The append and sync inside `MailboxService` are still the acceptance boundary.
 Notification and pane chrome remain effects of that durable fact, never a
 condition for whether the message exists.
 
+Fresh pane observation and durable messaging also meet at this boundary for
+the first extracted consequence family. Fusion commits the pane cache and
+returns an immutable quota-reset observation containing the exact recipient,
+pane, session slot, and route-evidence generation. `WorkspaceMessaging` alone
+turns that observation into `QuotaResetObserved` journal facts and explicit
+administrator notices. The observer does not append those facts, and reset
+observation never requeues or writes to the terminal.
+
 ## Watching: how the daemon knows what a pane is doing
 
 ```mermaid
@@ -83,6 +91,8 @@ flowchart TD
     P -->|"a row moved, a hook edge arrived,<br/>or a caller asked"| F["fusion"]
     F -->|"the verdict moved"| O(["state event · ledger line · border repaint"])
     F -->|"a caller asked"| Q(["status · pane.read · agent.wait · the gate"])
+    F -->|"positive quota-reset evidence"| E["immutable messaging observation"]
+    E --> M["WorkspaceMessaging:<br/>durable reset fact + explicit notice"]
 ```
 
 Notifications are hints, not truth. Truth comes from `list-panes`, and the
@@ -449,7 +459,7 @@ two:
 | Edge | Fired by |
 |---|---|
 | adoption | `adopt_pane` |
-| a fused state change | `fusion::recompute_pane_with_evidence` |
+| a fused state change | `fusion::observe_pane_with_evidence` |
 | a clear | `unadopt_pane` |
 | a session attach | `reconcile_adoptions` |
 | a window move | `move_chrome` |

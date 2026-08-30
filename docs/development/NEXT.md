@@ -13,20 +13,24 @@ preserved behavior, stop conditions, and rollback requirements.
 
 ## Current milestone
 
-Milestone 4 runs on **beta/refactor/observation-messaging**. It separates one
-observation-to-messaging consequence family without changing durable or tmux
-behavior. Milestone 3 put send and reply acceptance behind the internal
-`WorkspaceMessaging` Module. Milestone 2 consolidated official transport
-semantics in PR #104, and Milestone 1 merged in PR #103 after the documentation
-authority repair in PR #101.
+Milestone 5 runs on **beta/refactor/legacy-compatibility**. It quarantines only
+the proven compatibility-sensitive legacy writers and readers after completing
+their caller census and focused replay evidence. Milestone 4 moved positive
+quota-reset consequences out of fusion: pane observation now returns immutable
+evidence, while `WorkspaceMessaging` alone commits the durable reset facts and
+explicit administrator notices. Milestone 3 put send and reply acceptance
+behind the internal `WorkspaceMessaging` Module. Milestone 2 consolidated
+official transport semantics in PR #104, and Milestone 1 merged in PR #103
+after the documentation authority repair in PR #101.
 
 Exit evidence:
 
-- Pane Observer returns immutable evidence rather than committing messaging
-  consequences itself;
-- one `WorkspaceMessaging` operation decides the durable consequences of that
-  evidence;
-- a domain trace proves the same durable facts and tmux behavior; and
+- the caller census identifies every repository use of compatibility-sensitive
+  legacy paths, including `Daemon::deliver_payload`;
+- proven legacy writers and readers sit behind one explicit compatibility
+  boundary without claiming unverified public support;
+- retained replay fixtures and restart traces define the readable history
+  boundary; and
 - focused boundary tests and all required repository gates pass.
 
 ## Milestone queue
@@ -72,17 +76,19 @@ provides measurable isolation, and the operator separately approves it.
   performance, migration, and user-journey audits before the final pull request
   from **beta/messaging-rework** into `main`.
 
-## Milestone 4 session boundary
+## Milestone 5 session boundary
 
 Use this scope:
 
-> Implement only Milestone 4 from the approved Messaging Refactor Charter: move
-> one observation-to-messaging consequence family out of fusion. Pane Observer
-> returns immutable evidence, and WorkspaceMessaging decides the durable
-> consequences. Prove the same durable facts and tmux behavior. Do not begin
-> legacy quarantine, presentation work, UI redesign, broad CI restructuring,
-> MCP work, or later milestones. Preserve historical replay and honest
-> uncertainty. Stop if any charter stop condition is encountered.
+> Implement only Milestone 5 from the approved Messaging Refactor Charter:
+> quarantine proven legacy writers and readers behind an explicit compatibility
+> path. Complete the caller census first, preserve every currently readable
+> journal format, and use replay fixtures plus restart traces to define the
+> supported history boundary. Do not substantially change or remove
+> Daemon::deliver_payload until its census is complete. Do not begin
+> presentation work, UI redesign, broad CI restructuring, MCP work, or later
+> milestones. Preserve honest uncertainty and stop if any charter stop
+> condition is encountered.
 
 ## Release naming gate
 

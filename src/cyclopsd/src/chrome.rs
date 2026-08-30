@@ -8,7 +8,7 @@
 //! | Edge | Fired by |
 //! |---|---|
 //! | adoption | `adopt_pane` |
-//! | a fused state change | `fusion::recompute_pane_with_evidence` |
+//! | a fused state change | `fusion::observe_pane_with_evidence` |
 //! | a clear | `unadopt_pane` |
 //! | a session attach | `reconcile_adoptions` |
 //! | a window move | `move_chrome` |
@@ -376,10 +376,7 @@ mod tests {
     /// own source, so a ninth caller fails the build.
     const WRITE_EDGES: [(&str, &str); 8] = [
         ("adoption", "adopt_pane"),
-        (
-            "a fused state change",
-            "fusion::recompute_pane_with_evidence",
-        ),
+        ("a fused state change", "fusion::observe_pane_with_evidence"),
         ("a clear", "unadopt_pane"),
         ("a session attach", "reconcile_adoptions"),
         ("a window move", "move_chrome"),

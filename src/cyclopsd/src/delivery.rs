@@ -37,8 +37,8 @@ use cyclops_manifest::{
 };
 use cyclops_proto::{
     AgentState, ComposerSemantic, ComposerState, Delivery, DeliveryReceipt, DeliveryState,
-    Detection, Event, Kind, LedgerLine, MessageId, MsgSendParams, MsgSendResult,
-    NotificationAttemptId, NotificationAttentionCause, NotificationBinding, NotificationManifestId,
+    Detection, Event, Kind, LedgerLine, MsgSendParams, MsgSendResult, NotificationAttemptId,
+    NotificationAttentionCause, NotificationBinding, NotificationManifestId,
     NotificationPreWriteCause, NotificationPreWriteObservation, NotificationRecord,
     NotificationRouteEvidenceId, NotificationState, NotificationTransport,
     NotificationVerifyFailureKind, NotificationVerifyOutcome, NotifyLevel, ProcessInstanceId,
@@ -55,6 +55,9 @@ use crate::notification_adapter::{
     ClaimedNotificationBarrier, NotificationAdapterError, NotificationContext, SubmitReservation,
 };
 use crate::{daemon_line, fusion, unix_ms, Inner, PaneKey};
+
+#[cfg(test)]
+use cyclops_proto::MessageId;
 
 /// Delivery gives up on evidence this long after submit (spec: neither ACK
 /// tier within 5s goes to retry_queued).
@@ -3433,7 +3436,7 @@ async fn persist_notification_prewrite_block(
         crate::messaging::schedule_route_reconciliation(inner, handle.session_idx, &handle.pane_id);
         if let Some(watcher) = inner.watcher_of(handle.session_idx) {
             let route_evidence = inner.route_evidence_id(handle.session_idx, &handle.pane_id);
-            fusion::recompute_pane_for_route_evidence(
+            crate::messaging::observe_pane_for_route_evidence(
                 inner,
                 handle.session_idx,
                 &watcher,
@@ -4247,7 +4250,7 @@ async fn attempt_delivery(
     // notice: same pane, same pid, same manifest, new draft. So the
     // readiness rule is asked again here, against a capture taken now,
     // immediately before the write that cannot be taken back.
-    match fusion::recompute_pane(
+    match crate::messaging::observe_pane(
         inner,
         handle.session_idx,
         &watcher,
@@ -5803,8 +5806,10 @@ async fn park_recipient(
         // already won, the edge's scan found no held attempt. Recheck the
         // exact route once after the hold exists so the attempt cannot be
         // stranded until another unrelated redraw.
-        if fusion::quota_reset_observed_now(inner, handle.session_idx, &handle.pane_id) {
-            observe_quota_reset(inner, handle.session_idx, &handle.pane_id);
+        if let Some(observation) =
+            fusion::quota_reset_observation_now(inner, handle.session_idx, &handle.pane_id)
+        {
+            crate::messaging::apply_messaging_observation(inner, observation);
         }
         return;
     }
@@ -5847,48 +5852,6 @@ async fn park_recipient(
         Some(handle.session_idx),
         About::delivery(&handle.to),
     );
-}
-
-/// Persist a positive quota-reset observation and expose only the explicit
-/// administrator verb. This never queues a worker or moves a delivery.
-pub(crate) fn observe_quota_reset(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) {
-    let Some(service) = inner.mailbox.as_ref() else {
-        return;
-    };
-    let Some(recipient) = inner.recipient_key(session_idx, pane_id) else {
-        return;
-    };
-    let observed = match service.observe_quota_reset(recipient) {
-        Ok(observed) => observed,
-        Err(error) => {
-            error!(%recipient, %error, "cannot record observed quota reset");
-            return;
-        }
-    };
-    if observed.is_empty() {
-        return;
-    }
-    let label = service
-        .identity_for_recipient(recipient)
-        .ok()
-        .flatten()
-        .map(|identity| identity.label)
-        .unwrap_or_else(|| pane_id.to_string());
-    for record in observed {
-        admin_notify(
-            inner,
-            NotifyLevel::ActionRequired,
-            &format!("quota reset observed for {label}"),
-            &quota_reset_notice(&record.message_id),
-            Some(record.message_id.as_str()),
-            Some(session_idx),
-            About::delivery(&label),
-        );
-    }
-}
-
-fn quota_reset_notice(message_id: &MessageId) -> String {
-    format!("message {message_id} remains held; run `cyclops requeue {message_id}`")
 }
 
 fn legacy_park_hint(handle: &DeliveryHandle, hint: Option<String>) -> Option<String> {
@@ -6065,7 +6028,7 @@ async fn gate(
                                 observation: Box::new(observation),
                             };
                         }
-                        let Some(det) = fusion::recompute_pane(
+                        let Some(det) = crate::messaging::observe_pane(
                             inner,
                             handle.session_idx,
                             w,
@@ -8005,7 +7968,7 @@ async fn receipt_checkpoint_pass(
     let Some(watcher) = inner.watcher_of(handle.session_idx) else {
         return ReceiptStep::Freeze;
     };
-    let detection = fusion::recompute_pane(
+    let detection = crate::messaging::observe_pane(
         inner,
         handle.session_idx,
         &watcher,
@@ -9475,7 +9438,7 @@ pub(crate) async fn wait_pinned(
     let watcher = inner.watcher_of(session_idx);
     let mut pane_rx = watcher.as_ref().map(|w| w.subscribe());
     if let Some(watcher) = watcher.as_ref() {
-        fusion::recompute_pane(
+        crate::messaging::observe_pane(
             inner,
             session_idx,
             watcher,
@@ -10730,15 +10693,6 @@ mod tests {
         inner.engine.begin_stopping();
         inner.engine.wait_for_descendant_tasks().await;
         assert!(inner.engine.take_legacy_worker_tasks().is_empty());
-    }
-
-    #[test]
-    fn quota_reset_notice_names_the_exact_message_wide_command() {
-        let message_id = MessageId::new("m-quota").unwrap();
-        assert_eq!(
-            quota_reset_notice(&message_id),
-            "message m-quota remains held; run `cyclops requeue m-quota`"
-        );
     }
 
     fn prepare_notification_receipt(context: &NotificationContext) {

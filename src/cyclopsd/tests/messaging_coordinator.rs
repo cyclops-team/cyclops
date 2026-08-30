@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use common::{
     composer_pane, faketui_path, hold_script, manual_lifecycle_composer_pane,
     swallowing_animated_composer_pane, tmux_available, wait_pane_state, Rig, CAT_MANIFEST,
-    HOOK_MANIFEST, LIVENESS_MANIFEST, MODAL_MANIFEST,
+    HOOK_MANIFEST, LIVENESS_MANIFEST, MODAL_MANIFEST, QUOTA_MANIFEST,
 };
 use cyclops_proto::{
     Kind, LedgerLine, MessageId, MsgSendParams, NotificationAttemptId, NotificationState,
@@ -213,6 +213,84 @@ async fn send_summarized_workspace_message(
         )
         .await
         .unwrap()
+}
+
+// Obsolete if a mailbox quota reset no longer requires a fresh pane
+// observation followed by explicit operator requeue.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_positive_quota_observation_records_reset_without_requeue_or_terminal_write() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let script = "sh -c 'echo \"Individual quota reached. Please upgrade your subscription.\"; read x; printf \"\\033[2J\\033[H\"; exec cat'";
+    let mut rig = Rig::new(
+        "workspace-quota-reset-observation",
+        QUOTA_MANIFEST,
+        script,
+        "",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "blocked_quota").await;
+
+    let sent = send_workspace_message(
+        &rig,
+        "quota-reset-observation",
+        "Held during quota",
+        "body stays durable",
+    )
+    .await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    let held_notice = rig
+        .ev
+        .wait_event(Duration::from_secs(8), |event| {
+            event["event"] == "admin-notify"
+                && event["data"]["level"] == "urgent"
+                && event["data"]["id"] == message_id.as_str()
+        })
+        .await;
+    assert!(held_notice["data"]["body"]
+        .as_str()
+        .is_some_and(|body| body.contains("will not resume automatically")));
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::QuotaHeld),
+        1
+    );
+    let attempts_before = notification_attempts(&rig, &message_id);
+
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
+    let reset_notice = rig
+        .ev
+        .wait_event(Duration::from_secs(8), |event| {
+            event["event"] == "admin-notify"
+                && event["data"]["level"] == "action_required"
+                && event["data"]["id"] == message_id.as_str()
+        })
+        .await;
+    assert_eq!(
+        reset_notice["data"]["subject"],
+        "quota reset observed for worker"
+    );
+    assert!(reset_notice["data"]["body"]
+        .as_str()
+        .is_some_and(|body| body.contains(&format!("cyclops requeue {message_id}"))));
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::QuotaResetObserved),
+        1
+    );
+    assert_eq!(notification_attempts(&rig, &message_id), attempts_before);
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::Writing),
+        0,
+        "positive reset observation must not write or requeue"
+    );
+    let screen = rig.tmux.capture(&pane);
+    assert!(!screen.contains(&compact_doorbell(&rig, &message_id)));
+    assert!(!screen.contains("body stays durable"));
+
+    rig.daemon.shutdown().await;
 }
 
 struct WaitingPair {

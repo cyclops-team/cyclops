@@ -2552,7 +2552,7 @@ async fn adopt_pane(
     paint_chrome(inner, session_idx, pane_id).await;
     // 4. Re-read.
     let route_evidence = inner.advance_route_evidence(session_idx, pane_id);
-    fusion::recompute_pane_for_route_evidence(
+    messaging::observe_pane_for_route_evidence(
         inner,
         session_idx,
         watcher,
@@ -2662,7 +2662,7 @@ async fn unadopt_pane(
     // 5. Re-read.
     if let Some(w) = watcher {
         let route_evidence = inner.advance_route_evidence(session_idx, pane_id);
-        fusion::recompute_pane_for_route_evidence(
+        messaging::observe_pane_for_route_evidence(
             inner,
             session_idx,
             w,
@@ -2964,7 +2964,7 @@ pub(crate) async fn paint_chrome(inner: &Arc<Inner>, session_idx: usize, pane_id
 
 /// Repaint the state half of an adopted pane's border. Called from the one
 /// place a fused state change is recorded
-/// (fusion::recompute_pane_with_evidence), so a border can never disagree
+/// (fusion::observe_pane_with_evidence), so a border can never disagree
 /// with the row `cyclops list` prints.
 pub(crate) async fn repaint_chrome(
     inner: &Arc<Inner>,
@@ -4334,7 +4334,7 @@ async fn run_session(
     reconcile_adoptions(inner, idx, watcher, &kept).await;
     for row in watcher.snapshot() {
         let route_evidence = inner.advance_route_evidence(idx, &row.pane_id);
-        fusion::recompute_pane_for_route_evidence(
+        messaging::observe_pane_for_route_evidence(
             inner,
             idx,
             watcher,
@@ -4391,7 +4391,7 @@ async fn run_session(
                     }
                     for row in watcher.snapshot() {
                         let route_evidence = inner.advance_route_evidence(idx, &row.pane_id);
-                        fusion::recompute_pane_for_route_evidence(
+                        messaging::observe_pane_for_route_evidence(
                             inner,
                             idx,
                             watcher,
@@ -4882,7 +4882,7 @@ async fn handle_pane_event(
                     .insert(row.pane_id.clone(), ObservedPane::capture(row.clone()));
             });
             let route_evidence = inner.advance_route_evidence(session_idx, &row.pane_id);
-            fusion::recompute_pane_for_route_evidence(
+            messaging::observe_pane_for_route_evidence(
                 inner,
                 session_idx,
                 watcher,
@@ -5086,7 +5086,7 @@ async fn handle_pane_event(
                 inner.route_evidence_id(session_idx, &id)
             };
             if route_changed {
-                fusion::recompute_pane_for_route_evidence(
+                messaging::observe_pane_for_route_evidence(
                     inner,
                     session_idx,
                     watcher,
@@ -5154,7 +5154,7 @@ async fn handle_pane_event(
             }
             for pane_id in outcome.changed_panes {
                 let route_evidence = inner.advance_route_evidence(session_idx, &pane_id);
-                fusion::recompute_pane_for_route_evidence(
+                messaging::observe_pane_for_route_evidence(
                     inner,
                     session_idx,
                     watcher,
@@ -5232,7 +5232,7 @@ async fn debounce_task(
             return;
         };
         let route_evidence = inner.advance_route_evidence(session_idx, &pane_id);
-        fusion::recompute_pane_from_output(
+        messaging::observe_pane_from_output(
             &inner,
             session_idx,
             &watcher,

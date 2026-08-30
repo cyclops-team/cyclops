@@ -1900,9 +1900,16 @@ async fn refresh_status_detections(inner: &Arc<Inner>) -> HashSet<crate::PaneKey
             jobs.push_back((
                 key,
                 Box::pin(async move {
-                    fusion::recompute_pane(&inner, session_idx, &watcher, &pane_id, true, "status")
-                        .await
-                        .is_some()
+                    crate::messaging::observe_pane(
+                        &inner,
+                        session_idx,
+                        &watcher,
+                        &pane_id,
+                        true,
+                        "status",
+                    )
+                    .await
+                    .is_some()
                 }) as StatusRefreshFuture,
             ));
         }
@@ -2485,7 +2492,7 @@ async fn pane_read(inner: &Arc<Inner>, id: Value, params: Value) -> Response {
         PaneReadSource::Detection => {
             // Reconcile on doubt: an explicit detection read refreshes with
             // the full sensor set instead of trusting the cache.
-            let det = match fusion::recompute_pane(
+            let det = match crate::messaging::observe_pane(
                 inner,
                 session_idx,
                 &watcher,
