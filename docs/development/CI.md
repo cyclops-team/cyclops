@@ -83,9 +83,12 @@ not replace domain tests or review.
 The named backspace regression waits for the positive `write_ready` event that
 actually wakes or reopens the held attempt. Waiting only for the weaker
 `composer_clean` projection failed once under the release suite because screen
-settlement had not yet produced write permission. The event synchronization
-contains no timing sleep; the bounded timeout only turns a missing contract
-event into a useful failure.
+settlement had not yet produced write permission. A fresh event subscription is
+established after the durable hold and immediately before Backspace, so setup
+events cannot satisfy the release condition. The test then waits on explicit
+injected pre-write and staged phase events. This synchronization contains no
+timing sleep; the 20-second phase timeout only bounds a missing contract event
+under four concurrent isolated rigs on a cold shared runner.
 
 ## Task 3 representative pull-request comparison
 
