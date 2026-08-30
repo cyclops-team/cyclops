@@ -20,7 +20,7 @@ use cyclops_proto::{
     NotificationWithdrawParams, PaneReadParams, PaneReadResult, PaneReadSource, PingResult,
     ProcessInstanceId, QuiesceParams, RecipientKey, ReplyParams, Request, RequeueParams,
     RequeueResult, Response, SessionStatus, StateReportParams, StatusParams, StatusResult,
-    SubscribeParams, WireError, PROTOCOL_VERSION,
+    StreamBackfillParams, SubscribeParams, WireError, PROTOCOL_VERSION,
 };
 #[cfg(test)]
 use cyclops_proto::{AlarmPreviewResult, NotificationAttentionCause, TmuxPaneId};
@@ -735,10 +735,28 @@ pub(crate) async fn dispatch(
                     }
                 }
             };
-            if params.cursor.is_some() {
-                debug!("subscribe cursor ignored: ledger replay lands with the stream client (M3)");
-            }
+            // `cursor` is accepted only as a compatibility input. This
+            // stream is deliberately ephemeral; authoritative recovery is a
+            // snapshot or a domain-specific follow page.
             (Response::ok(id, json!({"subscribed": true})), Some(params))
+        }
+        "events.backfill" => {
+            let params: StreamBackfillParams = if req.params.is_null() {
+                StreamBackfillParams::default()
+            } else {
+                match decode_params(&id, req.params, "events.backfill params") {
+                    Ok(params) => params,
+                    Err(response) => return (response, None),
+                }
+            };
+            let result = crate::history::stream_backfill(inner, params);
+            (
+                Response::ok(
+                    id,
+                    serde_json::to_value(result).expect("stream backfill serializes"),
+                ),
+                None,
+            )
         }
         "workspace_ui.get" => {
             let result = crate::workspace_ui::workspace_ui_get(&inner.workspace_ui);
@@ -4868,6 +4886,40 @@ mod tests {
         .await;
         assert_eq!(resp.result.unwrap()["subscribed"], true);
         assert_eq!(sub.unwrap().kinds, vec!["state"]);
+    }
+
+    #[tokio::test]
+    async fn subscribe_cursor_is_compatibility_input_and_backfill_is_the_snapshot() {
+        let inner = bare_inner();
+        let (response, subscription) = dispatch(
+            &inner,
+            Request {
+                id: json!("subscribe"),
+                method: "events.subscribe".into(),
+                params: json!({"cursor": 99}),
+            },
+            own_peer(),
+        )
+        .await;
+        assert_eq!(response.result.unwrap()["subscribed"], true);
+        assert_eq!(subscription.expect("subscription begins").cursor, Some(99));
+
+        let (response, subscription) = dispatch(
+            &inner,
+            Request {
+                id: json!("backfill"),
+                method: "events.backfill".into(),
+                params: json!({"limit": 20}),
+            },
+            own_peer(),
+        )
+        .await;
+        assert!(subscription.is_none(), "a snapshot switched to push mode");
+        let result: cyclops_proto::StreamBackfillResult =
+            serde_json::from_value(response.result.unwrap()).unwrap();
+        assert!(result.lines.is_empty());
+        assert_eq!(result.max_seq, None);
+        assert_eq!(result.gap, None);
     }
 
     #[test]

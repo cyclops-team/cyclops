@@ -618,7 +618,7 @@ its own CI job).
 | Sensor fusion with per-sensor readings and observable disagreement (revision 2) | Types in `src/cyclops-proto/src/state.rs`; engine in `src/cyclopsd/src/fusion.rs`; hook sensor fed from `src/cyclopsd/src/ack.rs` |
 | Detection rules are per-CLI data, not code (H2) | `cyclops-manifest`, `resources/manifests/{claude,codex,agy,cursor}.toml` |
 | NDJSON Unix socket, hello line first, version mismatch warns never rejects (S2) | `src/cyclops-proto/src/wire.rs`; server in `src/cyclopsd/src/server.rs` |
-| Append-only NDJSON ledger, monotonic seq plus boot_id, replayable by cursor (C6) | Schema in `src/cyclops-proto/src/ledger.rs`; writer in `cyclops-ledger`. The stream client backfills by reading session files directly; server-side cursor replay on `events.subscribe` is accepted and ignored, with no client that needs it |
+| Append-only NDJSON ledger, monotonic seq plus boot_id, replayable by cursor (C6) | Schema in `src/cyclops-proto/src/ledger.rs`; writer in `cyclops-ledger`. The daemon owns retained history traversal and serves the stream a bounded body-free `events.backfill` projection. `events.subscribe` is explicitly ephemeral; durable mailbox recovery uses `messages.follow` |
 | Delivery pipeline: queue, gate, paste, verify, submit, ACK; only proven pre-write failures retry, while after-write outcomes require attention | `src/cyclops-proto/src/ledger.rs` for the machine, `src/cyclopsd/src/delivery.rs` for the pipeline |
 | Turn detection from hooks via a `cyclops hook` receiver | `wire.rs` (`agent.state.report`), `src/cyclops/src/hook.rs`, `src/cyclopsd/src/ack.rs` |
 | Agent surface: thin CLI speaking NDJSON to the socket | `src/cyclops` |
@@ -664,9 +664,11 @@ Idle CPU near zero is a hard goal (GOALS.md). Concretely:
   doubt, never on a schedule.
 - Daemon stalls are in-band, not watchdog-polled: `pause-after` converts
   falling behind into `%pause` and `%continue` notifications (amendment a).
-- Clients never poll the daemon: `events.subscribe` pushes. The stream UI
-  backfills by reading the session ledger tails once at startup and rides
-  the push from there.
+- Clients never poll the daemon: `events.subscribe` pushes. After each
+  acknowledged connection, the stream UI installs one daemon-owned
+  `events.backfill` plus current-status replacement before it resumes live
+  events. A later replacement is caused only by an observed gap and explicit
+  reconnect.
 
 Timers do exist; none of them is an interval. Each is a one-shot tied to
 one thing that already happened: the paste verification re-reads, the

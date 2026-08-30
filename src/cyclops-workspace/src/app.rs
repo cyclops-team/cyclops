@@ -30,12 +30,10 @@ use std::pin::Pin;
 use crossterm::event::{
     self, Event, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use cyclops_client::{BlockingClient, ClientError, DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT};
 use cyclops_tmux::sizing::ClientIdentity;
 use cyclops_tmux::{
     ControlClient, ControlConfig, InputCapacity, Notification, NotificationReceiver, TmuxError,
-};
-use cyclops_ui::daemon_client::{
-    BlockingClient, ClientError, DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT,
 };
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::Rect;

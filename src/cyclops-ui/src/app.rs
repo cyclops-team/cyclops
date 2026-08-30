@@ -735,6 +735,19 @@ impl App {
         self.eye != self.eye_target()
     }
 
+    /// Forget every value owned by the stream projection before installing a
+    /// daemon snapshot for a new subscription epoch. Mailbox state is separate
+    /// and is replaced by `messages.snapshot` on its own cursor contract.
+    pub fn clear_stream_projection(&mut self) {
+        self.record = Record::new();
+        self.panes.clear();
+        self.roster.clear();
+        self.admin_unread = 0;
+        self.filter_routes.clear();
+        self.selected = None;
+        self.top = None;
+    }
+
     /// One line replayed from the record: it goes on the screen and
     /// nowhere else ([`crate::stream::Record::replay`]).
     pub fn replay(&mut self, e: Entry) {

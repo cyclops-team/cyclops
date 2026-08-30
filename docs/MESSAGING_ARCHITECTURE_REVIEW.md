@@ -2017,7 +2017,7 @@ Do not add more guards while continuing to claim an impossible guarantee.
 
 The UI documentation says every daemon frame and ledger line is limited to
 1 MiB. At the reviewed revision the UI enforced that limit in its `wire.rs`
-module, now consolidated into `src/cyclops-ui/src/daemon_client.rs`, and when
+module, later moved into `src/cyclops-client/src/lib.rs`, and when
 reading the ledger. The daemon reads requests with unbounded
 `BufReader::lines()`, the CLI reads an entire body file or stdin into memory,
 and the daemon writes responses without a corresponding size check. No

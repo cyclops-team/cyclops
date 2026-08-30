@@ -136,6 +136,7 @@ alphabet.
 | `agent.state.report` | A hook reporting a turn edge. Only from inside the pane |
 | `hooks.verify` | Hook liveness for a pane: tier and last-seen edges |
 | `hooks.selftest` | One no-op delivery that proves the ack hook fires |
+| `events.backfill` | Read one bounded, body-free stream-history projection |
 | `events.subscribe` | Switch this connection to push mode |
 | `admin.notify` | Raise something for the human |
 | `theme.reload` | Re-read the theme selection and repaint every named pane's border |
@@ -1061,6 +1062,26 @@ event. Pick `fyi` unless a person genuinely has to do something: an
 `action_required` ping that names nothing a client can later see resolved
 sits in the calm stream under a closed eye until the daemon restarts.
 
+### events.backfill
+
+One bounded connection-epoch projection for stream presentations. The daemon
+owns the retained session-journal source set and returns only body-free facts;
+clients do not discover or open journal paths.
+
+```
+-> {"id":1,"method":"events.backfill","params":{"limit":200}}
+<- {"id":1,"result":{"lines":[]}}
+```
+
+`limit` defaults to 200. The result is oldest first. `max_seq` is meaningful
+only when one journal supplied the projection and is omitted for several
+sources. If a retained source is unreadable or the official frame bound forces
+older rows out, `gap` reports `unreadable_sources` and `omitted_rows`. A normal
+bounded tail does not call its intentionally older rows a gap.
+
+This method is a snapshot, not subscription replay. Mailbox views recover
+durable progress with `messages.follow` instead.
+
 ### events.subscribe
 
 Sending it switches the connection to push mode. Responses to earlier
@@ -1077,6 +1098,11 @@ requests still arrive; unsolicited event lines now arrive too.
 event line has no `id` and never answers a request, so tell the two apart by
 the presence of `event`. `seq` is the ledger seq when the event corresponds
 to a ledger line.
+
+Subscriptions are ephemeral invalidation and observation streams. A legacy
+`cursor` field is accepted for wire compatibility but never promises replay;
+use `events.backfill`, a current snapshot, or `messages.follow` according to
+the projection being rebuilt.
 
 Use a second connection for the stream if you also want to make requests.
 `cyclops watch --json` is exactly this.

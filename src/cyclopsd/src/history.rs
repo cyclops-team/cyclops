@@ -21,8 +21,9 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use cyclops_proto::{
-    Delivery, HistoryParams, HistoryResult, Kind, LedgerLine, MessageMetadata, OpenDelivery,
-    RecipientKey, ThreadResult, WireError,
+    Delivery, FrameContract, HistoryParams, HistoryResult, Kind, LedgerLine, MessageMetadata,
+    OpenDelivery, RecipientKey, StreamBackfillGap, StreamBackfillParams, StreamBackfillResult,
+    ThreadResult, WireError,
 };
 use serde_json::Value;
 use tracing::warn;
@@ -42,6 +43,116 @@ fn wire_err(code: &str, msg: impl Into<String>) -> WireError {
         code: code.to_string(),
         message: msg.into(),
         data: None,
+    }
+}
+
+const STREAM_BACKFILL_ITEM_CAP: usize = 4096;
+const STREAM_BACKFILL_FRAME_RESERVE: usize = 4096;
+
+/// A bounded, body-free projection of retained session history for stream
+/// presentation startup. Journal discovery and compatibility traversal stay
+/// in the daemon; clients receive authorized facts rather than file paths.
+pub(crate) fn stream_backfill(inner: &Inner, params: StreamBackfillParams) -> StreamBackfillResult {
+    let report = compatibility::history_sources_report(inner);
+    let source_count = report.files.len();
+    let mut rows = report
+        .files
+        .into_iter()
+        .enumerate()
+        .flat_map(|(source, (_, lines))| {
+            lines
+                .into_iter()
+                .enumerate()
+                .filter(|(_, line)| stream_line_is_presentable(line))
+                .map(move |(ordinal, mut line)| {
+                    line.body = None;
+                    if matches!(line.kind, Kind::Msg | Kind::Fyi) {
+                        line.data = None;
+                    } else if let Some(data) = &mut line.data {
+                        redact_body_fields(data);
+                    }
+                    (line.ts, line.seq, source, ordinal, line)
+                })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        (left.0, left.1, left.2, left.3).cmp(&(right.0, right.1, right.2, right.3))
+    });
+
+    let requested = usize::try_from(params.limit).unwrap_or(usize::MAX);
+    let retained_limit = requested.min(STREAM_BACKFILL_ITEM_CAP);
+    let mut omitted_rows = if requested > STREAM_BACKFILL_ITEM_CAP {
+        rows.len().saturating_sub(retained_limit) as u64
+    } else {
+        0
+    };
+    let excess = rows.len().saturating_sub(retained_limit);
+    rows.drain(..excess);
+    let mut lines = rows
+        .into_iter()
+        .map(|(_, _, _, _, line)| line)
+        .collect::<Vec<_>>();
+
+    // Leave room for the response envelope and future additive fields. A
+    // single oversized historical fact is omitted with an explicit gap; it
+    // can never make the daemon return an ambiguous oversized-response error.
+    let payload_budget = FrameContract::MAX_JSON_BYTES - STREAM_BACKFILL_FRAME_RESERVE;
+    loop {
+        let gap = StreamBackfillGap {
+            unreadable_sources: u32::try_from(report.unreadable_sources).unwrap_or(u32::MAX),
+            omitted_rows,
+        };
+        let candidate = StreamBackfillResult {
+            max_seq: single_source_max_seq(source_count, &lines),
+            lines: lines.clone(),
+            gap: (!gap.is_empty()).then_some(gap),
+        };
+        if serde_json::to_vec(&candidate).is_ok_and(|encoded| encoded.len() <= payload_budget) {
+            return candidate;
+        }
+        if lines.is_empty() {
+            return candidate;
+        }
+        lines.remove(0);
+        omitted_rows = omitted_rows.saturating_add(1);
+    }
+}
+
+fn redact_body_fields(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            fields.remove("body");
+            for value in fields.values_mut() {
+                redact_body_fields(value);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_body_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn single_source_max_seq(source_count: usize, lines: &[LedgerLine]) -> Option<u64> {
+    if source_count == 1 {
+        lines.iter().map(|line| line.seq).max()
+    } else {
+        None
+    }
+}
+
+fn stream_line_is_presentable(line: &LedgerLine) -> bool {
+    match line.kind {
+        Kind::Msg | Kind::Fyi => true,
+        Kind::State | Kind::Gate => line.data.is_some(),
+        Kind::System => line
+            .data
+            .as_ref()
+            .and_then(|data| data.get("event"))
+            .and_then(Value::as_str)
+            .is_some(),
     }
 }
 

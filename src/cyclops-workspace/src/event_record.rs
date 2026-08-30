@@ -2,7 +2,7 @@
 //! startup contract, applied to the shared `cyclops_ui::Record`.
 //!
 //! `cyclops watch` reconciles three sources whose ages differ and whose
-//! order is the whole correctness story — the replayed ledger tail is
+//! order is the whole correctness story — the daemon's bounded history is
 //! history, the status seed is the daemon's answer about now, and a live
 //! entry that arrives during startup is newer than either. The buffering
 //! that enforces that order lives in `cyclops_ui::Intake`
@@ -25,13 +25,13 @@ use std::path::Path;
 
 use cyclops_ui::{Entry, Intake, Record, StatusSeed};
 
-/// Ledger lines the boot replays: the same tail `cyclops watch` replays
+/// History rows the boot replays: the same tail `cyclops watch` replays
 /// by default (`--backfill`, src/cyclops/src/main.rs), so opening the
 /// panel and opening the CLI start from the same history.
 pub const BACKFILL: usize = 200;
 
-/// One bounded replacement for the shared stream model. Loading may touch
-/// the daemon socket and journal, so the application builds this off-loop
+/// One bounded replacement for the shared stream model. Loading touches the
+/// daemon socket, so the application builds this off-loop
 /// after an ingress gap and installs it as one result.
 pub struct Bootstrap {
     seed: Option<Box<StatusSeed>>,
@@ -60,7 +60,7 @@ pub fn status(record: &mut Record, intake: &mut Intake, seed: Box<StatusSeed>) {
     }
 }
 
-/// The one-time ledger tail. Applying what lands is the startup order
+/// The one-time daemon backfill. Applying what lands is the startup order
 /// itself: replayed history first, then the held seed, then whatever
 /// queued live while the two were loading.
 pub fn backfill(
@@ -87,13 +87,11 @@ fn apply_seed(record: &mut Record, seed: &StatusSeed) {
     }
 }
 
-/// Boot-time construction: one bounded status request, then one
-/// ledger-tail read, exactly the two fetches `cyclops_ui`'s seed task
-/// makes for watch (src/cyclops-ui/src/data.rs `seed_task`). The status
-/// answer names the sessions the daemon watches, and the tail replays
-/// THOSE sessions' ledgers and no others; a daemon that does not answer
-/// costs the scope, not the tail. Neither fetch repeats: after boot the
-/// record moves on the live subscription alone.
+/// Boot-time construction: one bounded status request, then one daemon-owned
+/// history projection, exactly the two fetches `cyclops_ui` performs after an
+/// acknowledged subscription. The status answer and history projection share
+/// the daemon's authoritative source set. The workspace repeats this same
+/// bounded replacement after an observed stream gap, never on a timer.
 pub fn boot(record: &mut Record, intake: &mut Intake, home: &Path) -> Option<String> {
     install(record, intake, load(home))
 }
@@ -105,9 +103,16 @@ pub fn load(home: &Path) -> Bootstrap {
     let seed = crate::daemon::status(home, params)
         .ok()
         .map(|s| Box::new(StatusSeed::from_status(&s)));
-    let watched = seed.as_ref().map(|s| s.watched.clone());
-    let report =
-        cyclops_ui::read_backfill_report(&home.join("ledger"), BACKFILL, watched.as_deref());
+    let report = match crate::daemon::stream_backfill(home, BACKFILL) {
+        Ok(result) => cyclops_ui::project_backfill(result),
+        Err(error) => cyclops_ui::BackfillReport {
+            entries: Vec::new(),
+            max_seq: None,
+            warning: Some(format!(
+                "backfill unavailable; stream history has a gap: {error}. Use cyclops history for the durable record"
+            )),
+        },
+    };
     Bootstrap {
         seed,
         entries: report.entries,

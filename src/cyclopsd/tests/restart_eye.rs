@@ -47,14 +47,14 @@ fn ledger_with_deliveries_in_flight(home: &std::path::Path, chains: &[(&str, &st
 /// The UI's own startup, in the one order it can happen: the daemon's
 /// answer, then the replayed tail, then the seed over it (cyclops-ui
 /// `Intake`). `answer` is what `status` returned for this run.
-fn ui_after_startup(home: &std::path::Path, answer: &StatusResult) -> App {
+fn ui_after_startup(answer: &StatusResult, backfill: cyclops_proto::StreamBackfillResult) -> App {
     let mut app = App::new(Theme::none(), View::Admin, Filter::default());
     let mut intake = Intake::new();
     let seed = StatusSeed::from_status(answer);
-    let watched = seed.watched.clone();
     assert!(intake.status(Box::new(seed)).is_none());
-    let (entries, max_seq) = cyclops_ui::read_backfill(&home.join("ledger"), 500, Some(&watched));
-    let landed = intake.backfill(entries, max_seq);
+    let report = cyclops_ui::project_backfill(backfill);
+    assert!(report.warning.is_none(), "{:?}", report.warning);
+    let landed = intake.backfill(report.entries, report.max_seq);
     for e in landed.replayed {
         app.replay(e);
     }
@@ -155,7 +155,7 @@ async fn the_restart_ping_never_outlives_the_deliveries_it_names() {
     //    carries the ping, and the two agree.
     let answer = daemon.status(true);
     assert_eq!(answer.open_deliveries.len(), 2, "{:?}", answer);
-    let mut app = ui_after_startup(&home, &answer);
+    let mut app = ui_after_startup(&answer, daemon.stream_backfill(500));
     assert_eq!(app.attention_count(), 2);
     assert_eq!(app.eye(), Eye::Open);
     let rows = build(&mut app, 80, 20);
@@ -169,7 +169,7 @@ async fn the_restart_ping_never_outlives_the_deliveries_it_names() {
     //    stands: the other has not been dealt with, and the eye says so.
     let mut half_done = daemon.status(true);
     half_done.open_deliveries.retain(|d| d.to == "reviewer");
-    let mut app = ui_after_startup(&home, &half_done);
+    let mut app = ui_after_startup(&half_done, daemon.stream_backfill(500));
     assert_eq!(app.attention_count(), 1);
     let rows = build(&mut app, 80, 20);
     assert!(rows[0].contains("1 needs attention"), "{:?}", rows[0]);
@@ -190,7 +190,7 @@ async fn the_restart_ping_never_outlives_the_deliveries_it_names() {
     //    milestone is about, so the calm view may not take it.
     let mut cleared = daemon.status(true);
     cleared.open_deliveries.clear();
-    let mut app = ui_after_startup(&home, &cleared);
+    let mut app = ui_after_startup(&cleared, daemon.stream_backfill(500));
     assert_eq!(app.attention_count(), 0);
     assert_eq!(app.eye(), Eye::Closed);
     let ping = restart_ping(&app).clone();

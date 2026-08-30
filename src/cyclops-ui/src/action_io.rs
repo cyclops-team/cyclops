@@ -18,8 +18,8 @@ use std::time::Duration;
 use cyclops_proto::{MessageId, NotificationAttemptId};
 use serde_json::{json, Value};
 
-use crate::daemon_client::{AsyncClient, Certainty, ClientError};
 use crate::detail::{Check, Loaded, ThreadEntry};
+use cyclops_client::{AsyncClient, Certainty, ClientError};
 
 /// What a request is doing, which decides how its silence is read.
 ///

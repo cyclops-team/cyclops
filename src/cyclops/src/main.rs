@@ -1220,6 +1220,10 @@ fn cmd_ui(cli: &Cli, args: &UiArgs) -> i32 {
 }
 
 fn run_stream_ui(cli: &Cli, args: &UiArgs, filters: cyclops_ui::Filter) -> i32 {
+    fn focus_pane(target: &str) -> Result<(), String> {
+        cyclops_tmux::focus_pane(None, None, target).map_err(|error| error.to_string())
+    }
+
     cyclops_ui::run(cyclops_ui::UiOptions {
         plain: cli.plain,
         firehose: args.firehose,
@@ -1227,6 +1231,7 @@ fn run_stream_ui(cli: &Cli, args: &UiArgs, filters: cyclops_ui::Filter) -> i32 {
         from: filters.from,
         to: filters.to,
         backfill: args.backfill,
+        focus: Some(focus_pane),
     })
 }
 

@@ -7,6 +7,7 @@ members = [
     "src/cyclops-state",
     "src/cyclops-ledger",
     "src/cyclops-theme",
+    "src/cyclops-client",
     "src/cyclops-ui",
     "src/cyclopsd",
     "src/cyclops",
@@ -46,6 +47,7 @@ cyclops-tmux = { path = "src/cyclops-tmux" }
 cyclops-state = { path = "src/cyclops-state" }
 cyclops-ledger = { path = "src/cyclops-ledger" }
 cyclops-theme = { path = "src/cyclops-theme" }
+cyclops-client = { path = "src/cyclops-client" }
 cyclops-ui = { path = "src/cyclops-ui" }
 cyclops-testrig = { path = "tests/testrig" }
 cyclops-workspace = { path = "src/cyclops-workspace" }
