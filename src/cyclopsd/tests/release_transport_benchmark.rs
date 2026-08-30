@@ -1066,7 +1066,7 @@ fn test_status_daemon_identity_uses_the_protocol_field_and_package_version() {
 #[test]
 fn test_list_pane_lookup_uses_the_cli_agents_field() {
     let list = json!({
-        "home": "/private/tmp/cyc",
+        "home": "/private/tmp/cyc", // scratch-path-lint: non-filesystem JSON fixture
         "sessions": ["release-candidate"],
         "agents": [
             {"pane_id": "%1", "agent": "blocked"},

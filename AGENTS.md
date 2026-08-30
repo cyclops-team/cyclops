@@ -52,8 +52,9 @@ python3 scripts/check-doc-paths.py
 - Touching either installer requires keeping `scripts/install.sh` and
   `website/static/install.sh` byte-for-byte identical, then running
   `./tests/e2e/parity-check.sh --with-installer`.
-- CI also reruns the whole suite with `CYCLOPS_TEST_TMP` relocated and has an advisory
-  job against tmux built from master.
+- CI runs focused root-selection, source-boundary, and tmux/daemon/socket evidence
+  with `CYCLOPS_TEST_TMP` relocated, and has an advisory job against tmux built from
+  master.
 
 ## Rules that are unusual for this repo
 
