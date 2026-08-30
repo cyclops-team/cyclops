@@ -11,7 +11,8 @@ use cyclops_proto::{
     NotificationAttemptId, NotificationAttentionCause, NotificationBinding, NotificationManifestId,
     NotificationPreWriteCause, NotificationPreWriteObservation, NotificationRecord,
     NotificationRouteEvidenceId, NotificationState, NotificationWithdrawDisposition,
-    NotificationWithdrawResult, NotifyLevel, ProcessInstanceId, RecipientKey,
+    NotificationWithdrawResult, NotifyLevel, OpenDelivery, ProcessInstanceId, RecipientKey,
+    StatusBlockedNotification, StatusMailboxRoute,
 };
 use cyclops_tmux::{PaneRow, SessionWatcher};
 use tokio::time::Instant;
@@ -136,6 +137,32 @@ pub(crate) enum MessagingAttentionError {
     },
     #[error(transparent)]
     Mailbox(#[from] MailboxServiceError),
+}
+
+/// Body-free durable messaging facts used while composing daemon status.
+///
+/// The status surface receives this projection instead of reading mailbox
+/// variants, directory fallbacks, or notification indexes itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WorkspaceMessagingStatus {
+    pub(crate) mailbox_routes: Vec<StatusMailboxRoute>,
+    pub(crate) admin_unread: u64,
+    pub(crate) mailbox_attention: Vec<OpenDelivery>,
+    pub(crate) blocked_notifications: Vec<StatusBlockedNotification>,
+    pub(crate) blocked_notifications_total: u64,
+    unread_by_recipient: HashMap<RecipientKey, u64>,
+    projection_readable: bool,
+}
+
+impl WorkspaceMessagingStatus {
+    pub(crate) fn unread_for(&self, recipient: RecipientKey) -> Option<u64> {
+        self.projection_readable.then_some(
+            self.unread_by_recipient
+                .get(&recipient)
+                .copied()
+                .unwrap_or(0),
+        )
+    }
 }
 
 /// Narrow post-commit capabilities needed by durable message acceptance.
@@ -288,12 +315,12 @@ impl WorkspaceMessagingEffects for DaemonMessagingEffects {
 
 /// Internal messaging Module for one workspace.
 ///
-/// The module owns durable send/reply acceptance; inbox, message, alarm, and
-/// attention-selection reads; claims, requeue, exact pre-write withdrawal; and
-/// the post-commit actions that follow those mutations. Callers supply an
-/// authenticated identity and request; they do not receive the journal,
-/// projection, publication lock, worker, unread scheduler, or daemon
-/// composition root.
+/// The module owns durable send/reply acceptance; inbox, message, alarm,
+/// attention-selection, and status reads; claims, requeue, exact pre-write
+/// withdrawal; and the post-commit actions that follow those mutations.
+/// Callers supply an authenticated identity and request; they do not receive
+/// the journal, projection, publication lock, worker, unread scheduler, or
+/// daemon composition root.
 pub(crate) struct WorkspaceMessaging {
     service: Arc<MailboxService>,
     publication: Arc<StdMutex<()>>,
@@ -535,6 +562,99 @@ impl WorkspaceMessaging {
                 .map(|record| record.attempt_id.to_string())
                 .collect(),
             summaries: summaries.iter().map(alarm_summary).collect(),
+        })
+    }
+
+    /// Build the coherent body-free mailbox half of daemon status.
+    pub(crate) fn status_snapshot(
+        &self,
+        include_attention: bool,
+        observed_at_ms: u64,
+        blocked_limit: usize,
+    ) -> WorkspaceMessagingStatus {
+        self.with_published(|messaging| {
+            let service = &messaging.service;
+            let admin = service.admin().key;
+            let admin_unread = service.pending_count(admin);
+            let projection_readable = admin_unread.is_ok();
+            let admin_unread = admin_unread.unwrap_or(0) as u64;
+            let mut unread_by_recipient = HashMap::new();
+            if projection_readable {
+                unread_by_recipient.insert(admin, admin_unread);
+            }
+
+            let mut mailbox_routes: Vec<StatusMailboxRoute> = service
+                .routes()
+                .ok()
+                .map(|routes| {
+                    routes
+                        .into_iter()
+                        .map(|identity| {
+                            let unread = service
+                                .pending_count(identity.key)
+                                .ok()
+                                .map(|count| count as u64);
+                            if let Some(unread) = unread {
+                                unread_by_recipient.insert(identity.key, unread);
+                            }
+                            StatusMailboxRoute {
+                                recipient: identity.key,
+                                label: identity.label,
+                                unread,
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if let Ok(pending) = service.pending_recipients() {
+                for key in pending {
+                    let unread = service.pending_count(key).ok().map(|count| count as u64);
+                    if let Some(unread) = unread {
+                        unread_by_recipient.insert(key, unread);
+                    }
+                    if !mailbox_routes.iter().any(|route| route.recipient == key)
+                        && unread.unwrap_or(0) > 0
+                    {
+                        let label = service
+                            .recipient_label(key)
+                            .ok()
+                            .flatten()
+                            .or_else(|| {
+                                service
+                                    .identity_for_recipient(key)
+                                    .ok()
+                                    .flatten()
+                                    .map(|identity| identity.label)
+                            })
+                            .unwrap_or_else(|| key.to_string());
+                        mailbox_routes.push(StatusMailboxRoute {
+                            recipient: key,
+                            label,
+                            unread,
+                        });
+                    }
+                }
+            }
+
+            let mailbox_attention = if include_attention {
+                service.mailbox_attention_rows().unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let blocked = service
+                .blocked_notification_snapshot(observed_at_ms, blocked_limit)
+                .unwrap_or_default();
+
+            WorkspaceMessagingStatus {
+                mailbox_routes,
+                admin_unread,
+                mailbox_attention,
+                blocked_notifications: blocked.rows,
+                blocked_notifications_total: blocked.total,
+                unread_by_recipient,
+                projection_readable,
+            }
         })
     }
 
@@ -2247,6 +2367,52 @@ mod tests {
         assert_eq!(cleared.summaries.len(), 1);
         assert_eq!(cleared.summaries[0].id, preview.entries[0].id);
         assert_eq!(cleared.summaries[0].cause, preview.entries[0].cause);
+        assert!(effects.calls().is_empty());
+    }
+
+    // Obsolete if daemon status again reconstructs mailbox routes, unread
+    // counts, held attention, or blocked-notification samples itself.
+    #[test]
+    fn workspace_messaging_owns_the_body_free_status_projection_without_inner() {
+        let (_scratch, service, events, reviewer, observer) =
+            mailbox_service("workspace-messaging-status", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            effects.clone(),
+        );
+        let accepted = send_to(&service, &["reviewer", "observer"], "Status boundary");
+        let (_record, context) = prepare_context(&service, reviewer);
+        context.record_gating().unwrap();
+        context.record_quota_held().unwrap();
+
+        let quiet = messaging.status_snapshot(false, u64::MAX, 32);
+        assert!(quiet.mailbox_attention.is_empty());
+        assert_eq!(quiet.admin_unread, 0);
+        assert_eq!(quiet.unread_for(reviewer), Some(1));
+        assert_eq!(quiet.unread_for(observer), Some(1));
+        assert_eq!(quiet.mailbox_routes.len(), 3);
+        assert!(quiet.mailbox_routes.iter().any(|route| {
+            route.recipient == reviewer && route.label == "reviewer" && route.unread == Some(1)
+        }));
+        assert!(quiet.mailbox_routes.iter().any(|route| {
+            route.recipient == observer && route.label == "observer" && route.unread == Some(1)
+        }));
+
+        let detailed = messaging.status_snapshot(true, u64::MAX, 32);
+        assert_eq!(detailed.mailbox_attention.len(), 1);
+        assert_eq!(
+            detailed.mailbox_attention[0].id,
+            accepted.message_id.to_string()
+        );
+        assert_eq!(detailed.mailbox_attention[0].recipient, Some(reviewer));
+        assert_eq!(
+            detailed.mailbox_attention[0].cause.as_deref(),
+            Some("quota_held")
+        );
+        assert!(detailed.blocked_notifications.is_empty());
+        assert_eq!(detailed.blocked_notifications_total, 0);
         assert!(effects.calls().is_empty());
     }
 

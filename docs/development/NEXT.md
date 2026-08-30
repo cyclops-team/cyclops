@@ -14,7 +14,7 @@ preserved behavior, stop conditions, and rollback requirements.
 ## Current milestone
 
 The next focused completion pass runs on
-**beta/refactor/workspace-messaging-status**. The first Milestone 3 family
+**beta/refactor/workspace-messaging-runtime**. The first Milestone 3 family
 proved the internal seam. The read-and-claim pass then moved inbox listing,
 claiming, message snapshots, and durable follow pages behind
 `WorkspaceMessaging`; the Module owns retained claim-locator interpretation,
@@ -26,8 +26,11 @@ handlers and in-process seams no longer coordinate those mechanisms. The
 attention pass moved body-free alarm projection, administrator clearance,
 exact attention-target selection, ambiguity, and recipient privacy behind the
 Module; the socket layer no longer receives mailbox records for that family.
-The next pass removes direct mailbox projection reads from daemon status
-composition before the runtime-effects boundary is narrowed.
+The status pass moved mailbox route fallback, unread counts, held attention,
+and the bounded blocked-wake sample behind one body-free Module projection;
+daemon status retains the legacy session-ledger fold separately and no longer
+reads mailbox projections directly. The next pass narrows the runtime-effects
+boundary so messaging code cannot reach unrelated daemon state.
 Additional narrowly named completion branches remain allowed when one pull
 request would become broad. The corresponding observation completion pass
 follows before Milestone 6. Milestone 5 put retained direct-delivery entry
