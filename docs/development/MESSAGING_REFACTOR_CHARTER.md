@@ -199,7 +199,7 @@ All findings below were checked at the reviewed revision.
 | Current acceptance is already durable-first | `server::msg_send` authenticates, then `WorkspaceMessaging::send` calls `MailboxService`; the store prepares, appends, and commits its projection before the Module schedules notification, unread, and receipt consequences through a narrow effects capability. | Verified behavior preserved by Milestone 3 |
 | Claim coordinates several domains after commit | `MailboxService` commits the claim before notification settlement, delivery cancellation, attention reconciliation, FIFO scheduling, and unread projection. | Verified candidate for a later deep Interface |
 | Runtime observation still coordinates several consequence domains | Milestone 4 moved positive quota-reset consequences behind an immutable pane observation consumed by `WorkspaceMessaging`. Fusion still reads recovery and mailbox state, persists recovery, schedules attention work, emits events, paints chrome, and confirms delivery ACKs. | Verified responsibility leak, narrowed by Milestone 4 |
-| Current and legacy delivery still coexist | Normal `msg.send` uses the mailbox path. Hook self-test calls legacy `delivery::msg_send`. `Daemon::deliver_payload` remains an in-process bypass for tests and possible embedders. | Verified repository callers; installed embedder use unverified |
+| Current and legacy delivery still coexist | Normal `msg.send` uses the mailbox path. Hook self-test and `Daemon::deliver_payload` cross the explicit compatibility boundary before the retained direct writer. | Repository and local-install census complete; external embedder use unverified |
 | Historical replay has real obligations | Formats 1 and 2, original doorbells, incomplete bindings, legacy direct payloads, and the replay-only historical `Staged` to `Submitted` transition remain readable under explicit restrictions. | Verified compatibility obligation |
 | Official transports duplicate uncertainty knowledge | CLI, stream UI, and workspace separately implement greeting, framing, response handling, gaps, reconnect, and timeouts. | Verified repeated knowledge |
 | Headless runtime and build independence differ | `cyclopsd` has no production UI dependency. The public `cyclops` binary depends on both UI crates. | Runtime independence verified; build independence incomplete |
@@ -296,7 +296,7 @@ redesign.
 | Bounded sender-authored preview | `DELIVERY.md`, direct user goal | Format 4 stores and stages the sender’s bounded two-sentence summary | Yes | Exact grammar may change only after measurement; purpose and bound remain |
 | Operator-controlled raw-tmux emergency | `README.md`, `DELIVERY.md` | Manual path is outside receipts and never automatic after uncertainty | Yes | One role-aware procedure may unify docs and skill; no synthetic facts |
 | Process-derived caller identity | `INVARIANTS.md`, `PROTOCOL.md` | Peer credentials and ancestry decide vendor, admin, or denial | Yes | Adapters may inherit identity only after host proof; no claimed sender input |
-| `Daemon::deliver_payload` compatibility seam | Repository callers verified; external callers unverified | Tests and possible embedders may use the in-process bypass | Compatibility-sensitive; support status unverified | Do not remove or substantially change it until the caller census finishes |
+| `Daemon::deliver_payload` compatibility seam | Milestone 5 repository and local-install census complete; external callers remain unverified | Nine repository test/support call sites and possible embedders may use the in-process bypass | Compatibility-sensitive; support status unverified | Preserve the exact seam; a later removal needs separate external-support evidence and approval |
 | Compatibility obligations | `DELIVERY.md`, `PROTOCOL.md` | Old doorbells, Formats 1 and 2, incomplete bindings, direct payloads, and replay-only transitions remain readable | Preserve every currently readable journal format throughout this refactor; this is not an indefinite promise | Old writers may later be quarantined or retired; readers and fixtures remain until a separately approved history boundary |
 | Data lifecycle | Interim operator rule | Append and replay are specified; full retention, export, restore, deletion, and migration policy is deferred | No silent deletion, truncation, or rewriting | A breaking migration requires an explicit export or migration path; a complete lifecycle policy needs separate approval |
 | Human-input safety | `INVARIANTS.md`, `DELIVERY.md` | Fresh positive composer and occupant evidence, late proof, durable intent, exact verification, conservative recovery | Concrete goal and guards: yes. Absolute “always”: no | Correct wording and add characterization; absolute safety needs cooperative input ownership |
@@ -348,10 +348,18 @@ redesign.
 
 - Normal socket `msg.send`, `msg.reply`, and claim operations use
   `MailboxService` and the current messaging coordinator.
-- Hook self-test calls `delivery::msg_send` directly and bypasses the mailbox.
+- Hook self-test bypasses the mailbox through
+  `compatibility::deliver_payload`. A private boundary capability prevents it
+  or any new caller from reaching the retained direct writer accidentally.
 - `Daemon::deliver_payload` remains an in-process direct-delivery Interface for
-  tests and possible embedders. It is compatibility-sensitive, but its public
-  support status is unverified.
+  tests and possible embedders. The repository has nine call sites across seven
+  integration-test or test-support files and no production caller of that
+  public method. A read-only search under `/Users/yahirh/projects` and
+  `/Users/yahirh/Documents` found only Cyclops worktrees and one archived
+  Cyclops source snapshot. An exact public GitHub code search found no other
+  Rust definition. Those negative results do not prove that no external
+  embedder exists, so public support status remains unverified and the method
+  is preserved unchanged.
 - Summaryless wire clients can still select Format 3 or canonical direct
   fallback. Current CLI sends Format 4.
 - Formats 1 and 2, original doorbells, incomplete historical bindings, unknown
@@ -359,6 +367,29 @@ redesign.
   historical direct `Staged` to `Submitted` edge remain replay obligations.
 - Session-ledger recovery still folds legacy delivery chains independently from
   workspace-owned notification attempts.
+
+### Read-only retained-format census
+
+Measured on 2026-08-29 across the seven NDJSON or JSONL files under the local
+Cyclops state root, including its retained archive:
+
+- all 575 lines parsed as JSON;
+- the largest JSON object was 1,781 bytes, excluding its newline;
+- kinds were 394 `state`, 135 `system`, 22 `gate`, 14 `msg`, and 10 records
+  without a `kind` field;
+- retained notification transitions included five Format 3 and eight Format 4
+  writing facts;
+- 130 records carried record version 1 and three resolution records carried
+  proof version 1; and
+- the census emitted only structural metadata. It did not emit, copy, or store
+  message bodies.
+
+This is evidence about the inspected local state, not permission to reject a
+larger historical object or delete another readable shape. Formats 1 and 2,
+original and summaryless doorbells, incomplete bindings, restricted unknown
+numeric formats, direct payloads, historical `Staged` to `Submitted`, linked
+session journals, and workspace-journal versions remain covered by their
+existing readers and fixtures.
 
 ### Questions that block deletion or substantial compatibility changes
 
@@ -417,6 +448,28 @@ Each milestone must leave the repository coherent if all later work stops.
 | Milestone 5 | Quarantine proven legacy writers and readers behind an explicit compatibility path | Caller census, replay fixtures, and restart traces define the supported history boundary |
 | Milestone 6 | Complete honest snapshot/follow/event and pure presentation seams | UI rebuilds authorized state without reusable presentation code reading journals or tmux |
 | Milestone 7 | Complete the missing full-workspace collapsed cue while preserving existing pane border and chrome-free choices | Full, compact, hidden, adopted-tmux, detach, and reconnect journeys agree without forced chrome or broadcast content |
+
+### Completion rule for Milestones 3 and 4
+
+The first operation family proves that a seam can carry real behavior. It does
+not complete the responsibility migration by itself. Continue with additional
+focused pull requests before Milestone 6 until:
+
+- `WorkspaceMessaging` owns the durable messaging decisions assigned to it by
+  this charter;
+- ordinary callers no longer understand journal variants, projection internals,
+  messaging locks, worker topology, or post-commit scheduling;
+- observation returns immutable evidence instead of executing messaging policy;
+- remaining `Arc<Inner>` use cannot let messaging code reach unrelated daemon
+  state merely for convenience; and
+- a fresh architecture audit finds no material messaging responsibility in the
+  wrong module.
+
+This is a responsibility and locality gate, not an instruction to remove every
+`Arc`, invent a perfect abstraction, or move unrelated daemon behavior. Each
+additional pull request remains a focused, independently reviewable slice.
+Presentation ownership of sockets, journals, tmux, or messaging mechanisms is
+the corresponding exit gate for Milestone 6.
 
 Runner, host-adapter, and MCP work are research gates, not production milestones
 in this sequence. They enter a later charter only if their probes pass.

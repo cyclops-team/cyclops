@@ -10,7 +10,8 @@
 //! Four things live here that read like they belong elsewhere, and each
 //! one is here because it needs the same handle the pipeline holds:
 //! `admin_notify` (a ping usually points at a delivery), `close_limbo`
-//! (the restart sweep over chains this file left open), `agent_wait` and
+//! (the retained restart sweep, entered only through `compatibility.rs`),
+//! `agent_wait` and
 //! `wait_pinned` (send-and-wait pins on the pid the submit went to), and
 //! `About`, the item a ping names so a reader can stop showing it.
 //!
@@ -1900,7 +1901,11 @@ pub(crate) async fn quiesce(inner: &Arc<Inner>, timeout_ms: Option<u64>) -> Quie
 /// that file, so a chain recorded in another session's file is never
 /// falsely closed here; a delivery that died before its first state line
 /// still closes through its hosted msg record.
-pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine>)]) {
+pub(crate) fn close_limbo(
+    inner: &Arc<Inner>,
+    replayed: &[(usize, Vec<LedgerLine>)],
+    _boundary: &crate::compatibility::BoundaryToken,
+) {
     /// What `render_payload` needs to rebuild a requeued delivery's bytes,
     /// straight off the msg line.
     struct Envelope {
@@ -2314,6 +2319,7 @@ pub(crate) async fn msg_send(
     inner: &Arc<Inner>,
     from: &str,
     params: MsgSendParams,
+    _boundary: &crate::compatibility::BoundaryToken,
 ) -> Result<Value, WireError> {
     if inner.session_count() == 0 {
         return Err(wire_err("no_such_target", "no sessions are watched"));

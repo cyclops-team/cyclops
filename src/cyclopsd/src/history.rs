@@ -16,19 +16,18 @@
 //! machine, so no indexed reader was added to that crate; the additive
 //! index stays a measured-need option, not a speculative one.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
-use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use cyclops_proto::{
     Delivery, HistoryParams, HistoryResult, Kind, LedgerLine, MessageMetadata, OpenDelivery,
     RecipientKey, ThreadResult, WireError,
 };
-use cyclops_state::StateRoot;
 use serde_json::Value;
-use tracing::{error, warn};
+use tracing::warn;
 
+use crate::compatibility;
 use crate::identity;
 use crate::mailbox::MailboxIdentity;
 use crate::server::sender_panes;
@@ -330,34 +329,11 @@ fn history_sources(inner: &Inner) -> (Vec<Vec<LedgerLine>>, Vec<String>, Option<
             }
         }
     }
-    let roots = inner
-        .session_slots()
-        .into_iter()
-        .enumerate()
-        .map(|(idx, slot)| {
-            (
-                idx,
-                slot.journal_file_name().unwrap_or_default(),
-                read_session(&slot),
-            )
-        })
-        .collect();
-    for (journal, lines) in session_journal_replay(&inner.state_root, roots).files {
-        names.push(legacy_journal_source_for_file(&journal));
+    for (source, lines) in compatibility::history_sources(inner) {
+        names.push(source);
         files.push(lines);
     }
     (files, names, workspace_file)
-}
-
-fn legacy_journal_source_for_file(file: &str) -> String {
-    format!("session-journal:{file}")
-}
-
-pub(crate) struct SessionJournalReplay {
-    /// Globally unique files for id preload and the history read model.
-    pub(crate) files: Vec<(String, Vec<LedgerLine>)>,
-    /// One causally ordered stream per unambiguous configured root.
-    pub(crate) recovery: Vec<(usize, Vec<LedgerLine>)>,
 }
 
 /// Recover the display name last observed for a configured session.
@@ -415,196 +391,6 @@ pub(crate) fn latest_session_rename(
 
 fn valid_session_name(name: &str) -> bool {
     !name.trim().is_empty()
-}
-
-struct SessionJournalNode {
-    journal: String,
-    lines: Vec<LedgerLine>,
-    links: Vec<String>,
-    owners: BTreeSet<usize>,
-}
-
-/// Root session journals plus every rename-linked journal they reach.
-///
-/// History and boot recovery share this traversal so a linked compatibility
-/// chain cannot be visible to readers while remaining invisible to id preload
-/// or restart settlement. History sees each file once. Recovery sees each
-/// unambiguous family descendants-first and its configured root last, so a
-/// terminal fact appended to the root on an earlier boot follows the linked
-/// message that fact closes.
-pub(crate) fn session_journal_replay(
-    state_root: &StateRoot,
-    roots: Vec<(usize, String, Vec<LedgerLine>)>,
-) -> SessionJournalReplay {
-    let mut nodes = Vec::<SessionJournalNode>::new();
-    let mut by_journal = HashMap::<String, usize>::new();
-    let mut root_nodes = Vec::new();
-    let mut pending = VecDeque::<(usize, usize)>::new();
-    for (idx, journal, lines) in roots {
-        let node_idx = match by_journal.get(&journal).copied() {
-            Some(node_idx) => node_idx,
-            None => {
-                let node_idx = nodes.len();
-                by_journal.insert(journal.clone(), node_idx);
-                nodes.push(SessionJournalNode {
-                    links: linked_session_journals(&lines),
-                    journal,
-                    lines,
-                    owners: BTreeSet::new(),
-                });
-                node_idx
-            }
-        };
-        root_nodes.push((idx, node_idx));
-        if nodes[node_idx].owners.insert(idx) {
-            pending.push_back((node_idx, idx));
-        }
-    }
-
-    // The queue is one (journal, configured owner) pair. A cycle can revisit
-    // a file, but it cannot add the same owner twice, so traversal is bounded
-    // by files times configured roots.
-    while let Some((node_idx, owner)) = pending.pop_front() {
-        let links = nodes[node_idx].links.clone();
-        for linked in links {
-            let linked_idx = match by_journal.get(&linked).copied() {
-                Some(linked_idx) => linked_idx,
-                None => {
-                    let descendant = PathBuf::from("ledger").join(&linked);
-                    let lines = match cyclops_ledger::read_after(state_root, &descendant, 0) {
-                        Ok(lines) => lines,
-                        Err(read_error) => {
-                            warn!(journal = linked, error = %read_error, "linked session journal is unreadable");
-                            Vec::new()
-                        }
-                    };
-                    let linked_idx = nodes.len();
-                    by_journal.insert(linked.clone(), linked_idx);
-                    nodes.push(SessionJournalNode {
-                        links: linked_session_journals(&lines),
-                        journal: linked,
-                        lines,
-                        owners: BTreeSet::new(),
-                    });
-                    linked_idx
-                }
-            };
-            if nodes[linked_idx].owners.insert(owner) {
-                pending.push_back((linked_idx, owner));
-            }
-        }
-    }
-
-    for node in &nodes {
-        if node.owners.len() > 1 {
-            error!(
-                journal = node.journal,
-                owners = ?node.owners,
-                "linked session journal has more than one configured owner; restart recovery will leave it untouched"
-            );
-        }
-    }
-
-    fn collect_descendants_first(
-        node_idx: usize,
-        owner: usize,
-        nodes: &[SessionJournalNode],
-        by_journal: &HashMap<String, usize>,
-        visited: &mut HashSet<usize>,
-        order: &mut Vec<usize>,
-    ) {
-        if !visited.insert(node_idx)
-            || nodes[node_idx].owners.len() != 1
-            || !nodes[node_idx].owners.contains(&owner)
-        {
-            return;
-        }
-        for linked in &nodes[node_idx].links {
-            if let Some(linked_idx) = by_journal.get(linked).copied() {
-                collect_descendants_first(linked_idx, owner, nodes, by_journal, visited, order);
-            }
-        }
-        order.push(node_idx);
-    }
-
-    let mut recovery = Vec::new();
-    let mut history_order = Vec::new();
-    let mut history_seen = HashSet::new();
-    for (owner, root_idx) in root_nodes {
-        let mut visited = HashSet::new();
-        let mut family = Vec::new();
-        collect_descendants_first(
-            root_idx,
-            owner,
-            &nodes,
-            &by_journal,
-            &mut visited,
-            &mut family,
-        );
-        let lines = family
-            .iter()
-            .flat_map(|node_idx| nodes[*node_idx].lines.iter().cloned())
-            .collect();
-        for node_idx in family {
-            if history_seen.insert(node_idx) {
-                history_order.push(node_idx);
-            }
-        }
-        recovery.push((owner, lines));
-    }
-    // Ambiguously owned or otherwise unreachable nodes stay visible to
-    // history and id preload, but follow the unambiguous causal families.
-    for node_idx in 0..nodes.len() {
-        if history_seen.insert(node_idx) {
-            history_order.push(node_idx);
-        }
-    }
-    let mut nodes = nodes.into_iter().map(Some).collect::<Vec<_>>();
-    let files = history_order
-        .into_iter()
-        .map(|node_idx| {
-            let node = nodes[node_idx].take().expect("journal emitted once");
-            (node.journal, node.lines)
-        })
-        .collect();
-    SessionJournalReplay { files, recovery }
-}
-
-fn linked_session_journals(lines: &[LedgerLine]) -> Vec<String> {
-    lines
-        .iter()
-        .filter_map(|line| line.data.as_ref())
-        .filter(|data| data["event"] == "session_slot_aliased")
-        .filter_map(|data| data["canonical_journal"].as_str())
-        .filter_map(|file| {
-            if valid_session_journal_file(file) {
-                Some(file.to_owned())
-            } else {
-                warn!(journal = file, "invalid linked session journal was ignored");
-                None
-            }
-        })
-        .collect()
-}
-
-fn valid_session_journal_file(file: &str) -> bool {
-    let path = Path::new(file);
-    matches!(
-        path.components().collect::<Vec<_>>().as_slice(),
-        [Component::Normal(_)]
-    ) && path
-        .extension()
-        .is_some_and(|extension| extension == "ndjson")
-}
-
-fn read_session(slot: &crate::SessionSlot) -> Vec<LedgerLine> {
-    match slot.ledger.read_after(0) {
-        Ok(lines) => lines,
-        Err(e) => {
-            warn!(session = %slot.name(), error = %e, "history read failed; treating as empty");
-            Vec::new()
-        }
-    }
 }
 
 /// Fold one file's delivery-state lines into its msg/fyi lines. Returns the

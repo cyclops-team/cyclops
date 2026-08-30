@@ -153,14 +153,37 @@ return to idle. Cyclops does not pair Claude's next `Stop` with that prompt by
 arrival order or elapsed time. Blocked states always come from rules because
 no tested CLI hook identifies its modals or quota screens.
 
+## Retained compatibility boundary
+
+`src/cyclopsd/src/compatibility.rs` is the explicit entry point for behavior
+that predates the workspace mailbox: direct in-process payload delivery,
+restart settlement of direct-delivery chains, and replay of session journals
+linked across session renames. It does not make those paths the current
+messaging contract and does not promise indefinite support.
+
+The direct writer and restart settlement functions in `delivery.rs` require a
+private capability value that only `compatibility.rs` owns. The hook self-test
+and `Daemon::deliver_payload` therefore cannot reach those writers without
+naming the compatibility boundary. `Daemon::deliver_payload` remains
+compatibility-sensitive and unchanged; its public support status is unverified.
+
+The history read model asks the same boundary for compatibility sources. That
+boundary owns session-journal discovery, safe rename-link traversal, and the
+`session-journal:<file>` source label. Ambiguously owned linked files remain
+readable and reserve their identifiers, but they cannot authorize restart
+settlement. Workspace-owned records still win identity and body collisions.
+Nothing in this quarantine rewrites, truncates, or deletes a journal.
+
 ## Legacy direct-payload sending: how a message becomes a receipt
 
 This section documents the compatibility pipeline. The public `msg.send`
 endpoint uses the mailbox path: it returns durable acceptance, then schedules a
 separate notification attempt as specified in [DELIVERY.md](DELIVERY.md). The
-internal `delivery::msg_send` compatibility function writes a session fact and
-fans out; one FIFO worker per recipient pane then carries each chain on its own.
-The implementation is `src/cyclopsd/src/delivery.rs`.
+`compatibility::deliver_payload` entry point delegates to the retained direct
+writer in `delivery.rs`, which writes a session fact and fans out; one FIFO
+worker per recipient pane then carries each chain on its own. The boundary is
+`src/cyclopsd/src/compatibility.rs`; the pipeline remains in
+`src/cyclopsd/src/delivery.rs`.
 
 ### The call: what the sender gets back
 
@@ -336,8 +359,10 @@ therefore not in the queue that a park drains.
 
 One transition is missing from the diagram because it has no single source.
 A daemon restart closes every chain still in flight to `attention_required`
-with cause `daemon_restart`, whatever state it was in (`delivery.rs`,
-`close_limbo`). Limbo is a bug, so a restart never leaves a chain open.
+with cause `daemon_restart`, whatever state it was in
+(`compatibility::recover_direct_deliveries` delegates to the retained
+`delivery.rs` settlement). Limbo is a bug, so a restart never leaves a chain
+open.
 
 ## What needs a human, and who owns it
 

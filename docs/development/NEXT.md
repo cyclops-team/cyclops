@@ -13,26 +13,36 @@ preserved behavior, stop conditions, and rollback requirements.
 
 ## Current milestone
 
-Milestone 5 runs on **beta/refactor/legacy-compatibility**. It quarantines only
-the proven compatibility-sensitive legacy writers and readers after completing
-their caller census and focused replay evidence. Milestone 4 moved positive
-quota-reset consequences out of fusion: pane observation now returns immutable
-evidence, while `WorkspaceMessaging` commits the durable reset facts and decides
-the explicit administrator notices that the daemon composition root commits in
-PR #109. Milestone 3 put send and reply
+The next focused completion pass runs on
+**beta/refactor/workspace-messaging-completion**. The first Milestone 3 family
+proved the internal seam; this pass continues moving charter-assigned durable
+messaging decisions and post-commit coordination out of ordinary callers.
+Additional narrowly named completion branches remain allowed when one pull
+request would become broad. The corresponding observation completion pass
+follows before Milestone 6. Milestone 5 put retained direct-delivery entry
+points, restart
+settlement, and session-journal traversal behind
+`src/cyclopsd/src/compatibility.rs`; its census preserves
+`Daemon::deliver_payload` with support status unverified and preserves every
+currently readable journal shape. Milestone 4 moved positive quota-reset
+consequences out of fusion: pane observation now returns immutable evidence,
+while `WorkspaceMessaging` commits the durable reset facts and decides the
+explicit administrator notices that the daemon composition root commits in PR
+#109. Milestone 3 put send and reply
 acceptance behind the internal `WorkspaceMessaging` Module. Milestone 2
 consolidated official transport semantics in PR #104, and Milestone 1 merged in
 PR #103 after the documentation authority repair in PR #101.
 
 Exit evidence:
 
-- the caller census identifies every repository use of compatibility-sensitive
-  legacy paths, including `Daemon::deliver_payload`;
-- proven legacy writers and readers sit behind one explicit compatibility
-  boundary without claiming unverified public support;
-- retained replay fixtures and restart traces define the readable history
-  boundary; and
-- focused boundary tests and all required repository gates pass.
+- `WorkspaceMessaging` owns the charter-assigned durable messaging decisions;
+- ordinary callers do not understand journal variants, projection internals,
+  messaging locks, worker topology, or post-commit scheduling;
+- remaining `Arc<Inner>` use cannot give messaging code unrelated daemon state
+  merely for convenience;
+- focused contract evidence protects each moved family; and
+- a fresh responsibility audit identifies no material messaging decision left
+  in an ordinary caller before observation completion begins.
 
 ## Milestone queue
 
@@ -50,6 +60,11 @@ Exit evidence:
    responsibilities without changing durable behavior.
 5. **beta/refactor/legacy-compatibility**: quarantine compatibility-sensitive
    legacy paths after the caller census and focused regression evidence.
+   Before Milestone 6, use focused
+   **beta/refactor/workspace-messaging-completion** and
+   **beta/refactor/observation-messaging-completion** pull requests, with a
+   descriptive suffix for any additional slice, until the charter's
+   responsibility audit is clean.
 6. **beta/refactor/presentation-seams**: make snapshot, follow, event, and
    presentation seams honest and explicit.
 7. **beta/feat/collapsed-messages-cue**: add the missing collapsed-workspace
@@ -77,19 +92,19 @@ provides measurable isolation, and the operator separately approves it.
   performance, migration, and user-journey audits before the final pull request
   from **beta/messaging-rework** into `main`.
 
-## Milestone 5 session boundary
+## WorkspaceMessaging completion session boundary
 
 Use this scope:
 
-> Implement only Milestone 5 from the approved Messaging Refactor Charter:
-> quarantine proven legacy writers and readers behind an explicit compatibility
-> path. Complete the caller census first, preserve every currently readable
-> journal format, and use replay fixtures plus restart traces to define the
-> supported history boundary. Do not substantially change or remove
-> Daemon::deliver_payload until its census is complete. Do not begin
-> presentation work, UI redesign, broad CI restructuring, MCP work, or later
-> milestones. Preserve honest uncertainty and stop if any charter stop
-> condition is encountered.
+> Continue Milestone 3 from the approved Messaging Refactor Charter after its
+> first tracer family. Move one additional coherent family of durable messaging
+> decisions or post-commit coordination behind `WorkspaceMessaging`, and prove
+> the ordinary caller loses journal, projection, lock, worker, or scheduling
+> knowledge. Keep the pull request focused and repeat through later focused
+> branches until the responsibility audit is clean. Do not change wire meaning,
+> readable journals, UI behavior, observation policy, presentation, broad CI,
+> MCP, or later milestones. Preserve honest uncertainty and stop if any charter
+> stop condition is encountered.
 
 ## Release naming gate
 
