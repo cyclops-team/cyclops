@@ -52,7 +52,7 @@ const STATUS_BLOCKED_NOTIFICATION_LIMIT: usize = 32;
 const STATUS_REFRESH_INCOMPLETE: &str = "status_refresh_incomplete";
 
 /// The same source build identifier written on the daemon boot log line.
-const BUILD_REF: &str = env!("CYCLOPS_BUILD_REF");
+const BUILD_REF: &str = cyclops_proto::BUILD_REF;
 
 /// One kernel observation shared by every hello and status answer.
 fn daemon_process() -> Option<ProcessInstanceId> {

@@ -31,6 +31,7 @@
 //! and it sits in the crate every other crate already depends on.
 
 pub mod attention;
+pub mod build_identity;
 pub mod identity;
 pub mod label;
 pub mod ledger;
@@ -41,6 +42,7 @@ pub mod state;
 pub mod wire;
 
 pub use attention::*;
+pub use build_identity::*;
 pub use identity::*;
 pub use ledger::*;
 pub use mailbox::*;

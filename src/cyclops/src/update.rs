@@ -46,8 +46,8 @@ use cyclops_state::{
 const DEFAULT_REPO: &str = "https://github.com/cyclops-team/cyclops.git";
 const DEFAULT_REF: &str = "main";
 
-/// The commit baked into this binary by build.rs.
-const BUILD_REF: &str = env!("CYCLOPS_BUILD_REF");
+/// The commit baked into every Cyclops component by the shared build stamp.
+const BUILD_REF: &str = cyclops_proto::BUILD_REF;
 
 /// What the baked build ref can say about a freshness check.
 #[derive(Debug, PartialEq)]
@@ -2456,9 +2456,22 @@ fn prove_candidate_replay(
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
-    let build = candidate_build(&pair.join("cyclops"))?;
-    if hello.build.as_deref() != Some(build.as_str()) {
-        return Err("candidate CLI and daemon source builds do not match".to_string());
+    let client_identity_text = binary_identity(&pair.join("cyclops"), "cyclops")?;
+    if client_identity_text != pair_proof.identity {
+        return Err(format!(
+            "candidate CLI identity changed during replay: staged {:?}, running {:?}",
+            pair_proof.identity, client_identity_text
+        ));
+    }
+    let client_identity = cyclops_client::RuntimeIdentity::parse(&client_identity_text)
+        .ok_or_else(|| "candidate pair has an invalid runtime identity".to_string())?;
+    let daemon_identity = cyclops_client::RuntimeIdentity::from_hello(&hello);
+    if client_identity != daemon_identity {
+        return Err(format!(
+            "candidate CLI identity {} does not match daemon greeting {}",
+            client_identity.description(),
+            daemon_identity.description()
+        ));
     }
     let stopped = Command::new(pair.join("cyclops"))
         .args(["daemon", "stop"])
@@ -2674,6 +2687,7 @@ fn hash_regular_file(path: &Path, hasher: &mut Sha256) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn candidate_build(binary: &Path) -> Result<String, String> {
     let output = version_output(binary)
         .map_err(|error| format!("run {} --version: {error}", binary.display()))?;
@@ -2682,6 +2696,19 @@ pub(crate) fn candidate_build(binary: &Path) -> Result<String, String> {
     }
     identity_build(String::from_utf8_lossy(&output.stdout).trim())
         .map_err(|_| format!("{} did not report a source build", binary.display()))
+}
+
+pub(crate) fn candidate_identity(
+    binary: &Path,
+    expected_name: &str,
+) -> Result<cyclops_client::RuntimeIdentity, String> {
+    let identity = binary_identity(binary, expected_name)?;
+    cyclops_client::RuntimeIdentity::parse(&identity).ok_or_else(|| {
+        format!(
+            "{} did not report a complete runtime identity",
+            binary.display()
+        )
+    })
 }
 
 fn identity_build(identity: &str) -> Result<String, String> {
@@ -3109,11 +3136,13 @@ fn validate_uninstall_pair(prefix: &Path) -> Result<PathBuf, String> {
             client.display()
         ));
     }
-    let client_build = candidate_build(&client)?;
-    let daemon_build = candidate_build(&daemon)?;
-    if client_build != daemon_build {
+    let client_identity = candidate_identity(&client, "cyclops")?;
+    let daemon_identity = candidate_identity(&daemon, "cyclopsd")?;
+    if client_identity != daemon_identity {
         return Err(format!(
-            "selected client build {client_build} does not match daemon build {daemon_build}"
+            "selected client identity {} does not match daemon identity {}",
+            client_identity.description(),
+            daemon_identity.description()
         ));
     }
     Ok(daemon)
@@ -3319,13 +3348,12 @@ fn prove_selected_rollback_replay(
     })?;
     let pair = store.pair_path(&selection.known_good)?;
     verify_recorded_pair(&pair, proof)?;
-    let expected_build = identity_build(&proof.identity)?;
     let replay = prove_candidate_replay(&pair, source_home, scratch)
         .map_err(|error| format!("known-good journal replay failed: {error}"))?;
-    let replayed_build = identity_build(&replay.pair.identity)?;
-    if replayed_build != expected_build {
+    if replay.pair.identity != proof.identity {
         return Err(format!(
-            "known-good replay reported build {replayed_build}, expected {expected_build}"
+            "known-good replay reported identity {:?}, expected {:?}",
+            replay.pair.identity, proof.identity
         ));
     }
     Ok(replay)
@@ -3415,12 +3443,20 @@ fn run_rollback(style: &Style) -> i32 {
 }
 
 fn start_pair_daemon(daemon: &Path) -> Result<(), String> {
-    let build = candidate_build(daemon)?;
-    start_pair_daemon_with_build(daemon, &build)
+    let directory = daemon
+        .parent()
+        .ok_or_else(|| format!("selected daemon {} has no pair directory", daemon.display()))?;
+    let identity = prove_pair_identity(directory)?;
+    let identity = cyclops_client::RuntimeIdentity::parse(&identity)
+        .ok_or_else(|| "selected pair has an invalid runtime identity".to_string())?;
+    start_pair_daemon_with_identity(daemon, &identity)
 }
 
-fn start_pair_daemon_with_build(daemon: &Path, build: &str) -> Result<(), String> {
-    match crate::daemon::start_and_prove_from(&cyclops_proto::cyclops_home(), daemon, build)? {
+fn start_pair_daemon_with_identity(
+    daemon: &Path,
+    identity: &cyclops_client::RuntimeIdentity,
+) -> Result<(), String> {
+    match crate::daemon::start_and_prove_from(&cyclops_proto::cyclops_home(), daemon, identity)? {
         crate::daemon::Started::Spawned => Ok(()),
         crate::daemon::Started::AlreadyRunning => {
             Err("another daemon answered before the selected pair started".to_string())
@@ -3429,13 +3465,18 @@ fn start_pair_daemon_with_build(daemon: &Path, build: &str) -> Result<(), String
 }
 
 fn start_and_prove_selected(store: &PairStore) -> Result<(), String> {
+    let cli = store.active_binary("cyclops")?;
     let daemon = store.active_binary("cyclopsd")?;
-    let cli_build = candidate_build(&store.active_binary("cyclops")?)?;
-    let daemon_build = candidate_build(&daemon)?;
-    if cli_build != daemon_build {
-        return Err("selected CLI and daemon source builds do not match".to_string());
+    let cli_identity = candidate_identity(&cli, "cyclops")?;
+    let daemon_identity = candidate_identity(&daemon, "cyclopsd")?;
+    if cli_identity != daemon_identity {
+        return Err(format!(
+            "selected CLI identity {} does not match daemon identity {}",
+            cli_identity.description(),
+            daemon_identity.description()
+        ));
     }
-    start_pair_daemon_with_build(&daemon, &cli_build)
+    start_pair_daemon_with_identity(&daemon, &cli_identity)
 }
 
 const GENERATION_MIGRATION: &str =
@@ -3737,6 +3778,33 @@ mod tests {
             error.contains("decode candidate hello"),
             "unexpected replay failure: {error}"
         );
+        assert_replay_probe_reaped(&scratch);
+    }
+
+    #[test]
+    fn candidate_replay_refuses_a_greeting_with_the_same_build_but_another_version() {
+        let scratch = Scratch::create().unwrap();
+        let pair = scratch.path().join("pair-version-mismatch");
+        let hello = serde_json::to_string(&cyclops_proto::Hello {
+            cyclops: "0.0.9".to_string(),
+            build: Some("same-build".to_string()),
+            daemon_process: None,
+            daemon_executable: None,
+            proto: cyclops_proto::PROTOCOL_VERSION,
+            boot_id: "probe-version-mismatch".to_string(),
+        })
+        .unwrap();
+        replay_failure_pair(
+            &pair,
+            "same-build",
+            &hello,
+            b"#!/bin/sh\n[ \"$1\" = \"--version\" ] && { echo 'cyclops 0.1.0 (same-build)'; exit 0; }\nexit 1\n",
+        );
+
+        let error =
+            prove_candidate_replay(&pair, &scratch.path().join("absent"), &scratch).unwrap_err();
+        assert!(error.contains("0.1.0 (same-build)"), "{error}");
+        assert!(error.contains("0.0.9 (same-build)"), "{error}");
         assert_replay_probe_reaped(&scratch);
     }
 
@@ -4783,6 +4851,24 @@ sys.exit(43)"#,
         assert!(error.contains("does not match"), "{error}");
         assert!(error.contains("cli-build"), "{error}");
         assert!(error.contains("daemon-build"), "{error}");
+    }
+
+    #[test]
+    fn same_build_different_versions_are_not_a_matched_pair() {
+        let scratch = Scratch::create().unwrap();
+        let source = scratch.path().join("mixed-version");
+        pair_source(&source, "same-build");
+        std::fs::remove_file(source.join("cyclopsd")).unwrap();
+        write_new(
+            &source.join("cyclopsd"),
+            b"#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo 'cyclopsd 0.0.9 (same-build)'\n",
+            0o755,
+        )
+        .unwrap();
+
+        let error = prove_pair_identity(&source).unwrap_err();
+        assert!(error.contains("0.1.0 (same-build)"), "{error}");
+        assert!(error.contains("0.0.9 (same-build)"), "{error}");
     }
 
     #[test]

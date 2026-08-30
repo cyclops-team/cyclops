@@ -2,11 +2,12 @@
 //!
 //! Blocking CLI and workspace callers and async stream callers differ in how
 //! they wait, not in what socket facts mean. This module owns Hello-first
-//! connection facts, bounded NDJSON, request correlation, event buffering,
-//! timeout classes and their certainty, refusal decoding, post-write
-//! uncertainty, and subscription gap classification. Callers choose or accept
-//! the shared default deadlines. Applications own retry and reconnect
-//! schedules, projection restoration, and domain-result presentation.
+//! connection facts, runtime compatibility classification, bounded NDJSON,
+//! request correlation, event buffering, timeout classes and their certainty,
+//! refusal decoding, post-write uncertainty, and subscription gap
+//! classification. Callers choose or accept the shared default deadlines.
+//! Applications own retry and reconnect schedules, projection restoration, and
+//! domain-result presentation.
 
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
@@ -23,6 +24,115 @@ use tokio::net::UnixStream as AsyncUnixStream;
 
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Cargo workspace version compiled into this official client.
+pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// One running Cyclops component's Cargo version and source build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeIdentity {
+    pub version: String,
+    pub build: Option<String>,
+}
+
+impl RuntimeIdentity {
+    pub fn new(version: impl Into<String>, build: Option<&str>) -> Self {
+        Self {
+            version: version.into(),
+            build: build.map(str::to_string),
+        }
+    }
+
+    pub fn current_client() -> Self {
+        Self::new(CLIENT_VERSION, Some(cyclops_proto::BUILD_REF))
+    }
+
+    pub fn from_hello(hello: &Hello) -> Self {
+        Self::new(&hello.cyclops, hello.build.as_deref())
+    }
+
+    /// Parse the identity portion of `cyclops --version` or
+    /// `cyclopsd --version`, after the command name has been removed.
+    pub fn parse(identity: &str) -> Option<Self> {
+        let (version, build) = identity.strip_suffix(')')?.rsplit_once(" (")?;
+        if version.is_empty() || build.is_empty() {
+            return None;
+        }
+        Some(Self::new(version, Some(build)))
+    }
+
+    /// Exact facts available for a diagnostic. Old daemons may not report a
+    /// source build, and that absence must stay visible rather than matching.
+    pub fn description(&self) -> String {
+        format!(
+            "{} ({})",
+            self.version,
+            self.build.as_deref().unwrap_or("build unavailable")
+        )
+    }
+}
+
+/// How an official client classifies the authenticated daemon's Hello.
+///
+/// Compatibility remains tolerant: this reports drift but does not override
+/// the protocol's warn-and-continue policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelloCompatibility {
+    Current {
+        client: RuntimeIdentity,
+        daemon: RuntimeIdentity,
+    },
+    Mismatch {
+        client: RuntimeIdentity,
+        daemon: RuntimeIdentity,
+    },
+    UnverifiedDaemon {
+        client: RuntimeIdentity,
+        daemon: RuntimeIdentity,
+    },
+}
+
+impl HelloCompatibility {
+    pub fn from_hello(hello: &Hello) -> Self {
+        Self::between(
+            RuntimeIdentity::current_client(),
+            RuntimeIdentity::from_hello(hello),
+        )
+    }
+
+    pub fn between(client: RuntimeIdentity, daemon: RuntimeIdentity) -> Self {
+        if daemon.build.is_none() {
+            Self::UnverifiedDaemon { client, daemon }
+        } else if client == daemon {
+            Self::Current { client, daemon }
+        } else {
+            Self::Mismatch { client, daemon }
+        }
+    }
+
+    /// The exact client and daemon facts behind this classification.
+    pub fn identities(&self) -> (&RuntimeIdentity, &RuntimeIdentity) {
+        match self {
+            Self::Current { client, daemon }
+            | Self::Mismatch { client, daemon }
+            | Self::UnverifiedDaemon { client, daemon } => (client, daemon),
+        }
+    }
+
+    pub fn version_matches(&self) -> bool {
+        let (client, daemon) = self.identities();
+        client.version == daemon.version
+    }
+
+    pub fn build_matches(&self) -> Option<bool> {
+        match self {
+            Self::UnverifiedDaemon { .. } => None,
+            Self::Current { client, daemon } | Self::Mismatch { client, daemon } => {
+                Some(client.build == daemon.build)
+            }
+        }
+    }
+}
 
 /// What an official caller knows after a client failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -425,6 +535,10 @@ impl BlockingClient {
         &self.hello
     }
 
+    pub fn hello_compatibility(&self) -> HelloCompatibility {
+        HelloCompatibility::from_hello(&self.hello)
+    }
+
     pub fn request(&mut self, method: &str, params: Value) -> Result<Value, ClientError> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
@@ -640,6 +754,10 @@ impl AsyncClient {
 
     pub fn hello(&self) -> &Hello {
         &self.hello
+    }
+
+    pub fn hello_compatibility(&self) -> HelloCompatibility {
+        HelloCompatibility::from_hello(&self.hello)
     }
 
     pub async fn request(

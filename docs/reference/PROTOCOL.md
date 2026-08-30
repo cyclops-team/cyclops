@@ -29,7 +29,7 @@ The daemon writes one hello line as soon as you connect, then one response
 line per request.
 
 ```
-{"cyclops":"0.1.0","proto":1,"boot_id":"b4ce18e9-c6d6-4473-af9b-a43b525106fe"}
+{"cyclops":"0.1.0","build":"abc1234","proto":1,"boot_id":"b4ce18e9-c6d6-4473-af9b-a43b525106fe"}
 ```
 
 `boot_id` changes on every daemon restart, so a client can tell which
@@ -39,9 +39,18 @@ Sequences are ordered within their owning journal, not across session ledgers
 and the workspace message journal. Messaging snapshots and invalidations name
 their workspace journal position explicitly as `workspace_seq`.
 
-`proto` mismatching yours is a warning, never a disconnect: unknown fields
-are ignored in both directions, so a newer client and an older daemon keep
-working.
+`cyclops` is the Cargo workspace version compiled into the running daemon;
+`build` is its exact source build. Official clients compare both with their
+own identity. CLI, stream, and health output name both exact identities. The
+full workspace keeps a compact warning visible even when its sidebar is
+collapsed; `cyclops health` gives the exact pair when narrow chrome cannot.
+A mismatch does not disconnect: the additive protocol keeps a newer client and
+an older daemon working. A daemon old enough to omit `build` remains explicitly
+unverified.
+
+`proto` follows the same tolerant rule. A mismatch warns and continues because
+unknown fields are ignored in both directions. Package and source identity are
+runtime facts; they do not assign, move, or publish a public release tag.
 
 ```mermaid
 sequenceDiagram

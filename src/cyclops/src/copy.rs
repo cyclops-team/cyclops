@@ -294,18 +294,25 @@ pub fn proto_mismatch(server: u32, client: u32) -> String {
     format!("note: cyclopsd speaks protocol {server}, this cyclops speaks {client}. Continuing; update the older side.")
 }
 
-/// A running daemon built from different source than this client.
-///
-/// Absence is a mismatch too: it identifies a daemon old enough to predate
-/// exact build reporting rather than silently treating it as current.
-pub fn build_mismatch(server: Option<&str>, client: &str) -> Option<String> {
-    match server {
-        Some(server) if server == client => None,
-        Some(server) => Some(format!(
-            "note: cyclopsd is build {server}, this cyclops is build {client}. Continuing; run cyclops daemon restart to load the installed daemon build."
+/// Persistent notice for a daemon that is not the same runtime identity as
+/// this CLI. Classification stays in `cyclops-client`; this module owns the
+/// command and recovery wording shown to a person.
+pub fn hello_compatibility_notice(
+    compatibility: &cyclops_client::HelloCompatibility,
+) -> Option<String> {
+    use cyclops_client::HelloCompatibility;
+
+    match compatibility {
+        HelloCompatibility::Current { .. } => None,
+        HelloCompatibility::Mismatch { client, daemon } => Some(format!(
+            "version/build mismatch: cyclops {}, cyclopsd {}. Continuing; run cyclops daemon restart. If they still differ, update or reinstall the older side.",
+            client.description(),
+            daemon.description()
         )),
-        None => Some(format!(
-            "note: cyclopsd did not report a build identifier, this cyclops is build {client}. Continuing; run cyclops daemon restart to load the installed daemon build."
+        HelloCompatibility::UnverifiedDaemon { client, daemon } => Some(format!(
+            "daemon identity unverified: cyclops {}, cyclopsd {}. Continuing; run cyclops daemon restart. If it remains unverified, update or reinstall the daemon.",
+            client.description(),
+            daemon.description()
         )),
     }
 }
@@ -726,15 +733,16 @@ mod tests {
     }
 
     #[test]
-    fn build_mismatch_names_both_builds_and_treats_absence_as_old() {
-        assert_eq!(build_mismatch(Some("abc1234"), "abc1234"), None);
-        assert_eq!(
-            build_mismatch(Some("old5678"), "abc1234").as_deref(),
-            Some("note: cyclopsd is build old5678, this cyclops is build abc1234. Continuing; run cyclops daemon restart to load the installed daemon build.")
+    fn runtime_identity_notice_names_both_sides_and_an_existing_recovery_command() {
+        let compatibility = cyclops_client::HelloCompatibility::between(
+            cyclops_client::RuntimeIdentity::new("0.1.0", Some("client-new")),
+            cyclops_client::RuntimeIdentity::new("0.0.9", Some("daemon-old")),
         );
         assert_eq!(
-            build_mismatch(None, "abc1234").as_deref(),
-            Some("note: cyclopsd did not report a build identifier, this cyclops is build abc1234. Continuing; run cyclops daemon restart to load the installed daemon build.")
+            hello_compatibility_notice(&compatibility).as_deref(),
+            Some(
+                "version/build mismatch: cyclops 0.1.0 (client-new), cyclopsd 0.0.9 (daemon-old). Continuing; run cyclops daemon restart. If they still differ, update or reinstall the older side."
+            )
         );
     }
 

@@ -391,7 +391,7 @@ fn try_frozen_candidate() -> Result<FrozenCandidate, String> {
         .map_err(|_| "set CYC_RELEASE_SHA to the frozen 40-character commit".to_string())?;
     validate_frozen_sha(&sha)?;
     let expected_prefix = expected_build_ref_prefix(&sha)?;
-    let test_build_ref = env!("CYCLOPS_BUILD_REF");
+    let test_build_ref = cyclops_proto::BUILD_REF;
     if test_build_ref != expected_prefix {
         return Err(format!(
             "benchmark test binary build ref {test_build_ref:?} does not match expected prefix {expected_prefix:?} for SHA {sha}"
@@ -1314,7 +1314,7 @@ async fn frozen_candidate_separates_transport_phases() {
         "schema": 2,
         "kind": "cyclops_frozen_transport_benchmark",
         "frozen_commit_sha40": candidate.sha,
-        "benchmark_test_build_ref": env!("CYCLOPS_BUILD_REF"),
+        "benchmark_test_build_ref": cyclops_proto::BUILD_REF,
         "external_candidate_binary_evidence": {
             "cli_version": candidate.cli.version,
             "daemon_version": candidate.daemon.version,

@@ -1724,6 +1724,8 @@ mod tests {
             selection: SelectionState::default(),
             drag: None,
             notice: crate::notice::NoticeState::default(),
+            daemon_compatibility: None,
+            daemon_compatibility_notice: None,
             decoration: DecorationSnapshot::default(),
             prefs: WorkspacePrefs::default(),
             expanded_workspaces: HashSet::new(),

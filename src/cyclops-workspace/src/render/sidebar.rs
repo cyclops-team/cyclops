@@ -96,6 +96,44 @@ pub fn sidebar_body_bottom(sidebar: Rect) -> u16 {
     }
 }
 
+/// Paint compact authenticated-daemon health in the Sessions tab's reserved
+/// status row. The exact identities remain available on the pane notice line;
+/// this marker is deliberately short enough to survive the narrowest sidebar.
+pub fn paint_daemon_status(
+    area: Rect,
+    tab: SidebarTab,
+    status: &str,
+    buf: &mut Buffer,
+    paint: &Paint,
+) {
+    if area.width == 0 || area.height <= 2 {
+        return;
+    }
+    let inner = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
+    let pad = 2.min(inner.width / 2);
+    let content = Rect::new(
+        inner.x + pad,
+        inner.y,
+        inner.width.saturating_sub(pad.saturating_mul(2)),
+        inner.height,
+    );
+    match tab.available() {
+        SidebarTab::Sessions => super::overlay_text_ellipsized(
+            buf,
+            content,
+            content.x,
+            content.y + 2,
+            status,
+            theme::chrome_notice(paint),
+        ),
+        // Stream rows start one cell in from the panel edge. Keep their
+        // text intact and use that otherwise-empty gutter for the marker.
+        SidebarTab::Stream => {
+            buf.set_string(inner.x, inner.y + 2, "!", theme::chrome_notice(paint));
+        }
+    }
+}
+
 /// Render the workspace sidebar: the tab header, the selected tab's body,
 /// the shared footer, and the collapse chevron on its outer edge.
 pub fn paint_sidebar(
@@ -431,6 +469,7 @@ pub fn paint_sidebar_rail(
     buf: &mut Buffer,
     paint: &Paint,
     hits: &mut HitMap,
+    daemon_warning: bool,
     hover: Option<(u16, u16)>,
 ) {
     if area.width == 0 || area.height == 0 {
@@ -450,6 +489,12 @@ pub fn paint_sidebar_rail(
         hits,
         hover,
     );
+    // A hidden sidebar is an intentional journey, not permission to hide an
+    // authenticated identity problem with it. The shape is redundant with
+    // warning color and occupies a row outside the centered toggle.
+    if daemon_warning {
+        buf.set_string(area.x, area.y, "!", theme::chrome_notice(paint));
+    }
 }
 
 /// Render the Messages pane on the right edge. Its left border remains the
@@ -2329,6 +2374,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_daemon_mismatch_stays_visible_at_the_narrowest_sidebar_width() {
+        let paint = Paint::for_test();
+        let mut term = Terminal::new(TestBackend::new(
+            crate::render::SIDEBAR_MIN_WIDTH,
+            GRAB_TEST_HEIGHT,
+        ))
+        .unwrap();
+        term.draw(|frame| {
+            paint_daemon_status(
+                frame.area(),
+                SidebarTab::Sessions,
+                "daemon mismatch",
+                frame.buffer_mut(),
+                &paint,
+            );
+        })
+        .unwrap();
+
+        let frame = flatten(term.backend().buffer());
+        assert!(frame.contains("daemon"), "{frame}");
+    }
+
     /// The tree stops at the footer and does not scroll, so what it
     /// dropped has to be said somewhere: a workspace below the fold is
     /// otherwise indistinguishable from one that does not exist.
@@ -3004,6 +3072,29 @@ mod tests {
         assert!(!tree.contains(&word), "{tree:?}");
     }
 
+    #[test]
+    fn a_stream_tab_warning_keeps_the_first_event_row_intact() {
+        if !crate::persist::STREAM_TAB {
+            return;
+        }
+        let paint = Paint::for_test();
+        let record = one_row_record();
+        let word = cyclops_proto::AgentState::BlockedPermission.to_string();
+        let (mut stream_buf, _) = draw_sidebar(SidebarTab::Stream, &record, &paint);
+
+        paint_daemon_status(
+            SIDEBAR,
+            SidebarTab::Stream,
+            "daemon mismatch",
+            &mut stream_buf,
+            &paint,
+        );
+        let stream = sidebar_text(&stream_buf);
+        assert!(stream.contains("rev"), "{stream:?}");
+        assert!(stream.contains(&word), "{stream:?}");
+        assert_eq!(stream_buf[(SIDEBAR.x, SIDEBAR.y + 2)].symbol(), "!");
+    }
+
     /// Both chips answer the mouse where they paint, and the selected one
     /// is materially different from the other. Rule 11: the cue survives
     /// `NO_COLOR`, because the accent chip reverses when there is no color
@@ -3247,7 +3338,7 @@ mod tests {
         let rail = Rect::new(0, 0, 1, SIDEBAR.height);
         let mut term = Terminal::new(TestBackend::new(20, SIDEBAR.height)).unwrap();
         let mut hits = HitMap::default();
-        term.draw(|f| paint_sidebar_rail(rail, f.buffer_mut(), paint, &mut hits, hover))
+        term.draw(|f| paint_sidebar_rail(rail, f.buffer_mut(), paint, &mut hits, false, hover))
             .unwrap();
         (term.backend().buffer().clone(), hits)
     }
@@ -3283,6 +3374,27 @@ mod tests {
         for y in 0..SIDEBAR.height {
             assert_eq!(buf[(1, y)].symbol(), " ", "the rail painted past column 0");
         }
+    }
+
+    #[test]
+    fn a_collapsed_sidebar_keeps_a_daemon_warning_visible() {
+        let rail = Rect::new(0, 0, 1, SIDEBAR.height);
+        let mut term = Terminal::new(TestBackend::new(20, SIDEBAR.height)).unwrap();
+        let mut hits = HitMap::default();
+        term.draw(|frame| {
+            paint_sidebar_rail(
+                rail,
+                frame.buffer_mut(),
+                &Paint::for_test(),
+                &mut hits,
+                true,
+                None,
+            );
+        })
+        .unwrap();
+
+        assert_eq!(term.backend().buffer()[(0, 0)].symbol(), "!");
+        assert!(matches!(hits.hit(0, 0), Some(HitTarget::SidebarToggle)));
     }
 
     /// The open panel carries the same control on the middle of its own

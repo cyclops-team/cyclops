@@ -1,3 +1,4 @@
+use cyclops_client::RuntimeIdentity;
 use cyclops_proto::Hello;
 use cyclops_ui::{build, App, BuildHealth, Filter, Theme, View};
 
@@ -26,27 +27,33 @@ fn hello_keeps_both_build_identities_or_names_a_legacy_daemon() {
         BuildHealth::Mismatch {
             ref daemon,
             ref client
-        } if daemon == "daemon-old" && !client.is_empty()
+        } if daemon.build.as_deref() == Some("daemon-old")
+            && client.build.as_deref() == Some(cyclops_proto::BUILD_REF)
+            && daemon.version == "0.1.0"
     ));
 
     let legacy = BuildHealth::from_hello(&hello(None));
     assert!(matches!(
         legacy,
-        BuildHealth::LegacyDaemon { ref client } if !client.is_empty()
+        BuildHealth::UnverifiedDaemon { ref client, ref daemon }
+            if client.build.as_deref() == Some(cyclops_proto::BUILD_REF)
+                && daemon.build.is_none()
     ));
 }
 
 #[test]
 fn build_mismatch_stays_visible_after_transient_notices_clear() {
     let mut app = app(BuildHealth::Mismatch {
-        client: "client-new".into(),
-        daemon: "daemon-old".into(),
+        client: RuntimeIdentity::new("0.1.0", Some("client-new")),
+        daemon: RuntimeIdentity::new("0.0.9", Some("daemon-old")),
     });
 
     let first = build(&mut app, 120, 24).join("\n");
     assert!(first.contains("build mismatch"), "{first}");
     assert!(first.contains("client-new"), "{first}");
     assert!(first.contains("daemon-old"), "{first}");
+    assert!(first.contains("0.1.0"), "{first}");
+    assert!(first.contains("0.0.9"), "{first}");
 
     app.notice = Some("temporary action result".into());
     let with_transient = build(&mut app, 120, 24).join("\n");
@@ -66,12 +73,13 @@ fn build_mismatch_stays_visible_after_transient_notices_clear() {
 
 #[test]
 fn a_legacy_daemon_without_build_identity_stays_visible() {
-    let mut app = app(BuildHealth::LegacyDaemon {
-        client: "client-new".into(),
+    let mut app = app(BuildHealth::UnverifiedDaemon {
+        client: RuntimeIdentity::new("0.1.0", Some("client-new")),
+        daemon: RuntimeIdentity::new("0.0.8", None),
     });
 
     let frame = build(&mut app, 120, 24).join("\n");
-    assert!(frame.contains("daemon build unavailable"), "{frame}");
+    assert!(frame.contains("daemon identity unverified"), "{frame}");
     assert!(frame.contains("client-new"), "{frame}");
-    assert!(frame.contains("restart cyclopsd"), "{frame}");
+    assert!(frame.contains("cyclops daemon restart"), "{frame}");
 }

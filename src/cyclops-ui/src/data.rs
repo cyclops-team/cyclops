@@ -549,9 +549,7 @@ async fn subscribe_loop(
     // Hello first (S2). The protocol remains tolerant, but build drift is
     // persistent UI health rather than a warning lost before raw mode starts.
     if tx
-        .send(UiMsg::BuildHealth(crate::health::BuildHealth::from_hello(
-            client.hello(),
-        )))
+        .send(UiMsg::BuildHealth(client.hello_compatibility()))
         .await
         .is_err()
     {
@@ -1077,7 +1075,7 @@ mod tests {
         let mut gate = RefreshGate::new();
         assert!(matches!(
             rx.recv().await.unwrap(),
-            UiMsg::BuildHealth(crate::health::BuildHealth::LegacyDaemon { .. })
+            UiMsg::BuildHealth(crate::health::BuildHealth::UnverifiedDaemon { .. })
         ));
         match rx.recv().await.unwrap() {
             UiMsg::StreamProjection(projection) => {

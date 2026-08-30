@@ -605,7 +605,7 @@ pub fn verify_build_id_pure(build_id: &str, expected_sha: &str) -> Result<(), St
 /// Verifies that the compiled library/test build ref matches the caller SHA.
 pub fn verify_build_ref_integrity(expected_sha: &str) -> Result<GitCommitMetadata, String> {
     let meta = verify_checkout_integrity(expected_sha)?;
-    verify_build_id_pure(env!("CYCLOPS_BUILD_ID"), expected_sha)?;
+    verify_build_id_pure(cyclops_proto::BUILD_ID, expected_sha)?;
     Ok(meta)
 }
 

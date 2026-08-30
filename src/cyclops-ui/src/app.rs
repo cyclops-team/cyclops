@@ -342,10 +342,7 @@ impl App {
 
     /// Persistent health copy followed by the current transient notice.
     pub fn notice_text(&self) -> Option<String> {
-        let health = self
-            .build_health
-            .as_ref()
-            .and_then(crate::health::BuildHealth::notice);
+        let health = self.build_health.as_ref().and_then(crate::health::notice);
         match (health, self.notice.as_deref()) {
             (Some(health), Some(notice)) => Some(format!("{health}; {notice}")),
             (Some(health), None) => Some(health),
