@@ -12,19 +12,18 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::Context as _;
-#[cfg(test)]
-use cyclops_proto::TmuxPaneId;
 use cyclops_proto::{
-    AdminNotifyParams, AgentWaitParams, AlarmClearParams, AlarmClearResult, AlarmPreviewParams,
-    AlarmPreviewResult, AlarmSummary, AttentionResolveParams, AttentionShowParams,
-    DaemonShutdownParams, DaemonShutdownResult, DeliveryState, Event, FrameContract, FrameSize,
-    Hello, InboxClaimParams, InboxListParams, MessagesFollowParams, MessagesSnapshotParams,
-    MsgSendParams, NotificationAttemptId, NotificationAttentionCause, NotificationRecord,
-    NotificationResolution, NotificationWithdrawParams, PaneReadParams, PaneReadResult,
-    PaneReadSource, PingResult, ProcessInstanceId, QuiesceParams, RecipientKey, ReplyParams,
-    Request, RequeueParams, RequeueResult, Response, SessionStatus, StateReportParams,
-    StatusMailboxRoute, StatusParams, StatusResult, SubscribeParams, WireError, PROTOCOL_VERSION,
+    AdminNotifyParams, AgentWaitParams, AlarmClearParams, AlarmPreviewParams,
+    AttentionResolveParams, AttentionShowParams, DaemonShutdownParams, DaemonShutdownResult, Event,
+    FrameContract, FrameSize, Hello, InboxClaimParams, InboxListParams, MessagesFollowParams,
+    MessagesSnapshotParams, MsgSendParams, NotificationAttemptId, NotificationResolution,
+    NotificationWithdrawParams, PaneReadParams, PaneReadResult, PaneReadSource, PingResult,
+    ProcessInstanceId, QuiesceParams, RecipientKey, ReplyParams, Request, RequeueParams,
+    RequeueResult, Response, SessionStatus, StateReportParams, StatusMailboxRoute, StatusParams,
+    StatusResult, SubscribeParams, WireError, PROTOCOL_VERSION,
 };
+#[cfg(test)]
+use cyclops_proto::{AlarmPreviewResult, NotificationAttentionCause, TmuxPaneId};
 use cyclops_state::{BoundSocketCleanup, StateRoot};
 use cyclops_tmux::SessionWatcher;
 use serde::Serialize;
@@ -1119,40 +1118,16 @@ fn alarm_preview(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Re
         Ok(params) => params,
         Err(response) => return response,
     };
-    let (service, caller) = match mailbox_caller(inner, peer) {
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    if !caller.key.is_admin() {
-        return wire_error_response(id, mailbox_admin_required());
-    }
-    let cutoff_ms = unix_ms().saturating_sub(params.older_than_ms);
-    let records = match service.alarms_at_or_before(cutoff_ms) {
-        Ok(records) => records,
-        Err(error) => return wire_error_response(id, mailbox_service_error(error)),
-    };
-    // Identity, state and age only. No subject and no body: an operator
-    // deciding what to clear does not need the message contents.
-    let entries = records.iter().map(alarm_summary).collect();
-    Response::ok(
-        id,
-        serde_json::to_value(AlarmPreviewResult { entries, cutoff_ms })
-            .expect("alarm preview result serializes"),
-    )
-}
-
-fn alarm_summary(record: &NotificationRecord) -> AlarmSummary {
-    AlarmSummary {
-        id: record.attempt_id.to_string(),
-        message_id: record.message_id.to_string(),
-        recipient: record.recipient.to_string(),
-        state: DeliveryState::AttentionRequired,
-        // An attention record always carries a cause. If one ever reaches
-        // here without it, report an unknown outcome instead of inventing one.
-        cause: record
-            .cause
-            .unwrap_or(NotificationAttentionCause::TransportOutcomeUnknown),
-        ts: record.updated_at,
+    match messaging.alarm_preview(caller.key, params.older_than_ms, unix_ms()) {
+        Ok(result) => Response::ok(
+            id,
+            serde_json::to_value(result).expect("alarm preview result serializes"),
+        ),
+        Err(error) => wire_error_response(id, messaging_attention_error(error)),
     }
 }
 
@@ -1171,28 +1146,17 @@ fn alarm_clear(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Resp
             Err(_) => return Response::err(id, "bad_request", format!("invalid alarm id '{raw}'")),
         }
     }
-    let (service, caller) = match mailbox_caller(inner, peer) {
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    if !caller.key.is_admin() {
-        return wire_error_response(id, mailbox_admin_required());
+    match messaging.clear_alarms(caller.key, &attempts, params.cutoff_ms) {
+        Ok(result) => Response::ok(
+            id,
+            serde_json::to_value(result).expect("alarm clear result serializes"),
+        ),
+        Err(error) => wire_error_response(id, messaging_attention_error(error)),
     }
-    let summaries = match service.clear_alarms(caller.key, &attempts, params.cutoff_ms) {
-        Ok(summaries) => summaries,
-        Err(error) => return wire_error_response(id, mailbox_service_error(error)),
-    };
-    let result = AlarmClearResult {
-        cleared_ids: summaries
-            .iter()
-            .map(|record| record.attempt_id.to_string())
-            .collect(),
-        summaries: summaries.iter().map(alarm_summary).collect(),
-    };
-    Response::ok(
-        id,
-        serde_json::to_value(result).expect("alarm clear result serializes"),
-    )
 }
 
 async fn attention_show(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
@@ -1200,40 +1164,33 @@ async fn attention_show(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer
         Ok(params) => params,
         Err(response) => return response,
     };
-    let (service, caller) = match mailbox_caller(inner, peer) {
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    attention_show_for_caller(inner, id, params, &service, caller.key).await
+    attention_show_for_caller(inner, id, params, &messaging, caller.key).await
 }
 
 async fn attention_show_for_caller(
     inner: &Arc<Inner>,
     id: Value,
     params: AttentionShowParams,
-    service: &Arc<crate::mailbox::MailboxService>,
+    messaging: &crate::messaging::WorkspaceMessaging,
     caller: RecipientKey,
 ) -> Response {
-    // A non-admin caller learns nothing from a lookup failure: not whether
-    // the id exists, nor which candidates an ambiguous prefix names.
-    let target = match attention_target(service, &params.id) {
-        Ok(target) => target,
-        Err(_) if !caller.is_admin() => return wire_error_response(id, mailbox_admin_required()),
-        Err(error) => return wire_error_response(id, error),
-    };
-    if !attention_show_allowed(&caller, &target.record) {
-        return wire_error_response(id, mailbox_admin_required());
-    }
     // Diff mode returns the exact payload selected at the write boundary.
     // Direct compatibility attempts can therefore include message content,
     // which is why only the administrator and the attempt's own recipient,
     // who may already claim that body, can ask. Neither diff input is
     // logged or stored.
-    let result = crate::attention_resolution::show(inner, service, &target, params.diff).await;
-    Response::ok(
-        id,
-        serde_json::to_value(result).expect("attention show result serializes"),
-    )
+    match crate::attention_resolution::show(inner, messaging, caller, &params.id, params.diff).await
+    {
+        Ok(result) => Response::ok(
+            id,
+            serde_json::to_value(result).expect("attention show result serializes"),
+        ),
+        Err(error) => wire_error_response(id, messaging_attention_error(error)),
+    }
 }
 
 async fn attention_resolve(
@@ -1248,53 +1205,37 @@ async fn attention_resolve(
             Ok(params) => params,
             Err(response) => return response,
         };
-    let (service, caller) = match mailbox_caller(inner, peer) {
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    if !caller.key.is_admin() {
-        return wire_error_response(id, mailbox_admin_required());
-    }
-    let target = match attention_target(&service, &params.id) {
-        Ok(target) => target,
-        Err(error) => return wire_error_response(id, error),
-    };
-    match crate::attention_resolution::resolve(inner, &service, &target, resolution).await {
+    match crate::attention_resolution::resolve(
+        inner, &messaging, caller.key, &params.id, resolution,
+    )
+    .await
+    {
         Ok(result) => Response::ok(
             id,
             serde_json::to_value(result).expect("attention resolution result serializes"),
         ),
-        Err(error) => wire_error_response(id, attention_action_error(error)),
+        Err(error) => wire_error_response(id, attention_resolve_error(error)),
     }
 }
 
-fn attention_target(
-    service: &Arc<crate::mailbox::MailboxService>,
-    raw: &str,
-) -> Result<crate::mailbox::AttentionTarget, WireError> {
-    match service.attention_target(raw) {
-        Ok(target) => Ok(target),
-        Err(crate::mailbox::MailboxServiceError::Store(
-            crate::mailbox::MessageStoreError::Mailbox(error),
-        )) => {
-            if let crate::mailbox::MailboxError::AmbiguousAttentionTarget { candidates, .. } =
-                error.as_ref()
-            {
-                return Err(WireError {
-                    code: "ambiguous_attention".to_string(),
-                    message: error.to_string(),
-                    data: Some(json!({
-                        "candidates": candidates.iter().map(ToString::to_string).collect::<Vec<_>>()
-                    })),
-                });
-            }
-            Err(mailbox_service_error(
-                crate::mailbox::MailboxServiceError::Store(
-                    crate::mailbox::MessageStoreError::Mailbox(error),
-                ),
-            ))
-        }
-        Err(error) => Err(mailbox_service_error(error)),
+fn messaging_attention_error(error: crate::messaging::MessagingAttentionError) -> WireError {
+    match error {
+        crate::messaging::MessagingAttentionError::Denied => mailbox_admin_required(),
+        crate::messaging::MessagingAttentionError::Ambiguous {
+            message,
+            candidates,
+        } => WireError {
+            code: "ambiguous_attention".to_string(),
+            message,
+            data: Some(json!({
+                "candidates": candidates.iter().map(ToString::to_string).collect::<Vec<_>>()
+            })),
+        },
+        crate::messaging::MessagingAttentionError::Mailbox(error) => mailbox_service_error(error),
     }
 }
 
@@ -1326,15 +1267,15 @@ fn attention_action_error(error: crate::attention_resolution::AttentionActionErr
     }
 }
 
-/// Who may read an attention attempt. `show` is read-only and the attempt's
-/// recipient is the one party that can say what its own composer holds, so
-/// it may look; every other non-admin identity is refused. `complete` and
-/// `discard` stay administrator-only and do not consult this.
-pub(crate) fn attention_show_allowed(
-    caller: &cyclops_proto::RecipientKey,
-    record: &cyclops_proto::NotificationRecord,
-) -> bool {
-    caller.is_admin() || *caller == record.recipient
+fn attention_resolve_error(error: crate::attention_resolution::AttentionResolveError) -> WireError {
+    match error {
+        crate::attention_resolution::AttentionResolveError::Selection(error) => {
+            messaging_attention_error(error)
+        }
+        crate::attention_resolution::AttentionResolveError::Action(error) => {
+            attention_action_error(error)
+        }
+    }
 }
 
 fn require_mailbox_admin(inner: &Arc<Inner>, peer: Peer) -> Result<(), WireError> {
@@ -4073,46 +4014,6 @@ mod tests {
         std::fs::remove_dir_all(path).ok();
     }
 
-    /// The attempt's recipient may read its own attention record. The
-    /// administrator may read any, and every other identity is refused.
-    #[test]
-    fn attention_show_admits_admin_and_the_attempts_recipient_only() {
-        let workspace: cyclops_proto::WorkspaceId =
-            "00000000-0000-0000-0000-000000000001".parse().unwrap();
-        let session: cyclops_proto::SessionInstanceId =
-            "00000000-0000-0000-0000-000000000002".parse().unwrap();
-        let recipient =
-            cyclops_proto::RecipientKey::agent(workspace, session, "%1".parse().unwrap());
-        let stranger =
-            cyclops_proto::RecipientKey::agent(workspace, session, "%2".parse().unwrap());
-        let admin = cyclops_proto::RecipientKey::admin(workspace);
-        let record = cyclops_proto::NotificationRecord {
-            attempt_id: cyclops_proto::NotificationAttemptId::parse(
-                "att-00000000-0000-4000-8000-000000000001",
-            )
-            .unwrap(),
-            message_id: cyclops_proto::MessageId::new("m-1").unwrap(),
-            recipient,
-            state: cyclops_proto::NotificationState::AttentionRequired,
-            binding: None,
-            transport: cyclops_proto::NotificationTransport::Doorbell,
-            doorbell_format: Some(2),
-            cause: Some(cyclops_proto::NotificationAttentionCause::VerifyFailed),
-            verify_outcome: None,
-            pre_write_cause: None,
-            wake_block: None,
-            pre_write_observation: None,
-            pre_write_reopen_count: 0,
-            unclaimed_reminder_count: 0,
-            started_seq: 1,
-            updated_seq: 2,
-            updated_at: 3,
-        };
-        assert!(attention_show_allowed(&admin, &record));
-        assert!(attention_show_allowed(&recipient, &record));
-        assert!(!attention_show_allowed(&stranger, &record));
-    }
-
     #[tokio::test]
     async fn attention_show_endpoint_admits_the_exact_recipient_without_leaking_other_ids() {
         let (inner, path, attempt_id, _) = inner_with_alarm(
@@ -4126,20 +4027,22 @@ mod tests {
         let recipient =
             RecipientKey::agent(workspace, session, TmuxPaneId::from_str("%1").unwrap());
         let stranger = RecipientKey::agent(workspace, session, TmuxPaneId::from_str("%2").unwrap());
-        let service = inner.mailbox.as_ref().unwrap();
+        let messaging = inner.workspace_messaging().unwrap();
         let params = AttentionShowParams {
             id: attempt_id.to_string(),
             diff: true,
         };
 
         let shown =
-            attention_show_for_caller(&inner, json!(1), params.clone(), service, recipient).await;
+            attention_show_for_caller(&inner, json!(1), params.clone(), &messaging, recipient)
+                .await;
         assert!(shown.error.is_none(), "{:?}", shown.error);
         let shown: cyclops_proto::AttentionShowResult =
             serde_json::from_value(shown.result.unwrap()).unwrap();
         assert_eq!(shown.attempt_id, attempt_id);
 
-        let denied = attention_show_for_caller(&inner, json!(2), params, service, stranger).await;
+        let denied =
+            attention_show_for_caller(&inner, json!(2), params, &messaging, stranger).await;
         assert_eq!(denied.error.unwrap().code, "denied");
 
         let hidden = attention_show_for_caller(
@@ -4149,7 +4052,7 @@ mod tests {
                 id: "att-00000000-0000-4000-8000-000000000099".into(),
                 diff: true,
             },
-            service,
+            &messaging,
             stranger,
         )
         .await;
@@ -5239,13 +5142,18 @@ mod tests {
     #[test]
     fn messaging_handlers_do_not_recover_mailbox_implementation_knowledge() {
         let source = include_str!("server.rs");
-        for (name, next) in [
-            ("inbox_list", "inbox_claim"),
-            ("inbox_claim", "messages_snapshot"),
-            ("messages_snapshot", "messages_follow"),
-            ("messages_follow", "msg_requeue"),
-            ("msg_requeue", "notification_withdraw"),
-            ("notification_withdraw", "alarm_preview"),
+        for (name, next, authenticates) in [
+            ("inbox_list", "inbox_claim", true),
+            ("inbox_claim", "messages_snapshot", true),
+            ("messages_snapshot", "messages_follow", true),
+            ("messages_follow", "msg_requeue", true),
+            ("msg_requeue", "notification_withdraw", true),
+            ("notification_withdraw", "alarm_preview", true),
+            ("alarm_preview", "alarm_clear", true),
+            ("alarm_clear", "attention_show", true),
+            ("attention_show", "attention_show_for_caller", true),
+            ("attention_show_for_caller", "attention_resolve", false),
+            ("attention_resolve", "messaging_attention_error", true),
         ] {
             let marker = format!("fn {name}(");
             let next_marker = format!("fn {next}(");
@@ -5256,10 +5164,12 @@ mod tests {
                 .split_once(&next_marker)
                 .unwrap_or_else(|| panic!("handler after {name}"))
                 .0;
-            assert!(
-                handler.contains("workspace_messaging_caller"),
-                "{name} bypasses WorkspaceMessaging"
-            );
+            if authenticates {
+                assert!(
+                    handler.contains("workspace_messaging_caller"),
+                    "{name} bypasses WorkspaceMessaging"
+                );
+            }
             for forbidden in [
                 "mailbox_caller",
                 "mailbox_publication",
@@ -5267,6 +5177,10 @@ mod tests {
                 "crate::mailbox::",
                 "parse_notification_attempt_claim_locator",
                 "schedule_recipient",
+                "service.alarms_at_or_before",
+                "service.clear_alarms",
+                "service.attention_target",
+                "alarm_summary",
             ] {
                 assert!(
                     !handler.contains(forbidden),

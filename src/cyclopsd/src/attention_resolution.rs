@@ -15,6 +15,7 @@ use crate::mailbox::{
     AttentionConsumptionSignal, AttentionResolutionStart, AttentionTarget, MailboxService,
     MailboxServiceError,
 };
+use crate::messaging::{MessagingAttentionError, WorkspaceMessaging};
 use crate::{delivery, fusion, messaging, unix_ms, Inner};
 
 // Bound terminal-action settlement while allowing slower terminal clients to
@@ -36,6 +37,14 @@ pub(crate) enum AttentionActionError {
     Uncertain,
     #[error("forced submit refused: {0}")]
     ForceRefused(&'static str),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AttentionResolveError {
+    #[error(transparent)]
+    Selection(#[from] MessagingAttentionError),
+    #[error(transparent)]
+    Action(#[from] AttentionActionError),
 }
 
 struct ActionRoute {
@@ -63,27 +72,33 @@ struct Assessment {
 
 pub(crate) async fn show(
     inner: &Arc<Inner>,
-    service: &MailboxService,
-    target: &AttentionTarget,
+    messaging: &WorkspaceMessaging,
+    caller: cyclops_proto::RecipientKey,
+    raw: &str,
     include_diff: bool,
-) -> AttentionShowResult {
-    assess(inner, service, target, include_diff).await.result
+) -> Result<AttentionShowResult, MessagingAttentionError> {
+    let target = messaging.attention_for_show(caller, raw)?;
+    let service = messaging.attention_service();
+    Ok(assess(inner, &service, &target, include_diff).await.result)
 }
 
 pub(crate) async fn resolve(
     inner: &Arc<Inner>,
-    service: &Arc<MailboxService>,
-    target: &AttentionTarget,
+    messaging: &WorkspaceMessaging,
+    caller: cyclops_proto::RecipientKey,
+    raw: &str,
     resolution: NotificationResolution,
-) -> Result<AttentionResolveResult, AttentionActionError> {
-    let result = resolve_selected(inner, service, target, resolution, false).await;
+) -> Result<AttentionResolveResult, AttentionResolveError> {
+    let target = messaging.attention_for_resolution(caller, raw)?;
+    let service = messaging.attention_service();
+    let result = resolve_selected(inner, &service, &target, resolution, false).await;
     if service
         .resume_exact_reconciliation(target.record.attempt_id)
         .unwrap_or(false)
     {
-        spawn_exact_owned_worker(inner, Arc::clone(service), target.record.attempt_id);
+        spawn_exact_owned_worker(inner, service, target.record.attempt_id);
     }
-    result
+    result.map_err(Into::into)
 }
 
 /// Press the manifest submit key once for an exact verify-failed notification

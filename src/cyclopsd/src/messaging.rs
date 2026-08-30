@@ -5,10 +5,11 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use cyclops_proto::{
-    ClaimDisposition, DeliveryReceipt, DeliveryState, InboxClaimResult, InboxListResult,
-    InboxSummaryEntry, MessageId, MessageWakeBlock, MessagesFollowResult, MessagesSnapshotResult,
-    MsgSendParams, MsgSendResult, NotificationAttemptId, NotificationBinding,
-    NotificationManifestId, NotificationPreWriteCause, NotificationPreWriteObservation,
+    AlarmClearResult, AlarmPreviewResult, AlarmSummary, ClaimDisposition, DeliveryReceipt,
+    DeliveryState, InboxClaimResult, InboxListResult, InboxSummaryEntry, MessageId,
+    MessageWakeBlock, MessagesFollowResult, MessagesSnapshotResult, MsgSendParams, MsgSendResult,
+    NotificationAttemptId, NotificationAttentionCause, NotificationBinding, NotificationManifestId,
+    NotificationPreWriteCause, NotificationPreWriteObservation, NotificationRecord,
     NotificationRouteEvidenceId, NotificationState, NotificationWithdrawDisposition,
     NotificationWithdrawResult, NotifyLevel, ProcessInstanceId, RecipientKey,
 };
@@ -18,8 +19,8 @@ use tracing::{debug, error};
 
 use crate::delivery;
 use crate::mailbox::{
-    AcceptResult, ClaimOutcome, MailboxIdentity, MailboxSend, MailboxService, MailboxServiceError,
-    UnclaimedReminderQueue,
+    AcceptResult, AttentionTarget, ClaimOutcome, MailboxError, MailboxIdentity, MailboxSend,
+    MailboxService, MailboxServiceError, MessageStoreError, UnclaimedReminderQueue,
 };
 use crate::notification_adapter::NotificationContext;
 use crate::{Inner, PaneKey};
@@ -118,6 +119,23 @@ pub(crate) struct MessagingAdminNotice {
 pub(crate) struct ObservationApplication {
     durable_messages: Vec<MessageId>,
     pub(crate) notices: Vec<MessagingAdminNotice>,
+}
+
+/// Stable operation failures for selecting or administering attention.
+///
+/// The socket adapter maps these outcomes to wire errors without inspecting
+/// the mailbox projection or its lookup rules.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum MessagingAttentionError {
+    #[error("this operation requires the workspace administrator")]
+    Denied,
+    #[error("{message}")]
+    Ambiguous {
+        message: String,
+        candidates: Vec<NotificationAttemptId>,
+    },
+    #[error(transparent)]
+    Mailbox(#[from] MailboxServiceError),
 }
 
 /// Narrow post-commit capabilities needed by durable message acceptance.
@@ -270,11 +288,12 @@ impl WorkspaceMessagingEffects for DaemonMessagingEffects {
 
 /// Internal messaging Module for one workspace.
 ///
-/// The module owns durable send/reply acceptance, inbox and message reads,
-/// claims, and the post-commit actions that follow acceptance or claiming.
-/// Callers supply an authenticated identity and request; they do not receive
-/// the journal, projection, publication lock, worker, unread scheduler, or
-/// daemon composition root.
+/// The module owns durable send/reply acceptance; inbox, message, alarm, and
+/// attention-selection reads; claims, requeue, exact pre-write withdrawal; and
+/// the post-commit actions that follow those mutations. Callers supply an
+/// authenticated identity and request; they do not receive the journal,
+/// projection, publication lock, worker, unread scheduler, or daemon
+/// composition root.
 pub(crate) struct WorkspaceMessaging {
     service: Arc<MailboxService>,
     publication: Arc<StdMutex<()>>,
@@ -485,6 +504,98 @@ impl WorkspaceMessaging {
         })
     }
 
+    pub(crate) fn alarm_preview(
+        &self,
+        caller: RecipientKey,
+        older_than_ms: u64,
+        observed_at_ms: u64,
+    ) -> Result<AlarmPreviewResult, MessagingAttentionError> {
+        self.require_admin(caller)?;
+        let cutoff_ms = observed_at_ms.saturating_sub(older_than_ms);
+        let entries = self
+            .service
+            .alarms_at_or_before(cutoff_ms)?
+            .iter()
+            .map(alarm_summary)
+            .collect();
+        Ok(AlarmPreviewResult { entries, cutoff_ms })
+    }
+
+    pub(crate) fn clear_alarms(
+        &self,
+        caller: RecipientKey,
+        attempts: &[NotificationAttemptId],
+        cutoff_ms: Option<u64>,
+    ) -> Result<AlarmClearResult, MessagingAttentionError> {
+        self.require_admin(caller)?;
+        let summaries = self.service.clear_alarms(caller, attempts, cutoff_ms)?;
+        Ok(AlarmClearResult {
+            cleared_ids: summaries
+                .iter()
+                .map(|record| record.attempt_id.to_string())
+                .collect(),
+            summaries: summaries.iter().map(alarm_summary).collect(),
+        })
+    }
+
+    /// Select one attention attempt for a read without exposing projection
+    /// lookup or recipient-privacy policy to the requesting adapter.
+    pub(crate) fn attention_for_show(
+        &self,
+        caller: RecipientKey,
+        raw: &str,
+    ) -> Result<AttentionTarget, MessagingAttentionError> {
+        let target = match self.attention_target(raw) {
+            Ok(target) => target,
+            Err(_) if !caller.is_admin() => return Err(MessagingAttentionError::Denied),
+            Err(error) => return Err(error),
+        };
+        if !caller.is_admin() && caller != target.record.recipient {
+            return Err(MessagingAttentionError::Denied);
+        }
+        Ok(target)
+    }
+
+    /// Select one exact attention attempt for an administrator mutation.
+    pub(crate) fn attention_for_resolution(
+        &self,
+        caller: RecipientKey,
+        raw: &str,
+    ) -> Result<AttentionTarget, MessagingAttentionError> {
+        self.require_admin(caller)?;
+        self.attention_target(raw)
+    }
+
+    /// Narrow handoff to the terminal-resolution mechanism. Ordinary callers
+    /// never receive this service or an `AttentionTarget`.
+    pub(crate) fn attention_service(&self) -> Arc<MailboxService> {
+        Arc::clone(&self.service)
+    }
+
+    fn require_admin(&self, caller: RecipientKey) -> Result<(), MessagingAttentionError> {
+        if caller.is_admin() {
+            Ok(())
+        } else {
+            Err(MessagingAttentionError::Denied)
+        }
+    }
+
+    fn attention_target(&self, raw: &str) -> Result<AttentionTarget, MessagingAttentionError> {
+        match self.service.attention_target(raw) {
+            Ok(target) => Ok(target),
+            Err(MailboxServiceError::Store(MessageStoreError::Mailbox(error))) => {
+                if let MailboxError::AmbiguousAttentionTarget { candidates, .. } = error.as_ref() {
+                    return Err(MessagingAttentionError::Ambiguous {
+                        message: error.to_string(),
+                        candidates: candidates.clone(),
+                    });
+                }
+                Err(MailboxServiceError::Store(MessageStoreError::Mailbox(error)).into())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     async fn finish_acceptance(
         &self,
         accepted: AcceptResult,
@@ -629,6 +740,21 @@ impl WorkspaceMessaging {
                 .collect(),
             notices,
         })
+    }
+}
+
+fn alarm_summary(record: &NotificationRecord) -> AlarmSummary {
+    AlarmSummary {
+        id: record.attempt_id.to_string(),
+        message_id: record.message_id.to_string(),
+        recipient: record.recipient.to_string(),
+        state: DeliveryState::AttentionRequired,
+        // An attention record always carries a cause. If one ever reaches
+        // here without it, report an unknown outcome instead of inventing one.
+        cause: record
+            .cause
+            .unwrap_or(NotificationAttentionCause::TransportOutcomeUnknown),
+        ts: record.updated_at,
     }
 }
 
@@ -2055,6 +2181,73 @@ mod tests {
                 RecordedEffect::InvalidateUnread(reviewer),
             ]
         );
+    }
+
+    // Obsolete if alarm or attention adapters again inspect notification
+    // records, resolve ambiguous targets, or decide recipient visibility.
+    #[test]
+    fn workspace_messaging_owns_alarm_projection_and_attention_selection_without_inner() {
+        let (_scratch, service, events, reviewer, observer) =
+            mailbox_service("workspace-messaging-attention", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            effects.clone(),
+        );
+        let (_accepted, context, _) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        record_doorbell_write(&context);
+        let attention = context
+            .record_verify_attention(NotificationVerifyOutcome::ambiguous())
+            .unwrap();
+        let admin = service.admin().key;
+
+        assert!(matches!(
+            messaging.alarm_preview(reviewer, 0, u64::MAX),
+            Err(MessagingAttentionError::Denied)
+        ));
+        let preview = messaging.alarm_preview(admin, 0, u64::MAX).unwrap();
+        assert_eq!(preview.entries.len(), 1);
+        assert_eq!(preview.entries[0].id, attention.attempt_id.to_string());
+        assert_eq!(
+            preview.entries[0].cause,
+            NotificationAttentionCause::VerifyFailed
+        );
+
+        let shown = messaging
+            .attention_for_show(reviewer, &attention.attempt_id.to_string())
+            .unwrap();
+        assert_eq!(shown.record.attempt_id, attention.attempt_id);
+        assert!(matches!(
+            messaging.attention_for_show(observer, &attention.attempt_id.to_string()),
+            Err(MessagingAttentionError::Denied)
+        ));
+        assert!(matches!(
+            messaging.attention_for_show(observer, "att-00000000-0000-4000-8000-000000000099"),
+            Err(MessagingAttentionError::Denied)
+        ));
+        assert!(matches!(
+            messaging.attention_for_resolution(reviewer, &attention.attempt_id.to_string()),
+            Err(MessagingAttentionError::Denied)
+        ));
+        assert_eq!(
+            messaging
+                .attention_for_resolution(admin, &attention.attempt_id.to_string())
+                .unwrap()
+                .record
+                .attempt_id,
+            attention.attempt_id
+        );
+
+        let cleared = messaging
+            .clear_alarms(admin, &[attention.attempt_id], Some(u64::MAX))
+            .unwrap();
+        assert_eq!(cleared.cleared_ids, vec![attention.attempt_id.to_string()]);
+        assert_eq!(cleared.summaries.len(), 1);
+        assert_eq!(cleared.summaries[0].id, preview.entries[0].id);
+        assert_eq!(cleared.summaries[0].cause, preview.entries[0].cause);
+        assert!(effects.calls().is_empty());
     }
 
     // Obsolete if fusion again commits quota-reset messaging state itself, or
