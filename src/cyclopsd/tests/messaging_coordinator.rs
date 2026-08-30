@@ -2045,12 +2045,16 @@ async fn a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt() 
         })
         .await;
     assert_eq!(readiness["seq"], serde_json::Value::Null, "{readiness}");
-    tokio::time::timeout(Duration::from_secs(8), prewrite_rx.recv())
+    // These are explicit injected phase events, not settlement guesses. The
+    // timeout only bounds a broken test; it leaves room for four concurrent
+    // isolated rigs on a cold shared runner after readiness has been proven.
+    let phase_timeout = Duration::from_secs(20);
+    tokio::time::timeout(phase_timeout, prewrite_rx.recv())
         .await
         .expect("final deletion released the human hold")
         .expect("pre-write boundary sender stayed open");
     prewrite_release.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(8), staged_rx.recv())
+    tokio::time::timeout(phase_timeout, staged_rx.recv())
         .await
         .expect("released attempt reached the staged boundary")
         .expect("staged boundary sender stayed open");
