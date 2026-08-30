@@ -160,8 +160,9 @@ Read in this order:
 2. [PROTOCOL.md](../reference/PROTOCOL.md) for `msg.send`, `inbox.list`,
    `inbox.claim`, `msg.reply`, and `messages.snapshot`.
 3. `src/cyclopsd/src/messaging.rs` for the internal `WorkspaceMessaging`
-   operation boundary, acceptance-to-notification coordination, and durable
-   consequences of typed pane observations.
+   operation boundary, acceptance and claim coordination, body-free inbox,
+   snapshot, and follow reads, and durable consequences of typed pane
+   observations.
 4. `src/cyclopsd/src/mailbox.rs` for the durable projection and mutations owned
    behind that boundary.
 5. `src/cyclopsd/src/notification_adapter.rs` and the notification path in

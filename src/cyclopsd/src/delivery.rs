@@ -11975,7 +11975,7 @@ composer_trailer_required_prefix = 1
             composer_recovery: StdMutex::new(
                 crate::composer_recovery::RecoveryCoordinator::default(),
             ),
-            mailbox_publication: StdMutex::new(()),
+            mailbox_publication: Arc::new(StdMutex::new(())),
             unread_projection_gate: tokio::sync::Mutex::new(()),
             unread_projection_pending: StdMutex::new(HashSet::new()),
             unread_projection_wake: tokio::sync::Notify::new(),
