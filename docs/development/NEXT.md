@@ -14,14 +14,16 @@ preserved behavior, stop conditions, and rollback requirements.
 ## Current milestone
 
 The next focused completion pass runs on
-**beta/refactor/workspace-messaging-mutations**. The first Milestone 3 family
-proved the internal seam. The initial completion pass then moved inbox listing,
+**beta/refactor/workspace-messaging-attention**. The first Milestone 3 family
+proved the internal seam. The read-and-claim pass then moved inbox listing,
 claiming, message snapshots, and durable follow pages behind
-`WorkspaceMessaging`; the Module now also owns retained claim-locator
-interpretation, publication synchronization, claim result mapping, and the
-post-claim scheduling sequence. Socket handlers and in-process seams no longer
-receive mailbox projection or claim-outcome types for that family. The next
-pass moves the coherent requeue and pre-write withdrawal mutation family.
+`WorkspaceMessaging`; the Module owns retained claim-locator interpretation,
+publication synchronization, claim result mapping, and the post-claim
+scheduling sequence. The mutation pass moved requeue and exact pre-write
+withdrawal behind the same boundary, including durable mutation, notification
+scheduling, cancellation, FIFO advance, and unread invalidation. Socket
+handlers and in-process seams no longer coordinate those mechanisms. The next
+pass moves the coherent alarm and attention decision family.
 Additional narrowly named completion branches remain allowed when one pull
 request would become broad. The corresponding observation completion pass
 follows before Milestone 6. Milestone 5 put retained direct-delivery entry

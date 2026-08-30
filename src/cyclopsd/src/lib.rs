@@ -1962,12 +1962,12 @@ impl Daemon {
         recipient: RecipientKey,
         attempt_id: NotificationAttemptId,
     ) -> Result<NotificationWithdrawResult, WireError> {
-        let service = self.inner.mailbox.as_ref().ok_or_else(|| WireError {
+        let messaging = self.inner.workspace_messaging().ok_or_else(|| WireError {
             code: "mailbox_unavailable".to_string(),
             message: "durable workspace identity is not connected".to_string(),
             data: None,
         })?;
-        let operator = service
+        let operator = messaging
             .identity_for_address(operator)
             .map_err(server::mailbox_service_error)?;
         if !operator.key.is_admin() {
@@ -1977,7 +1977,8 @@ impl Daemon {
                 data: None,
             });
         }
-        messaging::withdraw_notification(&self.inner, service, operator.key, recipient, attempt_id)
+        messaging
+            .withdraw_notification(operator.key, recipient, attempt_id)
             .map_err(server::mailbox_service_error)
     }
 

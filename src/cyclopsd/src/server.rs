@@ -1071,14 +1071,14 @@ fn msg_requeue(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Resp
         Ok(params) => params,
         Err(response) => return response,
     };
-    if let Err(error) = require_mailbox_admin(inner, peer) {
-        return wire_error_response(id, error);
-    }
-    let service = match mailbox_service(inner) {
-        Ok(service) => service,
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
+        Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    let requeued = match crate::messaging::requeue(inner, &service, params.message_id.clone()) {
+    if !caller.key.is_admin() {
+        return wire_error_response(id, mailbox_admin_required());
+    }
+    let requeued = match messaging.requeue(params.message_id.clone()) {
         Ok(requeued) => requeued,
         Err(error) => return wire_error_response(id, mailbox_service_error(error)),
     };
@@ -1098,20 +1098,14 @@ fn notification_withdraw(inner: &Arc<Inner>, id: Value, params: Value, peer: Pee
             Ok(params) => params,
             Err(response) => return response,
         };
-    let (service, caller) = match mailbox_caller(inner, peer) {
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
     if !caller.key.is_admin() {
         return wire_error_response(id, mailbox_admin_required());
     }
-    match crate::messaging::withdraw_notification(
-        inner,
-        &service,
-        caller.key,
-        params.recipient,
-        params.attempt_id,
-    ) {
+    match messaging.withdraw_notification(caller.key, params.recipient, params.attempt_id) {
         Ok(result) => Response::ok(
             id,
             serde_json::to_value(result).expect("notification withdrawal result serializes"),
@@ -5240,16 +5234,18 @@ mod tests {
     }
 
     /// Syntactic architecture lint: these wire adapters may validate and
-    /// serialize protocol values, but durable reads, locator interpretation,
-    /// claim transitions, and post-commit work belong to WorkspaceMessaging.
+    /// serialize protocol values, but durable reads and mutations, locator
+    /// interpretation, and post-commit work belong to WorkspaceMessaging.
     #[test]
-    fn inbox_and_message_read_handlers_do_not_recover_mailbox_implementation_knowledge() {
+    fn messaging_handlers_do_not_recover_mailbox_implementation_knowledge() {
         let source = include_str!("server.rs");
         for (name, next) in [
             ("inbox_list", "inbox_claim"),
             ("inbox_claim", "messages_snapshot"),
             ("messages_snapshot", "messages_follow"),
             ("messages_follow", "msg_requeue"),
+            ("msg_requeue", "notification_withdraw"),
+            ("notification_withdraw", "alarm_preview"),
         ] {
             let marker = format!("fn {name}(");
             let next_marker = format!("fn {next}(");
