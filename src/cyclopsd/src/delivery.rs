@@ -40,10 +40,10 @@ use cyclops_proto::{
     AgentState, ComposerSemantic, ComposerState, Delivery, DeliveryReceipt, DeliveryState,
     Detection, Event, Kind, LedgerLine, MsgSendParams, MsgSendResult, NotificationAttemptId,
     NotificationAttentionCause, NotificationBinding, NotificationManifestId,
-    NotificationPreWriteCause, NotificationPreWriteObservation, NotificationRecord,
-    NotificationRouteEvidenceId, NotificationState, NotificationTransport,
-    NotificationVerifyFailureKind, NotificationVerifyOutcome, NotifyLevel, ProcessInstanceId,
-    QuiesceResult, RecipientKey, Sensor, StatusDiagnostic, VerifiedBy, WaitUntil, WireError,
+    NotificationPreWriteCause, NotificationPreWriteObservation, NotificationState,
+    NotificationTransport, NotificationVerifyFailureKind, NotificationVerifyOutcome, NotifyLevel,
+    ProcessInstanceId, QuiesceResult, RecipientKey, Sensor, StatusDiagnostic, VerifiedBy,
+    WaitUntil, WireError,
 };
 use cyclops_tmux::{ControlClient, PaneEvent, PaneRow, SessionWatcher, TmuxError};
 use serde_json::{json, Value};
@@ -52,13 +52,14 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, error, warn};
 
+use crate::messaging::{MessagingPreWriteBlock, MessagingPreWriteBlockOutcome};
 use crate::notification_adapter::{
     ClaimedNotificationBarrier, NotificationAdapterError, NotificationContext, SubmitReservation,
 };
 use crate::{daemon_line, fusion, unix_ms, Inner, PaneKey};
 
 #[cfg(test)]
-use cyclops_proto::MessageId;
+use cyclops_proto::{MessageId, NotificationRouteEvidenceId};
 
 /// Delivery gives up on evidence this long after submit (spec: neither ACK
 /// tier within 5s goes to retry_queued).
@@ -3255,10 +3256,21 @@ fn recover_failed_job(
                 true
             }
             NotificationState::Queued | NotificationState::Gating => {
-                let Some(record) = persist_worker_failed_prewrite(notification, worker) else {
+                let Some(messaging) = inner.workspace_messaging() else {
+                    worker.set_fault("notification recovery has no workspace messaging Module");
                     return false;
                 };
-                notify_notification_prewrite_blocked(inner, handle, &record);
+                let block = match messaging.record_worker_failed_prewrite(notification) {
+                    Ok(MessagingPreWriteBlockOutcome::Recorded(block)) => Some(block),
+                    Ok(MessagingPreWriteBlockOutcome::Obsolete) => None,
+                    Err(error) => {
+                        worker.set_fault(format!("notification recovery failed: {error}"));
+                        return false;
+                    }
+                };
+                if let Some(block) = block {
+                    notify_notification_prewrite_blocked(inner, handle, &block);
+                }
                 worker.finish(handle);
                 inner.engine.retire_notification_run(handle);
                 true
@@ -3389,26 +3401,6 @@ fn recover_failed_job(
     }
 }
 
-/// Persist the terminal pre-write block before releasing FIFO ownership.
-///
-/// A failed read or append leaves the exact current handle in place. Advancing
-/// to the next queued message would bypass a durable attempt that still owns
-/// the recipient FIFO.
-fn persist_worker_failed_prewrite(
-    notification: &NotificationContext,
-    worker: &Worker,
-) -> Option<NotificationRecord> {
-    match notification.record_gating().and_then(|_| {
-        notification.record_pre_write_block(NotificationPreWriteCause::WorkerFailed, None)
-    }) {
-        Ok(record) => Some(record),
-        Err(error) => {
-            worker.set_fault(format!("notification recovery failed: {error}"));
-            None
-        }
-    }
-}
-
 /// Persist one known pre-write block without releasing FIFO ownership on an
 /// uncertain journal append.
 ///
@@ -3429,86 +3421,45 @@ async fn persist_notification_prewrite_block(
     // Test seam: an admitting edge can land between the gate's verdict and
     // this append. The reconcile below must catch it, never strand it.
     inject_pause(inner, "pre_prewrite_block").await;
-    if let Some(record) = record_notification_prewrite_block(
+    let Some(messaging) = inner.workspace_messaging() else {
+        worker.set_fault("notification pre-write block has no workspace messaging Module");
+        return;
+    };
+    let block = match messaging.record_notification_prewrite_block(
         notification,
-        worker,
-        &inner.mailbox_publication,
         cause,
         observation,
-        &route_evidence,
+        route_evidence,
+        handle.session_idx,
+        &handle.pane_id,
     ) {
-        notify_notification_prewrite_blocked(inner, handle, &record);
-        // A positive route edge can race just ahead of this append and see
-        // only Gating. Reconcile once after the durable block exists so that
-        // edge is not lost. The mailbox projection enforces the one-reopen
-        // limit and exact binding checks.
-        if let Some(messaging) = inner.workspace_messaging() {
-            messaging.notification_prewrite_blocked(handle.session_idx, &handle.pane_id);
-        }
-        if let Some(watcher) = inner.watcher_of(handle.session_idx) {
-            let route_evidence = inner.route_evidence_id(handle.session_idx, &handle.pane_id);
-            crate::observe_pane_for_route_evidence(
-                inner,
-                handle.session_idx,
-                &watcher,
-                &handle.pane_id,
-                true,
-                "prewrite_block_reconcile",
-                &route_evidence,
-            )
-            .await;
-            if let Some(messaging) = inner.workspace_messaging() {
-                messaging.notification_prewrite_blocked(handle.session_idx, &handle.pane_id);
-            }
-        }
-    }
-}
-
-fn record_notification_prewrite_block(
-    notification: &NotificationContext,
-    worker: &Worker,
-    publication: &StdMutex<()>,
-    cause: NotificationPreWriteCause,
-    observation: Option<NotificationPreWriteObservation>,
-    route_evidence: &NotificationRouteEvidenceId,
-) -> Option<NotificationRecord> {
-    let observation =
-        if cause == NotificationPreWriteCause::WriteReadinessChanged && observation.is_none() {
-            // A readiness race can lack binding or width evidence, but it still
-            // needs the route generation under which the write was refused.
-            Some(NotificationPreWriteObservation {
-                write_block: None,
-                pane_root: None,
-                selected_manifest: None,
-                binding: None,
-                route_evidence: Some(route_evidence.clone()),
-                pane_width: None,
-                required_pane_width: None,
-            })
-        } else {
-            observation
-        };
-    let recorded = {
-        let _publication = publication.lock().expect("mailbox publication lock");
-        let wake_block = (cause == NotificationPreWriteCause::ComposerOwnershipUnproven)
-            .then_some(cyclops_proto::MessageWakeBlock::ComposerOwnershipUnproven);
-        notification.record_pre_write_block_with_wake_block(cause, observation, wake_block)
-    };
-    match recorded {
-        Ok(record) => Some(record),
-        Err(NotificationAdapterError::NoLongerCurrentBeforeWrite) => None,
-        Err(NotificationAdapterError::TerminalConflict(
-            NotificationState::Withdrawn
-            | NotificationState::WithdrawnByOperator
-            | NotificationState::Superseded,
-        )) => None,
+        Ok(MessagingPreWriteBlockOutcome::Recorded(block)) => block,
+        Ok(MessagingPreWriteBlockOutcome::Obsolete) => return,
         Err(error) => {
             error!(id = %notification.message_id(), %error, "notification pre-write block fact failed");
             worker.set_fault(format!(
                 "notification pre-write block storage failed: {error}"
             ));
-            None
+            return;
         }
+    };
+    notify_notification_prewrite_blocked(inner, handle, &block);
+    // A positive route edge can race just ahead of this append and see only
+    // Gating. Re-observe after the durable block exists so that edge is not
+    // lost. The Module enforces the one-reopen limit and exact binding checks.
+    if let Some(watcher) = inner.watcher_of(handle.session_idx) {
+        let route_evidence = inner.route_evidence_id(handle.session_idx, &handle.pane_id);
+        crate::observe_pane_for_route_evidence(
+            inner,
+            handle.session_idx,
+            &watcher,
+            &handle.pane_id,
+            true,
+            "prewrite_block_reconcile",
+            &route_evidence,
+        )
+        .await;
+        messaging.notification_prewrite_blocked(handle.session_idx, &handle.pane_id);
     }
 }
 
@@ -5676,11 +5627,10 @@ async fn fail_attempt(
 fn notify_notification_prewrite_blocked(
     inner: &Arc<Inner>,
     handle: &DeliveryHandle,
-    record: &cyclops_proto::NotificationRecord,
+    block: &MessagingPreWriteBlock,
 ) {
-    let cause = record
-        .pre_write_cause
-        .and_then(|cause| serde_json::to_value(cause).ok())
+    let cause = serde_json::to_value(block.cause)
+        .ok()
         .and_then(|value| value.as_str().map(str::to_string))
         .unwrap_or_else(|| "unknown".to_string());
     admin_notify(
@@ -5689,7 +5639,7 @@ fn notify_notification_prewrite_blocked(
         &format!("notification to {} blocked before write", handle.to),
         &format!(
             "message {} attempt {}: {cause}; the mailbox remains claimable",
-            handle.msg_id, record.attempt_id
+            handle.msg_id, block.attempt_id
         ),
         Some(&handle.msg_id),
         Some(handle.session_idx),
@@ -12864,7 +12814,13 @@ composer_trailer_required_prefix = 1
             &handle
         ));
 
-        assert!(persist_worker_failed_prewrite(&context, &worker).is_none());
+        let error = context
+            .record_gating()
+            .and_then(|_| {
+                context.record_pre_write_block(NotificationPreWriteCause::WorkerFailed, None)
+            })
+            .expect_err("injected append failure reaches the Module boundary");
+        worker.set_fault(format!("notification recovery failed: {error}"));
         assert!(worker.is_faulted());
         assert!(Arc::ptr_eq(
             &worker.current().expect("failed attempt remains current"),
@@ -12912,18 +12868,26 @@ composer_trailer_required_prefix = 1
             &handle
         ));
 
-        let record = record_notification_prewrite_block(
-            &context,
-            &worker,
-            &StdMutex::new(()),
-            NotificationPreWriteCause::WriteReadinessChanged,
-            None,
-            &NotificationRouteEvidenceId {
-                boot_id: "boot".into(),
-                generation: 1,
-            },
-        );
-        assert!(record.is_none());
+        let error = context
+            .record_pre_write_block(
+                NotificationPreWriteCause::WriteReadinessChanged,
+                Some(NotificationPreWriteObservation {
+                    write_block: None,
+                    pane_root: None,
+                    selected_manifest: None,
+                    binding: None,
+                    route_evidence: Some(NotificationRouteEvidenceId {
+                        boot_id: "boot".into(),
+                        generation: 1,
+                    }),
+                    pane_width: None,
+                    required_pane_width: None,
+                }),
+            )
+            .expect_err("injected append failure reaches the Module boundary");
+        worker.set_fault(format!(
+            "notification pre-write block storage failed: {error}"
+        ));
         assert!(worker.is_faulted());
         assert!(Arc::ptr_eq(
             &worker.current().expect("failed attempt remains current"),
@@ -13007,21 +12971,25 @@ composer_trailer_required_prefix = 1
             queued.attempt_id,
         );
         context.record_gating().unwrap();
-        let worker = Worker::new();
         let route_evidence = |generation| NotificationRouteEvidenceId {
             boot_id: "boot".into(),
             generation,
         };
         let baseline = route_evidence(7);
-        let blocked = record_notification_prewrite_block(
-            &context,
-            &worker,
-            &StdMutex::new(()),
-            NotificationPreWriteCause::WriteReadinessChanged,
-            None,
-            &baseline,
-        )
-        .expect("readiness block");
+        let blocked = context
+            .record_pre_write_block(
+                NotificationPreWriteCause::WriteReadinessChanged,
+                Some(NotificationPreWriteObservation {
+                    write_block: None,
+                    pane_root: None,
+                    selected_manifest: None,
+                    binding: None,
+                    route_evidence: Some(baseline.clone()),
+                    pane_width: None,
+                    required_pane_width: None,
+                }),
+            )
+            .expect("readiness block");
         let stored = blocked
             .pre_write_observation
             .as_ref()
@@ -13107,15 +13075,20 @@ composer_trailer_required_prefix = 1
             recipient,
             queued.attempt_id,
         );
-        let blocked_again = record_notification_prewrite_block(
-            &reopened_context,
-            &worker,
-            &StdMutex::new(()),
-            NotificationPreWriteCause::WriteReadinessChanged,
-            None,
-            &route_evidence(8),
-        )
-        .expect("second readiness block");
+        let blocked_again = reopened_context
+            .record_pre_write_block(
+                NotificationPreWriteCause::WriteReadinessChanged,
+                Some(NotificationPreWriteObservation {
+                    write_block: None,
+                    pane_root: None,
+                    selected_manifest: None,
+                    binding: None,
+                    route_evidence: Some(route_evidence(8)),
+                    pane_width: None,
+                    required_pane_width: None,
+                }),
+            )
+            .expect("second readiness block");
         assert_eq!(blocked_again.pre_write_reopen_count, 1);
         let lines_before_repeat = service.journal_lines().unwrap().len();
         assert!(service
@@ -13143,18 +13116,22 @@ composer_trailer_required_prefix = 1
             &handle
         ));
 
-        let record = record_notification_prewrite_block(
-            &context,
-            &worker,
-            &StdMutex::new(()),
+        let record = context.record_pre_write_block(
             NotificationPreWriteCause::WriteReadinessChanged,
-            None,
-            &NotificationRouteEvidenceId {
-                boot_id: "boot".into(),
-                generation: 1,
-            },
+            Some(NotificationPreWriteObservation {
+                write_block: None,
+                pane_root: None,
+                selected_manifest: None,
+                binding: None,
+                route_evidence: Some(NotificationRouteEvidenceId {
+                    boot_id: "boot".into(),
+                    generation: 1,
+                }),
+                pane_width: None,
+                required_pane_width: None,
+            }),
         );
-        assert!(record.is_some());
+        assert!(record.is_ok());
         assert!(!worker.is_faulted());
         assert_eq!(
             notification_state(&store, recipient, context.message_id()).state,

@@ -9,10 +9,11 @@ use cyclops_proto::{
     DeliveryReceipt, DeliveryState, InboxClaimResult, InboxListResult, InboxSummaryEntry,
     MessageId, MessageWakeBlock, MessagesFollowResult, MessagesSnapshotResult, MsgSendParams,
     MsgSendResult, NotificationAttemptId, NotificationAttentionCause, NotificationBinding,
-    NotificationManifestId, NotificationRecord, NotificationResolution,
-    NotificationResolutionConsumptionObservation, NotificationRouteEvidenceId, NotificationState,
-    NotificationWithdrawDisposition, NotificationWithdrawResult, NotifyLevel, OpenDelivery,
-    ProcessInstanceId, RecipientKey, StatusBlockedNotification, StatusMailboxRoute,
+    NotificationManifestId, NotificationPreWriteCause, NotificationPreWriteObservation,
+    NotificationRecord, NotificationResolution, NotificationResolutionConsumptionObservation,
+    NotificationRouteEvidenceId, NotificationState, NotificationWithdrawDisposition,
+    NotificationWithdrawResult, NotifyLevel, OpenDelivery, ProcessInstanceId, RecipientKey,
+    StatusBlockedNotification, StatusMailboxRoute,
 };
 use cyclops_tmux::{PaneRow, SessionWatcher};
 use tokio::time::Instant;
@@ -26,10 +27,7 @@ use crate::mailbox::{
     ClaimOutcome, ExactOwnedRecoveryAction, MailboxError, MailboxIdentity, MailboxSend,
     MailboxService, MailboxServiceError, MessageStoreError,
 };
-#[cfg(test)]
-use crate::notification_adapter::NotificationContext;
-#[cfg(test)]
-use cyclops_proto::{NotificationPreWriteCause, NotificationPreWriteObservation};
+use crate::notification_adapter::{NotificationAdapterError, NotificationContext};
 
 pub(crate) struct NotificationRoute {
     pub(crate) session_idx: usize,
@@ -131,6 +129,23 @@ pub(crate) struct MessagingRouteEvidence {
     pub(crate) pane_id: String,
     pub(crate) evidence_id: NotificationRouteEvidenceId,
 }
+
+/// Body-free result of one durable pre-write block transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MessagingPreWriteBlock {
+    pub(crate) attempt_id: NotificationAttemptId,
+    pub(crate) cause: NotificationPreWriteCause,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MessagingPreWriteBlockOutcome {
+    Recorded(MessagingPreWriteBlock),
+    Obsolete,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub(crate) struct MessagingPreWriteBlockError(#[from] NotificationAdapterError);
 
 /// One immutable authenticated hook observation for an exact attention
 /// consumption candidate.
@@ -845,6 +860,91 @@ impl WorkspaceMessaging {
     /// or worker topology to the observer.
     pub(crate) fn route_evidence_observed(&self, evidence: MessagingRouteEvidence) {
         self.effects.reconcile_route_evidence(evidence);
+    }
+
+    /// Persist one known pre-write refusal and publish its route consequence
+    /// without exposing the journal lock or terminal-state variants.
+    pub(crate) fn record_notification_prewrite_block(
+        &self,
+        notification: &NotificationContext,
+        cause: NotificationPreWriteCause,
+        observation: Option<NotificationPreWriteObservation>,
+        route_evidence: NotificationRouteEvidenceId,
+        session_idx: usize,
+        pane_id: impl Into<String>,
+    ) -> Result<MessagingPreWriteBlockOutcome, MessagingPreWriteBlockError> {
+        let observation =
+            if cause == NotificationPreWriteCause::WriteReadinessChanged && observation.is_none() {
+                // A readiness race can lack binding or width evidence, but it still
+                // needs the route generation under which the write was refused.
+                Some(NotificationPreWriteObservation {
+                    write_block: None,
+                    pane_root: None,
+                    selected_manifest: None,
+                    binding: None,
+                    route_evidence: Some(route_evidence),
+                    pane_width: None,
+                    required_pane_width: None,
+                })
+            } else {
+                observation
+            };
+        let outcome = self.record_prewrite_transition(notification, cause, observation, false)?;
+        if matches!(outcome, MessagingPreWriteBlockOutcome::Recorded(_)) {
+            self.notification_prewrite_blocked(session_idx, pane_id);
+        }
+        Ok(outcome)
+    }
+
+    /// Convert an exhausted notification supervisor into one durable
+    /// pre-write block before its worker releases FIFO ownership.
+    pub(crate) fn record_worker_failed_prewrite(
+        &self,
+        notification: &NotificationContext,
+    ) -> Result<MessagingPreWriteBlockOutcome, MessagingPreWriteBlockError> {
+        self.record_prewrite_transition(
+            notification,
+            NotificationPreWriteCause::WorkerFailed,
+            None,
+            true,
+        )
+    }
+
+    fn record_prewrite_transition(
+        &self,
+        notification: &NotificationContext,
+        cause: NotificationPreWriteCause,
+        observation: Option<NotificationPreWriteObservation>,
+        ensure_gating: bool,
+    ) -> Result<MessagingPreWriteBlockOutcome, MessagingPreWriteBlockError> {
+        let recorded = {
+            let _publication = self.publication.lock().expect("mailbox publication lock");
+            (|| {
+                if ensure_gating {
+                    notification.record_gating()?;
+                }
+                let wake_block = (cause == NotificationPreWriteCause::ComposerOwnershipUnproven)
+                    .then_some(MessageWakeBlock::ComposerOwnershipUnproven);
+                notification.record_pre_write_block_with_wake_block(cause, observation, wake_block)
+            })()
+        };
+        match recorded {
+            Ok(record) => Ok(MessagingPreWriteBlockOutcome::Recorded(
+                MessagingPreWriteBlock {
+                    attempt_id: record.attempt_id,
+                    cause: record.pre_write_cause.unwrap_or(cause),
+                },
+            )),
+            Err(NotificationAdapterError::NoLongerCurrentBeforeWrite) => {
+                Ok(MessagingPreWriteBlockOutcome::Obsolete)
+            }
+            Err(NotificationAdapterError::TerminalConflict(
+                NotificationState::Withdrawn
+                | NotificationState::WithdrawnByOperator
+                | NotificationState::Superseded,
+            )) => Ok(MessagingPreWriteBlockOutcome::Obsolete),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Reconsider the current route after a durable pre-write block commits.
@@ -2516,6 +2616,218 @@ mod tests {
                 "authenticated hook recovered messaging internals through {forbidden}"
             );
         }
+    }
+
+    /// Syntactic architecture lint: delivery supplies physical evidence and
+    /// reacts to a body-free result. It cannot recover the publication lock or
+    /// append a pre-write transition itself.
+    #[test]
+    fn delivery_cannot_own_the_prewrite_transaction() {
+        let source = include_str!("delivery.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("delivery test boundary")
+            .0;
+
+        for required in [
+            "record_notification_prewrite_block(",
+            "record_worker_failed_prewrite(",
+        ] {
+            assert!(
+                production.contains(required),
+                "delivery stopped using the WorkspaceMessaging boundary: {required}"
+            );
+        }
+        for forbidden in [
+            "mailbox_publication",
+            "record_pre_write_block_with_wake_block",
+            "record_pre_write_block(NotificationPreWriteCause::WorkerFailed",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "delivery recovered pre-write messaging internals through {forbidden}"
+            );
+        }
+    }
+
+    // Obsolete if delivery again synthesizes route baselines, chooses wake
+    // blocks, or interprets durable terminal variants itself.
+    #[test]
+    fn workspace_messaging_owns_the_prewrite_transaction_and_policy() {
+        let (_scratch, service, events, reviewer, _) =
+            mailbox_service("workspace-messaging-prewrite", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            effects.clone(),
+        );
+        let (accepted, context, _) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        let baseline = NotificationRouteEvidenceId {
+            boot_id: "boot".into(),
+            generation: 7,
+        };
+
+        assert_eq!(
+            messaging
+                .record_notification_prewrite_block(
+                    &context,
+                    NotificationPreWriteCause::WriteReadinessChanged,
+                    None,
+                    baseline.clone(),
+                    2,
+                    "%7",
+                )
+                .unwrap(),
+            MessagingPreWriteBlockOutcome::Recorded(MessagingPreWriteBlock {
+                attempt_id: context.attempt_id(),
+                cause: NotificationPreWriteCause::WriteReadinessChanged,
+            })
+        );
+        let record = service
+            .store_handle()
+            .lock()
+            .unwrap()
+            .projection()
+            .notification(reviewer, &accepted.message_id)
+            .cloned()
+            .expect("pre-write block is durable");
+        let observation = record
+            .pre_write_observation
+            .expect("readiness race keeps its route baseline");
+        assert_eq!(observation.route_evidence, Some(baseline));
+        assert!(observation.binding.is_none());
+        assert_eq!(
+            effects.calls(),
+            vec![RecordedEffect::ReconcileCurrentRoute(2, "%7".to_string())]
+        );
+    }
+
+    #[test]
+    fn workspace_messaging_prewrite_preserves_claims_and_classifies_obsolete_work() {
+        let (_scratch, service, events, reviewer, _) =
+            mailbox_service("workspace-messaging-prewrite-claim", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging =
+            WorkspaceMessaging::new(Arc::clone(&service), Arc::new(StdMutex::new(())), effects);
+        let (accepted, context, _) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        service
+            .claim(reviewer, accepted.message_id.clone())
+            .unwrap();
+        let route = NotificationRouteEvidenceId {
+            boot_id: "boot".into(),
+            generation: 1,
+        };
+
+        assert!(matches!(
+            messaging
+                .record_notification_prewrite_block(
+                    &context,
+                    NotificationPreWriteCause::WriteReadinessChanged,
+                    None,
+                    route.clone(),
+                    0,
+                    "%3",
+                )
+                .unwrap(),
+            MessagingPreWriteBlockOutcome::Recorded(_)
+        ));
+        assert_eq!(
+            service.message_dispositions(&accepted.message_id).unwrap()[0].notification_state_raw,
+            Some(NotificationState::BlockedPreWrite),
+            "a body claim does not retire the operator-visible notification"
+        );
+        messaging
+            .withdraw_notification(service.admin().key, reviewer, context.attempt_id())
+            .unwrap();
+        assert_eq!(
+            messaging
+                .record_notification_prewrite_block(
+                    &context,
+                    NotificationPreWriteCause::WriteReadinessChanged,
+                    None,
+                    route,
+                    0,
+                    "%3",
+                )
+                .unwrap(),
+            MessagingPreWriteBlockOutcome::Obsolete
+        );
+
+        let (_scratch, service, events, reviewer, _) =
+            mailbox_service("workspace-messaging-worker-obsolete", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging =
+            WorkspaceMessaging::new(Arc::clone(&service), Arc::new(StdMutex::new(())), effects);
+        let (_accepted, context, _) = queued_attempt(&service);
+        messaging
+            .withdraw_notification(service.admin().key, reviewer, context.attempt_id())
+            .unwrap();
+        assert_eq!(
+            messaging.record_worker_failed_prewrite(&context).unwrap(),
+            MessagingPreWriteBlockOutcome::Obsolete,
+            "supervisor exhaustion cannot revive an operator-withdrawn attempt"
+        );
+    }
+
+    #[test]
+    fn workspace_messaging_prewrite_reports_storage_uncertainty_without_a_false_block() {
+        let (_scratch, service, events, _reviewer, _) =
+            mailbox_service("workspace-messaging-prewrite-failure", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            effects.clone(),
+        );
+        let (accepted, context, _) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        service
+            .store_handle()
+            .lock()
+            .unwrap()
+            .inject_next_pre_write_block_append_failure();
+
+        assert!(messaging
+            .record_notification_prewrite_block(
+                &context,
+                NotificationPreWriteCause::WriteReadinessChanged,
+                None,
+                NotificationRouteEvidenceId {
+                    boot_id: "boot".into(),
+                    generation: 1,
+                },
+                0,
+                "%3",
+            )
+            .is_err());
+        let disposition = service.message_dispositions(&accepted.message_id).unwrap();
+        assert_eq!(
+            disposition[0].notification_state_raw,
+            Some(NotificationState::Gating)
+        );
+        assert_eq!(disposition[0].pre_write_cause, None);
+        assert!(effects.calls().is_empty());
+
+        let (_scratch, service, events, _reviewer, _) =
+            mailbox_service("workspace-messaging-worker-failure", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging =
+            WorkspaceMessaging::new(Arc::clone(&service), Arc::new(StdMutex::new(())), effects);
+        let (_accepted, context, _) = queued_attempt(&service);
+        assert_eq!(
+            messaging.record_worker_failed_prewrite(&context).unwrap(),
+            MessagingPreWriteBlockOutcome::Recorded(MessagingPreWriteBlock {
+                attempt_id: context.attempt_id(),
+                cause: NotificationPreWriteCause::WorkerFailed,
+            })
+        );
+        assert_eq!(
+            context.current_record().unwrap().state,
+            NotificationState::BlockedPreWrite
+        );
     }
 
     // Obsolete if alarm or attention adapters again inspect notification

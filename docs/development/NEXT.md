@@ -14,7 +14,7 @@ preserved behavior, stop conditions, and rollback requirements.
 ## Current milestone
 
 The next focused completion pass runs on
-**beta/refactor/workspace-messaging-prewrite**. The first Milestone 3
+**beta/refactor/workspace-messaging-recovery**. The first Milestone 3
 family proved the internal seam. The read-and-claim pass then moved inbox listing,
 claiming, message snapshots, and durable follow pages behind
 `WorkspaceMessaging`; the Module owns retained claim-locator interpretation,
@@ -69,9 +69,14 @@ found that authenticated hook handling still reached the mailbox service to
 match boot-local attention candidates. The first audit correction now sends
 one immutable authenticated observation through `WorkspaceMessaging`; the
 Module owns exact registered-candidate lookup, payload and durable-binding
-comparison, and the one-shot signal. The next correction moves delivery
-pre-write publication synchronization, durable block transition, and
-terminal-state classification behind the Module.
+comparison, and the one-shot signal. The pre-write correction moved
+publication synchronization, readiness-route baseline synthesis, wake-block
+policy, the durable block transition, benign terminal-state classification,
+the exhausted-supervisor transition, and the first post-commit route
+consequence behind the Module. Delivery now retains physical route observation
+and worker fault ownership while receiving only a body-free
+recorded-or-obsolete result. The next correction moves composer recovery
+messaging decisions behind the Module.
 Additional narrowly named completion branches remain allowed when one pull
 request would become broad. The corresponding observation completion pass
 follows before Milestone 6. Milestone 5 put retained direct-delivery entry
