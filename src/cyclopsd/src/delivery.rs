@@ -5182,12 +5182,8 @@ async fn reconcile_claimed_notification_barrier<I: Injector>(
         )
         .await;
     }
-    inner
-        .composer_recovery
-        .lock()
-        .expect("composer recovery lock")
-        .retired(record.attempt_id);
     if let Some(messaging) = inner.workspace_messaging() {
+        messaging.composer_barrier_retired(record.attempt_id);
         if let Err(error) = messaging.notification_head_changed(notification.recipient()) {
             error!(id = %handle.msg_id, %error, "cannot advance notification FIFO after staged claim");
         }
@@ -11927,9 +11923,9 @@ composer_trailer_required_prefix = 1
             session_identities: StdMutex::new(session_identities),
             mailbox: None,
             workspace_messaging: std::sync::OnceLock::new(),
-            composer_recovery: StdMutex::new(
+            composer_recovery: Arc::new(StdMutex::new(
                 crate::composer_recovery::RecoveryCoordinator::default(),
-            ),
+            )),
             mailbox_publication: Arc::new(StdMutex::new(())),
             unread_projection_gate: tokio::sync::Mutex::new(()),
             unread_projection_pending: StdMutex::new(HashSet::new()),

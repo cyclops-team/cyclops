@@ -2949,9 +2949,9 @@ mod tests {
             session_identities: StdMutex::new(session_identities),
             mailbox: None,
             workspace_messaging: std::sync::OnceLock::new(),
-            composer_recovery: StdMutex::new(
+            composer_recovery: Arc::new(StdMutex::new(
                 crate::composer_recovery::RecoveryCoordinator::default(),
-            ),
+            )),
             mailbox_publication: Arc::new(StdMutex::new(())),
             unread_projection_gate: tokio::sync::Mutex::new(()),
             unread_projection_pending: StdMutex::new(HashSet::new()),

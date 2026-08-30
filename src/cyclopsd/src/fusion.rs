@@ -3758,12 +3758,11 @@ async fn observe_pane_with_evidence(
     };
     let recovery_recipient =
         crate::composer_recovery::exact_recipient(inner, session_idx, watcher, &row);
-    let (recovery_records, recovery_store_error) = match recovery_recipient {
-        Some(recipient) => match crate::composer_recovery::active_for_recipient(inner, recipient) {
-            Ok(records) => (records, None),
-            Err(reason) => (Vec::new(), Some(reason)),
-        },
-        None => (Vec::new(), None),
+    let workspace_messaging = inner.workspace_messaging();
+    let recovery_probe = match (recovery_recipient, workspace_messaging.as_ref()) {
+        (Some(recipient), Some(messaging)) => messaging.composer_recovery_probe(recipient),
+        (Some(_), None) => crate::messaging::MessagingComposerRecoveryProbe::store_unavailable(),
+        (None, _) => crate::messaging::MessagingComposerRecoveryProbe::none(),
     };
     let (composer_candidates, composer_store_available) = match recovery_recipient {
         Some(recipient) => match inner
@@ -3776,7 +3775,7 @@ async fn observe_pane_with_evidence(
         },
         None => (Vec::new(), true),
     };
-    let recovering = !recovery_records.is_empty() || recovery_store_error.is_some();
+    let recovering = recovery_probe.is_recovering();
     let manifest = bind_manifest_for(inner, session_idx, &row);
     let manifest_id = manifest.map(|m| m.agent.id.clone());
     // Resolved once, before anything that needs it: the pane's admitted
@@ -4343,75 +4342,39 @@ async fn observe_pane_with_evidence(
             binding,
         )
     });
-    let exact_claim_after_write = match recovery_records.as_slice() {
-        [record] => inner
-            .mailbox
-            .as_ref()
-            .and_then(|service| service.exact_recipient_claimed_after_write(record).ok())
-            .unwrap_or(false),
-        _ => false,
-    };
-    let legacy_claimed_clean = exact_claim_after_write
-        && recovery_live.as_ref().is_some_and(|binding| {
-            claimed_legacy_recovery_ready(
-                &detection,
-                row.in_mode,
-                manifest_id.as_deref(),
-                binding,
-                &composer_capture,
-            )
-        });
-    let mut recovery_action = if let Some(reason) = recovery_store_error {
-        Some(crate::composer_recovery::RecoveryAction::Hold(reason))
-    } else {
-        inner
-            .composer_recovery
-            .lock()
-            .expect("composer recovery lock")
-            .reconcile(
-                &recovery_records,
+    let legacy_composer_ready = recovery_live.as_ref().is_some_and(|binding| {
+        claimed_legacy_recovery_ready(
+            &detection,
+            row.in_mode,
+            manifest_id.as_deref(),
+            binding,
+            &composer_capture,
+        )
+    });
+    let mut recovery_plan = match workspace_messaging.as_ref() {
+        Some(messaging) => {
+            let plan = messaging.reconcile_composer_recovery(
+                recovery_probe,
+                crate::messaging::MessagingComposerRecoveryObservation {
+                    binding: recovery_live.clone(),
+                    clean_composer: recovery_clean,
+                    legacy_composer_ready,
+                },
+            );
+            let lifecycle_candidate = crate::composer_recovery::exact_lifecycle_candidate(
+                inner,
+                session_idx,
+                pane_id,
                 recovery_live.as_ref(),
                 recovery_clean,
-                legacy_claimed_clean,
-            )
-    };
-    let retired_attempt = match recovery_action.as_ref() {
-        Some(action @ crate::composer_recovery::RecoveryAction::Retire { .. }) => {
-            match crate::composer_recovery::persist(inner, action) {
-                Ok(attempt_id) => {
-                    recovery_action = None;
-                    Some(attempt_id)
-                }
-                Err(reason) => {
-                    recovery_action = Some(crate::composer_recovery::RecoveryAction::Hold(reason));
-                    None
-                }
-            }
+            );
+            Some(messaging.settle_composer_recovery_lifecycle(plan, lifecycle_candidate))
         }
-        _ => None,
-    };
-    if matches!(
-        recovery_action,
-        Some(crate::composer_recovery::RecoveryAction::Restore(_))
-    ) {
-        match crate::composer_recovery::retire_exact_lifecycle(
-            inner,
-            session_idx,
-            pane_id,
-            recovery_live.as_ref(),
-            recovery_clean,
-        ) {
-            crate::composer_recovery::LifecycleRetirement::NotReady => {}
-            crate::composer_recovery::LifecycleRetirement::Durable(_) => {
-                // The matching end is still pinned. Normal settlement below
-                // may now clear the runtime hold and consume it.
-                recovery_action = None;
-            }
-            crate::composer_recovery::LifecycleRetirement::Blocked(reason) => {
-                recovery_action = Some(crate::composer_recovery::RecoveryAction::Hold(reason));
-            }
+        None if recovery_recipient.is_some() => {
+            Some(crate::messaging::MessagingComposerRecoveryPlan::store_unavailable())
         }
-    }
+        None => None,
+    };
 
     let working_confirmed =
         working_is_confirmed(inner, &route, &detection, admitted, manifest_id.as_deref());
@@ -4426,24 +4389,6 @@ async fn observe_pane_with_evidence(
         missing_end_diagnostic,
     ) = {
         let mut map = inner.detections.lock().expect("detections lock");
-        if matches!(
-            recovery_action.as_ref(),
-            Some(crate::composer_recovery::RecoveryAction::Hold(
-                "composer_recovery_retirement_pending"
-            ))
-        ) {
-            let pending = recovery_records
-                .first()
-                .and_then(|record| {
-                    inner
-                        .composer_recovery
-                        .lock()
-                        .expect("composer recovery lock")
-                        .retirement_pending_reason(record.attempt_id)
-                })
-                .map(crate::composer_recovery::RecoveryAction::Hold);
-            recovery_action = pending;
-        }
         let prior_entry = map.get(&route);
         let prior = prior_entry.map(|e| e.detection.state);
         let prior_ready = prior_entry.map(readiness_key);
@@ -4481,15 +4426,23 @@ async fn observe_pane_with_evidence(
         } else {
             base_hold
         };
-        let (base_hold, hold_owner, clear_turn, recovery_refusal) =
-            crate::composer_recovery::merge_barrier(
-                recovery_action.as_ref(),
-                retired_attempt,
-                base_hold,
-                hold_owner,
-                detection.turn_running_at().is_some(),
-            );
-        if clear_turn {
+        let turn_running = detection.turn_running_at().is_some();
+        let recovery_update = match (workspace_messaging.as_ref(), recovery_plan.take()) {
+            (Some(messaging), Some(plan)) => {
+                messaging.merge_composer_recovery_barrier(plan, base_hold, hold_owner, turn_running)
+            }
+            (None, Some(plan)) => plan.merge_without_module(base_hold, hold_owner, turn_running),
+            (_, None) => crate::messaging::MessagingComposerBarrierUpdate {
+                hold: base_hold,
+                owner: hold_owner,
+                clear_turn: false,
+                refusal: None,
+                recovered_hold: None,
+            },
+        };
+        let base_hold = recovery_update.hold;
+        let hold_owner = recovery_update.owner;
+        if recovery_update.clear_turn {
             turn = None;
         }
         // Any unresolved recovered action owns the runtime barrier. It may
@@ -4501,11 +4454,7 @@ async fn observe_pane_with_evidence(
         // already running when recovery restored the barrier. That turn
         // cannot consume the payload, so the hold becomes Staged and waits
         // for the next exact start.
-        let recovered_hold = recovery_hold_before_durable_retirement(
-            recovery_action.as_ref(),
-            base_hold,
-            &detection,
-        );
+        let recovered_hold = recovery_update.recovered_hold;
         // `settle_turn` owns the lane rule. Called here, under both
         // locks, because the advance and the consumption of an exact end
         // are one decision: splitting them leaves a window where another
@@ -4572,7 +4521,7 @@ async fn observe_pane_with_evidence(
         } else if stranded {
             detection = detection.refused("turn_evidence_lost");
         }
-        if let Some(reason) = recovery_refusal {
+        if let Some(reason) = recovery_update.refusal {
             detection = detection.refused(reason);
         }
         // Before the cache, for the same reason the stamp is: the cache is
@@ -4839,6 +4788,7 @@ fn quota_reset_probe_needed(prior_screen_clear: bool, current: &Detection) -> bo
 /// The only transition allowed before then ends a turn that was already
 /// running when the barrier was restored. That turn cannot consume the staged
 /// payload, so recovery waits in `Staged` for the next exact start.
+#[cfg(test)]
 fn recovery_hold_before_durable_retirement(
     action: Option<&crate::composer_recovery::RecoveryAction>,
     hold: ComposerHold,
@@ -10449,10 +10399,19 @@ regex = ['^IDLE']
             manifest: NotificationManifestId::new("codex").unwrap(),
         };
 
-        assert_eq!(
-            crate::composer_recovery::retire_exact_lifecycle(&inner, 0, "%1", Some(&live), true,),
-            crate::composer_recovery::LifecycleRetirement::Durable(queued.attempt_id)
+        let messaging = inner.workspace_messaging().unwrap();
+        let probe = messaging.composer_recovery_probe(recipient);
+        let plan = messaging.reconcile_composer_recovery(
+            probe,
+            crate::messaging::MessagingComposerRecoveryObservation {
+                binding: Some(live.clone()),
+                clean_composer: false,
+                legacy_composer_ready: false,
+            },
         );
+        let candidate =
+            crate::composer_recovery::exact_lifecycle_candidate(&inner, 0, "%1", Some(&live), true);
+        messaging.settle_composer_recovery_lifecycle(plan, candidate);
         assert!(service.active_notification_barriers().unwrap().is_empty());
         assert!(turnkey::PaneEnds::holds(
             &inner.turn_ends.lock().unwrap(),
@@ -10544,10 +10503,8 @@ regex = ['^IDLE']
         };
 
         assert_eq!(
-            crate::composer_recovery::retire_exact_lifecycle(&inner, 0, "%1", Some(&live), true,),
-            crate::composer_recovery::LifecycleRetirement::Blocked(
-                "composer_recovery_store_unavailable"
-            )
+            crate::composer_recovery::exact_lifecycle_candidate(&inner, 0, "%1", Some(&live), true,),
+            Some(attempt_id)
         );
         let entry = inner
             .detections
@@ -10592,9 +10549,9 @@ regex = ['^IDLE']
             session_identities: StdMutex::new(session_identities),
             mailbox: None,
             workspace_messaging: std::sync::OnceLock::new(),
-            composer_recovery: StdMutex::new(
+            composer_recovery: Arc::new(StdMutex::new(
                 crate::composer_recovery::RecoveryCoordinator::default(),
-            ),
+            )),
             mailbox_publication: Arc::new(StdMutex::new(())),
             unread_projection_gate: tokio::sync::Mutex::new(()),
             unread_projection_pending: StdMutex::new(HashSet::new()),

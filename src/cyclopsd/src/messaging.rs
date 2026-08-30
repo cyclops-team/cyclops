@@ -5,12 +5,13 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use cyclops_proto::{
-    AgentState, AlarmClearResult, AlarmPreviewResult, AlarmSummary, ClaimDisposition,
+    AgentState, AlarmClearResult, AlarmPreviewResult, AlarmSummary, ClaimDisposition, ComposerHold,
     DeliveryReceipt, DeliveryState, InboxClaimResult, InboxListResult, InboxSummaryEntry,
     MessageId, MessageWakeBlock, MessagesFollowResult, MessagesSnapshotResult, MsgSendParams,
-    MsgSendResult, NotificationAttemptId, NotificationAttentionCause, NotificationBinding,
-    NotificationManifestId, NotificationPreWriteCause, NotificationPreWriteObservation,
-    NotificationRecord, NotificationResolution, NotificationResolutionConsumptionObservation,
+    MsgSendResult, NotificationAttemptId, NotificationAttentionCause,
+    NotificationBarrierRetirementCause, NotificationBinding, NotificationManifestId,
+    NotificationPreWriteCause, NotificationPreWriteObservation, NotificationRecord,
+    NotificationResolution, NotificationResolutionConsumptionObservation,
     NotificationRouteEvidenceId, NotificationState, NotificationWithdrawDisposition,
     NotificationWithdrawResult, NotifyLevel, OpenDelivery, ProcessInstanceId, RecipientKey,
     StatusBlockedNotification, StatusMailboxRoute,
@@ -262,6 +263,116 @@ struct MessagingComposerCandidate {
     message_state: Option<cyclops_proto::ComposerMessageState>,
     recovery_action: ExactOwnedRecoveryAction,
     runtime: MessagingComposerRuntimeFacts,
+}
+
+/// Opaque durable half of one composer-recovery observation.
+///
+/// Fusion may ask whether screen capture is required and later return current
+/// terminal evidence, but it cannot inspect the journal records or recovery
+/// coordinator that made the answer necessary.
+pub(crate) struct MessagingComposerRecoveryProbe {
+    records: Vec<NotificationRecord>,
+    store_error: Option<&'static str>,
+}
+
+impl MessagingComposerRecoveryProbe {
+    pub(crate) fn none() -> Self {
+        Self {
+            records: Vec::new(),
+            store_error: None,
+        }
+    }
+
+    pub(crate) fn store_unavailable() -> Self {
+        Self {
+            records: Vec::new(),
+            store_error: Some("composer_recovery_store_unavailable"),
+        }
+    }
+
+    pub(crate) fn is_recovering(&self) -> bool {
+        !self.records.is_empty() || self.store_error.is_some()
+    }
+}
+
+/// Immutable physical evidence supplied to durable composer recovery.
+///
+/// Process, screen, and manifest adapters prove these facts. The messaging
+/// Module decides how they join to an active durable barrier.
+pub(crate) struct MessagingComposerRecoveryObservation {
+    pub(crate) binding: Option<NotificationBinding>,
+    pub(crate) clean_composer: bool,
+    pub(crate) legacy_composer_ready: bool,
+}
+
+/// Opaque recovery decision carried through one fusion transaction.
+pub(crate) struct MessagingComposerRecoveryPlan {
+    action: Option<crate::composer_recovery::RecoveryAction>,
+    attempt_id: Option<NotificationAttemptId>,
+    retired_attempt: Option<NotificationAttemptId>,
+}
+
+impl MessagingComposerRecoveryPlan {
+    pub(crate) fn store_unavailable() -> Self {
+        Self {
+            action: Some(crate::composer_recovery::RecoveryAction::Hold(
+                "composer_recovery_store_unavailable",
+            )),
+            attempt_id: None,
+            retired_attempt: None,
+        }
+    }
+
+    pub(crate) fn merge_without_module(
+        self,
+        base_hold: ComposerHold,
+        owner: Option<String>,
+        turn_running: bool,
+    ) -> MessagingComposerBarrierUpdate {
+        self.barrier_update(base_hold, owner, turn_running)
+    }
+
+    fn barrier_update(
+        self,
+        base_hold: ComposerHold,
+        owner: Option<String>,
+        turn_running: bool,
+    ) -> MessagingComposerBarrierUpdate {
+        let (hold, owner, clear_turn, refusal) = crate::composer_recovery::merge_barrier(
+            self.action.as_ref(),
+            self.retired_attempt,
+            base_hold,
+            owner,
+            turn_running,
+        );
+        let recovered_hold = self.action.as_ref().map(|action| {
+            if matches!(action, crate::composer_recovery::RecoveryAction::Restore(_))
+                && hold == ComposerHold::StagedDuringTurn
+                && !turn_running
+            {
+                ComposerHold::Staged
+            } else {
+                hold
+            }
+        });
+        MessagingComposerBarrierUpdate {
+            hold,
+            owner,
+            clear_turn,
+            refusal,
+            recovered_hold,
+        }
+    }
+}
+
+/// Finished runtime barrier update. No durable record or recovery variant
+/// crosses the Module boundary.
+pub(crate) struct MessagingComposerBarrierUpdate {
+    pub(crate) hold: ComposerHold,
+    pub(crate) owner: Option<String>,
+    pub(crate) clear_turn: bool,
+    pub(crate) refusal: Option<&'static str>,
+    pub(crate) recovered_hold: Option<ComposerHold>,
 }
 
 /// One Module-owned decision for an elected exact-attention worker.
@@ -627,19 +738,324 @@ pub(crate) struct WorkspaceMessaging {
     service: Arc<MailboxService>,
     publication: Arc<StdMutex<()>>,
     effects: Arc<dyn WorkspaceMessagingEffects>,
+    composer_recovery: Arc<StdMutex<crate::composer_recovery::RecoveryCoordinator>>,
 }
 
 impl WorkspaceMessaging {
+    #[cfg(test)]
     pub(crate) fn new(
         service: Arc<MailboxService>,
         publication: Arc<StdMutex<()>>,
         effects: Arc<dyn WorkspaceMessagingEffects>,
     ) -> Self {
+        Self::new_with_recovery(
+            service,
+            publication,
+            effects,
+            Arc::new(StdMutex::new(
+                crate::composer_recovery::RecoveryCoordinator::default(),
+            )),
+        )
+    }
+
+    pub(crate) fn new_with_recovery(
+        service: Arc<MailboxService>,
+        publication: Arc<StdMutex<()>>,
+        effects: Arc<dyn WorkspaceMessagingEffects>,
+        composer_recovery: Arc<StdMutex<crate::composer_recovery::RecoveryCoordinator>>,
+    ) -> Self {
         Self {
             service,
             publication,
             effects,
+            composer_recovery,
         }
+    }
+
+    /// Read the exact active durable barriers for one physical composer.
+    pub(crate) fn composer_recovery_probe(
+        &self,
+        recipient: RecipientKey,
+    ) -> MessagingComposerRecoveryProbe {
+        let canonical = match self.service.active_notification_barriers() {
+            Ok(records) => records,
+            Err(_) => return MessagingComposerRecoveryProbe::store_unavailable(),
+        };
+        let mut recovery = self
+            .composer_recovery
+            .lock()
+            .expect("composer recovery lock");
+        let records = recovery.active_for_recipient(&canonical, recipient);
+        let store_error = (recovery.writer_unknown() && !records.is_empty())
+            .then_some("composer_recovery_reopen_required");
+        MessagingComposerRecoveryProbe {
+            records,
+            store_error,
+        }
+    }
+
+    /// Join current physical evidence to the exact durable recovery head and
+    /// persist any immediately proven retirement.
+    pub(crate) fn reconcile_composer_recovery(
+        &self,
+        probe: MessagingComposerRecoveryProbe,
+        observation: MessagingComposerRecoveryObservation,
+    ) -> MessagingComposerRecoveryPlan {
+        let attempt_id = probe.records.first().map(|record| record.attempt_id);
+        let exact_claim_after_write = match probe.records.as_slice() {
+            [record] => self
+                .service
+                .exact_recipient_claimed_after_write(record)
+                .unwrap_or(false),
+            _ => false,
+        };
+        let legacy_claimed_clean = exact_claim_after_write && observation.legacy_composer_ready;
+        let mut action = if let Some(reason) = probe.store_error {
+            Some(crate::composer_recovery::RecoveryAction::Hold(reason))
+        } else {
+            self.composer_recovery
+                .lock()
+                .expect("composer recovery lock")
+                .reconcile(
+                    &probe.records,
+                    observation.binding.as_ref(),
+                    observation.clean_composer,
+                    legacy_claimed_clean,
+                )
+        };
+        let retired_attempt = match action.as_ref() {
+            Some(retirement @ crate::composer_recovery::RecoveryAction::Retire { .. }) => {
+                match self.persist_composer_recovery(retirement) {
+                    Ok(attempt_id) => {
+                        action = None;
+                        Some(attempt_id)
+                    }
+                    Err(reason) => {
+                        action = Some(crate::composer_recovery::RecoveryAction::Hold(reason));
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        MessagingComposerRecoveryPlan {
+            action,
+            attempt_id,
+            retired_attempt,
+        }
+    }
+
+    /// Persist an exact post-restart lifecycle retirement when the physical
+    /// adapter supplies the matching completed attempt.
+    pub(crate) fn settle_composer_recovery_lifecycle(
+        &self,
+        mut plan: MessagingComposerRecoveryPlan,
+        candidate: Option<NotificationAttemptId>,
+    ) -> MessagingComposerRecoveryPlan {
+        let Some(candidate) = candidate else {
+            return plan;
+        };
+        if !matches!(
+            plan.action,
+            Some(crate::composer_recovery::RecoveryAction::Restore(attempt))
+                if attempt == candidate
+        ) {
+            return plan;
+        }
+        let canonical = match self.service.active_notification_barriers() {
+            Ok(records) => records,
+            Err(_) => {
+                plan.action = Some(crate::composer_recovery::RecoveryAction::Hold(
+                    "composer_recovery_store_unavailable",
+                ));
+                return plan;
+            }
+        };
+        if canonical.iter().any(|record| {
+            record.attempt_id == candidate && record.needs_claimed_ack_timeout_reconciliation()
+        }) {
+            plan.action = Some(crate::composer_recovery::RecoveryAction::Hold(
+                "claimed_notification_reconciliation_pending",
+            ));
+            return plan;
+        }
+        let record = match self
+            .composer_recovery
+            .lock()
+            .expect("composer recovery lock")
+            .reserve_record(&canonical, candidate)
+        {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                plan.action = None;
+                return plan;
+            }
+            Err(reason) => {
+                plan.action = Some(crate::composer_recovery::RecoveryAction::Hold(reason));
+                return plan;
+            }
+        };
+        let action = crate::composer_recovery::RecoveryAction::Retire {
+            record: Box::new(record),
+            cause: NotificationBarrierRetirementCause::LifecycleReconciled,
+            replacement: None,
+        };
+        plan.action = match self.persist_composer_recovery(&action) {
+            Ok(_) => None,
+            Err(reason) => Some(crate::composer_recovery::RecoveryAction::Hold(reason)),
+        };
+        plan
+    }
+
+    /// Merge an opaque recovery decision into the runtime barrier while
+    /// revalidating any concurrent durable retirement.
+    pub(crate) fn merge_composer_recovery_barrier(
+        &self,
+        mut plan: MessagingComposerRecoveryPlan,
+        base_hold: ComposerHold,
+        owner: Option<String>,
+        turn_running: bool,
+    ) -> MessagingComposerBarrierUpdate {
+        if matches!(
+            plan.action,
+            Some(crate::composer_recovery::RecoveryAction::Hold(
+                "composer_recovery_retirement_pending"
+            ))
+        ) {
+            plan.action = plan.attempt_id.and_then(|attempt_id| {
+                self.composer_recovery
+                    .lock()
+                    .expect("composer recovery lock")
+                    .retirement_pending_reason(attempt_id)
+                    .map(crate::composer_recovery::RecoveryAction::Hold)
+            });
+        }
+        plan.barrier_update(base_hold, owner, turn_running)
+    }
+
+    pub(crate) fn track_composer_recovery(&self, attempt_id: NotificationAttemptId) {
+        self.composer_recovery
+            .lock()
+            .expect("composer recovery lock")
+            .track(attempt_id);
+    }
+
+    pub(crate) fn composer_recovery_contains(&self, attempt_id: NotificationAttemptId) -> bool {
+        self.composer_recovery
+            .lock()
+            .expect("composer recovery lock")
+            .contains(attempt_id)
+    }
+
+    pub(crate) fn composer_barrier_retired(&self, attempt_id: NotificationAttemptId) {
+        self.composer_recovery
+            .lock()
+            .expect("composer recovery lock")
+            .retired(attempt_id);
+    }
+
+    pub(crate) fn retire_gone_composer_recipient(
+        &self,
+        recipient: RecipientKey,
+    ) -> Result<(), &'static str> {
+        self.retire_composer_recipient(
+            recipient,
+            NotificationBarrierRetirementCause::PaneGone,
+            None,
+        )
+    }
+
+    pub(crate) fn retire_replaced_composer_recipient(
+        &self,
+        recipient: RecipientKey,
+        replacement: Option<NotificationBinding>,
+    ) -> Result<(), &'static str> {
+        self.retire_composer_recipient(
+            recipient,
+            NotificationBarrierRetirementCause::OccupantReplaced,
+            replacement,
+        )
+    }
+
+    fn retire_composer_recipient(
+        &self,
+        recipient: RecipientKey,
+        cause: NotificationBarrierRetirementCause,
+        replacement: Option<NotificationBinding>,
+    ) -> Result<(), &'static str> {
+        let records: Vec<_> = self
+            .service
+            .active_notification_barriers()
+            .map_err(|_| "composer_recovery_store_unavailable")?
+            .into_iter()
+            .filter(|record| record.recipient == recipient)
+            .collect();
+        if records.is_empty() {
+            return Ok(());
+        }
+        if cause == NotificationBarrierRetirementCause::OccupantReplaced && replacement.is_none() {
+            return Err("composer_recovery_replacement_unproven");
+        }
+        if self
+            .composer_recovery
+            .lock()
+            .expect("composer recovery lock")
+            .writer_unknown()
+        {
+            return Err("composer_recovery_reopen_required");
+        }
+        for record in records {
+            if let Err(error) =
+                self.service
+                    .retire_notification_barrier(&record, cause, replacement.clone())
+            {
+                if crate::composer_recovery::writer_requires_reopen(&error) {
+                    self.composer_recovery
+                        .lock()
+                        .expect("composer recovery lock")
+                        .require_reopen();
+                }
+                return Err("composer_recovery_retirement_failed");
+            }
+            self.composer_barrier_retired(record.attempt_id);
+        }
+        Ok(())
+    }
+
+    fn persist_composer_recovery(
+        &self,
+        action: &crate::composer_recovery::RecoveryAction,
+    ) -> Result<NotificationAttemptId, &'static str> {
+        let crate::composer_recovery::RecoveryAction::Retire {
+            record,
+            cause,
+            replacement,
+        } = action
+        else {
+            return Err("composer_recovery_not_a_retirement");
+        };
+        let attempt_id = record.attempt_id;
+        let result = self
+            .service
+            .retire_notification_barrier(record, *cause, replacement.clone());
+        let writer_unknown = result
+            .as_ref()
+            .is_err_and(crate::composer_recovery::writer_requires_reopen);
+        let mut recovery = self
+            .composer_recovery
+            .lock()
+            .expect("composer recovery lock");
+        if result.is_ok() {
+            recovery.retired(attempt_id);
+        } else {
+            recovery.retirement_failed(attempt_id);
+            if writer_unknown {
+                recovery.require_reopen();
+            }
+        }
+        result
+            .map(|()| attempt_id)
+            .map_err(|_| "composer_recovery_retirement_failed")
     }
 
     /// Read the current directory and its matching daemon route publication as
@@ -1890,6 +2306,51 @@ mod tests {
             !source.contains(&daemon_root_impl),
             "WorkspaceMessaging construction returned to the operation module"
         );
+    }
+
+    /// Syntactic architecture lint: runtime and observation adapters may
+    /// supply physical evidence, but durable recovery records, variants, and
+    /// coordinator state remain private to WorkspaceMessaging.
+    #[test]
+    fn composer_recovery_policy_cannot_leak_back_into_runtime_callers() {
+        let fusion = include_str!("fusion.rs")
+            .split_once("#[cfg(test)]")
+            .expect("fusion test boundary")
+            .0;
+        for forbidden in [
+            "composer_recovery::RecoveryAction",
+            "composer_recovery::persist",
+            "active_notification_barriers",
+            "exact_recipient_claimed_after_write",
+            ".composer_recovery",
+        ] {
+            assert!(
+                !fusion.contains(forbidden),
+                "fusion recovered durable composer policy: {forbidden}"
+            );
+        }
+
+        let recovery = include_str!("composer_recovery.rs")
+            .split_once("#[cfg(test)]")
+            .expect("composer recovery test boundary")
+            .0;
+        for forbidden in ["inner.mailbox", ".composer_recovery\n"] {
+            assert!(
+                !recovery.contains(forbidden),
+                "physical composer evidence recovered durable state: {forbidden}"
+            );
+        }
+
+        for (adapter, source) in [
+            ("delivery", include_str!("delivery.rs")),
+            ("messaging runtime", include_str!("messaging_runtime.rs")),
+            ("ack", include_str!("ack.rs")),
+        ] {
+            assert!(
+                !source.contains(".composer_recovery"),
+                "{adapter} reached into composer recovery coordinator state"
+            );
+        }
     }
 
     struct Scratch(PathBuf);
