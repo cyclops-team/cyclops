@@ -87,11 +87,19 @@ notification payload reconstruction, and submission-state interpretation
 behind an opaque `WorkspaceMessaging` probe. Fusion now supplies only
 immutable terminal facts and receives one body-free projection; deletion
 evidence prevents raw candidate records or durable projection policy from
-returning. The fresh observation audit found that fusion still invokes the
-exact-owned evidence consequence directly after a state or composer edge. The
-next correction makes that edge immutable observation output and applies it
-after observation completes. Additional narrowly named completion branches
-remain allowed when one pull request would become broad. Milestone 5 put retained direct-delivery entry
+returning. The observation-evidence correction now returns a state or composer
+edge as typed exact-owned evidence and applies it at the composition root. Pane
+observation carries an ordered collection so a simultaneous quota-reset fact is
+not dropped, while a deletion lint prevents fusion from invoking exact-owned
+candidate selection or worker election directly. The fresh follow-up audit
+found that the readiness helper still invokes route reconciliation while
+observation is running. The next focused completion pass runs on
+**beta/refactor/observation-messaging-route-evidence** and moves that causal
+edge into the immutable observation handoff without changing readiness or
+delivery semantics. Later focused passes must also remove remaining recovery
+and ACK messaging consequences from the observer before the responsibility
+audit can close. Additional narrowly named completion branches remain allowed
+when one pull request would become broad. Milestone 5 put retained direct-delivery entry
 points, restart settlement, and session-journal traversal behind
 `src/cyclopsd/src/compatibility.rs`; its census preserves
 `Daemon::deliver_payload` with support status unverified and preserves every

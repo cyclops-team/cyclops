@@ -124,7 +124,7 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 /// client still lags out and is dropped by the server.
 const EVENT_BUFFER: usize = 8192;
 
-/// Commit one pane observation before projecting its optional tmux chrome.
+/// Commit all consequences of one pane observation before optional tmux chrome.
 ///
 /// The cache commit already happened in fusion. Durable messaging must follow
 /// it before the first presentation await so a stalled or cancelled border
@@ -136,8 +136,8 @@ async fn apply_pane_observation(
     pane_id: &str,
     observed: fusion::PaneObservation,
 ) -> Detection {
-    let (detection, messaging_observation, repaint, recompute_guard) = observed.into_parts();
-    if let Some(observation) = messaging_observation {
+    let (detection, messaging_observations, repaint, recompute_guard) = observed.into_parts();
+    for observation in messaging_observations {
         apply_messaging_observation(inner, observation);
     }
     if repaint {

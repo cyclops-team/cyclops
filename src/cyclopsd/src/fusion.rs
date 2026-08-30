@@ -3434,6 +3434,9 @@ pub(crate) enum PaneMessagingObservation {
         session_idx: usize,
         pane_id: String,
     },
+    ExactOwnedEvidenceChanged {
+        recipient: RecipientKey,
+    },
 }
 
 impl PaneMessagingObservation {
@@ -3448,14 +3451,40 @@ impl PaneMessagingObservation {
             pane_id: pane_id.into(),
         }
     }
+
+    pub(crate) fn exact_owned_evidence_changed(recipient: RecipientKey) -> Self {
+        Self::ExactOwnedEvidenceChanged { recipient }
+    }
 }
 
-/// A committed pane-cache result and any immutable messaging evidence derived
-/// from that same observation. The fields stay private so callers can only
-/// consume the complete value.
+fn pane_messaging_observations(
+    exact_owned_recipient: Option<RecipientKey>,
+    quota_reset_recipient: Option<RecipientKey>,
+    session_idx: usize,
+    pane_id: &str,
+) -> Vec<PaneMessagingObservation> {
+    let mut observations = Vec::new();
+    if let Some(recipient) = exact_owned_recipient {
+        observations.push(PaneMessagingObservation::exact_owned_evidence_changed(
+            recipient,
+        ));
+    }
+    if let Some(recipient) = quota_reset_recipient {
+        observations.push(PaneMessagingObservation::quota_reset(
+            recipient,
+            session_idx,
+            pane_id,
+        ));
+    }
+    observations
+}
+
+/// A committed pane-cache result and all ordered immutable messaging evidence
+/// derived from that same observation. The fields stay private so callers can
+/// only consume the complete value.
 pub(crate) struct PaneObservation {
     detection: Detection,
-    messaging: Option<PaneMessagingObservation>,
+    messaging: Vec<PaneMessagingObservation>,
     repaint: bool,
     recompute_guard: tokio::sync::OwnedMutexGuard<()>,
 }
@@ -3465,7 +3494,7 @@ impl PaneObservation {
         self,
     ) -> (
         Detection,
-        Option<PaneMessagingObservation>,
+        Vec<PaneMessagingObservation>,
         bool,
         tokio::sync::OwnedMutexGuard<()>,
     ) {
@@ -3758,7 +3787,7 @@ async fn observe_pane_with_evidence(
         }
         return Some(PaneObservation {
             detection: det,
-            messaging: None,
+            messaging: Vec::new(),
             repaint: false,
             recompute_guard,
         });
@@ -3831,7 +3860,7 @@ async fn observe_pane_with_evidence(
                         }
                         return Some(PaneObservation {
                             detection: p,
-                            messaging: None,
+                            messaging: Vec::new(),
                             repaint: false,
                             recompute_guard,
                         });
@@ -4404,16 +4433,6 @@ async fn observe_pane_with_evidence(
         &detection,
         evidence.route,
     );
-    let messaging_observation = probe_quota_reset
-        .then(|| {
-            let recipient = inner.recipient_key(session_idx, pane_id)?;
-            Some(PaneMessagingObservation::quota_reset(
-                recipient,
-                session_idx,
-                pane_id,
-            ))
-        })
-        .flatten();
     // First sight of a pane that reads Unknown is baseline, not a change.
     let state_changed = prior != Some(detection.state)
         && !(prior.is_none() && detection.state == AgentState::Unknown);
@@ -4421,13 +4440,18 @@ async fn observe_pane_with_evidence(
         && prior == Some(AgentState::Working)
         && prior_working_confirmed != working_confirmed;
     let changed = state_changed || certainty_changed;
-    if state_changed || composer_changed {
-        if let Some(recipient) = recovery_recipient {
-            if let Some(workspace_messaging) = inner.workspace_messaging() {
-                workspace_messaging.exact_owned_evidence_changed(recipient);
-            }
-        }
-    }
+    let exact_owned_recipient = (state_changed || composer_changed)
+        .then_some(recovery_recipient)
+        .flatten();
+    let quota_reset_recipient = probe_quota_reset
+        .then(|| inner.recipient_key(session_idx, pane_id))
+        .flatten();
+    let messaging_observations = pane_messaging_observations(
+        exact_owned_recipient,
+        quota_reset_recipient,
+        session_idx,
+        pane_id,
+    );
     if changed {
         debug!(
             pane = pane_id,
@@ -4462,7 +4486,7 @@ async fn observe_pane_with_evidence(
     }
     Some(PaneObservation {
         detection,
-        messaging: messaging_observation,
+        messaging: messaging_observations,
         repaint: changed,
         recompute_guard,
     })
@@ -8887,6 +8911,23 @@ regex = ['^']
             write_block: None,
             composer_semantic: semantic,
         }
+    }
+
+    #[test]
+    fn one_pane_result_preserves_coincident_messaging_observations_in_prior_order() {
+        let recipient = RecipientKey::agent(
+            "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            "00000000-0000-4000-8000-000000000002".parse().unwrap(),
+            "%1".parse().unwrap(),
+        );
+
+        assert_eq!(
+            pane_messaging_observations(Some(recipient), Some(recipient), 3, "%1"),
+            vec![
+                PaneMessagingObservation::exact_owned_evidence_changed(recipient),
+                PaneMessagingObservation::quota_reset(recipient, 3, "%1"),
+            ]
+        );
     }
 
     #[test]
