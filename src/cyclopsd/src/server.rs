@@ -1934,7 +1934,8 @@ fn status_result_with_refresh(
         .lock()
         .expect("registry lock")
         .exact_adoptions();
-    let mut diagnostics = crate::deadlock::status_diagnostics(inner);
+    let mut diagnostics =
+        crate::deadlock::status_diagnostics(messaging_status.deadlock_candidates());
     diagnostics.extend(inner.engine.notification_worker_diagnostics());
     // Status joins durable notification state below. Clone the content-free
     // fusion stamps first so no journal read runs under the detection lock.

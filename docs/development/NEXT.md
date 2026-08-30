@@ -14,7 +14,7 @@ preserved behavior, stop conditions, and rollback requirements.
 ## Current milestone
 
 The next focused completion pass runs on
-**beta/refactor/workspace-messaging-diagnostics**. The first Milestone 3
+**beta/refactor/workspace-messaging-audit**. The first Milestone 3
 family proved the internal seam. The read-and-claim pass then moved inbox listing,
 claiming, message snapshots, and durable follow pages behind
 `WorkspaceMessaging`; the Module owns retained claim-locator interpretation,
@@ -59,10 +59,14 @@ one finished decision instead of reconstructing messaging policy. The
 runtime-locality pass then moved daemon-root notification scheduling and
 terminal recovery into a physically separate composition adapter. A whole-file
 lint prevents the durable Module from recovering `Inner`, the pane cache, task
-spawning, delivery enqueueing, or pane observation. The next pass moves the
-foreground-watch diagnostic's durable projection and route lookup behind
-`WorkspaceMessaging`, leaving deadlock detection to consume body-free
-candidates and inspect only operating-system process state.
+spawning, delivery enqueueing, or pane observation. The diagnostics pass then
+moved the foreground-watch diagnostic's durable gating projection, route
+resolution, and working-state join behind `WorkspaceMessaging`. Deadlock
+detection now consumes body-free candidates and inspects only operating-system
+process state; a deletion lint prevents it from recovering mailbox, route, or
+daemon-root knowledge. The next pass is the fresh Milestone 3 responsibility
+and locality audit. It may include one final focused correction if the audit
+finds a material durable messaging decision in an ordinary caller.
 Additional narrowly named completion branches remain allowed when one pull
 request would become broad. The corresponding observation completion pass
 follows before Milestone 6. Milestone 5 put retained direct-delivery entry
