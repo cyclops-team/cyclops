@@ -7271,8 +7271,7 @@ process_names = ["never"]
             first.session_instance_id()
         );
 
-        drop(tmux);
-        let tmux = cyclops_testrig::TmuxServer::new("durable-session-wiring");
+        let tmux = tmux.restart();
         tmux.run_ok(&["new-session", "-d", "-s", "after"]);
         let second = wait_for_session_binding(&slot, Some(first.session_instance_id())).await;
         let second_pane: TmuxPaneId = slot

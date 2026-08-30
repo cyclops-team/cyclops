@@ -112,13 +112,13 @@ use cyclops_testrig::{tmux_available, TmuxServer};
 if !tmux_available() {
     return;                                // skip cleanly, never fail
 }
-let rig = TmuxServer::new("my-feature");   // -L cyc-my-feature-<pid>
+let rig = TmuxServer::new("my-feature");   // -L cyc-my-feature-<pid>-<sequence>
 rig.run_ok(&["new-session", "-d", "-s", "demo"]);
 // teardown is Drop: stop the server, then unlink the socket file
 ```
 
 The reasons are all measured, and they are written out in that crate's
-header. The short version: `-L cyc-<tag>-<pid>` keeps concurrent test
+header. The short version: `-L cyc-<tag>-<pid>-<sequence>` keeps concurrent test
 binaries off each other, `-f /dev/null` keeps your tmux config from
 changing behavior, `-u` stops tmux sanitizing tabs and non-ASCII to `_`
 (F14, which silently destroys the title sensor), and teardown must both
@@ -132,13 +132,15 @@ time an assertion fails.
 Homes work the same way: point `CYCLOPS_HOME` at a scratch directory. A
 test that writes to the real one corrupts your own message history.
 
-There are two guards, and they exist because this rule was fixed three
+There are three guards, and they exist because this rule was fixed three
 times and kept getting copied back in:
 
 - `tests/testrig/tests/teardown_has_one_home.rs` fails if any
   other Rust file starts or kills a tmux server.
 - `tests/testrig/tests/shell_teardown.rs` holds `tests/e2e/lib/lib.sh`,
   the shell home of the same rule, to the same contract.
+- `tests/testrig/tests/interrupted_owner.rs` kills a fixture before `Drop`
+  and proves its external owner removes only that fixture's exact resources.
 
 Shell and Python go through `tests/e2e/lib/lib.sh`. Source it, never paste from it.
 
@@ -162,16 +164,17 @@ states that once, and `CYCLOPS_TEST_TMP` overrides it.
 
 That is F24, and it cost two milestones and two red CI runs to learn.
 
-Prove it still holds by relocating the root and running the suite again.
-On macOS a relocated run takes the same code path Linux does:
+Prove it still holds with the focused relocated-root command. On macOS the
+relocated run takes the same code path Linux does:
 
 ```bash
 mkdir -p /private/var/tmp/cyc-relocated
-CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
-CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated cargo test -p cyclopsd --all-targets --no-fail-fast
+CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated ./scripts/test-relocated-scratch.sh
 ```
 
-CI runs the whole suite twice for this reason, once relocated.
+The command proves the override itself, rejects direct temp APIs in real-tmux
+fixtures, and runs one real tmux plus daemon-socket journey. CI runs this
+focused evidence on both platforms instead of repeating every unrelated test.
 
 ## Demos
 
@@ -216,7 +219,7 @@ baseline are recorded in [CI evidence lanes and baseline](docs/development/CI.md
 | `cargo test --workspace --doc` | A Rust doctest fails |
 | `python3 scripts/check-doc-paths.py` | A doc points at a file this repo does not have, or a page exists that no front door links to. `--selftest` proves the checker still catches, so a green run cannot mean it stopped looking |
 | `./tests/e2e/parity-check.sh` | A doc quotes output the binaries no longer print |
-| The whole suite again with `CYCLOPS_TEST_TMP` relocated | Something hardcoded a scratch path (F24) |
+| `./scripts/test-relocated-scratch.sh` with `CYCLOPS_TEST_TMP` set | Root selection broke, a real-tmux fixture bypassed the helper, or the relocated tmux/daemon/socket journey failed (F24) |
 | `./tests/e2e/parity-check.sh --with-installer` | `scripts/install.sh` stopped doing what install.md says, or left a shell profile changed after `--uninstall`. Its own job: it does a release build |
 | `cmp scripts/install.sh website/static/install.sh`, then `npm run check` and `npm run build` in `website/` | The hosted installer drifted from the tested installer, or the website no longer type-checks or builds |
 

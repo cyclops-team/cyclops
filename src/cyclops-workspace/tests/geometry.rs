@@ -534,7 +534,7 @@ async fn deliberate_minimized_pane_survives_ordinary_resizes_and_takeover_and_re
         following: std::collections::BTreeSet::new(),
     };
 
-    let temp_home = std::env::temp_dir();
+    let temp_home = cyclops_proto::scratch::scratch_root();
     let modified =
         cyclops_workspace::app::recover_post_resize_geometry(&sizing, &client, &temp_home, None)
             .await
@@ -612,7 +612,7 @@ async fn byte_exact_malformed_provenance_rejects_trailing_tabs_and_spaces() {
         following: std::collections::BTreeSet::new(),
     };
 
-    let temp_home = std::env::temp_dir();
+    let temp_home = cyclops_proto::scratch::scratch_root();
     let modified =
         cyclops_workspace::app::recover_post_resize_geometry(&sizing, &client, &temp_home, None)
             .await

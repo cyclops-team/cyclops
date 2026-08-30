@@ -478,7 +478,7 @@ tested repository installer.
 so one run reports every failing test.
 
 Tests need tmux on PATH; the ones that need it skip cleanly without it.
-Every test runs against its own tmux server (`-L cyc-<tag>-<pid>`), never
+Every test runs against its own tmux server (`-L cyc-<tag>-<pid>-<sequence>`), never
 yours.
 
 Throwaway test state goes under a short scratch root, because a Unix

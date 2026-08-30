@@ -475,6 +475,28 @@ async fn wait_for_human_composer_evidence(rig: &mut Rig, pane: &str) {
     }
 }
 
+async fn wait_for_clean_composer_evidence(rig: &mut Rig, pane: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = rig.ctl.request("status", json!({})).await;
+        let clean = status["result"]["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|session| session["panes"].as_array())
+            .flatten()
+            .any(|row| row["pane_id"] == pane && row["composer"] == "composer_clean");
+        if clean {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pane {pane} did not record clean composer evidence: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn pane_pid(rig: &Rig, pane: &str) -> i64 {
     let output = rig
         .tmux
@@ -2025,10 +2047,11 @@ async fn a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt() 
         })
     });
     rig.tmux.run_ok(&["send-keys", "-t", &pane, "BSpace"]);
-    // tmux accepting the key is not evidence that the composer consumed it.
-    // Wait for the daemon's observable state to cross from human input back to
-    // the clean composer before asking whether the held attempt reopened.
-    wait_pane_state(&mut rig, "idle").await;
+    // Runtime state can remain idle while the composer contains a human draft.
+    // Wait for the daemon's distinct composer projection to cross from
+    // `human_draft` to `composer_clean` before asking whether the held attempt
+    // reopened. Tmux command acceptance and runtime-idle are neither proof.
+    wait_for_clean_composer_evidence(&mut rig, &pane).await;
     tokio::time::timeout(Duration::from_secs(8), prewrite_rx.recv())
         .await
         .expect("final deletion released the human hold")

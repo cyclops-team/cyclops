@@ -30,6 +30,8 @@ filter = '''
   binary_id(cyclops::sizing_cli) |
   binary_id(cyclops::workspace_boot_sizing) |
   binary_id(cyclops::workspace_cli) |
+  binary_id(cyclops-testrig::interrupted_owner) |
+  binary_id(cyclops-testrig::scratch_path_lint) |
   binary_id(cyclops-testrig::shell_teardown) |
   binary_id(cyclops-testrig::teardown) |
   binary_id(cyclops-testrig::teardown_has_one_home)
