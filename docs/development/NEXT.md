@@ -13,22 +13,20 @@ preserved behavior, stop conditions, and rollback requirements.
 
 ## Current milestone
 
-Milestone 2 runs on **beta/refactor/daemon-client**. It consolidates the
-Hello-first connection, bounded framing, request correlation, timeout classes,
-uncertainty, refusal, and stream-gap semantics used by the blocking CLI, stream
-UI, and workspace clients. Milestone 1 merged in PR #103 after the documentation
-authority repair in PR #101.
+Milestone 3 runs on **beta/refactor/workspace-messaging**. It places one current
+durable operation family behind an internal `WorkspaceMessaging` Interface.
+Milestone 2 consolidated official transport semantics in PR #104. Milestone 1
+merged in PR #103 after the documentation authority repair in PR #101.
 
 Exit evidence:
 
-- blocking and async callers use one Daemon Client Interface;
-- callers no longer own socket opening, Hello parsing, frame reads and writes,
-  response correlation, refusal decoding, or uncertainty classification;
-- blocking and async contract suites prove the same boundary, correlation,
-  refusal, gap, and post-write uncertainty rules;
-- CLI, stream UI, update replay, and workspace journeys retain their existing
-  presentation and caller-owned retry policy; and
-- focused client tests and all required repository gates pass.
+- one current durable operation family enters through the internal
+  `WorkspaceMessaging` Interface;
+- its caller loses journal, projection, worker, and post-commit scheduling
+  knowledge;
+- the current durable trace remains byte- and outcome-equivalent;
+- no crate is extracted; and
+- focused boundary tests and all required repository gates pass.
 
 ## Milestone queue
 
@@ -73,15 +71,17 @@ provides measurable isolation, and the operator separately approves it.
   performance, migration, and user-journey audits before the final pull request
   from **beta/messaging-rework** into `main`.
 
-## Milestone 2 session boundary
+## Milestone 3 session boundary
 
 Use this scope:
 
-> Implement only Milestone 2 from the approved Messaging Refactor Charter: one
-> shared Daemon Client Interface for official transport semantics. Do not begin
-> WorkspaceMessaging extraction, crate extraction, UI redesign, broad CI
-> restructuring, legacy deletion, MCP work, or later milestones. Preserve
-> caller-owned presentation and product policy, historical replay, and honest
+> Implement only Milestone 3 from the approved Messaging Refactor Charter: put
+> one current durable operation family behind an internal WorkspaceMessaging
+> Interface. Prove that the caller loses journal, projection, worker, and
+> post-commit scheduling knowledge while the durable trace stays byte- and
+> outcome-equivalent. Do not extract a crate or begin observation separation,
+> legacy quarantine, presentation work, UI redesign, broad CI restructuring,
+> MCP work, or later milestones. Preserve historical replay and honest
 > uncertainty. Stop if any charter stop condition is encountered.
 
 ## Release naming gate
