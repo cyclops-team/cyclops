@@ -1224,7 +1224,7 @@ pub async fn run_async() -> i32 {
     model.sidebar_visible = prefs.sidebar_visible;
     model.messages_visible = prefs.messages_visible;
     let declared_client_size =
-        declare_initial_client_size(term_size, &model, &prefs, &sizing, &client, &home).await;
+        declare_initial_client_size(term_size, &model, &prefs, &mut sizing, &client, &home).await;
     if declared_client_size.is_some() {
         if let Err(error) = recover_post_resize_geometry(&sizing, &client, &home, None).await {
             log_err(&home, &format!("boot post-resize recovery failed: {error}"));
@@ -2485,7 +2485,7 @@ async fn declare_initial_client_size(
     term_size: (u16, u16),
     model: &WorkspaceModel,
     prefs: &WorkspacePrefs,
-    sizing: &WindowSizing,
+    sizing: &mut WindowSizing,
     client: &ControlClient,
     home: &std::path::Path,
 ) -> Option<(u16, u16)> {
@@ -2833,6 +2833,26 @@ pub struct OwnedSession {
     /// applies, no owner exists, and no later workspace can tell what it
     /// was. Holding the mark keeps it visibly somebody's problem.
     pub blocked: BTreeSet<String>,
+    /// Per pinned window, the last size this workspace asked tmux for and
+    /// the size the window was laid out at when it asked. This is how
+    /// [`resize_client`] tells a window that still needs moving from one
+    /// tmux has already declined to move. A layout has a minimum (one row
+    /// per pane plus a separator between each), and a `resize-window`
+    /// below it is clamped, not refused: the command succeeds and the
+    /// window keeps disagreeing with its target however often it is asked.
+    /// Asking again is not free, because tmux answers every
+    /// `resize-window` with a `%layout-change` whether or not the size
+    /// changed (F79), and a workspace that re-asks on each of those is a
+    /// loop at tmux round-trip speed.
+    pub settled: BTreeMap<String, AskedSize>,
+}
+
+/// One `resize-window` this workspace issued, kept as the two facts a later
+/// pass needs: what was asked for, and what the window was at the time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AskedSize {
+    pub target: (u16, u16),
+    pub laid_out: (u16, u16),
 }
 
 impl OwnedSession {
@@ -3073,17 +3093,22 @@ impl SizingOutcome {
 
 /// Push per-window topology-derived target sizes to every window this workspace owns,
 /// in every session it owns. Returns exact per-window successes and failures.
+///
+/// Every ask that lands is remembered on its session ([`OwnedSession::settled`]),
+/// so the next pass can tell a window that still needs moving from one tmux
+/// has already left where it is.
 async fn size_owned_windows(
-    sizing: &WindowSizing,
+    sizing: &mut WindowSizing,
     client: &ControlClient,
     canvas: Rect,
     tabs: &[TabModel],
     home: &std::path::Path,
 ) -> SizingOutcome {
     let mut outcome = SizingOutcome::default();
-    for owned in sizing.owned.values() {
+    for owned in sizing.owned.values_mut() {
         for window_id in &owned.pinned {
-            let target_size = if let Some(tab) = tabs.iter().find(|t| &t.window_id == window_id) {
+            let tab = tabs.iter().find(|t| &t.window_id == window_id);
+            let target_size = if let Some(tab) = tab {
                 crate::render::window_target_size_for_layout(canvas, &tab.layout, tab.zoomed)
             } else {
                 let inner = crate::render::pane_canvas(canvas);
@@ -3099,6 +3124,25 @@ async fn size_owned_windows(
                 .await
             {
                 Ok(()) => {
+                    // Only a window whose layout is on hand can be judged
+                    // against its target later, so only that ask is
+                    // remembered. A background session's window has no tab
+                    // here and nothing to judge it by.
+                    match tab {
+                        Some(tab) => {
+                            let rect = tab.layout.rect();
+                            owned.settled.insert(
+                                window_id.clone(),
+                                AskedSize {
+                                    target: target_size,
+                                    laid_out: (rect.width, rect.height),
+                                },
+                            );
+                        }
+                        None => {
+                            owned.settled.remove(window_id);
+                        }
+                    }
                     outcome.succeeded.insert(window_id.clone());
                 }
                 Err(error) => {
@@ -3256,29 +3300,48 @@ async fn resize_client(app: &mut App, client: &ControlClient) -> SizingOutcome {
     if !declarable(size) {
         return SizingOutcome::default();
     }
+    // A window still not laid out the way this canvas wants it is a reason
+    // to write sizes even when the canvas has not moved. Two windows are
+    // not that reason, and both used to be read as if they were (F79):
+    //
+    // 1. A pinned window of a session this workspace owns but is not
+    //    showing. It has no tab in the displayed model, so there is no
+    //    layout to judge it by. Reading "no tab" as "diverged" made every
+    //    workspace that owned two sessions re-issue `resize-window` for
+    //    all of them on every `%layout-change`, and tmux answers every
+    //    `resize-window` with a `%layout-change`, size changed or not. That
+    //    is the thousand-a-second loop an operator sees as the canvas
+    //    jumping, with the workspace and the tmux server each on half a
+    //    core.
+    // 2. A window tmux has already declined to move: asked for exactly
+    //    this target while laid out exactly like this, and left there. A
+    //    layout has a minimum and `resize-window` below it is clamped, not
+    //    refused, so asking again changes nothing except producing the
+    //    notification that would ask again.
     let any_window_diverged = app.sizing.owned.values().any(|owned| {
         owned.pinned.iter().any(|window_id| {
-            if let Some(tab) = app
+            let Some(tab) = app
                 .model
                 .session
                 .tabs
                 .iter()
                 .find(|t| &t.window_id == window_id)
-            {
-                let target =
-                    crate::render::window_target_size_for_layout(canvas, &tab.layout, tab.zoomed);
-                let rect = tab.layout.rect();
-                rect.width != target.0 || rect.height != target.1
-            } else {
-                true
-            }
+            else {
+                return false;
+            };
+            let target =
+                crate::render::window_target_size_for_layout(canvas, &tab.layout, tab.zoomed);
+            let rect = tab.layout.rect();
+            let laid_out = (rect.width, rect.height);
+            laid_out != target
+                && owned.settled.get(window_id) != Some(&AskedSize { target, laid_out })
         })
     });
     if app.declared_client_size == Some(size) && !any_window_diverged {
         return SizingOutcome::default();
     }
     let outcome = size_owned_windows(
-        &app.sizing,
+        &mut app.sizing,
         client,
         canvas,
         &app.model.session.tabs,
@@ -7723,6 +7786,295 @@ mod tests {
         let _ = std::fs::remove_dir_all(home);
     }
 
+    /// The next `%layout-change` tmux sends for `window`, shaped the way
+    /// the event loop hands it to [`apply_layout_change`]. Bounded so a
+    /// fixture that never produces one fails instead of hanging.
+    async fn next_layout_change(
+        rx: &mut cyclops_tmux::NotificationReceiver,
+        window: &str,
+    ) -> (String, Option<String>) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let Some(notification) = rx.recv().await else {
+                    panic!("tmux closed the stream before a %layout-change for {window}");
+                };
+                if let Some(AppMsg::LayoutChanged {
+                    window: changed,
+                    layout,
+                    flags,
+                }) = structural_message(notification)
+                {
+                    if changed == window {
+                        return (layout, flags);
+                    }
+                }
+            }
+        })
+        .await
+        .expect("tmux sent no %layout-change for the window it was asked to resize")
+    }
+
+    /// Whether tmux announces a layout change within `wait`. After a pass
+    /// that wrote nothing it must not, since only a write is answered.
+    async fn layout_change_within(
+        rx: &mut cyclops_tmux::NotificationReceiver,
+        wait: std::time::Duration,
+    ) -> bool {
+        tokio::time::timeout(wait, async {
+            loop {
+                match rx.recv().await {
+                    Some(Notification::LayoutChange { .. }) => return true,
+                    Some(_) => continue,
+                    None => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Wait for the server to drop a client that just shut down, so a
+    /// takeover below tests a dead marker and not a closing one.
+    async fn wait_until_client_gone(client: &ControlClient, marker: &str) {
+        for _ in 0..50 {
+            let live = client
+                .server_client_markers()
+                .await
+                .expect("server clients");
+            if !live.iter().any(|m| m == marker) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        panic!("the first terminal's client never left the server");
+    }
+
+    /// The loop F79 measured, reproduced the way it was hit: a workspace
+    /// reopened from another terminal that ends up owning two sessions.
+    ///
+    /// One terminal opened `main`, then the session it worked in next, and
+    /// so owned both. It went away without its exit path running. A second
+    /// terminal ran `cyclops`, took `main` over from the dead marker,
+    /// reopened the last-active session, and owned both too. From then on
+    /// every `%layout-change` tmux sent for the workspace's own
+    /// `resize-window` was answered with another `resize-window`, because
+    /// the background session's window has no tab in the displayed model
+    /// and "no tab" was read as "diverged". tmux answers every
+    /// `resize-window` with a `%layout-change` whether or not the size
+    /// changed, so the pair never stopped: about a thousand a second on
+    /// tmux 3.7b, the workspace and the tmux server each on half a core,
+    /// and the canvas visibly jumping.
+    ///
+    /// Driven through the real seam: the second workspace's
+    /// `resize_client`, then the `%layout-change` that write produced,
+    /// applied the way the event loop applies it, then `resize_client`
+    /// again. The second call must write nothing, and tmux must then have
+    /// nothing to announce.
+    #[tokio::test]
+    async fn reopening_from_another_terminal_with_two_owned_sessions_does_not_loop() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-reopen-two-owned");
+        for name in ["main", "agent"] {
+            server.run_ok(&[
+                "new-session",
+                "-d",
+                "-s",
+                name,
+                "-x",
+                "120",
+                "-y",
+                "40",
+                "/bin/sh",
+            ]);
+        }
+        let attach = |session: &str| {
+            ControlConfig::attach(session)
+                .on_socket(server.socket().to_string())
+                .with_config_file("/dev/null")
+        };
+        let home = cyclops_proto::scratch::scratch_dir("workspace-reopen-two-owned-home");
+
+        // The first terminal: owns main, then the session it opened next,
+        // then is gone before anything is handed back.
+        let (first, _rx1) = ControlClient::spawn(attach("main"))
+            .await
+            .expect("first terminal");
+        let mut first_sizing = WindowSizing::default();
+        let main_tabs = fetch_workspace_model(&first, "main")
+            .await
+            .expect("main model")
+            .session
+            .tabs;
+        adopt_windows(&mut first_sizing, &first, "main", &main_tabs, &home).await;
+        let agent_tabs = fetch_workspace_model(&first, "agent")
+            .await
+            .expect("agent model")
+            .session
+            .tabs;
+        adopt_windows(&mut first_sizing, &first, "agent", &agent_tabs, &home).await;
+        assert!(
+            first_sizing.owns("main") && first_sizing.owns("agent"),
+            "the fixture wants the first terminal owning both sessions"
+        );
+        let gone = first_sizing.identity.as_ref().expect("identity").marker();
+        first.shutdown().await;
+
+        // The second terminal: boots on main, takes it over from the dead
+        // marker, reopens the last-active session, takes that over too.
+        let (client, mut rx) = ControlClient::spawn(attach("main"))
+            .await
+            .expect("second terminal");
+        wait_until_client_gone(&client, &gone).await;
+        let mut sizing = WindowSizing::default();
+        adopt_windows(&mut sizing, &client, "main", &main_tabs, &home).await;
+        client
+            .command("switch-client -t 'agent'")
+            .await
+            .expect("reopen last-active");
+        let model = fetch_workspace_model(&client, "agent")
+            .await
+            .expect("agent model");
+        adopt_windows(&mut sizing, &client, "agent", &model.session.tabs, &home).await;
+        assert!(
+            sizing.owns("main") && sizing.owns("agent"),
+            "the fixture wants one workspace owning both sessions"
+        );
+        let shown = model.active_tab().window_id.clone();
+        let mut app = test_app(model, home.clone());
+        app.term_size = (120, 40);
+        app.sizing = sizing;
+
+        // The canvas has never been declared: one write per owned window.
+        let boot = resize_client(&mut app, &client).await;
+        assert_eq!(boot.succeeded.len(), 2, "boot sizes both owned windows");
+        assert!(boot.failed.is_empty(), "{:?}", boot.failed);
+
+        // tmux's answer to that write, applied the way the loop applies it.
+        let (layout, flags) = next_layout_change(&mut rx, &shown).await;
+        assert!(apply_layout_change(
+            &mut app,
+            &shown,
+            &layout,
+            flags.as_deref()
+        ));
+
+        // The pass that made the loop: same canvas, both sessions owned.
+        let again = resize_client(&mut app, &client).await;
+        assert!(
+            again.succeeded.is_empty() && again.failed.is_empty(),
+            "an unchanged canvas over two owned sessions re-issued resize-window: {again:?}"
+        );
+        assert!(
+            !layout_change_within(&mut rx, std::time::Duration::from_millis(300)).await,
+            "tmux announced a layout change after a pass that wrote nothing"
+        );
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// The same loop through a different door: a target tmux will not
+    /// give. A layout has a minimum, one row per pane plus a separator
+    /// between each, and `resize-window` below it is clamped, not refused
+    /// (F79): the command succeeds and the window keeps disagreeing with
+    /// its target. A workspace that re-asks whenever a window disagrees
+    /// re-asks on every `%layout-change` its own ask produced. It asks
+    /// once more at most, then leaves the window where tmux put it until
+    /// the target or the window moves.
+    #[tokio::test]
+    async fn a_target_tmux_declines_is_asked_for_once_not_forever() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-clamped-target");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "120",
+            "-y",
+            "40",
+            "/bin/sh",
+        ]);
+        // Six stacked panes: tmux cannot lay them out below 11 rows.
+        for _ in 0..5 {
+            server.run_ok(&["split-window", "-v", "-t", "s"]);
+            server.run_ok(&["select-layout", "-t", "s", "even-vertical"]);
+        }
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, mut rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-clamped-target-home");
+        let model = fetch_workspace_model(&client, "s").await.expect("model");
+        let mut sizing = WindowSizing::default();
+        adopt_windows(&mut sizing, &client, "s", &model.session.tabs, &home).await;
+        assert!(sizing.owns("s"));
+        let window = model.active_tab().window_id.clone();
+        let mut app = test_app(model, home.clone());
+        // A terminal short enough that the six-pane target is below the
+        // rows tmux needs, and tall enough that it is still declarable.
+        app.term_size = (80, 18);
+        app.sizing = sizing;
+        let canvas = app.chrome(Rect::new(0, 0, 80, 18)).tmux_sizing_canvas();
+        let target = crate::render::tmux_client_size(canvas, app.model.active_tab());
+        assert!(
+            declarable(target) && target.1 < 11,
+            "the fixture wants a declarable target tmux cannot give: {target:?}"
+        );
+
+        // Two passes may write: the first ask, and one more once the
+        // window is seen where tmux clamped it. Each is answered.
+        for pass in 0..2 {
+            let outcome = resize_client(&mut app, &client).await;
+            assert!(
+                outcome.failed.is_empty(),
+                "pass {pass}: {:?}",
+                outcome.failed
+            );
+            if outcome.succeeded.is_empty() {
+                break;
+            }
+            let (layout, flags) = next_layout_change(&mut rx, &window).await;
+            assert!(apply_layout_change(
+                &mut app,
+                &window,
+                &layout,
+                flags.as_deref()
+            ));
+        }
+        let laid_out = app.model.active_tab().layout.rect();
+        assert!(
+            laid_out.height >= 11 && laid_out.height != target.1,
+            "the fixture wants tmux to have clamped the ask: {laid_out:?} for {target:?}"
+        );
+
+        // From here the window disagrees with its target and stays that
+        // way, and that must not be a reason to write again.
+        let settled = resize_client(&mut app, &client).await;
+        assert!(
+            settled.succeeded.is_empty() && settled.failed.is_empty(),
+            "a target tmux declined was asked for again: {settled:?}"
+        );
+        assert!(
+            !layout_change_within(&mut rx, std::time::Duration::from_millis(300)).await,
+            "tmux announced a layout change after a pass that wrote nothing"
+        );
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
     /// A tab opened later is pinned AND reported, because pinning alone
     /// leaves it holding whatever size it had.
     ///
@@ -9287,7 +9639,7 @@ mod tests {
         // Enter through the exact production cold-boot calculation and
         // write, after persisted visibility has been installed on the model.
         let declared =
-            declare_initial_client_size((100, 30), &model, &prefs, &sizing, &client, &home)
+            declare_initial_client_size((100, 30), &model, &prefs, &mut sizing, &client, &home)
                 .await
                 .expect("fixture has a declarable cold-boot target");
         let layout = nested_tmux_layout(&server, &window_id);
@@ -12090,7 +12442,7 @@ mod tests {
             "s".into(),
             OwnedSession {
                 pinned: std::collections::BTreeSet::from(["@0".into()]),
-                blocked: std::collections::BTreeSet::new(),
+                ..Default::default()
             },
         );
         app.decoration = DecorationSnapshot {

@@ -2208,3 +2208,43 @@ single-frame and active hidden-frame tests remain fail-closed. A vendor mode
 that hides undiscarded bytes behind the same settled clean chrome is outside
 the generic screen contract and must expose a non-clean manifest rule if it
 needs stronger treatment.
+
+## F79. tmux answers every `resize-window` with a `%layout-change`, and clamps rather than refuses
+
+MEASURED 2026-08-30 on an isolated tmux 3.7b server (`tmux -L probe -f
+/dev/null`), one control-mode observer attached, every server torn down
+after.
+
+| # | Fact |
+|---|---|
+| M1 | With `window-size manual` and a window already at 106x55, three `resize-window -t @0 -x 106 -y 55` produced three `%layout-change @0 c37d,106x55,...` lines. The size did not change; the notification came anyway, once per command. |
+| M2 | `set-option -w -t @0 window-size manual` on a window already on `manual` produced no notification. |
+| M3 | Six panes stacked with `even-vertical` need 11 rows (one per pane, one separator between each). `resize-window -t @0 -x 100 -y 5` exited 0 with no message and left the window at 100x11 with six 1-row panes: a size below the layout's minimum is clamped, not refused. |
+| M4 | The same command issued again from control mode, with the window already at 100x11, answered `%begin`/`%end` (success) and another `%layout-change` at 100x11. |
+
+M1 is what turns a harmless re-ask into a loop. A workspace that answers
+`%layout-change` for a window it sizes by checking whether that window is
+where it should be, and re-issuing `resize-window` when it is not, will get
+another `%layout-change` for that write. If the check can answer "not where
+it should be" forever, the pair runs at tmux round-trip speed. Observed on
+Admin's machine as about 1,000 `%layout-change` a second on each of two
+sessions, `cyclops` and the tmux server each at roughly half a core, the
+daemon socket answering EAGAIN under the reconcile load, and the workspace
+reporting `motion: off, this terminal writes frames slower than it draws
+them`. Two checks answered "not where it should be" forever:
+
+- A pinned window of a session the workspace owns but is not showing. It
+  has no tab in the displayed model, and "no tab" was read as "diverged".
+  One workspace owning two sessions is enough, which is what a workspace
+  reopened from another terminal ends up with when it takes over `main`
+  and then reopens the last-active session.
+- A window whose target is below the layout minimum (M3). tmux leaves it
+  above the target and reports success, so a re-ask changes nothing except
+  producing the notification (M4) that re-asks.
+
+The workspace now judges divergence only for windows it can see, and
+remembers per window what it asked for and what the window was at the
+time, so a window tmux left where it was is asked once more at most. The
+regression tests are `reopening_from_another_terminal_with_two_owned_sessions_does_not_loop`
+and `a_target_tmux_declines_is_asked_for_once_not_forever` in
+`src/cyclops-workspace/src/app.rs`.

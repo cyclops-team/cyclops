@@ -7,6 +7,16 @@ versions are unreleased until admin cuts a tag.
 
 ### Fixed
 
+- A workspace that owned two sessions, which is what reopening Cyclops
+  from another terminal produces once it takes over `main` and reopens the
+  last-active session, answered every `%layout-change` with another
+  `resize-window` for every window it owned. tmux answers each of those
+  with a `%layout-change` whether or not the size changed (F79), so the
+  canvas jumped continuously with the workspace and the tmux server each
+  on half a core. The background session's window was being read as
+  "not at its target" because it has no tab in the displayed model.
+  Divergence is now judged only for windows on screen, and a target tmux
+  clamps rather than gives is asked for once more at most.
 - A `[workspace.bindings]` rebinding onto a chord a default already used
   left both actions on the chord, and which one fired depended on hash
   order: it worked in one process and did nothing in the next. The
