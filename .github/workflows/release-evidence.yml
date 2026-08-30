@@ -1,0 +1,111 @@
+name: release evidence
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-evidence-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  clean-validation:
+    name: release clean-checkout validation
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.100
+      - name: Install tmux
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y tmux; else brew install tmux; fi
+      - name: Full repository gate
+        run: ./scripts/check.sh
+
+  historical-journals:
+    name: release historical-journal compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Strict, lenient, and daemon replay contracts
+        run: |
+          cargo test -p cyclops-ledger --all-targets --no-fail-fast
+          cargo test -p cyclopsd --test m2_history --no-fail-fast
+          cargo test -p cyclopsd --test attention_recovery --no-fail-fast
+
+  installer-and-journeys:
+    name: release installer and user journeys (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install tmux
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y tmux; else brew install tmux; fi
+      - name: Installer lifecycle and real user journeys
+        run: ./tests/e2e/parity-check.sh --with-installer
+
+  performance:
+    name: release performance comparison
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Run stable workloads with environment metadata
+        run: python3 scripts/ci-performance.py artifacts/performance.json
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: release-performance-${{ github.sha }}-${{ github.run_attempt }}
+          path: artifacts/performance.json
+          if-no-files-found: error
+          retention-days: 90
+
+  beta-release-gate:
+    name: beta release evidence complete
+    if: ${{ always() }}
+    needs:
+      - clean-validation
+      - historical-journals
+      - installer-and-journeys
+      - performance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every release responsibility
+        env:
+          CLEAN: ${{ needs.clean-validation.result }}
+          JOURNALS: ${{ needs.historical-journals.result }}
+          JOURNEYS: ${{ needs.installer-and-journeys.result }}
+          PERFORMANCE: ${{ needs.performance.result }}
+        run: |
+          test "$CLEAN" = success
+          test "$JOURNALS" = success
+          test "$JOURNEYS" = success
+          test "$PERFORMANCE" = success
+          echo "Release evidence is complete. This workflow does not publish or merge anything."
