@@ -93,7 +93,7 @@ Unknown manual history also selects every lane and fails safe.
 
 | Stable check | Runs substantive evidence when |
 |---|---|
-| `test (ubuntu-latest)` | Rust, documentation, or exact-output inputs change |
+| `test (ubuntu-latest)` | Always checks documentation paths; adds Rust, documentation, and exact-output evidence when their inputs change |
 | `test (macos-latest)` | A named platform or tmux risk changes |
 | `installer (ubuntu-latest)` | Installer, packaged assets, or install docs change |
 | `installer (macos-latest)` | Installer, packaged assets, or install docs change |
@@ -102,6 +102,10 @@ Unknown manual history also selects every lane and fails safe.
 
 Every check always exists. An unrelated change receives an explicit successful
 not-applicable step, so branch protection never depends on a disappearing job.
+The documentation-path check is the deliberate exception to conditional work:
+it runs for every pull request because deleting or renaming any quoted target
+can break a page even when no Markdown file changed. If classification itself
+fails, each stable check fails instead of silently skipping.
 Pull-request runs share a workflow-and-PR concurrency key and cancel an older
 revision. Push and manual evidence use unique keys and never cancel each other.
 
@@ -126,7 +130,7 @@ warnings into a new blocking policy.
 | Installer lifecycle on both platforms | Installation, profile restoration, seeded assets, and uninstall | Both stable installer checks run the same lifecycle only for installer-owned inputs; release evidence repeats it with user journeys |
 | Complete Rust gate against tmux HEAD | Upstream tmux adapter compatibility | Pull requests run `cyclops-tmux`, `cyclops-workspace`, and the M0 tmux/daemon/socket journey; the retained `watcher_modes` contract still catches F25; scheduled evidence runs the full fast gate against tmux HEAD |
 | Three performance test binaries inside ordinary nextest | Frame, queue, control-write, flood, and terminal-restoration budgets | Scheduled and release runs execute the same binaries through `scripts/ci-performance.py` and retain comparable metadata |
-| Zero-test doctest execution | Rust documentation compilation | `cargo doc` builds every workspace page with warnings denied |
+| Zero-test doctest execution | Rust documentation compilation | `cargo doc` builds every workspace page; pre-existing warnings remain visible without becoming a new blocking policy |
 
 Path-classifier self-tests simulate unrelated website, installer, daemon,
 platform-client, documentation, domain-only, and workflow changes. They assert

@@ -32,6 +32,10 @@ def under(path: str, *prefixes: str) -> bool:
 
 def classify(paths: list[str]) -> dict[str, bool]:
     result = {lane: False for lane in LANES}
+    # A deleted or renamed source, script, resource, or fixture can invalidate
+    # a path quoted by documentation. The checker is cheap, and a name-only
+    # diff cannot prove that an arbitrary removed target was unreferenced.
+    result["docs"] = True
     for path in paths:
         control = under(path, ".github/workflows/") or path.startswith("scripts/ci-") or path in {
             ".config/nextest.toml",
@@ -128,7 +132,7 @@ def selftest() -> None:
     assert docs["docs"] and docs["parity"]
     assert not docs["rust"] and not docs["installer"]
     ordinary = classify(["src/cyclops-proto/src/attention.rs"])
-    assert ordinary["rust"] and ordinary["parity"]
+    assert ordinary["rust"] and ordinary["docs"] and ordinary["parity"]
     assert not ordinary["website"] and not ordinary["installer"]
     assert not ordinary["tmux"] and not ordinary["platform"]
     assert not ordinary["tmux_head"]

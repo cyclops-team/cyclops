@@ -49,8 +49,14 @@ jobs:
   # explicit successful not-applicable result instead of a missing check.
   website:
     needs: classify
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
+      - name: require successful path classification
+        if: ${{ needs.classify.result != 'success' }}
+        run: |
+          echo "path classification failed; website applicability is unknown"
+          exit 1
       - name: website evidence not applicable
         if: ${{ needs.classify.outputs.website != 'true' }}
         run: echo "website inputs did not change"
@@ -80,8 +86,14 @@ jobs:
   test-ubuntu:
     name: test (ubuntu-latest)
     needs: classify
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
+      - name: require successful path classification
+        if: ${{ needs.classify.result != 'success' }}
+        run: |
+          echo "path classification failed; required evidence applicability is unknown"
+          exit 1
       - name: required evidence not applicable
         if: ${{ needs.classify.outputs.rust != 'true' && needs.classify.outputs.docs != 'true' && needs.classify.outputs.parity != 'true' }}
         run: echo "no Rust, documentation, or exact-output input changed"
@@ -137,8 +149,14 @@ jobs:
   test-macos:
     name: test (macos-latest)
     needs: classify
+    if: ${{ always() }}
     runs-on: macos-latest
     steps:
+      - name: require successful path classification
+        if: ${{ needs.classify.result != 'success' }}
+        run: |
+          echo "path classification failed; macOS applicability is unknown"
+          exit 1
       - name: macOS evidence not applicable
         if: ${{ needs.classify.outputs.platform != 'true' && needs.classify.outputs.tmux != 'true' }}
         run: echo "no named macOS portability or tmux risk changed"
@@ -176,12 +194,18 @@ jobs:
   # distinct profile and userland behavior when installer-owned inputs move.
   installer:
     needs: classify
+    if: ${{ always() }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      - name: require successful path classification
+        if: ${{ needs.classify.result != 'success' }}
+        run: |
+          echo "path classification failed; installer applicability is unknown"
+          exit 1
       - name: installer evidence not applicable
         if: ${{ needs.classify.outputs.installer != 'true' }}
         run: echo "installer, packaged assets, and installation docs did not change"
@@ -202,9 +226,14 @@ jobs:
   # when adapter or manifest inputs move. Nightly owns the complete HEAD suite.
   tmux-head:
     needs: classify
+    if: ${{ always() }}
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
+      - name: require successful path classification
+        if: ${{ needs.classify.result != 'success' }}
+        run: |
+          echo "path classification failed; tmux HEAD applicability is unknown"
+          exit 1
       - name: tmux HEAD evidence not applicable
         if: ${{ needs.classify.outputs.tmux_head != 'true' }}
         run: echo "tmux adapter, rig, manifests, and layouts did not change"
@@ -220,6 +249,7 @@ jobs:
           tool: cargo-nextest@0.9.100
       - name: Build tmux from master
         if: ${{ needs.classify.outputs.tmux_head == 'true' }}
+        continue-on-error: true
         run: |
           sudo apt-get update
           sudo apt-get install -y libevent-dev ncurses-dev build-essential bison pkg-config autoconf automake
@@ -229,6 +259,7 @@ jobs:
           tmux -V
       - name: Focused adapter evidence against tmux HEAD
         if: ${{ needs.classify.outputs.tmux_head == 'true' }}
+        continue-on-error: true
         run: |
           cargo nextest run -p cyclops-tmux -p cyclops-workspace --no-fail-fast
           cargo test -p cyclopsd --test m0 m0_shadow_daemon_end_to_end -- --exact
