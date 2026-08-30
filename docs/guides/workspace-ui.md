@@ -195,6 +195,25 @@ grid was already narrower than the terminal because another workspace owns
 the shared tmux geometry, closing Messages does not stretch it past the tmux
 source.
 
+The one-column rail remains stateful while the pane is closed. It reads only
+authenticated, body-free snapshot counts and never forces the pane open:
+
+- `✉` followed by `1` through `9` shows the current number of Work messages;
+- `✉` followed by `+` means ten or more Work messages;
+- `!` means at least one message notification needs attention; and
+- `?` means Cyclops has no authenticated snapshot yet or the retained snapshot
+  is stale after a connection gap or failed refresh.
+
+A body-free `messages.changed` edge refreshes this cue even while the pane is
+closed. Ordinary pane decoration changes do not create message reads. Opening
+Messages always refreshes its detailed projection before enabling actions, and
+the rail remains the same one-column click target in every cue state.
+
+This cue is specific to the full workspace. Adopted tmux panes keep their
+existing body-free message count in the pane border. A direct native tmux
+attach remains intentionally free of Cyclops chrome; use the inbox commands to
+inspect messaging there.
+
 The Messages pane uses the same card language as agent panes: a complete
 muted border at rest and a double accent border while it has keyboard focus.
 Drag its left border horizontally to resize it. The border responds after one
