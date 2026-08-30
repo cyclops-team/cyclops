@@ -128,10 +128,12 @@ paste path cannot be gated on bracketing; composer verification is the gate.
 Reproduced in the CLI e2e and Daemon Client tests: `set_read_timeout(None)`,
 `set_read_timeout(Some(_))`, and `set_write_timeout(Some(_))` on a UnixStream
 whose peer already closed can fail with EINVAL while buffered lines remain
-readable. The client swallows only that macOS closed-peer error and lets the
-next IO report the buffered line or close. Anything applying or adjusting
-socket timeouts mid-connection on macOS must tolerate this or it will hide
-readable data behind a misnamed error.
+readable. During initial connection setup, the client swallows only that macOS
+closed-peer error and lets the next IO report the buffered line or close.
+Later event-stream timeout adjustments are explicitly best effort and ignore
+setter errors so buffered frames remain authoritative. Anything applying or
+adjusting socket timeouts mid-connection on macOS must tolerate this or it will
+hide readable data behind a misnamed error.
 
 ## F19. codex ghost text is SGR-dim; typed text is bare (MEASURED)
 
