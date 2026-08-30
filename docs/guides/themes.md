@@ -217,6 +217,13 @@ unthemeable here: they print onto the terminal's own background, the
 CLI has no background emitter, and the full-screen stream inherits the
 terminal's ground the same way.
 
+While the workspace runs it paints the terminal's own default background
+(the few pixels of window padding around the grid) with the theme ground,
+and restores the terminal's original default when it exits or loses focus.
+It learns that original by asking the terminal at startup, so a terminal
+that honors setting the background but not resetting it — Apple Terminal —
+still gets its own color back instead of keeping the theme's.
+
 Naming a `stream.*` token in a theme file warns on stderr and is
 skipped, and so does a per-state token name from before the groups
 (`state.idle`, `badge.attention`):

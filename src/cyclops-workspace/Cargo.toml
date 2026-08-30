@@ -12,6 +12,7 @@ cyclops-theme.workspace = true
 cyclops-tmux.workspace = true
 cyclops-ui.workspace = true
 crossterm = "0.29"
+libc.workspace = true
 ratatui = "0.30"
 serde_json.workspace = true
 thiserror.workspace = true

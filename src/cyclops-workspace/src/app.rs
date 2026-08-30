@@ -1088,6 +1088,13 @@ pub async fn run_async() -> i32 {
         }
     });
 
+    // Ask the terminal for its own default colors before the reader thread
+    // below starts consuming stdin: the reply arrives as terminal input, so
+    // it must be read here or not at all. On exit and on focus loss the
+    // workspace hands these exact colors back (`term_guard::reset_window_palette`),
+    // because Apple Terminal honors an OSC 10/11 set but ignores the OSC
+    // 110/111 reset that would otherwise undo the themed ground.
+    crate::term_guard::capture_default_palette();
     let terminal_input_gate = pane_input_gate.clone();
     std::thread::spawn(move || loop {
         match event::read() {

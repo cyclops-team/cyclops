@@ -7,6 +7,15 @@ versions are unreleased until admin cuts a tag.
 
 ### Fixed
 
+- Detaching or quitting the workspace left the theme's ground on the
+  shell underneath on terminals that honor an OSC 11 background *set* but
+  ignore the OSC 110/111 *reset* — Apple Terminal is the common one, where
+  the only reset the workspace ever sent was the one that terminal drops.
+  The workspace now asks the terminal for its own default colors at
+  startup (OSC 10/11 query, fenced by a DA1 request) and hands exactly
+  those back on exit and on focus loss, which is a plain set every such
+  terminal obeys. Terminals that do not answer the query fall back to the
+  OSC 110/111 reset as before.
 - The Messages pane's current-session view told sessions apart by pane id
   alone, so after a tmux server restart the new `main` showed the messages
   of the `main` that died before it: tmux hands `%0`, `%1`, … out again,

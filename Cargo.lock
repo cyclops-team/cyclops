@@ -503,6 +503,7 @@ dependencies = [
  "cyclops-theme",
  "cyclops-tmux",
  "cyclops-ui",
+ "libc",
  "ratatui",
  "serde_json",
  "thiserror 2.0.19",

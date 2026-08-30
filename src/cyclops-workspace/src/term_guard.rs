@@ -1,8 +1,11 @@
 //! Terminal guard: raw mode, alternate screen, panic-safe restore.
 
 use std::io::{self, Write};
+use std::mem::MaybeUninit;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
@@ -129,9 +132,202 @@ fn write_window_palette(out: &mut impl Write, fg: (u8, u8, u8), bg: (u8, u8, u8)
     );
 }
 
-/// Hand the terminal's default foreground and background back (OSC 110/111).
+/// One terminal color as 8-bit RGB.
+type Rgb = (u8, u8, u8);
+
+/// The terminal's own default foreground and background, learned once at
+/// startup by asking the terminal (`capture_default_palette`).
+///
+/// `Some(None)` means the query ran and the terminal did not answer (no
+/// tty, or a terminal that does not report its colors); an unset cell means
+/// capture never ran, which is the case under test. Both resolve to "not
+/// known" and fall back to the OSC 110/111 reset request.
+static ORIGINAL_PALETTE: OnceLock<Option<(Rgb, Rgb)>> = OnceLock::new();
+
+fn original_palette() -> Option<(Rgb, Rgb)> {
+    ORIGINAL_PALETTE.get().copied().flatten()
+}
+
+/// Ask the terminal for its own default foreground and background and
+/// remember them, so exit and focus-loss can hand back the exact colors
+/// the terminal started with.
+///
+/// This is the fix for a terminal that honors an OSC 10/11 *set* but
+/// ignores the OSC 110/111 *reset* — Apple Terminal is the common one. On
+/// such a terminal the workspace's themed ground would otherwise stay on
+/// the shell after cyclops leaves, because the only reset it was ever sent
+/// is the one that terminal drops on the floor. Handing back the captured
+/// colors is a plain OSC set, which every terminal that showed the theme
+/// ground in the first place obeys.
+///
+/// Runs once, and must run before the input reader thread starts: the
+/// terminal answers the query as terminal input, so whoever reads stdin
+/// first reads the answer. A terminal that never answers costs one bounded
+/// wait here and nothing afterward.
+pub fn capture_default_palette() {
+    let _ = ORIGINAL_PALETTE.set(query_default_palette());
+}
+
+/// Restore stdin's termios on drop, so no early return can leave the
+/// terminal in the transient raw mode the query needs.
+struct TermiosRestore(libc::termios);
+
+impl Drop for TermiosRestore {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0);
+        }
+    }
+}
+
+fn query_default_palette() -> Option<(Rgb, Rgb)> {
+    // Only a real terminal answers, and only over stdin.
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+        return None;
+    }
+    let orig = unsafe {
+        let mut t = MaybeUninit::<libc::termios>::uninit();
+        if libc::tcgetattr(libc::STDIN_FILENO, t.as_mut_ptr()) != 0 {
+            return None;
+        }
+        t.assume_init()
+    };
+    let _restore = TermiosRestore(orig);
+    let mut raw = orig;
+    // Non-canonical, no echo, timed reads: the reply has no newline, so a
+    // cooked read would block until Enter, and echo would print the reply.
+    raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+    raw.c_cc[libc::VMIN] = 0;
+    raw.c_cc[libc::VTIME] = 1; // 100ms per read
+    if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
+        return None;
+    }
+    // Foreground (OSC 10) and background (OSC 11), then a primary
+    // device-attributes request (DA1, `ESC [ c`) as a fence. Every terminal
+    // answers DA1, and its answer cannot precede the color answers it was
+    // sent after, so the read stops the instant DA1 lands rather than
+    // guessing a timeout and risking a real keystroke typed at launch.
+    {
+        let mut out = io::stdout();
+        let _ = out.write_all(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[c");
+        let _ = out.flush();
+    }
+    let deadline = Instant::now() + Duration::from_millis(300);
+    let mut buf: Vec<u8> = Vec::with_capacity(128);
+    let mut chunk = [0u8; 256];
+    while Instant::now() < deadline {
+        let n = unsafe { libc::read(libc::STDIN_FILENO, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if n > 0 {
+            buf.extend_from_slice(&chunk[..n as usize]);
+            if da1_answered(&buf) {
+                break;
+            }
+        } else if n == 0 {
+            // VTIME elapsed with nothing. A terminal that answers has begun
+            // by now; an empty first read means it never will.
+            if buf.is_empty() {
+                break;
+            }
+        } else {
+            break; // read error
+        }
+    }
+    match parse_osc_colors(&buf) {
+        (Some(fg), Some(bg)) => Some((fg, bg)),
+        _ => None,
+    }
+}
+
+/// Whether a DA1 reply (`ESC [ ... c`) is present: a CSI closed by `c`. The
+/// color replies are OSC sequences closed by BEL or ST, so the only `c`
+/// that closes a CSI here is DA1's.
+fn da1_answered(buf: &[u8]) -> bool {
+    let Some(start) = find_subslice(buf, b"\x1b[") else {
+        return false;
+    };
+    buf[start + 2..].contains(&b'c')
+}
+
+fn parse_osc_colors(buf: &[u8]) -> (Option<Rgb>, Option<Rgb>) {
+    (
+        find_osc_color(buf, b"\x1b]10;"),
+        find_osc_color(buf, b"\x1b]11;"),
+    )
+}
+
+fn find_osc_color(buf: &[u8], prefix: &[u8]) -> Option<Rgb> {
+    let pos = find_subslice(buf, prefix)?;
+    let rest = &buf[pos + prefix.len()..];
+    // OSC terminator: BEL, or ESC of the two-byte ST.
+    let end = rest.iter().position(|&b| b == 0x07 || b == 0x1b)?;
+    parse_color_payload(&rest[..end])
+}
+
+fn parse_color_payload(payload: &[u8]) -> Option<Rgb> {
+    let s = std::str::from_utf8(payload).ok()?.trim();
+    if let Some(hex) = s.strip_prefix("rgb:") {
+        let mut it = hex.split('/');
+        let r = scale_component(it.next()?)?;
+        let g = scale_component(it.next()?)?;
+        let b = scale_component(it.next()?)?;
+        if it.next().is_some() {
+            return None;
+        }
+        return Some((r, g, b));
+    }
+    if let Some(hex) = s.strip_prefix('#') {
+        if hex.len() == 6 {
+            return Some((
+                u8::from_str_radix(&hex[0..2], 16).ok()?,
+                u8::from_str_radix(&hex[2..4], 16).ok()?,
+                u8::from_str_radix(&hex[4..6], 16).ok()?,
+            ));
+        }
+    }
+    None
+}
+
+/// One `rgb:` component, 1..=4 hex digits, scaled to 8 bits. `xterm`
+/// reports 16-bit (`3a3a`); a shorter width is scaled across its own range
+/// so `f` is full intensity, not near-black.
+fn scale_component(s: &str) -> Option<u8> {
+    if s.is_empty() || s.len() > 4 {
+        return None;
+    }
+    let value = u32::from_str_radix(s, 16).ok()?;
+    let max = (1u32 << (4 * s.len())) - 1;
+    Some(((value * 255 + max / 2) / max) as u8)
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Hand the terminal's default foreground and background back.
+///
+/// When the terminal told us its defaults at startup
+/// (`capture_default_palette`), set exactly those back: Apple Terminal
+/// honors an OSC 10/11 set but ignores the OSC 110/111 reset, so a bare
+/// reset leaves the workspace's ground on the shell. Writing the captured
+/// colors is the reset it obeys, and it is correct on every terminal that
+/// answered the query. Otherwise fall back to asking the terminal to reset
+/// to its own defaults (OSC 110/111).
 fn reset_window_palette(out: &mut impl Write) {
-    let _ = write!(out, "\x1b]110\x1b\\\x1b]111\x1b\\");
+    write_reset(out, original_palette());
+}
+
+fn write_reset(out: &mut impl Write, original: Option<(Rgb, Rgb)>) {
+    match original {
+        Some((fg, bg)) => write_window_palette(out, fg, bg),
+        None => {
+            let _ = write!(out, "\x1b]110\x1b\\\x1b]111\x1b\\");
+        }
+    }
 }
 
 /// Hand the foreground and background back while the workspace keeps running.
@@ -257,6 +453,63 @@ mod tests {
             "\x1b]10;#3a2b26\x1b\\\x1b]11;#faf6e6\x1b\\",
             "foreground and background channels are lowercase, zero-padded hex"
         );
+    }
+
+    /// The reset the operator's shell actually gets. When the terminal
+    /// reported its own defaults at startup, hand exactly those back with an
+    /// OSC set — the reset Apple Terminal obeys — instead of the OSC 110/111
+    /// request it silently drops, which is what left the theme ground on the
+    /// shell after a detach.
+    #[test]
+    fn a_known_default_is_handed_back_by_setting_it_not_by_asking_for_a_reset() {
+        let mut out: Vec<u8> = Vec::new();
+        write_reset(&mut out, Some(((0x3a, 0x2b, 0x26), (0x00, 0x00, 0x00))));
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b]10;#3a2b26\x1b\\\x1b]11;#000000\x1b\\",
+            "a captured default is set back, never left to an ignored OSC 110/111"
+        );
+    }
+
+    /// With no captured default — a terminal that does not answer the query,
+    /// or no tty at all — fall back to asking the terminal to reset itself.
+    #[test]
+    fn an_unknown_default_falls_back_to_the_reset_request() {
+        let mut out: Vec<u8> = Vec::new();
+        write_reset(&mut out, None);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b]110\x1b\\\x1b]111\x1b\\",
+            "no captured default means ask the terminal to reset to its own"
+        );
+    }
+
+    /// A terminal's OSC 10/11 replies, ST- and BEL-terminated, are read out
+    /// of the raw byte stream and 16-bit `rgb:` channels are downscaled to
+    /// eight bits. The trailing DA1 reply is the fence the reader stops on.
+    #[test]
+    fn a_terminals_color_reply_is_parsed_and_downscaled() {
+        let buf = b"\x1b]10;rgb:3a3a/2b2b/2626\x1b\\\x1b]11;rgb:0000/0000/0000\x07\x1b[?62;c";
+        let (fg, bg) = parse_osc_colors(buf);
+        assert_eq!(fg, Some((0x3a, 0x2b, 0x26)));
+        assert_eq!(bg, Some((0x00, 0x00, 0x00)));
+        assert!(da1_answered(buf), "the DA1 reply is the read fence");
+    }
+
+    /// Neither the `#rrggbb` form nor a short `rgb:` component is near-black:
+    /// each width scales across its own range, so `f` is full intensity.
+    #[test]
+    fn color_payloads_parse_hash_and_short_forms() {
+        assert_eq!(parse_color_payload(b"#ff8800"), Some((0xff, 0x88, 0x00)));
+        assert_eq!(parse_color_payload(b"rgb:f/0/8"), Some((255, 0, 136)));
+        assert_eq!(parse_color_payload(b"rubbish"), None);
+    }
+
+    /// A DA1 reply that has not arrived yet does not falsely fence the read:
+    /// the color replies alone carry no CSI closed by `c`.
+    #[test]
+    fn da1_is_not_reported_before_it_arrives() {
+        assert!(!da1_answered(b"\x1b]11;rgb:0000/0000/0000\x1b\\"));
     }
 
     #[test]
