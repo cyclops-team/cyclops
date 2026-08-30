@@ -218,7 +218,7 @@ async fn send_summarized_workspace_message(
 // Obsolete if a mailbox quota reset no longer requires a fresh pane
 // observation followed by explicit operator requeue.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_positive_quota_observation_records_reset_without_requeue_or_terminal_write() {
+async fn a_positive_quota_observation_commits_before_cancelled_chrome_repaint() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -260,7 +260,11 @@ async fn a_positive_quota_observation_records_reset_without_requeue_or_terminal_
     );
     let attempts_before = notification_attempts(&rig, &message_id);
 
+    let repaint = rig.daemon.pause_next_chrome_repaint_for_test();
     rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
+    tokio::time::timeout(Duration::from_secs(8), repaint.wait_until_entered())
+        .await
+        .expect("quota reset did not reach the post-commit chrome boundary");
     let reset_notice = rig
         .ev
         .wait_event(Duration::from_secs(8), |event| {
@@ -290,7 +294,14 @@ async fn a_positive_quota_observation_records_reset_without_requeue_or_terminal_
     assert!(!screen.contains(&compact_doorbell(&rig, &message_id)));
     assert!(!screen.contains("body stays durable"));
 
+    // Leave the repaint stalled. Shutdown cancels that session task after its
+    // bounded grace period, proving presentation cancellation cannot consume
+    // the already-committed reset edge.
     rig.daemon.shutdown().await;
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::QuotaResetObserved),
+        1
+    );
 }
 
 struct WaitingPair {

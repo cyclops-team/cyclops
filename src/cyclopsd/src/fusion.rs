@@ -3714,11 +3714,12 @@ impl PaneMessagingObservation {
 pub(crate) struct PaneObservation {
     detection: Detection,
     messaging: Option<PaneMessagingObservation>,
+    repaint: bool,
 }
 
 impl PaneObservation {
-    pub(crate) fn into_parts(self) -> (Detection, Option<PaneMessagingObservation>) {
-        (self.detection, self.messaging)
+    pub(crate) fn into_parts(self) -> (Detection, Option<PaneMessagingObservation>, bool) {
+        (self.detection, self.messaging, self.repaint)
     }
 }
 
@@ -4010,6 +4011,7 @@ async fn observe_pane_with_evidence(
         return Some(PaneObservation {
             detection: det,
             messaging: None,
+            repaint: false,
         });
     }
 
@@ -4081,6 +4083,7 @@ async fn observe_pane_with_evidence(
                         return Some(PaneObservation {
                             detection: p,
                             messaging: None,
+                            repaint: false,
                         });
                     }
                     // Nothing cached describes whoever is in the pane now,
@@ -4741,10 +4744,6 @@ async fn observe_pane_with_evidence(
             (admitted, source_manifest.as_str()),
             working_confirmed,
         );
-        // The border says what this row says, from the same edge. No
-        // timer, no second rule: an adopted pane's chrome moves exactly
-        // when the fused state it names moves.
-        crate::repaint_chrome(inner, session_idx, watcher, pane_id).await;
     }
     for confirmed in confirmed_candidates {
         crate::delivery::confirm_dispatch_ack(
@@ -4763,6 +4762,7 @@ async fn observe_pane_with_evidence(
     Some(PaneObservation {
         detection,
         messaging: messaging_observation,
+        repaint: changed,
     })
 }
 
@@ -10591,6 +10591,7 @@ regex = ['^IDLE']
             unread_projection_wake: tokio::sync::Notify::new(),
             unread_projection_stopping: std::sync::atomic::AtomicBool::new(false),
             unread_projection_pause: StdMutex::new(None),
+            chrome_repaint_pause: StdMutex::new(None),
             mailbox_publish_pause: StdMutex::new(None),
             boot_id: "b-test".into(),
             started: std::time::Instant::now(),

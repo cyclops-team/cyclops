@@ -11975,6 +11975,7 @@ composer_trailer_required_prefix = 1
             unread_projection_wake: tokio::sync::Notify::new(),
             unread_projection_stopping: std::sync::atomic::AtomicBool::new(false),
             unread_projection_pause: StdMutex::new(None),
+            chrome_repaint_pause: StdMutex::new(None),
             mailbox_publish_pause: StdMutex::new(None),
             boot_id: "b-unwritten-test".into(),
             started: std::time::Instant::now(),
