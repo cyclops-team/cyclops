@@ -64,6 +64,8 @@ responsibility boundaries, not a requirement for one crate per noun:
 | Utility room | tmux, sockets, files, terminal effects, and other physical adapters |
 | Records room | Durable state, append-only journals, replay, and migration |
 | Maintenance room | Install, inventory, update, health, repair, rollback, cleanup, and removal plans |
+| Agent integration room | Vendor manifests, capabilities, hook facts, and safe setup knowledge |
+| Front hall | CLI and product entry, first useful action, and progressive-disclosure guidance |
 
 The glossary in the whole-system review is approved. In particular, a
 participant is not necessarily an agent; an agent runtime is one exact process
@@ -122,6 +124,8 @@ decision; production seams precede test-only reorganization.
 
 The primary tracer is **beta/fix/tmux-focus-context**. The independent
 **beta/fix/version-identity** slice may proceed in parallel.
+After those slices merge, **beta/test/first-run-journeys** assigns the
+representative journeys to their cheapest honest evidence lanes before Track C.
 
 ## Approved P1 tracers
 
@@ -184,6 +188,11 @@ contract; lose durability, identity, FIFO, claim authorization, replay, or
 honest uncertainty; require automatic raw-tmux fallback; introduce unresolved
 security or data-loss risk; or expand into another daemon, distributed broker,
 generic workflow engine, production agent runner, or MCP integration.
+
+Also stop if readable history cannot remain readable or migrate safely, secure
+state ownership or user-data recovery cannot be maintained, a consequential
+user-experience choice has two materially different unresolved outcomes, or
+repository-admin branch protection must change.
 
 Stop before signing credentials, public artifact distribution, release tags,
 or a GitHub Release. Do not merge **beta/messaging-rework** into `main`, create or

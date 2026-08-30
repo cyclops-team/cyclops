@@ -15,6 +15,9 @@ The primary tracer is **beta/fix/tmux-focus-context**. The independent
 **beta/fix/version-identity** slice may run in parallel. Work in flight is
 reported by its pull request and checks rather than copied into this page.
 
+After those slices merge, **beta/test/first-run-journeys** assigns the
+representative journeys to their cheapest honest evidence lanes before Track C.
+
 After direct user correctness, continue through Tracks C, D, F, B, E, G, H,
 and I, then run the final whole-beta responsibility and user-journey audit. The
 charter records their responsibilities and dependencies.
