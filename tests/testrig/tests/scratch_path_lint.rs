@@ -41,6 +41,7 @@ fn real_tmux_fixtures_do_not_bypass_the_scratch_root() {
     let mut offenders = Vec::new();
     let forbidden = [
         "temp_dir()",
+        "tempdir()",
         "tempfile::tempdir()",
         ".tempdir()",
         "TempDir::new()",
