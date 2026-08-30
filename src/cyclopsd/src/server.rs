@@ -1900,7 +1900,7 @@ async fn refresh_status_detections(inner: &Arc<Inner>) -> HashSet<crate::PaneKey
             jobs.push_back((
                 key,
                 Box::pin(async move {
-                    fusion::recompute_pane(&inner, session_idx, &watcher, &pane_id, true, "status")
+                    crate::observe_pane(&inner, session_idx, &watcher, &pane_id, true, "status")
                         .await
                         .is_some()
                 }) as StatusRefreshFuture,
@@ -2485,7 +2485,7 @@ async fn pane_read(inner: &Arc<Inner>, id: Value, params: Value) -> Response {
         PaneReadSource::Detection => {
             // Reconcile on doubt: an explicit detection read refreshes with
             // the full sensor set instead of trusting the cache.
-            let det = match fusion::recompute_pane(
+            let det = match crate::observe_pane(
                 inner,
                 session_idx,
                 &watcher,
@@ -3288,6 +3288,7 @@ mod tests {
             unread_projection_wake: tokio::sync::Notify::new(),
             unread_projection_stopping: std::sync::atomic::AtomicBool::new(false),
             unread_projection_pause: StdMutex::new(None),
+            chrome_repaint_pause: StdMutex::new(None),
             mailbox_publish_pause: StdMutex::new(None),
             boot_id: "b-test".into(),
             started: Instant::now(),
@@ -5241,7 +5242,8 @@ mod tests {
         assert!(arm.contains("status_result(inner, false)"));
         for forbidden in [
             "refresh_status_detections",
-            "recompute_pane",
+            "observe_pane",
+            "apply_messaging_observation",
             "open_deliveries: true",
             "engine.wake",
             "events.send",

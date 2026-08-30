@@ -532,7 +532,7 @@ async fn lifecycle_recheck_worker(
             return;
         };
         let cause = work.cause();
-        let Some(_detection) = recompute_pane(
+        let Some(_detection) = crate::observe_pane(
             &inner,
             pane.session_idx,
             &watcher,
@@ -3600,15 +3600,15 @@ fn pane_recompute_gate(inner: &Arc<Inner>, pane: &PaneKey) -> Arc<tokio::sync::M
 /// for the rename race that distinction closes. Every call site already
 /// has one, from wherever it entered the session (an event's own
 /// `session_task`, a resolved recipient, a delivery handle).
-pub(crate) async fn recompute_pane(
+pub(crate) async fn observe_pane(
     inner: &Arc<Inner>,
     session_idx: usize,
     watcher: &SessionWatcher,
     pane_id: &str,
     force_screen: bool,
     cause: &str,
-) -> Option<Detection> {
-    recompute_pane_with_evidence(
+) -> Option<PaneObservation> {
+    observe_pane_with_evidence(
         inner,
         session_idx,
         watcher,
@@ -3624,7 +3624,7 @@ pub(crate) async fn recompute_pane(
 ///
 /// Causal event sources mint the token before entering. Synthetic
 /// reconciliation supplies the current token so it cannot create an edge.
-pub(crate) async fn recompute_pane_for_route_evidence(
+pub(crate) async fn observe_pane_for_route_evidence(
     inner: &Arc<Inner>,
     session_idx: usize,
     watcher: &SessionWatcher,
@@ -3632,8 +3632,8 @@ pub(crate) async fn recompute_pane_for_route_evidence(
     force_screen: bool,
     cause: &str,
     route_evidence: &NotificationRouteEvidenceId,
-) -> Option<Detection> {
-    recompute_pane_with_evidence(
+) -> Option<PaneObservation> {
+    observe_pane_with_evidence(
         inner,
         session_idx,
         watcher,
@@ -3651,15 +3651,15 @@ pub(crate) async fn recompute_pane_for_route_evidence(
 /// Recompute after a settled output burst while preserving when that output
 /// was observed. The capture may run later, but it must not confirm a hook
 /// edge that arrived after the bytes which triggered it.
-pub(crate) async fn recompute_pane_from_output(
+pub(crate) async fn observe_pane_from_output(
     inner: &Arc<Inner>,
     session_idx: usize,
     watcher: &SessionWatcher,
     pane_id: &str,
     evidence_ms: u64,
     route_evidence: &NotificationRouteEvidenceId,
-) -> Option<Detection> {
-    recompute_pane_with_evidence(
+) -> Option<PaneObservation> {
+    observe_pane_with_evidence(
         inner,
         session_idx,
         watcher,
@@ -3680,7 +3680,63 @@ struct RecomputeEvidence<'a> {
     route: Option<&'a NotificationRouteEvidenceId>,
 }
 
-async fn recompute_pane_with_evidence(
+/// One exact, immutable runtime observation relevant to durable messaging.
+///
+/// The pane observer supplies the exact durable recipient identity at the
+/// moment it commits its cache. `WorkspaceMessaging` never reaches back into
+/// fusion to guess what was seen later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PaneMessagingObservation {
+    QuotaResetObserved {
+        recipient: RecipientKey,
+        session_idx: usize,
+        pane_id: String,
+    },
+}
+
+impl PaneMessagingObservation {
+    pub(crate) fn quota_reset(
+        recipient: RecipientKey,
+        session_idx: usize,
+        pane_id: impl Into<String>,
+    ) -> Self {
+        Self::QuotaResetObserved {
+            recipient,
+            session_idx,
+            pane_id: pane_id.into(),
+        }
+    }
+}
+
+/// A committed pane-cache result and any immutable messaging evidence derived
+/// from that same observation. The fields stay private so callers can only
+/// consume the complete value.
+pub(crate) struct PaneObservation {
+    detection: Detection,
+    messaging: Option<PaneMessagingObservation>,
+    repaint: bool,
+    recompute_guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl PaneObservation {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Detection,
+        Option<PaneMessagingObservation>,
+        bool,
+        tokio::sync::OwnedMutexGuard<()>,
+    ) {
+        (
+            self.detection,
+            self.messaging,
+            self.repaint,
+            self.recompute_guard,
+        )
+    }
+}
+
+async fn observe_pane_with_evidence(
     inner: &Arc<Inner>,
     session_idx: usize,
     watcher: &SessionWatcher,
@@ -3688,7 +3744,7 @@ async fn recompute_pane_with_evidence(
     force_screen: bool,
     cause: &str,
     evidence: RecomputeEvidence<'_>,
-) -> Option<Detection> {
+) -> Option<PaneObservation> {
     let route = PaneKey::new(session_idx, pane_id);
     let prior_working_confirmed = cached_working_confirmed(inner, session_idx, pane_id);
     // One pane has one observation timeline. The capture is part of the
@@ -3697,7 +3753,7 @@ async fn recompute_pane_with_evidence(
     // The map keeps one stable gate per route for the daemon's lifetime so a
     // waiter can never race a newly-created replacement gate.
     let recompute_gate = pane_recompute_gate(inner, &route);
-    let _recompute_guard = recompute_gate.lock().await;
+    let recompute_guard = recompute_gate.lock_owned().await;
     let lifecycle_observation = LifecycleObservation::from_cause(cause);
     let Some(row) = watcher.pane(pane_id) else {
         inner
@@ -3965,7 +4021,12 @@ async fn recompute_pane_with_evidence(
         if !is_candidate_recheck_cause(cause) {
             schedule_lifecycle_recheck(inner, &route);
         }
-        return Some(det);
+        return Some(PaneObservation {
+            detection: det,
+            messaging: None,
+            repaint: false,
+            recompute_guard,
+        });
     }
 
     let mut capture_binding_changed = false;
@@ -4033,7 +4094,12 @@ async fn recompute_pane_with_evidence(
                         if !is_candidate_recheck_cause(cause) {
                             schedule_lifecycle_recheck(inner, &route);
                         }
-                        return Some(p);
+                        return Some(PaneObservation {
+                            detection: p,
+                            messaging: None,
+                            repaint: false,
+                            recompute_guard,
+                        });
                     }
                     // Nothing cached describes whoever is in the pane now,
                     // so there is nothing to retain. Fall through and let
@@ -4654,9 +4720,16 @@ async fn recompute_pane_with_evidence(
         &detection,
         evidence.route,
     );
-    if probe_quota_reset {
-        crate::delivery::observe_quota_reset(inner, session_idx, pane_id);
-    }
+    let messaging_observation = probe_quota_reset
+        .then(|| {
+            let recipient = inner.recipient_key(session_idx, pane_id)?;
+            Some(PaneMessagingObservation::quota_reset(
+                recipient,
+                session_idx,
+                pane_id,
+            ))
+        })
+        .flatten();
     // First sight of a pane that reads Unknown is baseline, not a change.
     let state_changed = prior != Some(detection.state)
         && !(prior.is_none() && detection.state == AgentState::Unknown);
@@ -4686,10 +4759,6 @@ async fn recompute_pane_with_evidence(
             (admitted, source_manifest.as_str()),
             working_confirmed,
         );
-        // The border says what this row says, from the same edge. No
-        // timer, no second rule: an adopted pane's chrome moves exactly
-        // when the fused state it names moves.
-        crate::repaint_chrome(inner, session_idx, watcher, pane_id).await;
     }
     for confirmed in confirmed_candidates {
         crate::delivery::confirm_dispatch_ack(
@@ -4705,7 +4774,12 @@ async fn recompute_pane_with_evidence(
     if !is_candidate_recheck_cause(cause) {
         schedule_lifecycle_recheck(inner, &PaneKey::new(session_idx, pane_id));
     }
-    Some(detection)
+    Some(PaneObservation {
+        detection,
+        messaging: messaging_observation,
+        repaint: changed,
+        recompute_guard,
+    })
 }
 
 fn is_candidate_recheck_cause(cause: &str) -> bool {
@@ -4741,13 +4815,25 @@ fn positive_quota_reset_observation(detection: &Detection) -> bool {
 /// Recheck the cached exact route after a quota hold is made durable.
 /// This closes the race where the positive reset edge lands just before
 /// the delivery worker appends `QuotaHeld` and therefore finds no target.
-pub(crate) fn quota_reset_observed_now(inner: &Inner, session_idx: usize, pane_id: &str) -> bool {
-    inner
+pub(crate) fn quota_reset_observation_now(
+    inner: &Inner,
+    session_idx: usize,
+    pane_id: &str,
+) -> Option<PaneMessagingObservation> {
+    let observed = inner
         .detections
         .lock()
         .expect("detections lock")
         .get(&PaneKey::new(session_idx, pane_id))
-        .is_some_and(|entry| entry.quota_screen_clear)
+        .is_some_and(|entry| entry.quota_screen_clear);
+    if !observed {
+        return None;
+    }
+    Some(PaneMessagingObservation::quota_reset(
+        inner.recipient_key(session_idx, pane_id)?,
+        session_idx,
+        pane_id,
+    ))
 }
 
 fn quota_reset_probe_needed(prior_screen_clear: bool, current: &Detection) -> bool {
@@ -10521,6 +10607,7 @@ regex = ['^IDLE']
             unread_projection_wake: tokio::sync::Notify::new(),
             unread_projection_stopping: std::sync::atomic::AtomicBool::new(false),
             unread_projection_pause: StdMutex::new(None),
+            chrome_repaint_pause: StdMutex::new(None),
             mailbox_publish_pause: StdMutex::new(None),
             boot_id: "b-test".into(),
             started: std::time::Instant::now(),

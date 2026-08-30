@@ -120,6 +120,116 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 /// client still lags out and is dropped by the server.
 const EVENT_BUFFER: usize = 8192;
 
+/// Commit one pane observation before projecting its optional tmux chrome.
+///
+/// The cache commit already happened in fusion. Durable messaging must follow
+/// it before the first presentation await so a stalled or cancelled border
+/// write cannot consume an immutable observation without recording it.
+async fn apply_pane_observation(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    watcher: &SessionWatcher,
+    pane_id: &str,
+    observed: fusion::PaneObservation,
+) -> Detection {
+    let (detection, messaging_observation, repaint, recompute_guard) = observed.into_parts();
+    if let Some(observation) = messaging_observation {
+        apply_messaging_observation(inner, observation);
+    }
+    if repaint {
+        repaint_chrome(inner, session_idx, watcher, pane_id).await;
+    }
+    // The same pane cannot commit or paint a newer observation until this
+    // complete durable-then-presentation sequence has finished.
+    drop(recompute_guard);
+    detection
+}
+
+/// Composition-root handoff from immutable pane evidence to durable messaging.
+pub(crate) fn apply_messaging_observation(
+    inner: &Arc<Inner>,
+    observation: fusion::PaneMessagingObservation,
+) {
+    let Some(messaging) = inner.workspace_messaging() else {
+        return;
+    };
+    match messaging.apply_observation(observation) {
+        Ok(application) => {
+            for notice in application.notices {
+                delivery::admin_notify(
+                    inner,
+                    notice.level,
+                    &notice.subject,
+                    &notice.body,
+                    Some(notice.message_id.as_str()),
+                    Some(notice.session_idx),
+                    delivery::About::delivery(&notice.recipient_label),
+                );
+            }
+        }
+        Err(error) => {
+            error!(%error, "cannot apply pane observation to workspace messaging");
+        }
+    }
+}
+
+/// Observe one pane, apply its typed messaging consequence, and return the
+/// ordinary fused detection expected by existing callers.
+pub(crate) async fn observe_pane(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    watcher: &SessionWatcher,
+    pane_id: &str,
+    force_screen: bool,
+    cause: &str,
+) -> Option<Detection> {
+    let observed =
+        fusion::observe_pane(inner, session_idx, watcher, pane_id, force_screen, cause).await?;
+    Some(apply_pane_observation(inner, session_idx, watcher, pane_id, observed).await)
+}
+
+pub(crate) async fn observe_pane_for_route_evidence(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    watcher: &SessionWatcher,
+    pane_id: &str,
+    force_screen: bool,
+    cause: &str,
+    route_evidence: &NotificationRouteEvidenceId,
+) -> Option<Detection> {
+    let observed = fusion::observe_pane_for_route_evidence(
+        inner,
+        session_idx,
+        watcher,
+        pane_id,
+        force_screen,
+        cause,
+        route_evidence,
+    )
+    .await?;
+    Some(apply_pane_observation(inner, session_idx, watcher, pane_id, observed).await)
+}
+
+pub(crate) async fn observe_pane_from_output(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    watcher: &SessionWatcher,
+    pane_id: &str,
+    evidence_ms: u64,
+    route_evidence: &NotificationRouteEvidenceId,
+) -> Option<Detection> {
+    let observed = fusion::observe_pane_from_output(
+        inner,
+        session_idx,
+        watcher,
+        pane_id,
+        evidence_ms,
+        route_evidence,
+    )
+    .await?;
+    Some(apply_pane_observation(inner, session_idx, watcher, pane_id, observed).await)
+}
+
 /// Test seam: an async pause awaited inside the delivery injection path at
 /// a named phase ("pre_paste", "pre_submit"), installed via
 /// [`Daemon::set_inject_pause`]. Always None in production.
@@ -198,6 +308,7 @@ pub(crate) struct Inner {
     unread_projection_wake: Notify,
     unread_projection_stopping: AtomicBool,
     unread_projection_pause: StdMutex<Option<Arc<UnreadProjectionTestPause>>>,
+    chrome_repaint_pause: StdMutex<Option<Arc<ChromeRepaintTestPause>>>,
     #[cfg(test)]
     mailbox_publish_pause: StdMutex<Option<MailboxPublishPause>>,
     pub(crate) boot_id: String,
@@ -1481,6 +1592,28 @@ pub struct UnreadProjectionTestPause {
     release: Notify,
 }
 
+/// Test-only coordination at the post-observation presentation boundary.
+///
+/// It is always compiled because integration tests exercise the public daemon
+/// type as a dependency. Production never arms it.
+#[doc(hidden)]
+pub struct ChromeRepaintTestPause {
+    entered: Notify,
+    release: Notify,
+}
+
+impl ChromeRepaintTestPause {
+    #[doc(hidden)]
+    pub async fn wait_until_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    #[doc(hidden)]
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
 impl UnreadProjectionTestPause {
     #[doc(hidden)]
     pub async fn wait_until_derived(&self) {
@@ -1726,6 +1859,27 @@ impl Daemon {
         assert!(
             replaced.is_none(),
             "an unread projection pause is already armed"
+        );
+        pause
+    }
+
+    /// Pause the next state-change chrome repaint after durable observation
+    /// consequences have committed but before tmux receives the border write.
+    #[doc(hidden)]
+    pub fn pause_next_chrome_repaint_for_test(&self) -> Arc<ChromeRepaintTestPause> {
+        let pause = Arc::new(ChromeRepaintTestPause {
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let replaced = self
+            .inner
+            .chrome_repaint_pause
+            .lock()
+            .expect("chrome repaint pause lock")
+            .replace(Arc::clone(&pause));
+        assert!(
+            replaced.is_none(),
+            "a chrome repaint pause is already armed"
         );
         pause
     }
@@ -2552,7 +2706,7 @@ async fn adopt_pane(
     paint_chrome(inner, session_idx, pane_id).await;
     // 4. Re-read.
     let route_evidence = inner.advance_route_evidence(session_idx, pane_id);
-    fusion::recompute_pane_for_route_evidence(
+    observe_pane_for_route_evidence(
         inner,
         session_idx,
         watcher,
@@ -2662,7 +2816,7 @@ async fn unadopt_pane(
     // 5. Re-read.
     if let Some(w) = watcher {
         let route_evidence = inner.advance_route_evidence(session_idx, pane_id);
-        fusion::recompute_pane_for_route_evidence(
+        observe_pane_for_route_evidence(
             inner,
             session_idx,
             w,
@@ -2963,9 +3117,9 @@ pub(crate) async fn paint_chrome(inner: &Arc<Inner>, session_idx: usize, pane_id
 }
 
 /// Repaint the state half of an adopted pane's border. Called from the one
-/// place a fused state change is recorded
-/// (fusion::recompute_pane_with_evidence), so a border can never disagree
-/// with the row `cyclops list` prints.
+/// place a fused state change's durable consequences finish
+/// (`apply_pane_observation`), so a border can never disagree with the row
+/// `cyclops list` prints or outrun messaging truth.
 pub(crate) async fn repaint_chrome(
     inner: &Arc<Inner>,
     session_idx: usize,
@@ -2975,6 +3129,15 @@ pub(crate) async fn repaint_chrome(
     let Some(adoption) = inner.adoption_for_route(session_idx, pane_id) else {
         return;
     };
+    let pause = inner
+        .chrome_repaint_pause
+        .lock()
+        .expect("chrome repaint pause lock")
+        .take();
+    if let Some(pause) = pause {
+        pause.entered.notify_one();
+        pause.release.notified().await;
+    }
     let theme = inner.theme_now();
     let state = inner.cached_state(session_idx, pane_id);
     if let Err(e) = chrome::repaint(
@@ -3273,6 +3436,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         unread_projection_wake: Notify::new(),
         unread_projection_stopping: AtomicBool::new(false),
         unread_projection_pause: StdMutex::new(None),
+        chrome_repaint_pause: StdMutex::new(None),
         #[cfg(test)]
         mailbox_publish_pause: StdMutex::new(None),
         boot_id,
@@ -4334,7 +4498,7 @@ async fn run_session(
     reconcile_adoptions(inner, idx, watcher, &kept).await;
     for row in watcher.snapshot() {
         let route_evidence = inner.advance_route_evidence(idx, &row.pane_id);
-        fusion::recompute_pane_for_route_evidence(
+        observe_pane_for_route_evidence(
             inner,
             idx,
             watcher,
@@ -4391,7 +4555,7 @@ async fn run_session(
                     }
                     for row in watcher.snapshot() {
                         let route_evidence = inner.advance_route_evidence(idx, &row.pane_id);
-                        fusion::recompute_pane_for_route_evidence(
+                        observe_pane_for_route_evidence(
                             inner,
                             idx,
                             watcher,
@@ -4882,7 +5046,7 @@ async fn handle_pane_event(
                     .insert(row.pane_id.clone(), ObservedPane::capture(row.clone()));
             });
             let route_evidence = inner.advance_route_evidence(session_idx, &row.pane_id);
-            fusion::recompute_pane_for_route_evidence(
+            observe_pane_for_route_evidence(
                 inner,
                 session_idx,
                 watcher,
@@ -5086,7 +5250,7 @@ async fn handle_pane_event(
                 inner.route_evidence_id(session_idx, &id)
             };
             if route_changed {
-                fusion::recompute_pane_for_route_evidence(
+                observe_pane_for_route_evidence(
                     inner,
                     session_idx,
                     watcher,
@@ -5154,7 +5318,7 @@ async fn handle_pane_event(
             }
             for pane_id in outcome.changed_panes {
                 let route_evidence = inner.advance_route_evidence(session_idx, &pane_id);
-                fusion::recompute_pane_for_route_evidence(
+                observe_pane_for_route_evidence(
                     inner,
                     session_idx,
                     watcher,
@@ -5232,7 +5396,7 @@ async fn debounce_task(
             return;
         };
         let route_evidence = inner.advance_route_evidence(session_idx, &pane_id);
-        fusion::recompute_pane_from_output(
+        observe_pane_from_output(
             &inner,
             session_idx,
             &watcher,
@@ -5416,6 +5580,7 @@ mod tests {
             unread_projection_wake: Notify::new(),
             unread_projection_stopping: AtomicBool::new(false),
             unread_projection_pause: StdMutex::new(None),
+            chrome_repaint_pause: StdMutex::new(None),
             mailbox_publish_pause: StdMutex::new(None),
             boot_id: "b-test".into(),
             started: Instant::now(),

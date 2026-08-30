@@ -67,6 +67,14 @@ The append and sync inside `MailboxService` are still the acceptance boundary.
 Notification and pane chrome remain effects of that durable fact, never a
 condition for whether the message exists.
 
+Fresh pane observation and durable messaging also meet at this boundary for
+the first extracted consequence family. Fusion commits the pane cache and
+returns an immutable quota-reset observation containing the exact recipient,
+pane, and session slot. `WorkspaceMessaging` turns that observation into
+`QuotaResetObserved` journal facts and decides the explicit administrator
+notice that the daemon composition root commits. The observer does not append
+those facts, and reset observation never requeues or writes to the terminal.
+
 ## Watching: how the daemon knows what a pane is doing
 
 ```mermaid
@@ -81,8 +89,12 @@ flowchart TD
     RC -->|"list-panes: the authoritative answer"| P["pane table, keyed by pane_id"]
     RW --> P
     P -->|"a row moved, a hook edge arrived,<br/>or a caller asked"| F["fusion"]
-    F -->|"the verdict moved"| O(["state event · ledger line · border repaint"])
+    F -->|"the verdict moved"| S(["state event · ledger line"])
     F -->|"a caller asked"| Q(["status · pane.read · agent.wait · the gate"])
+    F -->|"verdict + optional immutable evidence"| A["apply_pane_observation"]
+    A -->|"first: positive quota-reset evidence"| E["WorkspaceMessaging:<br/>durable reset fact + notice decision"]
+    E --> N["composition root:<br/>durable explicit notice"]
+    A -->|"then, after the durable handoff:<br/>the verdict moved"| O(["border repaint"])
 ```
 
 Notifications are hints, not truth. Truth comes from `list-panes`, and the
@@ -92,7 +104,7 @@ core). `src/cyclops-tmux/src/watcher.rs` owns this loop.
 
 ### Fusion: which sensor decides
 
-`src/cyclopsd/src/fusion.rs`, `recompute_pane`. Manifest rules are sorted by
+`src/cyclopsd/src/fusion.rs`, `observe_pane`. Manifest rules are sorted by
 priority once at load; every tier below picks the first rule that matches,
 and the fused verdict is whichever tier's winner sits earlier in that one
 order.
@@ -449,7 +461,7 @@ two:
 | Edge | Fired by |
 |---|---|
 | adoption | `adopt_pane` |
-| a fused state change | `fusion::recompute_pane_with_evidence` |
+| a fused state change | `apply_pane_observation` |
 | a clear | `unadopt_pane` |
 | a session attach | `reconcile_adoptions` |
 | a window move | `move_chrome` |

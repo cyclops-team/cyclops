@@ -771,7 +771,7 @@ pub(crate) async fn handle_report(
     let live = watcher.is_some();
     if let Some(w) = watcher {
         let route_evidence = inner.advance_route_evidence(session_idx, &pane_id);
-        fusion::recompute_pane_for_route_evidence(
+        crate::observe_pane_for_route_evidence(
             inner,
             session_idx,
             &w,

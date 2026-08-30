@@ -8,7 +8,8 @@ use cyclops_proto::{
     DeliveryReceipt, DeliveryState, MessageId, MessageWakeBlock, MsgSendParams, MsgSendResult,
     NotificationAttemptId, NotificationBinding, NotificationManifestId, NotificationPreWriteCause,
     NotificationPreWriteObservation, NotificationRouteEvidenceId, NotificationState,
-    NotificationWithdrawDisposition, NotificationWithdrawResult, ProcessInstanceId, RecipientKey,
+    NotificationWithdrawDisposition, NotificationWithdrawResult, NotifyLevel, ProcessInstanceId,
+    RecipientKey,
 };
 use cyclops_tmux::{PaneRow, SessionWatcher};
 use tokio::time::Instant;
@@ -98,6 +99,24 @@ fn receipt_with_schedule_truth(
 struct AcceptanceSchedule {
     outcomes: HashMap<RecipientKey, RecipientScheduleOutcome>,
     unavailable: HashSet<RecipientKey>,
+}
+
+/// One explicit post-commit effect requested by an observation application.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MessagingAdminNotice {
+    pub(crate) level: NotifyLevel,
+    pub(crate) subject: String,
+    pub(crate) body: String,
+    pub(crate) message_id: MessageId,
+    pub(crate) session_idx: usize,
+    pub(crate) recipient_label: String,
+}
+
+/// Durable transitions and requested effects produced by one observation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ObservationApplication {
+    durable_messages: Vec<MessageId>,
+    pub(crate) notices: Vec<MessagingAdminNotice>,
 }
 
 /// Narrow post-commit capabilities needed by durable message acceptance.
@@ -309,6 +328,47 @@ impl WorkspaceMessaging {
             .reply_with_summary(sender, reference, summary, body, client_key)?;
         self.finish_acceptance(accepted, false).await
     }
+
+    /// Apply one committed pane observation to durable messaging truth.
+    ///
+    /// This operation never captures a pane, resolves a live route, schedules
+    /// a delivery, or requeues a quota hold. It commits only the transitions
+    /// justified by the supplied evidence and decides which explicit
+    /// post-commit notices the daemon composition root must commit.
+    pub(crate) fn apply_observation(
+        &self,
+        observation: crate::fusion::PaneMessagingObservation,
+    ) -> Result<ObservationApplication, MailboxServiceError> {
+        let crate::fusion::PaneMessagingObservation::QuotaResetObserved {
+            recipient,
+            session_idx,
+            pane_id,
+        } = observation;
+        let observed = self.service.observe_quota_reset(recipient)?;
+        if observed.is_empty() {
+            return Ok(ObservationApplication::default());
+        }
+        let label =
+            quota_reset_recipient_label(self.service.identity_for_recipient(recipient), pane_id);
+        let notices: Vec<_> = observed
+            .iter()
+            .map(|record| MessagingAdminNotice {
+                level: NotifyLevel::ActionRequired,
+                subject: format!("quota reset observed for {label}"),
+                body: quota_reset_notice(&record.message_id),
+                message_id: record.message_id.clone(),
+                session_idx,
+                recipient_label: label.clone(),
+            })
+            .collect();
+        Ok(ObservationApplication {
+            durable_messages: observed
+                .into_iter()
+                .map(|record| record.message_id)
+                .collect(),
+            notices,
+        })
+    }
 }
 
 impl Inner {
@@ -320,6 +380,27 @@ impl Inner {
                 Arc::new(DaemonMessagingEffects::new(self)),
             ))
         })))
+    }
+}
+
+fn quota_reset_notice(message_id: &MessageId) -> String {
+    format!("message {message_id} remains held; run `cyclops requeue {message_id}`")
+}
+
+/// Preserve the post-commit recovery cue even when current identity metadata
+/// is absent or temporarily unreadable. The immutable observation's pane ID is
+/// less friendly than a current label, but it still names the held recipient.
+fn quota_reset_recipient_label(
+    identity: Result<Option<MailboxIdentity>, MailboxServiceError>,
+    pane_id: String,
+) -> String {
+    match identity {
+        Ok(Some(identity)) => identity.label,
+        Ok(None) => pane_id,
+        Err(error) => {
+            error!(%error, %pane_id, "cannot resolve quota-reset recipient label");
+            pane_id
+        }
     }
 }
 
@@ -904,7 +985,7 @@ async fn reconcile_due_unclaimed_reminder_barrier(
     let Ok(Some(route)) = notification_route(inner, service, recipient) else {
         return;
     };
-    crate::fusion::recompute_pane(
+    crate::observe_pane(
         inner,
         route.session_idx,
         &route.watcher,
@@ -1288,7 +1369,7 @@ fn schedule_claimed_composer_observation(
     let pane_id = route.pane_id.clone();
     let watcher = Arc::clone(&route.watcher);
     inner.engine.spawn_descendant_task(async move {
-        crate::fusion::recompute_pane(
+        crate::observe_pane(
             &task_inner,
             session_idx,
             &watcher,
@@ -1342,7 +1423,7 @@ fn schedule_claimed_notification_recovery(
     }
     let task_inner = Arc::clone(inner);
     inner.engine.spawn_descendant_task(async move {
-        crate::fusion::recompute_pane(
+        crate::observe_pane(
             &task_inner,
             session_idx,
             &watcher,
@@ -1405,6 +1486,8 @@ pub(crate) fn withdraw_notification(
 
 #[cfg(test)]
 mod tests {
+    use crate::fusion::PaneMessagingObservation;
+
     use super::*;
     use std::fs;
     use std::io::Write;
@@ -1667,6 +1750,87 @@ mod tests {
         let metadata: cyclops_proto::MessageMetadata =
             serde_json::from_value(line.data.unwrap()).unwrap();
         assert_eq!(metadata.recipients, vec![reviewer]);
+    }
+
+    // Obsolete if fusion again commits quota-reset messaging state itself, or
+    // if reset observation begins to requeue held work without operator action.
+    #[test]
+    fn workspace_messaging_owns_the_quota_reset_transition_and_notice_without_inner() {
+        let (scratch, service, events, reviewer, _) =
+            mailbox_service("workspace-messaging-quota-reset", 8);
+        let effects = Arc::new(RecordingAcceptanceEffects::new(events));
+        let messaging = WorkspaceMessaging::new(Arc::clone(&service), effects.clone());
+        let (accepted, context, _) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        context.record_quota_held().unwrap();
+
+        let journal_path = scratch
+            .0
+            .join("workspaces")
+            .join("current")
+            .join("messages.ndjson");
+        let before_lines = fs::read_to_string(&journal_path).unwrap().lines().count();
+        let application = messaging
+            .apply_observation(PaneMessagingObservation::quota_reset(reviewer, 2, "%7"))
+            .unwrap();
+
+        assert_eq!(
+            application.durable_messages,
+            vec![accepted.message_id.clone()]
+        );
+        assert_eq!(application.notices.len(), 1);
+        assert_eq!(
+            application.notices[0],
+            MessagingAdminNotice {
+                level: NotifyLevel::ActionRequired,
+                subject: "quota reset observed for reviewer".to_string(),
+                body: quota_reset_notice(&accepted.message_id),
+                message_id: accepted.message_id.clone(),
+                session_idx: 2,
+                recipient_label: "reviewer".to_string(),
+            }
+        );
+        assert!(effects.calls().is_empty());
+        assert_eq!(
+            fs::read_to_string(&journal_path).unwrap().lines().count(),
+            before_lines + 1,
+            "one observation appends one durable transition"
+        );
+        let disposition = service
+            .message_dispositions(&accepted.message_id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            disposition.notification_state_raw,
+            Some(NotificationState::QuotaResetObserved)
+        );
+        assert!(
+            service
+                .prepare_oldest_notification(reviewer)
+                .unwrap()
+                .is_none(),
+            "observation never requeues the held attempt"
+        );
+
+        let after_first = fs::read_to_string(&journal_path).unwrap().lines().count();
+        let calls_after_first = effects.calls();
+        let repeated = messaging
+            .apply_observation(PaneMessagingObservation::quota_reset(reviewer, 2, "%7"))
+            .unwrap();
+        assert_eq!(repeated, ObservationApplication::default());
+        assert_eq!(
+            fs::read_to_string(&journal_path).unwrap().lines().count(),
+            after_first
+        );
+        assert_eq!(effects.calls(), calls_after_first);
+    }
+
+    #[test]
+    fn a_directory_read_failure_cannot_suppress_the_quota_reset_recovery_cue() {
+        assert_eq!(
+            quota_reset_recipient_label(Err(MailboxServiceError::Poisoned), "%7".to_string()),
+            "%7"
+        );
     }
 
     fn queued_attempt(
