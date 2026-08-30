@@ -6313,9 +6313,8 @@ async fn gate(
                                                     ),
                                                 };
                                             };
-                                            observation.write_block = Some(
-                                                "no_write_safe_composer_evidence".to_string(),
-                                            );
+                                            observation.write_block =
+                                                Some("no_write_safe_composer_evidence".to_string());
                                             return GateOutcome::BlockedPreWrite {
                                                 cause:
                                                     NotificationPreWriteCause::ComposerSemanticAmbiguous,

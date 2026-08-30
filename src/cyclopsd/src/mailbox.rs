@@ -10210,14 +10210,16 @@ mod tests {
         // The same generation cannot reopen, however ready it claims to be:
         // this is the evidence the block was recorded against.
         let lines_before = service.journal_lines().unwrap().len();
-        assert!(service
-            .reopen_oldest_notification_after_route_evidence(
-                bob,
-                blocked_observation.clone(),
-                true,
-            )
-            .unwrap()
-            .is_none());
+        assert!(
+            service
+                .reopen_oldest_notification_after_route_evidence(
+                    bob,
+                    blocked_observation.clone(),
+                    true,
+                )
+                .unwrap()
+                .is_none()
+        );
         // Later evidence that is still not write-ready is still ambiguity.
         let later_observation = NotificationPreWriteObservation {
             route_evidence: evidence(8),
