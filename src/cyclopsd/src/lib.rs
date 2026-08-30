@@ -479,15 +479,15 @@ impl messaging::WorkspaceMessagingEffects for DaemonWorkspaceMessagingEffects {
         }
     }
 
-    fn notification_pane(
+    fn notification_route(
         &self,
         service: &mailbox::MailboxService,
         recipient: RecipientKey,
-    ) -> Result<Option<String>, mailbox::MailboxServiceError> {
+    ) -> Result<Option<messaging::NotificationRoute>, mailbox::MailboxServiceError> {
         let Some(inner) = self.inner.upgrade() else {
             return Ok(None);
         };
-        Ok(messaging::notification_route(&inner, service, recipient)?.map(|route| route.pane_id))
+        messaging::notification_route(&inner, service, recipient)
     }
 
     fn settle_notification_claim(&self, attempt_id: NotificationAttemptId) {

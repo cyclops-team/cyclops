@@ -14,7 +14,7 @@ preserved behavior, stop conditions, and rollback requirements.
 ## Current milestone
 
 The next focused completion pass runs on
-**beta/refactor/workspace-messaging-terminal-support**. The first Milestone 3
+**beta/refactor/workspace-messaging-status-composer**. The first Milestone 3
 family proved the internal seam. The read-and-claim pass then moved inbox listing,
 claiming, message snapshots, and durable follow pages behind
 `WorkspaceMessaging`; the Module owns retained claim-locator interpretation,
@@ -47,9 +47,12 @@ attention-runtime pass then moved exact-owned candidate selection, automatic
 policy, evidence coalescing, worker election, conflict parking, and re-election
 behind the Module. The composition adapter hosts elected tasks, and the terminal
 mechanism performs one requested exact action without scanning messaging
-projections or spawning workers. The next pass replaces its remaining mailbox
-service handoff with named terminal-support capabilities for expected payload,
-consumption registration, and route proof.
+projections or spawning workers. The terminal-support pass then moved expected
+payload reconstruction, current route lookup, runtime target selection,
+consumption registration, and deterministic registration cleanup behind named
+Module operations; the terminal mechanism no longer receives `MailboxService`.
+The next pass moves the remaining body-free composer-candidate projection and
+next-action policy out of daemon status composition.
 Additional narrowly named completion branches remain allowed when one pull
 request would become broad. The corresponding observation completion pass
 follows before Milestone 6. Milestone 5 put retained direct-delivery entry
