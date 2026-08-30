@@ -40,7 +40,7 @@
 //!
 //! What it does not own: anything that ships. `publish = false`, no
 //! dependencies, and nothing in the product links it. It also does not own
-//! the shell half of the same rule, which bash cannot call: that is
+//! the shell half of the same rule: external cleanup sources
 //! `tests/e2e/lib/lib.sh`, held to this contract by
 //! `tests/testrig/tests/shell_teardown.rs`. And
 //! it owns no fixture, session shape or wait helper beyond the server
@@ -55,6 +55,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const CLEANUP_OWNER_SCRIPT: &str = r#"
+. "$1"
 journal=
 while IFS= read -r record; do
   case "$record" in
@@ -68,18 +69,11 @@ printf '%s\n' "$journal" |
   awk 'length($0) > 1 { state[substr($0, 2)] = substr($0, 1, 1) }
        END { for (socket in state) if (state[socket] == "+") print socket }' |
   while IFS= read -r socket; do
-    path="$(tmux -u -L "$socket" -f /dev/null display-message -p '#{socket_path}' 2>/dev/null || true)"
-    if [ -z "$path" ]; then
-      tmux -u -L "$socket" -f /dev/null \
-        new-session -d -s teardown-probe /bin/sh >/dev/null 2>&1 || true
-      path="$(tmux -u -L "$socket" -f /dev/null display-message -p '#{socket_path}' 2>/dev/null || true)"
-    fi
-    tmux -u -L "$socket" -f /dev/null kill-server >/dev/null 2>&1 || true
-    if [ -n "$path" ]; then
-      rm -f -- "$path"
-    fi
+    cyc_tmux_teardown "$socket"
   done
 "#;
+
+const SHELL_HELPERS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../e2e/lib/lib.sh");
 
 static NEXT_SOCKET: AtomicU64 = AtomicU64::new(1);
 static CLEANUP_OWNER: OnceLock<Mutex<CleanupOwner>> = OnceLock::new();
@@ -92,7 +86,7 @@ struct CleanupOwner {
 impl CleanupOwner {
     fn spawn() -> Self {
         let mut process = Command::new("/bin/sh")
-            .args(["-c", CLEANUP_OWNER_SCRIPT])
+            .args(["-c", CLEANUP_OWNER_SCRIPT, "cyclops-cleanup", SHELL_HELPERS])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

@@ -74,7 +74,8 @@ The relocated-root step no longer repeats the complete Rust suite. It now runs
 1. `scratch_override` proves `CYCLOPS_TEST_TMP` selects the root and that empty
    values retain the platform default.
 2. `scratch_path_lint` is explicitly syntactic. It rejects direct platform-temp
-   calls in any Rust fixture that owns a real `cyclops-testrig` server.
+   calls and hardcoded `/tmp` or `/private/tmp` literals in any Rust fixture that
+   owns a real `cyclops-testrig` server.
 3. `m0_shadow_daemon_end_to_end` runs one real tmux server, in-process daemon,
    Unix socket, and scratch home under the relocated root.
 

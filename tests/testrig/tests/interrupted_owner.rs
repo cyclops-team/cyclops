@@ -2,7 +2,7 @@
 //!
 //! `Drop` already proves normal return and panic unwind. This executable kills
 //! an exact child test process, then observes that the child's server, socket,
-//! shell, and session are gone while a neighboring server remains live.
+//! and session are gone while a neighboring server remains live.
 //!
 //! This test becomes obsolete if the test runner itself owns exact external
 //! resources and proves their cleanup after forced termination.
