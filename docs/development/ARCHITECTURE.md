@@ -82,8 +82,11 @@ consumption, final settlement, and pre-key withdrawal cross back through
 Module also selects exact-owned reconciliation candidates, owns boot-local
 worker election and conflict parking, and returns one exact action at a time.
 The composition adapter hosts task execution, while the terminal mechanism no
-longer scans messaging projections or coordinates reconciliation workers. The
-socket adapter never receives the mailbox record or decides who may inspect it.
+longer scans messaging projections or coordinates reconciliation workers.
+Expected payload reconstruction, current route lookup, exact consumption
+registration, and deterministic registration cleanup are named Module
+operations; terminal code never receives `MailboxService`. The socket adapter
+never receives the mailbox record or decides who may inspect it.
 Daemon status receives one body-free `WorkspaceMessaging` projection containing
 mailbox routes, unread counts, held attention, and the bounded blocked-wake
 sample. Status composition keeps the legacy session-ledger fold separate, but

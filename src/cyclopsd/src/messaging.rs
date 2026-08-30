@@ -21,9 +21,9 @@ use tracing::{debug, error};
 
 use crate::delivery;
 use crate::mailbox::{
-    AcceptResult, AttentionResolutionStart, AttentionTarget, ClaimOutcome, MailboxError,
-    MailboxIdentity, MailboxSend, MailboxService, MailboxServiceError, MessageStoreError,
-    UnclaimedReminderQueue,
+    AcceptResult, AttentionConsumptionSignal, AttentionResolutionStart, AttentionTarget,
+    ClaimOutcome, MailboxError, MailboxIdentity, MailboxSend, MailboxService, MailboxServiceError,
+    MessageStoreError, UnclaimedReminderQueue,
 };
 use crate::notification_adapter::NotificationContext;
 use crate::{Inner, PaneKey};
@@ -142,6 +142,29 @@ pub(crate) enum ExactAttentionWork {
     },
 }
 
+/// Boot-local consumption observation registered through WorkspaceMessaging.
+///
+/// Dropping the handle deterministically removes the candidate without
+/// exposing the mailbox service to the terminal mechanism.
+pub(crate) struct AttentionConsumptionRegistration {
+    service: Arc<MailboxService>,
+    attempt_id: NotificationAttemptId,
+    signal: Arc<AttentionConsumptionSignal>,
+}
+
+impl AttentionConsumptionRegistration {
+    pub(crate) fn signal(&self) -> Arc<AttentionConsumptionSignal> {
+        Arc::clone(&self.signal)
+    }
+}
+
+impl Drop for AttentionConsumptionRegistration {
+    fn drop(&mut self) {
+        self.service
+            .unregister_attention_consumption_candidate(self.attempt_id);
+    }
+}
+
 impl MessagingRouteEvidence {
     pub(crate) fn new(
         session_idx: usize,
@@ -223,11 +246,11 @@ pub(crate) trait WorkspaceMessagingEffects: Send + Sync {
 
     fn invalidate_unread(&self, recipient: RecipientKey);
 
-    fn notification_pane(
+    fn notification_route(
         &self,
         service: &MailboxService,
         recipient: RecipientKey,
-    ) -> Result<Option<String>, MailboxServiceError>;
+    ) -> Result<Option<NotificationRoute>, MailboxServiceError>;
 
     fn settle_notification_claim(&self, attempt_id: NotificationAttemptId);
 
@@ -791,10 +814,57 @@ impl WorkspaceMessaging {
         self.attention_target(raw)
     }
 
-    /// Narrow handoff to the terminal-resolution mechanism. Ordinary callers
-    /// never receive this service or an `AttentionTarget`.
-    pub(crate) fn attention_service(&self) -> Arc<MailboxService> {
-        Arc::clone(&self.service)
+    /// Select one exact attempt for a Module-elected runtime action.
+    pub(crate) fn attention_for_runtime(
+        &self,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<AttentionTarget, MessagingAttentionError> {
+        self.attention_target(&attempt_id.to_string())
+    }
+
+    /// Resolve the current terminal route through the composition adapter.
+    pub(crate) fn attention_terminal_route(
+        &self,
+        recipient: RecipientKey,
+    ) -> Result<Option<NotificationRoute>, MailboxServiceError> {
+        self.effects.notification_route(&self.service, recipient)
+    }
+
+    /// Rebuild the exact body-free terminal payload from the current durable
+    /// message and attempt without exposing message lookup to terminal code.
+    pub(crate) fn expected_attention_notification(
+        &self,
+        target: &AttentionTarget,
+    ) -> Option<String> {
+        let message = self.service.message_line(&target.record.message_id).ok()?;
+        delivery::expected_notification_payload(&target.record, &message)
+    }
+
+    /// Register one exact post-dispatch consumption candidate. The returned
+    /// handle owns deterministic cleanup.
+    pub(crate) fn register_attention_consumption(
+        &self,
+        target: &AttentionTarget,
+        session_idx: usize,
+        pane_id: String,
+        expected_payload: String,
+        dispatch_started_ms: u64,
+    ) -> Result<Option<AttentionConsumptionRegistration>, MailboxServiceError> {
+        self.service
+            .register_attention_consumption_candidate(
+                target,
+                session_idx,
+                pane_id,
+                expected_payload,
+                dispatch_started_ms,
+            )
+            .map(|signal| {
+                signal.map(|signal| AttentionConsumptionRegistration {
+                    service: Arc::clone(&self.service),
+                    attempt_id: target.record.attempt_id,
+                    signal,
+                })
+            })
     }
 
     /// Reserve one exact attention attempt and classify its durable recovery
@@ -981,7 +1051,8 @@ impl WorkspaceMessaging {
                     let recipient = disposition.recipient;
                     let pane = self
                         .effects
-                        .notification_pane(&self.service, disposition.recipient)?;
+                        .notification_route(&self.service, disposition.recipient)?
+                        .map(|route| route.pane_id);
                     Ok(receipt_with_schedule_truth(
                         disposition,
                         pane,
@@ -1762,9 +1833,6 @@ pub(crate) fn schedule_force_submit(inner: &Arc<Inner>, record: cyclops_proto::N
     if !record.needs_exact_owned_reconciliation() || !inner.force_submit.get().0 {
         return;
     }
-    let Some(service) = inner.mailbox.as_ref().map(Arc::clone) else {
-        return;
-    };
     let Some(messaging) = inner.workspace_messaging() else {
         return;
     };
@@ -1789,17 +1857,12 @@ pub(crate) fn schedule_force_submit(inner: &Arc<Inner>, record: cyclops_proto::N
             .map(|pane_id| pane_id.to_string())
             .unwrap_or_default();
         let result = loop {
-            let target = match service.attention_target(&record.attempt_id.to_string()) {
+            let target = match messaging.attention_for_runtime(record.attempt_id) {
                 Ok(target) => target,
                 Err(_) => return,
             };
-            match crate::attention_resolution::force_complete(
-                &task_inner,
-                &messaging,
-                &service,
-                &target,
-            )
-            .await
+            match crate::attention_resolution::force_complete(&task_inner, &messaging, &target)
+                .await
             {
                 Err(crate::attention_resolution::AttentionActionError::Store(error))
                     if error.notification_resolution_in_progress() =>
@@ -2319,11 +2382,11 @@ mod tests {
                 .push(RecordedEffect::InvalidateUnread(recipient));
         }
 
-        fn notification_pane(
+        fn notification_route(
             &self,
             _service: &MailboxService,
             recipient: RecipientKey,
-        ) -> Result<Option<String>, MailboxServiceError> {
+        ) -> Result<Option<NotificationRoute>, MailboxServiceError> {
             self.calls
                 .lock()
                 .expect("acceptance calls lock")
@@ -2725,7 +2788,7 @@ mod tests {
     /// requested action. It cannot select projection candidates, manipulate
     /// election locks, or spawn messaging workers.
     #[test]
-    fn attention_terminal_mechanism_cannot_recover_worker_topology() {
+    fn attention_terminal_mechanism_cannot_recover_messaging_internals() {
         let compact: String = include_str!("attention_resolution.rs")
             .chars()
             .filter(|character| !character.is_ascii_whitespace())
@@ -2738,6 +2801,12 @@ mod tests {
             "park_exact_reconciliation_after_conflict(",
             "resume_exact_reconciliation(",
             "spawn_descendant_task(",
+            "Arc<MailboxService>",
+            "&MailboxService",
+            "service.",
+            "messaging::notification_route(",
+            "register_attention_consumption_candidate(",
+            "message_line(",
         ] {
             assert!(
                 !compact.contains(forbidden),
@@ -2916,6 +2985,44 @@ mod tests {
         messaging
             .cancel_attention_resolution(attention.attempt_id)
             .unwrap();
+    }
+
+    // Obsolete if terminal code again reads message rows or owns boot-local
+    // consumption-candidate cleanup through MailboxService.
+    #[test]
+    fn workspace_messaging_owns_attention_payload_and_consumption_registration() {
+        let (_scratch, service, events, _reviewer, _) =
+            mailbox_service("workspace-messaging-attention-support", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging =
+            WorkspaceMessaging::new(Arc::clone(&service), Arc::new(StdMutex::new(())), effects);
+        let (_accepted, context, _) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        record_doorbell_write(&context);
+        let attention = context
+            .record_verify_attention(NotificationVerifyOutcome::ambiguous())
+            .unwrap();
+        let target = messaging
+            .attention_for_runtime(attention.attempt_id)
+            .unwrap();
+        let expected = messaging
+            .expected_attention_notification(&target)
+            .expect("current message rebuilds its exact doorbell");
+        let pane_id = target.record.recipient.pane_id().unwrap().to_string();
+
+        let registration = messaging
+            .register_attention_consumption(&target, 0, pane_id.clone(), expected.clone(), 0)
+            .unwrap()
+            .expect("exact-attempt doorbells register consumption");
+        assert!(messaging
+            .register_attention_consumption(&target, 0, pane_id.clone(), expected.clone(), 0)
+            .is_err());
+        drop(registration);
+        let replacement = messaging
+            .register_attention_consumption(&target, 0, pane_id, expected, 0)
+            .unwrap()
+            .expect("dropping the Module handle releases the exact candidate");
+        drop(replacement);
     }
 
     /// Syntactic architecture lint: terminal code may prove and execute one
