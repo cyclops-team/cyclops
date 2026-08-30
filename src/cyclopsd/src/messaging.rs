@@ -10,6 +10,7 @@ use cyclops_proto::{
     MessageWakeBlock, MessagesFollowResult, MessagesSnapshotResult, MsgSendParams, MsgSendResult,
     NotificationAttemptId, NotificationAttentionCause, NotificationBinding, NotificationManifestId,
     NotificationPreWriteCause, NotificationPreWriteObservation, NotificationRecord,
+    NotificationResolution, NotificationResolutionConsumptionObservation,
     NotificationRouteEvidenceId, NotificationState, NotificationWithdrawDisposition,
     NotificationWithdrawResult, NotifyLevel, OpenDelivery, ProcessInstanceId, RecipientKey,
     StatusBlockedNotification, StatusMailboxRoute,
@@ -20,8 +21,9 @@ use tracing::{debug, error};
 
 use crate::delivery;
 use crate::mailbox::{
-    AcceptResult, AttentionTarget, ClaimOutcome, MailboxError, MailboxIdentity, MailboxSend,
-    MailboxService, MailboxServiceError, MessageStoreError, UnclaimedReminderQueue,
+    AcceptResult, AttentionResolutionStart, AttentionTarget, ClaimOutcome, MailboxError,
+    MailboxIdentity, MailboxSend, MailboxService, MailboxServiceError, MessageStoreError,
+    UnclaimedReminderQueue,
 };
 use crate::notification_adapter::NotificationContext;
 use crate::{Inner, PaneKey};
@@ -692,6 +694,127 @@ impl WorkspaceMessaging {
     /// never receive this service or an `AttentionTarget`.
     pub(crate) fn attention_service(&self) -> Arc<MailboxService> {
         Arc::clone(&self.service)
+    }
+
+    /// Reserve one exact attention attempt and classify its durable recovery
+    /// state before any terminal action.
+    pub(crate) fn begin_attention_resolution(
+        &self,
+        target: &AttentionTarget,
+        resolution: NotificationResolution,
+    ) -> Result<AttentionResolutionStart, MailboxServiceError> {
+        self.service.begin_attention_resolution(target, resolution)
+    }
+
+    pub(crate) fn cancel_attention_resolution(
+        &self,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<(), MailboxServiceError> {
+        self.service.cancel_attention_resolution(attempt_id)
+    }
+
+    pub(crate) fn force_submit_target_is_pending(
+        &self,
+        target: &AttentionTarget,
+    ) -> Result<bool, MailboxServiceError> {
+        self.service.force_submit_target_is_pending(target)
+    }
+
+    /// Commit the explicit operator or automatic resolution intent selected by
+    /// the durable messaging projection.
+    pub(crate) fn record_attention_resolution_intent(
+        &self,
+        target: &AttentionTarget,
+        requested: NotificationResolution,
+        automatic: bool,
+    ) -> Result<NotificationResolution, MailboxServiceError> {
+        if automatic {
+            self.service
+                .record_automatic_attention_resolution_intent(target)
+        } else {
+            self.service
+                .record_attention_resolution_intent(target, requested)?;
+            Ok(requested)
+        }
+    }
+
+    pub(crate) fn record_forced_attention_resolution_intent(
+        &self,
+        target: &AttentionTarget,
+    ) -> Result<(), MailboxServiceError> {
+        self.service
+            .record_forced_attention_resolution_intent(target)
+    }
+
+    pub(crate) fn record_attention_resolution_action_accepted(
+        &self,
+        target: &AttentionTarget,
+        resolution: NotificationResolution,
+    ) -> Result<(), MailboxServiceError> {
+        self.service
+            .record_attention_resolution_action_accepted(target, resolution)
+    }
+
+    pub(crate) fn attention_claim_consumption(
+        &self,
+        target: &AttentionTarget,
+    ) -> Result<Option<NotificationResolutionConsumptionObservation>, MailboxServiceError> {
+        self.service.attention_claim_consumption(target)
+    }
+
+    pub(crate) fn record_attention_resolution_consumption_observed(
+        &self,
+        target: &AttentionTarget,
+        observation: NotificationResolutionConsumptionObservation,
+    ) -> Result<(), MailboxServiceError> {
+        self.service
+            .record_attention_resolution_consumption_observed(target, observation)
+    }
+
+    pub(crate) fn commit_attention_resolution(
+        &self,
+        target: &AttentionTarget,
+        resolution: NotificationResolution,
+    ) -> Result<(), MailboxServiceError> {
+        self.service.resolve_attention(target, resolution)
+    }
+
+    pub(crate) fn commit_attention_without_terminal_action(
+        &self,
+        target: &AttentionTarget,
+    ) -> Result<(), MailboxServiceError> {
+        self.service
+            .resolve_attention_without_terminal_action(target)
+    }
+
+    /// Commit one proven pre-key refusal without conflating an append failure
+    /// with the boot-local reservation release that follows it.
+    pub(crate) fn withdraw_attention_resolution_intent(
+        &self,
+        target: &AttentionTarget,
+        resolution: NotificationResolution,
+    ) -> Result<(), MailboxServiceError> {
+        self.service
+            .withdraw_attention_resolution_intent(target, resolution)
+    }
+
+    /// Release a durably withdrawn pre-key intent and continue its recipient
+    /// FIFO. A scheduling failure does not make the durable withdrawal
+    /// uncertain.
+    pub(crate) fn finish_attention_intent_withdrawal(
+        &self,
+        target: &AttentionTarget,
+    ) -> Result<(), MailboxServiceError> {
+        self.service
+            .cancel_attention_resolution(target.record.attempt_id)?;
+        if let Err(error) = self.notification_head_changed(target.record.recipient) {
+            error!(
+                recipient = %target.record.recipient,
+                %error,
+                "cannot schedule mailbox notification after attention intent withdrawal"
+            );
+        }
+        Ok(())
     }
 
     fn require_admin(&self, caller: RecipientKey) -> Result<(), MessagingAttentionError> {
@@ -1539,6 +1662,9 @@ pub(crate) fn schedule_force_submit(inner: &Arc<Inner>, record: cyclops_proto::N
     let Some(service) = inner.mailbox.as_ref().map(Arc::clone) else {
         return;
     };
+    let Some(messaging) = inner.workspace_messaging() else {
+        return;
+    };
     let task_inner = Arc::clone(inner);
     inner.engine.spawn_descendant_task(async move {
         loop {
@@ -1564,7 +1690,13 @@ pub(crate) fn schedule_force_submit(inner: &Arc<Inner>, record: cyclops_proto::N
                 Ok(target) => target,
                 Err(_) => return,
             };
-            match crate::attention_resolution::force_complete(&task_inner, &service, &target).await
+            match crate::attention_resolution::force_complete(
+                &task_inner,
+                &messaging,
+                &service,
+                &target,
+            )
+            .await
             {
                 Err(crate::attention_resolution::AttentionActionError::Store(error))
                     if error.notification_resolution_in_progress() =>
@@ -2575,6 +2707,102 @@ mod tests {
         assert_eq!(cleared.summaries[0].id, preview.entries[0].id);
         assert_eq!(cleared.summaries[0].cause, preview.entries[0].cause);
         assert!(effects.calls().is_empty());
+    }
+
+    // Obsolete if the terminal mechanism again appends or withdraws durable
+    // resolution intent directly instead of asking WorkspaceMessaging.
+    #[test]
+    fn workspace_messaging_owns_attention_intent_and_pre_key_withdrawal() {
+        let (scratch, service, events, reviewer, _) =
+            mailbox_service("workspace-messaging-attention-commit", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            effects.clone(),
+        );
+        let (_accepted, context, _) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        record_doorbell_write(&context);
+        let attention = context
+            .record_verify_attention(NotificationVerifyOutcome::ambiguous())
+            .unwrap();
+        let target = messaging
+            .attention_for_resolution(service.admin().key, &attention.attempt_id.to_string())
+            .unwrap();
+        let journal_path = scratch
+            .0
+            .join("workspaces")
+            .join("current")
+            .join("messages.ndjson");
+        let before_lines = fs::read_to_string(&journal_path).unwrap().lines().count();
+
+        assert_eq!(
+            messaging
+                .begin_attention_resolution(&target, NotificationResolution::Complete)
+                .unwrap(),
+            AttentionResolutionStart::Fresh
+        );
+        assert_eq!(
+            messaging
+                .record_attention_resolution_intent(
+                    &target,
+                    NotificationResolution::Complete,
+                    false,
+                )
+                .unwrap(),
+            NotificationResolution::Complete
+        );
+        messaging
+            .withdraw_attention_resolution_intent(&target, NotificationResolution::Complete)
+            .unwrap();
+        messaging
+            .finish_attention_intent_withdrawal(&target)
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&journal_path).unwrap().lines().count(),
+            before_lines + 2,
+            "one intent and one withdrawal remain the complete durable pre-key trace"
+        );
+        assert_eq!(effects.calls(), vec![RecordedEffect::Schedule(reviewer)]);
+        assert_eq!(
+            messaging
+                .begin_attention_resolution(&target, NotificationResolution::Complete)
+                .unwrap(),
+            AttentionResolutionStart::Fresh
+        );
+        messaging
+            .cancel_attention_resolution(attention.attempt_id)
+            .unwrap();
+    }
+
+    /// Syntactic architecture lint: terminal code may prove and execute one
+    /// exact action, but every durable resolution boundary belongs to the
+    /// messaging Module.
+    #[test]
+    fn attention_terminal_mechanism_cannot_commit_messaging_state_directly() {
+        let compact: String = include_str!("attention_resolution.rs")
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect();
+        for forbidden in [
+            "service.begin_attention_resolution(",
+            "service.cancel_attention_resolution(",
+            "service.record_attention_resolution_intent(",
+            "service.record_automatic_attention_resolution_intent(",
+            "service.record_forced_attention_resolution_intent(",
+            "service.record_attention_resolution_action_accepted(",
+            "service.record_attention_resolution_consumption_observed(",
+            "service.resolve_attention(",
+            "service.resolve_attention_without_terminal_action(",
+            "service.withdraw_attention_resolution_intent(",
+        ] {
+            assert!(
+                !compact.contains(forbidden),
+                "terminal mechanism recovered durable messaging mutation: {forbidden}"
+            );
+        }
     }
 
     // Obsolete if daemon status again reconstructs mailbox routes, unread

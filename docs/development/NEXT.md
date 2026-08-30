@@ -14,7 +14,7 @@ preserved behavior, stop conditions, and rollback requirements.
 ## Current milestone
 
 The next focused completion pass runs on
-**beta/refactor/workspace-messaging-attention-commit**. The first Milestone 3
+**beta/refactor/workspace-messaging-attention-runtime**. The first Milestone 3
 family proved the internal seam. The read-and-claim pass then moved inbox listing,
 claiming, message snapshots, and durable follow pages behind
 `WorkspaceMessaging`; the Module owns retained claim-locator interpretation,
@@ -39,9 +39,13 @@ service merely to call the recipient scheduler. The runtime-evidence pass then
 moved route observations from fusion and authenticated ACK handling through an
 immutable evidence type, and moved durable pre-write, attention, notified, and
 force-submit-setting consequences behind named Module operations. Those
-callers no longer choose messaging schedulers. The next pass moves durable
-attention-resolution outcome commits behind `WorkspaceMessaging`, while the
-terminal mechanism retains only exact terminal inspection and action.
+callers no longer choose messaging schedulers. The attention-commit pass then
+moved resolution reservation, durable intent, accepted-action, consumption,
+settlement, no-key discard, and pre-key withdrawal behind `WorkspaceMessaging`;
+the terminal mechanism retains exact terminal proof and action. The next pass
+moves exact-reconciliation candidate selection and worker coordination behind
+the Module so the terminal mechanism no longer understands messaging worker
+topology.
 Additional narrowly named completion branches remain allowed when one pull
 request would become broad. The corresponding observation completion pass
 follows before Milestone 6. Milestone 5 put retained direct-delivery entry
