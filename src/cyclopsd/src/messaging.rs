@@ -2502,15 +2502,18 @@ impl WorkspaceMessaging {
 
     /// Apply one committed pane observation to durable messaging truth.
     ///
-    /// This operation never captures a pane, resolves a live route, schedules
-    /// a delivery, or requeues a quota hold. It commits only the transitions
-    /// justified by the supplied evidence and decides which explicit
-    /// post-commit notices the daemon composition root must commit.
+    /// This operation never captures a pane or resolves a live route. It owns
+    /// the durable and post-commit consequences justified by supplied evidence
+    /// and decides which explicit notices the daemon composition root commits.
     pub(crate) fn apply_observation(
         &self,
         observation: crate::fusion::PaneMessagingObservation,
     ) -> Result<ObservationApplication, MailboxServiceError> {
         let (recipient, session_idx, pane_id) = match observation {
+            crate::fusion::PaneMessagingObservation::RouteEvidenceObserved { evidence } => {
+                self.route_evidence_observed(evidence);
+                return Ok(ObservationApplication::default());
+            }
             crate::fusion::PaneMessagingObservation::QuotaResetObserved {
                 recipient,
                 session_idx,
@@ -2789,7 +2792,6 @@ mod tests {
             "composer_recovery::persist",
             "active_notification_barriers",
             "exact_recipient_claimed_after_write",
-            ".exact_owned_evidence_changed(",
             ".composer_recovery",
         ] {
             assert!(
@@ -2817,6 +2819,25 @@ mod tests {
             assert!(
                 !source.contains(".composer_recovery"),
                 "{adapter} reached into composer recovery coordinator state"
+            );
+        }
+    }
+
+    /// Syntactic architecture lint: fusion may identify immutable pane facts,
+    /// but the composition root is the only handoff to messaging policy.
+    #[test]
+    fn pane_observation_cannot_apply_messaging_policy_directly() {
+        let fusion = include_str!("fusion.rs")
+            .split_once("#[cfg(test)]")
+            .expect("fusion test boundary")
+            .0;
+        for forbidden in [
+            ".exact_owned_evidence_changed(",
+            ".route_evidence_observed(",
+        ] {
+            assert!(
+                !fusion.contains(forbidden),
+                "fusion applied messaging policy directly: {forbidden}"
             );
         }
     }
@@ -4578,6 +4599,38 @@ mod tests {
             vec![RecordedEffect::SpawnExactAttentionWorker(
                 attention.attempt_id
             )]
+        );
+    }
+
+    // Obsolete if readiness handling again invokes route reconciliation from
+    // fusion instead of returning immutable evidence to the composition root.
+    #[test]
+    fn workspace_messaging_applies_a_readiness_route_observation() {
+        let (_scratch, service, events, _reviewer, _) =
+            mailbox_service("workspace-messaging-route-observation", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            effects.clone(),
+        );
+        let evidence = MessagingRouteEvidence::new(
+            2,
+            "%7",
+            NotificationRouteEvidenceId {
+                boot_id: "boot".to_string(),
+                generation: 9,
+            },
+        );
+
+        let application = messaging
+            .apply_observation(PaneMessagingObservation::route_evidence(evidence.clone()))
+            .unwrap();
+
+        assert_eq!(application, ObservationApplication::default());
+        assert_eq!(
+            effects.calls(),
+            vec![RecordedEffect::ReconcileRouteEvidence(evidence)]
         );
     }
 

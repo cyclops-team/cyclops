@@ -2419,7 +2419,7 @@ fn wake_readiness(
     now: ReadinessKey,
     det: &Detection,
     route_evidence: Option<&NotificationRouteEvidenceId>,
-) {
+) -> Option<PaneMessagingObservation> {
     let decision = readiness_wake_plan(prior.as_ref(), &now, route_evidence.is_some());
     if decision.emit_public {
         inner.emit(
@@ -2433,17 +2433,16 @@ fn wake_readiness(
             None,
         );
     }
-    if decision.reconcile_route {
-        if let Some(route_evidence) = route_evidence {
-            if let Some(messaging) = inner.workspace_messaging() {
-                messaging.route_evidence_observed(crate::messaging::MessagingRouteEvidence::new(
-                    session_idx,
-                    pane_id,
-                    route_evidence.clone(),
-                ));
-            }
-        }
+    if !decision.reconcile_route {
+        return None;
     }
+    route_evidence.map(|route_evidence| {
+        PaneMessagingObservation::route_evidence(crate::messaging::MessagingRouteEvidence::new(
+            session_idx,
+            pane_id,
+            route_evidence.clone(),
+        ))
+    })
 }
 
 /// Publish a readiness mutation, minting one token only when it creates a
@@ -2459,7 +2458,7 @@ fn wake_readiness_after_mutation(
     let route_evidence = readiness_wake_decision(Some(&prior), &now)
         .reconcile_route
         .then(|| inner.advance_route_evidence(session_idx, pane_id));
-    wake_readiness(
+    if let Some(observation) = wake_readiness(
         inner,
         session_idx,
         pane_id,
@@ -2467,7 +2466,9 @@ fn wake_readiness_after_mutation(
         now,
         det,
         route_evidence.as_ref(),
-    );
+    ) {
+        crate::apply_messaging_observation(inner, observation);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3429,6 +3430,9 @@ struct RecomputeEvidence<'a> {
 /// fusion to guess what was seen later.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PaneMessagingObservation {
+    RouteEvidenceObserved {
+        evidence: crate::messaging::MessagingRouteEvidence,
+    },
     QuotaResetObserved {
         recipient: RecipientKey,
         session_idx: usize,
@@ -3440,6 +3444,10 @@ pub(crate) enum PaneMessagingObservation {
 }
 
 impl PaneMessagingObservation {
+    pub(crate) fn route_evidence(evidence: crate::messaging::MessagingRouteEvidence) -> Self {
+        Self::RouteEvidenceObserved { evidence }
+    }
+
     pub(crate) fn quota_reset(
         recipient: RecipientKey,
         session_idx: usize,
@@ -3458,12 +3466,16 @@ impl PaneMessagingObservation {
 }
 
 fn pane_messaging_observations(
+    route: Option<PaneMessagingObservation>,
     exact_owned_recipient: Option<RecipientKey>,
     quota_reset_recipient: Option<RecipientKey>,
     session_idx: usize,
     pane_id: &str,
 ) -> Vec<PaneMessagingObservation> {
     let mut observations = Vec::new();
+    if let Some(route) = route {
+        observations.push(route);
+    }
     if let Some(recipient) = exact_owned_recipient {
         observations.push(PaneMessagingObservation::exact_owned_evidence_changed(
             recipient,
@@ -3773,7 +3785,7 @@ async fn observe_pane_with_evidence(
         }
         // Entering a mode refuses a write without touching the runtime
         // state, so this is the wake that has no state edge behind it.
-        wake_readiness(
+        let messaging_observation = wake_readiness(
             inner,
             session_idx,
             pane_id,
@@ -3787,7 +3799,7 @@ async fn observe_pane_with_evidence(
         }
         return Some(PaneObservation {
             detection: det,
-            messaging: Vec::new(),
+            messaging: messaging_observation.into_iter().collect(),
             repaint: false,
             recompute_guard,
         });
@@ -3846,7 +3858,7 @@ async fn observe_pane_with_evidence(
                         // was write-ready and is now refused on stale
                         // evidence has to wake whoever was gating on the
                         // old answer.
-                        wake_readiness(
+                        let messaging_observation = wake_readiness(
                             inner,
                             session_idx,
                             pane_id,
@@ -3860,7 +3872,7 @@ async fn observe_pane_with_evidence(
                         }
                         return Some(PaneObservation {
                             detection: p,
-                            messaging: Vec::new(),
+                            messaging: messaging_observation.into_iter().collect(),
                             repaint: false,
                             recompute_guard,
                         });
@@ -4424,7 +4436,7 @@ async fn observe_pane_with_evidence(
     // a delivery sleeping on `not_write_ready:composer_hold` would sleep
     // through its own release. This wake is broadcast only. It is not a
     // state transition and must never be written to the ledger as one.
-    wake_readiness(
+    let route_observation = wake_readiness(
         inner,
         session_idx,
         pane_id,
@@ -4447,6 +4459,7 @@ async fn observe_pane_with_evidence(
         .then(|| inner.recipient_key(session_idx, pane_id))
         .flatten();
     let messaging_observations = pane_messaging_observations(
+        route_observation,
         exact_owned_recipient,
         quota_reset_recipient,
         session_idx,
@@ -5040,14 +5053,17 @@ line_regex = ['^ACTIVE']
         let ready_key: ReadinessKey = (true, None, false);
         let initial = inner.route_evidence_id(0, pane_id);
 
-        wake_readiness(
-            &inner,
-            0,
-            pane_id,
-            Some(held.clone()),
-            ready_key.clone(),
-            &ready,
-            None,
+        assert_eq!(
+            wake_readiness(
+                &inner,
+                0,
+                pane_id,
+                Some(held.clone()),
+                ready_key.clone(),
+                &ready,
+                None,
+            ),
+            None
         );
         assert_eq!(inner.route_evidence_id(0, pane_id), initial);
 
@@ -5071,9 +5087,43 @@ line_regex = ['^ACTIVE']
             "a causal source token must not be consumed by an earlier tokenless observer"
         );
 
+        let inner = inner_with(BTreeMap::new());
+        let mut detection = quota_detection(Sensor::Screen, AgentState::Idle);
+        detection.write_ready = true;
+        let evidence_id = NotificationRouteEvidenceId {
+            boot_id: "boot".to_string(),
+            generation: 9,
+        };
+        assert_eq!(
+            wake_readiness(
+                &inner,
+                2,
+                "%7",
+                Some(ready.clone()),
+                ready.clone(),
+                &detection,
+                Some(&evidence_id),
+            ),
+            Some(PaneMessagingObservation::route_evidence(
+                crate::messaging::MessagingRouteEvidence::new(2, "%7", evidence_id.clone())
+            ))
+        );
+
         let unchanged_negative = readiness_wake_plan(Some(&held), &held, true);
         assert!(!unchanged_negative.emit_public);
         assert!(!unchanged_negative.reconcile_route);
+        assert_eq!(
+            wake_readiness(
+                &inner,
+                2,
+                "%7",
+                Some(held.clone()),
+                held,
+                &detection,
+                Some(&evidence_id),
+            ),
+            None
+        );
     }
 
     #[test]
@@ -8920,10 +8970,27 @@ regex = ['^']
             "00000000-0000-4000-8000-000000000002".parse().unwrap(),
             "%1".parse().unwrap(),
         );
+        let route = PaneMessagingObservation::route_evidence(
+            crate::messaging::MessagingRouteEvidence::new(
+                3,
+                "%1",
+                NotificationRouteEvidenceId {
+                    boot_id: "boot".to_string(),
+                    generation: 4,
+                },
+            ),
+        );
 
         assert_eq!(
-            pane_messaging_observations(Some(recipient), Some(recipient), 3, "%1"),
+            pane_messaging_observations(
+                Some(route.clone()),
+                Some(recipient),
+                Some(recipient),
+                3,
+                "%1",
+            ),
             vec![
+                route,
                 PaneMessagingObservation::exact_owned_evidence_changed(recipient),
                 PaneMessagingObservation::quota_reset(recipient, 3, "%1"),
             ]
