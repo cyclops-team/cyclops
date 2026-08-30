@@ -27,11 +27,9 @@ use cyclops_manifest::{
 };
 use cyclops_proto::{
     AgentState, ComposerHold, ComposerProof, ComposerSemantic, ComposerState, Detection,
-    NotificationAttemptId, NotificationAttentionCause, NotificationRouteEvidenceId,
-    NotificationState, NotifyLevel, ProcessInstanceId, RecipientKey, Sensor, SensorReading,
+    NotificationAttemptId, NotificationRouteEvidenceId, NotifyLevel, ProcessInstanceId,
+    RecipientKey, Sensor, SensorReading,
 };
-#[cfg(test)]
-use cyclops_proto::{NotificationTransport, DOORBELL_FORMAT_COMPACT_CLAIM};
 use cyclops_tmux::{PaneRow, SessionWatcher, TmuxError};
 use tracing::debug;
 
@@ -2529,13 +2527,14 @@ fn retain_stale(
             .as_deref()
             .and_then(|owner| NotificationAttemptId::parse(owner).ok())
     });
-    let candidate_count = entry.composer.candidate_count as usize;
-    entry.composer = ambiguous_composer_projection(
-        attempt,
-        ComposerProof::Unprovable,
-        "detection_stale",
-        candidate_count,
-    );
+    entry.composer = ComposerProjection {
+        state: ComposerState::ComposerAmbiguous,
+        proof: ComposerProof::Unprovable,
+        notification_attempt: attempt,
+        reason: Some("detection_stale"),
+        candidate_count: entry.composer.candidate_count,
+        binding: None,
+    };
     entry.working_confirmed = false;
     Some(p)
 }
@@ -3208,60 +3207,6 @@ fn composer_capture_binding_is_stable(
         && binding_after == Some(binding_before)
 }
 
-fn semantic_composer_projection(semantic: Option<ComposerSemantic>) -> ComposerProjection {
-    match semantic {
-        Some(ComposerSemantic::Clean) => ComposerProjection {
-            state: ComposerState::ComposerClean,
-            proof: ComposerProof::ManifestRule,
-            notification_attempt: None,
-            reason: None,
-            candidate_count: 0,
-            binding: None,
-        },
-        Some(ComposerSemantic::HumanInput) => ComposerProjection {
-            state: ComposerState::HumanDraft,
-            proof: ComposerProof::ManifestRule,
-            notification_attempt: None,
-            reason: None,
-            candidate_count: 0,
-            binding: None,
-        },
-        Some(ComposerSemantic::GhostSuggestion) => ComposerProjection {
-            state: ComposerState::VendorGhostSuggestion,
-            proof: ComposerProof::ManifestRule,
-            notification_attempt: None,
-            reason: None,
-            candidate_count: 0,
-            binding: None,
-        },
-        Some(ComposerSemantic::Ambiguous) => ComposerProjection {
-            state: ComposerState::ComposerAmbiguous,
-            proof: ComposerProof::Ambiguous,
-            notification_attempt: None,
-            reason: Some("manifest_rule_ambiguous"),
-            candidate_count: 0,
-            binding: None,
-        },
-        None => ComposerProjection::default(),
-    }
-}
-
-fn ambiguous_composer_projection(
-    attempt: Option<NotificationAttemptId>,
-    proof: ComposerProof,
-    reason: &'static str,
-    candidate_count: usize,
-) -> ComposerProjection {
-    ComposerProjection {
-        state: ComposerState::ComposerAmbiguous,
-        proof,
-        notification_attempt: attempt,
-        reason: Some(reason),
-        candidate_count: u32::try_from(candidate_count).unwrap_or(u32::MAX),
-        binding: None,
-    }
-}
-
 fn claimed_legacy_recovery_ready(
     detection: &Detection,
     in_mode: bool,
@@ -3278,33 +3223,9 @@ fn claimed_legacy_recovery_ready(
         && matches!(capture, ComposerCapture::Visible(content) if content.is_empty())
 }
 
-fn notification_submission_recorded(record: &cyclops_proto::NotificationRecord) -> bool {
-    match record.state {
-        NotificationState::Submitted | NotificationState::Notified => true,
-        NotificationState::AttentionRequired => matches!(
-            record.cause,
-            Some(
-                NotificationAttentionCause::ReceiptOccupantChanged
-                    | NotificationAttentionCause::AckTimeout
-            )
-        ),
-        NotificationState::Queued
-        | NotificationState::Gating
-        | NotificationState::BlockedPreWrite
-        | NotificationState::QuotaHeld
-        | NotificationState::QuotaResetObserved
-        | NotificationState::Writing
-        | NotificationState::Staged
-        | NotificationState::Submitting
-        | NotificationState::Withdrawn
-        | NotificationState::WithdrawnAfterStaging
-        | NotificationState::WithdrawnByOperator
-        | NotificationState::Superseded => false,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn project_composer(
+    probe: &crate::messaging::MessagingComposerProjectionProbe,
     semantic: Option<ComposerSemantic>,
     owner: Option<&str>,
     detection: &Detection,
@@ -3312,260 +3233,72 @@ fn project_composer(
     binding: &BindingObservation,
     recipient: Option<RecipientKey>,
     capture: &ComposerCapture,
-    candidates: &[crate::mailbox::ActiveComposerNotification],
-    candidate_store_available: bool,
 ) -> ComposerProjection {
-    let parsed_owner = owner.and_then(|value| NotificationAttemptId::parse(value).ok());
-    if !candidate_store_available {
-        return ambiguous_composer_projection(
-            parsed_owner,
-            ComposerProof::Unprovable,
-            "notification_store_unavailable",
-            candidates.len(),
-        );
-    }
-    if in_mode {
-        return ambiguous_composer_projection(
-            parsed_owner,
-            ComposerProof::Ambiguous,
-            "pane_in_mode",
-            candidates.len(),
-        );
-    }
-    if detection.stale {
-        return ambiguous_composer_projection(
-            parsed_owner,
-            ComposerProof::Unprovable,
-            "detection_stale",
-            candidates.len(),
-        );
-    }
-    if matches!(capture, ComposerCapture::BindingChanged) {
-        return ambiguous_composer_projection(
-            parsed_owner,
-            ComposerProof::Ambiguous,
-            "binding_changed_during_capture",
-            candidates.len(),
-        );
-    }
-    if owner.is_none() && candidates.is_empty() {
-        return semantic_composer_projection(semantic);
-    }
-    if owner.is_some() && parsed_owner.is_none() && candidates.is_empty() {
-        return ambiguous_composer_projection(
-            None,
-            ComposerProof::Unprovable,
-            "direct_delivery_hold_unprovable",
-            0,
-        );
-    }
-
-    let attempt =
-        match (parsed_owner, candidates) {
-            (Some(attempt), [candidate]) if candidate.record.attempt_id == attempt => attempt,
-            (None, [candidate]) => {
-                let reason =
-                    if candidate.record.binding.as_ref().is_none_or(|binding| {
-                        binding.pane_root.is_none() || binding.leader.is_none()
-                    }) {
-                        "durable_binding_incomplete"
-                    } else {
-                        "notification_owner_missing"
-                    };
-                return ambiguous_composer_projection(
-                    Some(candidate.record.attempt_id),
-                    ComposerProof::Unprovable,
-                    reason,
-                    1,
-                );
-            }
-            (Some(attempt), []) => {
-                return ambiguous_composer_projection(
-                    Some(attempt),
-                    ComposerProof::Ambiguous,
-                    "notification_attempt_mismatch",
-                    0,
-                );
-            }
-            (Some(attempt), [_]) => {
-                return ambiguous_composer_projection(
-                    Some(attempt),
-                    ComposerProof::Ambiguous,
-                    "notification_attempt_mismatch",
-                    1,
-                );
-            }
-            (owner, _) => {
-                return ambiguous_composer_projection(
-                    owner,
-                    ComposerProof::Ambiguous,
-                    "multiple_active_notifications",
-                    candidates.len(),
-                );
-            }
-        };
-    let candidate = &candidates[0];
-
-    if matches!(binding, BindingObservation::Unprovable) {
-        return ambiguous_composer_projection(
-            Some(attempt),
-            ComposerProof::Unprovable,
-            "binding_unprovable",
-            candidates.len(),
-        );
-    }
-    if detection.disagreement
-        || detection.state.is_blocked()
-        || matches!(
-            binding,
-            BindingObservation::NotVendor | BindingObservation::Gone
-        )
-    {
-        return ambiguous_composer_projection(
-            Some(attempt),
-            ComposerProof::Ambiguous,
-            "terminal_state_unsafe",
-            candidates.len(),
-        );
-    }
-    if semantic.is_none() {
-        return ambiguous_composer_projection(
-            Some(attempt),
-            ComposerProof::Unprovable,
-            "composer_semantic_unprovable",
-            candidates.len(),
-        );
-    }
-
-    let Some(current_recipient) = recipient else {
-        return ambiguous_composer_projection(
-            Some(attempt),
-            ComposerProof::Unprovable,
-            "recipient_unprovable",
-            candidates.len(),
-        );
-    };
-    let Some(expected_binding) = candidate.record.binding.as_ref() else {
-        return ambiguous_composer_projection(
-            Some(attempt),
-            ComposerProof::Unprovable,
-            "durable_binding_incomplete",
-            candidates.len(),
-        );
-    };
-    let BindingObservation::Bound(current_binding) = binding else {
-        return ambiguous_composer_projection(
-            Some(attempt),
-            ComposerProof::Unprovable,
-            "binding_unprovable",
-            candidates.len(),
-        );
-    };
-    let Some(expected_pane_root) = expected_binding.pane_root else {
-        return ambiguous_composer_projection(
-            Some(attempt),
-            ComposerProof::Unprovable,
-            "durable_binding_incomplete",
-            candidates.len(),
-        );
-    };
-    let Some(expected_leader) = expected_binding.leader else {
-        return ambiguous_composer_projection(
-            Some(attempt),
-            ComposerProof::Unprovable,
-            "durable_binding_incomplete",
-            candidates.len(),
-        );
-    };
-    let current_pane_root = ProcessInstanceId::new(
-        current_binding.pane_root.pid,
-        current_binding.pane_root.birth,
-    )
-    .ok();
-    let current_leader =
-        ProcessInstanceId::new(current_binding.leader.pid, current_binding.leader.birth).ok();
-    let current_agent =
-        ProcessInstanceId::new(current_binding.agent.pid, current_binding.agent.birth).ok();
-    if expected_binding.recipient != candidate.record.recipient
-        || current_recipient != candidate.record.recipient
-        || Some(expected_pane_root) != current_pane_root
-        || Some(expected_leader) != current_leader
-        || Some(expected_binding.agent) != current_agent
-        || expected_binding.manifest.as_str() != current_binding.manifest
-    {
-        return ambiguous_composer_projection(
-            Some(attempt),
-            ComposerProof::Ambiguous,
-            "binding_mismatch",
-            candidates.len(),
-        );
-    }
-
-    let Some(expected) = candidate.message.as_ref().and_then(|message| {
-        crate::delivery::expected_notification_payload(&candidate.record, message)
-    }) else {
-        return ambiguous_composer_projection(
-            Some(attempt),
-            ComposerProof::Unprovable,
-            "notification_payload_unprovable",
-            candidates.len(),
-        );
-    };
-    match capture {
-        ComposerCapture::Visible(actual)
-            if actual == &expected && semantic == Some(ComposerSemantic::HumanInput) =>
-        {
-            ComposerProjection {
-                // Visible exact bytes are staged regardless of what the durable
-                // submit path previously recorded. This is the swallowed-submit
-                // case status must expose rather than declaring consumed.
-                state: ComposerState::CyclopsNotificationStaged,
-                proof: ComposerProof::ExactNotification,
-                notification_attempt: Some(attempt),
-                reason: None,
-                candidate_count: 1,
-                binding: Some(current_binding.clone()),
-            }
+    let current_binding = match binding {
+        BindingObservation::Bound(binding) => {
+            let observed = ProcessInstanceId::new(binding.pane_root.pid, binding.pane_root.birth)
+                .ok()
+                .zip(ProcessInstanceId::new(binding.leader.pid, binding.leader.birth).ok())
+                .zip(ProcessInstanceId::new(binding.agent.pid, binding.agent.birth).ok())
+                .zip(cyclops_proto::NotificationManifestId::new(&binding.manifest).ok())
+                .map(|(((pane_root, leader), agent), manifest)| {
+                    crate::messaging::MessagingComposerPhysicalBinding {
+                        pane_root,
+                        leader,
+                        agent,
+                        manifest,
+                    }
+                });
+            observed
+                .map(crate::messaging::MessagingComposerBindingObservation::Bound)
+                .unwrap_or(crate::messaging::MessagingComposerBindingObservation::Unprovable)
         }
-        ComposerCapture::Visible(actual)
-            if semantic == Some(ComposerSemantic::Clean)
-                && actual.is_empty()
-                && notification_submission_recorded(&candidate.record) =>
-        {
-            ComposerProjection {
-                state: ComposerState::CyclopsNotificationSubmitted,
-                proof: ComposerProof::ExactNotification,
-                notification_attempt: Some(attempt),
-                reason: None,
-                candidate_count: 1,
-                binding: Some(current_binding.clone()),
-            }
+        BindingObservation::NotVendor => {
+            crate::messaging::MessagingComposerBindingObservation::NotVendor
         }
-        ComposerCapture::Visible(_) => ambiguous_composer_projection(
-            Some(attempt),
-            ComposerProof::Ambiguous,
-            "composer_content_mismatch",
-            candidates.len(),
-        ),
-        ComposerCapture::Hidden => ambiguous_composer_projection(
-            Some(attempt),
-            ComposerProof::Unprovable,
-            "composer_hidden",
-            candidates.len(),
-        ),
-        ComposerCapture::NotRead => ambiguous_composer_projection(
-            Some(attempt),
-            ComposerProof::Unprovable,
-            "composer_not_read",
-            candidates.len(),
-        ),
-        ComposerCapture::Unprovable => ambiguous_composer_projection(
-            Some(attempt),
-            ComposerProof::Unprovable,
-            "composer_capture_unprovable",
-            candidates.len(),
-        ),
-        ComposerCapture::BindingChanged => unreachable!("handled before candidate projection"),
+        BindingObservation::Gone => crate::messaging::MessagingComposerBindingObservation::Gone,
+        BindingObservation::Unprovable => {
+            crate::messaging::MessagingComposerBindingObservation::Unprovable
+        }
+    };
+    let capture = match capture {
+        ComposerCapture::NotRead => crate::messaging::MessagingComposerCapture::NotRead,
+        ComposerCapture::Visible(content) => {
+            crate::messaging::MessagingComposerCapture::Visible(content.clone())
+        }
+        ComposerCapture::Hidden => crate::messaging::MessagingComposerCapture::Hidden,
+        ComposerCapture::Unprovable => crate::messaging::MessagingComposerCapture::Unprovable,
+        ComposerCapture::BindingChanged => {
+            crate::messaging::MessagingComposerCapture::BindingChanged
+        }
+    };
+    let projected = probe.project(crate::messaging::MessagingRuntimeComposerObservation {
+        semantic,
+        owner: owner.map(str::to_string),
+        in_mode,
+        detection_stale: detection.stale,
+        terminal_state_unsafe: detection.disagreement || detection.state.is_blocked(),
+        binding: current_binding,
+        recipient,
+        capture,
+    });
+    let verified_binding = if projected.binding_verified {
+        match binding {
+            BindingObservation::Bound(binding) => Some(binding.clone()),
+            BindingObservation::NotVendor
+            | BindingObservation::Gone
+            | BindingObservation::Unprovable => None,
+        }
+    } else {
+        None
+    };
+    ComposerProjection {
+        state: projected.state,
+        proof: projected.proof,
+        notification_attempt: projected.notification_attempt,
+        reason: projected.reason,
+        candidate_count: projected.candidate_count,
+        binding: verified_binding,
     }
 }
 
@@ -3764,16 +3497,12 @@ async fn observe_pane_with_evidence(
         (Some(_), None) => crate::messaging::MessagingComposerRecoveryProbe::store_unavailable(),
         (None, _) => crate::messaging::MessagingComposerRecoveryProbe::none(),
     };
-    let (composer_candidates, composer_store_available) = match recovery_recipient {
-        Some(recipient) => match inner
-            .mailbox
-            .as_ref()
-            .and_then(|service| service.active_composer_notifications(recipient).ok())
-        {
-            Some(candidates) => (candidates, true),
-            None => (Vec::new(), false),
-        },
-        None => (Vec::new(), true),
+    let composer_probe = match workspace_messaging.as_ref() {
+        Some(messaging) => messaging.composer_projection_probe(recovery_recipient),
+        None if recovery_recipient.is_some() => {
+            crate::messaging::MessagingComposerProjectionProbe::store_unavailable()
+        }
+        None => crate::messaging::MessagingComposerProjectionProbe::none(),
     };
     let recovering = recovery_probe.is_recovering();
     let manifest = bind_manifest_for(inner, session_idx, &row);
@@ -3864,7 +3593,7 @@ async fn observe_pane_with_evidence(
         .expect("detections lock")
         .get(&route)
         .and_then(|entry| entry.hold_owner.clone());
-    let inspect_composer = prior_hold_owner.is_some() || !composer_candidates.is_empty();
+    let inspect_composer = composer_probe.requires_capture(prior_hold_owner.is_some());
     let mut composer_capture = ComposerCapture::NotRead;
 
     // Kept for the emitted event: the verdict below consumes manifest_id.
@@ -3917,6 +3646,7 @@ async fn observe_pane_with_evidence(
                     e.detection = e.detection.clone().occupant_unprovable();
                 }
                 e.composer = project_composer(
+                    &composer_probe,
                     e.detection.composer_semantic,
                     e.hold_owner.as_deref(),
                     &e.detection,
@@ -3924,8 +3654,6 @@ async fn observe_pane_with_evidence(
                     &binding_observation,
                     recovery_recipient,
                     &ComposerCapture::NotRead,
-                    &composer_candidates,
-                    composer_store_available,
                 );
                 e.detection.clone()
             }
@@ -3946,6 +3674,7 @@ async fn observe_pane_with_evidence(
                     det = det.occupant_unprovable();
                 }
                 let composer = project_composer(
+                    &composer_probe,
                     det.composer_semantic,
                     None,
                     &det,
@@ -3953,8 +3682,6 @@ async fn observe_pane_with_evidence(
                     &binding_observation,
                     recovery_recipient,
                     &ComposerCapture::NotRead,
-                    &composer_candidates,
-                    composer_store_available,
                 );
                 map.insert(
                     route.clone(),
@@ -4547,6 +4274,7 @@ async fn observe_pane_with_evidence(
             detection = detection.refused("hook_admission_unproven");
         }
         let composer = project_composer(
+            &composer_probe,
             detection.composer_semantic,
             final_owner.as_deref(),
             &detection,
@@ -4554,8 +4282,6 @@ async fn observe_pane_with_evidence(
             &binding_observation,
             recovery_recipient,
             &composer_capture,
-            &composer_candidates,
-            composer_store_available,
         );
         let composer_changed = prior_entry.is_none_or(|entry| entry.composer != composer);
         // A positive screen baseline is enough to discover durable quota
@@ -9102,78 +8828,6 @@ regex = ['^']
         assert!(!d.disagreement);
     }
 
-    fn composer_candidate(
-        state: NotificationState,
-    ) -> (
-        crate::mailbox::ActiveComposerNotification,
-        RecipientKey,
-        BindingObservation,
-    ) {
-        let workspace = "00000000-0000-4000-8000-000000000001".parse().unwrap();
-        let session = "00000000-0000-4000-8000-000000000002".parse().unwrap();
-        let recipient = RecipientKey::agent(workspace, session, "%1".parse().unwrap());
-        let pane_root = crate::identity::ProcId { pid: 69, birth: 1 };
-        let leader = crate::identity::ProcId { pid: 70, birth: 2 };
-        let agent = crate::identity::ProcId { pid: 71, birth: 3 };
-        let message_id = cyclops_proto::MessageId::new("m-composer").unwrap();
-        let attempt_id =
-            NotificationAttemptId::parse("att-00000000-0000-4000-8000-000000000003").unwrap();
-        let record = cyclops_proto::NotificationRecord {
-            attempt_id,
-            message_id: message_id.clone(),
-            recipient,
-            state,
-            binding: Some(cyclops_proto::NotificationBinding {
-                recipient,
-                pane_root: Some(ProcessInstanceId::new(pane_root.pid, pane_root.birth).unwrap()),
-                leader: Some(ProcessInstanceId::new(leader.pid, leader.birth).unwrap()),
-                agent: ProcessInstanceId::new(agent.pid, agent.birth).unwrap(),
-                manifest: cyclops_proto::NotificationManifestId::new("claude").unwrap(),
-            }),
-            transport: NotificationTransport::Doorbell,
-            doorbell_format: Some(DOORBELL_FORMAT_COMPACT_CLAIM),
-            cause: None,
-            verify_outcome: None,
-            pre_write_cause: None,
-            wake_block: None,
-            pre_write_observation: None,
-            pre_write_reopen_count: 0,
-            unclaimed_reminder_count: 0,
-            started_seq: 2,
-            updated_seq: 3,
-            updated_at: 4,
-        };
-        let message = cyclops_proto::LedgerLine {
-            seq: 1,
-            boot_id: "boot".into(),
-            id: message_id.to_string(),
-            ts: 1,
-            kind: cyclops_proto::Kind::Msg,
-            from: "admin".into(),
-            to: vec!["claude".into()],
-            subject: Some("subject".into()),
-            body: Some("body".into()),
-            reply_to: None,
-            deliveries: Vec::new(),
-            data: None,
-        };
-        (
-            crate::mailbox::ActiveComposerNotification {
-                record,
-                message: Some(message),
-                entry_state: Some(cyclops_proto::MailboxEntryState::Pending),
-                recovery_action: crate::mailbox::ExactOwnedRecoveryAction::Ineligible,
-            },
-            recipient,
-            BindingObservation::Bound(Binding {
-                pane_root,
-                leader,
-                agent,
-                manifest: "claude".into(),
-            }),
-        )
-    }
-
     fn composer_detection(semantic: Option<ComposerSemantic>) -> Detection {
         let state = match semantic {
             Some(ComposerSemantic::Clean | ComposerSemantic::GhostSuggestion) => AgentState::Idle,
@@ -9198,175 +8852,18 @@ regex = ['^']
     }
 
     #[test]
-    fn composer_projection_exposes_the_six_closed_states() {
-        assert_eq!(
-            semantic_composer_projection(Some(ComposerSemantic::Clean)).state,
-            ComposerState::ComposerClean
-        );
-        assert_eq!(
-            semantic_composer_projection(Some(ComposerSemantic::HumanInput)).state,
-            ComposerState::HumanDraft
-        );
-        assert_eq!(
-            semantic_composer_projection(Some(ComposerSemantic::GhostSuggestion)).state,
-            ComposerState::VendorGhostSuggestion
-        );
-        assert_eq!(
-            semantic_composer_projection(Some(ComposerSemantic::Ambiguous)).state,
-            ComposerState::ComposerAmbiguous
-        );
-
-        let (candidate, recipient, binding) = composer_candidate(NotificationState::Submitted);
-        let expected = cyclops_proto::render_doorbell_v1(&candidate.record.message_id);
-        let staged = project_composer(
-            Some(ComposerSemantic::HumanInput),
-            Some(&candidate.record.attempt_id.to_string()),
-            &composer_detection(Some(ComposerSemantic::HumanInput)),
-            false,
-            &binding,
-            Some(recipient),
-            &ComposerCapture::Visible(expected),
-            std::slice::from_ref(&candidate),
-            true,
-        );
-        assert_eq!(staged.state, ComposerState::CyclopsNotificationStaged);
-        assert_eq!(staged.proof, ComposerProof::ExactNotification);
-
-        let submitted = project_composer(
-            Some(ComposerSemantic::Clean),
-            Some(&candidate.record.attempt_id.to_string()),
-            &composer_detection(Some(ComposerSemantic::Clean)),
-            false,
-            &binding,
-            Some(recipient),
-            &ComposerCapture::Visible(String::new()),
-            std::slice::from_ref(&candidate),
-            true,
-        );
-        assert_eq!(submitted.state, ComposerState::CyclopsNotificationSubmitted);
-        assert_eq!(submitted.proof, ComposerProof::ExactNotification);
-    }
-
-    #[test]
-    fn submitted_record_with_visible_exact_bytes_is_still_staged() {
-        let (candidate, recipient, binding) = composer_candidate(NotificationState::Submitted);
-        let expected = cyclops_proto::render_doorbell_v1(&candidate.record.message_id);
-        let projection = project_composer(
-            Some(ComposerSemantic::HumanInput),
-            Some(&candidate.record.attempt_id.to_string()),
-            &composer_detection(Some(ComposerSemantic::HumanInput)),
-            false,
-            &binding,
-            Some(recipient),
-            &ComposerCapture::Visible(expected),
-            std::slice::from_ref(&candidate),
-            true,
-        );
-
-        assert_eq!(projection.state, ComposerState::CyclopsNotificationStaged);
-        assert_eq!(projection.proof, ComposerProof::ExactNotification);
-    }
-
-    #[test]
-    fn submit_intent_and_post_staging_withdrawal_do_not_claim_submission() {
-        for state in [
-            NotificationState::Submitting,
-            NotificationState::WithdrawnAfterStaging,
-        ] {
-            let (candidate, recipient, binding) = composer_candidate(state);
-            let projection = project_composer(
-                Some(ComposerSemantic::Clean),
-                Some(&candidate.record.attempt_id.to_string()),
-                &composer_detection(Some(ComposerSemantic::Clean)),
-                false,
-                &binding,
-                Some(recipient),
-                &ComposerCapture::Visible(String::new()),
-                std::slice::from_ref(&candidate),
-                true,
-            );
-
-            assert_eq!(
-                projection.state,
-                ComposerState::ComposerAmbiguous,
-                "{state:?}"
-            );
-            assert_eq!(projection.proof, ComposerProof::Ambiguous, "{state:?}");
-        }
-    }
-
-    #[test]
-    fn copy_mode_and_stale_frames_never_reuse_a_semantic_as_current() {
-        let mut detection = composer_detection(Some(ComposerSemantic::Clean));
-        let copy_mode = project_composer(
-            detection.composer_semantic,
-            None,
-            &detection,
-            true,
-            &BindingObservation::Unprovable,
-            None,
-            &ComposerCapture::NotRead,
-            &[],
-            true,
-        );
-        assert_eq!(copy_mode.state, ComposerState::ComposerAmbiguous);
-        assert_eq!(copy_mode.proof, ComposerProof::Ambiguous);
-        assert_eq!(copy_mode.reason, Some("pane_in_mode"));
-
-        detection.stale = true;
-        let stale = project_composer(
-            detection.composer_semantic,
-            None,
-            &detection,
-            false,
-            &BindingObservation::Unprovable,
-            None,
-            &ComposerCapture::NotRead,
-            &[],
-            true,
-        );
-        assert_eq!(stale.state, ComposerState::ComposerAmbiguous);
-        assert_eq!(stale.proof, ComposerProof::Unprovable);
-        assert_eq!(stale.reason, Some("detection_stale"));
-    }
-
-    #[test]
-    fn process_change_during_capture_never_projects_exact_ownership() {
-        for (state, semantic, capture) in [
-            (
-                NotificationState::Staged,
-                ComposerSemantic::HumanInput,
-                ComposerCapture::BindingChanged,
-            ),
-            (
-                NotificationState::Submitted,
-                ComposerSemantic::Clean,
-                ComposerCapture::BindingChanged,
-            ),
-        ] {
-            let (candidate, recipient, binding) = composer_candidate(state);
-            let projection = project_composer(
-                Some(semantic),
-                Some(&candidate.record.attempt_id.to_string()),
-                &composer_detection(Some(semantic)),
-                false,
-                &binding,
-                Some(recipient),
-                &capture,
-                std::slice::from_ref(&candidate),
-                true,
-            );
-
-            assert_eq!(projection.state, ComposerState::ComposerAmbiguous);
-            assert_eq!(projection.proof, ComposerProof::Ambiguous);
-            assert_eq!(projection.reason, Some("binding_changed_during_capture"));
-            assert_eq!(projection.binding, None);
-        }
-    }
-
-    #[test]
     fn capture_bookend_requires_the_same_route_mode_and_process_generations() {
-        let (_, recipient, binding) = composer_candidate(NotificationState::Staged);
+        let recipient = RecipientKey::agent(
+            "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            "00000000-0000-4000-8000-000000000002".parse().unwrap(),
+            "%1".parse().unwrap(),
+        );
+        let binding = BindingObservation::Bound(Binding {
+            pane_root: crate::identity::ProcId { pid: 69, birth: 1 },
+            leader: crate::identity::ProcId { pid: 70, birth: 2 },
+            agent: crate::identity::ProcId { pid: 71, birth: 3 },
+            manifest: "claude".into(),
+        });
         let before = PaneRow {
             pane_id: "%1".into(),
             window_id: "@1".into(),
@@ -9441,215 +8938,25 @@ regex = ['^']
     }
 
     #[test]
-    fn conflicting_runtime_readings_never_project_exact_ownership() {
-        let (candidate, recipient, binding) = composer_candidate(NotificationState::Staged);
-        let expected = cyclops_proto::render_doorbell_v1(&candidate.record.message_id);
-        let mut detection = composer_detection(Some(ComposerSemantic::HumanInput));
-        detection.disagreement = true;
-        detection.readings.push(SensorReading {
-            sensor: Sensor::Hook,
-            state: AgentState::Working,
-            rule: "turn_start".into(),
-            ts: 6,
-        });
-        let projection = project_composer(
-            detection.composer_semantic,
-            Some(&candidate.record.attempt_id.to_string()),
-            &detection,
-            false,
-            &binding,
-            Some(recipient),
-            &ComposerCapture::Visible(expected),
-            std::slice::from_ref(&candidate),
-            true,
-        );
-
-        assert_eq!(projection.state, ComposerState::ComposerAmbiguous);
-        assert_eq!(projection.proof, ComposerProof::Ambiguous);
-        assert_eq!(projection.reason, Some("terminal_state_unsafe"));
-        assert_eq!(projection.binding, None);
-    }
-
-    #[test]
-    fn submitted_record_with_unprovable_capture_never_claims_exact_ownership() {
-        let (candidate, recipient, binding) = composer_candidate(NotificationState::Submitted);
-        let projection = project_composer(
-            Some(ComposerSemantic::Clean),
-            Some(&candidate.record.attempt_id.to_string()),
-            &composer_detection(Some(ComposerSemantic::Clean)),
-            false,
-            &binding,
-            Some(recipient),
-            &ComposerCapture::Unprovable,
-            std::slice::from_ref(&candidate),
-            true,
-        );
-
-        assert_eq!(projection.state, ComposerState::ComposerAmbiguous);
-        assert_eq!(projection.proof, ComposerProof::Unprovable);
-        assert_eq!(projection.reason, Some("composer_capture_unprovable"));
-        assert!(projection.binding.is_none());
-    }
-
-    #[test]
-    fn exact_notification_projection_fails_closed_on_hidden_or_extra_content() {
-        let (candidate, recipient, binding) = composer_candidate(NotificationState::Submitted);
-        let owner = candidate.record.attempt_id.to_string();
-        let expected = cyclops_proto::render_doorbell_v1(&candidate.record.message_id);
-        for (capture, proof) in [
-            (
-                ComposerCapture::Visible(format!("{expected} unexpected")),
-                ComposerProof::Ambiguous,
-            ),
-            (ComposerCapture::Hidden, ComposerProof::Unprovable),
-        ] {
-            let projection = project_composer(
-                Some(ComposerSemantic::HumanInput),
-                Some(&owner),
-                &composer_detection(Some(ComposerSemantic::HumanInput)),
-                false,
-                &binding,
-                Some(recipient),
-                &capture,
-                std::slice::from_ref(&candidate),
-                true,
-            );
-            assert_eq!(projection.state, ComposerState::ComposerAmbiguous);
-            assert_eq!(projection.proof, proof);
-        }
-
-        let projection = project_composer(
-            Some(ComposerSemantic::HumanInput),
-            Some(&owner),
-            &composer_detection(Some(ComposerSemantic::HumanInput)),
-            false,
-            &binding,
-            Some(recipient),
-            &ComposerCapture::Visible(expected),
-            &[candidate.clone(), candidate],
-            true,
-        );
-        assert_eq!(projection.state, ComposerState::ComposerAmbiguous);
-        assert_eq!(projection.proof, ComposerProof::Ambiguous);
-        assert_eq!(projection.reason, Some("multiple_active_notifications"));
-        assert_eq!(projection.candidate_count, 2);
-        assert!(projection.binding.is_none());
-    }
-
-    #[test]
-    fn a_direct_hold_is_not_reported_as_multiple_notifications() {
-        let direct = project_composer(
-            Some(ComposerSemantic::Clean),
-            Some("m-direct#1"),
-            &composer_detection(Some(ComposerSemantic::Clean)),
-            false,
-            &BindingObservation::Unprovable,
-            None,
-            &ComposerCapture::Visible(String::new()),
-            &[],
-            true,
-        );
-        assert_eq!(direct.state, ComposerState::ComposerAmbiguous);
-        assert_eq!(direct.proof, ComposerProof::Unprovable);
-        assert_eq!(direct.reason, Some("direct_delivery_hold_unprovable"));
-        assert_eq!(direct.candidate_count, 0);
-    }
-
-    #[test]
-    fn pane_root_generation_is_required_for_exact_composer_ownership() {
-        let (candidate, recipient, binding) = composer_candidate(NotificationState::Submitted);
-        let owner = candidate.record.attempt_id.to_string();
-        let expected = cyclops_proto::render_doorbell_v1(&candidate.record.message_id);
-        let BindingObservation::Bound(mut replaced_root) = binding.clone() else {
-            unreachable!("composer fixture has a complete binding")
-        };
-        replaced_root.pane_root = crate::identity::ProcId {
-            pid: replaced_root.pane_root.pid,
-            birth: replaced_root.pane_root.birth + 1,
-        };
-        let projection = project_composer(
-            Some(ComposerSemantic::HumanInput),
-            Some(&owner),
-            &composer_detection(Some(ComposerSemantic::HumanInput)),
-            false,
-            &BindingObservation::Bound(replaced_root),
-            Some(recipient),
-            &ComposerCapture::Visible(expected.clone()),
-            std::slice::from_ref(&candidate),
-            true,
-        );
-        assert_eq!(projection.state, ComposerState::ComposerAmbiguous);
-        assert_eq!(projection.proof, ComposerProof::Ambiguous);
-
-        let mut legacy = candidate;
-        legacy
-            .record
-            .binding
-            .as_mut()
-            .expect("composer fixture has a durable binding")
-            .pane_root = None;
-        let projection = project_composer(
-            Some(ComposerSemantic::HumanInput),
-            Some(&owner),
-            &composer_detection(Some(ComposerSemantic::HumanInput)),
-            false,
-            &binding,
-            Some(recipient),
-            &ComposerCapture::Visible(expected),
-            std::slice::from_ref(&legacy),
-            true,
-        );
-        assert_eq!(projection.state, ComposerState::ComposerAmbiguous);
-        assert_eq!(projection.proof, ComposerProof::Unprovable);
-    }
-
-    #[test]
-    fn an_ownerless_legacy_candidate_names_its_missing_durable_binding() {
-        let (mut candidate, recipient, binding) =
-            composer_candidate(NotificationState::AttentionRequired);
-        candidate
-            .record
-            .binding
-            .as_mut()
-            .expect("composer fixture has a durable binding")
-            .pane_root = None;
-        let expected = cyclops_proto::render_doorbell_v1(&candidate.record.message_id);
-
-        let projection = project_composer(
-            Some(ComposerSemantic::HumanInput),
-            None,
-            &composer_detection(Some(ComposerSemantic::HumanInput)),
-            false,
-            &binding,
-            Some(recipient),
-            &ComposerCapture::Visible(expected),
-            std::slice::from_ref(&candidate),
-            true,
-        );
-
-        assert_eq!(projection.state, ComposerState::ComposerAmbiguous);
-        assert_eq!(projection.proof, ComposerProof::Unprovable);
-        assert_eq!(projection.reason, Some("durable_binding_incomplete"));
-        assert_eq!(
-            projection.notification_attempt,
-            Some(candidate.record.attempt_id)
-        );
-    }
-
-    #[test]
     fn claimed_legacy_recovery_requires_semantic_clean_and_exact_visible_empty() {
-        let (candidate, _, _) = composer_candidate(NotificationState::AttentionRequired);
-        let binding = candidate
-            .record
-            .binding
-            .as_ref()
-            .expect("composer fixture has a durable binding");
+        let recipient = RecipientKey::agent(
+            "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            "00000000-0000-4000-8000-000000000002".parse().unwrap(),
+            "%1".parse().unwrap(),
+        );
+        let binding = cyclops_proto::NotificationBinding {
+            recipient,
+            pane_root: Some(ProcessInstanceId::new(69, 1).unwrap()),
+            leader: Some(ProcessInstanceId::new(70, 2).unwrap()),
+            agent: ProcessInstanceId::new(71, 3).unwrap(),
+            manifest: cyclops_proto::NotificationManifestId::new("claude").unwrap(),
+        };
         let clean = composer_detection(Some(ComposerSemantic::Clean));
         assert!(claimed_legacy_recovery_ready(
             &clean,
             false,
             Some("claude"),
-            binding,
+            &binding,
             &ComposerCapture::Visible(String::new()),
         ));
 
@@ -9662,7 +8969,7 @@ regex = ['^']
                 &composer_detection(Some(semantic)),
                 false,
                 Some("claude"),
-                binding,
+                &binding,
                 &ComposerCapture::Visible(String::new()),
             ));
         }
@@ -9676,7 +8983,7 @@ regex = ['^']
                 &clean,
                 false,
                 Some("claude"),
-                binding,
+                &binding,
                 &capture,
             ));
         }
