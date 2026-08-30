@@ -7,11 +7,12 @@ spend a day undoing one.
 For current behavior, start with this map and the behavior contracts below.
 The approved [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md)
 records Track A's scope and stop conditions. Its seven implementation
-milestones are integrated; focused acceptance corrections remain active.
+milestones and focused acceptance corrections are complete, and the charter
+remains their behavior and compatibility authority.
 [NEXT.md](NEXT.md) is the current whole-beta execution queue. The
 [Messaging Beta audit](MESSAGING_BETA_AUDIT.md) preserves the original
-completion evidence and records the acceptance gaps found by independent
-review.
+completion evidence, the independently found gaps, and the evidence that
+closed them.
 
 The
 [messaging architecture review](../MESSAGING_ARCHITECTURE_REVIEW.md) and its
@@ -42,9 +43,11 @@ For current messaging, start with [send.md](../guides/send.md),
 [PROTOCOL.md](../reference/PROTOCOL.md), `src/cyclopsd/src/mailbox.rs`, and
 `src/cyclopsd/src/messaging.rs`. Sections explicitly labeled legacy describe
 the compatibility path used by hook self-tests and old session records, not
-standard `cyclops send`. `src/cyclopsd/src/compatibility.rs` is the explicit
-boundary around retained direct-delivery writers, restart settlement, and
-session-journal readers.
+standard `cyclops send`. `src/cyclopsd/src/compatibility.rs` is the boundary
+around retained direct-delivery writers, restart settlement, and
+`CompatibilityHistoryAdapter`. `WorkspaceMessaging` owns policy for current
+history and threads. The adapter only discovers and replays retained session
+journals.
 
 ## Documentation map
 
@@ -56,9 +59,9 @@ contracts, and historical records separate:
 | User operation | [User guides](../guides/README.md) | Install, message, monitor, recover, and use the workspace. |
 | Stable reference | [Technical reference](../reference/README.md) | Wire methods, manifests, hooks, and measured performance claims. |
 | Current behavior contracts | [Architecture](ARCHITECTURE.md), [delivery](DELIVERY.md), [invariants](INVARIANTS.md), [protocol](../reference/PROTOCOL.md), [goals](GOALS.md), and [style](STYLE.md) | Read before changing product behavior, wire behavior, rendering, or tests. |
-| Approved implementation authority | [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) | Controls Track A when supporting records or historical plans differ. Track 0 will add the whole-product beta charter. |
-| Current execution queue | [NEXT.md](NEXT.md) | Active acceptance work, authorized track order, release boundary, and explicit exclusions. |
-| Messaging beta audit | [Messaging Beta audit](MESSAGING_BETA_AUDIT.md) | Revision-bound architecture, regression, performance, migration, reliability, and journey evidence plus independently found acceptance gaps. |
+| Approved implementation authority | [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) | Controls accepted Track A behavior and compatibility when supporting records or historical plans differ. Track 0 will add the whole-product beta charter. |
+| Current execution queue | [NEXT.md](NEXT.md) | Active track, authorized order, release boundary, and explicit exclusions. |
+| Messaging beta audit | [Messaging Beta audit](MESSAGING_BETA_AUDIT.md) | Revision-bound architecture, regression, performance, migration, reliability, and journey evidence, including the focused Track A acceptance corrections. |
 | Supporting design records | [Messaging architecture review](../MESSAGING_ARCHITECTURE_REVIEW.md) and [addendum](../ADDENDUM_REVIEW.md) | Reasoning behind the charter, not independent implementation authority. |
 | CI design record | [CI and test architecture review](CI_TEST_ARCHITECTURE_REVIEW.md) | Evidence and rationale behind the implemented [CI contract](CI.md), not messaging authority. |
 | General methodology | [Architecture review method](ARCHITECTURE_REVIEW_PROCESS.md) | Reusable audit process, not a Cyclops behavior contract. |

@@ -1,6 +1,6 @@
 # Messaging refactor charter
 
-**Status:** Approved implementation authority
+**Status:** Approved and accepted Track A authority
 
 **Approved:** 2026-08-29
 
@@ -15,6 +15,11 @@ the documented sequence and boundaries, not a broad rewrite. Each production
 milestone still requires its own branch, pull request, regression evidence,
 review, and rollback point. The documentation authority change precedes all
 production work.
+
+Track A's seven milestones and focused acceptance corrections are complete.
+This charter remains the behavior and compatibility authority for that work;
+the whole-product beta charter established by Track 0 will control subsequent
+scope and sequencing without weakening these contracts.
 
 ## 1. Scope
 
@@ -218,6 +223,7 @@ All findings below were checked at the reviewed revision.
 | Exact-owned pane evidence leaves observation as immutable data | A state or composer edge now appends a typed exact-owned observation to the same ordered collection that can carry quota-reset evidence. The daemon composition root applies every item through `WorkspaceMessaging` before presentation. Fusion no longer selects exact-owned candidates, elects a worker, or invokes that consequence directly, and a deletion lint protects the boundary. | Verified behavior preserved by the Milestone 4 exact-owned evidence correction |
 | Readiness route consequences leave observation as immutable data | Source recomputes append typed causal route evidence to the pane result before exact-owned and quota-reset observations. Cache-only hold mutations produce the same type and hand it to the composition root immediately. `WorkspaceMessaging` owns reconciliation; fusion no longer invokes it directly, and a deletion lint protects the boundary. | Verified behavior preserved by the Milestone 4 route-evidence correction |
 | Composer recovery crosses an immutable evidence boundary | Fusion supplies binding, clean-composer, legacy-readiness, and recovered lifecycle-start evidence to a narrow composition-root boundary. The adapter delegates durable probing, reconciliation, retirement, and coordinator decisions to `WorkspaceMessaging`, then returns only the body-free barrier update needed by the serialized cache commit. Fusion and the physical recovery helper can no longer obtain the messaging Module or invoke its policy methods, and a deletion lint protects that boundary. | Verified behavior preserved by the Milestone 4 composer-recovery evidence correction |
+| Current history crosses the messaging Interface | `WorkspaceMessaging::history` and `WorkspaceMessaging::thread` own current journal access, visibility for authenticated readers, workspace-first collision precedence, and canonical body release. The compatibility-history adapter captures only the validated state root and ordered session-journal references for retained cross-journal traversal. Ordinary history callers no longer access `MailboxService`, publication locks, current projections, redaction helpers, or workspace message identifiers. | Verified by the final Track A history-seam correction, focused Module tests, architecture lints, and retained history, identity, privacy, paging, thread, replay, and status regressions |
 | Dispatch ACK confirmation leaves observation as immutable data | Fusion returns exact route, process, manifest, turn, and causal-time evidence after the cache commit and any state event. The composition root applies that body-free evidence through the retained delivery mechanism before ordered messaging observations and presentation. Fusion can no longer access delivery handles or confirm their state, and a deletion lint protects the boundary. | Verified behavior and post-commit ordering preserved by the Milestone 4 dispatch-ACK evidence correction |
 | Current and legacy delivery still coexist | Normal `msg.send` uses the mailbox path. Hook self-test and `Daemon::deliver_payload` cross the explicit compatibility boundary before the retained direct writer. | Repository and local-install census complete; external embedder use unverified |
 | Historical replay has real obligations | Formats 1 and 2, original doorbells, incomplete bindings, legacy direct payloads, and the replay-only historical `Staged` to `Submitted` transition remain readable under explicit restrictions. | Verified compatibility obligation |
@@ -494,6 +500,11 @@ This is a responsibility and locality gate, not an instruction to remove every
 additional pull request remains a focused, independently reviewable slice.
 Presentation ownership of sockets, journals, tmux, or messaging mechanisms is
 the corresponding exit gate for Milestone 6.
+
+The post-completion audit found one remaining read-side ownership gap. This
+correction closes it: `WorkspaceMessaging` now owns current history policy,
+while retained session-journal discovery and replay stay behind the
+compatibility adapter.
 
 Runner, host-adapter, and MCP work are research gates, not production milestones
 in this sequence. They enter a later charter only if their probes pass.

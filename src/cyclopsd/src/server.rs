@@ -40,7 +40,7 @@ use crate::{ack, delivery, fusion, identity, unix_ms, Inner};
 /// Peer credentials captured once per connection, before the stream is
 /// split. None means the kernel could not report them; identity-gated
 /// methods fail closed on it.
-type Peer = Option<identity::PeerConn>;
+pub(crate) type Peer = Option<identity::PeerConn>;
 
 /// A write that does not finish inside this window means the client is
 /// wedged; the connection is dropped rather than buffered without bound.
@@ -1315,36 +1315,6 @@ fn mailbox_admin_required() -> WireError {
     }
 }
 
-fn mailbox_service(inner: &Arc<Inner>) -> Result<Arc<crate::mailbox::MailboxService>, WireError> {
-    inner.mailbox.clone().ok_or_else(|| WireError {
-        code: "mailbox_unavailable".to_string(),
-        message: "durable workspace identity is not connected".to_string(),
-        data: None,
-    })
-}
-
-pub(crate) fn mailbox_caller(
-    inner: &Arc<Inner>,
-    peer: Peer,
-) -> Result<
-    (
-        Arc<crate::mailbox::MailboxService>,
-        crate::mailbox::MailboxIdentity,
-    ),
-    WireError,
-> {
-    let credentials = daemon_peer(peer)?;
-    let _publication = inner
-        .mailbox_publication
-        .lock()
-        .expect("mailbox publication lock");
-    let service = mailbox_service(inner)?;
-    let caller = resolve_mailbox_identity(inner, credentials, service.admin(), |recipient| {
-        service.identity_for_recipient(recipient)
-    })?;
-    Ok((service, caller))
-}
-
 fn resolve_mailbox_identity(
     inner: &Arc<Inner>,
     (uid, pid): (u32, i32),
@@ -1420,6 +1390,33 @@ fn workspace_messaging_caller(
         message: "durable workspace identity is not connected".to_string(),
         data: None,
     })?;
+    let caller = resolve_workspace_messaging_caller(inner, &messaging, credentials)?;
+    Ok((messaging, caller))
+}
+
+pub(crate) fn workspace_messaging_caller_if_available(
+    inner: &Arc<Inner>,
+    peer: Peer,
+) -> Result<
+    Option<(
+        Arc<crate::messaging::WorkspaceMessaging>,
+        crate::mailbox::MailboxIdentity,
+    )>,
+    WireError,
+> {
+    let Some(messaging) = inner.workspace_messaging() else {
+        return Ok(None);
+    };
+    let credentials = daemon_peer(peer)?;
+    let caller = resolve_workspace_messaging_caller(inner, &messaging, credentials)?;
+    Ok(Some((messaging, caller)))
+}
+
+fn resolve_workspace_messaging_caller(
+    inner: &Arc<Inner>,
+    messaging: &crate::messaging::WorkspaceMessaging,
+    credentials: (u32, i32),
+) -> Result<crate::mailbox::MailboxIdentity, WireError> {
     let caller = messaging.with_published(|messaging| {
         resolve_mailbox_identity(
             inner,
@@ -1428,7 +1425,7 @@ fn workspace_messaging_caller(
             |recipient| messaging.identity_for_recipient(recipient),
         )
     })?;
-    Ok((messaging, caller))
+    Ok(caller)
 }
 
 fn mailbox_origin_denied() -> WireError {
@@ -4233,7 +4230,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_messaging_caller_waits_for_route_publication() {
+    fn optional_workspace_messaging_caller_waits_for_route_publication() {
         let (inner, path) = inner_with_mailbox("workspace-messaging-publication");
         let peer = own_peer();
         let messaging = inner.workspace_messaging().unwrap();
@@ -4245,7 +4242,7 @@ mod tests {
                 let inner = Arc::clone(&inner);
                 let reader = scope.spawn(move || {
                     started_tx.send(()).unwrap();
-                    let _ = workspace_messaging_caller(&inner, peer);
+                    let _ = workspace_messaging_caller_if_available(&inner, peer);
                     done_tx.send(()).unwrap();
                 });
                 started_rx.recv().unwrap();

@@ -1,12 +1,12 @@
 # Messaging Beta Rework audit
 
-**Status:** Acceptance corrections in progress
+**Status:** Track A accepted
 
 **Audit date:** 2026-08-30
 
 **Historical product revision reviewed:** `a1dfa125419bb59a6d2434e30bfed9a5449a615e`
 
-**Acceptance-correction base:** `f866266ae356be7db0d8688c4b8cff647552f06a`
+**History-seam base:** `f8946a5bee00df27ad7b4368db129737abd09e5f`
 
 **Stable comparison revision:** `8e40102a538ba1f6364df093658cb5cdd25286de`
 
@@ -22,15 +22,18 @@ fail-before evidence.
 The seven messaging implementation milestones and the three-task CI workstream
 are integrated. Their durable frame, transport, mailbox, observation,
 compatibility, presentation, and visibility behavior remains in place.
-Track A is not accepted yet: the read-side history path still reaches current
-mailbox authorization, projection, and publication knowledge outside
-`WorkspaceMessaging`. That correction is scheduled as the next focused pull
-request.
+Track A is accepted. Named `WorkspaceMessaging` operations now own current
+history and threads, visibility and body release for authenticated readers,
+and current-over-legacy ID collision rules.
 
-This correction repairs architecture lints that previously stopped at early
-test-only items, aligns daemon-client and application recovery ownership,
-adds component coverage for the collapsed cue when a fresh workspace attaches
-after detach, and restores the current documentation queue.
+Retained cross-journal discovery and rename-linked replay use
+`CompatibilityHistoryAdapter`. It captures only the state root and per-session
+journal references needed for replay.
+
+The correction pass repaired source-boundary lints, clarified client and
+application recovery ownership, added collapsed-cue coverage across detach and
+reattach, closed the current-history seam, and aligned the execution docs.
+
 `WorkspaceMessaging` still cannot traverse `Inner`; retained daemon-root access
 belongs to composition and physical notification, terminal, and lifecycle
 adapters.
@@ -76,7 +79,7 @@ Module deletion boundaries, historical doorbell and rename-linked replay,
 collapsed-rail rendering, hidden invalidation refresh, lost-response
 uncertainty, and oversized-response classification.
 
-The acceptance correction adds two focused pieces of present evidence. A small
+The acceptance correction adds focused present evidence. A small
 source simulation fails against the old first-`#[cfg(test)]` boundary because
 that boundary hides the inserted forbidden reference. It passes with the main
 test-module boundary, which keeps the later production region in the audited
@@ -87,6 +90,15 @@ resulting authenticated body-free snapshot restores Work and attention counts
 without opening the Messages pane. That regression protects current behavior;
 no historical fail-before result is claimed for it.
 
+The history-seam change includes an architecture guard that was confirmed to
+fail before implementation. Its focused tests exercise the real
+`WorkspaceMessaging` history and thread operations.
+
+Together with the retained regressions, the tests cover current-over-legacy
+collision rules, body release after an exact claim, unrelated-reader
+redaction, metadata-less compatibility records, legacy-only cursors,
+linked-journal ordering, and read-loss reporting.
+
 ## Milestone disposition
 
 | Milestone | Integrated pull requests | Audit result |
@@ -94,7 +106,7 @@ no historical fail-before result is claimed for it.
 | Documentation authority | #101 | Verified. The charter, authority hierarchy, execution queue, raw-tmux doctrine, and shipped skill agree. |
 | 1. Bounded official frames | #103 | Verified. Official ingress, egress, blocking clients, and async clients share a 1,048,576-byte JSON-object limit, excluding the newline. Historical journal readers are not subject to the live frame ceiling. |
 | 2. Shared Daemon Client | #104 | Verified with corrected ownership. `cyclops-client` owns connection facts, greeting, framing, correlation, shared timeout defaults and certainty, refusal decoding, post-write uncertainty, and stream gaps. Callers choose or accept those deadlines; applications own retry schedules and projection restoration. |
-| 3. `WorkspaceMessaging` | #107, #111-#127, #133 | Acceptance pending one read-side seam. Mutation families, projections, worker selection, recovery policy, and post-commit scheduling moved behind the Module. Current history and thread composition still need to cross the Module while cross-journal history remains an explicit compatibility concern. |
+| 3. `WorkspaceMessaging` | #107, #111-#127, #133 plus the final history seam | Verified. Mutation families, projections, worker selection, recovery policy, post-commit scheduling, current history and thread composition, body redaction, and current collision ownership live behind the Module. Cross-journal discovery and replay remain an explicit compatibility concern. |
 | 4. Observation separation | #109, #128-#132 | Verified. Fusion returns ordered immutable route, composer, ownership, recovery, and ACK evidence. The composition root applies that evidence after observation instead of letting observation execute messaging policy. |
 | 5. Compatibility quarantine | #110 | Verified. Current mailbox work and retained direct delivery cross distinct paths; replay readers and fixtures remain. `Daemon::deliver_payload` is preserved as compatibility-sensitive with public support status unverified. |
 | 6. Honest seams | #134 | Verified. Snapshot, ephemeral events, durable follow, gaps, and recovery have distinct contracts. Reusable presentation does not own daemon framing, journal traversal, or tmux effects. |
@@ -108,11 +120,15 @@ no historical fail-before result is claimed for it.
 - `WorkspaceMessaging` owns `MailboxService`, the publication boundary, and a
   narrow post-commit effects capability. It does not own or receive `Inner`.
 - Normal mutation and projection handlers authenticate and call named
-  `WorkspaceMessaging` operations. They do not coordinate worker topology or
-  schedule post-commit work. `msg.history` and `msg.thread` are the recorded
-  exception: their current-workspace authorization, projection, and
-  publication knowledge must move behind the Module, while cross-journal
-  reading remains behind a compatibility-history adapter.
+  `WorkspaceMessaging` operations. They do not coordinate worker topology,
+  schedule post-commit work, read the current message journal, interpret body
+  release, or inspect current collision ownership. `msg.history` and
+  `msg.thread` receive authenticated identities and immutable compatibility
+  sources; current messaging policy remains inside the Module.
+- `CompatibilityHistoryAdapter` captures only the validated state root and
+  ordered session-journal references. It owns legacy source discovery,
+  rename-linked traversal, stable cursor source names, and read-loss counts.
+  It cannot traverse live panes or current mailbox state after capture.
 - Delivery and attention mechanisms report physical or durable outcomes to
   `WorkspaceMessaging`; they do not decide the next durable messaging policy.
 - Fusion returns typed immutable observations. It cannot obtain the messaging
@@ -254,23 +270,18 @@ as zero. The workflow did not merge, tag, name, or publish anything.
 
 ## Open gates and explicit non-results
 
-1. **Track A read-side ownership is incomplete.** Current `msg.history` and
-   `msg.thread` handling still reaches mailbox authorization, current
-   projection, and publication knowledge outside `WorkspaceMessaging`.
-   Cross-journal history is a retained compatibility concern, not permission
-   for ordinary current-message callers to recover those internals.
-2. **Release identity is unresolved.** The newest remote tag by creator date is
+1. **Release identity is unresolved.** The newest remote tag by creator date is
    `v0.2.0-beta` from 2026-08-27, the repository has no GitHub Release objects,
    and the workspace version remains `0.1.0`. These authorities must be
    reconciled before naming or publishing a release.
-3. **External support for `Daemon::deliver_payload` is unverified.** This blocks
+2. **External support for `Daemon::deliver_payload` is unverified.** This blocks
    deletion or substantial change, not the completed internal quarantine.
-4. **A complete data-lifecycle policy is deferred.** The interim no-silent-loss
+3. **A complete data-lifecycle policy is deferred.** The interim no-silent-loss
    rule remains binding.
-5. **Agent Runner, host-adapter, MCP, distributed broker, and generic workflow
+4. **Agent Runner, host-adapter, MCP, distributed broker, and generic workflow
    work is not implemented.** Those were research gates or explicit non-goals,
    not missing beta milestones.
-6. **No claim is made that terminal injection can be absolutely race-free.**
+5. **No claim is made that terminal injection can be absolutely race-free.**
    The final pre-write check still leaves a small interval before the terminal
    write; composer ownership, durable intent, and conservative recovery remain
    the protections around that interval.
@@ -278,16 +289,10 @@ as zero. The workflow did not merge, tag, name, or publish anything.
 ## Current acceptance and release boundary
 
 The retained release run is historical evidence for its exact commit, not the
-final whole-product beta gate. The authorized next actions are:
-
-1. merge the focused evidence and documentation correction after independent
-   review and required checks;
-2. complete the current-history seam in
-   **beta/refactor/messaging-history-seam** with preserved authorization,
-   redaction, ordering, and replay;
-3. obtain independent review of the corrected Track A claims; and
-4. continue into Track 0 to establish the whole-product beta charter and
-   execution authority in the repository.
+final whole-product beta gate. Track A now satisfies the corrected acceptance
+criteria. The authorized next action is Track 0: establish the whole-product
+beta charter and execution authority in the repository, then begin the first
+direct user-correctness tracer from that approved queue.
 
 Keep **beta/messaging-rework** as the integration branch. Explicit operator
 approval is still required before merging it into `main`, creating or moving a

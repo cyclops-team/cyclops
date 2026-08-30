@@ -5,27 +5,36 @@
 **Integration branch:** **beta/messaging-rework**
 
 The approved [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md)
-continues to control Track A behavior and stop conditions. The operator has
-authorized the rest of the whole-product beta program. Track 0 will record that
-authority in `CYCLOPS_BETA_CHARTER.md`; until then, this queue records the
-authorized sequence without reopening already approved Track A decisions.
+continues to control accepted Track A behavior and stop conditions. The
+operator has authorized the rest of the whole-product beta program. Track 0
+will record that authority in `CYCLOPS_BETA_CHARTER.md`; until then, this queue
+records the authorized sequence without reopening Track A decisions.
+
+## Accepted Track A
+
+Track A's seven implementation milestones and its focused acceptance
+corrections are complete. The correction pass:
+
+1. repaired source-boundary lints that stopped at early test-only items;
+2. made current status, CI, client responsibility, and evidence language agree;
+3. protected the body-free collapsed cue across detach and a fresh workspace
+   attachment;
+4. routed current history, thread, redaction, and legacy-collision ownership
+   through `WorkspaceMessaging`;
+5. confined cross-journal discovery and replay to the narrow
+   `CompatibilityHistoryAdapter`; and
+6. received independent review of the corrected claims.
+
+The audit-integrity correction and the production history seam remain separate
+rollback points. Current messaging contracts, readable journals, authorization,
+redaction, paging, replay, and all three visibility choices remain preserved.
 
 ## Active work
 
-Track A's seven implementation milestones are integrated. Acceptance remains
-open for the focused corrections found by the post-completion review:
-
-1. repair source-boundary lints that stopped at early test-only items;
-2. make current status, CI, client responsibility, and evidence language agree;
-3. protect the body-free collapsed cue across detach and a fresh workspace
-   attachment;
-4. route current history and thread knowledge through `WorkspaceMessaging`,
-   keeping cross-journal history behind an explicit compatibility adapter; and
-5. obtain independent review of the corrected claims.
-
-The active branch is **beta/fix/messaging-beta-audit-integrity**. The read-side
-production seam follows on **beta/refactor/messaging-history-seam** so audit
-repair and durable history behavior remain independent rollback points.
+Create **beta/docs/whole-beta-authority** from the latest
+**beta/messaging-rework** and complete Track 0. Establish the whole-product beta
+charter, reconcile the documentation hierarchy, and name
+**beta/fix/tmux-focus-context** as the first production tracer.
 
 ## Authorized sequence after Track A
 

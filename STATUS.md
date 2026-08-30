@@ -5,6 +5,13 @@ Updated 2026-08-30. Cyclops is pre-release software at workspace version
 beta integration line. The shell/Python implementation remains available as
 the read-only `v1-final` tag.
 
+Track A, the Messaging Beta Rework, is accepted. `WorkspaceMessaging` now owns
+current durable messaging policy. Retained session-journal discovery and replay
+go through the narrow compatibility-history adapter.
+
+Track 0 is next: it establishes the whole-product beta charter. No final
+version or release name has been assigned.
+
 ## Built
 
 - A Rust daemon (`cyclopsd`) watches tmux panes without polling, combines

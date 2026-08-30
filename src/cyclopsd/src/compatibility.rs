@@ -11,12 +11,13 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use cyclops_ledger::LedgerWriter;
 use cyclops_proto::{LedgerLine, MsgSendParams, WireError};
 use cyclops_state::StateRoot;
 use serde_json::Value;
 use tracing::{error, warn};
 
-use crate::{delivery, Inner, SessionSlot};
+use crate::{delivery, Inner};
 
 /// Capability proving that a direct-delivery writer entered through this
 /// compatibility boundary. The field and the only value stay private here, so
@@ -50,9 +51,73 @@ pub(crate) struct SessionJournalReplay {
     pub(crate) unreadable_sources: usize,
 }
 
-pub(crate) struct HistorySources {
+pub(crate) struct CompatibilityHistorySources {
     pub(crate) files: Vec<(String, Vec<LedgerLine>)>,
     pub(crate) unreadable_sources: usize,
+}
+
+struct CompatibilityHistoryRoot {
+    owner: usize,
+    name: String,
+    journal: String,
+    ledger: Arc<LedgerWriter>,
+}
+
+/// Narrow adapter for retained pre-workspace session journals.
+///
+/// The adapter captures only the validated state root and ordered ledger
+/// handles needed for compatibility traversal. A history read cannot reach
+/// live panes, the mailbox projection, or any other daemon state through it.
+pub(crate) struct CompatibilityHistoryAdapter {
+    state_root: Arc<StateRoot>,
+    roots: Vec<CompatibilityHistoryRoot>,
+}
+
+impl CompatibilityHistoryAdapter {
+    pub(crate) fn capture(inner: &Inner) -> Self {
+        let roots = inner
+            .session_slots()
+            .into_iter()
+            .enumerate()
+            .map(|(owner, slot)| CompatibilityHistoryRoot {
+                owner,
+                name: slot.name(),
+                journal: slot.journal_file_name().unwrap_or_default(),
+                ledger: Arc::clone(&slot.ledger),
+            })
+            .collect();
+        Self {
+            state_root: Arc::clone(&inner.state_root),
+            roots,
+        }
+    }
+
+    /// Read retained sources in their historical order and count unreadable
+    /// sources. Source labels are encoded in `cursor2`, so changing a label
+    /// invalidates an active history cursor.
+    pub(crate) fn read(&self) -> CompatibilityHistorySources {
+        let mut unreadable_sources = 0;
+        let roots = self
+            .roots
+            .iter()
+            .map(|root| {
+                let (lines, unreadable) = read_session(&root.name, &root.ledger);
+                unreadable_sources += usize::from(unreadable);
+                (root.owner, root.journal.clone(), lines)
+            })
+            .collect();
+        let replay = session_journal_replay(&self.state_root, roots);
+        unreadable_sources = unreadable_sources.saturating_add(replay.unreadable_sources);
+        let files = replay
+            .files
+            .into_iter()
+            .map(|(journal, lines)| (format!("session-journal:{journal}"), lines))
+            .collect();
+        CompatibilityHistorySources {
+            files,
+            unreadable_sources,
+        }
+    }
 }
 
 struct SessionJournalNode {
@@ -60,44 +125,6 @@ struct SessionJournalNode {
     lines: Vec<LedgerLine>,
     links: Vec<String>,
     owners: BTreeSet<usize>,
-}
-
-/// Return retained session-journal sources for the history read model.
-///
-/// The source label is intentionally part of the compatibility boundary so a
-/// current reader does not need to know how old session journals are named or
-/// linked.
-pub(crate) fn history_sources(inner: &Inner) -> Vec<(String, Vec<LedgerLine>)> {
-    history_sources_report(inner).files
-}
-
-/// The retained history sources plus explicit read loss for presentation.
-///
-/// Ordinary history keeps its compatibility behavior, while a bounded UI
-/// projection can tell the operator that a named source was unreadable.
-pub(crate) fn history_sources_report(inner: &Inner) -> HistorySources {
-    let mut unreadable_sources = 0;
-    let roots = inner
-        .session_slots()
-        .into_iter()
-        .enumerate()
-        .map(|(idx, slot)| {
-            let (lines, unreadable) = read_session(&slot);
-            unreadable_sources += usize::from(unreadable);
-            (idx, slot.journal_file_name().unwrap_or_default(), lines)
-        })
-        .collect();
-    let replay = session_journal_replay(&inner.state_root, roots);
-    unreadable_sources = unreadable_sources.saturating_add(replay.unreadable_sources);
-    let files = replay
-        .files
-        .into_iter()
-        .map(|(journal, lines)| (format!("session-journal:{journal}"), lines))
-        .collect();
-    HistorySources {
-        files,
-        unreadable_sources,
-    }
 }
 
 /// Root session journals plus every rename-linked journal they reach.
@@ -279,11 +306,11 @@ fn valid_session_journal_file(file: &str) -> bool {
         .is_some_and(|extension| extension == "ndjson")
 }
 
-fn read_session(slot: &SessionSlot) -> (Vec<LedgerLine>, bool) {
-    match slot.ledger.read_after(0) {
+fn read_session(name: &str, ledger: &LedgerWriter) -> (Vec<LedgerLine>, bool) {
+    match ledger.read_after(0) {
         Ok(lines) => (lines, false),
         Err(error) => {
-            warn!(session = %slot.name(), error = %error, "compatibility history read failed; treating as empty");
+            warn!(session = %name, error = %error, "compatibility history read failed; treating as empty");
             (Vec::new(), true)
         }
     }
@@ -382,6 +409,60 @@ mod tests {
                 .map(|line| line.id.as_str())
                 .collect::<Vec<_>>(),
             ["child", "root"]
+        );
+    }
+
+    #[test]
+    fn compatibility_history_adapter_preserves_link_order_and_reports_read_loss() {
+        let scratch = Scratch::new("adapter");
+        let root = Arc::new(scratch.root());
+        write_journal(&root, "child.ndjson", &[line("child")]);
+        std::fs::create_dir_all(root.path().join("ledger/unreadable.ndjson"))
+            .expect("unreadable linked source directory is created");
+
+        let root_ledger = Arc::new(
+            LedgerWriter::open(&root, Path::new("ledger/root.ndjson"), "boot")
+                .expect("root ledger opens"),
+        );
+        root_ledger
+            .append(link("root", "child.ndjson"))
+            .expect("root link appends");
+        root_ledger
+            .append(link("unreadable", "unreadable.ndjson"))
+            .expect("unreadable link appends");
+
+        let report = CompatibilityHistoryAdapter {
+            state_root: Arc::clone(&root),
+            roots: vec![CompatibilityHistoryRoot {
+                owner: 0,
+                name: "root".into(),
+                journal: "root.ndjson".into(),
+                ledger: root_ledger,
+            }],
+        }
+        .read();
+
+        assert_eq!(report.unreadable_sources, 1);
+        assert_eq!(
+            report
+                .files
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "session-journal:child.ndjson",
+                "session-journal:unreadable.ndjson",
+                "session-journal:root.ndjson",
+            ]
+        );
+        assert_eq!(
+            report
+                .files
+                .iter()
+                .flat_map(|(_, lines)| lines.iter())
+                .filter(|line| line.id == "child")
+                .count(),
+            1
         );
     }
 
