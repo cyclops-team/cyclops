@@ -8290,6 +8290,30 @@ mod tests {
             !app.messages_gate.may_mutate(),
             "the retained cue must be labeled stale"
         );
+
+        app.messages_gate.disconnected();
+        app.messages_gate.connected();
+        pump_messages_refresh(&mut app);
+        let (reconnect_request, reconnect_bound) = rx
+            .try_recv()
+            .expect("a hidden reconnect must rebuild the authorized cue");
+        assert_eq!(reconnect_bound, 128);
+        assert!(install_messages_snapshot(
+            &mut app,
+            reconnect_request,
+            messages_snapshot(8, 2, 0),
+        ));
+        assert_eq!(
+            app.messages_snapshot_counts
+                .expect("reconnected counts")
+                .work_messages,
+            2
+        );
+        assert!(app.messages_gate.may_mutate());
+        assert!(
+            !app.model.messages_visible,
+            "reconnecting forced the Messages pane open"
+        );
         let _ = std::fs::remove_dir_all(home);
     }
 
