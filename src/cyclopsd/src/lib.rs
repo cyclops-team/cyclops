@@ -85,7 +85,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cyclops_ledger::LedgerWriter;
@@ -287,9 +287,8 @@ pub(crate) struct Inner {
     pub(crate) session_identities: StdMutex<sessionstore::SessionIdentities>,
     pub(crate) mailbox: Option<Arc<mailbox::MailboxService>>,
     /// The internal durable messaging Module. It is initialized on first use
-    /// after `Inner` exists so its daemon-effects adapter can hold only a
-    /// `Weak<Inner>` rather than creating a second owner of the composition
-    /// root.
+    /// at this composition root. The Module receives named post-commit
+    /// capabilities and cannot traverse daemon state itself.
     pub(crate) workspace_messaging: OnceLock<Arc<messaging::WorkspaceMessaging>>,
     /// Boot-scoped reconciliation state for barriers derived from the
     /// canonical workspace projection.
@@ -429,6 +428,132 @@ pub(crate) struct Inner {
     /// alongside `Daemon.tasks` so a session added at runtime shuts down
     /// exactly as cleanly as one that was configured.
     pub(crate) extra_tasks: StdMutex<Vec<JoinHandle<()>>>,
+}
+
+/// Composition-root adapter for the post-commit capabilities requested by
+/// `WorkspaceMessaging`.
+///
+/// The durable operation Module sees only `WorkspaceMessagingEffects`. Keeping
+/// the daemon-root upgrade here prevents operation code from reaching through
+/// `Inner` for unrelated state while preserving a non-owning cycle boundary.
+struct DaemonWorkspaceMessagingEffects {
+    inner: Weak<Inner>,
+    events: broadcast::Sender<Event>,
+    receipt_block: Duration,
+}
+
+impl DaemonWorkspaceMessagingEffects {
+    fn new(inner: &Arc<Inner>) -> Self {
+        Self {
+            inner: Arc::downgrade(inner),
+            events: inner.events.clone(),
+            receipt_block: Duration::from_millis(inner.cfg.receipt_block_ms),
+        }
+    }
+
+    fn inner(&self) -> Result<Arc<Inner>, mailbox::MailboxServiceError> {
+        self.inner.upgrade().ok_or_else(|| {
+            mailbox::MailboxServiceError::NotificationSchedule(
+                "daemon messaging effects are unavailable".to_string(),
+            )
+        })
+    }
+}
+
+impl messaging::WorkspaceMessagingEffects for DaemonWorkspaceMessagingEffects {
+    fn subscribe_messages_changed(&self) -> broadcast::Receiver<Event> {
+        self.events.subscribe()
+    }
+
+    fn schedule_notification(
+        &self,
+        service: &Arc<mailbox::MailboxService>,
+        recipient: RecipientKey,
+    ) -> Result<messaging::RecipientScheduleOutcome, mailbox::MailboxServiceError> {
+        messaging::schedule_recipient(&self.inner()?, service, recipient)
+    }
+
+    fn invalidate_unread(&self, recipient: RecipientKey) {
+        if let Some(inner) = self.inner.upgrade() {
+            schedule_recipient_unread(&inner, recipient);
+        }
+    }
+
+    fn notification_pane(
+        &self,
+        service: &mailbox::MailboxService,
+        recipient: RecipientKey,
+    ) -> Result<Option<String>, mailbox::MailboxServiceError> {
+        let Some(inner) = self.inner.upgrade() else {
+            return Ok(None);
+        };
+        Ok(messaging::notification_route(&inner, service, recipient)?.map(|route| route.pane_id))
+    }
+
+    fn settle_notification_claim(&self, attempt_id: NotificationAttemptId) {
+        if let Some(inner) = self.inner.upgrade() {
+            delivery::settle_notification_claim(&inner, attempt_id);
+        }
+    }
+
+    fn observe_claimed_composer(
+        &self,
+        service: &Arc<mailbox::MailboxService>,
+        claimant: RecipientKey,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<(), mailbox::MailboxServiceError> {
+        messaging::schedule_claimed_composer_observation(
+            &self.inner()?,
+            service,
+            claimant,
+            attempt_id,
+        )
+    }
+
+    fn recover_claimed_notification(
+        &self,
+        service: &Arc<mailbox::MailboxService>,
+        claimant: RecipientKey,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<(), mailbox::MailboxServiceError> {
+        messaging::schedule_claimed_notification_recovery(
+            &self.inner()?,
+            service,
+            claimant,
+            attempt_id,
+        )
+    }
+
+    fn cancel_notification(&self, attempt_id: NotificationAttemptId) {
+        if let Some(inner) = self.inner.upgrade() {
+            inner.engine.cancel_notification(attempt_id);
+        }
+    }
+
+    fn reconcile_claimed_recipient(&self, claimant: RecipientKey) {
+        if let Some(inner) = self.inner.upgrade() {
+            attention_resolution::schedule_exact_owned_reconciliation(&inner, claimant);
+        }
+    }
+
+    fn receipt_block(&self) -> Duration {
+        self.receipt_block
+    }
+}
+
+impl Inner {
+    pub(crate) fn workspace_messaging(
+        self: &Arc<Self>,
+    ) -> Option<Arc<messaging::WorkspaceMessaging>> {
+        let service = self.mailbox.clone()?;
+        Some(Arc::clone(self.workspace_messaging.get_or_init(|| {
+            Arc::new(messaging::WorkspaceMessaging::new(
+                service,
+                Arc::clone(&self.mailbox_publication),
+                Arc::new(DaemonWorkspaceMessagingEffects::new(self)),
+            ))
+        })))
+    }
 }
 
 pub(crate) struct ForceSubmitRuntime {

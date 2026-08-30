@@ -83,9 +83,13 @@ mailbox routes, unread counts, held attention, and the bounded blocked-wake
 sample. Status composition keeps the legacy session-ledger fold separate, but
 does not inspect mailbox variants, directory fallbacks, or notification
 indexes.
-The daemon composition root supplies those downstream actions through one
-narrow effects capability. The Module does not wrap `Arc<Inner>`, and it remains
-internal to `cyclopsd`; no messaging crate has been extracted.
+The daemon composition root in `src/cyclopsd/src/lib.rs` constructs the Module
+and supplies those downstream actions through one narrow effects capability.
+Only that composition adapter may upgrade the non-owning daemon-root reference;
+the `WorkspaceMessaging` operation code can name capabilities but cannot
+traverse `Inner`. The Module remains internal to `cyclopsd`; no messaging crate
+has been extracted. Runtime scheduling helpers still accept the daemon root and
+remain an explicit Milestone 3 completion target.
 
 The append and sync inside `MailboxService` are still the acceptance boundary.
 Notification and pane chrome remain effects of that durable fact, never a
