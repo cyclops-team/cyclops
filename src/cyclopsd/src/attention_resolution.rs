@@ -92,15 +92,20 @@ pub(crate) async fn resolve(
     let target = messaging.attention_for_resolution(caller, raw)?;
     let service = messaging.attention_service();
     let result = resolve_selected(inner, messaging, &service, &target, resolution, false).await;
-    if service
-        .resume_exact_reconciliation(target.record.attempt_id)
-        .unwrap_or(false)
-    {
-        if let Some(messaging) = inner.workspace_messaging() {
-            spawn_exact_owned_worker(inner, messaging, service, target.record.attempt_id);
-        }
-    }
+    messaging.resume_exact_attention_reconciliation(target.record.attempt_id);
     result.map_err(Into::into)
+}
+
+/// Execute one Module-selected automatic resolution through the same exact
+/// proof and settlement path as an explicit operator action.
+pub(crate) async fn resolve_automatic(
+    inner: &Arc<Inner>,
+    messaging: &WorkspaceMessaging,
+    target: &AttentionTarget,
+    resolution: NotificationResolution,
+) -> Result<AttentionResolveResult, AttentionActionError> {
+    let service = messaging.attention_service();
+    resolve_selected(inner, messaging, &service, target, resolution, true).await
 }
 
 /// Press the manifest submit key once for an exact verify-failed notification
@@ -264,101 +269,6 @@ fn force_action_route(
         row: route.row,
         manifest,
     })
-}
-
-/// Reconcile exact Cyclops-owned composer content after relevant evidence moves.
-///
-/// The durable mailbox selects submit for pending work and clear for a claim
-/// ordered after the write. Every terminal action still passes through the
-/// same proof, intent, acceptance, and settlement path as an explicit action.
-pub(crate) fn schedule_exact_owned_reconciliation(
-    inner: &Arc<Inner>,
-    recipient: cyclops_proto::RecipientKey,
-) {
-    let Some(messaging) = inner.workspace_messaging() else {
-        return;
-    };
-    let service = messaging.attention_service();
-    let Ok(candidates) = service.active_composer_notifications(recipient) else {
-        return;
-    };
-    if tokio::runtime::Handle::try_current().is_err() {
-        return;
-    }
-    for attempt_id in candidates
-        .into_iter()
-        .filter(|candidate| candidate.record.needs_exact_owned_reconciliation())
-        .map(|candidate| candidate.record.attempt_id)
-    {
-        if service
-            .request_exact_reconciliation(attempt_id)
-            .unwrap_or(false)
-        {
-            spawn_exact_owned_worker(
-                inner,
-                Arc::clone(&messaging),
-                Arc::clone(&service),
-                attempt_id,
-            );
-        }
-    }
-}
-
-fn spawn_exact_owned_worker(
-    inner: &Arc<Inner>,
-    messaging: Arc<WorkspaceMessaging>,
-    service: Arc<MailboxService>,
-    attempt_id: cyclops_proto::NotificationAttemptId,
-) {
-    let task_inner = Arc::clone(inner);
-    inner.engine.spawn_descendant_task(async move {
-        while service
-            .take_exact_reconciliation_request(attempt_id)
-            .unwrap_or(false)
-        {
-            delivery::inject_pause(&task_inner, "automatic_attention_before_resolve").await;
-            let target = match service.attention_target(&attempt_id.to_string()) {
-                Ok(target) => target,
-                Err(_) => continue,
-            };
-            let resolution = match service.automatic_attention_resolution(&target) {
-                Ok(Some(resolution)) => resolution,
-                Ok(None) | Err(_) => continue,
-            };
-            match resolve_selected(&task_inner, &messaging, &service, &target, resolution, true)
-                .await
-            {
-                Ok(result) => tracing::info!(
-                    %attempt_id,
-                    resolution = ?result.resolution,
-                    "exact-owned composer notification reconciled"
-                ),
-                Err(AttentionActionError::Evidence(_)) => {}
-                Err(AttentionActionError::ForceRefused(_)) => {}
-                Err(AttentionActionError::Uncertain) => tracing::warn!(
-                    %attempt_id,
-                    "exact-owned composer reconciliation remains uncertain"
-                ),
-                Err(AttentionActionError::DiscardUnsupported) => tracing::warn!(
-                    %attempt_id,
-                    "exact-owned composer cannot be cleared by this manifest"
-                ),
-                Err(AttentionActionError::Store(error)) => {
-                    if error.notification_resolution_in_progress() {
-                        match service.park_exact_reconciliation_after_conflict(attempt_id) {
-                            Ok(true) => continue,
-                            Ok(false) | Err(_) => return,
-                        }
-                    }
-                    tracing::debug!(
-                        %attempt_id,
-                        %error,
-                        "exact-owned composer reconciliation did not start"
-                    );
-                }
-            }
-        }
-    });
 }
 
 async fn resolve_selected(
