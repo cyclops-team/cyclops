@@ -111,6 +111,30 @@ timing, tmux, or a mutation framework. After the repair, the real Backspace
 journey passed 40 bounded concurrent repetitions and the current 41-test
 messaging coordinator passed 10 bounded four-thread repetitions.
 
+A follow-up required run
+[33323429830](https://github.com/cyclops-team/cyclops/actions/runs/33323429830)
+showed that the regression still waited beyond the contract it named. After
+observing the positive readiness edge, it also waited for the worker to reach
+the final pre-write boundary, stage the terminal doorbell, and pause before
+submit. Those later phases prove terminal injection and presentation, not that
+Backspace released the held attempt, and the pre-write wait exhausted its
+20-second bound under runner load. The regression now stops at the exact
+message-specific `gate: proceed` event produced by that readiness edge and
+asserts that the attempt identity did not change. Focused tests separately
+protect staged notification bytes, body-free doorbells, and reopened-attempt
+injection.
+
+This follow-up removed two injected phase semaphores and one terminal capture;
+it added no sleep and did not increase a timeout. Disabling the production rule
+that retires an unowned human-input hold after settled visible emptiness made
+the narrowed regression fail on the missing readiness event, then restoring
+the rule made it pass. The restored test passed 20 serial repetitions, 80
+focused repetitions at eight-way process concurrency, and ten complete
+four-thread coordinator repetitions. The complete coordinator averaged 15.17s
+before and 15.42s after locally, which is no meaningful wall-time change; the
+gain is removal of a false 20-second terminal-scheduling dependency. No defect
+class moved to scheduled or release evidence.
+
 ## Task 3 representative pull-request comparison
 
 Messaging Milestone 3 provided the first post-merge product change whose diff
