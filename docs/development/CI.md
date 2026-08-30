@@ -239,8 +239,8 @@ disposable beta trigger branch at the exact integration commit:
 
 ```bash
 git fetch origin beta/messaging-rework
-git push origin \
-  refs/remotes/origin/beta/messaging-rework:refs/heads/beta/test/release-evidence
+release_sha="$(git rev-parse refs/remotes/origin/beta/messaging-rework)"
+git push origin "$release_sha":refs/heads/beta/test/release-evidence
 ```
 
 Identify, watch, and inspect the resulting `release evidence` run before
@@ -250,8 +250,12 @@ removing the trigger branch:
 release_run="$(gh run list \
   --branch beta/test/release-evidence \
   --limit 20 \
-  --json databaseId,workflowName \
-  --jq '[.[] | select(.workflowName == "release evidence")][0].databaseId')"
+  --json databaseId,headSha,workflowName \
+  --jq "[.[] | select(.workflowName == \"release evidence\" and .headSha == \"$release_sha\")][0].databaseId")"
+if [ -z "$release_run" ]; then
+  echo "release evidence for $release_sha is not registered yet" >&2
+  exit 1
+fi
 gh run watch "$release_run" --exit-status
 gh run view "$release_run"
 git push origin --delete beta/test/release-evidence
@@ -271,7 +275,7 @@ merging **beta/messaging-rework** into **main** or publishing a release.
 
 The representative comparison above fulfills the final Task 3 measurement: it
 uses the first post-merge messaging pull request whose diff did not change CI
-control files. The evidence-lanes exact-head run
+control files. An earlier workflow-control run at commit `5f96cc4`,
 [33288631738](https://github.com/cyclops-team/cyclops/actions/runs/33288631738)
 correctly selected every lane because it changed the workflow itself. That
 control run completed in 6m44s wall time and 21m13s runner time, but it is proof
