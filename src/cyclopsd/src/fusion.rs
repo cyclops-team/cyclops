@@ -3570,6 +3570,9 @@ pub(crate) enum PaneMessagingObservation {
     RouteEvidenceObserved {
         evidence: crate::messaging::MessagingRouteEvidence,
     },
+    PaneSizeChanged {
+        evidence: crate::messaging::MessagingPaneSizeEvidence,
+    },
     QuotaResetObserved {
         recipient: RecipientKey,
         session_idx: usize,
@@ -3583,6 +3586,10 @@ pub(crate) enum PaneMessagingObservation {
 impl PaneMessagingObservation {
     pub(crate) fn route_evidence(evidence: crate::messaging::MessagingRouteEvidence) -> Self {
         Self::RouteEvidenceObserved { evidence }
+    }
+
+    pub(crate) fn pane_size_changed(evidence: crate::messaging::MessagingPaneSizeEvidence) -> Self {
+        Self::PaneSizeChanged { evidence }
     }
 
     pub(crate) fn quota_reset(

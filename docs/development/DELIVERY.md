@@ -409,6 +409,14 @@ mutations mint the same evidence type and immediately pass it through the
 composition root. Fusion decides only whether the physical readiness edge
 exists; `WorkspaceMessaging` owns route reconciliation. Tokenless observations
 and unchanged negative causal observations still produce no messaging item.
+The surrounding tmux event source follows the same rule for route and pane-size
+edges that do not originate as a fusion consequence. It publishes the causal
+route token and exact durable recipient as body-free evidence. Only
+`WorkspaceMessaging` may inspect whether the recipient has a durable width
+block and select reconciliation. Route-directory and daemon-replay lifecycle
+edges likewise report availability; the Module selects pending recipients,
+unclaimed reminders, and force-submit candidates before asking the retained
+runtime adapter to host the work.
 Composer recovery uses a synchronous evidence boundary because its result must
 stamp the same serialized pane-cache commit. Fusion supplies only immutable
 binding, clean-composer, legacy-readiness, and exact lifecycle-start evidence
