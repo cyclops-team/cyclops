@@ -377,12 +377,20 @@ impl BlockingClient {
     }
 
     fn from_stream(stream: BlockingUnixStream, read: Duration) -> Result<Self, ClientError> {
-        stream
-            .set_read_timeout(Some(read))
-            .map_err(|error| ClientError::NotSent(error.to_string()))?;
-        stream
-            .set_write_timeout(Some(read))
-            .map_err(|error| ClientError::NotSent(error.to_string()))?;
+        for result in [
+            stream.set_read_timeout(Some(read)),
+            stream.set_write_timeout(Some(read)),
+        ] {
+            if let Err(error) = result {
+                // macOS returns EINVAL when the peer closed after writing
+                // bytes that are still readable (F18). Keep those bytes
+                // authoritative; the next IO reports the buffered frame or
+                // the close.
+                if !(cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EINVAL)) {
+                    return Err(ClientError::NotSent(error.to_string()));
+                }
+            }
+        }
         let mut reader = BufReader::new(stream);
         let frame = match read_blocking_frame(&mut reader, Some(read)) {
             Ok(Some(frame)) => frame,
@@ -818,6 +826,18 @@ mod tests {
             ClientError::OversizedResponse(message)
                 if message == "request exceeds the official frame limit"
         ));
+    }
+
+    #[test]
+    fn blocking_hello_remains_readable_after_the_peer_closes() {
+        let (client_stream, mut daemon_stream) = BlockingUnixStream::pair().unwrap();
+        daemon_stream
+            .write_all(b"{\"cyclops\":\"0.1.0\",\"proto\":1,\"boot_id\":\"closed\"}\n")
+            .unwrap();
+        drop(daemon_stream);
+
+        let client = BlockingClient::from_stream(client_stream, Duration::from_secs(1)).unwrap();
+        assert_eq!(client.hello().boot_id, "closed");
     }
 
     #[test]
