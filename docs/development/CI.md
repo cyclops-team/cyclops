@@ -154,6 +154,26 @@ test fail. The restored proof passed 20 serial focused runs, 80 focused runs at
 eight-way process concurrency, and ten complete four-thread coordinator runs.
 It adds no sleep or timeout and moves no defect class.
 
+Required macOS runs
+[33322158633](https://github.com/cyclops-team/cyclops/actions/runs/33322158633)
+and
+[33326783742](https://github.com/cyclops-team/cyclops/actions/runs/33326783742)
+exposed a separate false dependency in the real workspace boot-sizing test.
+That regression already records the first target-side resize in an immutable
+tmux hook, but it waited for unrelated terminal text before reading the hook.
+The same test passed on adjacent macOS runs and in 20 focused local repetitions,
+confirming that paint scheduling did not honestly prove the sizing contract.
+
+The test now waits directly for the recorded cold-boot resize and asserts both
+that first event and the converged window size. It no longer treats a rendered
+`Chat 0 !0` line, alternate-screen state, or terminal teardown as sizing
+evidence. Changing the persisted preference to `messages_visible = false` in a
+local regression simulation made the replacement fail with the collapsed
+width `(95, 26)` instead of the required open width `(72, 26)`. Restored, the
+focused test passed 50 bounded repetitions. No timeout increased, no sleep was
+added, and renderer coverage remains in the renderer and workspace journey
+suites that own it.
+
 ## Task 3 representative pull-request comparison
 
 Messaging Milestone 3 provided the first post-merge product change whose diff
