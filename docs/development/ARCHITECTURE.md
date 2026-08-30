@@ -52,9 +52,10 @@ nothing in a body can forge the header a recipient reads.
 
 `src/cyclopsd/src/messaging.rs` contains the internal `WorkspaceMessaging`
 Module. The socket handlers authenticate the caller, then hand this Module an
-identity and a send, reply, inbox, claim, snapshot, or follow request. They do
-not receive the workspace journal, mailbox projection, publication lock,
-notification worker, unread scheduler, or pane route.
+identity and a send, reply, inbox, claim, snapshot, follow, requeue, or exact
+pre-write withdrawal request. They do not receive the workspace journal,
+mailbox projection, publication lock, notification worker, unread scheduler,
+or pane route.
 
 `WorkspaceMessaging` owns the durable acceptance call and the complete
 post-commit sequence: subscribe before worker scheduling, schedule every exact
@@ -64,9 +65,12 @@ It also owns body-free inbox and message reads, the compatibility-sensitive
 claim-locator choice, the durable claim transition, and the exact post-claim
 sequence for notification settlement, cancellation, recovery, FIFO advance,
 attention reconciliation, and unread invalidation. Socket adapters receive wire
-results rather than mailbox projection or claim-outcome types. Publication
-synchronization is owned inside the Module and exposed only as one consistent
-identity-resolution transaction.
+results rather than mailbox projection or claim-outcome types. Requeue and
+pre-write withdrawal also stay atomic at this boundary: the Module commits the
+durable mutation, then owns notification scheduling, exact cancellation, FIFO
+advance, and unread invalidation. Publication synchronization is owned inside
+the Module and exposed only through Module operations that require one
+consistent transaction.
 The daemon composition root supplies those downstream actions through one
 narrow effects capability. The Module does not wrap `Arc<Inner>`, and it remains
 internal to `cyclopsd`; no messaging crate has been extracted.

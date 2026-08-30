@@ -444,6 +444,47 @@ impl WorkspaceMessaging {
         self.service.messages_follow(caller, after_seq, limit)
     }
 
+    pub(crate) fn requeue(&self, message_id: MessageId) -> Result<bool, MailboxServiceError> {
+        let records = self.service.requeue_message(message_id)?;
+        let recipients: HashSet<_> = records.iter().map(|record| record.recipient).collect();
+        for recipient in recipients {
+            if let Err(error) = self.effects.schedule_notification(&self.service, recipient) {
+                error!(%recipient, %error, "cannot schedule requeued mailbox notification");
+            }
+            self.effects.invalidate_unread(recipient);
+        }
+        Ok(!records.is_empty())
+    }
+
+    /// Withdraw one exact unwritten wake and advance the recipient FIFO.
+    pub(crate) fn withdraw_notification(
+        &self,
+        operator: RecipientKey,
+        recipient: RecipientKey,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<NotificationWithdrawResult, MailboxServiceError> {
+        let (record, inserted) = self.with_published(|messaging| {
+            messaging
+                .service
+                .withdraw_notification_before_write(operator, recipient, attempt_id)
+        })?;
+        self.effects.cancel_notification(attempt_id);
+        if let Err(error) = self.effects.schedule_notification(&self.service, recipient) {
+            error!(%recipient, %error, "cannot schedule mailbox notification after withdrawal");
+        }
+        self.effects.invalidate_unread(recipient);
+        Ok(NotificationWithdrawResult {
+            attempt_id,
+            message_id: record.message_id,
+            recipient,
+            disposition: if inserted {
+                NotificationWithdrawDisposition::Withdrawn
+            } else {
+                NotificationWithdrawDisposition::AlreadyWithdrawn
+            },
+        })
+    }
+
     async fn finish_acceptance(
         &self,
         accepted: AcceptResult,
@@ -1584,54 +1625,6 @@ fn schedule_claimed_notification_recovery(
     Ok(())
 }
 
-pub(crate) fn requeue(
-    inner: &Arc<Inner>,
-    service: &Arc<MailboxService>,
-    message_id: MessageId,
-) -> Result<bool, MailboxServiceError> {
-    let records = service.requeue_message(message_id)?;
-    let recipients: HashSet<_> = records.iter().map(|record| record.recipient).collect();
-    for recipient in recipients {
-        if let Err(error) = schedule_recipient(inner, service, recipient) {
-            error!(%recipient, %error, "cannot schedule requeued mailbox notification");
-        }
-        crate::schedule_recipient_unread(inner, recipient);
-    }
-    Ok(!records.is_empty())
-}
-
-/// Withdraw one exact unwritten wake and advance the recipient's FIFO.
-pub(crate) fn withdraw_notification(
-    inner: &Arc<Inner>,
-    service: &Arc<MailboxService>,
-    operator: RecipientKey,
-    recipient: RecipientKey,
-    attempt_id: cyclops_proto::NotificationAttemptId,
-) -> Result<NotificationWithdrawResult, MailboxServiceError> {
-    let (record, inserted) = {
-        let _publication = inner
-            .mailbox_publication
-            .lock()
-            .expect("mailbox publication lock");
-        service.withdraw_notification_before_write(operator, recipient, attempt_id)?
-    };
-    inner.engine.cancel_notification(attempt_id);
-    if let Err(error) = schedule_recipient(inner, service, recipient) {
-        error!(%recipient, %error, "cannot schedule mailbox notification after withdrawal");
-    }
-    crate::schedule_recipient_unread(inner, recipient);
-    Ok(NotificationWithdrawResult {
-        attempt_id,
-        message_id: record.message_id,
-        recipient,
-        disposition: if inserted {
-            NotificationWithdrawDisposition::Withdrawn
-        } else {
-            NotificationWithdrawDisposition::AlreadyWithdrawn
-        },
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use crate::fusion::PaneMessagingObservation;
@@ -2006,6 +1999,61 @@ mod tests {
             fs::read_to_string(&journal_path).unwrap().lines().count(),
             before_claim + 1,
             "one claim remains one durable mailbox fact"
+        );
+    }
+
+    // Obsolete if requeue or pre-write withdrawal callers again coordinate
+    // durable notification mutations with workers, cancellation, or unread
+    // projection themselves.
+    #[test]
+    fn workspace_messaging_owns_requeue_and_withdrawal_post_commit_effects_without_inner() {
+        let (_scratch, service, events, reviewer, _) =
+            mailbox_service("workspace-messaging-requeue", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            effects.clone(),
+        );
+        let (accepted, context, _) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        context.record_quota_held().unwrap();
+        assert_eq!(service.observe_quota_reset(reviewer).unwrap().len(), 1);
+
+        assert!(messaging.requeue(accepted.message_id).unwrap());
+        assert_eq!(
+            effects.calls(),
+            vec![
+                RecordedEffect::Schedule(reviewer),
+                RecordedEffect::InvalidateUnread(reviewer),
+            ]
+        );
+
+        let (_scratch, service, events, reviewer, _) =
+            mailbox_service("workspace-messaging-withdrawal", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            effects.clone(),
+        );
+        let (_accepted, _context, head) = queued_attempt(&service);
+
+        let withdrawn = messaging
+            .withdraw_notification(service.admin().key, reviewer, head.attempt_id)
+            .unwrap();
+        assert_eq!(
+            withdrawn.disposition,
+            NotificationWithdrawDisposition::Withdrawn
+        );
+        assert_eq!(withdrawn.recipient, reviewer);
+        assert_eq!(
+            effects.calls(),
+            vec![
+                RecordedEffect::CancelNotification(head.attempt_id),
+                RecordedEffect::Schedule(reviewer),
+                RecordedEffect::InvalidateUnread(reviewer),
+            ]
         );
     }
 
