@@ -1622,6 +1622,7 @@ impl MailboxProjection {
                 Some(
                     NotificationPreWriteCause::BindingUnprovable
                         | NotificationPreWriteCause::ComposerSemanticMissing
+                        | NotificationPreWriteCause::ComposerSemanticAmbiguous
                 )
             ) || width_observation.is_some()
                 && pre_write_cause == Some(NotificationPreWriteCause::WriteReadinessChanged))
@@ -5147,6 +5148,20 @@ impl MailboxService {
                         write_ready && later_route_evidence
                     }
                 }
+            }
+            // Ambiguity can clear without repairing anything: a later
+            // frame the manifest CAN prove reopens the wake. A manifest
+            // that truly cannot classify this vendor never produces that
+            // write-ready evidence and the block stays, exactly like the
+            // static ComposerSemanticMissing gap below.
+            Some(NotificationPreWriteCause::ComposerSemanticAmbiguous) => {
+                let later_route_evidence = current
+                    .pre_write_observation
+                    .as_ref()
+                    .and_then(|prior| prior.route_evidence.as_ref())
+                    .zip(observation.route_evidence.as_ref())
+                    .is_some_and(|(prior, current)| route_evidence_is_later(prior, current));
+                write_ready && later_route_evidence
             }
             _ => false,
         };
@@ -10118,6 +10133,121 @@ mod tests {
         reopened_context
             .record_pre_write_block(
                 NotificationPreWriteCause::WriteReadinessChanged,
+                Some(later_observation.clone()),
+            )
+            .unwrap();
+        let lines_before_repeat = service.journal_lines().unwrap().len();
+        let final_observation = NotificationPreWriteObservation {
+            route_evidence: evidence(9),
+            ..later_observation
+        };
+        assert!(service
+            .reopen_oldest_notification_after_route_evidence(bob, final_observation, true)
+            .unwrap()
+            .is_none());
+        assert_eq!(service.journal_lines().unwrap().len(), lines_before_repeat);
+    }
+
+    /// A `composer_semantic_ambiguous` block settles a wake whose composer
+    /// kept reading ambiguous on an idle pane. Unlike the static
+    /// `composer_semantic_missing` gap it may reopen without anyone
+    /// repairing anything — but only on LATER route evidence whose cached
+    /// verdict is actually write-ready. Ambiguity is not evidence: neither
+    /// unchanged-generation write-readiness nor later still-ambiguous
+    /// frames reopen it, and the automatic reopen spends once.
+    #[test]
+    fn blocked_ambiguous_composer_reopens_once_only_on_later_write_ready_evidence() {
+        let scratch = StoreScratch::new("blocked-ambiguous-reopen");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, _, bob, _) = test_context();
+        let directory = MailboxDirectory::new(
+            workspace,
+            [MailboxIdentity {
+                key: bob,
+                label: "reviewer".into(),
+            }],
+        )
+        .unwrap();
+        let store = MessageStore::open(&root, journal, workspace, "boot").unwrap();
+        let service = MailboxService::new(directory, store);
+        let message = service
+            .send(service.admin(), mailbox_send("reviewer", "Wake", ""))
+            .unwrap();
+        let queued = service.prepare_oldest_notification(bob).unwrap().unwrap();
+        let context = crate::notification_adapter::NotificationContext::new(
+            service.store_handle(),
+            message.message_id.clone(),
+            bob,
+            queued.attempt_id,
+        );
+        context.record_gating().unwrap();
+        let evidence = |generation| {
+            Some(NotificationRouteEvidenceId {
+                boot_id: "boot".into(),
+                generation,
+            })
+        };
+        let blocked_observation = NotificationPreWriteObservation {
+            pane_root: Some(ProcessInstanceId::new(3999, 817_999).unwrap()),
+            selected_manifest: Some(NotificationManifestId::new("cursor").unwrap()),
+            binding: Some(NotificationBinding {
+                manifest: NotificationManifestId::new("cursor").unwrap(),
+                ..notification_binding(bob)
+            }),
+            route_evidence: evidence(7),
+            pane_width: None,
+            required_pane_width: None,
+            write_block: Some("no_write_safe_composer_evidence".into()),
+        };
+        context
+            .record_pre_write_block(
+                NotificationPreWriteCause::ComposerSemanticAmbiguous,
+                Some(blocked_observation.clone()),
+            )
+            .unwrap();
+
+        // The same generation cannot reopen, however ready it claims to be:
+        // this is the evidence the block was recorded against.
+        let lines_before = service.journal_lines().unwrap().len();
+        assert!(service
+            .reopen_oldest_notification_after_route_evidence(
+                bob,
+                blocked_observation.clone(),
+                true,
+            )
+            .unwrap()
+            .is_none());
+        // Later evidence that is still not write-ready is still ambiguity.
+        let later_observation = NotificationPreWriteObservation {
+            route_evidence: evidence(8),
+            ..blocked_observation.clone()
+        };
+        assert!(service
+            .reopen_oldest_notification_after_route_evidence(bob, later_observation.clone(), false,)
+            .unwrap()
+            .is_none());
+        assert_eq!(service.journal_lines().unwrap().len(), lines_before);
+
+        // Later, write-ready evidence is the frame the manifest could
+        // finally prove: the wake reopens, once.
+        let reopened = service
+            .reopen_oldest_notification_after_route_evidence(bob, later_observation.clone(), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened.attempt_id, queued.attempt_id);
+        assert_eq!(reopened.state, NotificationState::Gating);
+        assert_eq!(reopened.pre_write_reopen_count, 1);
+
+        let reopened_context = crate::notification_adapter::NotificationContext::new(
+            service.store_handle(),
+            message.message_id,
+            bob,
+            queued.attempt_id,
+        );
+        reopened_context
+            .record_pre_write_block(
+                NotificationPreWriteCause::ComposerSemanticAmbiguous,
                 Some(later_observation.clone()),
             )
             .unwrap();

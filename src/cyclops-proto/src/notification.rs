@@ -262,6 +262,14 @@ pub enum NotificationPreWriteCause {
     /// The matched screen rule does not classify its composer ownership.
     /// No terminal write can be authorized until the manifest is repaired.
     ComposerSemanticMissing,
+    /// The screen rules kept classifying an idle pane's composer as
+    /// ambiguous for the whole settle window. One ambiguous frame may be a
+    /// redraw caught mid-paint; ambiguity that outlives the window is a
+    /// manifest that cannot prove this vendor's clean composer, and no pane
+    /// event announces "still ambiguous", so the wake settles durably
+    /// instead of waiting in memory forever. Later write-ready route
+    /// evidence reopens it once.
+    ComposerSemanticAmbiguous,
     /// The terminal grid cannot prove the complete application composer.
     /// No terminal write or submit key is authorized until an application
     /// source proves the exact composer bytes.
@@ -282,6 +290,7 @@ impl NotificationPreWriteCause {
             Self::PasteCommandUnwritten => "paste_command_unwritten",
             Self::BindingUnprovable => "binding_unprovable",
             Self::ComposerSemanticMissing => "composer_semantic_missing",
+            Self::ComposerSemanticAmbiguous => "composer_semantic_ambiguous",
             Self::ComposerOwnershipUnproven => "composer_ownership_unproven",
             Self::WorkerFailed => "worker_failed",
         }
@@ -298,6 +307,7 @@ impl NotificationPreWriteCause {
             Self::PasteCommandUnwritten => "paste command was not written",
             Self::BindingUnprovable => "binding unprovable",
             Self::ComposerSemanticMissing => "composer ownership rule missing",
+            Self::ComposerSemanticAmbiguous => "composer stays ambiguous on an idle pane",
             Self::ComposerOwnershipUnproven => "complete composer ownership unproven",
             Self::WorkerFailed => "worker failed",
         }
@@ -1136,6 +1146,10 @@ mod tests {
             (
                 NotificationPreWriteCause::ComposerSemanticMissing,
                 "composer_semantic_missing",
+            ),
+            (
+                NotificationPreWriteCause::ComposerSemanticAmbiguous,
+                "composer_semantic_ambiguous",
             ),
             (NotificationPreWriteCause::WorkerFailed, "worker_failed"),
         ];

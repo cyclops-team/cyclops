@@ -19,6 +19,18 @@ versions are unreleased until admin cuts a tag.
   Cursor injection is unmeasured — keep failing closed on the ambiguous
   rule below it. Locked against the live capture in
   `cursor_clean_idle_composer_esc.txt` (cursor-agent 2026.08.25-3e8eec8).
+- A wake whose composer kept reading `ambiguous` on an idle pane waited
+  in memory as "checking readiness" indefinitely, invisible to `cyclops
+  status` and to the reopen scheduler: the durable
+  `composer_semantic_missing` block only covered rules with NO composer
+  classification, not rules that answer "ambiguous" on every frame. The
+  gate now holds such a wake under its own named cause and, when the
+  ambiguity outlives a settle window (`ambiguous_composer_settle_ms`,
+  default 10s, with a timed wake so a silent pane still settles), records
+  a durable `composer_semantic_ambiguous` pre-write block — named,
+  operator-visible, withdrawable. Later route evidence whose verdict is
+  actually write-ready reopens the wake once; mid-turn ambiguity never
+  escalates, because working frames never reach the idle arm.
 - Detaching or quitting the workspace left the theme's ground on the
   shell underneath on terminals that honor an OSC 11 background *set* but
   ignore the OSC 110/111 *reset* — Apple Terminal is the common one, where
