@@ -116,7 +116,7 @@ fn clicks_land_on_what_the_frame_drew() {
     });
     assert_eq!(cmd, Some(Command::Focus("%0".into())));
 
-    // A stream entry row, clicked right of the divider: selection, no jump.
+    // A stream entry row, clicked right of the divider: selection, no focus.
     let entry_row = app
         .row_targets
         .iter()

@@ -213,6 +213,19 @@ impl Settings {
     }
 }
 
+/// Bind a semantic pane-focus request to this launcher's configured server.
+pub fn focus_adapter(home: &Path) -> cyclops_ui::FocusPane {
+    let server = Settings::read(home).server;
+    cyclops_ui::FocusPane::new(move |target| {
+        cyclops_tmux::focus_pane(
+            server.socket.as_deref(),
+            server.config_file.as_deref(),
+            target,
+        )
+        .map_err(|error| error.to_string())
+    })
+}
+
 pub fn config_path(home: &Path) -> PathBuf {
     home.join("config.toml")
 }

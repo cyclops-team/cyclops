@@ -384,7 +384,7 @@ fn the_calm_view_shows_the_alarm_and_the_line_that_ends_it() {
             "  12:04:32  reviewer  ✔ cleared · was ⚠ blocked_permission".to_string(),
             String::new(),
             String::new(),
-            "? keys · tab view · a agents · c density · w/f/t filter · enter jump · q quit"
+            "? keys · tab view · a agents · c density · w/f/t filter · enter focus · q quit"
                 .to_string(),
         ]
     );
