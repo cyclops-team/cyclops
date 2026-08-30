@@ -181,20 +181,18 @@ focused evidence on both platforms instead of repeating every unrelated test.
 
 ## Demos
 
-`demos/` holds runnable end-to-end scripts, one per milestone. Each one
-builds an isolated rig, drives a real scenario, and prints what happened.
+`demos/` holds maintained end-to-end journeys. Each script builds an
+isolated rig, drives a real scenario, and prints what happened.
 
 ```bash
-./demos/m1-send.sh        # a message from send to verified receipt
+./demos/m1-send.sh        # durable mailbox acceptance without either UI
 ./demos/m4-workspace.sh   # build, name, save, kill, restore a workspace
 ./demos/m5-theme.sh       # a theme switch reaching a real pane border
 ```
 
-All of them need `tmux`; the ones that read the ledger back
-(`m1-send.sh`, `m2-conversation.sh`, and `m3-stream.sh`)
-also need `jq`, and the first three need `python3`. They check for what
-they use and say so. None of them touches your tmux server or your home,
-and all are safe to run repeatedly.
+All of them need `tmux`; each script checks any additional dependencies it
+uses and says what is missing. None of them touches your tmux server or your
+home, and all are safe to run repeatedly.
 
 Write one when you ship anything a user will do end to end. This is not
 ceremony: on this codebase the demos have found defects that reading the
