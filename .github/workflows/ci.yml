@@ -153,7 +153,9 @@ jobs:
     name: test (macos-latest)
     needs: classify
     if: ${{ !cancelled() }}
-    runs-on: macos-latest
+    # Preserve the stable check name while keeping a not-applicable result off
+    # the scarcer macOS pool. Substantive platform evidence still runs there.
+    runs-on: ${{ (needs.classify.outputs.platform == 'true' || needs.classify.outputs.tmux == 'true') && 'macos-latest' || 'ubuntu-latest' }}
     steps:
       - name: require successful path classification
         if: ${{ needs.classify.result != 'success' }}
@@ -202,7 +204,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    # Matrix names remain stable. Not-applicable checks use a cheap Linux
+    # runner; installer changes still exercise both named operating systems.
+    runs-on: ${{ needs.classify.outputs.installer == 'true' && matrix.os || 'ubuntu-latest' }}
     steps:
       - name: require successful path classification
         if: ${{ needs.classify.result != 'success' }}

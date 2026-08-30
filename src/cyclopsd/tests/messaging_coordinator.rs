@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use common::{
     composer_pane, faketui_path, hold_script, manual_lifecycle_composer_pane,
-    swallowing_animated_composer_pane, tmux_available, wait_pane_state, Rig, CAT_MANIFEST,
-    HOOK_MANIFEST, LIVENESS_MANIFEST, MODAL_MANIFEST, QUOTA_MANIFEST,
+    swallowing_animated_composer_pane, tmux_available, wait_pane_state, Rig, TestClient,
+    CAT_MANIFEST, HOOK_MANIFEST, LIVENESS_MANIFEST, MODAL_MANIFEST, QUOTA_MANIFEST,
 };
 use cyclops_proto::{
     Kind, LedgerLine, MessageId, MsgSendParams, NotificationAttemptId, NotificationState,
@@ -548,28 +548,6 @@ async fn wait_for_human_composer_evidence(rig: &mut Rig, pane: &str) {
         assert!(
             Instant::now() < deadline,
             "pane {pane} did not record the human composer evidence: {status}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-async fn wait_for_clean_composer_evidence(rig: &mut Rig, pane: &str) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let status = rig.ctl.request("status", json!({})).await;
-        let clean = status["result"]["sessions"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|session| session["panes"].as_array())
-            .flatten()
-            .any(|row| row["pane_id"] == pane && row["composer"] == "composer_clean");
-        if clean {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "pane {pane} did not record clean composer evidence: {status}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -2124,18 +2102,37 @@ async fn a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt() 
             }
         })
     });
+    // Subscribe after the durable hold and immediately before Backspace. This
+    // connection is a causal barrier: unlike the rig's long-lived event
+    // client, it cannot contain a positive readiness event from setup.
+    let mut release_events = TestClient::connect(&rig.daemon.socket_path()).await;
+    let subscribed = release_events.request("events.subscribe", json!({})).await;
+    assert_eq!(subscribed["result"]["subscribed"], true);
     rig.tmux.run_ok(&["send-keys", "-t", &pane, "BSpace"]);
-    // Runtime state can remain idle while the composer contains a human draft.
-    // Wait for the daemon's distinct composer projection to cross from
-    // `human_draft` to `composer_clean` before asking whether the held attempt
-    // reopened. Tmux command acceptance and runtime-idle are neither proof.
-    wait_for_clean_composer_evidence(&mut rig, &pane).await;
-    tokio::time::timeout(Duration::from_secs(8), prewrite_rx.recv())
+    // `composer_clean` can precede the positive write-readiness edge while the
+    // screen is still settling. The readiness event is the exact contract that
+    // wakes or reopens the held attempt, so wait for it rather than polling a
+    // weaker projection or guessing how long settlement takes.
+    let readiness = release_events
+        .wait_event(Duration::from_secs(8), |event| {
+            event["event"] == "readiness"
+                && event["data"]["session_idx"] == 0
+                && event["data"]["pane_id"] == pane.as_str()
+                && event["data"]["write_ready"] == true
+                && event["data"]["write_block"].is_null()
+        })
+        .await;
+    assert_eq!(readiness["seq"], serde_json::Value::Null, "{readiness}");
+    // These are explicit injected phase events, not settlement guesses. The
+    // timeout only bounds a broken test; it leaves room for four concurrent
+    // isolated rigs on a cold shared runner after readiness has been proven.
+    let phase_timeout = Duration::from_secs(20);
+    tokio::time::timeout(phase_timeout, prewrite_rx.recv())
         .await
         .expect("final deletion released the human hold")
         .expect("pre-write boundary sender stayed open");
     prewrite_release.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(8), staged_rx.recv())
+    tokio::time::timeout(phase_timeout, staged_rx.recv())
         .await
         .expect("released attempt reached the staged boundary")
         .expect("staged boundary sender stayed open");
