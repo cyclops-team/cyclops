@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use common::{
     composer_pane, faketui_path, hold_script, manual_lifecycle_composer_pane,
-    swallowing_animated_composer_pane, tmux_available, wait_pane_state, Rig, CAT_MANIFEST,
-    HOOK_MANIFEST, LIVENESS_MANIFEST, MODAL_MANIFEST,
+    swallowing_animated_composer_pane, tmux_available, wait_pane_state, Rig, TestClient,
+    CAT_MANIFEST, HOOK_MANIFEST, LIVENESS_MANIFEST, MODAL_MANIFEST,
 };
 use cyclops_proto::{
     Kind, LedgerLine, MessageId, MsgSendParams, NotificationAttemptId, NotificationState,
@@ -2024,13 +2024,18 @@ async fn a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt() 
             }
         })
     });
+    // Subscribe after the durable hold and immediately before Backspace. This
+    // connection is a causal barrier: unlike the rig's long-lived event
+    // client, it cannot contain a positive readiness event from setup.
+    let mut release_events = TestClient::connect(&rig.daemon.socket_path()).await;
+    let subscribed = release_events.request("events.subscribe", json!({})).await;
+    assert_eq!(subscribed["result"]["subscribed"], true);
     rig.tmux.run_ok(&["send-keys", "-t", &pane, "BSpace"]);
     // `composer_clean` can precede the positive write-readiness edge while the
     // screen is still settling. The readiness event is the exact contract that
     // wakes or reopens the held attempt, so wait for it rather than polling a
     // weaker projection or guessing how long settlement takes.
-    let readiness = rig
-        .ev
+    let readiness = release_events
         .wait_event(Duration::from_secs(8), |event| {
             event["event"] == "readiness"
                 && event["data"]["session_idx"] == 0
