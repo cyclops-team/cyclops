@@ -177,6 +177,8 @@ enum AppMsg {
         pane: String,
     },
     DecorationChanged(DecorationSnapshot),
+    /// Persistent classification of the authenticated daemon's Hello identity.
+    DaemonCompatibility(cyclops_client::HelloCompatibility),
     /// The daemon subscription (re)connected. The handler resyncs what an
     /// outage loses on both sides: a restarted daemon forgot every watch
     /// ask (those live in its memory, not config.toml), and any state that
@@ -452,6 +454,10 @@ struct App {
     /// an idle workspace without a keypress and without a timer of its
     /// own.
     notice: NoticeState,
+    daemon_compatibility: Option<cyclops_client::HelloCompatibility>,
+    /// A Hello mismatch is durable connection state, not a transient action
+    /// result. It remains visible until a later authenticated Hello replaces it.
+    daemon_compatibility_notice: Option<String>,
     decoration: DecorationSnapshot,
     prefs: WorkspacePrefs,
     /// Stable session ids whose agent children are visible in the sidebar.
@@ -1289,6 +1295,8 @@ pub async fn run_async() -> i32 {
         selection: SelectionState::default(),
         drag: None,
         notice: NoticeState::default(),
+        daemon_compatibility: None,
+        daemon_compatibility_notice: None,
         // Nothing to fall back to on the first frame: no answer here is
         // genuinely "nothing known yet", which is what the default says.
         decoration: decoration::fetch_decoration(&home).unwrap_or_else(|error| {
@@ -2104,6 +2112,12 @@ fn subscribe_decoration_once(
                 return SubscribeEnd::ConnectFailed;
             }
         };
+    if stream_tx
+        .blocking_send(AppMsg::DaemonCompatibility(client.hello_compatibility()))
+        .is_err()
+    {
+        return SubscribeEnd::SinkGone;
+    }
     if let Err(error) = client.subscribe(serde_json::json!({})) {
         log_err(
             home,
@@ -2509,6 +2523,16 @@ fn reconnect_config(base: &ControlConfig, session: &str) -> ControlConfig {
 }
 
 impl App {
+    fn daemon_compatibility_marker(&self) -> Option<&'static str> {
+        match self.daemon_compatibility.as_ref()? {
+            cyclops_client::HelloCompatibility::Current { .. } => None,
+            cyclops_client::HelloCompatibility::Mismatch { .. } => Some("daemon mismatch"),
+            cyclops_client::HelloCompatibility::UnverifiedDaemon { .. } => {
+                Some("daemon unverified")
+            }
+        }
+    }
+
     /// Put a dialog on screen at its resting center.
     ///
     /// Every open goes through here so the drag offset is cleared with it.
@@ -3901,6 +3925,11 @@ async fn handle_app_msg(
                 app.messages_gate.mark_dirty();
                 pump_messages_refresh(app);
             }
+            arm(debounce);
+        }
+        AppMsg::DaemonCompatibility(compatibility) => {
+            app.daemon_compatibility_notice = copy::daemon_compatibility_notice(&compatibility);
+            app.daemon_compatibility = Some(compatibility);
             arm(debounce);
         }
         AppMsg::DaemonReconnected => {
@@ -6675,13 +6704,26 @@ fn draw<B: Backend>(
                     app.hover,
                     app.drag.as_ref(),
                 );
+                if app.decoration.online {
+                    if let Some(marker) = app.daemon_compatibility_marker() {
+                        crate::render::paint_daemon_status(
+                            sidebar,
+                            app.sidebar_tab,
+                            marker,
+                            f.buffer_mut(),
+                            &app.paint,
+                        );
+                    }
+                }
             }
             if let Some(rail) = areas.rail {
+                let daemon_warning = app.daemon_compatibility_marker().is_some();
                 paint_sidebar_rail(
                     rail,
                     f.buffer_mut(),
                     &app.paint,
                     &mut app.hit_map,
+                    daemon_warning,
                     app.hover,
                 );
             }
@@ -6696,10 +6738,14 @@ fn draw<B: Backend>(
                     .messages_refresh_error
                     .as_ref()
                     .map(|error| format!("refresh failed: {error} · Ctrl+R to retry"));
+                let visible_notice = app
+                    .notice
+                    .text()
+                    .or(app.daemon_compatibility_notice.as_deref());
                 let link_status = refresh_status.as_deref().or_else(|| {
                     (app.messages_gate.link() == cyclops_ui::Link::Lost)
                         .then_some("daemon reconnecting")
-                        .or_else(|| app.notice.text())
+                        .or(visible_notice)
                 });
                 paint_messages(
                     &app.messages_queue,
@@ -6740,6 +6786,10 @@ fn draw<B: Backend>(
                 app.hover,
             );
             let tab = app.model.active_tab();
+            let visible_notice = app
+                .notice
+                .text()
+                .or(app.daemon_compatibility_notice.as_deref());
             let mut ctx = crate::render::WindowPaintCtx {
                 link: app.link_state,
                 paused: &app.paused_panes,
@@ -6747,7 +6797,7 @@ fn draw<B: Backend>(
                 decoration: &app.decoration,
                 selection: app.selection.active_pane(),
                 drag: app.drag.as_ref(),
-                notice: app.notice.text(),
+                notice: visible_notice,
                 minimized: &app.minimized,
                 cursor: None,
                 // Where every fade this frame stands. `none()` while motion
@@ -8048,6 +8098,8 @@ mod tests {
             selection: SelectionState::default(),
             drag: None,
             notice: NoticeState::default(),
+            daemon_compatibility: None,
+            daemon_compatibility_notice: None,
             decoration: DecorationSnapshot::default(),
             prefs: WorkspacePrefs::default(),
             expanded_workspaces: HashSet::new(),

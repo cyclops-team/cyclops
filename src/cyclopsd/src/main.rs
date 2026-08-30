@@ -16,12 +16,7 @@ use tracing_subscriber::fmt::MakeWriter;
 
 use cyclopsd::Config;
 
-const VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    " (",
-    env!("CYCLOPS_BUILD_REF"),
-    ")"
-);
+const VERSION: &str = cyclops_proto::VERSION_WITH_BUILD;
 
 #[derive(Parser)]
 #[command(

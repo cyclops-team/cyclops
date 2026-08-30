@@ -127,7 +127,7 @@ fn health_works_with_no_daemon_and_does_not_create_state() {
         report["state"]["socket"],
         home.join("sock").display().to_string()
     );
-    assert_eq!(report["client"]["build"], env!("CYCLOPS_BUILD_REF"));
+    assert_eq!(report["client"]["build"], cyclops_proto::BUILD_REF);
     assert!(report["client"]["selected_executable"]
         .as_str()
         .is_some_and(|path| !path.is_empty()));
@@ -452,7 +452,7 @@ fn health_reports_hello_identity_with_one_read_only_snapshot_request() {
             "{}",
             json!({
                 "cyclops": "0.1.0",
-                "build": env!("CYCLOPS_BUILD_REF"),
+                "build": cyclops_proto::BUILD_REF,
                 "daemon_process": { "pid": 4242, "birth": 818221 },
                 "daemon_executable": daemon_wire,
                 "proto": 1,
@@ -488,9 +488,155 @@ fn health_reports_hello_identity_with_one_read_only_snapshot_request() {
     assert_eq!(report["daemon"]["process"]["birth"], 818221);
     assert_eq!(report["daemon"]["boot_id"], "health-boot");
     assert_eq!(report["daemon"]["uptime_ms"], 123);
+    assert_eq!(
+        report["client"]["version"],
+        cyclops_proto::VERSION_WITH_BUILD
+    );
+    assert_eq!(
+        report["client"]["package_version"],
+        cyclops_client::CLIENT_VERSION
+    );
+    assert_eq!(report["daemon"]["version"], cyclops_client::CLIENT_VERSION);
+    assert_eq!(report["daemon"]["client_version_matches"], true);
     assert_eq!(report["daemon"]["client_build_matches"], true);
     assert_eq!(report["daemon"]["executable"]["state"], "proven");
     assert_eq!(report["daemon"]["executable"]["path"], expected_daemon);
+}
+
+#[test]
+fn health_names_the_exact_client_and_daemon_versions_when_they_differ() {
+    let (_temp, home, user, runtime_temp) = scratch("cyc-h-ver");
+    let (client, daemon) = paired_client(&user.join("bin"));
+    fs::create_dir(&home).unwrap();
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = UnixListener::bind(home.join("sock")).unwrap();
+    let daemon_wire = daemon.display().to_string();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream;
+        writeln!(
+            writer,
+            "{}",
+            json!({
+                "cyclops": "0.0.9",
+                "build": cyclops_proto::BUILD_REF,
+                "daemon_process": { "pid": 4242, "birth": 818221 },
+                "daemon_executable": daemon_wire,
+                "proto": 1,
+                "boot_id": "version-mismatch"
+            })
+        )
+        .unwrap();
+        answer_health_snapshot(writer);
+    });
+
+    let output = run_health_binary(&client, &home, &user, &runtime_temp, "");
+    server.join().unwrap();
+    let report = parse(&output);
+
+    assert_eq!(report["daemon"]["client_version_matches"], false);
+    let issue = report["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|issue| issue["code"] == "client_daemon_version_mismatch")
+        .expect("semantic version mismatch is a health issue");
+    assert!(
+        issue["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(cyclops_client::CLIENT_VERSION)
+                && message.contains("0.0.9")),
+        "{issue}"
+    );
+}
+
+#[test]
+fn health_names_both_complete_identities_for_a_build_only_mismatch() {
+    let (_temp, home, user, runtime_temp) = scratch("cyc-h-build");
+    let (client, daemon) = paired_client(&user.join("bin"));
+    fs::create_dir(&home).unwrap();
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = UnixListener::bind(home.join("sock")).unwrap();
+    let daemon_wire = daemon.display().to_string();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream;
+        writeln!(
+            writer,
+            "{}",
+            json!({
+                "cyclops": cyclops_client::CLIENT_VERSION,
+                "build": "daemon-other-build",
+                "daemon_process": { "pid": 4242, "birth": 818221 },
+                "daemon_executable": daemon_wire,
+                "proto": 1,
+                "boot_id": "build-mismatch"
+            })
+        )
+        .unwrap();
+        answer_health_snapshot(writer);
+    });
+
+    let output = run_health_binary(&client, &home, &user, &runtime_temp, "");
+    server.join().unwrap();
+    let report = parse(&output);
+    let issue = report["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|issue| issue["code"] == "client_daemon_build_mismatch")
+        .expect("build mismatch is a health issue");
+    let message = issue["message"].as_str().unwrap();
+    assert!(
+        message.contains(cyclops_client::CLIENT_VERSION),
+        "{message}"
+    );
+    assert!(message.contains(cyclops_proto::BUILD_REF), "{message}");
+    assert!(message.contains("daemon-other-build"), "{message}");
+}
+
+#[test]
+fn health_keeps_an_old_daemon_without_a_build_explicitly_unverified() {
+    let (_temp, home, user, runtime_temp) = scratch("cyc-h-unverified");
+    let (client, daemon) = paired_client(&user.join("bin"));
+    fs::create_dir(&home).unwrap();
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = UnixListener::bind(home.join("sock")).unwrap();
+    let daemon_wire = daemon.display().to_string();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream;
+        writeln!(
+            writer,
+            "{}",
+            json!({
+                "cyclops": cyclops_client::CLIENT_VERSION,
+                "daemon_process": { "pid": 4242, "birth": 818221 },
+                "daemon_executable": daemon_wire,
+                "proto": 1,
+                "boot_id": "identity-unverified"
+            })
+        )
+        .unwrap();
+        answer_health_snapshot(writer);
+    });
+
+    let output = run_health_binary(&client, &home, &user, &runtime_temp, "");
+    server.join().unwrap();
+    let report = parse(&output);
+
+    assert_eq!(report["daemon"]["client_version_matches"], true);
+    assert_eq!(report["daemon"]["client_build_matches"], Value::Null);
+    assert!(report["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|issue| issue["code"] == "client_daemon_identity_unverified"));
+    assert!(!report["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|issue| issue["code"] == "client_daemon_build_mismatch"));
 }
 
 #[test]
@@ -508,7 +654,7 @@ fn health_refuses_a_non_absolute_hello_executable() {
             "{}",
             json!({
                 "cyclops": "0.1.0",
-                "build": env!("CYCLOPS_BUILD_REF"),
+                "build": cyclops_proto::BUILD_REF,
                 "daemon_process": { "pid": 4242, "birth": 818221 },
                 "daemon_executable": "relative/cyclopsd",
                 "proto": 1,

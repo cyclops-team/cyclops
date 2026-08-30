@@ -89,17 +89,12 @@ const WAIT_TIMEOUT_DEFAULT: &str = "60s";
 /// budget, so the transport never times out before the daemon answers.
 const WAIT_READ_SLACK: Duration = Duration::from_secs(10);
 
-/// Exact source build stamped by this crate's existing build script.
-const BUILD_REF: &str = env!("CYCLOPS_BUILD_REF");
+/// Exact source build stamped once for the whole workspace.
+const BUILD_REF: &str = cyclops_proto::BUILD_REF;
 
 /// Version plus the commit that built it (build.rs), so "which build am
 /// I on" is one command instead of an afternoon.
-const VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    " (",
-    env!("CYCLOPS_BUILD_REF"),
-    ")"
-);
+const VERSION: &str = cyclops_proto::VERSION_WITH_BUILD;
 
 #[derive(Parser)]
 #[command(
@@ -1016,7 +1011,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 Ok(client) => client,
                 Err(error) => return inbox_next_client_failed(cli, &error),
             };
-            report_hello_mismatch(client.hello());
+            report_hello_mismatch(&client);
             cmd_inbox_next(&mut client, cli, timeout, from.as_deref())
         }
         // Install renders and instructs without a daemon; verify and
@@ -1238,11 +1233,12 @@ fn run_stream_ui(cli: &Cli, args: &UiArgs, filters: cyclops_ui::Filter) -> i32 {
 /// Both mismatches warn and continue. The protocol is tolerant by design,
 /// while the build identifier detects an old or shadowed daemon without
 /// pretending that it cannot answer requests.
-fn report_hello_mismatch(hello: &cyclops_proto::Hello) {
+fn report_hello_mismatch(client: &Client) {
+    let hello = client.hello();
     if hello.proto != PROTOCOL_VERSION {
         eprintln!("{}", copy::proto_mismatch(hello.proto, PROTOCOL_VERSION));
     }
-    if let Some(note) = copy::build_mismatch(hello.build.as_deref(), BUILD_REF) {
+    if let Some(note) = copy::hello_compatibility_notice(&client.hello_compatibility()) {
         eprintln!("{note}");
     }
 }
@@ -1251,7 +1247,7 @@ fn report_hello_mismatch(hello: &cyclops_proto::Hello) {
 fn connect() -> Result<Client, i32> {
     match Client::connect() {
         Ok(c) => {
-            report_hello_mismatch(c.hello());
+            report_hello_mismatch(&c);
             Ok(c)
         }
         Err(e) => {
@@ -1356,7 +1352,7 @@ fn cmd_daemon(cli: &Cli, style: &Style, cmd: &DaemonCmd) -> i32 {
                     return 0;
                 }
             };
-            report_hello_mismatch(client.hello());
+            report_hello_mismatch(&client);
             let status: StatusResult = match ask(
                 &mut client,
                 "status",

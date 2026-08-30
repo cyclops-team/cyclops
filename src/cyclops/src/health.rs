@@ -51,6 +51,7 @@ struct BinaryReport {
     selected_daemon: PathBuf,
     selected_daemon_resolved: Option<PathBuf>,
     selected_daemon_ready: bool,
+    selected_daemon_version: Option<String>,
     selected_daemon_build: Option<String>,
     selected_daemon_build_error: Option<String>,
     resolutions: Vec<BinaryResolution>,
@@ -72,6 +73,7 @@ struct DaemonReport {
     boot_id: Option<String>,
     process: Option<ProcessInstanceId>,
     uptime_ms: Option<u64>,
+    version_matches_client: Option<bool>,
     build_matches_client: Option<bool>,
     status: Option<StatusResult>,
     status_error: Option<String>,
@@ -339,30 +341,94 @@ fn collect() -> HealthReport {
         });
     }
     if binaries
-        .selected_daemon_build
+        .selected_daemon_version
         .as_deref()
-        .is_some_and(|build| build != crate::BUILD_REF)
+        .is_some_and(|version| version != cyclops_client::CLIENT_VERSION)
     {
         issues.push(Issue {
-            code: "selected_daemon_build_mismatch",
+            code: "selected_daemon_version_mismatch",
             message: format!(
-                "client build {} does not match selected adjacent daemon build {}",
-                crate::BUILD_REF,
-                binaries
-                    .selected_daemon_build
-                    .as_deref()
-                    .unwrap_or("unreported")
+                "client {} does not match selected adjacent daemon {}",
+                cyclops_client::RuntimeIdentity::current_client().description(),
+                cyclops_client::RuntimeIdentity::new(
+                    binaries
+                        .selected_daemon_version
+                        .as_deref()
+                        .unwrap_or("unreported"),
+                    binaries.selected_daemon_build.as_deref(),
+                )
+                .description()
             ),
             path: Some(binaries.selected_daemon.clone()),
         });
     }
-    if daemon.running && daemon.build.as_deref() != Some(crate::BUILD_REF) {
+    if binaries
+        .selected_daemon_build
+        .as_deref()
+        .is_some_and(|build| build != crate::BUILD_REF)
+    {
+        let client = cyclops_client::RuntimeIdentity::current_client();
+        let selected = cyclops_client::RuntimeIdentity::new(
+            binaries
+                .selected_daemon_version
+                .as_deref()
+                .unwrap_or("unreported"),
+            binaries.selected_daemon_build.as_deref(),
+        );
+        issues.push(Issue {
+            code: "selected_daemon_build_mismatch",
+            message: format!(
+                "client {} does not match selected adjacent daemon {}",
+                client.description(),
+                selected.description()
+            ),
+            path: Some(binaries.selected_daemon.clone()),
+        });
+    }
+    if daemon.version_matches_client == Some(false) {
+        let client = cyclops_client::RuntimeIdentity::current_client();
+        let running = cyclops_client::RuntimeIdentity::new(
+            daemon.version.as_deref().unwrap_or("unreported"),
+            daemon.build.as_deref(),
+        );
+        issues.push(Issue {
+            code: "client_daemon_version_mismatch",
+            message: format!(
+                "client {} does not match daemon {}",
+                client.description(),
+                running.description()
+            ),
+            path: None,
+        });
+    }
+    if daemon.build_matches_client == Some(false) {
+        let client = cyclops_client::RuntimeIdentity::current_client();
+        let running = cyclops_client::RuntimeIdentity::new(
+            daemon.version.as_deref().unwrap_or("unreported"),
+            daemon.build.as_deref(),
+        );
         issues.push(Issue {
             code: "client_daemon_build_mismatch",
             message: format!(
-                "client build {} does not match daemon build {}",
-                crate::BUILD_REF,
-                daemon.build.as_deref().unwrap_or("unreported")
+                "client {} does not match daemon {}",
+                client.description(),
+                running.description()
+            ),
+            path: None,
+        });
+    }
+    if daemon.running && daemon.build_matches_client.is_none() {
+        let client = cyclops_client::RuntimeIdentity::current_client();
+        let running = cyclops_client::RuntimeIdentity::new(
+            daemon.version.as_deref().unwrap_or("unreported"),
+            daemon.build.as_deref(),
+        );
+        issues.push(Issue {
+            code: "client_daemon_identity_unverified",
+            message: format!(
+                "client {} cannot verify daemon {}; the daemon did not report a build identity",
+                client.description(),
+                running.description()
             ),
             path: None,
         });
@@ -743,14 +809,15 @@ fn inspect_binaries_from(path: Option<&OsStr>, selected_client: PathBuf) -> Bina
         .iter()
         .any(|entry| entry.name == "cyclopsd" && entry.path == selected_daemon && entry.executable);
     let selected_daemon_resolved = std::fs::canonicalize(&selected_daemon).ok();
-    let (selected_daemon_build, selected_daemon_build_error) = if selected_daemon_ready {
-        match crate::update::candidate_build(&selected_daemon) {
-            Ok(build) => (Some(build), None),
-            Err(error) => (None, Some(error)),
-        }
-    } else {
-        (None, None)
-    };
+    let (selected_daemon_version, selected_daemon_build, selected_daemon_build_error) =
+        if selected_daemon_ready {
+            match crate::update::candidate_identity(&selected_daemon, "cyclopsd") {
+                Ok(identity) => (Some(identity.version), identity.build, None),
+                Err(error) => (None, None, Some(error)),
+            }
+        } else {
+            (None, None, None)
+        };
     let shadowed = distinct_clients.len() > 1 || distinct_daemons.len() > 1;
     BinaryReport {
         selected_client,
@@ -758,6 +825,7 @@ fn inspect_binaries_from(path: Option<&OsStr>, selected_client: PathBuf) -> Bina
         selected_daemon,
         selected_daemon_resolved,
         selected_daemon_ready,
+        selected_daemon_version,
         selected_daemon_build,
         selected_daemon_build_error,
         resolutions,
@@ -930,6 +998,7 @@ fn daemon_stopped() -> DaemonReport {
         boot_id: None,
         process: None,
         uptime_ms: None,
+        version_matches_client: None,
         build_matches_client: None,
         status: None,
         status_error: None,
@@ -997,6 +1066,9 @@ fn daemon_from_hello(
     status_error: Option<String>,
 ) -> DaemonReport {
     let mut transport_error = None;
+    let compatibility = cyclops_client::HelloCompatibility::from_hello(&hello);
+    let version_matches_client = compatibility.version_matches();
+    let build_matches_client = compatibility.build_matches();
     let executable = hello.daemon_executable.map(PathBuf::from);
     let executable = match executable {
         Some(path) if !path.is_absolute() => {
@@ -1024,7 +1096,8 @@ fn daemon_from_hello(
         authenticated_socket,
         stale_socket: false,
         version: Some(hello.cyclops),
-        build_matches_client: Some(hello.build.as_deref() == Some(crate::BUILD_REF)),
+        version_matches_client: Some(version_matches_client),
+        build_matches_client,
         build: hello.build,
         executable,
         boot_id: Some(hello.boot_id),
@@ -2011,12 +2084,14 @@ fn report_json(report: &HealthReport) -> Value {
         "healthy": report.issues.is_empty(),
         "client": {
             "version": crate::VERSION,
+            "package_version": cyclops_client::CLIENT_VERSION,
             "build": crate::BUILD_REF,
             "selected_executable": report.binaries.selected_client.display().to_string(),
             "selected_resolved": report.binaries.selected_resolved.as_ref().map(|path| path.display().to_string()),
             "selected_daemon": report.binaries.selected_daemon.display().to_string(),
             "selected_daemon_resolved": report.binaries.selected_daemon_resolved.as_ref().map(|path| path.display().to_string()),
             "selected_daemon_ready": report.binaries.selected_daemon_ready,
+            "selected_daemon_version": report.binaries.selected_daemon_version.as_deref(),
             "selected_daemon_build": report.binaries.selected_daemon_build.as_deref(),
             "selected_daemon_build_error": report.binaries.selected_daemon_build_error.as_deref(),
             "path": {
@@ -2041,6 +2116,7 @@ fn report_json(report: &HealthReport) -> Value {
             "authenticated_socket": report.daemon.authenticated_socket,
             "version": report.daemon.version.as_deref(),
             "build": report.daemon.build.as_deref(),
+            "client_version_matches": report.daemon.version_matches_client,
             "client_build_matches": report.daemon.build_matches_client,
             "boot_id": report.daemon.boot_id.as_deref(),
             "pid": report.daemon.process.map(ProcessInstanceId::pid),
@@ -2134,8 +2210,9 @@ fn render_plain(report: &HealthReport, style: &Style) -> String {
     };
     lines.push(style.bold(heading));
     lines.push(format!(
-        "  client   {} · build {}",
+        "  client   {} · version {} · build {}",
         report.binaries.selected_client.display(),
+        cyclops_client::CLIENT_VERSION,
         crate::BUILD_REF
     ));
     if let Some(resolved) = &report.binaries.selected_resolved {
@@ -2173,13 +2250,18 @@ fn render_plain(report: &HealthReport, style: &Style) -> String {
         lines.push("    PATH inventory truncated at its fixed limit".into());
     }
     lines.push(format!(
-        "    paired daemon {} · {} · build {}",
+        "    paired daemon {} · {} · version {} · build {}",
         report.binaries.selected_daemon.display(),
         if report.binaries.selected_daemon_ready {
             "executable"
         } else {
             "missing or not executable"
         },
+        report
+            .binaries
+            .selected_daemon_version
+            .as_deref()
+            .unwrap_or("unproven"),
         report
             .binaries
             .selected_daemon_build
@@ -2202,7 +2284,12 @@ fn render_plain(report: &HealthReport, style: &Style) -> String {
             report.daemon.boot_id.as_deref().unwrap_or("unreported")
         ));
         lines.push(format!(
-            "    client build match {}",
+            "    client version/build match {}/{}",
+            match report.daemon.version_matches_client {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "unproven",
+            },
             match report.daemon.build_matches_client {
                 Some(true) => "yes",
                 Some(false) => "no",
@@ -2569,6 +2656,7 @@ mod tests {
                 "/prefix/.cyclops-pairs/pairs/pair.a/cyclopsd",
             )),
             selected_daemon_ready: true,
+            selected_daemon_version: Some(cyclops_client::CLIENT_VERSION.into()),
             selected_daemon_build: Some(crate::BUILD_REF.into()),
             selected_daemon_build_error: None,
             resolutions: vec![BinaryResolution {

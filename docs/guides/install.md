@@ -580,6 +580,12 @@ directory containing the matched pair. The public commands pass through one
 `active` selector, so there is no moment where a new CLI names an old daemon.
 The previous matched pair remains as `known-good`.
 
+The number before the parentheses is the Cargo workspace version. The value in
+parentheses is the exact source build. Cyclops compares the complete pair
+identity during staging and checks the candidate daemon's greeting before
+activation. These internal facts do not choose a public beta tag; naming and
+publishing that tag remains a separate release gate.
+
 The pair-store lease admits one updater. A concurrent updater exits before it
 can stage, select, or repair files. If an updater process stops at a filesystem
 commit boundary, the next update removes only validated temporary selectors

@@ -134,7 +134,7 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
             // (`Theme::none`, this is the screen-reader mode), so a theme
             // switch has nothing here to move.
             UiMsg::BuildHealth(health) => {
-                if let Some(notice) = health.notice() {
+                if let Some(notice) = crate::health::notice(&health) {
                     eprintln!("{notice}");
                 }
             }

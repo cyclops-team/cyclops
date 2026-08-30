@@ -44,7 +44,7 @@ where
                 "{}",
                 json!({
                     "cyclops": "0.1.0",
-                    "build": env!("CYCLOPS_BUILD_REF"),
+                    "build": cyclops_proto::BUILD_REF,
                     "proto": 1,
                     "boot_id": "b-ui"
                 })

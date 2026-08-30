@@ -69,6 +69,28 @@ pub fn pane_input_uncertain(pane: &str, error: &dyn std::fmt::Display) -> String
 
 pub const STREAM_RECONCILED: &str = "stream rebuilt from the durable tail";
 
+/// Workspace presentation for the shared Hello compatibility classification.
+/// This stays terse because it occupies the pane-canvas notice line.
+pub fn daemon_compatibility_notice(
+    compatibility: &cyclops_client::HelloCompatibility,
+) -> Option<String> {
+    use cyclops_client::HelloCompatibility;
+
+    match compatibility {
+        HelloCompatibility::Current { .. } => None,
+        HelloCompatibility::Mismatch { client, daemon } => Some(format!(
+            "version/build mismatch: cyclops {}, cyclopsd {} · continuing · run cyclops daemon restart",
+            client.description(),
+            daemon.description()
+        )),
+        HelloCompatibility::UnverifiedDaemon { client, daemon } => Some(format!(
+            "daemon identity unverified: cyclops {}, cyclopsd {} · continuing · run cyclops daemon restart",
+            client.description(),
+            daemon.description()
+        )),
+    }
+}
+
 // No space after the glyph: ☰ is ambiguous-width and most fonts already
 // draw it with a right shoulder, so a literal space read as a two-cell gap.
 pub const APP_MENU_BUTTON: &str = "☰menu";
@@ -397,5 +419,19 @@ mod tests {
         // Column-accurate, not byte-accurate: a wide glyph is one thing
         // the operator selected, not three bytes.
         assert_eq!(copied("你好"), "copied 2 characters");
+    }
+
+    #[test]
+    fn daemon_mismatch_names_both_identities_and_the_recovery_command() {
+        let mismatch = cyclops_client::HelloCompatibility::between(
+            cyclops_client::RuntimeIdentity::new("0.1.0", Some("client-new")),
+            cyclops_client::RuntimeIdentity::new("0.0.9", Some("daemon-old")),
+        );
+        assert_eq!(
+            daemon_compatibility_notice(&mismatch).as_deref(),
+            Some(
+                "version/build mismatch: cyclops 0.1.0 (client-new), cyclopsd 0.0.9 (daemon-old) · continuing · run cyclops daemon restart"
+            )
+        );
     }
 }

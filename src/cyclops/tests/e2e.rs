@@ -31,7 +31,7 @@ fn scratch_home(tag: &str) -> PathBuf {
 fn hello(proto: u32) -> Value {
     json!({
         "cyclops": "0.1.0",
-        "build": env!("CYCLOPS_BUILD_REF"),
+        "build": cyclops_proto::BUILD_REF,
         "proto": proto,
         "boot_id": "b-e2e"
     })
@@ -225,7 +225,7 @@ fn run_cyclops_binary_io(
 fn canned_status() -> Value {
     json!({
         "daemon_version": "0.1.0",
-        "daemon_build": env!("CYCLOPS_BUILD_REF"),
+        "daemon_build": cyclops_proto::BUILD_REF,
         "proto": 1,
         "boot_id": "b-e2e",
         "uptime_ms": 120_000,
@@ -781,7 +781,7 @@ fn daemon_restart_refuses_while_mid_flight() {
     let daemon_executable = daemon.display().to_string();
     let hello_line = json!({
         "cyclops": "0.1.0",
-        "build": env!("CYCLOPS_BUILD_REF"),
+        "build": cyclops_proto::BUILD_REF,
         "daemon_process": process.clone(),
         "daemon_executable": daemon_executable.clone(),
         "proto": 1,
@@ -845,12 +845,13 @@ fn proto_mismatch_warns_and_continues() {
 fn build_mismatch_is_reported_by_health_and_machine_readable_status() {
     let home = scratch_home("bm");
     let mut canned = canned_status();
+    canned["daemon_version"] = json!("0.0.9");
     canned["daemon_build"] = json!("shadowed-build");
     let expected = canned.clone();
     serve_conns(
         &home,
         json!({
-            "cyclops": "0.1.0",
+            "cyclops": "0.0.9",
             "build": "shadowed-build",
             "proto": 1,
             "boot_id": "b-shadowed"
@@ -870,8 +871,8 @@ fn build_mismatch_is_reported_by_health_and_machine_readable_status() {
     );
 
     let note = format!(
-        "note: cyclopsd is build shadowed-build, this cyclops is build {}. Continuing; run cyclops daemon restart to load the installed daemon build.",
-        env!("CYCLOPS_BUILD_REF")
+        "version/build mismatch: cyclops {}, cyclopsd 0.0.9 (shadowed-build). Continuing; run cyclops daemon restart. If they still differ, update or reinstall the older side.",
+        cyclops_proto::VERSION_WITH_BUILD
     );
     let ping = run_cyclops(&home, &["ping", "--json"]);
     assert!(ping.status.success());
@@ -883,6 +884,36 @@ fn build_mismatch_is_reported_by_health_and_machine_readable_status() {
     assert_eq!(status, expected);
     assert_eq!(status["daemon_build"], "shadowed-build");
     assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), note);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn semantic_version_drift_warns_even_when_the_source_build_matches() {
+    let home = scratch_home("vm");
+    serve_once(
+        &home,
+        json!({
+            "cyclops": "0.0.9",
+            "build": cyclops_proto::BUILD_REF,
+            "proto": 1,
+            "boot_id": "b-version-drift"
+        }),
+        move |req| {
+            assert_eq!(req["method"], "ping");
+            (
+                vec![json!({"id": req["id"], "result": {"pong": true, "ts": 1}}).to_string()],
+                false,
+            )
+        },
+    );
+
+    let output = run_cyclops(&home, &["ping", "--json"]);
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(cyclops_client::CLIENT_VERSION), "{stderr}");
+    assert!(stderr.contains("0.0.9"), "{stderr}");
+    assert!(stderr.contains(cyclops_proto::BUILD_REF), "{stderr}");
+    assert!(stderr.contains("cyclops daemon restart"), "{stderr}");
     let _ = fs::remove_dir_all(&home);
 }
 
