@@ -75,8 +75,14 @@ policy, the durable block transition, benign terminal-state classification,
 the exhausted-supervisor transition, and the first post-commit route
 consequence behind the Module. Delivery now retains physical route observation
 and worker fault ownership while receiving only a body-free
-recorded-or-obsolete result. The next correction moves composer recovery
-messaging decisions behind the Module.
+recorded-or-obsolete result. The recovery correction then moved active-barrier
+lookup, exact claim comparison, recovery coordination, retirement policy and
+persistence, writer-uncertainty handling, and lifecycle, replacement, and
+pane-loss settlement behind `WorkspaceMessaging`. Fusion now supplies physical
+binding, screen, and exact-turn evidence and carries one opaque recovery plan.
+Runtime adapters can track or settle only an exact attempt through named
+Module operations. The next correction moves fusion's remaining raw
+active-composer candidate join and projection behind the Module.
 Additional narrowly named completion branches remain allowed when one pull
 request would become broad. The corresponding observation completion pass
 follows before Milestone 6. Milestone 5 put retained direct-delivery entry

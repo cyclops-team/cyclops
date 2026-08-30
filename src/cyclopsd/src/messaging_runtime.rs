@@ -595,11 +595,9 @@ async fn reconcile_due_unclaimed_reminder_barrier(
     recipient: RecipientKey,
     attempt_id: NotificationAttemptId,
 ) {
-    inner
-        .composer_recovery
-        .lock()
-        .expect("composer recovery lock")
-        .track(attempt_id);
+    if let Some(messaging) = inner.workspace_messaging() {
+        messaging.track_composer_recovery(attempt_id);
+    }
     let Ok(Some(route)) = notification_route(inner, service, recipient) else {
         return;
     };
@@ -764,11 +762,9 @@ pub(crate) fn schedule_claimed_composer_observation(
     recipient: RecipientKey,
     attempt_id: cyclops_proto::NotificationAttemptId,
 ) -> Result<(), MailboxServiceError> {
-    inner
-        .composer_recovery
-        .lock()
-        .expect("composer recovery lock")
-        .track(attempt_id);
+    if let Some(messaging) = inner.workspace_messaging() {
+        messaging.track_composer_recovery(attempt_id);
+    }
     let Some(route) = notification_route(inner, service, recipient)? else {
         return Ok(());
     };
@@ -805,11 +801,9 @@ pub(crate) fn schedule_claimed_notification_recovery(
     recipient: RecipientKey,
     attempt_id: cyclops_proto::NotificationAttemptId,
 ) -> Result<(), MailboxServiceError> {
-    inner
-        .composer_recovery
-        .lock()
-        .expect("composer recovery lock")
-        .track(attempt_id);
+    if let Some(messaging) = inner.workspace_messaging() {
+        messaging.track_composer_recovery(attempt_id);
+    }
     let Some(route) = notification_route(inner, service, recipient)? else {
         return Ok(());
     };

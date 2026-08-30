@@ -294,7 +294,7 @@ pub(crate) struct Inner {
     pub(crate) workspace_messaging: OnceLock<Arc<messaging::WorkspaceMessaging>>,
     /// Boot-scoped reconciliation state for barriers derived from the
     /// canonical workspace projection.
-    pub(crate) composer_recovery: StdMutex<composer_recovery::RecoveryCoordinator>,
+    composer_recovery: Arc<StdMutex<composer_recovery::RecoveryCoordinator>>,
     /// Serializes route state, directory replacement, and authenticated reads.
     pub(crate) mailbox_publication: Arc<StdMutex<()>>,
     /// Serializes unread badge derivations and tmux writes across concurrent sync requests.
@@ -681,10 +681,11 @@ impl Inner {
     ) -> Option<Arc<messaging::WorkspaceMessaging>> {
         let service = self.mailbox.clone()?;
         Some(Arc::clone(self.workspace_messaging.get_or_init(|| {
-            Arc::new(messaging::WorkspaceMessaging::new(
+            Arc::new(messaging::WorkspaceMessaging::new_with_recovery(
                 service,
                 Arc::clone(&self.mailbox_publication),
                 Arc::new(DaemonWorkspaceMessagingEffects::new(self)),
+                Arc::clone(&self.composer_recovery),
             ))
         })))
     }
@@ -3691,9 +3692,9 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         session_identities: StdMutex::new(session_identities),
         mailbox: Some(mailbox),
         workspace_messaging: OnceLock::new(),
-        composer_recovery: StdMutex::new(composer_recovery::RecoveryCoordinator::new(
+        composer_recovery: Arc::new(StdMutex::new(composer_recovery::RecoveryCoordinator::new(
             recovered_barrier_ids,
-        )),
+        ))),
         mailbox_publication: Arc::new(StdMutex::new(())),
         unread_projection_gate: tokio::sync::Mutex::new(()),
         unread_projection_pending: StdMutex::new(HashSet::new()),
@@ -4215,9 +4216,12 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                                         .hook_liveness
                                         .close(&PaneKey::new(idx, &adoption.pane_id));
                                     if let Some(recipient) = adoption.recipient {
-                                        match crate::composer_recovery::retire_gone_recipient(
-                                            &inner, recipient,
-                                        ) {
+                                        match inner
+                                            .workspace_messaging()
+                                            .ok_or("composer_recovery_store_unavailable")
+                                            .and_then(|messaging| {
+                                                messaging.retire_gone_composer_recipient(recipient)
+                                            }) {
                                             Ok(()) => gone.push(recipient),
                                             Err(reason) => {
                                                 warn!(session = %name, %reason, "cannot retire composer barrier for missing session");
@@ -4898,7 +4902,10 @@ async fn reconcile_adoption_records(
             .find(|adoption| adoption.recipient == Some(recipient))
             .ok_or("composer_recovery_pane_root_unproven")?;
         if crate::composer_recovery::physical_pane_gone(watcher, adoption).await? {
-            crate::composer_recovery::retire_gone_recipient(inner, recipient)?;
+            inner
+                .workspace_messaging()
+                .ok_or("composer_recovery_store_unavailable")?
+                .retire_gone_composer_recipient(recipient)?;
         } else {
             transferred.insert(recipient);
         }
@@ -4927,7 +4934,7 @@ async fn reconcile_adoption_records(
 /// replacement route can become addressable. Only the label, manifest pin,
 /// and saved chrome move.
 fn rebind_same_session_adoptions(
-    inner: &Inner,
+    inner: &Arc<Inner>,
     session_idx: usize,
     session_instance_id: SessionInstanceId,
     observed: &[ObservedPane],
@@ -4977,12 +4984,8 @@ fn rebind_same_session_adoptions(
         if current_root != old_root && current_root != new_root {
             return Err("adoption_rebind_route_changed");
         }
-        if inner.mailbox.is_some() {
-            crate::composer_recovery::retire_replaced_recipient(
-                inner,
-                recipient,
-                replacement_binding,
-            )?;
+        if let Some(messaging) = inner.workspace_messaging() {
+            messaging.retire_replaced_composer_recipient(recipient, replacement_binding)?;
         }
         if current_root == old_root {
             match registry.rebind_process(recipient, old_root, new_root) {
@@ -5251,12 +5254,8 @@ fn replace_pane_process(
         match adopted_root {
             None => {}
             Some(current) if current == new_root || previous_root == Some(current) => {
-                if inner.mailbox.is_some() {
-                    crate::composer_recovery::retire_replaced_recipient(
-                        inner,
-                        recipient,
-                        replacement_binding,
-                    )?;
+                if let Some(messaging) = inner.workspace_messaging() {
+                    messaging.retire_replaced_composer_recipient(recipient, replacement_binding)?;
                 }
                 if current != new_root {
                     match registry.rebind_process(recipient, current, new_root) {
@@ -5372,8 +5371,10 @@ async fn handle_pane_event(
                     .chain(expected.and_then(|adoption| adoption.recipient))
                     .collect();
                 for recipient in gone_recipients {
-                    if let Err(reason) =
-                        crate::composer_recovery::retire_gone_recipient(inner, recipient)
+                    if let Err(reason) = inner
+                        .workspace_messaging()
+                        .ok_or("composer_recovery_store_unavailable")
+                        .and_then(|messaging| messaging.retire_gone_composer_recipient(recipient))
                     {
                         warn!(pane = %id, %reason, "cannot retire composer barrier before pane cleanup");
                         return true;
@@ -5857,7 +5858,9 @@ mod tests {
             session_identities: StdMutex::new(session_identities),
             mailbox: None,
             workspace_messaging: OnceLock::new(),
-            composer_recovery: StdMutex::new(composer_recovery::RecoveryCoordinator::default()),
+            composer_recovery: Arc::new(StdMutex::new(
+                composer_recovery::RecoveryCoordinator::default(),
+            )),
             mailbox_publication: Arc::new(StdMutex::new(())),
             unread_projection_gate: tokio::sync::Mutex::new(()),
             unread_projection_pending: StdMutex::new(HashSet::new()),
