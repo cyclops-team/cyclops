@@ -14,7 +14,7 @@ preserved behavior, stop conditions, and rollback requirements.
 ## Current milestone
 
 The current responsibility-audit correction runs on
-**beta/refactor/observation-messaging-audit**. The first Milestone 3
+**beta/refactor/workspace-messaging-directory-boundary**. The first Milestone 3
 family proved the internal seam. The read-and-claim pass then moved inbox listing,
 claiming, message snapshots, and durable follow pages behind
 `WorkspaceMessaging`; the Module owns retained claim-locator interpretation,
@@ -118,10 +118,18 @@ force-submit schedulers directly. The current audit correction makes those
 sources publish route, pane-size, or availability evidence instead.
 `WorkspaceMessaging` now owns durable candidate selection and decides which
 retained mechanism runs; a deletion lint confines direct route scheduling to
-the effects adapter. The next focused correction is the participant-directory
-publication and caller-authentication boundary on
-**beta/refactor/workspace-messaging-directory-boundary**. Milestone 6 owns the
-separate history and presentation findings from this audit.
+the effects adapter. The participant-directory correction now makes the
+Module publish the complete durable directory and own the synchronization
+shared by route changes and authenticated callers. Adoption, clear, attach,
+rebind, and process-replacement code supplies physical route evidence without
+recovering the concrete mailbox service or publication lock. Force-submit
+settings authenticate through the same Module boundary. Existing concurrency
+tests preserve atomic label claims, non-overlapping publications, and stale
+snapshot exclusion, while deletion lints protect the new ownership. With that
+correction, the fresh Milestones 3–4 responsibility audit has no material
+messaging decision left in an ordinary caller. The next milestone is
+**beta/refactor/presentation-seams**. Milestone 6 owns the separate history and
+presentation findings from the audit.
 Additional narrowly named completion branches remain allowed when one pull
 request would become broad. Milestone 5 put
 retained direct-delivery entry points, restart settlement, and session-journal
