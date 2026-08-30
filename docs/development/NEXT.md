@@ -14,8 +14,8 @@ preserved behavior, stop conditions, and rollback requirements.
 ## Current milestone
 
 The next focused completion pass runs on
-**beta/refactor/workspace-messaging-runtime-evidence**. The first Milestone 3 family
-proved the internal seam. The read-and-claim pass then moved inbox listing,
+**beta/refactor/workspace-messaging-attention-commit**. The first Milestone 3
+family proved the internal seam. The read-and-claim pass then moved inbox listing,
 claiming, message snapshots, and durable follow pages behind
 `WorkspaceMessaging`; the Module owns retained claim-locator interpretation,
 publication synchronization, claim result mapping, and the post-claim
@@ -35,9 +35,13 @@ root; the operation Module now sees only named capabilities and a dependency
 lint prevents it from recovering `Inner`. The runtime-host pass then moved
 recipient FIFO continuation and direct-delivery unread ordering behind the
 Module, so delivery and attention mechanisms no longer receive the mailbox
-service merely to call the recipient scheduler. The next pass replaces the
-remaining schedule-style calls in fusion, ACK, delivery, and server code with
-typed runtime evidence or narrow Module operations.
+service merely to call the recipient scheduler. The runtime-evidence pass then
+moved route observations from fusion and authenticated ACK handling through an
+immutable evidence type, and moved durable pre-write, attention, notified, and
+force-submit-setting consequences behind named Module operations. Those
+callers no longer choose messaging schedulers. The next pass moves durable
+attention-resolution outcome commits behind `WorkspaceMessaging`, while the
+terminal mechanism retains only exact terminal inspection and action.
 Additional narrowly named completion branches remain allowed when one pull
 request would become broad. The corresponding observation completion pass
 follows before Milestone 6. Milestone 5 put retained direct-delivery entry

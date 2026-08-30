@@ -90,9 +90,14 @@ the `WorkspaceMessaging` operation code can name capabilities but cannot
 traverse `Inner`. The Module remains internal to `cyclopsd`; no messaging crate
 has been extracted. Delivery and attention mechanisms report a changed durable
 notification head back to the Module; they no longer receive the mailbox
-service and call the recipient scheduler themselves. Other runtime scheduling
-helpers still accept the daemon root and remain an explicit Milestone 3
-completion target.
+service and call the recipient scheduler themselves. Fusion and authenticated
+ACK handling now publish immutable route evidence, while delivery and socket
+code invoke named Module operations after durable pre-write, notification,
+attention, and force-submit-setting changes. Those callers no longer choose
+route reconciliation, reminder, or force-submit workers. The retained runtime
+mechanisms are reachable only through the composition adapter; narrowing their
+remaining daemon-root capabilities is still an explicit Milestone 3 completion
+target.
 
 The append and sync inside `MailboxService` are still the acceptance boundary.
 Notification and pane chrome remain effects of that durable fact, never a
