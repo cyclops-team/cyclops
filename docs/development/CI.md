@@ -143,16 +143,52 @@ process binding after the composer hold has already been released. Binding
 doubt may honestly replace the composer-era hold with `occupant_unprovable`;
 it does not mean Backspace failed to release the same attempt.
 
-The revised regression establishes a fresh event subscription after the initial exact
-gate hold and immediately before Backspace. It requires the positive readiness
-edge and then a new gate decision for the same message that either proceeds or
-names a different downstream hold. Attempt identity must remain unchanged and
-no requeue fact may appear. A local simulation that forced only the later
-foreground-binding check to return unavailable passed through the honest new
-hold, while disabling the original settled-visible-empty release rule made the
-test fail. The restored proof passed 20 serial focused runs, 80 focused runs at
-eight-way process concurrency, and ten complete four-thread coordinator runs.
-It adds no sleep or timeout and moves no defect class.
+Required Linux run
+[33327467320](https://github.com/cyclops-team/cyclops/actions/runs/33327467320)
+showed that the replacement gate decision was still a false dependency. The
+real-tmux path had already observed the positive Backspace readiness edge, then
+waited for an ephemeral delivery-worker decision whose durable consequences are
+protected more cheaply below that adapter.
+
+The final proof is split at the actual ownership boundaries. The real-tmux
+journey establishes a fresh event subscription after the initial exact gate
+hold, sends Backspace, requires the positive readiness edge, and verifies that
+the attempt identity did not change or requeue. The deterministic
+`causal_route_evidence_survives_an_earlier_tokenless_readiness_observation`
+test protects the source edge,
+`workspace_messaging_applies_a_readiness_route_observation` protects the Module
+boundary, and
+`blocked_readiness_reopens_once_only_after_positive_exact_route_evidence`
+protects one-time reopening of the same durable attempt. Event waits now name
+their boundary if either physical event is absent.
+
+A small local regression simulation removed the rule that preserves positive
+causal route evidence after an earlier tokenless readiness observation. The
+fusion test failed at that exact lost-edge assertion, then passed when the rule
+was restored. The real-tmux journey passed 200 bounded focused repetitions at
+16-way process concurrency, and the complete 41-test coordinator passed ten
+bounded four-thread repetitions. No timeout increased, no sleep was added, and
+no defect class moved to scheduled or release evidence.
+
+Required macOS runs
+[33322158633](https://github.com/cyclops-team/cyclops/actions/runs/33322158633)
+and
+[33326783742](https://github.com/cyclops-team/cyclops/actions/runs/33326783742)
+exposed a separate false dependency in the real workspace boot-sizing test.
+That regression already records the first target-side resize in an immutable
+tmux hook, but it waited for unrelated terminal text before reading the hook.
+The same test passed on adjacent macOS runs and in 20 focused local repetitions,
+confirming that paint scheduling did not honestly prove the sizing contract.
+
+The test now waits directly for the recorded cold-boot resize and asserts both
+that first event and the converged window size. It no longer treats a rendered
+`Chat 0 !0` line, alternate-screen state, or terminal teardown as sizing
+evidence. Changing the persisted preference to `messages_visible = false` in a
+local regression simulation made the replacement fail with the collapsed
+width `(95, 26)` instead of the required open width `(72, 26)`. Restored, the
+focused test passed 50 bounded repetitions. No timeout increased, no sleep was
+added, and renderer coverage remains in the renderer and workspace journey
+suites that own it.
 
 ## Task 3 representative pull-request comparison
 
