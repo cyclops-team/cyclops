@@ -92,13 +92,17 @@ edge as typed exact-owned evidence and applies it at the composition root. Pane
 observation carries an ordered collection so a simultaneous quota-reset fact is
 not dropped, while a deletion lint prevents fusion from invoking exact-owned
 candidate selection or worker election directly. The fresh follow-up audit
-found that the readiness helper still invokes route reconciliation while
-observation is running. The next focused completion pass runs on
-**beta/refactor/observation-messaging-route-evidence** and moves that causal
-edge into the immutable observation handoff without changing readiness or
-delivery semantics. Later focused passes must also remove remaining recovery
-and ACK messaging consequences from the observer before the responsibility
-audit can close. Additional narrowly named completion branches remain allowed
+found that the readiness helper still invoked route reconciliation while
+observation was running. The route-evidence correction now returns that causal
+token as the first typed item in the ordered pane result. Cache-only hold
+mutations produce the same type and pass it through the composition root, while
+tokenless and unchanged negative observations remain quiet. A deletion lint
+prevents fusion from invoking route or exact-owned policy directly. The next
+focused completion pass runs on
+**beta/refactor/observation-messaging-recovery-evidence** and separates
+composer-recovery decisions from physical observation. A later focused pass
+must also remove ACK messaging consequences from the observer before the
+responsibility audit can close. Additional narrowly named completion branches remain allowed
 when one pull request would become broad. Milestone 5 put retained direct-delivery entry
 points, restart settlement, and session-journal traversal behind
 `src/cyclopsd/src/compatibility.rs`; its census preserves

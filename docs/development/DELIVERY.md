@@ -403,6 +403,12 @@ quota-reset edge remains a separate observation in the same collection, so
 neither consequence suppresses the other. Exact-owned evidence is applied
 first, preserving the ordering of the earlier direct handoff without exposing
 its policy to the observer.
+When the same pane result carries causal readiness-route evidence, that typed
+observation precedes exact-owned and quota-reset evidence. Cache-only hold
+mutations mint the same evidence type and immediately pass it through the
+composition root. Fusion decides only whether the physical readiness edge
+exists; `WorkspaceMessaging` owns route reconciliation. Tokenless observations
+and unchanged negative causal observations still produce no messaging item.
 The immediate post-append reconciliation also reuses the current identity, so
 unchanged evidence is a no-op while an edge that raced ahead of the append is not
 lost. A later generation may reopen even when its complete process binding is
