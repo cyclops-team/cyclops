@@ -10,7 +10,8 @@
 //! - The record: one crash-safe NDJSON ledger per watched session, and
 //!   the read side over it (`history.rs`: `msg.history`, `msg.thread`).
 //! - Delivery (`delivery.rs`, docs/development/DELIVERY.md): the gate, the paste,
-//!   the ACK tiers, quota parking, `agent.wait`, restart-limbo closure.
+//!   the ACK tiers, quota parking, and `agent.wait`. Retained direct-delivery
+//!   entry points and restart replay cross `compatibility.rs` first.
 //! - Who is who: sender identity from socket peer credentials
 //!   (`identity.rs`) and the durable adoption roster
 //!   (`registry.rs`).
@@ -47,6 +48,7 @@
 mod ack;
 mod attention_resolution;
 mod chrome;
+mod compatibility;
 mod composer_recovery;
 pub mod config;
 mod deadlock;
@@ -652,7 +654,7 @@ impl SessionSlot {
         retired
     }
 
-    fn journal_file_name(&self) -> Option<String> {
+    pub(crate) fn journal_file_name(&self) -> Option<String> {
         self.ledger
             .path()
             .file_name()
@@ -1978,7 +1980,8 @@ impl Daemon {
             .map_err(server::mailbox_service_error)
     }
 
-    /// Legacy in-process delivery seam used by transport tests and embedders.
+    /// Compatibility-sensitive in-process delivery seam used by repository
+    /// tests and possible embedders. Public support status is unverified.
     ///
     /// This bypasses the durable mailbox contract. Its optional composed
     /// wait is an occupant-pinned pane-state heuristic, not proof that a
@@ -1988,7 +1991,7 @@ impl Daemon {
         from: &str,
         params: MsgSendParams,
     ) -> Result<Value, WireError> {
-        delivery::msg_send(&self.inner, from, params).await
+        compatibility::deliver_payload(&self.inner, from, params).await
     }
 
     /// In-process agent.state.report with a pre-trusted origin, mirroring
@@ -3350,7 +3353,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         }
         sessions.push(slot);
     }
-    let replay = history::session_journal_replay(&state_root, replay_roots);
+    let replay = compatibility::session_journal_replay(&state_root, replay_roots);
     // This is the first Engine use after construction, so every historical
     // id is reserved before any request can mint one. Files stay separate for
     // history; restart recovery receives one descendant-first stream per root.
@@ -3502,7 +3505,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     }
 
     // Any delivery the previous run left unresolved gets a named ending now.
-    delivery::close_limbo(&inner, &replayed);
+    compatibility::recover_direct_deliveries(&inner, &replayed);
     drop(replayed);
     messaging::schedule_unclaimed_reminders(&inner);
     messaging::schedule_force_submit_candidates(&inner);

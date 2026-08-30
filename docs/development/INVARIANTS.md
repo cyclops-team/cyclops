@@ -197,7 +197,9 @@ broadcast recorded in another session's ledger is never falsely closed.
 If you add a new failure path to the pipeline, this is the rule you are
 most likely to break: an early return that logs and drops is limbo.
 
-- Enforced at: `src/cyclopsd/src/delivery.rs`, `close_limbo`; every
+- Enforced at: `src/cyclopsd/src/compatibility.rs`,
+  `recover_direct_deliveries`, delegating to the retained settlement in
+  `src/cyclopsd/src/delivery.rs`; every
   transition goes through `advance`, which appends a line.
 - Proven by: `src/cyclopsd/tests/m1_fixes.rs`,
   `restart_closes_limbo_deliveries`; `src/cyclopsd/tests/m1_blockers.rs`,

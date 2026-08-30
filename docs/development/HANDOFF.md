@@ -37,7 +37,9 @@ For current messaging, start with [send.md](../guides/send.md),
 [PROTOCOL.md](../reference/PROTOCOL.md), `src/cyclopsd/src/mailbox.rs`, and
 `src/cyclopsd/src/messaging.rs`. Sections explicitly labeled legacy describe
 the compatibility path used by hook self-tests and old session records, not
-standard `cyclops send`.
+standard `cyclops send`. `src/cyclopsd/src/compatibility.rs` is the explicit
+boundary around retained direct-delivery writers, restart settlement, and
+session-journal readers.
 
 ## Documentation map
 
@@ -178,10 +180,12 @@ internal transport tests. Read in this order:
 2. `src/cyclops-proto/src/ledger.rs`, `DeliveryState::can_transition_to`. The
    legal moves are a table you can read in a minute; everything below is a
    drive through it.
-3. `src/cyclopsd/src/delivery.rs`, in call order: `msg_send` -> `worker_for` ->
+3. `src/cyclopsd/src/compatibility.rs`. The only entry to the retained writer,
+   restart settlement, and session-journal replay.
+4. `src/cyclopsd/src/delivery.rs`, in call order: `msg_send` -> `worker_for` ->
    `worker_loop` -> `process` -> `gate` -> `attempt_delivery` -> `inject`
    -> `await_ack` -> `receipt_of`.
-4. The two diagrams in [ARCHITECTURE.md](ARCHITECTURE.md): the gate's eight
+5. The two diagrams in [ARCHITECTURE.md](ARCHITECTURE.md): the gate's eight
    ordered checks, and send-to-receipt.
 
 The one idea to take away is that **verified** and **delivered** are not

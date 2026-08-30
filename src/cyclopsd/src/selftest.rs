@@ -574,7 +574,7 @@ pub(crate) async fn selftest(
         wait: None,
         require_wake: false,
     };
-    let receipt = delivery::msg_send(inner, "cyclopsd", send_params).await?;
+    let receipt = crate::compatibility::deliver_payload(inner, "cyclopsd", send_params).await?;
     let msg_id = receipt["msg_id"].as_str().unwrap_or_default().to_string();
     let mut state: DeliveryState =
         serde_json::from_value(receipt["deliveries"][0]["state"].clone())
