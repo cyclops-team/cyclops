@@ -3150,18 +3150,21 @@ async fn notification_worker_loop(inner: Arc<Inner>, recipient: RecipientKey, wo
                             .claimed_notification_rerun_requested
                             .swap(false, Ordering::SeqCst)
                     {
-                        if let (Some(service), Some(notification)) =
-                            (&inner.mailbox, &handle.notification)
-                        {
-                            if let Err(error) = crate::messaging::schedule_recipient(
-                                &inner,
-                                service,
-                                notification.recipient(),
-                            ) {
+                        if let Some(notification) = &handle.notification {
+                            if let Some(messaging) = inner.workspace_messaging() {
+                                if let Err(error) =
+                                    messaging.notification_head_changed(notification.recipient())
+                                {
+                                    error!(
+                                        id = %handle.msg_id,
+                                        %error,
+                                        "cannot reschedule claimed notification after readiness edge"
+                                    );
+                                }
+                            } else {
                                 error!(
                                     id = %handle.msg_id,
-                                    %error,
-                                    "cannot reschedule claimed notification after readiness edge"
+                                    "cannot reschedule claimed notification without workspace messaging"
                                 );
                             }
                         }
@@ -3302,17 +3305,17 @@ fn recover_failed_job(
                         return false;
                     }
                     let recipient = notification.recipient();
-                    crate::schedule_recipient_unread(inner, recipient);
-                    if let Some(service) = &inner.mailbox {
-                        if let Err(error) = crate::messaging::schedule_recipient(
-                            inner,
-                            service,
-                            notification.recipient(),
-                        ) {
+                    if let Some(messaging) = inner.workspace_messaging() {
+                        if let Err(error) = messaging.direct_delivery_settled(recipient) {
                             worker
                                 .set_fault(format!("direct settlement scheduling failed: {error}"));
                             return false;
                         }
+                    } else {
+                        worker.set_fault(
+                            "direct settlement scheduling failed: workspace messaging unavailable",
+                        );
+                        return false;
                     }
                 }
                 let _ = advance(
@@ -5233,12 +5236,15 @@ async fn reconcile_claimed_notification_barrier<I: Injector>(
         .lock()
         .expect("composer recovery lock")
         .retired(record.attempt_id);
-    if let Some(service) = &inner.mailbox {
-        if let Err(error) =
-            crate::messaging::schedule_recipient(inner, service, notification.recipient())
-        {
+    if let Some(messaging) = inner.workspace_messaging() {
+        if let Err(error) = messaging.notification_head_changed(notification.recipient()) {
             error!(id = %handle.msg_id, %error, "cannot advance notification FIFO after staged claim");
         }
+    } else {
+        error!(
+            id = %handle.msg_id,
+            "cannot advance notification FIFO after staged claim without workspace messaging"
+        );
     }
     AttemptOutcome::Done
 }
@@ -6734,20 +6740,21 @@ fn record_notification_notified(
             if handle.notification_transport() == Some(NotificationTransport::DirectPayload) {
                 notification.record_delivered_direct()?;
                 let recipient = notification.recipient();
-                crate::schedule_recipient_unread(inner, recipient);
-                if let Some(service) = &inner.mailbox {
-                    if let Err(error) = crate::messaging::schedule_recipient(
-                        inner,
-                        service,
-                        notification.recipient(),
-                    ) {
+                if let Some(messaging) = inner.workspace_messaging() {
+                    if let Err(error) = messaging.direct_delivery_settled(recipient) {
                         error!(
                             id = %handle.msg_id,
-                            recipient = %notification.recipient(),
+                            %recipient,
                             %error,
                             "direct delivery settled but the next mailbox item could not be scheduled"
                         );
                     }
+                } else {
+                    error!(
+                        id = %handle.msg_id,
+                        %recipient,
+                        "direct delivery settled without workspace messaging"
+                    );
                 }
             } else {
                 crate::messaging::schedule_unclaimed_reminder(inner, record);

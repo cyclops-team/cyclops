@@ -429,6 +429,29 @@ impl WorkspaceMessaging {
         })
     }
 
+    /// Continue one recipient FIFO after another durable path changed its
+    /// current notification head.
+    ///
+    /// Delivery and terminal mechanisms report the committed outcome; they do
+    /// not receive the mailbox service or choose the worker that follows it.
+    pub(crate) fn notification_head_changed(
+        &self,
+        recipient: RecipientKey,
+    ) -> Result<(), MailboxServiceError> {
+        self.effects
+            .schedule_notification(&self.service, recipient)
+            .map(|_| ())
+    }
+
+    /// Apply the shared post-commit consequences of a direct mailbox delivery.
+    pub(crate) fn direct_delivery_settled(
+        &self,
+        recipient: RecipientKey,
+    ) -> Result<(), MailboxServiceError> {
+        self.effects.invalidate_unread(recipient);
+        self.notification_head_changed(recipient)
+    }
+
     pub(crate) fn alarm_preview(
         &self,
         caller: RecipientKey,
@@ -2213,6 +2236,51 @@ mod tests {
                 RecordedEffect::InvalidateUnread(reviewer),
             ]
         );
+    }
+
+    // Obsolete if delivery or attention mechanisms regain the mailbox service
+    // and directly choose how a settled head advances its recipient FIFO.
+    #[test]
+    fn workspace_messaging_owns_external_settlement_follow_up_order() {
+        let (_scratch, service, events, reviewer, _) =
+            mailbox_service("workspace-messaging-settlement-effects", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging = WorkspaceMessaging::new(
+            Arc::clone(&service),
+            Arc::new(StdMutex::new(())),
+            effects.clone(),
+        );
+
+        messaging.notification_head_changed(reviewer).unwrap();
+        messaging.direct_delivery_settled(reviewer).unwrap();
+
+        assert_eq!(
+            effects.calls(),
+            vec![
+                RecordedEffect::Schedule(reviewer),
+                RecordedEffect::InvalidateUnread(reviewer),
+                RecordedEffect::Schedule(reviewer),
+            ]
+        );
+    }
+
+    /// Syntactic architecture lint: delivery and terminal mechanisms report a
+    /// committed recipient change to WorkspaceMessaging; they cannot call the
+    /// scheduler with a mailbox projection themselves.
+    #[test]
+    fn mechanisms_cannot_schedule_recipient_fifos_directly() {
+        for (name, source) in [
+            ("delivery", include_str!("delivery.rs")),
+            (
+                "attention resolution",
+                include_str!("attention_resolution.rs"),
+            ),
+        ] {
+            assert!(
+                !source.contains("messaging::schedule_recipient("),
+                "{name} recovered direct recipient scheduling knowledge"
+            );
+        }
     }
 
     // Obsolete if alarm or attention adapters again inspect notification

@@ -14,7 +14,7 @@ preserved behavior, stop conditions, and rollback requirements.
 ## Current milestone
 
 The next focused completion pass runs on
-**beta/refactor/workspace-messaging-runtime-host**. The first Milestone 3 family
+**beta/refactor/workspace-messaging-runtime-evidence**. The first Milestone 3 family
 proved the internal seam. The read-and-claim pass then moved inbox listing,
 claiming, message snapshots, and durable follow pages behind
 `WorkspaceMessaging`; the Module owns retained claim-locator interpretation,
@@ -32,8 +32,12 @@ daemon status retains the legacy session-ledger fold separately and no longer
 reads mailbox projections directly. The runtime-effects boundary pass moved
 `WorkspaceMessaging` construction and its daemon adapter into the composition
 root; the operation Module now sees only named capabilities and a dependency
-lint prevents it from recovering `Inner`. The next pass narrows the remaining
-runtime scheduling helpers that still accept the daemon root.
+lint prevents it from recovering `Inner`. The runtime-host pass then moved
+recipient FIFO continuation and direct-delivery unread ordering behind the
+Module, so delivery and attention mechanisms no longer receive the mailbox
+service merely to call the recipient scheduler. The next pass replaces the
+remaining schedule-style calls in fusion, ACK, delivery, and server code with
+typed runtime evidence or narrow Module operations.
 Additional narrowly named completion branches remain allowed when one pull
 request would become broad. The corresponding observation completion pass
 follows before Milestone 6. Milestone 5 put retained direct-delivery entry
