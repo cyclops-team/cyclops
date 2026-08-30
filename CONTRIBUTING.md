@@ -223,6 +223,7 @@ measured beta baseline are recorded in
 | `cargo test -p cyclopsd --all-targets --no-fail-fast` | Any daemon test fails under its process-isolated rig contract |
 | `cargo doc --workspace --no-deps` | Workspace Rust documentation fails to compile |
 | `python3 scripts/check-doc-paths.py` | A doc points at a file this repo does not have, or a page exists that no front door links to. `--selftest` proves the checker still catches, so a green run cannot mean it stopped looking |
+| `./tests/e2e/messaging-docs-parity.sh` | Messaging authority or terminology drifts into a known stale or contradictory form |
 | `./tests/e2e/parity-check.sh` | A doc quotes output the binaries no longer print |
 | `./scripts/test-relocated-scratch.sh` with `CYCLOPS_TEST_TMP` set | Root selection broke, a real-tmux fixture bypassed the helper, or the relocated tmux/daemon/socket journey failed (F24) |
 | `./tests/e2e/parity-check.sh --with-installer` | `scripts/install.sh` stopped doing what install.md says, or left a shell profile changed after `--uninstall`. Its own job: it does a release build |
