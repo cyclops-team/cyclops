@@ -1,7 +1,13 @@
-# Current CI evidence and baseline
+# CI evidence lanes and measured baseline
 
-The workflow exposes six stable check names. This page records the measured
-baseline and the responsibility of the evidence that runs today.
+**Status:** Current CI contract
+
+Cyclops separates fast pull-request correctness from conditional integration,
+scheduled reliability, and release evidence. A lane may be cheaper than the
+one that preceded it, but it must still name the durable contract it protects.
+Replacement evidence protects the original defect or durable contract. A small
+local regression simulation is useful when practical; Cyclops does not maintain
+a general mutation-testing framework.
 
 ## Task 1 baseline
 
@@ -30,41 +36,17 @@ runs and are not counted as reruns.
 | Stable check | Baseline duration | Responsibility |
 |---|---:|---|
 | `test (ubuntu-latest)` | 10m 38s | Required pull-request correctness |
-| `test (macos-latest)` | 8m 58s | Required correctness plus platform evidence |
-| `installer (ubuntu-latest)` | 2m 49s | Conditional integration, currently run for every change |
-| `installer (macos-latest)` | 3m 27s | Conditional integration, currently run for every change |
-| `website` | 18s | Conditional integration, currently run for every change |
-| `tmux-head` | 6m 19s | Scheduled evidence, currently advisory on every change |
+| `test (macos-latest)` | 8m 58s | Conditional platform and tmux evidence |
+| `installer (ubuntu-latest)` | 2m 49s | Conditional installer integration |
+| `installer (macos-latest)` | 3m 27s | Conditional installer integration |
+| `website` | 18s | Conditional website integration |
+| `tmux-head` | 6m 19s | Conditional focused tmux HEAD evidence |
 
-No release-evidence job exists in the current workflow.
-
-## Repeated evidence in the Task 1 baseline
-
-Each operating-system test job runs the complete Rust evidence, then repeats
-the same non-daemon, daemon, and doctest commands under a relocated scratch
-root. The second execution attempts to prove only that test scratch paths honor
-`CYCLOPS_TEST_TMP`.
-
-The advisory `tmux-head` job builds upstream tmux and repeats nearly the same
-complete Rust gate a third time on Linux.
-
-Installer and website jobs do not duplicate the Rust correctness suite, but
-they currently run for unrelated changes.
-
-## Current lane responsibilities
-
-1. **Required pull-request correctness:** formatting, Clippy, Rust tests,
-   documentation paths, and exact-output parity in the two `test` checks.
-2. **Conditional integration:** website and installer checks. They currently
-   run for every change.
-3. **Scheduled evidence:** tmux HEAD. It currently runs on every pull request.
-4. **Release evidence:** no explicit release lane is implemented.
-
-## Superseded-run cancellation
-
-Pull-request runs share a workflow-and-PR concurrency key and cancel an older
-run when a new commit arrives. Push and manual runs use their unique GitHub run
-id, so release or operator-triggered evidence cannot cancel another run.
+The Task 1 workflow ran every check for every change. The two operating-system
+test jobs each ran the complete Rust suite, then repeated it under a relocated
+scratch root. The advisory tmux HEAD job built upstream tmux and repeated nearly
+the same complete Rust gate a third time on Linux. No scheduled or release
+workflow existed.
 
 ## Task 2 deterministic replacement evidence
 
@@ -79,9 +61,11 @@ The relocated-root step no longer repeats the complete Rust suite. It now runs
 3. `m0_shadow_daemon_end_to_end` runs one real tmux server, in-process daemon,
    Unix socket, and scratch home under the relocated root.
 
-The former duplicate step cost 3m21s on Linux and 3m20s on macOS in the CI
-architecture review's evidence run. The Task 2 pull request records the same
-step's replacement duration and the resulting job and runner-time delta.
+The former relocated step cost 3m21s on Linux and 3m20s on macOS. In Task 2 it
+cost 2 seconds on each platform. The complete pull-request run changed from
+10m38s wall time and 32m29s runner time to 8m28s and 27m23s. That is 2m10s
+(20.4%) less wall time and 5m06s (15.7%) fewer runner minutes without removing a
+named defect class.
 
 Tmux server names now include the executable pid and an in-process sequence.
 One external owner per test executable records only those exact names. The
@@ -90,19 +74,138 @@ observes that its server and socket disappear, and proves a neighboring server
 survives. Ordinary return, already-gone server, and panic cleanup remain covered
 by the existing teardown tests.
 
-### Source checks are not one evidence class
+`scratch_path_lint`, `teardown_has_one_home`, and the workspace guards enforce
+literal prohibited calls or ownership boundaries. They are syntactic
+architecture lints. `src/cyclops-proto/tests/one_place.rs` remains a semantic
+tripwire whose own header states what source shapes it cannot recognize. It does
+not replace domain tests or review.
 
-- `scratch_path_lint`, `teardown_has_one_home`, and the workspace guards enforce
-  literal prohibited calls or ownership boundaries. They are syntactic
-  architecture lints.
-- `src/cyclops-proto/tests/one_place.rs` remains a semantic tripwire. Its own
-  header documents the shapes it cannot recognize. A green result is not
-  runtime proof and does not replace the attention domain tests or review.
+The named backspace regression now waits for the distinct `composer_clean`
+projection instead of assuming runtime-idle also means a human draft is gone.
+It passed 30 focused local repetitions without an added sleep.
 
-No chronology-named regression was deleted or consolidated in Task 2. The
-required durable-contract and original-defect census did not establish a safe
-replacement for any of them. Task 2 corrected the named backspace regression's
-observable boundary: runtime-idle can coexist with a human draft, so the test
-now waits for the distinct `composer_clean` projection before expecting the
-attempt to reopen. It passed 30 focused local repetitions without an added
-sleep.
+## Normal pull-request workflow
+
+`.github/workflows/ci.yml` keeps the six stable check names in the baseline.
+`scripts/ci-paths.py` classifies the complete pull-request diff. Workflow and
+classifier changes select every lane so routing changes prove themselves.
+Unknown manual history also selects every lane and fails safe.
+
+| Stable check | Runs substantive evidence when |
+|---|---|
+| `test (ubuntu-latest)` | Always checks documentation paths; adds Rust, documentation, and exact-output evidence when their inputs change |
+| `test (macos-latest)` | A named platform or tmux risk changes |
+| `installer (ubuntu-latest)` | Installer, packaged assets, or install docs change |
+| `installer (macos-latest)` | Installer, packaged assets, or install docs change |
+| `website` | Website, hosted installer, or README-facing inputs change |
+| `tmux-head` | The tmux adapter, testrig, manifests, layouts, or Cargo graph changes |
+
+Every check always exists. An unrelated change receives an explicit successful
+not-applicable step, so branch protection never depends on a disappearing job.
+The documentation-path check is the deliberate exception to conditional work:
+it runs for every pull request because deleting or renaming any quoted target
+can break a page even when no Markdown file changed. If classification itself
+fails, each stable check fails instead of silently skipping.
+Pull-request runs share a workflow-and-PR concurrency key and cancel an older
+revision. Push and manual evidence use unique keys and never cancel each other.
+
+The Ubuntu correctness lane owns formatting, Clippy, parallel-safe tests,
+daemon tests, Rust documentation compilation, documentation paths,
+exact-output parity, and focused relocated-root evidence. The normal nextest
+filter excludes the three performance executables. Those workloads retain
+their own metadata and history in scheduled and release evidence.
+
+The old `cargo test --workspace --doc` command compiled every workspace crate
+and executed zero doctests. The replacement
+`cargo doc --workspace --no-deps` directly protects the intended
+documentation-compilation contract. It does not turn pre-existing rustdoc
+warnings into a new blocking policy.
+
+### Simplification ledger
+
+| Work removed from every pull request | Contract it attempted to protect | Replacement evidence |
+|---|---|---|
+| Complete macOS Rust suite | Named portability and tmux behavior | Conditional macOS suite for platform or tmux paths; scheduled full matrix for all other cross-platform drift |
+| Website install, check, and build | Hosted installer parity and website type/build correctness | Stable `website` check runs the same commands only for website-facing inputs |
+| Installer lifecycle on both platforms | Installation, profile restoration, seeded assets, and uninstall | Both stable installer checks run the same lifecycle only for installer-owned inputs; release evidence repeats it with user journeys |
+| Complete Rust gate against tmux HEAD | Upstream tmux adapter compatibility | Pull requests run `cyclops-tmux`, `cyclops-workspace`, and the M0 tmux/daemon/socket journey; the retained `watcher_modes` contract still catches F25; scheduled evidence runs the full fast gate against tmux HEAD |
+| Three performance test binaries inside ordinary nextest | Frame, queue, control-write, flood, and terminal-restoration budgets | Scheduled and release runs execute the same binaries through `scripts/ci-performance.py` and retain comparable metadata |
+| Zero-test doctest execution | Rust documentation compilation | `cargo doc` builds every workspace page; pre-existing warnings remain visible without becoming a new blocking policy |
+
+Path-classifier self-tests simulate unrelated website, installer, daemon,
+platform-client, documentation, domain-only, and workflow changes. They assert
+both selected and not-applicable lanes. The F25 test remains in the focused
+tmux HEAD package, and the performance script has been run locally through all
+three retained workloads with its JSON metadata contract checked. These are
+small contract simulations, not mutation infrastructure.
+
+Run the complete normal gate locally with:
+
+```bash
+./scripts/check.sh
+```
+
+Run the path classifier's contract examples with:
+
+```bash
+python3 scripts/ci-paths.py --selftest
+```
+
+## Scheduled evidence
+
+`.github/workflows/scheduled-evidence.yml` runs after every merge to
+**beta/messaging-rework**, runs nightly once the workflow reaches GitHub's
+default branch, and can be dispatched by lane. GitHub only fires cron workflows
+from the default branch, so the beta integration trigger prevents a dormant
+replacement lane during the rework. The workflow owns the complete Linux and
+macOS matrix, the full fast gate against tmux master, retained performance
+workloads, repeated race evidence, forced-cleanup evidence, soak tests, and
+long-history workloads.
+
+```bash
+gh workflow run scheduled-evidence.yml \
+  --ref beta/messaging-rework \
+  -f lane=all
+```
+
+For a focused manual run, replace `all` with `matrix`, `tmux-head`,
+`performance`, or `reliability`. The reliability command is also runnable
+locally with a bounded repeat count:
+
+```bash
+CYCLOPS_CI_REPEAT=10 ./scripts/ci-reliability.sh
+```
+
+`scripts/ci-performance.py` records the commit, dirty state, Cyclops version,
+operating system, architecture, CPU count, Rust and Cargo versions, tmux
+version, runner image, workload command, result, output, and duration. GitHub
+retains the JSON artifact for 90 days under a commit-specific name.
+
+## Release evidence
+
+`.github/workflows/release-evidence.yml` is manual and does not merge, tag, or
+publish anything. It owns full clean-checkout validation on Linux and macOS,
+strict and lenient journal replay, daemon historical replay, installer
+lifecycle, real parity journeys, and a retained performance comparison.
+
+```bash
+gh workflow run release-evidence.yml --ref beta/messaging-rework
+```
+
+The final `beta release evidence complete` job becomes green only when every
+release responsibility succeeds. Operator approval is still required before
+merging **beta/messaging-rework** into **main** or publishing a release.
+
+## Final comparison protocol
+
+The evidence-lanes pull request changes the workflow itself, so it correctly
+selects every lane and cannot represent an ordinary path-routed pull request.
+Measure the first post-merge messaging pull request whose diff does not change
+CI control files, then compare it to run 33275472898 with `scripts/ci-baseline.py`.
+Record wall time, total runner time, per-job duration, and every successful
+not-applicable check. This is the final Task 3 before-and-after measurement.
+
+No defect class is silently discarded. Performance, soak, repeated-race, full
+matrix, and full tmux HEAD evidence move to scheduled or release ownership.
+Ordinary pull requests keep the cheapest evidence that can honestly fail for
+their changed contract.

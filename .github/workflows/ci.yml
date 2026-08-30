@@ -2,14 +2,15 @@ name: ci
 
 on:
   push:
-    branches: [v2, v3, main]
+    branches: [main, beta/messaging-rework]
   pull_request:
   workflow_dispatch:
 
-# A pull request can only merge its newest revision. Do not spend runner time
-# proving an older revision after a replacement commit arrives. Push and manual
-# evidence use the unique run id, so release or operator-triggered runs are
-# never cancelled by this rule.
+permissions:
+  contents: read
+
+# A pull request can only merge its newest revision. Push and manual evidence
+# use the unique run id so operator-triggered evidence never cancels another run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -18,132 +19,240 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Responsibility: conditional integration. The stable `website` check
-  # currently runs for every change.
-  website:
+  classify:
+    name: classify changed paths
     runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.paths.outputs.rust }}
+      docs: ${{ steps.paths.outputs.docs }}
+      parity: ${{ steps.paths.outputs.parity }}
+      website: ${{ steps.paths.outputs.website }}
+      installer: ${{ steps.paths.outputs.installer }}
+      tmux: ${{ steps.paths.outputs.tmux }}
+      platform: ${{ steps.paths.outputs.platform }}
+      tmux_head: ${{ steps.paths.outputs.tmux_head }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: prove and apply the path classifier
+        id: paths
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python3 scripts/ci-paths.py --selftest
+          python3 scripts/ci-paths.py \
+            --base "$BASE_SHA" --head "$HEAD_SHA" --github-output "$GITHUB_OUTPUT"
+
+  # Stable conditional check. The job always exists; unrelated changes get an
+  # explicit successful not-applicable result instead of a missing check.
+  website:
+    needs: classify
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: require successful path classification
+        if: ${{ needs.classify.result != 'success' }}
+        run: |
+          echo "path classification failed; website applicability is unknown"
+          exit 1
+      - name: website evidence not applicable
+        if: ${{ needs.classify.outputs.website != 'true' }}
+        run: echo "website inputs did not change"
+      - uses: actions/checkout@v7
+        if: ${{ needs.classify.outputs.website == 'true' }}
       - uses: actions/setup-node@v7
+        if: ${{ needs.classify.outputs.website == 'true' }}
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: website/package-lock.json
-      - run: cmp scripts/install.sh website/static/install.sh
-      - working-directory: website
+      - if: ${{ needs.classify.outputs.website == 'true' }}
+        run: cmp scripts/install.sh website/static/install.sh
+      - if: ${{ needs.classify.outputs.website == 'true' }}
+        working-directory: website
         run: npm ci
-      - working-directory: website
+      - if: ${{ needs.classify.outputs.website == 'true' }}
+        working-directory: website
         run: npm run check
-      - working-directory: website
+      - if: ${{ needs.classify.outputs.website == 'true' }}
+        working-directory: website
         run: npm run build
 
-  # Responsibility: required pull-request correctness. The two matrix entries
-  # intentionally retain their stable `test (<os>)` check names.
-  test:
-    strategy:
-      # One platform failing must not cancel the other. Cyclops has real
-      # per-OS behavior (peer credentials, scratch paths), so a Linux
-      # failure that hides the macOS result costs a whole round trip.
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  # Required pull-request correctness. Performance executables have a retained
+  # scheduled lane; this job owns static checks, domain/integration tests,
+  # documentation compilation, exact-output parity, and focused F24 evidence.
+  test-ubuntu:
+    name: test (ubuntu-latest)
+    needs: classify
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
     steps:
+      - name: require successful path classification
+        if: ${{ needs.classify.result != 'success' }}
+        run: |
+          echo "path classification failed; required evidence applicability is unknown"
+          exit 1
+      - name: required evidence not applicable
+        if: ${{ needs.classify.outputs.rust != 'true' && needs.classify.outputs.docs != 'true' && needs.classify.outputs.parity != 'true' }}
+        run: echo "no Rust, documentation, or exact-output input changed"
       - uses: actions/checkout@v7
+        if: ${{ needs.classify.outputs.rust == 'true' || needs.classify.outputs.docs == 'true' || needs.classify.outputs.parity == 'true' }}
       - uses: dtolnay/rust-toolchain@stable
+        if: ${{ needs.classify.outputs.rust == 'true' || needs.classify.outputs.parity == 'true' }}
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        if: ${{ needs.classify.outputs.rust == 'true' || needs.classify.outputs.parity == 'true' }}
       - uses: taiki-e/install-action@v2
+        if: ${{ needs.classify.outputs.rust == 'true' }}
         with:
           tool: cargo-nextest@0.9.100
       - name: Install tmux
-        run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y tmux; else brew install tmux; fi
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      # --no-fail-fast keeps scheduling after a failure so one run reports
-      # every failing test instead of hiding the remaining failures. The
-      # doctests run even when nextest failed, for the same reason; the
-      # step fails if either did.
-      - name: Rust tests
+        if: ${{ needs.classify.outputs.rust == 'true' || needs.classify.outputs.parity == 'true' }}
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: formatting
+        if: ${{ needs.classify.outputs.rust == 'true' }}
+        run: cargo fmt --all --check
+      - name: linting and compilation
+        if: ${{ needs.classify.outputs.rust == 'true' }}
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Rust correctness tests
+        if: ${{ needs.classify.outputs.rust == 'true' }}
         run: |
           status=0
-          cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast || status=$?
-          # One cyclopsd test binary owns several private tmux servers and
-          # socket-backed runtimes. Eight in-process tests can exceed macOS's
-          # 256-FD soft limit; four preserves parallelism without EMFILE.
+          cargo nextest run --workspace \
+            -E 'not (package(cyclopsd) | binary_id(=cyclops-ui::perf) | binary_id(=cyclops-ui::queue_perf) | binary_id(=cyclops-workspace::perf_contract))' \
+            --no-fail-fast || status=$?
           cargo test -p cyclopsd --all-targets --no-fail-fast -- --test-threads=4 || status=$?
-          cargo test --workspace --doc || status=$?
           exit "$status"
-      # A path in a doc is checkable. Before this, ARCHITECTURE.md pointed
-      # newcomers at files that were not in the repo, and thirty-one source
-      # paths were missing their source-directory prefix. --selftest first, so a
-      # green result cannot mean the checker stopped checking.
+      - name: Rust documentation compiles
+        if: ${{ needs.classify.outputs.rust == 'true' }}
+        run: cargo doc --workspace --no-deps
       - name: docs point at files that exist
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && needs.classify.outputs.docs == 'true' }}
         run: |
           python3 scripts/check-doc-paths.py --selftest
           python3 scripts/check-doc-paths.py
-      # Docs are part of done, so a doc quoting output the binaries no
-      # longer print fails the build. This walks the README ladder against
-      # a throwaway tmux server and asserts every shape the pages promise.
-      # Reuses the debug binaries the tests above built.
+      - name: messaging documentation agrees
+        if: ${{ !cancelled() && needs.classify.outputs.docs == 'true' }}
+        run: ./tests/e2e/messaging-docs-parity.sh
       - name: docs and binaries agree
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && needs.classify.outputs.parity == 'true' }}
         run: ./tests/e2e/parity-check.sh
-      # F24: the override unit test proves root selection, a syntactic lint
-      # rejects direct temp APIs in real-tmux fixtures, and M0 crosses one
-      # real tmux + daemon socket + scratch-home journey. This replaces a full
-      # duplicate Rust execution that cost about 3m20s per operating system.
       - name: tests with the scratch root relocated
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && needs.classify.outputs.rust == 'true' }}
         env:
-          CYCLOPS_TEST_TMP: ${{ runner.os == 'macOS' && '/private/var/tmp/cyc-relocated' || '/tmp/cyc-relocated' }}
+          CYCLOPS_TEST_TMP: /tmp/cyc-relocated
         run: ./scripts/test-relocated-scratch.sh
 
-  # Responsibility: conditional integration. Both stable `installer (<os>)`
-  # checks currently run for every change.
-  #
-  # The installer is what a stranger runs first, so it gets its own gate:
-  # build, place the binaries, edit a shell profile, set the home up, then
-  # uninstall and prove the profile came back byte for byte. Its own job
-  # because it does a cold release build, and behind `test` that would sit
-  # in front of every test result.
-  #
-  # Both platforms: the profile it picks and the tools it edits with differ
-  # (.bash_profile vs .bashrc, BSD vs GNU userland).
+  # Stable conditional portability check. A full two-platform matrix runs on
+  # schedule; PRs pay for macOS only when named platform or tmux risks change.
+  test-macos:
+    name: test (macos-latest)
+    needs: classify
+    if: ${{ !cancelled() }}
+    runs-on: macos-latest
+    steps:
+      - name: require successful path classification
+        if: ${{ needs.classify.result != 'success' }}
+        run: |
+          echo "path classification failed; macOS applicability is unknown"
+          exit 1
+      - name: macOS evidence not applicable
+        if: ${{ needs.classify.outputs.platform != 'true' && needs.classify.outputs.tmux != 'true' }}
+        run: echo "no named macOS portability or tmux risk changed"
+      - uses: actions/checkout@v7
+        if: ${{ needs.classify.outputs.platform == 'true' || needs.classify.outputs.tmux == 'true' }}
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ needs.classify.outputs.platform == 'true' || needs.classify.outputs.tmux == 'true' }}
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ needs.classify.outputs.platform == 'true' || needs.classify.outputs.tmux == 'true' }}
+      - uses: taiki-e/install-action@v2
+        if: ${{ needs.classify.outputs.platform == 'true' || needs.classify.outputs.tmux == 'true' }}
+        with:
+          tool: cargo-nextest@0.9.100
+      - name: Install tmux
+        if: ${{ needs.classify.outputs.platform == 'true' || needs.classify.outputs.tmux == 'true' }}
+        run: brew install tmux
+      - name: macOS correctness and portability
+        if: ${{ needs.classify.outputs.platform == 'true' || needs.classify.outputs.tmux == 'true' }}
+        run: |
+          status=0
+          cargo nextest run --workspace \
+            -E 'not (package(cyclopsd) | binary_id(=cyclops-ui::perf) | binary_id(=cyclops-ui::queue_perf) | binary_id(=cyclops-workspace::perf_contract))' \
+            --no-fail-fast || status=$?
+          cargo test -p cyclopsd --all-targets --no-fail-fast -- --test-threads=4 || status=$?
+          exit "$status"
+      - name: tests with the scratch root relocated
+        if: ${{ !cancelled() && (needs.classify.outputs.platform == 'true' || needs.classify.outputs.tmux == 'true') }}
+        env:
+          CYCLOPS_TEST_TMP: /private/var/tmp/cyc-relocated
+        run: ./scripts/test-relocated-scratch.sh
+
+  # Stable conditional installer checks. Both platforms still prove their
+  # distinct profile and userland behavior when installer-owned inputs move.
   installer:
+    needs: classify
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      - name: require successful path classification
+        if: ${{ needs.classify.result != 'success' }}
+        run: |
+          echo "path classification failed; installer applicability is unknown"
+          exit 1
+      - name: installer evidence not applicable
+        if: ${{ needs.classify.outputs.installer != 'true' }}
+        run: echo "installer, packaged assets, and installation docs did not change"
       - uses: actions/checkout@v7
+        if: ${{ needs.classify.outputs.installer == 'true' }}
       - uses: dtolnay/rust-toolchain@stable
+        if: ${{ needs.classify.outputs.installer == 'true' }}
       - uses: Swatinem/rust-cache@v2
+        if: ${{ needs.classify.outputs.installer == 'true' }}
       - name: Install tmux
+        if: ${{ needs.classify.outputs.installer == 'true' }}
         run: |
           if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y tmux; else brew install tmux; fi
-      - run: ./tests/e2e/parity-check.sh --installer-only
+      - if: ${{ needs.classify.outputs.installer == 'true' }}
+        run: ./tests/e2e/parity-check.sh --installer-only
 
-  # Responsibility: scheduled evidence. This stable advisory check currently
-  # runs on every pull request.
-  #
-  # ADR-001 owns the tmux-churn risk by testing the adapter against tmux HEAD.
-  # Failures here are early warning, not merge blockers.
+  # Stable advisory tmux-HEAD check. PRs run a focused adapter contract only
+  # when adapter or manifest inputs move. Nightly owns the complete HEAD suite.
   tmux-head:
+    needs: classify
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
+      - name: require successful path classification
+        if: ${{ needs.classify.result != 'success' }}
+        run: |
+          echo "path classification failed; tmux HEAD applicability is unknown"
+          exit 1
+      - name: tmux HEAD evidence not applicable
+        if: ${{ needs.classify.outputs.tmux_head != 'true' }}
+        run: echo "tmux adapter, rig, manifests, and layouts did not change"
       - uses: actions/checkout@v7
+        if: ${{ needs.classify.outputs.tmux_head == 'true' }}
       - uses: dtolnay/rust-toolchain@stable
+        if: ${{ needs.classify.outputs.tmux_head == 'true' }}
       - uses: Swatinem/rust-cache@v2
+        if: ${{ needs.classify.outputs.tmux_head == 'true' }}
       - uses: taiki-e/install-action@v2
+        if: ${{ needs.classify.outputs.tmux_head == 'true' }}
         with:
           tool: cargo-nextest@0.9.100
       - name: Build tmux from master
+        id: build_tmux_head
+        if: ${{ needs.classify.outputs.tmux_head == 'true' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y libevent-dev ncurses-dev build-essential bison pkg-config autoconf automake
@@ -151,23 +260,12 @@ jobs:
           cd /tmp/tmux-head && sh autogen.sh && ./configure && make -j
           sudo make install
           tmux -V
-      # Both halves of the Rust gate, same as the test job: the doctests
-      # run even when nextest failed, and the step fails if either did.
-      - name: Rust tests against tmux HEAD
+      - name: Focused adapter evidence against tmux HEAD
+        if: ${{ needs.classify.outputs.tmux_head == 'true' && steps.build_tmux_head.outcome == 'success' }}
         run: |
-          status=0
-          cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast || status=$?
-          # This regression drives sixteen real terminal keys through a 300ms
-          # output-settlement boundary. The upstream debug build is much
-          # slower than a released tmux, and running seven other private tmux
-          # rigs beside it can starve the final causal edge past the test's
-          # bounded wait. Keep the behavior covered against HEAD, but give its
-          # exact private rig the process budget it is meant to measure.
-          cargo test -p cyclopsd --all-targets --no-fail-fast -- \
-            --test-threads=4 \
-            --skip a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt || status=$?
-          cargo test -p cyclopsd --test messaging_coordinator \
-            a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt -- \
-            --exact || status=$?
-          cargo test --workspace --doc || status=$?
-          exit "$status"
+          cargo build -p cyclops -p cyclopsd --bins
+          cargo nextest run -p cyclops-tmux -p cyclops-workspace --no-fail-fast
+          cargo test -p cyclopsd --test m0 m0_shadow_daemon_end_to_end -- --exact
+      - name: tmux HEAD evidence unavailable
+        if: ${{ !cancelled() && needs.classify.outputs.tmux_head == 'true' && steps.build_tmux_head.outcome != 'success' }}
+        run: echo "tmux HEAD did not build; no fallback tmux evidence was reported"

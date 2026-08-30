@@ -8,8 +8,9 @@ REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 DOC_FILES=("$REPO/README.md")
 while IFS= read -r file; do
   DOC_FILES+=("$file")
-done < <(find "$REPO/docs" "$REPO/skills/cyclops" -type f \
-  \( -name '*.md' -o -name '*.mdx' \) -print | sort)
+done < <(find "$REPO/docs" "$REPO/skills/cyclops" \
+  -path "$REPO/docs/development/archive" -prune -o \
+  -type f \( -name '*.md' -o -name '*.mdx' \) -print | sort)
 
 reject() {
   local pattern="$1"
@@ -39,6 +40,6 @@ reject 'every message and state change lands in an append-only ledger'
 reject 'canonical.*ledger/<session>'
 
 # User-facing documentation follows the repository writing standard.
-reject $'\u2014'
+reject "$(printf '\342\200\224')"
 
 printf 'messaging stale-language and documentation style lint passed\n'

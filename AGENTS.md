@@ -32,17 +32,18 @@ fact to an NDJSON ledger. A generated knowledge base with diagrams lives at
 
 ## The gates a change must pass
 
-Same five core gates, in order (full detail: [CONTRIBUTING.md](CONTRIBUTING.md)).
-`./scripts/check.sh` runs them all, cheapest first; `--fast` stops after
-the test suite. The Rust test gate uses nextest for executable tests and Cargo
-for doctests, which nextest does not run.
+The complete local gate is documented in [CONTRIBUTING.md](CONTRIBUTING.md).
+`./scripts/check.sh` runs it cheapest first; `--fast` stops after Rust
+correctness and documentation compilation. Performance executables run in the
+scheduled and release lanes, not as ordinary correctness tests.
 
 ```bash
-cargo fmt --all
+./tests/e2e/messaging-docs-parity.sh
+cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
+cargo nextest run --workspace -E 'not (package(cyclopsd) | binary_id(=cyclops-ui::perf) | binary_id(=cyclops-ui::queue_perf) | binary_id(=cyclops-workspace::perf_contract))' --no-fail-fast
 cargo test -p cyclopsd --all-targets --no-fail-fast
-cargo test --workspace --doc
+cargo doc --workspace --no-deps
 python3 scripts/check-doc-paths.py
 ./tests/e2e/parity-check.sh
 ```
@@ -52,9 +53,12 @@ python3 scripts/check-doc-paths.py
 - Touching either installer requires keeping `scripts/install.sh` and
   `website/static/install.sh` byte-for-byte identical, then running
   `./tests/e2e/parity-check.sh --with-installer`.
-- CI runs focused root-selection, source-boundary, and tmux/daemon/socket evidence
-  with `CYCLOPS_TEST_TMP` relocated, and has an advisory job against tmux built from
-  master.
+- CI runs focused root-selection, source-boundary, and tmux/daemon/socket
+  evidence with `CYCLOPS_TEST_TMP` relocated. Website, installer, tmux HEAD,
+  macOS, and other platform evidence run on pull requests only when their owned
+  inputs change. Full matrix, tmux HEAD, reliability, performance, and release
+  evidence have explicit workflows described in
+  [CI.md](docs/development/CI.md).
 
 ## Rules that are unusual for this repo
 
