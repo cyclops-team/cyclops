@@ -140,9 +140,9 @@ are applied by `cyclops start` when it builds a workspace.
 
 ### Build and run it
 
-[install.md](../guides/install.md), then `cargo build`. To see the whole system work
-without wiring up a real agent, run a demo: it builds its own tmux server,
-its own home, and cleans both up.
+[install.md](../guides/install.md), then `cargo build`. To see durable mailbox
+acceptance work without either Cyclops UI or a real agent, run the maintained
+messaging demo. It builds its own tmux server and home, then cleans both up.
 
 ```bash
 ./demos/m1-send.sh
@@ -151,6 +151,8 @@ its own home, and cleans both up.
 Then [QUICKSTART.md](../guides/QUICKSTART.md) for the two-agent walk with your own
 CLIs. Development loop and gates: [CONTRIBUTING.md](../../CONTRIBUTING.md).
 Historical release-demo planning: [archived Demo Day checklist](archive/demo-day-checklist.md).
+The pre-mailbox M2 conversation and M3 stream scripts are retained in Git
+history rather than advertised as current runnable journeys.
 
 ### Explain current mailbox messaging
 
@@ -172,6 +174,11 @@ Read in this order:
 The key boundary is durable acceptance before asynchronous notification. The
 recipient reads the body only by claiming the exact message. Standard send
 does not paste that body or return verified and unverified delivery tiers.
+`demos/m1-send.sh` demonstrates that boundary with notification-incapable cat
+panes: both sends are durable, the authenticated body-free projection remains
+usable, and the workspace journal records message metadata while omitting
+bodies from the demo output. The blocked optional wakes are reported as
+`composer_semantic_missing`; they do not undo acceptance or invent delivery.
 
 ### Explain a legacy direct-delivery self-test receipt
 
@@ -205,23 +212,9 @@ the same claim, and the receipt never blurs them:
   transition out of a delivered state, and it exists so a receipt is never
   more confident than the evidence and never less.
 
-Then run the demo and read what it actually wrote:
-
-```
-$ ./demos/m1-send.sh
-== cyclops send implementer (watch the paste land)
-✓ delivered · unverified (screen)
-
-== ledger state lines (every delivery transition, causes never screens)
-{"seq":8,"id":"m-b90b2a","to":"implementer","from":"queued","to_state":"gating","cause":null}
-{"seq":10,"id":"m-b90b2a","to":"implementer","from":"gating","to_state":"pasting","cause":null}
-{"seq":11,"id":"m-b90b2a","to":"implementer","from":"pasting","to_state":"staged","cause":null}
-{"seq":12,"id":"m-b90b2a","to":"implementer","from":"staged","to_state":"submitted","cause":null}
-{"seq":13,"id":"m-b90b2a","to":"implementer","from":"submitted","to_state":"delivered_unverified","cause":"screen_evidence"}
-```
-
-Those panes run `cat`, not an agent, so there is no hook and the demo lands
-on tier 2 every time. That is the honest floor, not a failure.
+The retained direct-delivery behavior is covered by focused compatibility and
+self-test regression suites. Do not use the current mailbox demo as evidence
+for a legacy verified or screen-inferred receipt.
 
 ### Add support for a new agent CLI
 

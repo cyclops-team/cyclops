@@ -12,12 +12,11 @@
 //!
 //! Scope, stated because the check is narrower than it could be: this
 //! catches a helper FUNCTION, which is what a new demo copies when it is
-//! written from an old one. Four demos still stop their daemon inline in
-//! `cleanup` (`m0-status`, `m1-send`, `m2-conversation`, `m4-workspace`,
-//! and `m3-stream` over a pid list), and two of those are a deliberate
-//! variant: they run cyclopsd under `cargo run`, so they `pkill` the child
-//! before the parent. Folding a variant into the shared rule needs the
-//! variant understood first, and that is not this change.
+//! written from an old one. Three demos still stop their daemon inline in
+//! `cleanup` (`m0-status`, `m1-send`, and `m4-workspace`). The first two are
+//! a deliberate variant: they run cyclopsd under `cargo run`, so they `pkill`
+//! the child before the parent. Folding a variant into the shared rule needs
+//! the variant understood first, and that is not this change.
 
 use std::path::{Path, PathBuf};
 
