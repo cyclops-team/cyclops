@@ -283,8 +283,9 @@ file panel and hand the whole column back to the session tree. The
 the only way back, because a closed panel leaves no rule to grab.
 
 The panel is two browsers behind one header. The agent browser follows
-the focused agent: switch panes or let the agent `cd` and within a second
-the panel is looking at its working directory. The pinned browser stays
+the focused agent: a pane switch or output from the active pane requests
+one short settled snapshot of its working directory. That lets the panel
+catch a `cd` without polling the filesystem. The pinned browser stays
 wherever you last put it, such as a downloads folder or spec directory,
 and remembers that across launches (`files_pinned_root` in `config.toml`,
 written when you browse the pinned view). The chip at the header's right
@@ -321,11 +322,11 @@ still arrives as a path relative to the focused pane's own directory, so
 `@src/main.rs` means the same thing whether you clicked it from the
 project root or after walking into `src`.
 
-It re-reads once a second and repaints only when something you can see has
-moved: a file written into an open folder shows up on its own, one written
-into a closed one does not, because nothing on screen would change. A
-folder with more than 500 entries is listed short and says how many it
-left out.
+Files takes a fresh snapshot after a pane route, active-pane output, or a
+Files interaction, and repaints only when something you can see moved. It
+does not poll the filesystem: a change made without one of those edges
+appears after the next relevant interaction, route, or output. A folder
+with more than 500 entries is listed short and says how many it left out.
 
 Click a file and its path is typed into the focused pane as `@src/main.rs `,
 relative to the panel's root, with a trailing space so a second click does

@@ -1551,7 +1551,7 @@ mod tests {
 
         fn tree(&self) -> crate::files::FileTree {
             let mut tree = crate::files::FileTree::new();
-            tree.reroot(&self.0);
+            crate::file_adapter::reroot(&mut tree, &self.0);
             tree
         }
     }
