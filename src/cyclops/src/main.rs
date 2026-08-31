@@ -46,6 +46,7 @@ mod hash;
 mod health;
 mod hook;
 mod hookset;
+mod managed_assets;
 mod manifests;
 mod render;
 mod setup;
