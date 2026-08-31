@@ -5,9 +5,7 @@
 //! own broadcast receiver, a lagged receiver is dropped with a warning,
 //! and writes carry a timeout so a wedged client costs one connection.
 
-use std::collections::{HashSet, VecDeque};
-use std::future::Future;
-use std::pin::Pin;
+use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -32,7 +30,6 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, watch};
-use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::{ack, delivery, fusion, identity, unix_ms, Inner};
@@ -46,8 +43,6 @@ pub(crate) type Peer = Option<identity::PeerConn>;
 /// wedged; the connection is dropped rather than buffered without bound.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
-const STATUS_REFRESH_BUDGET: Duration = Duration::from_millis(250);
-const STATUS_REFRESH_CONCURRENCY: usize = 8;
 const STATUS_BLOCKED_NOTIFICATION_LIMIT: usize = 32;
 const STATUS_REFRESH_INCOMPLETE: &str = "status_refresh_incomplete";
 
@@ -438,7 +433,7 @@ pub(crate) async fn dispatch(
                     Err(r) => return (r, None),
                 },
             };
-            let incomplete = refresh_status_detections(inner).await;
+            let incomplete = crate::refresh_status_observations(inner).await;
             let result = status_result_with_refresh(inner, params.open_deliveries, &incomplete);
             (
                 Response::ok(id, serde_json::to_value(result).expect("status serializes")),
@@ -1815,76 +1810,6 @@ fn verify_report_origin(
     })
 }
 
-type StatusRefreshFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
-type StatusRefreshJob = (crate::PaneKey, StatusRefreshFuture);
-
-/// Refresh live panes within one request-wide budget. Unfinished routes remain
-/// in the returned set and the status projection refuses their cached facts.
-async fn refresh_status_detections(inner: &Arc<Inner>) -> HashSet<crate::PaneKey> {
-    let deadline = tokio::time::Instant::now() + STATUS_REFRESH_BUDGET;
-    let mut jobs = VecDeque::new();
-    for (session_idx, _) in inner.active_session_slots() {
-        let Some(watcher) = inner.watcher_of(session_idx) else {
-            continue;
-        };
-        for pane in watcher.snapshot() {
-            let pane_id = pane.pane_id;
-            let key = crate::PaneKey::new(session_idx, &pane_id);
-            let inner = Arc::clone(inner);
-            let watcher = Arc::clone(&watcher);
-            jobs.push_back((
-                key,
-                Box::pin(async move {
-                    crate::observe_pane(&inner, session_idx, &watcher, &pane_id, true, "status")
-                        .await
-                        .is_some()
-                }) as StatusRefreshFuture,
-            ));
-        }
-    }
-    run_status_refresh_jobs(&inner.engine, jobs, deadline, STATUS_REFRESH_CONCURRENCY).await
-}
-
-async fn run_status_refresh_jobs(
-    engine: &delivery::Engine,
-    mut pending: VecDeque<StatusRefreshJob>,
-    deadline: tokio::time::Instant,
-    concurrency: usize,
-) -> HashSet<crate::PaneKey> {
-    let mut incomplete: HashSet<_> = pending.iter().map(|(pane, _)| pane.clone()).collect();
-    let mut running = JoinSet::new();
-    let concurrency = concurrency.max(1);
-
-    loop {
-        while running.len() < concurrency {
-            let Some((pane, refresh)) = pending.pop_front() else {
-                break;
-            };
-            running.spawn(engine.track_descendant(async move { (pane, refresh.await) }));
-        }
-        if running.is_empty() {
-            break;
-        }
-        match tokio::time::timeout_at(deadline, running.join_next()).await {
-            Ok(Some(Ok(Some((pane, true))))) => {
-                incomplete.remove(&pane);
-            }
-            Ok(Some(Ok(Some((_, false)))) | Some(Ok(None)) | Some(Err(_))) => {}
-            Ok(None) => break,
-            Err(_) => {
-                // Pane recomputation can publish state and journal facts. It
-                // is not cancellation-safe, so overdue work finishes in the
-                // background while this answer refuses its cached result.
-                // The daemon lifetime still owns it and cancels it before
-                // sealing the old boot's journals during shutdown.
-                running.detach_all();
-                break;
-            }
-        }
-    }
-    incomplete
-}
-
 fn refuse_incomplete_status(pane: &mut cyclops_proto::PaneStatus) {
     pane.manifest = None;
     pane.manifest_display_name = None;
@@ -2445,7 +2370,6 @@ mod tests {
     use std::io::Cursor;
     use std::path::Path;
     use std::str::FromStr;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
     use std::time::{Duration, Instant};
 
@@ -2598,64 +2522,6 @@ mod tests {
         assert_eq!(error.code, FrameContract::TOO_LARGE_CODE);
         assert!(error.message.contains("outcome is unknown"));
         assert!(fallback.result.is_none());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn status_refresh_has_one_budget_and_bounded_concurrency() {
-        let engine = delivery::Engine::new();
-        let started = Arc::new(AtomicUsize::new(0));
-        let mut jobs = VecDeque::new();
-        for index in 0..(STATUS_REFRESH_CONCURRENCY + 3) {
-            let started = Arc::clone(&started);
-            jobs.push_back((
-                crate::PaneKey::new(0, &format!("%{index}")),
-                Box::pin(async move {
-                    started.fetch_add(1, Ordering::SeqCst);
-                    std::future::pending::<()>().await;
-                    true
-                }) as StatusRefreshFuture,
-            ));
-        }
-        let budget = Duration::from_millis(25);
-        let before = tokio::time::Instant::now();
-
-        let incomplete =
-            run_status_refresh_jobs(&engine, jobs, before + budget, STATUS_REFRESH_CONCURRENCY)
-                .await;
-
-        assert_eq!(tokio::time::Instant::now() - before, budget);
-        assert_eq!(started.load(Ordering::SeqCst), STATUS_REFRESH_CONCURRENCY);
-        assert_eq!(incomplete.len(), STATUS_REFRESH_CONCURRENCY + 3);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn overdue_status_refresh_finishes_after_the_response_budget() {
-        let engine = delivery::Engine::new();
-        let completed = Arc::new(AtomicUsize::new(0));
-        let completed_by_job = Arc::clone(&completed);
-        let pane = crate::PaneKey::new(0, "%1");
-        let jobs = VecDeque::from([(
-            pane.clone(),
-            Box::pin(async move {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                completed_by_job.fetch_add(1, Ordering::SeqCst);
-                true
-            }) as StatusRefreshFuture,
-        )]);
-        let before = tokio::time::Instant::now();
-
-        let incomplete =
-            run_status_refresh_jobs(&engine, jobs, before + Duration::from_millis(25), 1).await;
-
-        assert_eq!(incomplete, HashSet::from([pane]));
-        assert_eq!(
-            tokio::time::Instant::now() - before,
-            Duration::from_millis(25)
-        );
-        assert_eq!(completed.load(Ordering::SeqCst), 0);
-        tokio::time::advance(Duration::from_millis(25)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(completed.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -4741,7 +4607,7 @@ mod tests {
 
         assert!(arm.contains("status_result(inner, false)"));
         for forbidden in [
-            "refresh_status_detections",
+            "refresh_status_observations",
             "observe_pane",
             "apply_messaging_observation",
             "open_deliveries: true",
@@ -4753,6 +4619,41 @@ mod tests {
                 "health snapshot entered mutating path {forbidden}"
             );
         }
+    }
+
+    /// Syntactic boundary tripwire, not a proof of refresh semantics. The
+    /// server may request one named runtime refresh, but session discovery,
+    /// pane iteration, task ownership, and observation application belong to
+    /// the daemon runtime operation.
+    #[test]
+    fn status_dispatch_delegates_runtime_observation_refresh() {
+        fn keeps_runtime_boundary(arm: &str) -> bool {
+            arm.contains("crate::refresh_status_observations(inner).await")
+                && [
+                    "active_session_slots(",
+                    "watcher_of(",
+                    "run_status_refresh_jobs(",
+                    "JoinSet",
+                    "observe_pane(",
+                ]
+                .iter()
+                .all(|forbidden| !arm.contains(forbidden))
+        }
+
+        let source = include_str!("server.rs");
+        let arm = source
+            .split_once("        \"status\" => {")
+            .expect("status dispatch arm")
+            .1
+            .split_once("        \"health.snapshot\" =>")
+            .expect("next dispatch arm")
+            .0;
+
+        assert!(keeps_runtime_boundary(arm));
+        assert!(
+            !keeps_runtime_boundary("let routes = inner.active_session_slots();"),
+            "the tripwire must reject a direct runtime traversal"
+        );
     }
 
     /// Syntactic architecture lint: these wire adapters may validate and
