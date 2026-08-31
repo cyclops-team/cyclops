@@ -138,8 +138,7 @@ enum Cmd {
     /// Safe to run twice; a session that is already there is left alone.
     #[command(hide = true)]
     Start(StartArgs),
-    /// Inspect manifests, hook wiring, and agent skill installation.
-    /// Reads setup state without changing it.
+    /// Inspect setup state or preview safe seeded-file decisions without changing it.
     #[command(hide = true)]
     Setup {
         #[command(subcommand)]
@@ -398,6 +397,8 @@ enum DaemonCmd {
 enum SetupCmd {
     /// Report setup and whether messaging uses a doorbell or direct fallback.
     Check,
+    /// Preview manifest and installed-consumer skill seeding without writing files.
+    Plan,
 }
 
 #[derive(clap::Args)]
@@ -912,8 +913,9 @@ fn run(cli: &Cli) -> i32 {
 /// never there. Without manifests, every pane reads unknown and nothing can
 /// be delivered, which is indistinguishable from a broken install to a
 /// first-time visitor who ran bare `cyclops` after a binary-only copy.
-/// Operator-edited files stay unchanged. Known unedited shipped files may
-/// advance, and a current home costs no writes on open.
+/// Existing manifests stay unchanged, including known old shipped seeds;
+/// setup reports those as outdated for manual review. A current manifest home
+/// costs no writes on open. Themes and sounds retain their own update policy.
 ///
 /// A problem is a note, not an exit: a home without themes still renders in
 /// built-in colors, and a home without manifests still opens (the sidebar
@@ -1004,6 +1006,9 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
         Cmd::Setup {
             cmd: SetupCmd::Check,
         } => setup::run_check(cli.json, &style_for(cli)),
+        Cmd::Setup {
+            cmd: SetupCmd::Plan,
+        } => setup::run_plan(cli.json, &style_for(cli)),
         // Health must not load a theme through an unchecked state path.
         Cmd::Sizing {
             cmd: SizingCmd::Release { session },

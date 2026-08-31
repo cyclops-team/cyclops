@@ -212,6 +212,21 @@ pub struct StateInspector {
     root: InspectedEntry,
 }
 
+/// Descriptor-relative authority to publish a Cyclops-managed file below an
+/// existing consumer directory.
+///
+/// Consumer directories are not Cyclops state roots: their permissions and
+/// unrelated entries belong to the consumer. This type therefore never
+/// repairs an existing directory. It creates only missing managed descendants
+/// with owner-only permissions, refuses links and multiply linked files, and
+/// publishes one complete file atomically through held descriptors.
+#[derive(Debug)]
+pub struct ManagedAssetRoot {
+    directory: File,
+    path: PathBuf,
+    owner: u32,
+}
+
 /// One exact inspected file or empty directory bound for explicit removal.
 /// Dropping the handle without calling [`BoundStateRemoval::remove`] changes nothing.
 pub struct BoundStateRemoval {
@@ -321,6 +336,20 @@ impl StateInspector {
             && current.ino() == self.root.inode
             && current.uid() == self.owner
             && current.file_type().is_dir())
+    }
+
+    /// Transfer this verified read-only root into the narrowly scoped
+    /// authority used to publish a declared managed asset.
+    ///
+    /// This is intentionally not a general consumer-directory writer: the
+    /// resulting value can create only explicit missing regular-file
+    /// descendants through its held descriptor.
+    pub fn into_managed_asset_root(self) -> ManagedAssetRoot {
+        ManagedAssetRoot {
+            directory: self.directory,
+            path: self.path,
+            owner: self.owner,
+        }
     }
 
     /// Inspect the state root's direct children within explicit hard bounds.
@@ -945,6 +974,178 @@ impl StateInspector {
             expected: expected.clone(),
             kind,
         })
+    }
+}
+
+impl ManagedAssetRoot {
+    /// Open a consumer-owned root or create an explicitly declared managed
+    /// root when it is absent.
+    ///
+    /// Existing consumer directories retain their mode and contents. Callers
+    /// decide whether their one declared root is allowed to be created; this
+    /// small filesystem primitive does not make that policy decision.
+    pub fn open_or_create(path: &Path) -> Result<Self, StateError> {
+        let parts = inspection_root_parts(path)?;
+        let owner = effective_uid();
+        let mut directory = open_start(path)?;
+
+        // Ancestors are consumer or user-owned. Resolve each through a held
+        // descriptor, but never repair or create one as a side effect.
+        for part in &parts[..parts.len() - 1] {
+            let name = c_name(path, part)?;
+            directory = open_directory_at(&directory, &name).map_err(|error| {
+                path_error(
+                    path,
+                    error,
+                    "managed asset root contains a linked or non-directory component",
+                )
+            })?;
+        }
+        validate_root_parent(&directory, path)?;
+
+        let leaf = c_name(
+            path,
+            parts.last().expect("managed asset root has one component"),
+        )?;
+        let root = managed_asset_directory_at(&directory, &leaf, path, owner, true)?
+            .expect("create=true returns a managed asset root");
+        Ok(Self {
+            directory: root,
+            path: path.to_path_buf(),
+            owner,
+        })
+    }
+
+    /// Check that the user-visible root path still names this held directory.
+    fn path_matches_held_root(&self) -> Result<bool, StateError> {
+        let parts = inspection_root_parts(&self.path)?;
+        let mut directory = open_start(&self.path)?;
+        for part in parts {
+            let name = c_name(&self.path, part)?;
+            directory = match open_directory_at(&directory, &name) {
+                Ok(next) => next,
+                Err(_) => return Ok(false),
+            };
+        }
+        let held = self
+            .directory
+            .metadata()
+            .map_err(|source| io_error(&self.path, source))?;
+        let current = directory
+            .metadata()
+            .map_err(|source| io_error(&self.path, source))?;
+        Ok(current.file_type().is_dir()
+            && current.dev() == held.dev()
+            && current.ino() == held.ino()
+            && current.uid() == self.owner)
+    }
+
+    /// Atomically create a managed file only when no leaf is already present.
+    ///
+    /// Any raced or unsafe leaf stays exactly where it is. Callers must
+    /// re-inspect it before deciding whether another action is permitted.
+    pub fn create_file_once(
+        &self,
+        descendant: &Path,
+        contents: &[u8],
+    ) -> Result<CreateFileOutcome, StateError> {
+        let parts = inspection_descendant_parts(descendant)?;
+        let display_path = self.path.join(descendant);
+        let mut directory = clone_file(&self.directory, &display_path)?;
+        // Reject a renamed consumer root before creating any missing managed
+        // parents through its held descriptor.
+        self.validate_publish_parent(&[], &directory, &display_path)?;
+        for part in &parts[..parts.len() - 1] {
+            let name = c_name(&display_path, part)?;
+            directory =
+                managed_asset_directory_at(&directory, &name, &display_path, self.owner, true)?
+                    .expect("create=true returns an opened managed asset directory");
+        }
+        self.validate_publish_parent(&parts[..parts.len() - 1], &directory, &display_path)?;
+
+        let leaf = c_name(
+            &display_path,
+            parts
+                .last()
+                .expect("managed asset descendant has one component"),
+        )?;
+        let mut temporary = ReplacementTemp::create(&directory, &display_path, self.owner)?;
+        let result = (|| {
+            temporary
+                .file
+                .write_all(contents)
+                .map_err(|source| io_error(&temporary.path, source))?;
+            temporary
+                .file
+                .sync_all()
+                .map_err(|source| io_error(&temporary.path, source))?;
+            self.validate_publish_parent(&parts[..parts.len() - 1], &directory, &display_path)?;
+            if !temporary.rename_once_to(&leaf, &display_path, self.owner)? {
+                temporary.remove()?;
+                sync_directory(&directory).map_err(|source| io_error(&display_path, source))?;
+                return Ok(CreateFileOutcome::AlreadyExists);
+            }
+            temporary.validate_published(&leaf, &display_path, self.owner)?;
+            sync_directory(&directory).map_err(|source| StateError::CreationDurabilityUnknown {
+                path: display_path.clone(),
+                source,
+            })?;
+            Ok(CreateFileOutcome::Created)
+        })();
+
+        match result {
+            Ok(outcome) => Ok(outcome),
+            Err(error) if temporary.live => {
+                temporary.remove()?;
+                sync_directory(&directory).map_err(|source| io_error(&display_path, source))?;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn validate_publish_parent(
+        &self,
+        parent_parts: &[&OsStr],
+        held_parent: &File,
+        display_path: &Path,
+    ) -> Result<(), StateError> {
+        if !self.path_matches_held_root()? {
+            return Err(unsafe_path(
+                &self.path,
+                "managed asset root changed before publication",
+            ));
+        }
+        let mut current = clone_file(&self.directory, display_path)?;
+        for part in parent_parts {
+            let name = c_name(display_path, part)?;
+            current = open_directory_at(&current, &name).map_err(|error| {
+                path_error(
+                    display_path,
+                    error,
+                    "managed asset parent is linked or changed before publication",
+                )
+            })?;
+            validate_directory(&current, display_path, self.owner)?;
+        }
+        let held = held_parent
+            .metadata()
+            .map_err(|source| io_error(display_path, source))?;
+        let named = current
+            .metadata()
+            .map_err(|source| io_error(display_path, source))?;
+        if held.dev() != named.dev()
+            || held.ino() != named.ino()
+            || held.uid() != named.uid()
+            || !held.file_type().is_dir()
+            || !named.file_type().is_dir()
+        {
+            return Err(unsafe_path(
+                display_path,
+                "managed asset parent changed before publication",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -2081,6 +2282,105 @@ fn sync_directory(directory: &File) -> std::io::Result<()> {
 #[cfg(test)]
 fn inject_next_directory_sync_failure() {
     FAIL_NEXT_DIRECTORY_SYNC.with(|fail| fail.set(true));
+}
+
+/// Open one consumer-owned managed-asset directory without taking ownership
+/// of its existing permissions or unrelated contents.
+///
+/// Missing descendants may be created below an already held parent. Existing
+/// entries are never chmodded: a consumer owns their policy, while this
+/// module owns only the descriptor boundary used for one declared asset.
+fn managed_asset_directory_at(
+    parent: &File,
+    name: &CString,
+    path: &Path,
+    owner: u32,
+    create: bool,
+) -> Result<Option<File>, StateError> {
+    let mut created = false;
+    if create {
+        // SAFETY: parent and name are held values; mkdirat does not retain
+        // either pointer and never resolves outside that parent descriptor.
+        let result = unsafe {
+            libc::mkdirat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                DIRECTORY_MODE as libc::mode_t,
+            )
+        };
+        if result == 0 {
+            created = true;
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(path_error(
+                    path,
+                    error,
+                    "could not create managed asset directory",
+                ));
+            }
+        }
+    }
+
+    let directory = match open_directory_at(parent, name) {
+        Ok(directory) => directory,
+        Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        // A newly created directory can inherit a restrictive umask. Repair
+        // only that exact new entry through its held parent, then open it for
+        // the descriptor-bound mode and ACL cleanup below.
+        Err(error) if created && error.kind() == std::io::ErrorKind::PermissionDenied => {
+            let before = stat_at(parent, name, path)?;
+            validate_directory_stat(&before, path, owner)?;
+            chmod_at(parent, name, path, DIRECTORY_MODE, &before)?;
+            let after = stat_at(parent, name, path)?;
+            if before.st_dev != after.st_dev || before.st_ino != after.st_ino {
+                return Err(unsafe_path(
+                    path,
+                    "managed asset directory changed during creation",
+                ));
+            }
+            validate_directory_stat(&after, path, owner)?;
+            let directory = open_directory_at(parent, name).map_err(|error| {
+                path_error(
+                    path,
+                    error,
+                    "managed asset directory changed during creation",
+                )
+            })?;
+            let metadata = directory
+                .metadata()
+                .map_err(|source| io_error(path, source))?;
+            if metadata.dev() != after.st_dev as u64 || metadata.ino() != after.st_ino {
+                return Err(unsafe_path(
+                    path,
+                    "managed asset directory changed during creation",
+                ));
+            }
+            directory
+        }
+        Err(error) => {
+            return Err(path_error(
+                path,
+                error,
+                "managed asset path contains a linked or non-directory component",
+            ));
+        }
+    };
+    validate_directory(&directory, path, owner)?;
+    if created {
+        repair_descriptor_permissions(&directory, path, DIRECTORY_MODE)?;
+        validate_directory(&directory, path, owner)?;
+        directory
+            .sync_all()
+            .map_err(|source| io_error(path, source))?;
+        sync_directory(parent).map_err(|source| StateError::CreationDurabilityUnknown {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    Ok(Some(directory))
 }
 
 /// Open, validate, and repair one owned directory relative to `parent`.
@@ -4204,6 +4504,55 @@ mod tests {
         assert_eq!(bytes, b"private state\n");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn newly_created_managed_descendants_clear_inherited_acls_without_changing_consumer_root() {
+        const INHERITED_ACL: &str =
+            "everyone allow list,add_file,search,add_subdirectory,file_inherit,directory_inherit";
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent = base(&temp);
+        let status = Command::new("/bin/chmod")
+            .args(["+a", INHERITED_ACL])
+            .arg(&parent)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let consumer = parent.join("consumer");
+        fs::create_dir(&consumer).unwrap();
+        let consumer_acl = acl_entries(&consumer);
+        assert!(
+            !consumer_acl.is_empty(),
+            "the existing consumer root must retain inherited ACL evidence"
+        );
+        let root = StateInspector::open_existing(&consumer)
+            .unwrap()
+            .expect("consumer root")
+            .into_managed_asset_root();
+
+        assert_eq!(
+            root.create_file_once(Path::new("skills/cyclops/SKILL.md"), b"shipped\n")
+                .unwrap(),
+            CreateFileOutcome::Created
+        );
+
+        assert_eq!(acl_entries(&consumer), consumer_acl);
+        let skills = consumer.join("skills");
+        let cyclops = skills.join("cyclops");
+        let skill = cyclops.join("SKILL.md");
+        for path in [&skills, &cyclops, &skill] {
+            assert!(
+                acl_entries(path).is_empty(),
+                "new managed descendant kept an ACL: {}",
+                path.display()
+            );
+        }
+        assert_eq!(mode(&skills), DIRECTORY_MODE);
+        assert_eq!(mode(&cyclops), DIRECTORY_MODE);
+        assert_eq!(mode(&skill), FILE_MODE);
+    }
+
     #[test]
     fn permission_repair_requires_the_inspected_identity_and_metadata() {
         let temp = tempfile::tempdir().unwrap();
@@ -4524,6 +4873,93 @@ mod tests {
             external_directory.metadata().unwrap().permissions().mode() & 0o777,
             0o750
         );
+    }
+
+    #[test]
+    fn managed_asset_publisher_creates_only_and_refuses_linked_or_swapped_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let consumer = base.join("consumer");
+        let directory = consumer.join("skills/cyclops");
+        fs::create_dir_all(&directory).unwrap();
+        let external = base.join("outside.md");
+        fs::write(&external, b"released seed\n").unwrap();
+        let linked = directory.join("linked.md");
+        symlink(&external, &linked).unwrap();
+        let dangling_target = base.join("missing/outside.md");
+        let dangling = directory.join("dangling.md");
+        symlink(&dangling_target, &dangling).unwrap();
+        let skill = directory.join("SKILL.md");
+        fs::hard_link(&external, &skill).unwrap();
+        let owned = directory.join("owned.md");
+        fs::write(&owned, b"existing managed copy\n").unwrap();
+        let external_before = snapshot(&external);
+        let external_links = fs::metadata(&external).unwrap().nlink();
+        let root = StateInspector::open_existing(&consumer)
+            .unwrap()
+            .expect("consumer root")
+            .into_managed_asset_root();
+
+        assert_eq!(
+            root.create_file_once(Path::new("skills/cyclops/linked.md"), b"shipped\n")
+                .unwrap(),
+            CreateFileOutcome::AlreadyExists
+        );
+        assert_eq!(
+            root.create_file_once(Path::new("skills/cyclops/dangling.md"), b"shipped\n")
+                .unwrap(),
+            CreateFileOutcome::AlreadyExists
+        );
+        assert_eq!(
+            root.create_file_once(Path::new("skills/cyclops/SKILL.md"), b"shipped\n")
+                .unwrap(),
+            CreateFileOutcome::AlreadyExists
+        );
+        assert_eq!(
+            root.create_file_once(Path::new("skills/cyclops/owned.md"), b"shipped\n")
+                .unwrap(),
+            CreateFileOutcome::AlreadyExists
+        );
+        assert_eq!(
+            root.create_file_once(Path::new("skills/cyclops/fresh.md"), b"shipped\n")
+                .unwrap(),
+            CreateFileOutcome::Created
+        );
+
+        let outside_directory = base.join("outside-directory");
+        fs::create_dir(&outside_directory).unwrap();
+        let moved_parent = base.join("held-parent");
+        fs::rename(&directory, &moved_parent).unwrap();
+        symlink(&outside_directory, &directory).unwrap();
+        assert!(root
+            .create_file_once(Path::new("skills/cyclops/new.md"), b"shipped\n")
+            .is_err());
+
+        assert!(fs::symlink_metadata(&directory)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(snapshot(&external), external_before);
+        assert_eq!(fs::metadata(&external).unwrap().nlink(), external_links);
+        assert!(fs::symlink_metadata(moved_parent.join("linked.md"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(fs::symlink_metadata(moved_parent.join("dangling.md"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read(moved_parent.join("owned.md")).unwrap(),
+            b"existing managed copy\n"
+        );
+        assert_eq!(
+            fs::read(moved_parent.join("fresh.md")).unwrap(),
+            b"shipped\n"
+        );
+        assert!(!dangling_target.exists());
+        assert!(!outside_directory.join("new.md").exists());
+        assert!(!moved_parent.join("new.md").exists());
     }
 
     #[test]

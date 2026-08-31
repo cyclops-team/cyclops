@@ -9,7 +9,7 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -404,16 +404,18 @@ fn shipped_skill() -> Vec<u8> {
         .expect("read shipped skill")
 }
 
-fn released_skill_at(commit: &str) -> Option<Vec<u8>> {
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let object = format!("{commit}:skills/cyclops/SKILL.md");
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["show", &object])
-        .output()
-        .ok()?;
-    output.status.success().then_some(output.stdout)
+fn shipped_manifest(name: &str) -> Vec<u8> {
+    fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../resources/manifests")
+            .join(name),
+    )
+    .expect("read shipped manifest")
+}
+
+fn file_identity(path: &Path) -> (u64, u64) {
+    let metadata = fs::symlink_metadata(path).expect("managed file metadata");
+    (metadata.dev(), metadata.ino())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1049,45 +1051,6 @@ fn setup_preserves_edits_at_every_canonical_skill_path() {
 }
 
 #[test]
-fn setup_upgrades_unedited_skill_bytes_from_a_previous_release() {
-    let Some(previous) = released_skill_at("a9ba6634f87e14246969fef3c89e704314a1e234") else {
-        return;
-    };
-    assert_eq!(fnv64(&previous), "7ebc1453af11b931");
-
-    let home = scratch_home("ws-skills-upgrade");
-    let user = scratch_home("ws-skills-upgrade-user");
-    let paths = [
-        user.join(".claude/skills/cyclops/SKILL.md"),
-        user.join(".agents/skills/cyclops/SKILL.md"),
-        user.join(".gemini/antigravity-cli/skills/cyclops/SKILL.md"),
-    ];
-    fs::create_dir_all(user.join(".claude")).expect("create Claude home");
-    fs::create_dir_all(user.join(".codex")).expect("create Codex home");
-    fs::create_dir_all(user.join(".gemini/antigravity-cli")).expect("create AGY home");
-    for path in &paths {
-        fs::create_dir_all(path.parent().expect("skill parent")).expect("create skill parent");
-        fs::write(path, &previous).expect("write previous skill");
-    }
-
-    let out = cyclops_in_user_home(
-        &home,
-        &user,
-        &[],
-        &["start", "--setup-only", "--wire-hooks"],
-    );
-    assert!(out.status.success(), "{out:?}");
-    let current = shipped_skill();
-    assert_ne!(previous, current);
-    for path in &paths {
-        assert_eq!(fs::read(path).expect("read upgraded skill"), current);
-    }
-
-    let _ = fs::remove_dir_all(&home);
-    let _ = fs::remove_dir_all(&user);
-}
-
-#[test]
 fn setup_check_reports_an_incomplete_empty_home_without_writing() {
     let home = scratch_home("ws-setup-check-empty");
     let user = scratch_home("ws-setup-check-empty-user");
@@ -1133,6 +1096,667 @@ fn setup_check_reports_an_incomplete_empty_home_without_writing() {
         .expect("read user home")
         .next()
         .is_none());
+}
+
+#[test]
+fn setup_plan_is_body_free_read_only_and_ignores_uninstalled_consumers() {
+    let home = scratch_home("ws-setup-plan-empty");
+    let user = scratch_home("ws-setup-plan-empty-user");
+    let home_before = tree_snapshot(&home);
+    let user_before = tree_snapshot(&user);
+
+    let out = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "plan"]);
+    assert!(out.status.success(), "{out:?}");
+    let text = stdout(&out);
+    let plan: Value = serde_json::from_str(&text).expect("setup plan JSON");
+    assert_eq!(plan["read_only"], true, "{plan}");
+    assert_eq!(plan["scope"], "managed_asset_decisions_only", "{plan}");
+    assert_eq!(plan["apply_available"], false, "{plan}");
+    assert!(plan.get("apply").is_none(), "{plan}");
+    let assets = plan["assets"].as_array().expect("plan assets");
+    assert_eq!(assets.len(), 4, "{plan}");
+    for asset in assets {
+        assert_eq!(asset["kind"], "manifest", "{asset}");
+        assert_eq!(asset["observed_state"], "missing", "{asset}");
+        assert_eq!(asset["action"], "create", "{asset}");
+        assert!(asset.get("body").is_none(), "plan exposed a body: {asset}");
+        assert!(
+            asset.get("contents").is_none(),
+            "plan exposed contents: {asset}"
+        );
+        assert!(asset.get("bytes").is_none(), "plan exposed bytes: {asset}");
+    }
+    assert!(
+        assets.iter().all(|asset| asset["target"]
+            .as_str()
+            .is_some_and(|path| path.ends_with(".toml"))),
+        "{plan}"
+    );
+    assert_eq!(
+        tree_snapshot(&home),
+        home_before,
+        "setup plan wrote the Cyclops home"
+    );
+    assert_eq!(
+        tree_snapshot(&user),
+        user_before,
+        "setup plan wrote the user home"
+    );
+    assert!(
+        !user.join(".agents").exists(),
+        "plan invented a shared skill home"
+    );
+
+    let human = cyclops_in_user_home(&home, &user, &[], &["--plain", "setup", "plan"]);
+    assert!(human.status.success(), "{human:?}");
+    let human = stdout(&human);
+    for required in [
+        "setup plan · read-only",
+        "target",
+        "observed",
+        "action",
+        "ownership",
+        "Managed asset decisions only.",
+        "No apply command is available yet.",
+        "No files were changed. This report has no apply capability yet.",
+    ] {
+        assert!(human.contains(required), "missing {required:?}: {human}");
+    }
+    assert_eq!(tree_snapshot(&home), home_before);
+    assert_eq!(tree_snapshot(&user), user_before);
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&user);
+}
+
+#[test]
+fn setup_plan_refuses_an_unproven_manifest_path_without_repairing_it() {
+    let home = scratch_home("ws-setup-plan-unproven");
+    let user = scratch_home("ws-setup-plan-unproven-user");
+    let outside = scratch_home("ws-setup-plan-unproven-outside");
+    fs::write(outside.join("claude.toml"), b"not a Cyclops manifest\n")
+        .expect("write outside file");
+    std::os::unix::fs::symlink(&outside, home.join("manifests"))
+        .expect("link unproven manifest directory");
+
+    let home_before = tree_snapshot(&home);
+    let outside_before = tree_snapshot(&outside);
+    let out = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "plan"]);
+    assert!(out.status.success(), "{out:?}");
+    let plan: Value = serde_json::from_slice(&out.stdout).expect("setup plan JSON");
+    let claude = plan["assets"]
+        .as_array()
+        .expect("plan assets")
+        .iter()
+        .find(|asset| asset["target"] == home.join("manifests/claude.toml").display().to_string())
+        .expect("Claude manifest plan");
+    assert_eq!(
+        claude["observed_state"], "unreadable_or_unproven",
+        "{claude}"
+    );
+    assert_eq!(claude["action"], "manual_review_required", "{claude}");
+    assert!(
+        claude["ownership_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("manual review")),
+        "{claude}"
+    );
+    assert_eq!(tree_snapshot(&home), home_before, "plan repaired the home");
+    assert_eq!(
+        tree_snapshot(&outside),
+        outside_before,
+        "plan touched an unproven target"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&user);
+    let _ = fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn setup_plan_preserves_manifest_create_current_outdated_and_edit_decisions() {
+    let home = scratch_home("ws-setup-plan-manifests");
+    let user = scratch_home("ws-setup-plan-manifests-user");
+    let manifests = home.join("manifests");
+    fs::create_dir_all(&manifests).expect("create manifest directory");
+    fs::write(
+        manifests.join("claude.toml"),
+        shipped_manifest("claude.toml"),
+    )
+    .expect("write current manifest");
+    // A released manifest under another shipped name is a local known-old
+    // body. Setup reports it as outdated but leaves the existing leaf alone.
+    fs::write(
+        manifests.join("codex.toml"),
+        shipped_manifest("claude.toml"),
+    )
+    .expect("write known old seed");
+    fs::write(
+        manifests.join("cursor.toml"),
+        b"# operator's Cursor measurements\n",
+    )
+    .expect("write operator edit");
+
+    let existing = [
+        manifests.join("claude.toml"),
+        manifests.join("codex.toml"),
+        manifests.join("cursor.toml"),
+    ];
+    let existing_before: Vec<_> = existing
+        .iter()
+        .map(|path| {
+            (
+                path.clone(),
+                fs::read(path).expect("existing manifest bytes"),
+                file_identity(path),
+            )
+        })
+        .collect();
+    let home_before = tree_snapshot(&home);
+    let user_before = tree_snapshot(&user);
+    let out = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "plan"]);
+    assert!(out.status.success(), "{out:?}");
+    let plan: Value = serde_json::from_slice(&out.stdout).expect("setup plan JSON");
+    let assets = plan["assets"].as_array().expect("plan assets");
+    for (name, observed, action) in [
+        ("claude.toml", "current", "keep_current"),
+        ("codex.toml", "outdated", "preserve_known_old_seed"),
+        ("cursor.toml", "operator_edited", "preserve_operator_edit"),
+        ("agy.toml", "missing", "create"),
+    ] {
+        let target = manifests.join(name).display().to_string();
+        let asset = assets
+            .iter()
+            .find(|asset| asset["target"] == target)
+            .unwrap_or_else(|| panic!("missing {target} from {plan}"));
+        assert_eq!(asset["observed_state"], observed, "{asset}");
+        assert_eq!(asset["action"], action, "{asset}");
+        assert!(asset["ownership_reason"].as_str().is_some(), "{asset}");
+    }
+    assert_eq!(tree_snapshot(&home), home_before, "plan changed manifests");
+    assert_eq!(tree_snapshot(&user), user_before, "plan changed user home");
+    for (path, bytes, identity) in &existing_before {
+        assert_eq!(
+            fs::read(path).unwrap(),
+            *bytes,
+            "plan changed {}",
+            path.display()
+        );
+        assert_eq!(
+            file_identity(path),
+            *identity,
+            "plan replaced {}",
+            path.display()
+        );
+    }
+
+    let applied = cyclops_in_user_home(&home, &user, &[], &["start", "--setup-only"]);
+    assert!(applied.status.success(), "{applied:?}");
+    assert_eq!(
+        fs::read(manifests.join("claude.toml")).expect("read kept manifest"),
+        shipped_manifest("claude.toml")
+    );
+    assert_eq!(
+        fs::read(manifests.join("codex.toml")).expect("read preserved outdated manifest"),
+        shipped_manifest("claude.toml")
+    );
+    assert_eq!(
+        fs::read(manifests.join("cursor.toml")).expect("read preserved manifest"),
+        b"# operator's Cursor measurements\n"
+    );
+    assert_eq!(
+        fs::read(manifests.join("agy.toml")).expect("read created manifest"),
+        shipped_manifest("agy.toml")
+    );
+    for (path, bytes, identity) in &existing_before {
+        assert_eq!(
+            fs::read(path).unwrap(),
+            *bytes,
+            "setup changed {}",
+            path.display()
+        );
+        assert_eq!(
+            file_identity(path),
+            *identity,
+            "setup replaced {}",
+            path.display()
+        );
+    }
+
+    let check = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "check"]);
+    assert_eq!(check.status.code(), Some(1), "{check:?}");
+    let report: Value = serde_json::from_slice(&check.stdout).expect("setup check JSON");
+    assert_eq!(report["complete"], false, "{report}");
+    for (path, bytes, identity) in &existing_before {
+        assert_eq!(
+            fs::read(path).unwrap(),
+            *bytes,
+            "check changed {}",
+            path.display()
+        );
+        assert_eq!(
+            file_identity(path),
+            *identity,
+            "check replaced {}",
+            path.display()
+        );
+    }
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&user);
+}
+
+#[test]
+fn setup_plan_lists_only_installed_skill_destinations_and_preserves_edits() {
+    let home = scratch_home("ws-setup-plan-skills");
+    let user = scratch_home("ws-setup-plan-skills-user");
+    fs::create_dir_all(user.join(".claude/skills/cyclops")).expect("create Claude skill path");
+    fs::create_dir_all(user.join(".codex")).expect("create Codex home");
+    fs::create_dir_all(user.join(".gemini/antigravity-cli/skills/cyclops"))
+        .expect("create AGY skill path");
+    let claude_skill = user.join(".claude/skills/cyclops/SKILL.md");
+    let agy_skill = user.join(".gemini/antigravity-cli/skills/cyclops/SKILL.md");
+    fs::write(&claude_skill, b"# operator-owned Claude skill\n").expect("write Claude edit");
+    fs::write(&agy_skill, shipped_skill()).expect("write current AGY skill");
+    let existing_before: Vec<_> = [&claude_skill, &agy_skill]
+        .into_iter()
+        .map(|path| {
+            (
+                path.to_path_buf(),
+                fs::read(path).expect("existing skill bytes"),
+                file_identity(path),
+            )
+        })
+        .collect();
+
+    let home_before = tree_snapshot(&home);
+    let user_before = tree_snapshot(&user);
+    let out = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "plan"]);
+    assert!(out.status.success(), "{out:?}");
+    let plan: Value = serde_json::from_slice(&out.stdout).expect("setup plan JSON");
+    let skills: Vec<&Value> = plan["assets"]
+        .as_array()
+        .expect("plan assets")
+        .iter()
+        .filter(|asset| asset["kind"] == "skill")
+        .collect();
+    assert_eq!(skills.len(), 3, "{plan}");
+    for (consumer, target, observed, action) in [
+        (
+            "Claude Code",
+            claude_skill.display().to_string(),
+            "operator_edited",
+            "preserve_operator_edit",
+        ),
+        (
+            "Codex",
+            user.join(".agents/skills/cyclops/SKILL.md")
+                .display()
+                .to_string(),
+            "missing",
+            "create",
+        ),
+        (
+            "Antigravity CLI",
+            agy_skill.display().to_string(),
+            "current",
+            "keep_current",
+        ),
+    ] {
+        let asset = skills
+            .iter()
+            .find(|asset| asset["consumer"] == consumer)
+            .unwrap_or_else(|| panic!("missing {consumer} from {plan}"));
+        assert_eq!(asset["target"], target, "{asset}");
+        assert_eq!(asset["observed_state"], observed, "{asset}");
+        assert_eq!(asset["action"], action, "{asset}");
+    }
+    assert!(
+        skills.iter().all(|asset| asset["consumer"] != "Cursor"),
+        "the plan treated an absent Cursor consumer as installed: {plan}"
+    );
+    assert_eq!(
+        tree_snapshot(&home),
+        home_before,
+        "plan changed Cyclops home"
+    );
+    assert_eq!(tree_snapshot(&user), user_before, "plan changed user home");
+    for (path, bytes, identity) in &existing_before {
+        assert_eq!(
+            fs::read(path).unwrap(),
+            *bytes,
+            "plan changed {}",
+            path.display()
+        );
+        assert_eq!(
+            file_identity(path),
+            *identity,
+            "plan replaced {}",
+            path.display()
+        );
+    }
+
+    let applied = cyclops_in_user_home(
+        &home,
+        &user,
+        &[],
+        &["start", "--setup-only", "--wire-hooks"],
+    );
+    assert!(applied.status.success(), "{applied:?}");
+    assert_eq!(
+        fs::read(&claude_skill).expect("read preserved Claude skill"),
+        b"# operator-owned Claude skill\n"
+    );
+    assert_eq!(
+        fs::read(user.join(".agents/skills/cyclops/SKILL.md")).expect("read created shared skill"),
+        shipped_skill()
+    );
+    assert_eq!(
+        fs::read(&agy_skill).expect("read kept AGY skill"),
+        shipped_skill()
+    );
+    assert!(!user.join(".cursor").exists(), "setup invented Cursor home");
+    for (path, bytes, identity) in &existing_before {
+        assert_eq!(
+            fs::read(path).unwrap(),
+            *bytes,
+            "setup changed {}",
+            path.display()
+        );
+        assert_eq!(
+            file_identity(path),
+            *identity,
+            "setup replaced {}",
+            path.display()
+        );
+    }
+
+    let check = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "check"]);
+    assert!(check.status.success(), "{check:?}");
+    for (path, bytes, identity) in &existing_before {
+        assert_eq!(
+            fs::read(path).unwrap(),
+            *bytes,
+            "check changed {}",
+            path.display()
+        );
+        assert_eq!(
+            file_identity(path),
+            *identity,
+            "check replaced {}",
+            path.display()
+        );
+    }
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&user);
+}
+
+#[test]
+fn setup_plan_refuses_linked_skills_and_setup_leaves_their_targets_untouched() {
+    let home = scratch_home("ws-setup-plan-linked-skills");
+    let user = scratch_home("ws-setup-plan-linked-skills-user");
+    let outside = scratch_home("ws-setup-plan-linked-skills-outside");
+    let linked_target = outside.join("linked-skill.md");
+    let hard_link_target = outside.join("hard-linked-skill.md");
+    let dangling_target = outside.join("dangling-skill.md");
+    let current = shipped_skill();
+    fs::write(&linked_target, &current).expect("write linked target");
+    fs::write(&hard_link_target, &current).expect("write hard-link target");
+
+    let claude_skill = user.join(".claude/skills/cyclops/SKILL.md");
+    let codex_skill = user.join(".agents/skills/cyclops/SKILL.md");
+    let agy_skill = user.join(".gemini/antigravity-cli/skills/cyclops/SKILL.md");
+    fs::create_dir_all(claude_skill.parent().expect("Claude skill parent"))
+        .expect("create Claude skill parent");
+    fs::create_dir_all(user.join(".gemini/antigravity-cli/skills/cyclops"))
+        .expect("create AGY skill parent");
+    fs::create_dir_all(codex_skill.parent().expect("Codex skill parent"))
+        .expect("create Codex skill parent");
+    fs::create_dir_all(user.join(".codex")).expect("create Codex home");
+    std::os::unix::fs::symlink(&linked_target, &claude_skill).expect("link Claude skill");
+    std::os::unix::fs::symlink(&dangling_target, &codex_skill).expect("link Codex skill");
+    fs::hard_link(&hard_link_target, &agy_skill).expect("hard-link AGY skill");
+    let hard_before = fs::metadata(&agy_skill).expect("hard-link metadata");
+
+    let user_before = tree_snapshot(&user);
+    let outside_before = tree_snapshot(&outside);
+    let planned = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "plan"]);
+    assert!(planned.status.success(), "{planned:?}");
+    let plan: Value = serde_json::from_slice(&planned.stdout).expect("setup plan JSON");
+    for consumer in ["Claude Code", "Codex", "Antigravity CLI"] {
+        let asset = plan["assets"]
+            .as_array()
+            .expect("plan assets")
+            .iter()
+            .find(|asset| asset["consumer"] == consumer)
+            .unwrap_or_else(|| panic!("missing {consumer} from {plan}"));
+        assert_eq!(asset["observed_state"], "unreadable_or_unproven", "{asset}");
+        assert_eq!(asset["action"], "manual_review_required", "{asset}");
+        assert!(
+            asset["ownership_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("left untouched")),
+            "{asset}"
+        );
+    }
+    assert_eq!(
+        tree_snapshot(&user),
+        user_before,
+        "plan changed the user home"
+    );
+    assert_eq!(
+        tree_snapshot(&outside),
+        outside_before,
+        "plan followed a linked skill target"
+    );
+
+    let applied = cyclops_in_user_home(
+        &home,
+        &user,
+        &[],
+        &["--json", "start", "--setup-only", "--wire-hooks"],
+    );
+    assert!(applied.status.success(), "{applied:?}");
+    let report: Value = serde_json::from_slice(&applied.stdout).expect("setup JSON");
+    for consumer in ["Claude Code", "Codex", "Antigravity CLI"] {
+        let skill = report["skill"]
+            .as_array()
+            .expect("skill results")
+            .iter()
+            .find(|skill| skill["consumer"] == consumer)
+            .unwrap_or_else(|| panic!("missing {consumer} from {report}"));
+        assert_eq!(skill["outcome"], "problem", "{skill}");
+    }
+    assert!(
+        fs::symlink_metadata(&claude_skill)
+            .expect("Claude skill metadata")
+            .file_type()
+            .is_symlink(),
+        "setup replaced the Claude skill link"
+    );
+    assert!(
+        fs::symlink_metadata(&codex_skill)
+            .expect("Codex skill metadata")
+            .file_type()
+            .is_symlink(),
+        "setup replaced the dangling Codex skill link"
+    );
+    assert_eq!(
+        fs::read(&linked_target).expect("read linked target"),
+        current
+    );
+    assert_eq!(
+        fs::read(&hard_link_target).expect("read hard-link target"),
+        current
+    );
+    let hard_after = fs::metadata(&agy_skill).expect("hard-link metadata after setup");
+    assert_eq!(
+        hard_after.ino(),
+        hard_before.ino(),
+        "setup replaced the hard link"
+    );
+    assert_eq!(hard_after.nlink(), 2, "setup changed the hard-link count");
+    assert!(
+        !dangling_target.exists(),
+        "setup followed the dangling skill link and created its target"
+    );
+    let check = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "check"]);
+    assert_eq!(check.status.code(), Some(1), "{check:?}");
+    let report: Value = serde_json::from_slice(&check.stdout).expect("setup check JSON");
+    assert_eq!(report["complete"], false, "{report}");
+    for consumer in ["claude", "codex", "agy"] {
+        let check = report["consumers"]
+            .as_array()
+            .expect("consumer checks")
+            .iter()
+            .find(|check| check["id"] == consumer)
+            .unwrap_or_else(|| panic!("missing {consumer} from {report}"));
+        assert_eq!(check["skill"]["state"], "manual_review_required", "{check}");
+    }
+    assert_eq!(
+        tree_snapshot(&outside),
+        outside_before,
+        "setup check followed a linked skill target"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&user);
+    let _ = fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn setup_reports_an_unproven_skill_for_manual_review_without_touching_it() {
+    let home = scratch_home("ws-setup-plan-unproven-skill");
+    let user = scratch_home("ws-setup-plan-unproven-skill-user");
+    let skill = user.join(".claude/skills/cyclops/SKILL.md");
+    fs::create_dir_all(skill.parent().expect("Claude skill parent")).expect("create skill parent");
+    fs::write(&skill, shipped_skill()).expect("write skill");
+    fs::set_permissions(&skill, fs::Permissions::from_mode(0o000)).expect("make skill unreadable");
+
+    let planned = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "plan"]);
+    assert!(planned.status.success(), "{planned:?}");
+    let plan: Value = serde_json::from_slice(&planned.stdout).expect("setup plan JSON");
+    let claude = plan["assets"]
+        .as_array()
+        .expect("plan assets")
+        .iter()
+        .find(|asset| asset["consumer"] == "Claude Code")
+        .expect("Claude skill plan");
+    assert_eq!(
+        claude["observed_state"], "unreadable_or_unproven",
+        "{claude}"
+    );
+    assert_eq!(claude["action"], "manual_review_required", "{claude}");
+    assert!(
+        claude["ownership_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("left untouched")),
+        "{claude}"
+    );
+
+    let setup = cyclops_in_user_home(
+        &home,
+        &user,
+        &[],
+        &["start", "--setup-only", "--wire-hooks"],
+    );
+    assert!(setup.status.success(), "{setup:?}");
+    let text = stdout(&setup);
+    assert!(text.contains("manual review required"), "{text}");
+    assert!(text.contains("left untouched"), "{text}");
+    assert_eq!(
+        fs::symlink_metadata(&skill)
+            .expect("skill metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0,
+        "setup changed the unreadable skill"
+    );
+
+    let check = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "check"]);
+    assert_eq!(check.status.code(), Some(1), "{check:?}");
+    let report: Value = serde_json::from_slice(&check.stdout).expect("setup check JSON");
+    assert_eq!(
+        report["consumers"][0]["skill"]["state"], "unreadable",
+        "{report}"
+    );
+
+    fs::set_permissions(&skill, fs::Permissions::from_mode(0o600))
+        .expect("restore skill permissions");
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&user);
+}
+
+#[test]
+fn setup_check_requires_manual_review_for_a_linked_consumer_root() {
+    let home = scratch_home("ws-setup-check-linked-root");
+    let user = scratch_home("ws-setup-check-linked-root-user");
+    let outside = scratch_home("ws-setup-check-linked-root-outside");
+    for consumer in [
+        user.join(".claude"),
+        user.join(".codex"),
+        user.join(".cursor"),
+        user.join(".gemini/antigravity-cli"),
+    ] {
+        fs::create_dir_all(consumer).expect("create consumer home");
+    }
+    assert!(cyclops_in_user_home(
+        &home,
+        &user,
+        &[],
+        &["start", "--setup-only", "--wire-hooks"],
+    )
+    .status
+    .success());
+
+    let claude_root = user.join(".claude");
+    let external_root = outside.join("claude-root");
+    fs::rename(&claude_root, &external_root).expect("move Claude root outside user home");
+    std::os::unix::fs::symlink(&external_root, &claude_root).expect("link Claude root");
+    let home_before = tree_snapshot(&home);
+    let user_before = tree_snapshot(&user);
+    let outside_before = tree_snapshot(&outside);
+
+    let check = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "check"]);
+    assert_eq!(check.status.code(), Some(1), "{check:?}");
+    let report: Value = serde_json::from_slice(&check.stdout).expect("setup check JSON");
+    assert_eq!(report["complete"], false, "{report}");
+    let claude = report["consumers"]
+        .as_array()
+        .expect("consumer checks")
+        .iter()
+        .find(|check| check["id"] == "claude")
+        .expect("Claude check");
+    assert_eq!(claude["installed"], true, "{claude}");
+    assert_eq!(
+        claude["install_state"], "manual_review_required",
+        "{claude}"
+    );
+    assert_eq!(
+        claude["hook"]["state"], "manual_review_required",
+        "{claude}"
+    );
+    assert_eq!(
+        claude["skill"]["state"], "manual_review_required",
+        "{claude}"
+    );
+    assert_eq!(
+        tree_snapshot(&home),
+        home_before,
+        "check changed Cyclops home"
+    );
+    assert_eq!(tree_snapshot(&user), user_before, "check changed user home");
+    assert_eq!(
+        tree_snapshot(&outside),
+        outside_before,
+        "check followed the linked consumer root"
+    );
+
+    let _ = fs::remove_dir_all(&home);
+    let _ = fs::remove_dir_all(&user);
+    let _ = fs::remove_dir_all(&outside);
 }
 
 #[test]

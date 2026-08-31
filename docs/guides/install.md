@@ -182,8 +182,9 @@ The shared destination alone does not trigger either consumer. Claude Code
 requires `~/.claude`, and Antigravity CLI requires
 `~/.gemini/antigravity-cli`. Setup creates no home for an absent
 consumer and never seeds duplicate skill locations. It keeps current
-and edited copies unchanged, and upgrades an unedited copy from a known
-Cyclops release. The entire wiring step is skipped when
+and edited copies unchanged. An existing skill that matches a known older
+Cyclops release is also preserved for manual review; setup creates only a
+missing skill. The entire wiring step is skipped when
 `CYCLOPS_NO_VENDOR_HOOKS` is set.
 
 That consent outlives the run that gave it. `--wire-hooks` records it at
@@ -212,7 +213,28 @@ transport from the same exact-skill check the daemon uses: `doorbell` or
 claim contract and therefore selects direct fallback. It exits 0 when setup is
 complete for the installed consumers and 1 when setup needs repair. Add
 `--json` for a stable machine-readable report. The check reads setup state
-only. Use `cyclops start --setup-only --wire-hooks` to install or repair it.
+only. The standard setup workflow installs or repairs it.
+
+Review the managed setup seed decisions:
+
+```
+$ cyclops setup plan
+```
+
+The plan is a read-only, body-free report. `--json` gives the same rows for a
+script. Each row names the exact manifest or installed-consumer skill target,
+its observed state, and the managed-asset decision: create a missing file,
+keep the current seed, preserve an outdated released seed, preserve an
+operator edit, or leave an unreadable or unproven target untouched for manual
+review. A shared `~/.agents/skills/cyclops/SKILL.md` alone does not make Codex
+or Cursor look installed, and the report never creates a vendor directory.
+During setup, that shared `.agents` directory is the one missing target root
+Cyclops may create after it rechecks that Codex or Cursor is installed; it
+never recreates a missing direct consumer root.
+
+This is intentionally not a generic setup dry run. It does not plan or change
+config, hook wiring, themes, sounds, binaries, updates, cleanup, or uninstall.
+This first slice has no apply capability yet.
 
 The long way, by hand. Create `~/.cyclops/config.toml`:
 
@@ -247,12 +269,10 @@ find, so a new one lands on your next start and says so:
   wrote 1 detection manifest to /Users/you/.cyclops/manifests
 ```
 
-A file you edited is never rewritten, so your measurements survive every
-run. A copy still byte-identical to a version Cyclops shipped is a seed
-nobody touched, and a newer shipped version replaces it on the next run,
-so an upgrade reaches an untouched home without a reinstall. Themes
-follow the same rule; the shipped sounds are written once and then left
-alone.
+A file already present is never rewritten, so your measurements survive every
+run. A known old Cyclops seed is reported as outdated and stays in place for
+manual review. Themes follow their own update rule; the shipped sounds are
+written once and then left alone.
 
 Four optional keys. The first two change how the daemon talks to tmux, so
 add them only when you mean to. `theme` changes what every surface prints,
@@ -560,9 +580,9 @@ pair. The candidate CLI and daemon must report one build, then the candidate
 daemon must replay a private copy of the current journals before either
 installed selector changes. A running daemon is authenticated, quiesced, and
 stopped before that copy is taken, then restarted on the old pair if replay
-fails. Durable records and operator-edited setup files in your home are
-preserved. Known unedited shipped themes, manifests, hook artifacts, and skills
-may advance with the installed release.
+fails. Durable records and existing setup files in your home are preserved.
+Known unedited shipped themes and hook artifacts may advance with the installed
+release; manifests and skills remain in place and can report outdated state.
 
 The selected-pair record stores a content-free replay attestation bound to the
 exact client and daemon hashes plus the private snapshot identity. Older
@@ -652,8 +672,8 @@ Reopening with `cyclops` (or any `cyclops start`) repairs prepared hook
 artifacts under `~/.cyclops/hooks/` when their receipts prove they are still
 unedited. A file you edited, or one with no receipt, is named and left alone.
 The installer and updater run setup with vendor-wiring consent: Cyclops-owned
-hook entries in installed agent configs and known unedited Cyclops skills may
-be refreshed, while unrelated vendor entries stay unchanged. Set
+hook entries in installed agent configs may be refreshed, while existing
+Cyclops skills and unrelated vendor entries stay unchanged. Set
 `CYCLOPS_NO_VENDOR_HOOKS=1` to skip that wiring for one run.
 
 `CYCLOPS_REPO` and `CYCLOPS_REF` pick the source, exactly as they do for

@@ -17,26 +17,27 @@
 //! `--wire-hooks` consent (given at install time, or recorded then and
 //! honored by a later boot: `workspace::finish_deferred_wiring`), only when
 //! a consumer's own directory already exists, honoring
-//! `CYCLOPS_NO_VENDOR_HOOKS`, and never replacing bytes this project did
-//! not write ([`EVER_SHIPPED_FNV64`], the same edit-detection rule as
-//! `crate::manifests`).
+//! `CYCLOPS_NO_VENDOR_HOOKS`, and creating only a missing shipped skill.
+//! Every existing skill, including a known old Cyclops seed, remains
+//! untouched.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use cyclops_state::{CreateFileOutcome, ManagedAssetRoot, StateError, StateInspector};
 
 /// The skill body the binary carries.
 pub(crate) const SHIPPED: &str = include_str!("../../../skills/cyclops/SKILL.md");
 
 /// FNV-1a 64 of every skill body this project has released, the current
-/// one included. Same contract as `crate::manifests::EVER_SHIPPED_FNV64`:
-/// a file on disk whose hash is in this list is a seed nobody edited, so
-/// a newer shipped body may replace it; any other content is the
-/// operator's and is never touched. The test below fails until the
+/// one included. Same classification contract as
+/// `crate::manifests::EVER_SHIPPED_FNV64`: a file on disk whose hash is in
+/// this list is a known old Cyclops seed; any other existing content is an
+/// operator edit. Both remain untouched. The test below fails until the
 /// current body is listed, and prints the hash to append.
 ///
-/// Released, not every body that ever compiled. A hash here is permission
-/// to overwrite a file on somebody's disk, and an unreleased intermediate
-/// was never seeded onto one, so listing it would only claim that
-/// authority over bytes that could just as well be an operator's own.
+/// Released, not every body that ever compiled. An unreleased intermediate
+/// was never seeded onto an operator machine, so listing it would only
+/// misclassify bytes that could just as well be an operator's own.
 const EVER_SHIPPED_FNV64: &[&str] = &[
     "7ebc1453af11b931",
     "cf5916d45a60081c",
@@ -76,15 +77,14 @@ pub(crate) fn unedited_seed(data: &[u8]) -> bool {
 /// What one [`seed_into`] run did, in the order a caller checks them.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// The shipped body is now at [`SeededSkill::path`]: a fresh install
-    /// or an unedited old seed upgraded.
+    /// The shipped body was created at [`SeededSkill::path`].
     Written,
-    /// A file was already there and was left alone: either it is already
-    /// current, or the operator edited it and their copy outranks ours.
+    /// A file was already there and was left alone: it may be current,
+    /// outdated, or operator-edited.
     Kept,
     /// No consumer for this destination is installed. Nothing was created.
     NoAgent,
-    /// The write failed; the sentence says where and why.
+    /// Setup could not safely write; the sentence says where and why.
     Problem(String),
 }
 
@@ -95,41 +95,351 @@ pub struct SeededSkill {
     pub outcome: Outcome,
 }
 
-/// Put the shipped skill at `path`, keeping any operator edit.
-fn seed_into(consumer: &'static str, installed: bool, path: PathBuf) -> SeededSkill {
-    if !installed {
+/// One body-free preview of a consumer's skill destination.
+pub struct PlannedSkill {
+    pub consumer: &'static str,
+    pub path: PathBuf,
+    pub decision: crate::managed_assets::SeedDecision,
+}
+
+/// One canonical seed target. The target retains its root and relative path
+/// so planning and setup can make their ownership decision without
+/// path-following I/O.
+struct SkillTarget {
+    consumer: &'static str,
+    installation: Installation,
+    installation_roots: Vec<PathBuf>,
+    location: crate::consumer::AssetLocation,
+    missing_root: MissingRoot,
+}
+
+/// The only declared managed root that setup may create after it verifies an
+/// installed consumer. The shared Codex/Cursor skill intentionally lives in
+/// `~/.agents`, outside either consumer's own root. All other target roots
+/// must already exist.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MissingRoot {
+    Refuse,
+    CreateSharedCodexCursor,
+}
+
+/// Whether the consumer root is present through a no-follow inspection.
+/// An unsafe root is visible for manual review rather than being mistaken
+/// for an absent consumer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Installation {
+    Absent,
+    Present,
+    Unproven,
+}
+
+impl Installation {
+    fn inspect(root: &Path) -> Self {
+        match StateInspector::open_existing(root) {
+            Ok(Some(root)) => match root.path_matches_held_root() {
+                Ok(true) => Self::Present,
+                Ok(false) | Err(_) => Self::Unproven,
+            },
+            Ok(None) => Self::Absent,
+            Err(_) => Self::Unproven,
+        }
+    }
+}
+
+fn combined_installation(roots: &[PathBuf]) -> Installation {
+    let mut present = false;
+    for root in roots {
+        match Installation::inspect(root) {
+            Installation::Present => present = true,
+            Installation::Unproven => return Installation::Unproven,
+            Installation::Absent => {}
+        }
+    }
+    if present {
+        Installation::Present
+    } else {
+        Installation::Absent
+    }
+}
+
+/// The canonical consumer destinations for this user home. Codex and Cursor
+/// share a target when the consumer catalog says they do, so the writer and
+/// read-only plan cannot drift into two copies of one skill.
+fn targets(home: &Path) -> Vec<SkillTarget> {
+    let claude = crate::consumer::spec(crate::hookset::CliKind::Claude);
+    let claude_locations = claude.locations(home);
+    let codex = crate::consumer::spec(crate::hookset::CliKind::Codex);
+    let codex_locations = codex.locations(home);
+    let cursor = crate::consumer::spec(crate::hookset::CliKind::Cursor);
+    let cursor_locations = cursor.locations(home);
+    let agy = crate::consumer::spec(crate::hookset::CliKind::Agy);
+    let agy_locations = agy.locations(home);
+    let codex_installation = Installation::inspect(&codex_locations.install_root);
+    let cursor_installation = Installation::inspect(&cursor_locations.install_root);
+    let (shared_consumer, shared_installation) = match (codex_installation, cursor_installation) {
+        (Installation::Present, Installation::Present) => {
+            ("Codex and Cursor", Installation::Present)
+        }
+        (Installation::Present, Installation::Absent) => (codex.skill_name, Installation::Present),
+        (Installation::Absent, Installation::Present) => (cursor.skill_name, Installation::Present),
+        (Installation::Absent, Installation::Absent) => ("Codex and Cursor", Installation::Absent),
+        _ => ("Codex and Cursor", Installation::Unproven),
+    };
+    let mut targets = vec![SkillTarget {
+        consumer: claude.skill_name,
+        installation: Installation::inspect(&claude_locations.install_root),
+        installation_roots: vec![claude_locations.install_root.clone()],
+        location: claude_locations.skill,
+        missing_root: MissingRoot::Refuse,
+    }];
+    if codex_locations.skill == cursor_locations.skill {
+        targets.push(SkillTarget {
+            consumer: shared_consumer,
+            installation: shared_installation,
+            installation_roots: vec![
+                codex_locations.install_root.clone(),
+                cursor_locations.install_root.clone(),
+            ],
+            location: codex_locations.skill,
+            missing_root: MissingRoot::CreateSharedCodexCursor,
+        });
+    } else {
+        targets.push(SkillTarget {
+            consumer: codex.skill_name,
+            installation: codex_installation,
+            installation_roots: vec![codex_locations.install_root.clone()],
+            location: codex_locations.skill,
+            missing_root: MissingRoot::Refuse,
+        });
+        targets.push(SkillTarget {
+            consumer: cursor.skill_name,
+            installation: cursor_installation,
+            installation_roots: vec![cursor_locations.install_root.clone()],
+            location: cursor_locations.skill,
+            missing_root: MissingRoot::Refuse,
+        });
+    }
+    targets.push(SkillTarget {
+        consumer: agy.skill_name,
+        installation: Installation::inspect(&agy_locations.install_root),
+        installation_roots: vec![agy_locations.install_root.clone()],
+        location: agy_locations.skill,
+        missing_root: MissingRoot::Refuse,
+    });
+    targets
+}
+
+/// Preview installed consumers and name an unproven consumer root for manual
+/// review. A shared skill directory by itself is not evidence that Codex or
+/// Cursor is installed, so it never becomes a plan target on its own.
+pub fn plan(home: &Path) -> Vec<PlannedSkill> {
+    targets(home)
+        .into_iter()
+        .filter(|target| target.installation != Installation::Absent)
+        .map(|target| PlannedSkill {
+            consumer: target.consumer,
+            decision: seed_decision_at(target.installation, target.missing_root, &target.location),
+            path: target.location.path(),
+        })
+        .collect()
+}
+
+/// Read one target through a held no-follow descriptor. Links, multi-link
+/// files, failed reads, and an unproven consumer root cannot establish a
+/// safe create decision, so they remain untouched.
+fn seed_decision_at(
+    installation: Installation,
+    missing_root: MissingRoot,
+    location: &crate::consumer::AssetLocation,
+) -> crate::managed_assets::SeedDecision {
+    if installation != Installation::Present {
+        return crate::managed_assets::refuse_unreadable_or_unproven();
+    }
+    match StateInspector::open_existing(&location.root) {
+        Ok(Some(root)) => inspected_seed_decision(&root, location)
+            .unwrap_or_else(|()| crate::managed_assets::refuse_unreadable_or_unproven()),
+        // Codex and Cursor store their shared skill below `.agents`, which
+        // may be absent even when one of those consumers is installed. No
+        // direct consumer root is treated as creatable here.
+        Ok(None) if missing_root == MissingRoot::CreateSharedCodexCursor => {
+            crate::managed_assets::seed_decision(None, SHIPPED.as_bytes(), unedited_seed)
+        }
+        Ok(None) => crate::managed_assets::refuse_unreadable_or_unproven(),
+        Err(_) => crate::managed_assets::refuse_unreadable_or_unproven(),
+    }
+}
+
+/// Read one target only through the root descriptor that will later be
+/// transferred into managed publication authority. The resulting decision
+/// never authorizes changing an existing leaf.
+fn inspected_seed_decision(
+    root: &StateInspector,
+    location: &crate::consumer::AssetLocation,
+) -> Result<crate::managed_assets::SeedDecision, ()> {
+    match root.read_file(
+        &location.relative,
+        cyclops_state::INSPECTION_FILE_BYTES_LIMIT_MAX,
+    ) {
+        Ok(Some(file)) if !file.truncated => Ok(crate::managed_assets::seed_decision(
+            Some(&file.bytes),
+            SHIPPED.as_bytes(),
+            unedited_seed,
+        )),
+        Ok(None) => Ok(crate::managed_assets::seed_decision(
+            None,
+            SHIPPED.as_bytes(),
+            unedited_seed,
+        )),
+        Ok(Some(_)) | Err(_) => Err(()),
+    }
+}
+
+fn manual_review(path: &Path, cause: impl std::fmt::Display) -> Outcome {
+    Outcome::Problem(format!(
+        "manual review required for {}: {cause}; left untouched",
+        path.display()
+    ))
+}
+
+fn publish_problem(path: &Path, error: StateError) -> Outcome {
+    match error {
+        StateError::CreationDurabilityUnknown { .. } => Outcome::Problem(format!(
+            "manual review required for {}: publication may be visible, but durability is unknown; inspect it before retrying",
+            path.display()
+        )),
+        error => manual_review(path, error),
+    }
+}
+
+/// Create the shipped skill only when its declared destination is missing.
+///
+/// The installation proof is repeated immediately before each mutation. A
+/// direct consumer root that disappeared after target selection is never
+/// recreated. The one explicit exception is the shared Codex/Cursor
+/// `.agents` destination, which may be created only while one of those
+/// consumers still proves installed.
+fn seed_into(
+    consumer: &'static str,
+    installation_roots: &[PathBuf],
+    missing_root: MissingRoot,
+    location: crate::consumer::AssetLocation,
+) -> SeededSkill {
+    let path = location.path();
+    let installation = combined_installation(installation_roots);
+    if installation == Installation::Absent {
         return SeededSkill {
             consumer,
             path,
             outcome: Outcome::NoAgent,
         };
     }
-    if let Ok(existing) = std::fs::read(&path) {
-        // Already current needs no write, and anything the operator
-        // typed outranks the shipped copy.
-        if existing == SHIPPED.as_bytes() || !unedited_seed(&existing) {
+    if installation == Installation::Unproven {
+        return SeededSkill {
+            consumer,
+            path: path.clone(),
+            outcome: manual_review(&path, "consumer root is unproven"),
+        };
+    }
+
+    // Keep the descriptor that classified an existing target. Publishing a
+    // missing leaf remains below this same no-follow boundary.
+    let root = match StateInspector::open_existing(&location.root) {
+        Ok(Some(root)) => root,
+        Ok(None) => {
+            if missing_root != MissingRoot::CreateSharedCodexCursor {
+                return SeededSkill {
+                    consumer,
+                    path: path.clone(),
+                    outcome: manual_review(
+                        &path,
+                        "declared managed root is absent; setup will not recreate a consumer root",
+                    ),
+                };
+            }
+            match combined_installation(installation_roots) {
+                Installation::Present => {}
+                Installation::Absent => {
+                    return SeededSkill {
+                        consumer,
+                        path,
+                        outcome: Outcome::NoAgent,
+                    };
+                }
+                Installation::Unproven => {
+                    return SeededSkill {
+                        consumer,
+                        path: path.clone(),
+                        outcome: manual_review(&path, "consumer root is unproven"),
+                    };
+                }
+            }
+            let authority = match ManagedAssetRoot::open_or_create(&location.root) {
+                Ok(authority) => authority,
+                Err(error) => {
+                    return SeededSkill {
+                        consumer,
+                        path: path.clone(),
+                        outcome: publish_problem(&path, error),
+                    };
+                }
+            };
+            let outcome = match authority.create_file_once(&location.relative, SHIPPED.as_bytes()) {
+                Ok(CreateFileOutcome::Created) => Outcome::Written,
+                Ok(CreateFileOutcome::AlreadyExists) => {
+                    manual_review(&path, "target appeared while the skill was being published")
+                }
+                Err(error) => publish_problem(&path, error),
+            };
+            return SeededSkill {
+                consumer,
+                path,
+                outcome,
+            };
+        }
+        Err(error) => {
+            return SeededSkill {
+                consumer,
+                path: path.clone(),
+                outcome: manual_review(&path, error),
+            };
+        }
+    };
+    let decision = match inspected_seed_decision(&root, &location) {
+        Ok(inspection) => inspection,
+        Err(()) => {
+            return SeededSkill {
+                consumer,
+                path: path.clone(),
+                outcome: manual_review(&path, "target cannot be safely inspected"),
+            };
+        }
+    };
+    match decision.action() {
+        crate::managed_assets::SeedAction::KeepCurrent
+        | crate::managed_assets::SeedAction::PreserveKnownOldSeed
+        | crate::managed_assets::SeedAction::PreserveOperatorEdit => {
             return SeededSkill {
                 consumer,
                 path,
                 outcome: Outcome::Kept,
             };
         }
-    } else if path.exists() {
-        // There but unreadable: not ours to replace.
-        return SeededSkill {
-            consumer,
-            path,
-            outcome: Outcome::Kept,
-        };
+        crate::managed_assets::SeedAction::RefuseUnreadableOrUnproven => {
+            return SeededSkill {
+                consumer,
+                path: path.clone(),
+                outcome: manual_review(&path, decision.ownership_reason()),
+            };
+        }
+        crate::managed_assets::SeedAction::Create => {}
     }
-    let dir = path.parent().expect("skill path always has a parent");
-    let outcome = match std::fs::create_dir_all(dir)
-        .map_err(|e| format!("create {}: {e}", dir.display()))
-        .and_then(|()| {
-            std::fs::write(&path, SHIPPED).map_err(|e| format!("write {}: {e}", path.display()))
-        }) {
-        Ok(()) => Outcome::Written,
-        Err(cause) => Outcome::Problem(cause),
+    let authority = root.into_managed_asset_root();
+    let outcome = match authority.create_file_once(&location.relative, SHIPPED.as_bytes()) {
+        Ok(CreateFileOutcome::Created) => Outcome::Written,
+        Ok(CreateFileOutcome::AlreadyExists) => {
+            manual_review(&path, "target appeared while the skill was being published")
+        }
+        Err(error) => publish_problem(&path, error),
     };
     SeededSkill {
         consumer,
@@ -144,51 +454,17 @@ pub fn seed() -> Vec<SeededSkill> {
         return Vec::new();
     };
     let home = PathBuf::from(home);
-    let claude = crate::consumer::spec(crate::hookset::CliKind::Claude);
-    let claude_locations = claude.locations(&home);
-    let codex = crate::consumer::spec(crate::hookset::CliKind::Codex);
-    let codex_locations = codex.locations(&home);
-    let cursor = crate::consumer::spec(crate::hookset::CliKind::Cursor);
-    let cursor_locations = cursor.locations(&home);
-    let agy = crate::consumer::spec(crate::hookset::CliKind::Agy);
-    let agy_locations = agy.locations(&home);
-    let codex_installed = codex_locations.install_root.is_dir();
-    let cursor_installed = cursor_locations.install_root.is_dir();
-    let (shared_consumer, shared_installed) = match (codex_installed, cursor_installed) {
-        (true, true) => ("Codex and Cursor", true),
-        (true, false) => (codex.skill_name, true),
-        (false, true) => (cursor.skill_name, true),
-        (false, false) => ("Codex and Cursor", false),
-    };
-    let mut seeded = vec![seed_into(
-        claude.skill_name,
-        claude_locations.install_root.is_dir(),
-        claude_locations.skill.path(),
-    )];
-    if codex_locations.skill == cursor_locations.skill {
-        seeded.push(seed_into(
-            shared_consumer,
-            shared_installed,
-            codex_locations.skill.path(),
-        ));
-    } else {
-        seeded.push(seed_into(
-            codex.skill_name,
-            codex_installed,
-            codex_locations.skill.path(),
-        ));
-        seeded.push(seed_into(
-            cursor.skill_name,
-            cursor_installed,
-            cursor_locations.skill.path(),
-        ));
-    }
-    seeded.push(seed_into(
-        agy.skill_name,
-        agy_locations.install_root.is_dir(),
-        agy_locations.skill.path(),
-    ));
-    seeded
+    targets(&home)
+        .into_iter()
+        .map(|target| {
+            seed_into(
+                target.consumer,
+                &target.installation_roots,
+                target.missing_root,
+                target.location,
+            )
+        })
+        .collect()
 }
 
 /// The note `cyclops start --setup-only` prints for one seed attempt.
@@ -244,9 +520,9 @@ mod tests {
         );
     }
 
-    /// Same contract as the manifest list: whoever changes the skill sees
-    /// this fail and appends the new hash, so the replaced version stays
-    /// recognizable as an unedited seed forever after.
+    /// Same classification contract as the manifest list: whoever changes
+    /// the skill sees this fail and appends the new hash, so an older release
+    /// remains recognizable as outdated rather than edited.
     #[test]
     fn the_ever_shipped_list_contains_the_current_body() {
         assert!(
@@ -256,26 +532,40 @@ mod tests {
         );
     }
 
-    /// The whole policy in one run: no vendor dir means nothing is
-    /// created, a fresh seed writes, a rerun keeps quiet, an edit
-    /// survives, and shipped-but-stale bytes upgrade.
+    /// The whole policy in one run: a missing direct consumer root is not
+    /// recreated, a fresh seed writes below a present root, and existing
+    /// current or operator-owned bytes stay untouched.
     #[test]
     fn the_seed_respects_the_vendor_dir_and_the_operators_edits() {
         let root = cyclops_proto::scratch::scratch_dir("cyc-skillseed");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create root");
         let agent_dir = root.join(".claude");
-        let skill = agent_dir.join("skills/cyclops/SKILL.md");
+        let skill = crate::consumer::AssetLocation {
+            root: agent_dir.clone(),
+            relative: PathBuf::from("skills/cyclops/SKILL.md"),
+        };
 
         // Not installed: nothing appears, not even the directory.
-        let absent = seed_into("test agent", agent_dir.is_dir(), skill.clone());
+        let installation_roots = vec![agent_dir.clone()];
+        let absent = seed_into(
+            "test agent",
+            &installation_roots,
+            MissingRoot::Refuse,
+            skill.clone(),
+        );
         assert_eq!(absent.outcome, Outcome::NoAgent);
         assert!(!agent_dir.exists(), "seeding invented the vendor dir");
         assert_eq!(note(&absent), None);
 
         // Installed: the skill lands and says so.
         std::fs::create_dir_all(&agent_dir).expect("create agent dir");
-        let first = seed_into("test agent", agent_dir.is_dir(), skill.clone());
+        let first = seed_into(
+            "test agent",
+            &installation_roots,
+            MissingRoot::Refuse,
+            skill.clone(),
+        );
         assert_eq!(first.outcome, Outcome::Written);
         assert_eq!(
             std::fs::read_to_string(&first.path).expect("written"),
@@ -286,13 +576,23 @@ mod tests {
             .contains("installed the test agent skill"));
 
         // Rerun: current file, no write, no note.
-        let second = seed_into("test agent", agent_dir.is_dir(), skill.clone());
+        let second = seed_into(
+            "test agent",
+            &installation_roots,
+            MissingRoot::Refuse,
+            skill.clone(),
+        );
         assert_eq!(second.outcome, Outcome::Kept);
         assert_eq!(note(&second), None);
 
         // An operator edit outranks the shipped copy on every later run.
         std::fs::write(&first.path, "# my own notes\n").expect("edit");
-        let third = seed_into("test agent", agent_dir.is_dir(), skill);
+        let third = seed_into(
+            "test agent",
+            &installation_roots,
+            MissingRoot::Refuse,
+            skill,
+        );
         assert_eq!(third.outcome, Outcome::Kept);
         assert_eq!(
             std::fs::read_to_string(&first.path).unwrap(),
@@ -300,5 +600,34 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_direct_consumer_root_removed_after_target_selection_is_not_recreated() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-skillseed-root-removed");
+        let _ = std::fs::remove_dir_all(&home);
+        let claude_root = home.join(".claude");
+        std::fs::create_dir_all(&claude_root).expect("create Claude root");
+
+        let target = targets(&home)
+            .into_iter()
+            .find(|target| target.consumer == "Claude Code")
+            .expect("Claude target");
+        assert!(target.installation == Installation::Present);
+        std::fs::remove_dir_all(&claude_root).expect("remove selected consumer root");
+
+        let seeded = seed_into(
+            target.consumer,
+            &target.installation_roots,
+            target.missing_root,
+            target.location,
+        );
+        assert_eq!(seeded.outcome, Outcome::NoAgent);
+        assert!(
+            !claude_root.exists(),
+            "setup recreated a direct consumer root after its proof disappeared"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
