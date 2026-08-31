@@ -18,8 +18,8 @@
 //! Only the screen sensor can prove composer readiness. A verdict without a
 //! positive clean-composer reading still refuses writes under rule 12.
 
-use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use cyclops_manifest::{
@@ -386,9 +386,61 @@ pub(crate) fn schedule_unkeyed_dispatch_recheck(inner: &Arc<Inner>, pane: &PaneK
     schedule_lifecycle_recheck(inner, pane);
 }
 
-pub(crate) struct LifecycleRecheckTask {
+struct LifecycleRecheckTask {
     notify: Arc<tokio::sync::Notify>,
     task: tokio::task::JoinHandle<()>,
+}
+
+/// Owns the concurrency state for each exact pane observation timeline.
+///
+/// Recompute gates remain stable for the daemon lifetime so an older waiter
+/// can never race a replacement gate. Lifecycle candidates share one
+/// event-driven task per route, and shutdown drains every task published here.
+/// The concrete maps stay inside fusion; daemon callers only construct this
+/// runtime and request its shutdown handles.
+pub(crate) struct PaneObservationRuntime {
+    recompute_gates: StdMutex<HashMap<PaneKey, Arc<tokio::sync::Mutex<()>>>>,
+    lifecycle_rechecks: StdMutex<HashMap<PaneKey, LifecycleRecheckTask>>,
+}
+
+impl PaneObservationRuntime {
+    pub(crate) fn new() -> Self {
+        Self {
+            recompute_gates: StdMutex::new(HashMap::new()),
+            lifecycle_rechecks: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    fn recompute_gate(&self, pane: &PaneKey) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self
+            .recompute_gates
+            .lock()
+            .expect("pane recompute gates lock");
+        Arc::clone(
+            gates
+                .entry(pane.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+
+    /// Drain every published lifecycle task after the daemon closes task
+    /// publication. Each task is woken before its handle joins the shutdown
+    /// set, so a parked worker can observe the stop latch promptly.
+    pub(crate) fn take_tasks_for_shutdown(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let entries = std::mem::take(
+            &mut *self
+                .lifecycle_rechecks
+                .lock()
+                .expect("lifecycle rechecks lock"),
+        );
+        entries
+            .into_values()
+            .map(|entry| {
+                entry.notify.notify_one();
+                entry.task
+            })
+            .collect()
+    }
 }
 
 pub(crate) fn schedule_lifecycle_recheck(inner: &Arc<Inner>, pane: &PaneKey) {
@@ -399,6 +451,7 @@ pub(crate) fn schedule_lifecycle_recheck(inner: &Arc<Inner>, pane: &PaneKey) {
         return;
     };
     if let Some(notify) = inner
+        .pane_observation_runtime
         .lifecycle_rechecks
         .lock()
         .expect("lifecycle rechecks lock")
@@ -419,6 +472,7 @@ pub(crate) fn schedule_lifecycle_recheck(inner: &Arc<Inner>, pane: &PaneKey) {
         return;
     }
     let mut rechecks = inner
+        .pane_observation_runtime
         .lifecycle_rechecks
         .lock()
         .expect("lifecycle rechecks lock");
@@ -618,6 +672,7 @@ fn lifecycle_recheck_is_current(
     notify: &Arc<tokio::sync::Notify>,
 ) -> bool {
     inner
+        .pane_observation_runtime
         .lifecycle_rechecks
         .lock()
         .expect("lifecycle rechecks lock")
@@ -631,6 +686,7 @@ fn retire_lifecycle_recheck_if_empty(
     notify: &Arc<tokio::sync::Notify>,
 ) -> bool {
     let mut rechecks = inner
+        .pane_observation_runtime
         .lifecycle_rechecks
         .lock()
         .expect("lifecycle rechecks lock");
@@ -655,6 +711,7 @@ fn retire_lifecycle_recheck_if_empty(
 
 fn remove_lifecycle_recheck(inner: &Inner, pane: &PaneKey, notify: &Arc<tokio::sync::Notify>) {
     let mut rechecks = inner
+        .pane_observation_runtime
         .lifecycle_rechecks
         .lock()
         .expect("lifecycle rechecks lock");
@@ -668,6 +725,7 @@ fn remove_lifecycle_recheck(inner: &Inner, pane: &PaneKey, notify: &Arc<tokio::s
 
 pub(crate) fn cancel_lifecycle_recheck(inner: &Inner, pane: &PaneKey) {
     let mut rechecks = inner
+        .pane_observation_runtime
         .lifecycle_rechecks
         .lock()
         .expect("lifecycle rechecks lock");
@@ -683,6 +741,7 @@ pub(crate) fn cancel_lifecycle_recheck(inner: &Inner, pane: &PaneKey) {
 
 fn cancel_lifecycle_recheck_task(inner: &Inner, pane: &PaneKey) {
     let mut rechecks = inner
+        .pane_observation_runtime
         .lifecycle_rechecks
         .lock()
         .expect("lifecycle rechecks lock");
@@ -703,22 +762,6 @@ fn stop_lifecycle_recheck_entry(entry: Option<LifecycleRecheckTask>) {
             task.abort();
         }
     }
-}
-
-pub(crate) fn take_lifecycle_recheck_tasks(inner: &Inner) -> Vec<tokio::task::JoinHandle<()>> {
-    let entries = std::mem::take(
-        &mut *inner
-            .lifecycle_rechecks
-            .lock()
-            .expect("lifecycle rechecks lock"),
-    );
-    entries
-        .into_values()
-        .map(|entry| {
-            entry.notify.notify_one();
-            entry.task
-        })
-        .collect()
 }
 
 fn positive_visual_working(inner: &Inner, manifest: &str, detection: &Detection) -> bool {
@@ -2080,7 +2123,7 @@ pub(crate) async fn resolve_staged_hold(
     manifest: &str,
 ) -> bool {
     let pane = PaneKey::new(session_idx, pane_id);
-    let recompute_gate = pane_recompute_gate(inner, &pane);
+    let recompute_gate = inner.pane_observation_runtime.recompute_gate(&pane);
     let _recompute_guard = recompute_gate.lock().await;
     let expected = crate::identity::ProcId {
         pid: agent.pid(),
@@ -3301,18 +3344,6 @@ fn project_composer(
     }
 }
 
-fn pane_recompute_gate(inner: &Arc<Inner>, pane: &PaneKey) -> Arc<tokio::sync::Mutex<()>> {
-    let mut gates = inner
-        .pane_recomputes
-        .lock()
-        .expect("pane recompute gates lock");
-    Arc::clone(
-        gates
-            .entry(pane.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-    )
-}
-
 /// Recompute one pane's Detection, update the cache, and return immutable
 /// publication evidence when the fused state changed. Manifests with screen
 /// rules always run the full sensor set. `force_screen` additionally captures
@@ -3745,7 +3776,7 @@ async fn observe_pane_with_evidence(
     // clean frame captured first commit after a newer draft or Working frame.
     // The map keeps one stable gate per route for the daemon's lifetime so a
     // waiter can never race a newly-created replacement gate.
-    let recompute_gate = pane_recompute_gate(inner, &route);
+    let recompute_gate = inner.pane_observation_runtime.recompute_gate(&route);
     let recompute_guard = recompute_gate.lock_owned().await;
     let lifecycle_observation = LifecycleObservation::from_cause(cause);
     let Some(row) = watcher.pane(pane_id) else {
@@ -5424,7 +5455,12 @@ line_regex = ['^ACTIVE']
         schedule_lifecycle_recheck(&inner, &pane);
         schedule_lifecycle_recheck(&inner, &pane);
         assert_eq!(
-            inner.lifecycle_rechecks.lock().unwrap().len(),
+            inner
+                .pane_observation_runtime
+                .lifecycle_rechecks
+                .lock()
+                .unwrap()
+                .len(),
             1,
             "a transient final repaint needs exactly one follow-up, not a polling loop"
         );
@@ -5445,7 +5481,12 @@ line_regex = ['^ACTIVE']
         );
         schedule_lifecycle_recheck(&inner, &pane);
         assert!(
-            inner.lifecycle_rechecks.lock().unwrap().is_empty(),
+            inner
+                .pane_observation_runtime
+                .lifecycle_rechecks
+                .lock()
+                .unwrap()
+                .is_empty(),
             "an authoritative hook-owned turn must wait for its own end"
         );
     }
@@ -7962,7 +8003,7 @@ contains = ["done"]
         let mut promoted = entry(ComposerHold::TurnStarted { since_ms: 9 }, Some(attempt));
         promoted.turn = Some(turn.clone());
         put(entry(ComposerHold::Staged, Some(attempt)));
-        let recompute_gate = pane_recompute_gate(&inner, &pane());
+        let recompute_gate = inner.pane_observation_runtime.recompute_gate(&pane());
         let recompute_guard = recompute_gate.lock().await;
         let mut resolution = Box::pin(resolve_staged_hold(
             &inner, 0, "%1", attempt, process, "bash",
@@ -10229,8 +10270,7 @@ regex = ['^IDLE']
             events: tokio::sync::broadcast::channel(16).0,
             detections: StdMutex::new(HashMap::new()),
             route_evidence_generations: StdMutex::new(HashMap::new()),
-            pane_recomputes: StdMutex::new(HashMap::new()),
-            lifecycle_rechecks: StdMutex::new(HashMap::new()),
+            pane_observation_runtime: PaneObservationRuntime::new(),
             registry: StdMutex::new(registry),
             theme: StdMutex::new(cyclops_theme::ThemeWatch::new(&home)),
             hook_readings: StdMutex::new(HashMap::new()),
@@ -10325,9 +10365,11 @@ regex = ['^IDLE']
     async fn pane_observations_share_one_route_gate() {
         let inner = inner_with(BTreeMap::new());
         let route = PaneKey::new(0, "%1");
-        let first = pane_recompute_gate(&inner, &route);
-        let same = pane_recompute_gate(&inner, &route);
-        let other = pane_recompute_gate(&inner, &PaneKey::new(0, "%2"));
+        let first = inner.pane_observation_runtime.recompute_gate(&route);
+        let same = inner.pane_observation_runtime.recompute_gate(&route);
+        let other = inner
+            .pane_observation_runtime
+            .recompute_gate(&PaneKey::new(0, "%2"));
 
         let _guard = first.lock().await;
         assert!(
@@ -10353,6 +10395,7 @@ regex = ['^IDLE']
         );
         schedule_candidate_end_recheck(&inner, &pane, first);
         let original = inner
+            .pane_observation_runtime
             .lifecycle_rechecks
             .lock()
             .unwrap()
@@ -10371,7 +10414,11 @@ regex = ['^IDLE']
         );
         schedule_candidate_end_recheck(&inner, &pane, replacement);
         {
-            let rechecks = inner.lifecycle_rechecks.lock().unwrap();
+            let rechecks = inner
+                .pane_observation_runtime
+                .lifecycle_rechecks
+                .lock()
+                .unwrap();
             assert_eq!(rechecks.len(), 1);
             assert!(rechecks
                 .get(&pane)
@@ -10380,7 +10427,12 @@ regex = ['^IDLE']
 
         cancel_lifecycle_recheck(&inner, &pane);
         tokio::task::yield_now().await;
-        assert!(inner.lifecycle_rechecks.lock().unwrap().is_empty());
+        assert!(inner
+            .pane_observation_runtime
+            .lifecycle_rechecks
+            .lock()
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -10389,13 +10441,18 @@ regex = ['^IDLE']
         let pane = PaneKey::new(0, "%1");
         let notify = Arc::new(tokio::sync::Notify::new());
         let task = tokio::spawn(std::future::pending());
-        inner.lifecycle_rechecks.lock().unwrap().insert(
-            pane.clone(),
-            LifecycleRecheckTask {
-                notify: Arc::clone(&notify),
-                task,
-            },
-        );
+        inner
+            .pane_observation_runtime
+            .lifecycle_rechecks
+            .lock()
+            .unwrap()
+            .insert(
+                pane.clone(),
+                LifecycleRecheckTask {
+                    notify: Arc::clone(&notify),
+                    task,
+                },
+            );
 
         schedule_lifecycle_recheck(&inner, &pane);
         tokio::time::timeout(Duration::from_millis(50), notify.notified())
@@ -10420,6 +10477,7 @@ regex = ['^IDLE']
             let _ = done_tx.send(());
         });
         inner
+            .pane_observation_runtime
             .lifecycle_rechecks
             .lock()
             .unwrap()
@@ -10430,7 +10488,12 @@ regex = ['^IDLE']
             .await
             .expect("self-retirement aborted the active recompute")
             .expect("recheck task ended before reporting completion");
-        assert!(inner.lifecycle_rechecks.lock().unwrap().is_empty());
+        assert!(inner
+            .pane_observation_runtime
+            .lifecycle_rechecks
+            .lock()
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -10449,10 +10512,15 @@ regex = ['^IDLE']
         );
 
         schedule_candidate_end_recheck(&inner, &pane, candidate);
-        let mut tasks = take_lifecycle_recheck_tasks(&inner);
+        let mut tasks = inner.pane_observation_runtime.take_tasks_for_shutdown();
 
         assert_eq!(tasks.len(), 1, "the registry published no joinable task");
-        assert!(inner.lifecycle_rechecks.lock().unwrap().is_empty());
+        assert!(inner
+            .pane_observation_runtime
+            .lifecycle_rechecks
+            .lock()
+            .unwrap()
+            .is_empty());
         let mut task = tasks.pop().expect("one registered task");
         task.abort();
         let _ = (&mut task).await;
@@ -10477,7 +10545,12 @@ regex = ['^IDLE']
 
         schedule_candidate_end_recheck(&inner, &pane, candidate);
 
-        assert!(inner.lifecycle_rechecks.lock().unwrap().is_empty());
+        assert!(inner
+            .pane_observation_runtime
+            .lifecycle_rechecks
+            .lock()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
