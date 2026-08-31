@@ -1065,6 +1065,11 @@ pub(crate) struct DeliveryHandle {
     /// The legacy composed wait uses this only to reject a working phase
     /// that predates the submit. It does not correlate a turn to a message.
     working_seen: AtomicBool,
+    /// A receiver opened before the submit key and handed to a composed wait.
+    /// It may contain older broadcasts, so the wait treats it only as a
+    /// source of an exact post-submit Working fact. Its state sequence never
+    /// becomes the wait's live state.
+    post_submit_turn_events: StdMutex<Option<broadcast::Receiver<Event>>>,
     /// pane_pid of the occupant this delivery was submitted to, recorded
     /// right before the submit key. Send-and-wait pins its wait on THIS
     /// occupant, not whoever lives in the pane when the wait starts; an
@@ -1148,6 +1153,21 @@ struct HandleState {
     barrier: Option<String>,
 }
 
+/// The pre-Enter event receiver travels with the exact delivery it observed.
+/// It is consumed only as a fact source by the composed `send --wait` path;
+/// the wait itself starts a fresh live receiver after its baseline.
+pub(crate) struct SubmittedTurnEvidence {
+    events: broadcast::Receiver<Event>,
+    handle: Arc<DeliveryHandle>,
+}
+
+/// Identity facts a wait must preserve from a preceding delivery.
+#[derive(Default)]
+pub(crate) struct WaitPin {
+    submitted_pid: Option<i32>,
+    turn_evidence: Option<SubmittedTurnEvidence>,
+}
+
 impl DeliveryHandle {
     /// This attempt's claim on a pane's composer barrier.
     ///
@@ -1185,6 +1205,24 @@ impl DeliveryHandle {
             .expect("submitted manifest lock")
             .as_deref()
             == Some(manifest_id)
+    }
+
+    fn replace_post_submit_turn_events(&self, events: broadcast::Receiver<Event>) {
+        *self
+            .post_submit_turn_events
+            .lock()
+            .expect("post-submit turn events lock") = Some(events);
+    }
+
+    fn take_post_submit_turn_evidence(self: &Arc<Self>) -> Option<SubmittedTurnEvidence> {
+        self.post_submit_turn_events
+            .lock()
+            .expect("post-submit turn events lock")
+            .take()
+            .map(|events| SubmittedTurnEvidence {
+                events,
+                handle: Arc::clone(self),
+            })
     }
 
     fn new(
@@ -1280,6 +1318,7 @@ impl DeliveryHandle {
             ack: Notify::new(),
             cancel: Notify::new(),
             working_seen: AtomicBool::new(false),
+            post_submit_turn_events: StdMutex::new(None),
             submitted_pid: AtomicI32::new(0),
             submitted_agent: StdMutex::new(None),
             submitted_at_ms: std::sync::atomic::AtomicU64::new(0),
@@ -2609,6 +2648,7 @@ pub(crate) async fn msg_send(
             // submit and wait start must read occupant_changed instead of
             // answering for the impostor.
             let submitted = handle.submitted_pid.load(Ordering::SeqCst);
+            let turn_evidence = handle.take_post_submit_turn_evidence();
             let end = wait_pinned(
                 inner,
                 handle.session_idx,
@@ -2616,7 +2656,10 @@ pub(crate) async fn msg_send(
                 spec.until,
                 remaining,
                 working_pre,
-                (submitted != 0).then_some(submitted),
+                WaitPin {
+                    submitted_pid: (submitted != 0).then_some(submitted),
+                    turn_evidence,
+                },
             )
             .await;
             waits.push(json!({
@@ -4645,6 +4688,17 @@ async fn attempt_delivery(
     // phase before send-keys returns, so subscribing inside the receipt
     // waiter loses the only turn evidence that actually followed this key.
     let receipt_events = inner.events.subscribe();
+    // This receiver has one job: retain a matching working edge until a
+    // screen checkpoint has accounted for it. The main receipt receiver
+    // still owns session lifecycle and lag handling below. Keeping those
+    // responsibilities separate means a screen receipt cannot settle first
+    // and strand the `turn_ended` wait behind an already-observed turn.
+    let receipt_turn_events = inner.events.subscribe();
+    // Keep an independent receiver alive through receipt settlement and into
+    // `wait_pinned`. It can establish only an exact post-submit Working fact;
+    // the composed wait opens its own fresh stream for current and future
+    // state, so an older Idle cannot replay as a current answer.
+    handle.replace_post_submit_turn_events(inner.events.subscribe());
     let receipt_submit_at = Instant::now();
     let receipt_submit_at_ms = unix_ms();
     handle.submitted_pid.store(admitted_pid, Ordering::SeqCst);
@@ -4743,7 +4797,7 @@ async fn attempt_delivery(
             return AttemptOutcome::Done;
         }
     }
-    match await_ack(
+    let ack_outcome = await_ack(
         inner,
         handle,
         ReceiptWait {
@@ -4753,10 +4807,15 @@ async fn attempt_delivery(
             target,
             submit_at: receipt_submit_at,
             events: receipt_events,
+            turn_events: receipt_turn_events,
         },
     )
-    .await
-    {
+    .await;
+    // Test-only boundary after receipt observation has finished but before
+    // this worker publishes its delivery verdict. It proves the composed
+    // wait owns a receiver with no observation gap after an early receipt.
+    inject_pause(inner, "post_receipt").await;
+    match ack_outcome {
         AckOutcome::Resolved => AttemptOutcome::Done,
         AckOutcome::Screen => {
             // Stays registered: a late matching hook ACK upgrades it to
@@ -7874,6 +7933,7 @@ struct ReceiptWait<'a> {
     target: StagingTarget<'a>,
     submit_at: Instant,
     events: broadcast::Receiver<Event>,
+    turn_events: broadcast::Receiver<Event>,
 }
 
 fn receipt_is_resolved(handle: &DeliveryHandle) -> bool {
@@ -7924,9 +7984,18 @@ async fn receipt_checkpoint_pass(
     id_staged: bool,
     target: StagingTarget<'_>,
     working_seen: bool,
+    turn_events: &mut broadcast::Receiver<Event>,
     output_seen: bool,
     clock: &AckClock,
 ) -> ReceiptStep {
+    // `turn_events` subscribed before Enter. A screen checkpoint can become
+    // ready at the same instant as the state event, so account for every
+    // already-buffered matching edge before that checkpoint is allowed to
+    // settle the delivery. This is a fact recorder only; lifecycle handling
+    // remains on the main receipt event stream.
+    let working_seen = working_seen
+        || handle.working_seen.load(Ordering::SeqCst)
+        || record_buffered_working_evidence(turn_events, handle);
     let Some(watcher) = inner.watcher_of(handle.session_idx) else {
         return ReceiptStep::Freeze;
     };
@@ -7975,6 +8044,35 @@ async fn receipt_checkpoint_pass(
     }
 }
 
+/// Latch a matching working edge from the backlog present when this is called.
+/// The scan is bounded by that fixed backlog, not an arbitrary count. A
+/// receipt's main event stream handles later receipt lifecycle, while a
+/// composed wait has already opened a fresh stream for later fused state.
+///
+/// If the receiver has lagged, this records no fact. Missing a turn can only
+/// make `turn_ended` time out; inventing one would be a false success.
+fn record_buffered_working_evidence(
+    events: &mut broadcast::Receiver<Event>,
+    handle: &Arc<DeliveryHandle>,
+) -> bool {
+    let backlog = events.len();
+    for _ in 0..backlog {
+        match events.try_recv() {
+            Ok(event) => {
+                if submitted_working_state_event(&event, handle) {
+                    handle.working_seen.store(true, Ordering::SeqCst);
+                    return true;
+                }
+            }
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                return false;
+            }
+            Err(broadcast::error::TryRecvError::Lagged(_)) => return false,
+        }
+    }
+    false
+}
+
 async fn await_ack(
     inner: &Arc<Inner>,
     handle: &Arc<DeliveryHandle>,
@@ -7987,6 +8085,7 @@ async fn await_ack(
         target,
         submit_at,
         events: mut ev_rx,
+        turn_events: mut turn_ev_rx,
     } = wait;
     let tier1 = manifest.hooks.ack.is_some() && manifest.hooks.ack_payload_field.is_some();
     let mut pane_rx = inner.watcher_of(handle.session_idx).map(|w| w.subscribe());
@@ -8057,7 +8156,7 @@ async fn await_ack(
                 clock.advance_checkpoint();
                 match receipt_checkpoint_pass(
                     inner, handle, manifest, staged_window, id_staged, target,
-                    working_seen, output_seen, &clock,
+                    working_seen, &mut turn_ev_rx, output_seen, &clock,
                 ).await {
                     ReceiptStep::Resolved => return AckOutcome::Resolved,
                     ReceiptStep::Deliver => {
@@ -8108,7 +8207,7 @@ async fn await_ack(
                             // outage?
                             match receipt_checkpoint_pass(
                                 inner, handle, manifest, staged_window, id_staged, target,
-                                working_seen, output_seen, &clock,
+                                working_seen, &mut turn_ev_rx, output_seen, &clock,
                             ).await {
                                 ReceiptStep::Resolved => return AckOutcome::Resolved,
                                 ReceiptStep::Deliver => {
@@ -8151,7 +8250,7 @@ async fn await_ack(
                         clock.unfreeze(Instant::now());
                         match receipt_checkpoint_pass(
                             inner, handle, manifest, staged_window, id_staged, target,
-                            working_seen, output_seen, &clock,
+                            working_seen, &mut turn_ev_rx, output_seen, &clock,
                         ).await {
                             ReceiptStep::Resolved => return AckOutcome::Resolved,
                             ReceiptStep::Deliver => {
@@ -8181,26 +8280,28 @@ async fn await_ack(
     }
 }
 
-/// True when the event is a working fused-state change for this pane.
-fn track_state_event(
-    ev: &Result<Event, broadcast::error::RecvError>,
-    handle: &Arc<DeliveryHandle>,
-) -> bool {
-    let Ok(e) = ev else { return false };
-    if e.event != "state" || e.data["pane_id"] != handle.pane_id.as_str() {
+/// True when an event is an explicitly confirmed Working observation.
+fn confirmed_working_state_event(event: &Event) -> bool {
+    event.event == "state"
+        && event.data["state"] == "working"
+        && event.data["working_confirmed"] == true
+}
+
+/// True when an event proves a Working edge for this exact submitted delivery.
+///
+/// This does not associate a turn with a particular message. It only proves
+/// that the submitted process generation entered Working after the submit
+/// boundary, which is the conservative evidence `turn_ended` may carry from
+/// delivery into its separate pane wait.
+fn submitted_working_state_event(event: &Event, handle: &Arc<DeliveryHandle>) -> bool {
+    if !confirmed_working_state_event(event) || event.data["pane_id"] != handle.pane_id.as_str() {
         return false;
     }
-    if e.data["session_idx"].as_u64() != Some(handle.session_idx as u64) {
-        return false;
-    }
-    if e.data["state"] != "working" {
-        return false;
-    }
-    if e.data["working_confirmed"] != true {
+    if event.data["session_idx"].as_u64() != Some(handle.session_idx as u64) {
         return false;
     }
     let submitted_at_ms = handle.submitted_at_ms.load(Ordering::SeqCst);
-    if e.data["observed_at_ms"]
+    if event.data["observed_at_ms"]
         .as_u64()
         .is_none_or(|observed_at_ms| observed_at_ms < submitted_at_ms)
     {
@@ -8214,15 +8315,37 @@ fn track_state_event(
     // as long as the pane happened to look familiar again.
     // Both halves of the identity travel on the event, because a pid
     // alone is transferable and this is a trust comparison.
-    let Some(birth) = e.data["source_birth"].as_u64() else {
+    let Some(birth) = event.data["source_birth"].as_u64() else {
         return false;
     };
     let agent = crate::identity::ProcId {
-        pid: e.data["source_pid"].as_i64().unwrap_or_default() as i32,
+        pid: event.data["source_pid"].as_i64().unwrap_or_default() as i32,
         birth,
     };
-    let manifest = e.data["source_manifest"].as_str().unwrap_or_default();
+    let manifest = event.data["source_manifest"].as_str().unwrap_or_default();
     handle.submitted_binding_is(agent, manifest)
+}
+
+/// True when a wait may count an event as its Working phase. A standalone
+/// `agent.wait` follows the fused contract. A composed wait additionally
+/// retains the exact delivery identity it inherited across receipt settlement.
+fn wait_working_event_is_eligible(
+    event: &Event,
+    submitted_turn: Option<&Arc<DeliveryHandle>>,
+) -> bool {
+    match submitted_turn {
+        Some(handle) => submitted_working_state_event(event, handle),
+        None => confirmed_working_state_event(event),
+    }
+}
+
+/// Compatibility wrapper for receipt-path callers and focused tests.
+fn track_state_event(
+    ev: &Result<Event, broadcast::error::RecvError>,
+    handle: &Arc<DeliveryHandle>,
+) -> bool {
+    ev.as_ref()
+        .is_ok_and(|event| submitted_working_state_event(event, handle))
 }
 
 /// True when the event is a session lifecycle line: attach, detach, or
@@ -9385,7 +9508,7 @@ pub(crate) async fn wait_pinned(
     until: WaitUntil,
     timeout: Duration,
     working_pre: bool,
-    pinned: Option<i32>,
+    pin: WaitPin,
 ) -> WaitEnd {
     let started = Instant::now();
     let deadline = started + timeout;
@@ -9394,9 +9517,23 @@ pub(crate) async fn wait_pinned(
         state,
         waited_ms: started.elapsed().as_millis() as u64,
     };
-    // Subscribe before the baseline refresh so no state edge can fall
-    // between the fresh observation and the wait loop.
+    // Subscribe before the baseline refresh. A composed send also carries a
+    // fact-only receiver from before Enter; this fresh receiver owns the
+    // current and future state sequence, so stale state cannot replay after
+    // the baseline.
+    let WaitPin {
+        submitted_pid: pinned,
+        turn_evidence,
+    } = pin;
     let mut ev_rx = inner.events.subscribe();
+    let (submitted_turn_handle, handoff_working) = match turn_evidence {
+        Some(mut evidence) => {
+            let handoff_working =
+                record_buffered_working_evidence(&mut evidence.events, &evidence.handle);
+            (Some(evidence.handle), handoff_working)
+        }
+        None => (None, false),
+    };
     let watcher = inner.watcher_of(session_idx);
     let mut pane_rx = watcher.as_ref().map(|w| w.subscribe());
     if let Some(watcher) = watcher.as_ref() {
@@ -9451,8 +9588,14 @@ pub(crate) async fn wait_pinned(
             || fusion::foreground_pid_checked(pinned_pid) != Some(pinned_fg)
     };
     let mut working_seen = working_pre
-        || (state == AgentState::Working
+        || handoff_working
+        || (submitted_turn_handle.is_none()
+            && state == AgentState::Working
             && fusion::cached_working_confirmed(inner, session_idx, pane_id));
+    // Test-only boundary after the fresh baseline and fact-only handoff. It
+    // lets the regression prove that historical events cannot finish a newer
+    // current turn before the live pane stream wakes it.
+    inject_pause(inner, "post_wait_baseline").await;
     loop {
         if state == AgentState::Dead {
             return end(WaitOutcome::OccupantChanged, state);
@@ -9484,7 +9627,10 @@ pub(crate) async fn wait_pinned(
                     if let Ok(s) = serde_json::from_value::<AgentState>(e.data["state"].clone()) {
                         state = s;
                         if state == AgentState::Working
-                            && e.data["working_confirmed"] == true
+                            && wait_working_event_is_eligible(
+                                &e,
+                                submitted_turn_handle.as_ref(),
+                            )
                         {
                             working_seen = true;
                         }
@@ -9519,7 +9665,8 @@ pub(crate) async fn wait_pinned(
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     // Reconcile on doubt: re-read the cache and the pin.
                     state = inner.cached_state(session_idx, pane_id);
-                    if state == AgentState::Working
+                    if submitted_turn_handle.is_none()
+                        && state == AgentState::Working
                         && fusion::cached_working_confirmed(inner, session_idx, pane_id)
                     {
                         working_seen = true;
@@ -9547,6 +9694,10 @@ pub(crate) async fn wait_pinned(
                     if occupant_gone(inner, session_idx, pane_id, pinned_pid) {
                         return end(WaitOutcome::OccupantChanged, state);
                     }
+                    // Test-only proof that a composed wait reached a live
+                    // pane wake after its baseline. A stale historical Idle
+                    // would have returned before reaching this point.
+                    inject_pause(inner, "wait_pane_wake").await;
                 }
                 Ok(PaneEvent::Disconnected) | Err(broadcast::error::RecvError::Closed) => {
                     pane_rx = None;
@@ -9588,7 +9739,7 @@ pub(crate) async fn agent_wait(
         params.until,
         Duration::from_millis(timeout),
         false,
-        None,
+        WaitPin::default(),
     )
     .await;
     // `outcome` mirrors the send-and-wait entry shape: "reached" on
@@ -13916,6 +14067,66 @@ line_regex_esc = ['^❯$']
             &event(3, 1_000, agent.birth, true),
             &handle
         ));
+
+        // The composed pane wait uses the same gate on its fresh live
+        // receiver. A confirmed Working edge from an earlier submit or a
+        // replacement process must not turn a later Idle into success.
+        assert!(!wait_working_event_is_eligible(
+            &event(3, 999, agent.birth, true).expect("event"),
+            Some(&handle)
+        ));
+        assert!(!wait_working_event_is_eligible(
+            &event(3, 1_000, agent.birth + 1, true).expect("event"),
+            Some(&handle)
+        ));
+        assert!(wait_working_event_is_eligible(
+            &event(3, 1_000, agent.birth, true).expect("event"),
+            Some(&handle)
+        ));
+
+        // Standalone waits do not inherit a delivery identity; their outer
+        // loop has already selected the requested pane and session.
+        assert!(wait_working_event_is_eligible(
+            &event(2, 999, agent.birth + 1, true).expect("event"),
+            None
+        ));
+    }
+
+    #[test]
+    fn buffered_working_evidence_survives_a_screen_checkpoint_race() {
+        // Model the receipt boundary precisely: Enter subscribed first, the
+        // watcher published a matching Working fact, and a screen checkpoint
+        // is ready before the normal receipt loop reads that fact. The
+        // checkpoint must not erase the turn evidence needed by `turn_ended`.
+        let handle = DeliveryHandle::new("m-buffered-working", "worker", "%1", 3, "payload".into());
+        let agent = crate::identity::ProcId {
+            pid: 4242,
+            birth: 818_221,
+        };
+        *handle.submitted_agent.lock().unwrap() = Some(agent);
+        *handle.submitted_manifest.lock().unwrap() = Some("fix".into());
+        handle.submitted_at_ms.store(1_000, Ordering::SeqCst);
+        let (events, mut turn_events) = broadcast::channel(4);
+        events
+            .send(Event {
+                event: "state".into(),
+                data: json!({
+                    "pane_id": "%1",
+                    "session_idx": 3,
+                    "state": "working",
+                    "source_pid": 4242,
+                    "source_birth": agent.birth,
+                    "source_manifest": "fix",
+                    "observed_at_ms": 1_000,
+                    "working_confirmed": true,
+                }),
+                seq: None,
+            })
+            .expect("working event has a receiver");
+
+        assert!(record_buffered_working_evidence(&mut turn_events, &handle));
+        assert!(handle.working_seen.load(Ordering::SeqCst));
+        assert!(!record_buffered_working_evidence(&mut turn_events, &handle));
     }
 
     #[test]
