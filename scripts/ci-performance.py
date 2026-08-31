@@ -66,6 +66,21 @@ WORKLOADS = (
         ],
         "CYCLOPS_CONCURRENT_MESSAGING_JSON",
     ),
+    (
+        "idle-observation-counts",
+        [
+            "cargo",
+            "test",
+            "-p",
+            "cyclopsd",
+            "--test",
+            "idle_observation_perf",
+            "--",
+            "--ignored",
+            "--nocapture",
+        ],
+        "CYCLOPS_IDLE_OBSERVATION_JSON",
+    ),
 )
 
 # The daemon workload crosses a process boundary. This is its retained artifact
@@ -153,6 +168,31 @@ CONCURRENT_MESSAGING_WORKLOAD = {
     ],
     "timing": "raw per-request and per-workload samples plus p50, p95, and max summaries",
     "bounds": "descriptive evidence only; no universal latency or interleaving bound is asserted",
+}
+
+# This workload measures only the daemon observation work that a quiet pane
+# could start. It intentionally does not turn application counters into a
+# claim about OS scheduling, tmux internals, client refreshes, or delivery.
+IDLE_OBSERVATION_SCHEMA = 1
+IDLE_OBSERVATION_KIND = "cyclops_idle_observation_counts"
+IDLE_OBSERVATION_WORKLOAD = {
+    "fixture": "two sequential isolated tmux servers, each with one screen-tier CAT_MANIFEST pane running cat",
+    "positive_control": "one literal line sent to cat in a separate control fixture must reach every application counter",
+    "baseline": "the fresh quiet fixture completes attachment and readiness checks before counters reset",
+    "idle_window_ms": 1_000,
+    "counts": {
+        "watcher_event_wakes": "PaneEvent entries accepted by the daemon after the reset; not operating-system wakeups",
+        "observation_recompute_starts": "pane observation transactions that acquired their route gate after the reset",
+        "screen_capture_requests": "state-observation capture-pane commands issued after the reset",
+    },
+    "excludes": [
+        "daemon boot and fixture attachment",
+        "the separate positive output control fixture",
+        "client requests after the reset",
+        "agent or human pane output after the reset",
+        "terminal-delivery and composer-recovery captures",
+        "tmux internals and operating-system scheduler wakeups",
+    ],
 }
 
 
@@ -517,6 +557,48 @@ def concurrent_messaging_report_error(report: dict[str, object]) -> str | None:
     return None
 
 
+def idle_observation_report_error(report: dict[str, object]) -> str | None:
+    """Reject a report that does not prove the bounded quiet-pane contract."""
+    if set(report) != {
+        "schema",
+        "kind",
+        "benchmark_test_build_ref",
+        "cyclopsd_version",
+        "workload",
+        "positive_control_counts",
+        "counts",
+    }:
+        return "idle observation record has an unexpected shape"
+    if not exact_int(report.get("schema"), IDLE_OBSERVATION_SCHEMA):
+        return f"expected schema {IDLE_OBSERVATION_SCHEMA}"
+    if report.get("kind") != IDLE_OBSERVATION_KIND:
+        return f"expected kind {IDLE_OBSERVATION_KIND!r}"
+    if not nonempty_string(report.get("benchmark_test_build_ref")):
+        return "missing benchmark_test_build_ref"
+    if not nonempty_string(report.get("cyclopsd_version")):
+        return "missing cyclopsd_version"
+    if report.get("workload") != IDLE_OBSERVATION_WORKLOAD:
+        return "idle observation record does not match the retained workload contract"
+
+    expected_count_keys = {
+        "watcher_event_wakes",
+        "observation_recompute_starts",
+        "screen_capture_requests",
+    }
+    positive_control_counts = report.get("positive_control_counts")
+    if not isinstance(positive_control_counts, dict) or set(positive_control_counts) != expected_count_keys:
+        return "idle observation record has incomplete positive-control counts"
+    if any(not isinstance(count, int) or isinstance(count, bool) or count <= 0 for count in positive_control_counts.values()):
+        return "idle observation record did not prove every counter moves during its positive control"
+
+    counts = report.get("counts")
+    if not isinstance(counts, dict) or set(counts) != expected_count_keys:
+        return "idle observation record has incomplete counts"
+    if any(not exact_int(count, 0) for count in counts.values()):
+        return "idle observation record observed work during its quiet window"
+    return None
+
+
 def report_error(name: str, report: dict[str, object]) -> str | None:
     if name == "daemon-cold-start-replay":
         return cold_replay_report_error(report)
@@ -524,6 +606,8 @@ def report_error(name: str, report: dict[str, object]) -> str | None:
         return install_handoff_report_error(report)
     if name == "concurrent-mailbox-acceptance":
         return concurrent_messaging_report_error(report)
+    if name == "idle-observation-counts":
+        return idle_observation_report_error(report)
     return f"{name} has no retained-report validator"
 
 
@@ -710,6 +794,27 @@ def complete_concurrent_messaging_report() -> dict[str, object]:
     }
 
 
+def complete_idle_observation_report() -> dict[str, object]:
+    """One complete quiet-pane report for the runner's artifact-contract check."""
+    return {
+        "schema": IDLE_OBSERVATION_SCHEMA,
+        "kind": IDLE_OBSERVATION_KIND,
+        "benchmark_test_build_ref": "selftest",
+        "cyclopsd_version": "0.1.0",
+        "workload": IDLE_OBSERVATION_WORKLOAD,
+        "positive_control_counts": {
+            "watcher_event_wakes": 1,
+            "observation_recompute_starts": 1,
+            "screen_capture_requests": 1,
+        },
+        "counts": {
+            "watcher_event_wakes": 0,
+            "observation_recompute_starts": 0,
+            "screen_capture_requests": 0,
+        },
+    }
+
+
 def selftest() -> None:
     """Prove incomplete retained reports cannot become successful artifacts."""
 
@@ -741,6 +846,7 @@ def selftest() -> None:
         "daemon-cold-start-replay",
         "install-first-durable-handoff",
         "concurrent-mailbox-acceptance",
+        "idle-observation-counts",
     ):
         missing = fixture_result(name, None)
         assert missing["command_status"] == 0
@@ -825,6 +931,32 @@ def selftest() -> None:
     reordered_sequence = json.loads(json.dumps(concurrent))
     reordered_sequence["samples"][0]["callers"][0]["acceptance_sequences"][1] = 1
     rejected("concurrent-mailbox-acceptance", reordered_sequence)
+
+    idle = complete_idle_observation_report()
+    valid_idle = fixture_result("idle-observation-counts", idle)
+    assert valid_idle["status"] == 0
+    assert valid_idle["measurement"] == idle
+    rejected("idle-observation-counts", {})
+
+    changed_idle_window = json.loads(json.dumps(idle))
+    changed_idle_window["workload"]["idle_window_ms"] = 10
+    rejected("idle-observation-counts", changed_idle_window)
+
+    missing_idle_count = json.loads(json.dumps(idle))
+    missing_idle_count["counts"].pop("screen_capture_requests")
+    rejected("idle-observation-counts", missing_idle_count)
+
+    missing_positive_control = json.loads(json.dumps(idle))
+    missing_positive_control.pop("positive_control_counts")
+    rejected("idle-observation-counts", missing_positive_control)
+
+    vacuous_positive_control = json.loads(json.dumps(idle))
+    vacuous_positive_control["positive_control_counts"]["watcher_event_wakes"] = 0
+    rejected("idle-observation-counts", vacuous_positive_control)
+
+    unexpected_idle_work = json.loads(json.dumps(idle))
+    unexpected_idle_work["counts"]["watcher_event_wakes"] = 1
+    rejected("idle-observation-counts", unexpected_idle_work)
 
 
 def main() -> int:

@@ -265,7 +265,7 @@ revision. Push and manual evidence use unique keys and never cancel each other.
 The Ubuntu correctness lane owns formatting, Clippy, parallel-safe tests,
 daemon tests, Rust documentation compilation, documentation paths,
 exact-output parity, and focused relocated-root evidence. The normal nextest
-filter excludes the five performance executables. Those workloads, plus the
+filter excludes the six performance executables. Those workloads, plus the
 staged install-to-first-durable-handoff journey, retain their own metadata and
 history in scheduled and release evidence. The handoff journey never runs in a
 pull-request job.
@@ -290,14 +290,14 @@ warnings into a new blocking policy.
 | Website install, check, and build | Hosted installer parity and website type/build correctness | Stable `website` check runs the same commands only for website-facing inputs |
 | Installer lifecycle on both platforms | Installation, profile restoration, seeded assets, and uninstall | Both stable installer checks run the same lifecycle only for installer-owned inputs; release evidence repeats it with user journeys |
 | Complete Rust gate against tmux HEAD | Upstream tmux adapter compatibility | Pull requests run `cyclops-tmux`, `cyclops-workspace`, and the M0 tmux/daemon/socket journey; the retained `watcher_modes` contract still catches F25; scheduled evidence runs the full fast gate against tmux HEAD |
-| Five performance test binaries inside ordinary nextest, plus staged install-to-first-durable-handoff | Frame, queue, control-write, flood, terminal-restoration, daemon cold-boot/replay, concurrent durable mailbox acceptance, and the installed durable-handoff journey | Scheduled and release runs execute the same binaries and staged journey through `scripts/ci-performance.py` and retain comparable metadata |
+| Six performance test binaries inside ordinary nextest, plus staged install-to-first-durable-handoff | Frame, queue, control-write, flood, terminal-restoration, daemon cold-boot/replay, concurrent durable mailbox acceptance, quiet-pane observation work, and the installed durable-handoff journey | Scheduled and release runs execute the same binaries and staged journey through `scripts/ci-performance.py` and retain comparable metadata |
 | Zero-test doctest execution | Rust documentation compilation | `cargo doc` builds every workspace page; pre-existing warnings remain visible without becoming a new blocking policy |
 
 Path-classifier self-tests simulate unrelated website, installer, daemon,
 platform-client, documentation, domain-only, and workflow changes. They assert
 both selected and not-applicable lanes. The F25 test remains in the focused
 tmux HEAD package, and the performance script has been run locally through all
-six retained workloads with their JSON metadata contracts checked. These are
+seven retained workloads with their JSON metadata contracts checked. These are
 small contract simulations, not mutation infrastructure.
 
 Run the complete normal gate locally with:
@@ -385,6 +385,21 @@ the retained raw samples; they make no universal latency or fairness bound.
 The runner rejects a zero-exit concurrent workload unless its marker identifies
 the exact workload shape and contains every expected sequence, body-free
 snapshot, caller timing, and internally consistent timing/interleaving summary.
+
+The `idle-observation-counts` workload uses two sequential isolated tmux
+fixtures, each with one screen-tier `CAT_MANIFEST` pane running `cat`. The
+first sends one literal line to `cat`. That positive control must raise the
+watcher-event, recompute, and capture counters. A fresh second fixture then
+completes attachment and readiness checks, resets its counters, and observes a
+fixed one-second quiet window with no client request or pane output. The
+retained marker records the positive-control counts and requires zero
+application-level watcher-event wakes, observation-recompute starts, and
+state-observation `capture-pane` requests in the quiet window. The counts
+deliberately exclude daemon boot, fixture attachment, the separate control
+fixture, terminal-delivery and composer-recovery captures, tmux internals, and
+operating-system scheduler wakeups. The window is a bounded measurement period,
+not a retry used to make the fixture pass. A zero-exit test without the exact
+marker, positive control, and final zero counts is failed evidence.
 
 The `install-first-durable-handoff` workload adds one structured measurement
 to that artifact. It uses the public source installer from the checked-out

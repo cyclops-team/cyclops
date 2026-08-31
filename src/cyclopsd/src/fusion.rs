@@ -19,6 +19,7 @@
 //! positive clean-composer reading still refuses writes under rule 12.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -401,6 +402,9 @@ struct LifecycleRecheckTask {
 pub(crate) struct PaneObservationRuntime {
     recompute_gates: StdMutex<HashMap<PaneKey, Arc<tokio::sync::Mutex<()>>>>,
     lifecycle_rechecks: StdMutex<HashMap<PaneKey, LifecycleRecheckTask>>,
+    watcher_event_wakes: AtomicU64,
+    observation_recompute_starts: AtomicU64,
+    screen_capture_requests: AtomicU64,
 }
 
 impl PaneObservationRuntime {
@@ -408,6 +412,41 @@ impl PaneObservationRuntime {
         Self {
             recompute_gates: StdMutex::new(HashMap::new()),
             lifecycle_rechecks: StdMutex::new(HashMap::new()),
+            watcher_event_wakes: AtomicU64::new(0),
+            observation_recompute_starts: AtomicU64::new(0),
+            screen_capture_requests: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one application-level watcher wake. This is intentionally not
+    /// an operating-system scheduler wakeup count.
+    pub(crate) fn note_watcher_event_wake(&self) {
+        self.watcher_event_wakes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one pane observation that has acquired its ordered route gate.
+    fn note_observation_recompute_start(&self) {
+        self.observation_recompute_starts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one state-observation `capture-pane` command before issuing it.
+    fn note_screen_capture_request(&self) {
+        self.screen_capture_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn reset_work_counts(&self) {
+        self.watcher_event_wakes.store(0, Ordering::Relaxed);
+        self.observation_recompute_starts
+            .store(0, Ordering::Relaxed);
+        self.screen_capture_requests.store(0, Ordering::Relaxed);
+    }
+
+    pub(crate) fn work_counts(&self) -> crate::ObservationWorkCounts {
+        crate::ObservationWorkCounts {
+            watcher_event_wakes: self.watcher_event_wakes.load(Ordering::Relaxed),
+            observation_recompute_starts: self.observation_recompute_starts.load(Ordering::Relaxed),
+            screen_capture_requests: self.screen_capture_requests.load(Ordering::Relaxed),
         }
     }
 
@@ -3181,14 +3220,17 @@ pub(crate) fn winner_confirms_idle(winner: Option<&CompiledRule>) -> bool {
 /// human text reads as idle, which is the injection hazard they exist to
 /// prevent. The caller's doubt handling covers both captures.
 async fn capture_screens(
+    runtime: &PaneObservationRuntime,
     watcher: &SessionWatcher,
     m: &Manifest,
     pane_id: &str,
 ) -> Result<(String, Option<String>), TmuxError> {
     if !m.has_escaped_rules() {
+        runtime.note_screen_capture_request();
         let plain = watcher.client().capture_pane(pane_id).await?;
         return Ok((plain, None));
     }
+    runtime.note_screen_capture_request();
     let esc = watcher.client().capture_pane_escaped(pane_id).await?;
     let plain = strip_csi(&esc);
     Ok((plain, Some(esc)))
@@ -3955,6 +3997,9 @@ async fn observe_pane_with_evidence(
     // waiter can never race a newly-created replacement gate.
     let recompute_gate = inner.pane_observation_runtime.recompute_gate(&route);
     let recompute_guard = recompute_gate.lock_owned().await;
+    inner
+        .pane_observation_runtime
+        .note_observation_recompute_start();
     let lifecycle_observation = LifecycleObservation::from_cause(cause);
     let Some(row) = watcher.pane(pane_id) else {
         inner
@@ -4239,7 +4284,7 @@ async fn observe_pane_with_evidence(
         let need_screen = force_screen || manifest_uses_screen_tier(m);
         let mut capture_failed = false;
         let (screen, screen_esc) = if need_screen {
-            match capture_screens(watcher, m, pane_id).await {
+            match capture_screens(&inner.pane_observation_runtime, watcher, m, pane_id).await {
                 Ok((s, esc)) => (Some(s), esc),
                 Err(e) => {
                     // Sensor failure is doubt, not evidence: keep the prior
@@ -10713,6 +10758,28 @@ regex = ['^IDLE']
             "same-pane capture was not serialized"
         );
         assert!(other.try_lock().is_ok(), "unrelated panes shared one gate");
+    }
+
+    #[test]
+    fn observation_work_counts_reset_between_measurement_windows() {
+        let runtime = PaneObservationRuntime::new();
+        runtime.note_watcher_event_wake();
+        runtime.note_observation_recompute_start();
+        runtime.note_screen_capture_request();
+        assert_eq!(
+            runtime.work_counts(),
+            crate::ObservationWorkCounts {
+                watcher_event_wakes: 1,
+                observation_recompute_starts: 1,
+                screen_capture_requests: 1,
+            }
+        );
+
+        runtime.reset_work_counts();
+        assert_eq!(
+            runtime.work_counts(),
+            crate::ObservationWorkCounts::default()
+        );
     }
 
     #[tokio::test]
