@@ -359,7 +359,7 @@ enum SizingCmd {
     /// clear the ownership mark. Safe to run twice, and a window cyclops
     /// never sized is left exactly as it is.
     Release {
-        /// Session to release. Defaults to the one this shell is in.
+        /// Session to release. Defaults to this shell's session only on the default tmux server.
         #[arg(long)]
         session: Option<String>,
     },
@@ -1025,24 +1025,31 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
         // Health must not load a theme through an unchecked state path.
         Cmd::Sizing {
             cmd: SizingCmd::Release { session },
-        } => match session
-            .clone()
-            .or_else(|| cyclops_tmux::current_session(None))
-        {
-            Some(session) => sizing::run_release(
-                &cyclops_proto::cyclops_home(),
-                &session,
-                cli.json,
-                &style_for(cli),
-            ),
-            None => {
-                eprintln!(
-                    "{}",
-                    style_for(cli).bold("not inside tmux: name the session with --session <name>")
-                );
-                2
-            }
-        },
+        } => {
+            let home = cyclops_proto::cyclops_home();
+            let settings = match workspace::Settings::read(&home) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    if cli.json {
+                        println!(
+                            "{}",
+                            json!({"ok": false, "session": session.as_deref(), "error": error})
+                        );
+                    } else {
+                        eprintln!("{}", style_for(cli).bold(&error));
+                    }
+                    return 1;
+                }
+            };
+            let session = match sizing::resolve_session(session.clone(), &settings.server) {
+                Ok(session) => session,
+                Err(error) => {
+                    eprintln!("{}", style_for(cli).bold(&error));
+                    return EXIT_USAGE;
+                }
+            };
+            sizing::run_release(&settings.server, &session, cli.json, &style_for(cli))
+        }
         Cmd::Health => health::run(cli.json),
         Cmd::Data {
             cmd: DataCmd::Inventory,
@@ -1379,6 +1386,13 @@ fn cmd_ui(_cli: &Cli, _args: &UiArgs) -> i32 {
 #[cfg(feature = "full-ui")]
 fn run_stream_ui(cli: &Cli, args: &UiArgs, filters: cyclops_ui::Filter) -> i32 {
     let home = cyclops_proto::cyclops_home();
+    let focus = match workspace::focus_adapter(&home) {
+        Ok(focus) => focus,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
 
     cyclops_ui::run(cyclops_ui::UiOptions {
         plain: cli.plain,
@@ -1387,7 +1401,7 @@ fn run_stream_ui(cli: &Cli, args: &UiArgs, filters: cyclops_ui::Filter) -> i32 {
         from: filters.from,
         to: filters.to,
         backfill: args.backfill,
-        focus: Some(workspace::focus_adapter(&home)),
+        focus: Some(focus),
     })
 }
 
@@ -3584,8 +3598,24 @@ mod tests {
         let target = std::env::var("CYCLOPS_STREAM_FOCUS_CHILD_TARGET")
             .expect("parent supplied focus target");
         workspace::focus_adapter(std::path::Path::new(&home))
+            .expect("valid coordinator config")
             .focus(&target)
             .expect("focus through configured launcher adapter");
+    }
+
+    #[test]
+    #[cfg(feature = "full-ui")]
+    fn stream_focus_refuses_bad_coordinator_config_before_constructing_a_tmux_adapter() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-focus-malformed-config");
+        let _ = std::fs::remove_dir_all(&home);
+        cyclops_state::StateRoot::open_or_create(&home)
+            .expect("create safe home")
+            .replace_file(std::path::Path::new("config.toml"), b"tmux_socket = [")
+            .expect("write malformed config");
+
+        assert!(workspace::focus_adapter(&home).is_err());
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

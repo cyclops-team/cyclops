@@ -953,8 +953,14 @@ pub async fn run_async() -> i32 {
             return 1;
         }
     };
+    let tmux_cfg = match load_tmux_config(&home) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
     let prefs = load_prefs(&home);
-    let tmux_cfg = load_tmux_config(&home);
     let socket_name = tmux_cfg.socket.clone();
     let socket = socket_name.as_deref();
     // No server yet is the same as a server with no sessions: boot one.

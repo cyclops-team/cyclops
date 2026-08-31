@@ -7,6 +7,7 @@
 //! answer.
 
 use std::fs;
+use std::os::unix::fs::{symlink, PermissionsExt as _};
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -39,8 +40,123 @@ fn release(home: &Path, session: &str, json: bool) -> Output {
     cmd.output().expect("run cyclops sizing release")
 }
 
+/// Run the omitted-session form with an ambient tmux recorder. A config safety
+/// failure must return before this fake can observe any tmux invocation.
+fn release_without_session(home: &Path, tmux_bin: &Path, calls: &Path) -> Output {
+    let mut cmd = Command::new(Path::new(env!("CARGO_BIN_EXE_cyclops")));
+    cmd.env("CYCLOPS_HOME", home)
+        .env("CYCLOPS_SIZING_TMUX_CALLS", calls)
+        .env("PATH", tmux_bin)
+        .env("TMUX", "ambient,123,0")
+        .args(["--json", "sizing", "release"]);
+    cmd.output().expect("run cyclops sizing release")
+}
+
+fn fake_tmux(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let bin = root.join("bin");
+    fs::create_dir(&bin).expect("create fake tmux directory");
+    let fake_tmux = bin.join("tmux");
+    fs::write(
+        &fake_tmux,
+        "#!/bin/sh\nprintf 'tmux' >> \"$CYCLOPS_SIZING_TMUX_CALLS\"\nfor arg in \"$@\"; do printf '\\t%s' \"$arg\" >> \"$CYCLOPS_SIZING_TMUX_CALLS\"; done\nprintf '\\n' >> \"$CYCLOPS_SIZING_TMUX_CALLS\"\n",
+    )
+    .expect("write fake tmux recorder");
+    fs::set_permissions(&fake_tmux, fs::Permissions::from_mode(0o700))
+        .expect("make fake tmux executable");
+    (bin, root.join("tmux.calls"))
+}
+
+fn isolated_root(name: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(name)
+        .tempdir_in(cyclops_proto::scratch::scratch_root())
+        .expect("create isolated root")
+}
+
 fn json_of(out: &Output) -> Value {
     serde_json::from_slice(&out.stdout).expect("stdout is one JSON object")
+}
+
+/// A damaged configuration must refuse before the omitted-session fallback can
+/// query the terminal's ambient tmux server. This catches the old order where
+/// `current_session(None)` ran before the config boundary.
+#[test]
+fn malformed_or_linked_config_refuses_before_an_ambient_session_query() {
+    let root = isolated_root("sizing-config-refusal-");
+    let (tmux_bin, calls) = fake_tmux(root.path());
+
+    let malformed_home = root.path().join("malformed-home");
+    fs::create_dir(&malformed_home).expect("create malformed home");
+    fs::write(malformed_home.join("config.toml"), "tmux_socket = [")
+        .expect("write malformed config");
+    let malformed = release_without_session(&malformed_home, &tmux_bin, &calls);
+    assert_eq!(malformed.status.code(), Some(1));
+    let malformed_body = json_of(&malformed);
+    assert_eq!(malformed_body["ok"], Value::Bool(false));
+    assert!(
+        malformed_body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("malformed")),
+        "malformed config was not the reported failure: {malformed_body}"
+    );
+    assert!(
+        !calls.exists(),
+        "malformed config queried ambient tmux: {}",
+        fs::read_to_string(&calls).unwrap_or_default()
+    );
+
+    let linked_home = root.path().join("linked-home");
+    fs::create_dir(&linked_home).expect("create linked home");
+    let target = root.path().join("outside-config.toml");
+    fs::write(&target, "tmux_socket = \"foreign\"\n").expect("write external config");
+    symlink(&target, linked_home.join("config.toml")).expect("link external config");
+    let linked = release_without_session(&linked_home, &tmux_bin, &calls);
+    assert_eq!(linked.status.code(), Some(1));
+    let linked_body = json_of(&linked);
+    assert_eq!(linked_body["ok"], Value::Bool(false));
+    assert!(
+        linked_body["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("could not safely read coordinator config")),
+        "linked config was not the reported failure: {linked_body}"
+    );
+    assert!(
+        !calls.exists(),
+        "linked config queried ambient tmux: {}",
+        fs::read_to_string(&calls).unwrap_or_default()
+    );
+}
+
+/// The shell's session belongs to the ambient server. A named coordinator
+/// server must get an explicit recovery target rather than borrowing that
+/// potentially unrelated session name.
+#[test]
+fn named_server_requires_an_explicit_session_without_querying_ambient_tmux() {
+    let root = isolated_root("sizing-configured-session-");
+    let (tmux_bin, calls) = fake_tmux(root.path());
+    let home = root.path().join("configured-home");
+    fs::create_dir(&home).expect("create configured home");
+    fs::write(home.join("config.toml"), "tmux_socket = \"configured\"\n")
+        .expect("write configured server");
+
+    let output = release_without_session(&home, &tmux_bin, &calls);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "unexpected configured-server refusal:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--session <name>"),
+        "the refusal did not explain how to name the server target: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !calls.exists(),
+        "configured-server refusal queried ambient tmux: {}",
+        fs::read_to_string(&calls).unwrap_or_default()
+    );
 }
 
 /// Nothing to do is a success, and says so.

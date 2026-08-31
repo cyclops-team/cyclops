@@ -122,8 +122,10 @@ work: cyclops sizing released
   2 window(s) put back on their original policy
 ```
 
-It defaults to the session your shell is in. Name another with
-`--session <name>`, and add `--json` for scripts.
+It defaults to the session your shell is in when Cyclops uses that same
+default tmux server. If `tmux_socket` selects a named server, name the target
+with `--session <name>` instead; Cyclops refuses to guess a session across two
+servers. Add `--json` for scripts.
 
 A window Cyclops never sized is left exactly as it is, `manual` included,
 because Cyclops did not put it there.
@@ -172,9 +174,9 @@ Follow those and the session is yours again.
 | Code | Meaning |
 |---|---|
 | `0` | Released. Every window Cyclops sized is back on its original policy |
-| `2` | Not inside tmux and no `--session` given |
+| `2` | Cyclops needs an explicit `--session`: either this shell is not inside tmux, or `tmux_socket` selects a named server |
 | `3` | Refused. Nothing was read or written; the message says why |
-| `1` | tmux itself failed; the error is printed |
+| `1` | Cyclops could not safely read its coordinator config, or tmux itself failed; the error is printed |
 
 ## The options it uses
 
