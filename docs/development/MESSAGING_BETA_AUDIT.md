@@ -289,10 +289,11 @@ as zero. The workflow did not merge, tag, name, or publish anything.
 ## Current acceptance and release boundary
 
 The retained release run is historical evidence for its exact commit, not the
-final whole-product beta gate. Track A now satisfies the corrected acceptance
-criteria. The authorized next action is Track 0: establish the whole-product
-beta charter and execution authority in the repository, then begin the first
-direct user-correctness tracer from that approved queue.
+final whole-product beta gate. Track A continues to satisfy the corrected
+acceptance criteria. The whole-product implementation tracks are now integrated
+on the beta branch; a fresh final audit, exact-candidate release evidence, and
+release-identity reconciliation remain separate gates. See [NEXT.md](NEXT.md)
+for the current queue.
 
 Keep **beta/messaging-rework** as the integration branch. Explicit operator
 approval is still required before merging it into `main`, creating or moving a

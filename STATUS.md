@@ -1,17 +1,19 @@
 # Status
 
-Updated 2026-08-30. Cyclops is pre-release software at workspace version
-`0.1.0`. `main` is the stable line and **beta/messaging-rework** is the active
-beta integration line. The shell/Python implementation remains available as
-the read-only `v1-final` tag.
+Updated 2026-08-31. Cyclops is pre-release software; the Cargo workspace
+currently declares `0.1.0`. `main` is the stable line and
+**beta/messaging-rework** is the active beta integration line. The shell/Python
+implementation remains available as the read-only `v1-final` tag.
 
 Track A, the Messaging Beta Rework, is accepted. `WorkspaceMessaging` now owns
 current durable messaging policy. Retained session-journal discovery and replay
 go through the narrow compatibility-history adapter.
 
-The [Cyclops Beta Charter](docs/development/CYCLOPS_BETA_CHARTER.md) authorizes
-the remaining whole-product beta work. Direct user-correctness slices are next;
-no final version or release name has been assigned.
+The whole-product implementation tracks are integrated. The
+[Cyclops Beta Charter](docs/development/CYCLOPS_BETA_CHARTER.md) now governs
+final acceptance corrections and release evidence. No beta version or release
+name has been assigned: the Cargo version, existing `v0.2.0-beta` tag, and
+absence of GitHub Release objects still require operator-directed reconciliation.
 
 ## Built
 
