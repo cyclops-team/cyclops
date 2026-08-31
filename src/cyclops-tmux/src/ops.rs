@@ -156,13 +156,39 @@ impl ControlClient {
         pane_id: &str,
         direction: SplitDirection,
     ) -> Result<(), TmuxError> {
-        let path = self.display(pane_id, "#{pane_current_path}").await?;
+        self.split_window_target(pane_id, direction).await
+    }
+
+    /// Split a pane only while it still belongs to one exact session/window
+    /// route.
+    ///
+    /// Pane ids remain stable when tmux moves a pane. A bare `%pane` target
+    /// would therefore split it in its new workspace even though the operator
+    /// acted on the old layout. The compound id target makes tmux refuse that
+    /// stale route both when reading cwd and when performing the mutation.
+    pub async fn split_window_at(
+        &self,
+        session_id: &str,
+        window_id: &str,
+        pane_id: &str,
+        direction: SplitDirection,
+    ) -> Result<(), TmuxError> {
+        let target = format!("{session_id}:{window_id}.{pane_id}");
+        self.split_window_target(&target, direction).await
+    }
+
+    async fn split_window_target(
+        &self,
+        target: &str,
+        direction: SplitDirection,
+    ) -> Result<(), TmuxError> {
+        let path = self.display(target, "#{pane_current_path}").await?;
         let path = path.trim();
         let mut cmd = format!("split-window {}", direction.flag());
         if !path.is_empty() {
             cmd.push_str(&format!(" -c {}", quote_arg(path)));
         }
-        cmd.push_str(&format!(" -t {}", quote_arg(pane_id)));
+        cmd.push_str(&format!(" -t {}", quote_arg(target)));
         self.command(&cmd).await.map(|_| ())
     }
 
