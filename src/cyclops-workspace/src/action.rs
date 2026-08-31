@@ -89,6 +89,7 @@ use cyclops_tmux::{PaneDirection, SplitDirection};
 use crate::bindings::BindingAction;
 use crate::dialog::{Dialog, ForceSubmitRow, SettingsSection, ViewRow};
 use crate::drag::DragTarget;
+use crate::focus::{Direction, Intent as FocusIntent};
 use crate::input::mouse::{HitTarget, MenuState};
 use crate::layout::SplitDir;
 use crate::model::{TabModel, WorkspaceRow};
@@ -104,18 +105,12 @@ pub enum Action {
         pane_id: String,
         direction: SplitDirection,
     },
-    /// Focus a specific, already-known pane.
-    FocusPane {
-        pane_id: String,
-    },
-    /// Move focus to whichever pane tmux considers the current pane's
-    /// neighbour in `direction`. Unlike [`Action::FocusPane`] this carries
-    /// no target: tmux resolves the neighbour from live layout at execution
-    /// time, the same way `select-pane -L/-R/-U/-D` always has.
-    FocusDirection(PaneDirection),
+    /// Move focus without exposing keys, hit targets, or tmux command flags
+    /// to the policy that settles it.
+    Focus(FocusIntent),
     /// Swap the focused pane with whichever pane tmux considers its
     /// neighbour in `direction`. Carries no target for the same reason as
-    /// [`Action::FocusDirection`].
+    /// directional focus intent.
     SwapPaneDirection(PaneDirection),
     /// Exchange the positions of two specific panes: the drop half of a
     /// pane drag. tmux swaps the contents; each pane keeps its id and takes
@@ -402,6 +397,19 @@ pub struct RouteContext<'a> {
     pub active_workspace: usize,
 }
 
+fn pane_focus(pane_id: impl Into<String>) -> Action {
+    Action::Focus(FocusIntent::Pane {
+        pane_id: pane_id.into(),
+    })
+}
+
+fn adjacent_focus(from_pane_id: &str, direction: Direction) -> Action {
+    Action::Focus(FocusIntent::Adjacent {
+        from_pane_id: from_pane_id.to_string(),
+        direction,
+    })
+}
+
 /// Route one resolved keyboard action. Used directly for keyboard input,
 /// and by [`route_menu_item`] for the app menu, whose items are themselves
 /// `BindingAction`s.
@@ -420,10 +428,10 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
                 })
         }
         BindingAction::NewTab => Some(Action::NewTab { name: None }),
-        BindingAction::FocusLeft => Some(Action::FocusDirection(PaneDirection::Left)),
-        BindingAction::FocusRight => Some(Action::FocusDirection(PaneDirection::Right)),
-        BindingAction::FocusUp => Some(Action::FocusDirection(PaneDirection::Up)),
-        BindingAction::FocusDown => Some(Action::FocusDirection(PaneDirection::Down)),
+        BindingAction::FocusLeft => Some(adjacent_focus(ctx.active_pane, Direction::Left)),
+        BindingAction::FocusRight => Some(adjacent_focus(ctx.active_pane, Direction::Right)),
+        BindingAction::FocusUp => Some(adjacent_focus(ctx.active_pane, Direction::Up)),
+        BindingAction::FocusDown => Some(adjacent_focus(ctx.active_pane, Direction::Down)),
         // A keyboard swap acts on the focused pane, so it carries no
         // target, exactly like the Shift upgrade of the focus chords.
         // No target to resolve: the recipient is typed into the composer,
@@ -741,9 +749,9 @@ pub fn route_mouse_click(target: &HitTarget, button: MouseButton) -> Option<Acti
         )
         // Left-down on the grip starts a swap drag instead; only the
         // right-click (which never drags) focuses immediately.
-        | (HitTarget::PaneGrip { pane_id }, MouseButton::Right) => Some(Action::FocusPane {
-            pane_id: pane_id.clone(),
-        }),
+        | (HitTarget::PaneGrip { pane_id }, MouseButton::Right) => {
+            Some(pane_focus(pane_id.clone()))
+        }
         (HitTarget::PaneSplitRight { pane_id }, MouseButton::Left) => Some(Action::Split {
             pane_id: pane_id.clone(),
             direction: SplitDirection::Horizontal,
@@ -771,15 +779,15 @@ pub fn route_mouse_click(target: &HitTarget, button: MouseButton) -> Option<Acti
         (HitTarget::MessagesAction(action), MouseButton::Left) => {
             Some(Action::MessagesVerb(*action))
         }
-        (HitTarget::AttentionIndicator { pane_id }, MouseButton::Left) => Some(Action::FocusPane {
-            pane_id: pane_id.clone(),
-        }),
+        (HitTarget::AttentionIndicator { pane_id }, MouseButton::Left) => {
+            Some(pane_focus(pane_id.clone()))
+        }
         // Left-down on a sidebar agent starts a reorder drag instead; only
         // the right-click (which never drags) focuses immediately, matching
         // `handle_mouse` today.
-        (HitTarget::SidebarAgent { pane_id, .. }, MouseButton::Right) => Some(Action::FocusPane {
-            pane_id: pane_id.clone(),
-        }),
+        (HitTarget::SidebarAgent { pane_id, .. }, MouseButton::Right) => {
+            Some(pane_focus(pane_id.clone()))
+        }
         _ => None,
     }
 }
@@ -814,27 +822,21 @@ pub fn route_mouse_scroll(
 /// value the drag already carries (never a re-derived index).
 pub fn route_drag_click(target: &DragTarget) -> Option<Action> {
     match target {
-        DragTarget::Pane { pane_id } => Some(Action::FocusPane {
-            pane_id: pane_id.clone(),
-        }),
+        DragTarget::Pane { pane_id } => Some(pane_focus(pane_id.clone())),
         DragTarget::Tab { window_id } => Some(Action::SelectTab {
             window_id: window_id.clone(),
         }),
         DragTarget::Workspace { session, .. } => Some(Action::SelectWorkspace {
             session: session.clone(),
         }),
-        DragTarget::Agent { pane_id, .. } => Some(Action::FocusPane {
-            pane_id: pane_id.clone(),
-        }),
+        DragTarget::Agent { pane_id, .. } => Some(pane_focus(pane_id.clone())),
         // A seam grabbed through a pane's own top border focuses that pane
         // when the press never became a drag: the title strip painted there
         // is a focus control, and pressing it must still do what pressing
         // it always did. A seam grabbed in the bare gutter carries no pane
         // and stays a no-op, as does a title bar: neither has anything to
         // select.
-        DragTarget::Divider { focus_on_click, .. } => focus_on_click
-            .clone()
-            .map(|pane_id| Action::FocusPane { pane_id }),
+        DragTarget::Divider { focus_on_click, .. } => focus_on_click.clone().map(pane_focus),
         DragTarget::Sidebar
         | DragTarget::Messages
         | DragTarget::SidebarSplit
@@ -1372,12 +1374,32 @@ mod tests {
             MouseButton::Right,
         );
 
-        let expected = Some(Action::FocusPane {
-            pane_id: "%5".into(),
-        });
+        let expected = Some(pane_focus("%5"));
         assert_eq!(from_pane_body, expected);
         assert_eq!(from_attention, expected);
         assert_eq!(from_agent_right_click, expected);
+    }
+
+    #[test]
+    fn directional_focus_keys_capture_the_pane_that_was_current_when_routed() {
+        let tabs = [tab("@1")];
+        let workspaces = [workspace("$1", "main")];
+        let c = ctx(&tabs, 0, "%7", "main", &workspaces, 0);
+
+        for (binding, direction) in [
+            (BindingAction::FocusLeft, Direction::Left),
+            (BindingAction::FocusRight, Direction::Right),
+            (BindingAction::FocusUp, Direction::Up),
+            (BindingAction::FocusDown, Direction::Down),
+        ] {
+            assert_eq!(
+                route_binding(binding, &c),
+                Some(Action::Focus(FocusIntent::Adjacent {
+                    from_pane_id: "%7".into(),
+                    direction,
+                }))
+            );
+        }
     }
 
     #[test]
@@ -1944,9 +1966,7 @@ mod tests {
         let grip = HitTarget::PaneGrip {
             pane_id: "%5".into(),
         };
-        let expected = Some(Action::FocusPane {
-            pane_id: "%5".into(),
-        });
+        let expected = Some(pane_focus("%5"));
         assert_eq!(route_mouse_click(&frame, MouseButton::Left), expected);
         assert_eq!(route_mouse_click(&frame, MouseButton::Right), expected);
         assert_eq!(route_mouse_click(&grip, MouseButton::Right), expected);
@@ -2050,9 +2070,7 @@ mod tests {
             route_drag_click(&DragTarget::Pane {
                 pane_id: "%1".into()
             }),
-            Some(Action::FocusPane {
-                pane_id: "%1".into()
-            })
+            Some(pane_focus("%1"))
         );
         assert_eq!(
             route_drag_click(&DragTarget::Tab {
@@ -2077,9 +2095,7 @@ mod tests {
                 pane_id: "%1".into(),
                 order_key: "pane:%1".into(),
             }),
-            Some(Action::FocusPane {
-                pane_id: "%1".into()
-            })
+            Some(pane_focus("%1"))
         );
         // A seam grabbed in the bare gutter: nothing was pressed, so a
         // release that never moved has nothing to focus.
@@ -2100,9 +2116,7 @@ mod tests {
                 dir: SplitDir::Vertical,
                 focus_on_click: Some("%2".into()),
             }),
-            Some(Action::FocusPane {
-                pane_id: "%2".into()
-            })
+            Some(pane_focus("%2"))
         );
         assert_eq!(route_drag_click(&DragTarget::Sidebar), None);
         assert_eq!(route_drag_click(&DragTarget::Dialog), None);

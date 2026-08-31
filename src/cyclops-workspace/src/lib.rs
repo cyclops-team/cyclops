@@ -12,6 +12,7 @@ mod dialog;
 mod drag;
 pub mod event_record;
 mod files;
+mod focus;
 mod input;
 mod layout;
 mod model;

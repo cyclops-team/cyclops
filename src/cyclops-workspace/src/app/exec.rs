@@ -37,6 +37,7 @@ use crate::dialog::{
     Composed, Dialog, ForceSubmitPicker, SettingsSection, SoundPicker, SoundRow, ThemePicker,
     ViewSwitches,
 };
+use crate::focus::{Decision as FocusDecision, Direction as FocusDirection, Effect as FocusEffect};
 use crate::naming;
 use crate::persist::SidebarTab;
 
@@ -76,11 +77,7 @@ pub(super) async fn execute(
             client.split_window(&pane_id, direction).await?;
             Ok(Outcome::reconcile())
         }
-        Action::FocusPane { pane_id } => focus_pane(app, client, &pane_id).await,
-        Action::FocusDirection(direction) => {
-            client.select_pane_toward(direction).await?;
-            Ok(Outcome::reconcile())
-        }
+        Action::Focus(intent) => execute_focus(app, client, intent).await,
         Action::SwapPaneDirection(direction) => {
             // At an edge with no neighbour tmux answers with an error,
             // which the caller logs like any other failed command.
@@ -882,96 +879,94 @@ async fn scroll_pane(
     Ok(Outcome::default())
 }
 
-/// Focus a pane. Sidebar agent rows span every workspace, not just the
-/// active one, so this tries the active session first (cheap: no session
-/// switch) and only falls back to the cross-workspace path when the pane
-/// genuinely isn't on screen.
-async fn focus_pane(
+/// Decide and perform one focus intent. The decision is pure, the adapter owns
+/// every host transition, and only the next tmux event or snapshot may change
+/// the model. Even a failed multi-step route asks for reconciliation because a
+/// prefix of it may have landed.
+async fn execute_focus(
     app: &mut App,
     client: &ControlClient,
-    pane_id: &str,
+    intent: crate::focus::Intent,
 ) -> Result<Outcome, TmuxError> {
-    let target = app
-        .model
-        .session
-        .tabs
-        .iter()
-        .position(|tab| crate::layout::layout_contains_pane(&tab.layout, pane_id));
-    match target {
-        Some(index) => focus_pane_in_session(app, client, pane_id, index).await,
-        None => focus_pane_in_background_workspace(app, client, pane_id).await,
-    }
-}
-
-/// `pane_id` is on tab `index` of the active session. Select it, switching
-/// tabs first if needed, and hydrate synchronously on the input path the
-/// same way this has always worked. L1 made `hydrate_visible_tab` itself
-/// faster (every stale pane hydrates concurrently instead of serially)
-/// rather than moving it off this path: deferring it to the render deadline
-/// would be the background-effect system the recommendation says to add
-/// only after measurement shows this path is still slow, not speculatively.
-async fn focus_pane_in_session(
-    app: &mut App,
-    client: &ControlClient,
-    pane_id: &str,
-    index: usize,
-) -> Result<Outcome, TmuxError> {
-    // A click resolves against the frame it was aimed at, and a window can
-    // close between that frame and this handler. A stale index is a spent
-    // click, not a request.
-    if index >= app.model.session.tabs.len() {
-        return Ok(Outcome::default());
-    }
-    let prior_tab = app.model.session.active_tab;
-    let prior_pane = app.model.active_tab().active_pane.clone();
-    if index == prior_tab && prior_pane == pane_id {
-        // Already focused: nothing to tell tmux.
-        return Ok(Outcome::default());
-    }
-    if index != prior_tab {
-        client
-            .select_window(&app.model.session.tabs[index].window_id)
-            .await?;
-    }
-    client.select_pane(pane_id).await?;
-    app.model.session.active_tab = index;
-    let zoomed = app.model.session.tabs[index].zoomed;
-    app.model.session.tabs[index].active_pane = pane_id.to_string();
-    if index != prior_tab || (zoomed && prior_pane != pane_id) {
-        super::resize_client(app, client).await;
-        crate::sync::hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await;
-        app.needs_hydrate = false;
-        app.persist_active();
-    }
-    Ok(Outcome::default())
-}
-
-/// `pane_id` is not on the active session — it's a sidebar agent row in a
-/// background workspace. Switch to that workspace and select the pane's
-/// window; reconciliation replaces the local model with tmux's own answer.
-async fn focus_pane_in_background_workspace(
-    app: &mut App,
-    client: &ControlClient,
-    pane_id: &str,
-) -> Result<Outcome, TmuxError> {
-    let Some(window_id) = app.decoration.pane(pane_id).map(|d| d.window_id.clone()) else {
-        // Decoration doesn't know this pane — a stale hit, or a reconcile
-        // that hasn't caught up yet. Ask for a fresh model rather than guess.
-        return Ok(Outcome::reconcile());
+    let decision = crate::focus::decide(
+        intent,
+        &app.model,
+        &app.decoration,
+        app.link_state,
+        !app.needs_reconcile,
+    );
+    let effect = match decision {
+        FocusDecision::NoOp => return Ok(Outcome::default()),
+        FocusDecision::Refresh => return Ok(Outcome::reconcile()),
+        FocusDecision::Refused(crate::focus::Refusal::Reconnecting) => {
+            app.notice.show(
+                crate::copy::FOCUS_CONTROL_RECONNECTING,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::default());
+        }
+        FocusDecision::Refused(crate::focus::Refusal::ServerGone) => {
+            app.notice.show(
+                crate::copy::FOCUS_CONTROL_DISCONNECTED,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::default());
+        }
+        FocusDecision::Refused(crate::focus::Refusal::Refreshing) => {
+            app.notice.show(
+                crate::copy::FOCUS_STATE_REFRESHING,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::reconcile());
+        }
+        FocusDecision::Run(effect) => effect,
     };
-    let Some(session) = app
-        .model
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.window_ids.iter().any(|id| id == &window_id))
-        .map(|workspace| workspace.name.clone())
-    else {
-        return Ok(Outcome::reconcile());
+
+    let pane_id = focus_effect_pane(&effect).to_string();
+    let result = match effect {
+        FocusEffect::Pane(route) => client.select_pane(&route.pane_id).await,
+        FocusEffect::WindowPane(route) => {
+            client
+                .focus_window_pane(&route.window_id, &route.pane_id)
+                .await
+        }
+        FocusEffect::SessionWindowPane(route) => {
+            client
+                .focus_session_window_pane(&route.session_id, &route.window_id, &route.pane_id)
+                .await
+        }
+        FocusEffect::Adjacent { from, direction } => {
+            client
+                .select_pane_toward_from(&from.pane_id, tmux_focus_direction(direction))
+                .await
+        }
     };
-    client.switch_to_session(&session).await?;
-    client.select_window(&window_id).await?;
-    client.select_pane(pane_id).await?;
+    if let Err(error) = result {
+        super::log_err(&app.home, &error);
+        app.notice.show(
+            crate::copy::focus_unconfirmed(&pane_id, &error),
+            tokio::time::Instant::now(),
+        );
+    }
     Ok(Outcome::reconcile())
+}
+
+fn focus_effect_pane(effect: &FocusEffect) -> &str {
+    match effect {
+        FocusEffect::Pane(route)
+        | FocusEffect::WindowPane(route)
+        | FocusEffect::SessionWindowPane(route) => &route.pane_id,
+        FocusEffect::Adjacent { from, .. } => &from.pane_id,
+    }
+}
+
+fn tmux_focus_direction(direction: FocusDirection) -> cyclops_tmux::PaneDirection {
+    match direction {
+        FocusDirection::Left => cyclops_tmux::PaneDirection::Left,
+        FocusDirection::Right => cyclops_tmux::PaneDirection::Right,
+        FocusDirection::Up => cyclops_tmux::PaneDirection::Up,
+        FocusDirection::Down => cyclops_tmux::PaneDirection::Down,
+    }
 }
 
 /// Close one pane: straight away when it hosts no agent, else via a confirm
@@ -2072,6 +2067,200 @@ mod tests {
         );
         assert_eq!(pane_ids(&server, "s").len(), 2, "tmux actually split");
         client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_focus_route_is_visible_and_never_mutates_the_model_optimistically() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-focus-failure");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        server.run_ok(&["split-window", "-h", "-t", "s"]);
+        let client = rig_client(&server, "s").await;
+        let model = crate::sync::fetch_workspace_model(&client, "s")
+            .await
+            .expect("initial authoritative model");
+        let original = model.active_tab().active_pane.clone();
+        let target = pane_ids(&server, "s")
+            .into_iter()
+            .find(|pane| pane != &original)
+            .expect("other pane");
+        let home = scratch_home("exec-focus-failure-home");
+        let mut app = test_app(model, home.clone());
+
+        server.run_ok(&["kill-pane", "-t", &target]);
+        let outcome = execute(
+            &mut app,
+            &client,
+            Action::Focus(crate::focus::Intent::Pane {
+                pane_id: target.clone(),
+            }),
+        )
+        .await
+        .expect("focus failure is an honest settled outcome");
+
+        assert!(
+            outcome.reconcile,
+            "a partial route may have changed host state"
+        );
+        assert_eq!(
+            app.model.active_tab().active_pane,
+            original,
+            "focus must wait for an authoritative event or snapshot"
+        );
+        let notice = app.notice.text().expect("focus failure is visible");
+        assert!(
+            notice.contains(&format!("focus not confirmed for {target}")),
+            "{notice}"
+        );
+        assert!(notice.contains("refreshing workspace state"), "{notice}");
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn a_second_focus_waits_for_reconcile_instead_of_using_the_stale_model() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-focus-reconcile-gate");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        server.run_ok(&["split-window", "-h", "-t", "s"]);
+        server.run_ok(&["split-window", "-h", "-t", "s"]);
+        let panes = pane_ids(&server, "s");
+        let (original, first_target, second_target) = (&panes[0], &panes[1], &panes[2]);
+        server.run_ok(&["select-pane", "-t", original]);
+        let client = rig_client(&server, "s").await;
+        let model = crate::sync::fetch_workspace_model(&client, "s")
+            .await
+            .expect("initial authoritative model");
+        let home = scratch_home("exec-focus-reconcile-gate-home");
+        let mut app = test_app(model, home.clone());
+
+        let first = execute(
+            &mut app,
+            &client,
+            Action::Focus(crate::focus::Intent::Pane {
+                pane_id: first_target.clone(),
+            }),
+        )
+        .await
+        .expect("first focus route");
+        assert!(first.reconcile);
+        assert_eq!(active_pane_id(&server, "s"), *first_target);
+        app.needs_reconcile = first.reconcile;
+
+        let second = execute(
+            &mut app,
+            &client,
+            Action::Focus(crate::focus::Intent::Pane {
+                pane_id: second_target.clone(),
+            }),
+        )
+        .await
+        .expect("stale second focus is a settled refusal");
+
+        assert!(second.reconcile);
+        assert_eq!(
+            active_pane_id(&server, "s"),
+            *first_target,
+            "the second effect ran before authoritative focus settled"
+        );
+        assert_eq!(
+            app.model.active_tab().active_pane,
+            *original,
+            "neither effect may settle the local model optimistically"
+        );
+        assert_eq!(app.notice.text(), Some(crate::copy::FOCUS_STATE_REFRESHING));
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn focus_waits_through_reconnect_then_settles_from_the_replacement_clients_snapshot() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-focus-reconnect");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        server.run_ok(&["split-window", "-h", "-t", "s"]);
+        let first = rig_client(&server, "s").await;
+        let model = crate::sync::fetch_workspace_model(&first, "s")
+            .await
+            .expect("initial authoritative model");
+        let original = model.active_tab().active_pane.clone();
+        let target = pane_ids(&server, "s")
+            .into_iter()
+            .find(|pane| pane != &original)
+            .expect("other pane");
+        let home = scratch_home("exec-focus-reconnect-home");
+        let mut app = test_app(model, home.clone());
+        let intent = crate::focus::Intent::Pane {
+            pane_id: target.clone(),
+        };
+
+        app.link_state = LinkState::Reconnecting { attempt: 1 };
+        let held = execute(&mut app, &first, Action::Focus(intent.clone()))
+            .await
+            .expect("reconnecting focus is refused without IO");
+        assert!(!held.reconcile);
+        assert_eq!(app.model.active_tab().active_pane, original);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::FOCUS_CONTROL_RECONNECTING)
+        );
+
+        app.link_state = LinkState::ServerGone;
+        let stopped = execute(&mut app, &first, Action::Focus(intent.clone()))
+            .await
+            .expect("disconnected focus is refused without IO");
+        assert!(!stopped.reconcile);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::FOCUS_CONTROL_DISCONNECTED)
+        );
+        first.shutdown().await;
+
+        let replacement = rig_client(&server, "s").await;
+        app.link_state = LinkState::Live;
+        let sent = execute(&mut app, &replacement, Action::Focus(intent))
+            .await
+            .expect("replacement client performs the exact route");
+        assert!(sent.reconcile);
+        assert_eq!(
+            app.model.active_tab().active_pane,
+            original,
+            "adapter success still does not settle local focus"
+        );
+
+        crate::app::reconcile(&mut app, &replacement)
+            .await
+            .expect("replacement snapshot");
+        assert_eq!(app.model.active_tab().active_pane, target);
+
+        replacement.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn focus_execution_uses_no_legacy_helpers_or_optimistic_assignment() {
+        let source = include_str!("exec.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        for forbidden in [
+            "async fn focus_pane(",
+            "async fn focus_pane_in_session(",
+            "async fn focus_pane_in_background_workspace(",
+            "active_pane = pane_id.to_string()",
+            "select_pane_toward(direction)",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "focus caller recovered deleted transition knowledge through {forbidden}"
+            );
+        }
     }
 
     // -- Pane swap: ids exchange slots while the layout shape stays put. --

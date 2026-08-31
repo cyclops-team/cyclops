@@ -12668,7 +12668,8 @@ mod tests {
             ),
             other => panic!("a frame cell must never pick a pane up, got {other:?}"),
         }
-        // Released without moving: the seam stays put and the pane focuses.
+        // Released without moving: the seam stays put. This pane was already
+        // focused, so pure focus policy spends the click without host IO.
         handle_mouse(
             &mut app,
             &client,
@@ -12679,6 +12680,7 @@ mod tests {
         .expect("up");
         assert!(app.drag.is_none());
         assert_eq!(app.model.active_tab().active_pane, bottom);
+        assert!(!app.needs_reconcile);
 
         // The top pane's own top border has no pane above it, so there is
         // no seam there and the press is a plain focus click.
@@ -12691,9 +12693,14 @@ mod tests {
         .await
         .expect("down");
         assert!(app.drag.is_none());
-        assert_eq!(app.model.active_tab().active_pane, top);
+        assert_eq!(app.model.active_tab().active_pane, bottom);
+        assert!(app.needs_reconcile);
         let active = server.run(&["display-message", "-p", "-t", "s", "#{pane_id}"]);
         assert_eq!(String::from_utf8_lossy(&active.stdout).trim(), top);
+        reconcile(&mut app, &client)
+            .await
+            .expect("settle top focus from tmux");
+        assert_eq!(app.model.active_tab().active_pane, top);
         client.shutdown().await;
     }
 
