@@ -1338,7 +1338,14 @@ async fn execute_close_workspace(
         CloseDecision::Run(effect) => effect,
     };
 
-    if let Err(error) = perform_close_workspace(client, &effect).await {
+    let attempt = perform_close_workspace(client, &effect).await;
+    if let Some(session_id) = attempt.confirmed_current_session_id.as_deref() {
+        // Preserve the adapter's stable fact all the way through the fresh
+        // snapshot. Converting it back to the model's cached name here would
+        // reintroduce a rename race before reconciliation begins.
+        app.reconcile_session_id = Some(session_id.to_string());
+    }
+    if let Err(error) = attempt.close_result {
         super::log_err(&app.home, &error.to_string());
         app.notice.show(
             crate::copy::workspace_close_unconfirmed(&effect.target.name, &error),
@@ -1367,7 +1374,7 @@ async fn execute_close_workspace(
 async fn perform_close_workspace(
     client: &ControlClient,
     effect: &CloseEffect,
-) -> Result<(), TmuxError> {
+) -> cyclops_tmux::CloseSessionAttempt {
     client
         .close_session_at(
             &effect.target.session_id,
@@ -1850,6 +1857,7 @@ mod tests {
             declared_client_size: None,
             sizing: crate::app::WindowSizing::default(),
             needs_reconcile: false,
+            reconcile_session_id: None,
             needs_hydrate: false,
             paste_seq: 0,
             home,
@@ -3185,6 +3193,7 @@ mod tests {
         let mut app = test_app(model, home.clone());
         app.prefs.workspace_order = vec!["target".into(), "fallback".into()];
         app.prefs.folder_tracked = vec![target_id.clone(), fallback_id.clone()];
+        server.run_ok(&["rename-session", "-t", &fallback_id, "renamed-fallback"]);
 
         let outcome = execute(
             &mut app,
@@ -3205,7 +3214,15 @@ mod tests {
                 .any(|workspace| workspace.session_id == target_id),
             "only reconciliation may remove the closed workspace locally"
         );
-        assert_eq!(app.model.session.session, "target");
+        assert_eq!(
+            app.model.session.session, "target",
+            "no cached name is installed before the authoritative snapshot"
+        );
+        assert_eq!(
+            app.reconcile_session_id.as_deref(),
+            Some(fallback_id.as_str()),
+            "the confirmed fallback id must survive until reconciliation"
+        );
         assert_eq!(
             app.prefs.workspace_order,
             vec!["target".to_string(), "fallback".to_string()],
@@ -3217,14 +3234,34 @@ mod tests {
         assert!(!sessions.lines().any(|id| id == target_id));
         assert!(sessions.lines().any(|id| id == fallback_id));
         let attached = server.run(&["list-clients", "-F", "#{client_session}"]);
-        assert_eq!(String::from_utf8_lossy(&attached.stdout).trim(), "fallback");
+        assert_eq!(
+            String::from_utf8_lossy(&attached.stdout).trim(),
+            "renamed-fallback"
+        );
 
-        app.needs_reconcile = outcome.reconcile;
+        app.needs_reconcile = false;
+        crate::app::reconcile(&mut app, &client)
+            .await
+            .expect("authoritative close settlement");
+        assert_eq!(app.model.session.session, "renamed-fallback");
+        assert_eq!(app.reconcile_session_id, None);
+        assert!(
+            !app.model
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.session_id == target_id),
+            "the authoritative snapshot removes the closed identity"
+        );
+        assert_eq!(
+            app.model.workspaces[app.model.active_workspace].session_id,
+            fallback_id
+        );
+
         let second = execute(
             &mut app,
             &client,
             Action::CloseWorkspace(crate::workspace_close::Intent {
-                session_id: target_id,
+                session_id: target_id.clone(),
             }),
         )
         .await
@@ -3232,7 +3269,7 @@ mod tests {
         assert!(second.reconcile);
         assert_eq!(
             app.notice.text(),
-            Some(crate::copy::WORKSPACE_CLOSE_STATE_REFRESHING)
+            Some(crate::copy::WORKSPACE_CLOSE_ROUTE_STALE)
         );
         let sessions = server.run(&["list-sessions", "-F", "#{session_id}"]);
         assert!(
@@ -3254,7 +3291,12 @@ mod tests {
         let server = TmuxServer::new("exec-close-workspace-failure");
         server.run_ok(&["new-session", "-d", "-s", "target", "/bin/sh"]);
         server.run_ok(&["new-session", "-d", "-s", "fallback", "/bin/sh"]);
-        let client = rig_client(&server, "target").await;
+        // Keep the control connection on the surviving session while the
+        // application snapshot still represents target as active. This is
+        // the state after another client wins the close race, and lets the
+        // adapter confirm its fallback command before its target command
+        // reports the stale identity.
+        let client = rig_client(&server, "fallback").await;
         let model = crate::sync::fetch_workspace_model(&client, "target")
             .await
             .expect("initial authoritative model");
@@ -3279,7 +3321,10 @@ mod tests {
         app.dialog = Some(Dialog::ConfirmCloseWorkspace {
             session_id: target_id.clone(),
         });
-        server.run_ok(&["kill-session", "-t", &fallback_id]);
+        // Simulate the target disappearing after confirmation. The adapter's
+        // fallback switch still lands, then its close command reports that
+        // the target is already gone.
+        server.run_ok(&["kill-session", "-t", &target_id]);
 
         let outcome = execute(
             &mut app,
@@ -3300,18 +3345,42 @@ mod tests {
         );
         assert_eq!(
             app.prefs.folder_tracked,
-            vec![target_id.clone(), fallback_id]
+            vec![target_id.clone(), fallback_id.clone()]
         );
         let notice = app.notice.text().expect("failure is visible");
         assert!(notice.contains("close not confirmed for workspace target"));
         assert!(notice.contains("refreshing workspace state"));
+        assert_eq!(
+            app.model.session.session, "target",
+            "partial failure leaves the cached presentation model untouched"
+        );
+        assert_eq!(
+            app.reconcile_session_id.as_deref(),
+            Some(fallback_id.as_str()),
+            "a landed switch still supplies the exact repair target"
+        );
+        let attached = server.run(&["list-clients", "-F", "#{client_session}"]);
+        assert_eq!(String::from_utf8_lossy(&attached.stdout).trim(), "fallback");
         let sessions = server.run(&["list-sessions", "-F", "#{session_id}"]);
         assert!(
-            String::from_utf8_lossy(&sessions.stdout)
+            !String::from_utf8_lossy(&sessions.stdout)
                 .lines()
                 .any(|id| id == target_id),
-            "fallback failure must not proceed to target close"
+            "the simulated race removes the target before the adapter close"
         );
+        assert!(String::from_utf8_lossy(&sessions.stdout)
+            .lines()
+            .any(|id| id == fallback_id));
+
+        app.needs_reconcile = false;
+        crate::app::reconcile(&mut app, &client)
+            .await
+            .expect("authoritative partial-failure settlement");
+        assert_eq!(app.model.session.session, "fallback");
+        assert_eq!(app.reconcile_session_id, None);
+        assert_eq!(app.model.workspaces.len(), 1);
+        assert_eq!(app.model.workspaces[0].session_id, fallback_id);
+        assert_eq!(app.prefs.folder_tracked, vec![target_id, fallback_id]);
 
         client.shutdown().await;
         let _ = std::fs::remove_dir_all(home);

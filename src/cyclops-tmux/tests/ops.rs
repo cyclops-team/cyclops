@@ -938,6 +938,7 @@ async fn close_session_uses_the_confirmed_id_after_rename_and_name_reuse() {
     client
         .close_session_at(&target_id, None)
         .await
+        .close_result
         .expect("close the confirmed identity");
 
     let sessions = lines(
@@ -953,6 +954,12 @@ async fn close_session_uses_the_confirmed_id_after_rename_and_name_reuse() {
             .iter()
             .any(|row| row == &format!("{reused_id} target")),
         "the new session that reused the old name was closed: {sessions:?}"
+    );
+    let attached = lines(&srv, &["list-clients", "-F", "#{client_session}"]);
+    assert_eq!(
+        attached,
+        vec!["host"],
+        "closing a background session must not move the attached client"
     );
     client.shutdown().await;
 }
@@ -970,10 +977,14 @@ async fn close_active_session_selects_the_exact_fallback_before_killing() {
         .await
         .expect("spawn");
 
-    client
+    let attempt = client
         .close_session_at(&target_id, Some(&fallback_id))
-        .await
-        .expect("switch and close");
+        .await;
+    assert_eq!(
+        attempt.confirmed_current_session_id.as_deref(),
+        Some(fallback_id.as_str())
+    );
+    attempt.close_result.expect("switch and close");
 
     let attached = lines(&srv, &["list-clients", "-F", "#{client_session}"]);
     assert_eq!(attached, vec!["fallback"]);
@@ -997,9 +1008,12 @@ async fn missing_fallback_refuses_before_the_target_is_closed() {
         .expect("spawn");
     srv.tmux_ok(&["kill-session", "-t", &fallback_id]);
 
-    let error = client
+    let attempt = client
         .close_session_at(&target_id, Some(&fallback_id))
-        .await
+        .await;
+    assert_eq!(attempt.confirmed_current_session_id, None);
+    let error = attempt
+        .close_result
         .expect_err("the exact fallback is gone");
 
     assert!(matches!(error, TmuxError::Command(_)), "{error}");

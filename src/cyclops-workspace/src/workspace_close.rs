@@ -78,15 +78,15 @@ pub fn decide(
         return Decision::Refresh;
     };
 
-    let fallback_session_id = (target.session_id == active.session_id)
-        .then(|| {
-            model
-                .workspaces
-                .iter()
-                .find(|workspace| workspace.session_id != target.session_id)
-                .map(|workspace| workspace.session_id.clone())
-        })
-        .flatten();
+    let fallback_session_id = if target.session_id == active.session_id {
+        model
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.session_id != target.session_id)
+            .map(|workspace| workspace.session_id.clone())
+    } else {
+        None
+    };
 
     Decision::Run(Effect {
         target: Route {

@@ -46,6 +46,18 @@ pub enum PaneDirection {
     Down,
 }
 
+/// What tmux confirmed while attempting to close one session.
+///
+/// A fallback switch and the later close are separate commands. The switch
+/// can land even when the close fails, so callers need both facts: the exact
+/// session now selected for this client, when one was confirmed, and the
+/// result of the destructive command.
+#[derive(Debug)]
+pub struct CloseSessionAttempt {
+    pub confirmed_current_session_id: Option<String>,
+    pub close_result: Result<(), TmuxError>,
+}
+
 impl PaneDirection {
     fn flag(self) -> &'static str {
         match self {
@@ -454,23 +466,38 @@ impl ControlClient {
     /// product chooses where its control client lands before destruction. A
     /// returned error is not a claim that nothing happened: fallback selection
     /// may already have landed before the close failed, and a failed close
-    /// reply may itself be uncertain. Callers must reconcile host state after
-    /// every attempted operation.
+    /// reply may itself be uncertain. The returned attempt preserves a
+    /// successful fallback selection even when the close reports an error;
+    /// callers must reconcile host state after every attempted operation.
     pub async fn close_session_at(
         &self,
         target_session_id: &str,
         fallback_session_id: Option<&str>,
-    ) -> Result<(), TmuxError> {
+    ) -> CloseSessionAttempt {
+        let mut confirmed_current_session_id = None;
         if let Some(fallback_session_id) = fallback_session_id {
-            self.command(&format!(
-                "switch-client -t {}",
-                quote_arg(fallback_session_id)
-            ))
-            .await?;
+            if let Err(error) = self
+                .command(&format!(
+                    "switch-client -t {}",
+                    quote_arg(fallback_session_id)
+                ))
+                .await
+            {
+                return CloseSessionAttempt {
+                    confirmed_current_session_id,
+                    close_result: Err(error),
+                };
+            }
+            confirmed_current_session_id = Some(fallback_session_id.to_string());
         }
-        self.command(&format!("kill-session -t {}", quote_arg(target_session_id)))
+        let close_result = self
+            .command(&format!("kill-session -t {}", quote_arg(target_session_id)))
             .await
-            .map(|_| ())
+            .map(|_| ());
+        CloseSessionAttempt {
+            confirmed_current_session_id,
+            close_result,
+        }
     }
 }
 

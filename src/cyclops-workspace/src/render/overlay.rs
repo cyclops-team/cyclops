@@ -1493,7 +1493,7 @@ mod tests {
         );
         let items = menu_items(
             &MenuState::WorkspaceMenu {
-                session: "cyclops".into(),
+                session_id: "$1".into(),
                 at: (0, 0),
             },
             MenuChecks::default(),

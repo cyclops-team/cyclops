@@ -515,10 +515,10 @@ pub fn route_binding_shifted(action: BindingAction, ctx: &RouteContext) -> Optio
 }
 
 /// Route one menu item, given the menu state that opened it. `ContextMenu`,
-/// `TabMenu`, and `WorkspaceMenu` carry the pane/window/session the menu was
-/// opened on — the item resolves against THAT target, never whichever one
-/// happens to be active, so a right-click on a background tab still renames
-/// the tab that was clicked. `AppMenu` items are plain `BindingAction`s, so
+/// `TabMenu`, and `WorkspaceMenu` carry the pane/window/session identity the
+/// menu was opened on. The item resolves against THAT target, never whichever
+/// one happens to be active, so a right-click on a background tab still
+/// renames the tab that was clicked. `AppMenu` items are plain `BindingAction`s, so
 /// they resolve through [`route_binding`] exactly like the matching key
 /// would, except the `NewTab` item: every menu (unlike the keyboard) opens
 /// the naming dialog rather than creating a tab immediately — see the
@@ -589,24 +589,23 @@ pub fn route_menu_item(
             .then(|| Action::RequestRenameTab {
                 window_id: window_id.clone(),
             }),
-        (MenuState::TabMenu { window_id, .. }, BindingAction::CloseTab) => ctx
-            .tabs
-            .iter()
-            .any(|tab| &tab.window_id == window_id)
-            .then(|| active_workspace(ctx))
-            .flatten()
-            .map(|workspace| resolve_close_tab(window_id, ctx.tabs, workspace)),
-        (MenuState::WorkspaceMenu { session, .. }, BindingAction::RenameWorkspace) => ctx
+        (MenuState::TabMenu { window_id, .. }, BindingAction::CloseTab) => {
+            if !ctx.tabs.iter().any(|tab| &tab.window_id == window_id) {
+                return None;
+            }
+            active_workspace(ctx).map(|workspace| resolve_close_tab(window_id, ctx.tabs, workspace))
+        }
+        (MenuState::WorkspaceMenu { session_id, .. }, BindingAction::RenameWorkspace) => ctx
             .workspaces
             .iter()
-            .any(|workspace| &workspace.name == session)
-            .then(|| Action::RequestRenameWorkspace {
-                session: session.clone(),
+            .find(|workspace| &workspace.session_id == session_id)
+            .map(|workspace| Action::RequestRenameWorkspace {
+                session: workspace.name.clone(),
             }),
-        (MenuState::WorkspaceMenu { session, .. }, BindingAction::CloseWorkspace) => ctx
+        (MenuState::WorkspaceMenu { session_id, .. }, BindingAction::CloseWorkspace) => ctx
             .workspaces
             .iter()
-            .find(|workspace| &workspace.name == session)
+            .find(|workspace| &workspace.session_id == session_id)
             .map(request_close_workspace),
         // Every menu's "New tab" opens the naming dialog; only the keyboard
         // binding creates one immediately (checked above this arm so it
@@ -990,7 +989,7 @@ fn resolve_adjacent_workspace(
 /// Closing a session's only tab closes the workspace instead. This only
 /// reads the current tab count, so — unlike the has-agent confirmation
 /// check for either close — routing can make this decision itself.
-fn active_workspace<'a>(ctx: &'a RouteContext<'a>) -> Option<&'a WorkspaceRow> {
+fn active_workspace<'a>(ctx: &RouteContext<'a>) -> Option<&'a WorkspaceRow> {
     ctx.workspaces
         .get(ctx.active_workspace)
         .filter(|workspace| workspace.name == ctx.session)
@@ -1531,7 +1530,7 @@ mod tests {
         assert_eq!(
             route_menu_item(
                 &MenuState::WorkspaceMenu {
-                    session: "main".into(),
+                    session_id: "$1".into(),
                     at: (0, 0),
                 },
                 BindingAction::CloseWorkspace,
@@ -1547,6 +1546,32 @@ mod tests {
             Some(Action::CloseWorkspace(crate::workspace_close::Intent {
                 session_id: "$1".into(),
             }))
+        );
+    }
+
+    #[test]
+    fn workspace_menu_keeps_the_clicked_identity_across_rename_and_name_reuse() {
+        let tabs = [tab("@1")];
+        let workspaces = [workspace("$1", "renamed"), workspace("$2", "original")];
+        let c = ctx(&tabs, 0, "%0", "renamed", &workspaces, 0);
+        let menu = MenuState::WorkspaceMenu {
+            session_id: "$1".into(),
+            at: (0, 0),
+        };
+
+        assert_eq!(
+            route_menu_item(&menu, BindingAction::CloseWorkspace, &c),
+            Some(Action::RequestCloseWorkspace {
+                session_id: "$1".into(),
+            }),
+            "the session that reused the old menu label must not become the close target"
+        );
+        assert_eq!(
+            route_menu_item(&menu, BindingAction::RenameWorkspace, &c),
+            Some(Action::RequestRenameWorkspace {
+                session: "renamed".into(),
+            }),
+            "rename resolves the clicked identity's current name"
         );
     }
 

@@ -64,7 +64,7 @@ use crate::render::{
 };
 use crate::resilience::{self, LinkState};
 use crate::selection::{self, SelectionState};
-use crate::sync::{fetch_workspace_model, hydrate_visible_tab};
+use crate::sync::{fetch_workspace_model, fetch_workspace_model_by_id, hydrate_visible_tab};
 use crate::term_guard::{SynchronizedWriter, TermGuard};
 use crate::theme::Paint;
 
@@ -546,6 +546,10 @@ struct App {
     /// has pinned. See [`WindowSizing`].
     sizing: WindowSizing,
     needs_reconcile: bool,
+    /// Stable session identity the next authoritative snapshot must select.
+    /// Set only from a confirmed adapter transition and retained across a
+    /// failed repair so a rename cannot strand recovery on a cached name.
+    reconcile_session_id: Option<String>,
     /// A structural notification changed visible pane dimensions. Hydration
     /// waits for the render deadline so resize bursts collapse to one set of
     /// captures instead of blocking the input path for every intermediate.
@@ -1333,6 +1337,7 @@ pub async fn run_async() -> i32 {
         declared_client_size,
         sizing,
         needs_reconcile: false,
+        reconcile_session_id: None,
         needs_hydrate: false,
         paste_seq: 0,
         home,
@@ -3720,6 +3725,26 @@ fn install_messages_snapshot(
     true
 }
 
+/// Apply the latest ordered control-mode session transition.
+///
+/// The stable id replaces any older pending reconciliation selector. The
+/// accompanying name is useful for the next frame, but only the id is safe to
+/// carry into an authoritative snapshot if another client renames the session.
+fn apply_session_switched(app: &mut App, session: String, name: String) {
+    app.reconcile_session_id = Some(session.clone());
+    if let Some(index) = app
+        .model
+        .workspaces
+        .iter()
+        .position(|workspace| workspace.session_id == session)
+    {
+        app.model.active_workspace = index;
+    }
+    app.model.session.session = name;
+    app.needs_reconcile = true;
+    app.hit_map.clear();
+}
+
 /// Handle one app message. Returns false when the channel closed.
 async fn handle_app_msg(
     msg: Option<AppMsg>,
@@ -3790,17 +3815,7 @@ async fn handle_app_msg(
             arm(debounce);
         }
         AppMsg::SessionSwitched { session, name } => {
-            if let Some(index) = app
-                .model
-                .workspaces
-                .iter()
-                .position(|workspace| workspace.session_id == session)
-            {
-                app.model.active_workspace = index;
-            }
-            app.model.session.session = name;
-            app.needs_reconcile = true;
-            app.hit_map.clear();
+            apply_session_switched(app, session, name);
             arm(debounce);
         }
         AppMsg::SessionRenamed { session, name } => {
@@ -4545,9 +4560,9 @@ async fn handle_mouse(
                         at: (col, row),
                     });
                 }
-                HitTarget::SidebarRow { session, .. } => {
+                HitTarget::SidebarRow { session_id, .. } => {
                     app.open_menu(MenuState::WorkspaceMenu {
-                        session: session.clone(),
+                        session_id: session_id.clone(),
                         at: (col, row),
                     });
                 }
@@ -6031,8 +6046,12 @@ fn apply_daemon_reconnected(app: &mut App) {
 }
 
 async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_tmux::TmuxError> {
+    let confirmed_session_id = app.reconcile_session_id.clone();
     let session = app.model.session.session.clone();
-    let mut model = fetch_workspace_model(client, &session).await?;
+    let mut model = match confirmed_session_id.as_deref() {
+        Some(session_id) => fetch_workspace_model_by_id(client, session_id).await?,
+        None => fetch_workspace_model(client, &session).await?,
+    };
     apply_workspace_order(&mut model, &app.prefs.workspace_order);
     install_reconciled_model(
         &mut app.model,
@@ -6059,7 +6078,10 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
 
     // Fetch fresh model after resize and recovery so dimensions and
     // provenance are up-to-date with live tmux state before hydration and rendering.
-    let mut fresh_model = fetch_workspace_model(client, &session).await?;
+    let mut fresh_model = match confirmed_session_id.as_deref() {
+        Some(session_id) => fetch_workspace_model_by_id(client, session_id).await?,
+        None => fetch_workspace_model(client, &session).await?,
+    };
     apply_workspace_order(&mut fresh_model, &app.prefs.workspace_order);
     install_reconciled_model(
         &mut app.model,
@@ -6106,6 +6128,7 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
         hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await;
     }
     app.needs_hydrate = false;
+    app.reconcile_session_id = None;
     Ok(())
 }
 
@@ -8125,6 +8148,7 @@ mod tests {
             declared_client_size: None,
             sizing: WindowSizing::default(),
             needs_reconcile: false,
+            reconcile_session_id: None,
             needs_hydrate: false,
             paste_seq: 0,
             home,
@@ -8182,6 +8206,42 @@ mod tests {
             sidebar_visible: true,
             messages_visible: false,
         }
+    }
+
+    #[test]
+    fn the_latest_session_switch_replaces_an_older_pending_repair_target() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-switch-repair-target");
+        let mut model = one_pane_model();
+        model.workspaces.extend([
+            crate::model::WorkspaceRow {
+                session_id: "$b".into(),
+                name: "fallback".into(),
+                tab_count: 1,
+                window_ids: vec!["@b".into()],
+            },
+            crate::model::WorkspaceRow {
+                session_id: "$c".into(),
+                name: "chosen".into(),
+                tab_count: 1,
+                window_ids: vec!["@c".into()],
+            },
+        ]);
+        let mut app = test_app(model, home.clone());
+        app.reconcile_session_id = Some("$b".into());
+        app.hit_map
+            .push(Rect::new(0, 0, 1, 1), HitTarget::SidebarToggle);
+
+        apply_session_switched(&mut app, "$c".into(), "chosen".into());
+
+        assert_eq!(app.reconcile_session_id.as_deref(), Some("$c"));
+        assert_eq!(
+            app.model.workspaces[app.model.active_workspace].session_id,
+            "$c"
+        );
+        assert_eq!(app.model.session.session, "chosen");
+        assert!(app.needs_reconcile);
+        assert!(app.hit_map.hit(0, 0).is_none());
+        let _ = std::fs::remove_dir_all(home);
     }
 
     fn messages_pane_model() -> WorkspaceModel {

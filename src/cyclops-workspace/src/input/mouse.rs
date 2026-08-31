@@ -338,7 +338,7 @@ pub enum MenuState {
     AppMenu,
     ContextMenu { pane_id: String, at: (u16, u16) },
     TabMenu { window_id: String, at: (u16, u16) },
-    WorkspaceMenu { session: String, at: (u16, u16) },
+    WorkspaceMenu { session_id: String, at: (u16, u16) },
 }
 
 impl MenuState {
