@@ -258,10 +258,12 @@ async fn horizontal_split_puts_the_new_pane_beside_the_source() {
     };
     srv.new_session("s");
     let source = pane_ids(&srv, "s")[0].clone();
+    let session_id = field(&srv, "s", "#{session_id}");
+    let window_id = field(&srv, &source, "#{window_id}");
     let (client, _n) = ControlClient::spawn(srv.config("s")).await.expect("spawn");
 
     client
-        .split_window(&source, SplitDirection::Horizontal)
+        .split_window_at(&session_id, &window_id, &source, SplitDirection::Horizontal)
         .await
         .expect("split");
 
@@ -291,10 +293,12 @@ async fn vertical_split_puts_the_new_pane_below_the_source() {
     };
     srv.new_session("s");
     let source = pane_ids(&srv, "s")[0].clone();
+    let session_id = field(&srv, "s", "#{session_id}");
+    let window_id = field(&srv, &source, "#{window_id}");
     let (client, _n) = ControlClient::spawn(srv.config("s")).await.expect("spawn");
 
     client
-        .split_window(&source, SplitDirection::Vertical)
+        .split_window_at(&session_id, &window_id, &source, SplitDirection::Vertical)
         .await
         .expect("split");
 
@@ -364,6 +368,8 @@ async fn split_opens_in_the_source_panes_directory_not_the_sessions() {
     // having landed yet, and reproduced zero mistargeted-pane failures
     // over 100 tries.
     let source = pane_ids(&srv, "s:1")[0].clone();
+    let session_id = field(&srv, "s", "#{session_id}");
+    let window_id = field(&srv, &source, "#{window_id}");
     let (client, _n) = ControlClient::spawn(srv.config("s")).await.expect("spawn");
     assert!(
         same_dir(&field(&srv, &source, "#{pane_current_path}"), &pane_dir),
@@ -371,7 +377,7 @@ async fn split_opens_in_the_source_panes_directory_not_the_sessions() {
     );
 
     client
-        .split_window(&source, SplitDirection::Horizontal)
+        .split_window_at(&session_id, &window_id, &source, SplitDirection::Horizontal)
         .await
         .expect("split");
 
@@ -387,6 +393,40 @@ async fn split_opens_in_the_source_panes_directory_not_the_sessions() {
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&session_dir);
     let _ = std::fs::remove_dir_all(&pane_dir);
+}
+
+#[tokio::test]
+async fn exact_split_route_refuses_a_source_moved_to_another_workspace() {
+    let Some(srv) = TestServer::new("ops-split-moved-source") else {
+        return;
+    };
+    srv.new_session("shown");
+    srv.tmux_ok(&["split-window", "-h", "-t", "shown"]);
+    srv.new_session("other");
+    let source = pane_ids(&srv, "shown")[0].clone();
+    let session_id = field(&srv, "shown", "#{session_id}");
+    let window_id = field(&srv, &source, "#{window_id}");
+    let (client, _n) = ControlClient::spawn(srv.config("shown"))
+        .await
+        .expect("spawn");
+
+    srv.tmux_ok(&["move-pane", "-s", &source, "-t", "other"]);
+    let before_shown = pane_ids(&srv, "shown");
+    let before_other = pane_ids(&srv, "other");
+    let error = client
+        .split_window_at(&session_id, &window_id, &source, SplitDirection::Horizontal)
+        .await
+        .expect_err("the old compound route must be stale");
+
+    assert!(matches!(error, TmuxError::Command(_)), "{error}");
+    assert_eq!(pane_ids(&srv, "shown"), before_shown);
+    assert_eq!(
+        pane_ids(&srv, "other"),
+        before_other,
+        "a stale route split the pane in its new workspace"
+    );
+
+    client.shutdown().await;
 }
 
 #[tokio::test]

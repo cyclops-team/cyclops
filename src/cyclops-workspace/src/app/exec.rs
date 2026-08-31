@@ -40,6 +40,7 @@ use crate::dialog::{
 use crate::focus::{Decision as FocusDecision, Direction as FocusDirection, Effect as FocusEffect};
 use crate::naming;
 use crate::persist::SidebarTab;
+use crate::split::{Decision as SplitDecision, Effect as SplitEffect, Placement as SplitPlacement};
 
 /// What the caller must do after one action executed. Every field defaults
 /// to false ("nothing beyond what already happened"); an arm sets exactly
@@ -73,10 +74,7 @@ pub(super) async fn execute(
     action: Action,
 ) -> Result<Outcome, TmuxError> {
     match action {
-        Action::Split { pane_id, direction } => {
-            client.split_window(&pane_id, direction).await?;
-            Ok(Outcome::reconcile())
-        }
+        Action::Split(intent) => execute_split(app, client, intent).await,
         Action::Focus(intent) => execute_focus(app, client, intent).await,
         Action::SwapPaneDirection(direction) => {
             // At an edge with no neighbour tmux answers with an error,
@@ -969,6 +967,75 @@ fn tmux_focus_direction(direction: FocusDirection) -> cyclops_tmux::PaneDirectio
     }
 }
 
+/// Decide and perform one split intent. The exact source route is rechecked by
+/// tmux immediately before mutation, and only authoritative host state may add
+/// the resulting pane to the model.
+async fn execute_split(
+    app: &mut App,
+    client: &ControlClient,
+    intent: crate::split::Intent,
+) -> Result<Outcome, TmuxError> {
+    let decision = crate::split::decide(intent, &app.model, app.link_state, !app.needs_reconcile);
+    let effect = match decision {
+        SplitDecision::Refresh => {
+            app.notice
+                .show(crate::copy::SPLIT_ROUTE_STALE, tokio::time::Instant::now());
+            return Ok(Outcome::reconcile());
+        }
+        SplitDecision::Refused(crate::split::Refusal::Reconnecting) => {
+            app.notice.show(
+                crate::copy::SPLIT_CONTROL_RECONNECTING,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::default());
+        }
+        SplitDecision::Refused(crate::split::Refusal::ServerGone) => {
+            app.notice.show(
+                crate::copy::SPLIT_CONTROL_DISCONNECTED,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::default());
+        }
+        SplitDecision::Refused(crate::split::Refusal::Refreshing) => {
+            app.notice.show(
+                crate::copy::SPLIT_STATE_REFRESHING,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::reconcile());
+        }
+        SplitDecision::Run(effect) => effect,
+    };
+
+    let pane_id = effect.route.pane_id.clone();
+    if let Err(error) = perform_split(client, effect).await {
+        super::log_err(&app.home, &error);
+        app.notice.show(
+            crate::copy::split_unconfirmed(&pane_id, &error),
+            tokio::time::Instant::now(),
+        );
+    }
+    Ok(Outcome::reconcile())
+}
+
+async fn perform_split(client: &ControlClient, effect: SplitEffect) -> Result<(), TmuxError> {
+    let route = effect.route;
+    client
+        .split_window_at(
+            &route.session_id,
+            &route.window_id,
+            &route.pane_id,
+            tmux_split_direction(effect.placement),
+        )
+        .await
+}
+
+fn tmux_split_direction(placement: SplitPlacement) -> cyclops_tmux::SplitDirection {
+    match placement {
+        SplitPlacement::Right => cyclops_tmux::SplitDirection::Horizontal,
+        SplitPlacement::Down => cyclops_tmux::SplitDirection::Vertical,
+    }
+}
+
 /// Close one pane: straight away when it hosts no agent, else via a confirm
 /// dialog. The dialog's own Enter resolves to this SAME action, and by then
 /// `app.dialog` is still showing exactly this confirm — that is what lets
@@ -1635,7 +1702,7 @@ mod tests {
     use std::collections::HashSet;
 
     use cyclops_testrig::{tmux_available, TmuxServer};
-    use cyclops_tmux::{ControlClient, ControlConfig, PaneDirection, SplitDirection};
+    use cyclops_tmux::{ControlClient, ControlConfig, PaneDirection};
 
     use super::*;
     use crate::bindings::default_bindings;
@@ -2037,7 +2104,7 @@ mod tests {
     // -- An action that mutates structure reconciles. --
 
     #[tokio::test]
-    async fn split_calls_tmux_and_reconciles() {
+    async fn a_split_changes_tmux_and_waits_for_reconcile_to_change_the_model() {
         if !tmux_available() {
             return;
         }
@@ -2045,18 +2112,21 @@ mod tests {
         server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
         let pane = pane_ids(&server, "s")[0].clone();
         let client = rig_client(&server, "s").await;
-        let mut app = test_app(
-            one_tab_model("s", "@0", &pane, "$0"),
-            cyclops_proto::scratch::scratch_dir("exec-split-home"),
-        );
+        let model = crate::sync::fetch_workspace_model(&client, "s")
+            .await
+            .expect("initial authoritative model");
+        let home = cyclops_proto::scratch::scratch_dir("exec-split-home");
+        let mut app = test_app(model, home.clone());
+        let original_active = app.model.active_tab().active_pane.clone();
+        let original_slots = crate::layout::pane_ids_in_layout(&app.model.active_tab().layout);
 
         let outcome = execute(
             &mut app,
             &client,
-            Action::Split {
-                pane_id: pane.clone(),
-                direction: SplitDirection::Horizontal,
-            },
+            Action::Split(crate::split::Intent {
+                source_pane_id: pane.clone(),
+                placement: crate::split::Placement::Right,
+            }),
         )
         .await
         .expect("split executes");
@@ -2066,7 +2136,170 @@ mod tests {
             "a structural change must ask to reconcile"
         );
         assert_eq!(pane_ids(&server, "s").len(), 2, "tmux actually split");
+        assert_eq!(app.model.active_tab().active_pane, original_active);
+        assert_eq!(
+            crate::layout::pane_ids_in_layout(&app.model.active_tab().layout),
+            original_slots,
+            "only a tmux event or snapshot may settle the new pane locally"
+        );
+
+        let authoritative_active = active_pane_id(&server, "s");
+        let authoritative_panes = pane_ids(&server, "s");
+        crate::app::reconcile(&mut app, &client)
+            .await
+            .expect("authoritative split snapshot");
+        assert_eq!(app.model.active_tab().active_pane, authoritative_active);
+        let settled_panes = crate::layout::pane_ids_in_layout(&app.model.active_tab().layout);
+        assert_eq!(settled_panes.len(), authoritative_panes.len());
+        assert!(
+            authoritative_panes
+                .iter()
+                .all(|pane| settled_panes.contains(pane)),
+            "the reconciled model must contain every pane tmux reports"
+        );
         client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn a_second_split_waits_for_reconcile_instead_of_mutating_twice() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-split-reconcile-gate");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        let client = rig_client(&server, "s").await;
+        let model = crate::sync::fetch_workspace_model(&client, "s")
+            .await
+            .expect("initial authoritative model");
+        let pane = model.active_tab().active_pane.clone();
+        let home = scratch_home("exec-split-reconcile-gate-home");
+        let mut app = test_app(model, home.clone());
+        let intent = crate::split::Intent {
+            source_pane_id: pane,
+            placement: crate::split::Placement::Down,
+        };
+
+        let first = execute(&mut app, &client, Action::Split(intent.clone()))
+            .await
+            .expect("first split");
+        assert!(first.reconcile);
+        assert_eq!(pane_ids(&server, "s").len(), 2);
+        app.needs_reconcile = first.reconcile;
+
+        let second = execute(&mut app, &client, Action::Split(intent))
+            .await
+            .expect("stale second split is a settled refusal");
+        assert!(second.reconcile);
+        assert_eq!(
+            pane_ids(&server, "s").len(),
+            2,
+            "the second split ran before the first layout settled"
+        );
+        assert_eq!(app.notice.text(), Some(crate::copy::SPLIT_STATE_REFRESHING));
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn split_refusals_name_link_and_refresh_state_without_touching_tmux() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-split-refusals");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        let client = rig_client(&server, "s").await;
+        let model = crate::sync::fetch_workspace_model(&client, "s")
+            .await
+            .expect("initial authoritative model");
+        let pane = model.active_tab().active_pane.clone();
+        let home = scratch_home("exec-split-refusals-home");
+        let mut app = test_app(model, home.clone());
+        let intent = crate::split::Intent {
+            source_pane_id: pane,
+            placement: crate::split::Placement::Right,
+        };
+
+        client.shutdown().await;
+
+        app.link_state = LinkState::Reconnecting { attempt: 1 };
+        let reconnecting = execute(&mut app, &client, Action::Split(intent.clone()))
+            .await
+            .expect("reconnecting split is refused before IO");
+        assert!(!reconnecting.reconcile);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::SPLIT_CONTROL_RECONNECTING)
+        );
+
+        app.link_state = LinkState::ServerGone;
+        let disconnected = execute(&mut app, &client, Action::Split(intent.clone()))
+            .await
+            .expect("disconnected split is refused before IO");
+        assert!(!disconnected.reconcile);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::SPLIT_CONTROL_DISCONNECTED)
+        );
+
+        app.link_state = LinkState::Live;
+        app.needs_reconcile = true;
+        let refreshing = execute(&mut app, &client, Action::Split(intent))
+            .await
+            .expect("refreshing split is refused before IO");
+        assert!(refreshing.reconcile);
+        assert_eq!(app.notice.text(), Some(crate::copy::SPLIT_STATE_REFRESHING));
+        assert_eq!(
+            pane_ids(&server, "s").len(),
+            1,
+            "no refusal may reach the tmux adapter"
+        );
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn a_vanished_split_source_is_visible_and_never_changes_the_local_model() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-split-vanished-source");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        server.run_ok(&["split-window", "-h", "-t", "s"]);
+        let client = rig_client(&server, "s").await;
+        let model = crate::sync::fetch_workspace_model(&client, "s")
+            .await
+            .expect("initial authoritative model");
+        let pane = model.active_tab().active_pane.clone();
+        let original_slots = crate::layout::pane_ids_in_layout(&model.active_tab().layout);
+        let home = scratch_home("exec-split-vanished-source-home");
+        let mut app = test_app(model, home.clone());
+        server.run_ok(&["kill-pane", "-t", &pane]);
+
+        let outcome = execute(
+            &mut app,
+            &client,
+            Action::Split(crate::split::Intent {
+                source_pane_id: pane.clone(),
+                placement: crate::split::Placement::Right,
+            }),
+        )
+        .await
+        .expect("vanished source is an honest settled outcome");
+
+        assert!(outcome.reconcile);
+        assert_eq!(pane_ids(&server, "s").len(), 1);
+        assert_eq!(
+            crate::layout::pane_ids_in_layout(&app.model.active_tab().layout),
+            original_slots
+        );
+        let notice = app.notice.text().expect("split failure is visible");
+        assert!(notice.contains(&format!("split not confirmed for {pane}")));
+        assert!(notice.contains("refreshing workspace state"));
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[tokio::test]

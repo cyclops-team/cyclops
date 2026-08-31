@@ -77,6 +77,18 @@ pub fn focus_unconfirmed(pane: &str, error: &dyn std::fmt::Display) -> String {
     format!("focus not confirmed for {pane}: {error}; refreshing workspace state")
 }
 
+pub const SPLIT_CONTROL_RECONNECTING: &str =
+    "split is unavailable while the tmux connection is recovering";
+pub const SPLIT_CONTROL_DISCONNECTED: &str =
+    "split is unavailable because the tmux connection is no longer live";
+pub const SPLIT_STATE_REFRESHING: &str = "split was not started while workspace state refreshes";
+pub const SPLIT_ROUTE_STALE: &str =
+    "split was not started because the source pane is no longer current; refreshing workspace state";
+
+pub fn split_unconfirmed(pane: &str, error: &dyn std::fmt::Display) -> String {
+    format!("split not confirmed for {pane}: {error}; refreshing workspace state")
+}
+
 pub const STREAM_RECONCILED: &str = "stream rebuilt from the durable tail";
 
 /// Workspace presentation for the shared Hello compatibility classification.

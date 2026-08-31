@@ -84,7 +84,7 @@
 //! themselves.
 
 use crossterm::event::MouseButton;
-use cyclops_tmux::{PaneDirection, SplitDirection};
+use cyclops_tmux::PaneDirection;
 
 use crate::bindings::BindingAction;
 use crate::dialog::{Dialog, ForceSubmitRow, SettingsSection, ViewRow};
@@ -93,6 +93,7 @@ use crate::focus::{Direction, Intent as FocusIntent};
 use crate::input::mouse::{HitTarget, MenuState};
 use crate::layout::SplitDir;
 use crate::model::{TabModel, WorkspaceRow};
+use crate::split::{Intent as SplitIntent, Placement as SplitPlacement};
 
 /// One target-bearing workspace action. Every device resolves to this
 /// vocabulary; only [`Action`] values reach execution (added by a later
@@ -100,11 +101,8 @@ use crate::model::{TabModel, WorkspaceRow};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     // -- Pane --
-    /// Split `pane_id`; `direction` matches tmux's `-h`/`-v` split flags.
-    Split {
-        pane_id: String,
-        direction: SplitDirection,
-    },
+    /// Add a pane beside one stable source without exposing tmux flags.
+    Split(SplitIntent),
     /// Move focus without exposing keys, hit targets, or tmux command flags
     /// to the policy that settles it.
     Focus(FocusIntent),
@@ -444,14 +442,14 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
         BindingAction::SwapPaneRight => Some(Action::SwapPaneDirection(PaneDirection::Right)),
         BindingAction::SwapPaneUp => Some(Action::SwapPaneDirection(PaneDirection::Up)),
         BindingAction::SwapPaneDown => Some(Action::SwapPaneDirection(PaneDirection::Down)),
-        BindingAction::SplitRight => Some(Action::Split {
-            pane_id: ctx.active_pane.to_string(),
-            direction: SplitDirection::Horizontal,
-        }),
-        BindingAction::SplitDown => Some(Action::Split {
-            pane_id: ctx.active_pane.to_string(),
-            direction: SplitDirection::Vertical,
-        }),
+        BindingAction::SplitRight => Some(Action::Split(SplitIntent {
+            source_pane_id: ctx.active_pane.to_string(),
+            placement: SplitPlacement::Right,
+        })),
+        BindingAction::SplitDown => Some(Action::Split(SplitIntent {
+            source_pane_id: ctx.active_pane.to_string(),
+            placement: SplitPlacement::Down,
+        })),
         BindingAction::ClosePane => Some(Action::ClosePane {
             pane_id: ctx.active_pane.to_string(),
         }),
@@ -536,15 +534,17 @@ pub fn route_menu_item(
             })
         }
         (MenuState::ContextMenu { pane_id, .. }, BindingAction::SplitRight) => {
-            Some(Action::Split {
-                pane_id: pane_id.clone(),
-                direction: SplitDirection::Horizontal,
-            })
+            Some(Action::Split(SplitIntent {
+                source_pane_id: pane_id.clone(),
+                placement: SplitPlacement::Right,
+            }))
         }
-        (MenuState::ContextMenu { pane_id, .. }, BindingAction::SplitDown) => Some(Action::Split {
-            pane_id: pane_id.clone(),
-            direction: SplitDirection::Vertical,
-        }),
+        (MenuState::ContextMenu { pane_id, .. }, BindingAction::SplitDown) => {
+            Some(Action::Split(SplitIntent {
+                source_pane_id: pane_id.clone(),
+                placement: SplitPlacement::Down,
+            }))
+        }
         (MenuState::ContextMenu { pane_id, .. }, BindingAction::ZoomPane) => {
             Some(Action::ZoomPane {
                 pane_id: pane_id.clone(),
@@ -752,14 +752,18 @@ pub fn route_mouse_click(target: &HitTarget, button: MouseButton) -> Option<Acti
         | (HitTarget::PaneGrip { pane_id }, MouseButton::Right) => {
             Some(pane_focus(pane_id.clone()))
         }
-        (HitTarget::PaneSplitRight { pane_id }, MouseButton::Left) => Some(Action::Split {
-            pane_id: pane_id.clone(),
-            direction: SplitDirection::Horizontal,
-        }),
-        (HitTarget::PaneSplitDown { pane_id }, MouseButton::Left) => Some(Action::Split {
-            pane_id: pane_id.clone(),
-            direction: SplitDirection::Vertical,
-        }),
+        (HitTarget::PaneSplitRight { pane_id }, MouseButton::Left) => {
+            Some(Action::Split(SplitIntent {
+                source_pane_id: pane_id.clone(),
+                placement: SplitPlacement::Right,
+            }))
+        }
+        (HitTarget::PaneSplitDown { pane_id }, MouseButton::Left) => {
+            Some(Action::Split(SplitIntent {
+                source_pane_id: pane_id.clone(),
+                placement: SplitPlacement::Down,
+            }))
+        }
         (HitTarget::NewTabButton, MouseButton::Left) => Some(Action::RequestNewTab),
         // The same action Ctrl+B @ routes to. A control that opened a
         // different composer from the chord would be a second code path
@@ -1192,10 +1196,10 @@ mod tests {
             &c,
         );
 
-        let expected = Some(Action::Split {
-            pane_id: "%3".into(),
-            direction: SplitDirection::Horizontal,
-        });
+        let expected = Some(Action::Split(SplitIntent {
+            source_pane_id: "%3".into(),
+            placement: SplitPlacement::Right,
+        }));
         assert_eq!(from_keyboard, expected);
         assert_eq!(from_mouse, expected);
         assert_eq!(from_menu, expected);
@@ -1255,10 +1259,10 @@ mod tests {
             &c,
         );
 
-        let expected = Some(Action::Split {
-            pane_id: "%3".into(),
-            direction: SplitDirection::Vertical,
-        });
+        let expected = Some(Action::Split(SplitIntent {
+            source_pane_id: "%3".into(),
+            placement: SplitPlacement::Down,
+        }));
         assert_eq!(from_keyboard, expected);
         assert_eq!(from_mouse, expected);
         assert_eq!(from_menu, expected);
