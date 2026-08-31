@@ -616,14 +616,10 @@ pub(crate) struct Inner {
     /// Pane-local causal route observation generation for notification
     /// reproof. Synthetic reconciliation reads this map without advancing it.
     pub(crate) route_evidence_generations: StdMutex<HashMap<PaneKey, u64>>,
-    /// One observation transaction per pane. Capture and cache commit stay in
-    /// order, so an older slow capture cannot overwrite a newer verdict or
-    /// mutate lifecycle candidates after the newer observation settled them.
-    pub(crate) pane_recomputes: StdMutex<HashMap<PaneKey, Arc<tokio::sync::Mutex<()>>>>,
-    /// One event-driven lifecycle settlement task per exact pane route.
-    /// Candidate replacements wake the existing task instead of spawning
-    /// another sleeper for the same pane.
-    pub(crate) lifecycle_rechecks: StdMutex<HashMap<PaneKey, fusion::LifecycleRecheckTask>>,
+    /// Owns each pane's ordered recompute gate and event-driven lifecycle
+    /// recheck task. Fusion keeps the concrete concurrency state private so
+    /// daemon callers cannot create a second observation timeline.
+    pane_observation_runtime: fusion::PaneObservationRuntime,
     /// Adoption registry: which pane wears which label, what manifest is
     /// pinned to it, and the tmux chrome it wore before cyclops arrived.
     /// Explicit adoption via pane.label (v1 keeper), durable across
@@ -2241,7 +2237,11 @@ impl Daemon {
         tasks.extend(std::mem::take(
             &mut *self.inner.extra_tasks.lock().expect("extra tasks lock"),
         ));
-        tasks.extend(fusion::take_lifecycle_recheck_tasks(&self.inner));
+        tasks.extend(
+            self.inner
+                .pane_observation_runtime
+                .take_tasks_for_shutdown(),
+        );
         for mut task in tasks {
             if tokio::time::timeout(SHUTDOWN_GRACE, &mut task)
                 .await
@@ -3987,8 +3987,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         events,
         detections: StdMutex::new(HashMap::new()),
         route_evidence_generations: StdMutex::new(HashMap::new()),
-        pane_recomputes: StdMutex::new(HashMap::new()),
-        lifecycle_rechecks: StdMutex::new(HashMap::new()),
+        pane_observation_runtime: fusion::PaneObservationRuntime::new(),
         registry: StdMutex::new(adoptions),
         theme: StdMutex::new(theme),
         hook_readings: StdMutex::new(HashMap::new()),
@@ -6211,8 +6210,7 @@ mod tests {
             events: broadcast::channel(16).0,
             detections: StdMutex::new(HashMap::new()),
             route_evidence_generations: StdMutex::new(HashMap::new()),
-            pane_recomputes: StdMutex::new(HashMap::new()),
-            lifecycle_rechecks: StdMutex::new(HashMap::new()),
+            pane_observation_runtime: fusion::PaneObservationRuntime::new(),
             registry: StdMutex::new(registry),
             theme: StdMutex::new(cyclops_theme::ThemeWatch::new(&home)),
             hook_readings: StdMutex::new(HashMap::new()),
