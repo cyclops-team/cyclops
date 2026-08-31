@@ -204,7 +204,7 @@ jobs:
           # creates a new process group but remains in this session, so the
           # supervisor can snapshot it without signalling the GitHub runner.
           setsid bash -c '
-            start_tick="$(sed -E "s/^[^)]*\\) //" "/proc/$$/stat" | awk "{ print \\$20 }")"
+            start_tick="$(sed -E "s/^[^)]*\) //" "/proc/$$/stat" | awk "{ print \$20 }")"
             printf "%s %s %s %s\n" "$$" "$(ps -o pgid= -p "$$")" "$(ps -o sid= -p "$$")" "$start_tick" > "$1/pid"
             stage_dir=$1
             shift
