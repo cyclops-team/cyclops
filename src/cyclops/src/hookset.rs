@@ -60,7 +60,7 @@ const RECEIPT_NAME: &str = ".cyclops-prepared.json";
 /// Sequence for same-directory temporary artifact names.
 static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum CliKind {
     Claude,
     Codex,
@@ -154,16 +154,7 @@ pub fn render_shared(kind: CliKind, cyclops_bin: &str) -> String {
 /// sessions permanently without lifecycle hooks.
 fn vendor_hook_file(kind: CliKind) -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    match kind {
-        CliKind::Claude => Some(home.join(".claude").join("settings.json")),
-        // User level, and not the project-local alternative. MEASURED
-        // Project-local .codex/hooks.json does not load until
-        // the directory is trusted, and in a non-interactive run that
-        // dialog can never be answered, so the hooks silently never fire.
-        CliKind::Codex => Some(crate::consumer::root(kind, &home).join("hooks.json")),
-        CliKind::Agy => Some(home.join(".agents").join("hooks.json")),
-        CliKind::Cursor => Some(crate::consumer::root(kind, &home).join("hooks.json")),
-    }
+    Some(crate::consumer::spec(kind).locations(&home).hook.path())
 }
 
 /// True for a hook entry this project wrote.
