@@ -134,7 +134,10 @@ impl Drop for ParkedFixtureChild {
 #[cfg(unix)]
 fn kill_process_group(leader: u32) -> io::Result<()> {
     let status = Command::new("/bin/kill")
-        .args(["-KILL", &format!("-{leader}")])
+        // A negative target names a process group. End option parsing first:
+        // GNU kill otherwise treats the group id as another option and can
+        // report success without signalling the parked fixture.
+        .args(["-KILL", "--", &format!("-{leader}")])
         .status()
         .map_err(|error| {
             io::Error::new(
