@@ -45,6 +45,7 @@ rust_tests() {
 stage "messaging docs" ./tests/e2e/messaging-docs-parity.sh
 stage "fmt" cargo fmt --all --check
 stage "clippy" cargo clippy --workspace --all-targets -- -D warnings
+stage "headless build" ./scripts/check-headless.sh
 stage "doc paths" python3 scripts/check-doc-paths.py
 stage "test" rust_tests
 

@@ -985,6 +985,7 @@ fn watch_json_streams_events_then_reports_the_close() {
 }
 
 #[test]
+#[cfg(feature = "full-ui")]
 fn watch_rejects_every_unknown_display_alias_before_it_waits() {
     let home = scratch_home("wuf");
     serve_once(&home, hello(1), move |req| {
@@ -1017,6 +1018,7 @@ fn watch_rejects_every_unknown_display_alias_before_it_waits() {
 }
 
 #[test]
+#[cfg(feature = "full-ui")]
 fn deprecated_ui_rejects_the_same_unknown_display_alias() {
     let home = scratch_home("uuf");
     serve_once(&home, hello(1), move |req| {

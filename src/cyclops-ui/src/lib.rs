@@ -42,55 +42,99 @@
 //!   `messages.snapshot` answers after content-free change edges. Focus is a
 //!   target description handed to the launcher-provided terminal adapter.
 
+#[cfg(feature = "presentation")]
+mod action;
+#[cfg(feature = "watch")]
 pub mod action_io;
+#[cfg(feature = "presentation")]
 mod app;
+#[cfg(feature = "presentation")]
 pub mod avatar;
+#[cfg(feature = "presentation")]
 pub mod chat;
+#[cfg(feature = "watch")]
 mod data;
+#[cfg(feature = "presentation")]
 pub mod detail;
+#[cfg(feature = "presentation")]
 mod entry;
+#[cfg(feature = "presentation")]
 mod frame;
 pub mod grid;
+#[cfg(feature = "presentation")]
 mod health;
+#[cfg(feature = "watch")]
 mod input;
+#[cfg(feature = "presentation")]
+mod key;
+#[cfg(feature = "presentation")]
 pub mod messages;
+#[cfg(feature = "watch")]
 mod plain;
+#[cfg(feature = "presentation")]
+mod projection;
+#[cfg(feature = "presentation")]
 pub mod queue;
+#[cfg(feature = "presentation")]
 mod stream;
+#[cfg(feature = "watch")]
 mod term;
+mod terminal_size;
+#[cfg(feature = "presentation")]
 mod theme;
 
-pub use action_io::{perform, ActionOutcome, ActionRequest, RequestKind, RequestToken};
+#[cfg(feature = "presentation")]
+pub use action::{ActionOutcome, ActionRequest, RequestKind, RequestToken};
+#[cfg(feature = "watch")]
+pub use action_io::perform;
+#[cfg(feature = "presentation")]
 pub use app::{App, Command, Density, RosterRow, RowTarget, View};
+#[cfg(feature = "presentation")]
 pub use avatar::{Avatar, AvatarRegistry};
+#[cfg(feature = "presentation")]
 pub use chat::{
     chat_action_line, chat_action_lines, chat_action_strip, chat_action_strips, chat_actions,
     render_chat, render_chat_lines, wrap_words, ChatAction, ChatActionSpan, ChatActionStrip,
     ChatInk, ChatLine, ChatLineKind, ChatRenderContext, ChatSpan, ComposerMode, ComposerState,
     TimelineItem,
 };
+#[cfg(feature = "presentation")]
 pub use cyclops_proto::{Attention, AttentionItem, Eye, PaneSnapshot};
-pub use data::{project_backfill, BackfillReport, FocusPane, StreamProjection, UiMsg};
+#[cfg(feature = "watch")]
+pub use data::{FocusPane, UiMsg};
+#[cfg(feature = "presentation")]
 pub use detail::{Action, Back, Check, Detail, Draft, Loaded, Request, Stage, ThreadEntry};
+#[cfg(feature = "presentation")]
 pub use frame::{build, messages_help};
+#[cfg(feature = "presentation")]
 pub use health::BuildHealth;
-pub use input::Key;
+#[cfg(feature = "presentation")]
+pub use key::Key;
+#[cfg(feature = "presentation")]
 pub use messages::{
     rows_from_snapshot, FollowRequest, Link, MessageFollower, RefreshGate, RefreshRequest,
 };
+#[cfg(feature = "presentation")]
+pub use projection::{project_backfill, BackfillReport, StreamProjection};
+#[cfg(feature = "presentation")]
 pub use queue::{
     Counts, Direction, FrozenTarget, HumanQueue, MailboxWord, QueueRow, QueueTarget, Scope,
     SessionFilter, Snapshot, WakeWord,
 };
+#[cfg(feature = "presentation")]
 pub use stream::{
     Backfilled, EndpointFilter, Entry, EntryKind, Filter, Intake, MessageEndpoints, PingDelivery,
     Record, RosterSeed, StatusSeed,
 };
+#[cfg(feature = "presentation")]
 pub use theme::Theme;
 
+#[cfg(feature = "watch")]
 use std::io::IsTerminal;
+#[cfg(feature = "watch")]
 use std::path::Path;
 
+#[cfg(feature = "watch")]
 use tokio::sync::mpsc;
 
 /// The terminal's size in cells, or the classic 80x24 when there is none
@@ -100,10 +144,11 @@ use tokio::sync::mpsc;
 /// frame with it, and `cyclops start` sizes a new tmux session with it.
 /// The ioctl is written once.
 pub fn terminal_size() -> (usize, usize) {
-    term::Term::size()
+    terminal_size::get()
 }
 
 /// How `cyclops ui` was asked to run.
+#[cfg(feature = "watch")]
 #[derive(Debug, Clone, Default)]
 pub struct UiOptions {
     /// Line-oriented follow mode; also forced by a non-tty.
@@ -120,6 +165,7 @@ pub struct UiOptions {
     pub focus: Option<FocusPane>,
 }
 
+#[cfg(feature = "watch")]
 impl UiOptions {
     pub fn filter(&self) -> Filter {
         Filter {
@@ -138,11 +184,13 @@ impl UiOptions {
 /// UI standing: every state pairs a glyph with a word, so the eye, the
 /// firehose toggle, filters, scrolling, the cheatsheet and pane focus all
 /// read fine uncolored. GOALS lists the two as separate obligations.
+#[cfg(feature = "watch")]
 fn wants_plain(opts: &UiOptions, tty: bool) -> bool {
     opts.plain || !tty
 }
 
 /// Run the UI to completion. Returns the process exit code.
+#[cfg(feature = "watch")]
 pub fn run(opts: UiOptions) -> i32 {
     let home = cyclops_proto::cyclops_home();
     let tty = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
@@ -165,28 +213,37 @@ pub fn run(opts: UiOptions) -> i32 {
 }
 
 /// How long the eye holds its intermediate frame: one tick, never a loop.
+#[cfg(feature = "watch")]
 const EYE_TICK_MS: u64 = 120;
 
 /// Largest number of queued messages folded into one frame. Keeps a flood
 /// fluid (one render per batch) without starving key handling. The workspace
 /// UI uses the same budget so one number defines interactive ingress.
+#[cfg(feature = "watch")]
 pub const INGRESS_BATCH: usize = 256;
+#[cfg(feature = "watch")]
 const BATCH: usize = INGRESS_BATCH;
 /// One complete render batch. Producers backpressure after this instead of
 /// growing memory while the terminal is slow.
+#[cfg(feature = "watch")]
 pub(crate) const EVENT_CAPACITY: usize = BATCH;
 /// One result from each snapshot producer can be outstanding: startup,
 /// queue refresh, and durable follow.
+#[cfg(feature = "watch")]
 pub(crate) const SNAPSHOT_CAPACITY: usize = 3;
 /// The action worker is serial, so a second result cannot exist before the
 /// first is consumed.
+#[cfg(feature = "watch")]
 pub(crate) const ACTION_CAPACITY: usize = 1;
 /// Keys have their own lane and one render batch of headroom. The blocking
 /// reader waits when it fills, preserving every key without letting data
 /// traffic delay it.
+#[cfg(feature = "watch")]
 const INPUT_CAPACITY: usize = BATCH;
+#[cfg(feature = "watch")]
 const MESSAGE_GAP_NOTICE: &str = "message sequence gap detected; rebuilding from a whole snapshot";
 
+#[cfg(feature = "watch")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lane {
     Input,
@@ -195,6 +252,7 @@ enum Lane {
     Event,
 }
 
+#[cfg(feature = "watch")]
 impl Lane {
     fn next(self) -> Self {
         match self {
@@ -206,12 +264,14 @@ impl Lane {
     }
 }
 
+#[cfg(feature = "watch")]
 enum IngressWake {
     Message(Lane, UiMsg),
     Resize,
     Closed,
 }
 
+#[cfg(feature = "watch")]
 async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
     let view = if opts.firehose {
         View::Firehose
@@ -343,13 +403,13 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full((token, _))) => app.apply_action(
                     token,
-                    crate::action_io::ActionOutcome::NotSent(
+                    crate::action::ActionOutcome::NotSent(
                         "another detail action is still queued".into(),
                     ),
                 ),
                 Err(mpsc::error::TrySendError::Closed((token, _))) => app.apply_action(
                     token,
-                    crate::action_io::ActionOutcome::NotSent("action worker stopped".into()),
+                    crate::action::ActionOutcome::NotSent("action worker stopped".into()),
                 ),
             }
         }
@@ -383,6 +443,7 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
 }
 
 /// Apply one message to the app. True means quit.
+#[cfg(feature = "watch")]
 fn handle(
     app: &mut App,
     intake: &mut Intake,
@@ -504,18 +565,21 @@ fn handle(
 
 /// Apply the startup reconciliation and ingest the lines it wrote for
 /// items the replayed tail does not already carry.
+#[cfg(feature = "watch")]
 fn seed_status(app: &mut App, seed: stream::StatusSeed) {
     for e in app.seed_status(seed) {
         app.replay(e);
     }
 }
 
+#[cfg(feature = "watch")]
 fn draw(term: &mut term::Term, app: &mut App) {
-    let (w, h) = term::Term::size();
+    let (w, h) = terminal_size();
     let rows = frame::build(app, w, h);
     term.draw(&rows);
 }
 
+#[cfg(feature = "watch")]
 async fn recv_winch(sig: &mut Option<tokio::signal::unix::Signal>) -> bool {
     match sig {
         Some(s) => s.recv().await.is_some(),
@@ -525,6 +589,7 @@ async fn recv_winch(sig: &mut Option<tokio::signal::unix::Signal>) -> bool {
 
 /// Wait fairly across lanes. A closed stdin lane is disabled permanently,
 /// so EOF cannot become an eventless redraw loop that starves daemon work.
+#[cfg(feature = "watch")]
 async fn wait_next_ingress(
     key_open: &mut bool,
     key_rx: &mut mpsc::Receiver<Key>,
@@ -567,6 +632,7 @@ async fn wait_next_ingress(
 /// Drain ready work by rotating the first eligible lane after every item.
 /// Input starts each run first, while every continuously ready lane is served
 /// within four items.
+#[cfg(feature = "watch")]
 fn try_next_ready(
     start: &mut Lane,
     key_rx: &mut mpsc::Receiver<Key>,
@@ -590,7 +656,7 @@ fn try_next_ready(
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "watch"))]
 mod tests {
     use super::*;
 

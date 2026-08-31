@@ -4,6 +4,8 @@
 //! never engages) proves classification, ordering, dedupe, the hanging
 //! body line, and the eye word without a terminal anywhere.
 
+#![cfg(feature = "full-ui")]
+
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;

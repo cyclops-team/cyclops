@@ -495,7 +495,6 @@ dependencies = [
  "cyclops-state",
  "cyclops-theme",
  "libc",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",

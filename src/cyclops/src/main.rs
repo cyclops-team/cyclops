@@ -100,8 +100,19 @@ const VERSION: &str = cyclops_proto::VERSION_WITH_BUILD;
 #[command(
     name = "cyclops",
     version = VERSION,
-    about = "One eye on every agent",
-    after_help = "With no command, opens the full-screen workspace (and starts the daemon if needed)."
+    about = "One eye on every agent"
+)]
+#[cfg_attr(
+    feature = "full-ui",
+    command(
+        after_help = "With no command, opens the full-screen workspace (and starts the daemon if needed)."
+    )
+)]
+#[cfg_attr(
+    not(feature = "full-ui"),
+    command(
+        after_help = "This build includes command-line and JSON operation. The full-screen workspace and interactive watch are not included."
+    )
 )]
 struct Cli {
     /// Request structured JSON where the command supports it. `watch` emits
@@ -177,8 +188,14 @@ enum Cmd {
         #[arg(long)]
         raw: bool,
     },
-    /// Live stream of daemon events and the admin TUI. `--json` prints one
-    /// event per line; without it, opens the stream TUI (formerly `ui`).
+    #[cfg_attr(
+        feature = "full-ui",
+        doc = " Live stream of daemon events and the admin TUI. `--json` prints one event per line; without it, opens the stream TUI (formerly `ui`)."
+    )]
+    #[cfg_attr(
+        not(feature = "full-ui"),
+        doc = " Live stream of daemon events as NDJSON with `--json`. Interactive watch is not included in this build."
+    )]
     Watch {
         /// Only these event kinds (prefix match), comma separated. JSON mode
         /// only; ignored when opening the TUI.
@@ -225,7 +242,14 @@ enum Cmd {
         #[arg(long, default_value = WAIT_TIMEOUT_DEFAULT)]
         timeout: String,
     },
-    /// Deprecated alias for `cyclops watch`. Use `cyclops watch` instead.
+    #[cfg_attr(
+        feature = "full-ui",
+        doc = " Deprecated alias for `cyclops watch`. Use `cyclops watch` instead."
+    )]
+    #[cfg_attr(
+        not(feature = "full-ui"),
+        doc = " Deprecated interactive alias. This build supports `cyclops watch --json` instead."
+    )]
     Ui(UiArgs),
     /// Relay a vendor hook event to cyclops. Silent, always exits 0.
     Hook {
@@ -797,12 +821,20 @@ fn style_for(cli: &Cli) -> Style {
 fn run(cli: &Cli) -> i32 {
     match &cli.cmd {
         None => {
-            if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
-                seed_home_for_workspace();
-                ensure_daemon_for_workspace();
-                cyclops_workspace::run()
-            } else {
-                cyclops_workspace::print_help_and_exit()
+            #[cfg(feature = "full-ui")]
+            {
+                if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+                    seed_home_for_workspace();
+                    ensure_daemon_for_workspace();
+                    cyclops_workspace::run()
+                } else {
+                    cyclops_workspace::print_help_and_exit()
+                }
+            }
+            #[cfg(not(feature = "full-ui"))]
+            {
+                eprintln!("{}", copy::WORKSPACE_NOT_INCLUDED);
+                EXIT_USAGE
             }
         }
         Some(cmd) => run_cmd(cli, cmd),
@@ -822,6 +854,7 @@ fn run(cli: &Cli) -> i32 {
 /// A problem is a note, not an exit: a home without themes still renders in
 /// built-in colors, and a home without manifests still opens (the sidebar
 /// shows unknown) rather than refusing the front door.
+#[cfg(feature = "full-ui")]
 fn seed_home_for_workspace() {
     let home = cyclops_proto::cyclops_home();
     for why in themeseed::seed(&home).problems {
@@ -862,6 +895,7 @@ fn seed_home_for_workspace() {
 /// answers, so the state is never silently wrong. Boot failures write their
 /// own reason to the daemon log; this only has to carry the ones that never
 /// got as far as a running daemon.
+#[cfg(feature = "full-ui")]
 fn ensure_daemon_for_workspace() {
     let home = cyclops_proto::cyclops_home();
     if let Err(why) = daemon::ensure_running(&home) {
@@ -1133,13 +1167,23 @@ fn cmd_watch(cli: &Cli, style: &Style, kinds: &[String], ui: &UiArgs) -> i32 {
         };
         return cmd_watch_json(&mut c, cli, style, kinds);
     }
-    let filters = match preflight_watch_filters(ui) {
-        Ok(filters) => filters,
-        Err(code) => return code,
-    };
-    run_stream_ui(cli, ui, filters)
+    #[cfg(feature = "full-ui")]
+    {
+        let filters = match preflight_watch_filters(ui) {
+            Ok(filters) => filters,
+            Err(code) => return code,
+        };
+        run_stream_ui(cli, ui, filters)
+    }
+    #[cfg(not(feature = "full-ui"))]
+    {
+        let _ = ui;
+        eprintln!("{}", copy::WATCH_NOT_INCLUDED);
+        EXIT_USAGE
+    }
 }
 
+#[cfg(feature = "full-ui")]
 fn preflight_watch_filters(ui: &UiArgs) -> Result<cyclops_ui::Filter, i32> {
     if ui.with.is_none() && ui.from.is_none() && ui.to.is_none() {
         return Ok(cyclops_ui::Filter::default());
@@ -1150,6 +1194,7 @@ fn preflight_watch_filters(ui: &UiArgs) -> Result<cyclops_ui::Filter, i32> {
 
 /// Resolve display conveniences once to immutable endpoint identities.
 /// A later rename changes only presentation and cannot strand the watch.
+#[cfg(feature = "full-ui")]
 fn resolve_watch_filters(c: &mut Client, ui: &UiArgs) -> Result<cyclops_ui::Filter, i32> {
     let value = c
         .request(
@@ -1201,6 +1246,7 @@ fn resolve_watch_filters(c: &mut Client, ui: &UiArgs) -> Result<cyclops_ui::Filt
 }
 
 /// cyclops ui: deprecated alias for `cyclops watch`.
+#[cfg(feature = "full-ui")]
 fn cmd_ui(cli: &Cli, args: &UiArgs) -> i32 {
     if cli.json {
         eprintln!("{}", copy::UI_NO_JSON);
@@ -1214,6 +1260,13 @@ fn cmd_ui(cli: &Cli, args: &UiArgs) -> i32 {
     run_stream_ui(cli, args, filters)
 }
 
+#[cfg(not(feature = "full-ui"))]
+fn cmd_ui(_cli: &Cli, _args: &UiArgs) -> i32 {
+    eprintln!("{}", copy::WATCH_NOT_INCLUDED);
+    EXIT_USAGE
+}
+
+#[cfg(feature = "full-ui")]
 fn run_stream_ui(cli: &Cli, args: &UiArgs, filters: cyclops_ui::Filter) -> i32 {
     let home = cyclops_proto::cyclops_home();
 
@@ -3360,6 +3413,7 @@ fn cmd_watch_json(c: &mut Client, cli: &Cli, style: &Style, kinds: &[String]) ->
 mod tests {
     use super::*;
 
+    #[cfg(feature = "full-ui")]
     fn tmux_text(server: &cyclops_testrig::TmuxServer, args: &[&str]) -> String {
         let output = server.run(args);
         assert!(
@@ -3370,6 +3424,7 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
+    #[cfg(feature = "full-ui")]
     fn two_window_server(server: &cyclops_testrig::TmuxServer, session: &str) -> (String, String) {
         server.run_ok(&["new-session", "-d", "-s", session, "/bin/sh"]);
         server.run_ok(&["new-window", "-d", "-t", session, "/bin/sh"]);
@@ -3381,6 +3436,7 @@ mod tests {
         (panes[0].clone(), panes[1].clone())
     }
 
+    #[cfg(feature = "full-ui")]
     fn active_pane(server: &cyclops_testrig::TmuxServer, session: &str) -> String {
         tmux_text(
             server,
@@ -3388,6 +3444,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "full-ui")]
     fn focus_child(home: &std::path::Path, target: &str) -> std::process::Command {
         let mut child =
             std::process::Command::new(std::env::current_exe().expect("test executable"));
@@ -3404,6 +3461,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "full-ui")]
     #[ignore = "invoked by the parent focus test with isolated tmux context"]
     fn stream_focus_adapter_child() {
         let Some(home) = std::env::var_os("CYCLOPS_STREAM_FOCUS_CHILD_HOME") else {
@@ -3417,6 +3475,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "full-ui")]
     fn stream_focus_uses_the_configured_server_and_leaves_the_ambient_server_alone() {
         if !cyclops_testrig::tmux_available() {
             return;
@@ -3479,6 +3538,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "full-ui")]
     fn stream_focus_forwards_the_configured_socket_and_config_to_tmux() {
         use std::os::unix::fs::PermissionsExt;
 

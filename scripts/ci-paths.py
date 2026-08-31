@@ -39,6 +39,7 @@ def classify(paths: list[str]) -> dict[str, bool]:
     for path in paths:
         control = under(path, ".github/workflows/") or path.startswith("scripts/ci-") or path in {
             ".config/nextest.toml",
+            "scripts/check-headless.sh",
             "scripts/check.sh",
             "scripts/test-relocated-scratch.sh",
         }
@@ -152,6 +153,7 @@ def selftest() -> None:
     assert all(classify(["scripts/ci-performance.py"]).values())
     control = classify([".github/workflows/ci.yml"])
     assert all(control.values())
+    assert all(classify(["scripts/check-headless.sh"]).values())
 
 
 def main() -> int:

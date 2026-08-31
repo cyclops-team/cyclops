@@ -1,5 +1,7 @@
 //! Bare `cyclops` invocation (workspace Step 4).
 
+#![cfg(feature = "full-ui")]
+
 use std::ffi::CStr;
 use std::fs::{File, OpenOptions};
 use std::os::unix::net::UnixListener;

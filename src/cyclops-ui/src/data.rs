@@ -26,8 +26,9 @@ use std::sync::Arc;
 use cyclops_proto::{Event, MessagesChangedData, StatusResult, StreamBackfillResult};
 use tokio::sync::mpsc;
 
-use crate::input::Key;
+use crate::key::Key;
 use crate::messages::RefreshRequest;
+use crate::projection::{project_backfill, BackfillReport, StreamProjection};
 use crate::stream::Entry;
 use crate::stream::StatusSeed;
 use cyclops_client::{AsyncClient, ClientError};
@@ -86,16 +87,9 @@ pub enum UiMsg {
     /// A detail read or action came back, under the token it was sent
     /// with. The token is what decides whether it may be applied.
     ActionDone {
-        token: crate::action_io::RequestToken,
-        outcome: Box<crate::action_io::ActionOutcome>,
+        token: crate::action::RequestToken,
+        outcome: Box<crate::action::ActionOutcome>,
     },
-}
-
-pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// The event loop starts at most one request of each kind. A single slot
@@ -189,10 +183,7 @@ pub struct Io {
     pub reconnect: mpsc::Sender<()>,
     pub refresh: MessagesRefresh,
     pub follow: mpsc::Sender<crate::messages::FollowRequest>,
-    pub action: mpsc::Sender<(
-        crate::action_io::RequestToken,
-        crate::action_io::ActionRequest,
-    )>,
+    pub action: mpsc::Sender<(crate::action::RequestToken, crate::action::ActionRequest)>,
     /// One active tmux focus call and at most one queued request.
     pub focus: mpsc::Sender<String>,
 }
@@ -272,10 +263,7 @@ async fn follow_task(
 async fn action_task(
     tx: mpsc::Sender<UiMsg>,
     sock: std::path::PathBuf,
-    mut rx: mpsc::Receiver<(
-        crate::action_io::RequestToken,
-        crate::action_io::ActionRequest,
-    )>,
+    mut rx: mpsc::Receiver<(crate::action::RequestToken, crate::action::ActionRequest)>,
 ) {
     while let Some((token, request)) = rx.recv().await {
         let outcome = crate::action_io::perform(&sock, request).await;
@@ -448,15 +436,6 @@ async fn stream_projection(sock: &Path, backfill: usize) -> StreamProjection {
     }
 }
 
-/// Everything needed to replace the reusable stream model after an
-/// acknowledged subscription. Missing pieces remain explicit in `warning`.
-pub struct StreamProjection {
-    pub seed: Option<Box<StatusSeed>>,
-    pub entries: Vec<Entry>,
-    pub max_seq: Option<u64>,
-    pub warning: Option<String>,
-}
-
 /// The live stream: acknowledge subscription, then forward records and
 /// invalidation edges until the connection dies. The ConnLost text is
 /// print-ready copy in the CLI's voice: what happened, next step.
@@ -614,11 +593,17 @@ async fn forward_event(tx: &mpsc::Sender<UiMsg>, ev: Event) -> Result<bool, Stri
         "messages.route_changed" => Ok(tx.send(UiMsg::MessagesRouteChanged).await.is_ok()),
         "session" | "pane-removed" => Ok(tx.send(UiMsg::MessagesRouteChanged).await.is_ok()
             && tx
-                .send(UiMsg::Entry(Box::new(Entry::from_event(&ev, now_ms()))))
+                .send(UiMsg::Entry(Box::new(Entry::from_event(
+                    &ev,
+                    crate::stream::now_ms(),
+                ))))
                 .await
                 .is_ok()),
         _ => Ok(tx
-            .send(UiMsg::Entry(Box::new(Entry::from_event(&ev, now_ms()))))
+            .send(UiMsg::Entry(Box::new(Entry::from_event(
+                &ev,
+                crate::stream::now_ms(),
+            ))))
             .await
             .is_ok()),
     }
@@ -664,40 +649,6 @@ async fn status_seed(sock: &Path) -> Result<StatusSeed, UiError> {
         .into());
     }
     Ok(StatusSeed::from_status(&status))
-}
-
-/// A bounded daemon projection plus any explicitly reported loss.
-#[derive(Debug)]
-pub struct BackfillReport {
-    /// Entries retained in timestamp order.
-    pub entries: Vec<Entry>,
-    /// Highest retained sequence when exactly one file supplied the tail.
-    pub max_seq: Option<u64>,
-    /// Visible gap text when requested history could not be represented whole.
-    pub warning: Option<String>,
-}
-
-/// Convert the daemon-owned read projection into renderer-neutral entries.
-pub fn project_backfill(result: StreamBackfillResult) -> BackfillReport {
-    let entries = result.lines.iter().filter_map(Entry::from_ledger).collect();
-    let warning = result.gap.filter(|gap| !gap.is_empty()).map(|gap| {
-        let mut facts = Vec::new();
-        if gap.unreadable_sources > 0 {
-            facts.push(format!("{} unreadable sources", gap.unreadable_sources));
-        }
-        if gap.omitted_rows > 0 {
-            facts.push(format!("{} rows beyond the retained limits", gap.omitted_rows));
-        }
-        format!(
-            "backfill incomplete; stream history has a gap: {}. Use cyclops history for the durable record",
-            facts.join(", ")
-        )
-    });
-    BackfillReport {
-        entries,
-        max_seq: result.max_seq,
-        warning,
-    }
 }
 
 async fn stream_backfill(sock: &Path, limit: usize) -> Result<StreamBackfillResult, UiError> {

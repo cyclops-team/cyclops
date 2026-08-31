@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use cyclops_proto::{Attention, AttentionItem, Eye};
 
-use crate::input::Key;
+use crate::key::Key;
 use crate::stream::{EndpointFilter, Entry, EntryKind, Filter, Record, StatusSeed};
 use crate::theme::Theme;
 
@@ -240,13 +240,10 @@ pub struct App {
     /// Never a bare action. Resolving at drain time read whatever detail
     /// was open by then, so confirming on one row, leaving, and opening
     /// another built the first row's verb against the second's target.
-    pending: Option<(
-        crate::action_io::RequestToken,
-        crate::action_io::ActionRequest,
-    )>,
+    pending: Option<(crate::action::RequestToken, crate::action::ActionRequest)>,
     /// The one request that is out. Its answer is the only one allowed
     /// to touch the detail.
-    in_flight: Option<crate::action_io::RequestToken>,
+    in_flight: Option<crate::action::RequestToken>,
     /// The size the last frame was drawn at.
     ///
     /// Kept so the key handler can ask the same question the renderer
@@ -352,7 +349,7 @@ impl App {
     }
 
     /// The request that is out, if any.
-    pub fn in_flight(&self) -> Option<&crate::action_io::RequestToken> {
+    pub fn in_flight(&self) -> Option<&crate::action::RequestToken> {
         self.in_flight.as_ref()
     }
 
@@ -379,10 +376,10 @@ impl App {
     /// nothing about it reaches the screen.
     pub fn apply_action(
         &mut self,
-        token: crate::action_io::RequestToken,
-        outcome: crate::action_io::ActionOutcome,
+        token: crate::action::RequestToken,
+        outcome: crate::action::ActionOutcome,
     ) {
-        use crate::action_io::ActionOutcome;
+        use crate::action::ActionOutcome;
         if self.in_flight.as_ref() != Some(&token) {
             return;
         }
@@ -447,11 +444,8 @@ impl App {
     /// and reloading it after its facts moved cannot drift apart.
     pub fn detail_read(
         &self,
-    ) -> Option<(
-        crate::action_io::RequestToken,
-        crate::action_io::ActionRequest,
-    )> {
-        use crate::action_io::{ActionRequest, RequestKind, RequestToken};
+    ) -> Option<(crate::action::RequestToken, crate::action::ActionRequest)> {
+        use crate::action::{ActionRequest, RequestKind, RequestToken};
         use crate::queue::{Direction, MailboxWord};
 
         let detail = self.detail.as_ref()?;
@@ -500,25 +494,22 @@ impl App {
     fn resolve_action(
         &mut self,
         action: crate::detail::Action,
-    ) -> Option<(
-        crate::action_io::RequestToken,
-        crate::action_io::ActionRequest,
-    )> {
-        use crate::action_io::{RequestKind, RequestToken};
+    ) -> Option<(crate::action::RequestToken, crate::action::ActionRequest)> {
+        use crate::action::{RequestKind, RequestToken};
         use crate::detail::Action;
         let detail = self.detail.as_mut()?;
         let frozen = detail.target().clone();
         let request = match (frozen.attempt, action) {
             (_, Action::Reply) => {
                 let key = detail.draft_mut().key_for_send(next_client_key);
-                crate::action_io::ActionRequest::Reply {
+                crate::action::ActionRequest::Reply {
                     message_id: frozen.target.message_id.clone(),
                     body: detail.draft().text().to_string(),
                     client_key: key,
                 }
             }
             (Some(attempt_id), Action::WithdrawNotification) => {
-                crate::action_io::ActionRequest::WithdrawNotification {
+                crate::action::ActionRequest::WithdrawNotification {
                     attempt_id,
                     recipient: frozen.target.recipient,
                 }
@@ -528,13 +519,13 @@ impl App {
             // under a new attempt, and the operator confirmed against the
             // evidence they were shown.
             (Some(attempt_id), Action::ClearAlarm) => {
-                crate::action_io::ActionRequest::ClearAlarm { attempt_id }
+                crate::action::ActionRequest::ClearAlarm { attempt_id }
             }
             (Some(attempt_id), Action::AttentionComplete) => {
-                crate::action_io::ActionRequest::AttentionComplete { attempt_id }
+                crate::action::ActionRequest::AttentionComplete { attempt_id }
             }
             (Some(attempt_id), Action::AttentionDiscard) => {
-                crate::action_io::ActionRequest::AttentionDiscard { attempt_id }
+                crate::action::ActionRequest::AttentionDiscard { attempt_id }
             }
             // An attention verb with no attempt frozen never becomes a
             // request.
@@ -564,10 +555,7 @@ impl App {
     /// matched back to it.
     pub fn take_pending(
         &mut self,
-    ) -> Option<(
-        crate::action_io::RequestToken,
-        crate::action_io::ActionRequest,
-    )> {
+    ) -> Option<(crate::action::RequestToken, crate::action::ActionRequest)> {
         if self.in_flight.is_some() {
             return None;
         }
@@ -579,10 +567,7 @@ impl App {
     /// The read a detail is owed, marked in flight.
     pub fn take_detail_read(
         &mut self,
-    ) -> Option<(
-        crate::action_io::RequestToken,
-        crate::action_io::ActionRequest,
-    )> {
+    ) -> Option<(crate::action::RequestToken, crate::action::ActionRequest)> {
         if !self.refresh.may_mutate() || self.in_flight.is_some() || !self.detail_read_owed() {
             return None;
         }

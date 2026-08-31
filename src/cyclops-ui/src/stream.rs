@@ -40,6 +40,13 @@ use serde_json::Value;
 
 use crate::grid;
 
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// One authoritative connection-epoch reconciliation: which sessions the daemon watches,
 /// where every pane stands right now, and every delivery it still counts
 /// as needing a human.
@@ -1209,7 +1216,7 @@ impl Record {
                     // the line is stamped when the reading was taken. It
                     // says where the pane stands now, which is what status
                     // is.
-                    ts: crate::data::now_ms(),
+                    ts: now_ms(),
                     seq: None,
                     id: None,
                     kind: EntryKind::State {
@@ -1232,7 +1239,7 @@ impl Record {
                         // The record's own transition time: this line can
                         // be hours older than the replayed tail above it,
                         // and saying so is the point of showing it at all.
-                        ts: record.map_or_else(crate::data::now_ms, |d| d.ts),
+                        ts: record.map_or_else(now_ms, |d| d.ts),
                         seq: None,
                         id: Some(id.clone()),
                         kind: EntryKind::Delivery {
@@ -1260,7 +1267,7 @@ impl Record {
         //    that under the row the reader is looking at.
         for (item, recipient, how) in self.alarms_the_answer_cleared() {
             out.push(Entry::cleared(
-                crate::data::now_ms(),
+                now_ms(),
                 None,
                 recipient,
                 Resolved { was: item, how },
