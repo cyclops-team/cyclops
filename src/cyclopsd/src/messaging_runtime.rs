@@ -564,7 +564,8 @@ pub(crate) async fn wait_and_queue_unclaimed_reminder(
 ///
 /// A release is a boot-local ownership edge, not a durable mailbox change.
 /// Broadcast lag means a release edge was lost, not that this attempt was
-/// released. The caller revalidates once rather than polling on a timer.
+/// released. The caller revalidates after each matching edge rather than
+/// polling on a timer.
 async fn wait_for_attention_resolution_release(
     releases: &mut tokio::sync::broadcast::Receiver<NotificationAttemptId>,
     attempt_id: NotificationAttemptId,
@@ -591,34 +592,38 @@ pub(crate) fn schedule_force_submit(inner: &Arc<Inner>, record: cyclops_proto::N
     };
     let task_inner = Arc::clone(inner);
     inner.engine.spawn_descendant_task(async move {
-        loop {
-            let (enabled, threshold_ms) = task_inner.force_submit.get();
-            if !enabled {
-                return;
-            }
-            let elapsed_ms = crate::unix_ms().saturating_sub(record.updated_at);
-            let remaining_ms = threshold_ms.saturating_sub(elapsed_ms);
-            if remaining_ms == 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(remaining_ms)).await;
-        }
-
         let pane_id = record
             .recipient
             .pane_id()
             .map(|pane_id| pane_id.to_string())
             .unwrap_or_default();
         // Subscribe before trying to reserve the action. A release that races
-        // the conflict stays observable, and one revalidation is enough for
-        // this opt-in escape hatch. A second owner is allowed to finish; this
-        // task never retries terminal input on its own.
+        // the conflict stays observable. If a successor acquires before this
+        // task revalidates, wait for that exact successor release too. This
+        // retries only reservation acquisition after an ownership edge, never
+        // a terminal action after intent or a key.
         let mut releases = messaging.subscribe_attention_resolution_releases();
-        let target = match messaging.attention_for_runtime(record.attempt_id) {
-            Ok(target) => target,
-            Err(_) => return,
-        };
-        let result =
+        let result = loop {
+            // A live settings update can lengthen the delay while another
+            // resolver owns this attempt. Re-enter the same due-time check on
+            // every release-driven revalidation so that update takes effect
+            // before this task can reserve or send a key.
+            loop {
+                let (enabled, threshold_ms) = task_inner.force_submit.get();
+                if !enabled {
+                    return;
+                }
+                let elapsed_ms = crate::unix_ms().saturating_sub(record.updated_at);
+                let remaining_ms = threshold_ms.saturating_sub(elapsed_ms);
+                if remaining_ms == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(remaining_ms)).await;
+            }
+            let target = match messaging.attention_for_runtime(record.attempt_id) {
+                Ok(target) => target,
+                Err(_) => return,
+            };
             match crate::attention_resolution::force_complete(&task_inner, &messaging, &target)
                 .await
             {
@@ -633,25 +638,16 @@ pub(crate) fn schedule_force_submit(inner: &Arc<Inner>, record: cyclops_proto::N
                     {
                         return;
                     }
-                    let target = match messaging.attention_for_runtime(record.attempt_id) {
-                        Ok(target) => target,
-                        Err(_) => return,
-                    };
-                    match crate::attention_resolution::force_complete(
-                        &task_inner,
-                        &messaging,
-                        &target,
-                    )
-                    .await
-                    {
-                        Err(
-                            crate::attention_resolution::AttentionActionError::ResolutionInProgress,
-                        ) => return,
-                        result => result,
-                    }
+                    // Test-only coordination seam. Production has no pause
+                    // installed here, so the next revalidation proceeds
+                    // without test coordination.
+                    delivery::inject_pause(&task_inner, "force_submit_after_resolution_release")
+                        .await;
+                    continue;
                 }
-                result => result,
+                result => break result,
             };
+        };
         match result {
             Ok(_) => delivery::admin_notify(
                 &task_inner,
