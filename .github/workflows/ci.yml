@@ -116,6 +116,9 @@ jobs:
       - name: formatting
         if: ${{ needs.classify.outputs.rust == 'true' }}
         run: cargo fmt --all --check
+      - name: release evidence topology
+        if: ${{ needs.classify.outputs.rust == 'true' }}
+        run: python3 scripts/ci-release-evidence.py --selftest
       - name: retained performance artifact contract
         if: ${{ needs.classify.outputs.performance_runner == 'true' }}
         run: python3 scripts/ci-performance.py --selftest
