@@ -512,6 +512,114 @@ pub(crate) fn cached_notification_observation(
         .map(NotificationObservation::from_entry)
 }
 
+/// Immutable runtime facts used to compose one pane in a status snapshot.
+///
+/// Status and the shared attention register need the observation result, not
+/// fusion's cache layout. Keeping this value here also makes a stale verdict
+/// conservative in one place: its last known state may still describe work a
+/// human must clear, but it can never authorize a write or exact composer
+/// ownership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PaneStatusObservation {
+    pub(crate) manifest: Option<String>,
+    pub(crate) state: AgentState,
+    pub(crate) state_ms: u64,
+    pub(crate) write_ready: bool,
+    pub(crate) write_block: Option<String>,
+    pub(crate) unknown_reason: Option<cyclops_proto::UnknownReason>,
+    pub(crate) working_confirmed: bool,
+    pub(crate) composer: PaneComposerStatusObservation,
+    pub(crate) agent: Option<crate::identity::ProcId>,
+    binding: Option<Binding>,
+}
+
+/// Content-free composer facts from the same observation as pane state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PaneComposerStatusObservation {
+    pub(crate) state: ComposerState,
+    pub(crate) proof: ComposerProof,
+    pub(crate) notification_attempt: Option<NotificationAttemptId>,
+    pub(crate) reason: Option<String>,
+    pub(crate) candidate_count: u32,
+    binding: Option<Binding>,
+}
+
+impl PaneComposerStatusObservation {
+    pub(crate) fn notification_evidence(
+        &self,
+        recipient: RecipientKey,
+    ) -> Option<cyclops_proto::NotificationBinding> {
+        self.binding.as_ref()?.notification_evidence(recipient)
+    }
+}
+
+impl PaneStatusObservation {
+    fn from_entry(entry: &DetEntry) -> Self {
+        let composer = PaneComposerStatusObservation {
+            state: entry.composer.state,
+            proof: entry.composer.proof,
+            notification_attempt: entry.composer.notification_attempt,
+            reason: entry.composer.reason.map(str::to_string),
+            candidate_count: entry.composer.candidate_count,
+            binding: entry.composer.binding.clone(),
+        };
+        Self {
+            manifest: entry.manifest.clone(),
+            state: entry.detection.state,
+            state_ms: entry.since.elapsed().as_millis() as u64,
+            write_ready: entry.detection.write_ready,
+            write_block: entry.detection.write_block.clone(),
+            unknown_reason: entry.detection.unknown_reason.clone(),
+            working_confirmed: entry.working_confirmed,
+            composer,
+            agent: entry.agent,
+            binding: entry.binding.clone(),
+        }
+    }
+
+    /// Project a cached observation against the pane root visible now.
+    ///
+    /// A proven different generation rejects the predecessor. An unreadable
+    /// current generation preserves last-known state for attention while
+    /// revoking every positive fact tied to the prior process. An observation
+    /// without a complete binding remains useful as an explicitly unknown or
+    /// unsupported runtime fact, but never gains write authority here.
+    pub(crate) fn for_pane_root(&self, current: Option<crate::identity::ProcId>) -> Option<Self> {
+        match (self.binding.as_ref(), current) {
+            (Some(binding), Some(current)) if binding.pane_root != current => None,
+            (_, Some(_)) => Some(self.clone()),
+            // An unreadable process generation is doubt, not proof that the
+            // pane changed hands. Keep the last-known state so a blocked pane
+            // stays visible, while withdrawing every generation-specific
+            // positive fact.
+            (_, None) => {
+                let mut uncertain = self.clone();
+                uncertain.write_ready = false;
+                uncertain.write_block = Some("pane_root_unproven".to_string());
+                uncertain.working_confirmed = false;
+                uncertain.agent = None;
+                uncertain.binding = None;
+                uncertain.composer.state = ComposerState::ComposerAmbiguous;
+                uncertain.composer.proof = ComposerProof::Unprovable;
+                uncertain.composer.binding = None;
+                uncertain.composer.reason = Some("binding_unprovable".to_string());
+                Some(uncertain)
+            }
+        }
+    }
+}
+
+/// Snapshot every status-relevant pane observation under one short cache lock.
+pub(crate) fn pane_status_observations(inner: &Inner) -> HashMap<PaneKey, PaneStatusObservation> {
+    inner
+        .detections
+        .lock()
+        .expect("detections lock")
+        .iter()
+        .map(|(pane, entry)| (pane.clone(), PaneStatusObservation::from_entry(entry)))
+        .collect()
+}
+
 pub(crate) fn schedule_lifecycle_recheck(inner: &Arc<Inner>, pane: &PaneKey) {
     if *inner.stop.borrow() {
         return;
@@ -5006,6 +5114,70 @@ mod tests {
         assert!(observation.can_decide_notification_now(false));
         assert!(!observation.write_ready_for(false, &binding));
         assert!(!observation.can_decide_notification_now(true));
+    }
+
+    #[test]
+    fn stale_status_keeps_human_attention_but_refuses_write_and_composer_authority() {
+        let binding = notification_binding(200);
+        let mut entry = notification_entry(AgentState::BlockedPermission, &binding);
+        entry.detection.stale = true;
+        entry.detection = entry.detection.clone().stamped(false, entry.hold);
+        entry.composer = ComposerProjection::default();
+
+        let observation = PaneStatusObservation::from_entry(&entry);
+        let observation = observation
+            .for_pane_root(None)
+            .expect("unprovable root preserves last-known status");
+        assert!(
+            observation.state.is_blocked(),
+            "last-known blocked evidence must remain visible to the one attention rule"
+        );
+        assert!(!observation.write_ready);
+        assert_eq!(observation.composer.state, ComposerState::ComposerAmbiguous);
+        assert_eq!(observation.composer.proof, ComposerProof::Unprovable);
+        assert!(
+            observation.composer.binding.is_none(),
+            "stale composer evidence cannot cross as an exact binding"
+        );
+    }
+
+    #[test]
+    fn status_observation_does_not_cross_a_process_generation_change() {
+        let binding = notification_binding(200);
+        let current_root = binding.pane_root;
+        let mut entry = notification_entry(AgentState::Working, &binding);
+        entry.working_confirmed = true;
+        entry.composer = ComposerProjection {
+            state: ComposerState::CyclopsNotificationStaged,
+            proof: ComposerProof::ExactNotification,
+            notification_attempt: None,
+            reason: None,
+            candidate_count: 1,
+            binding: Some(binding.clone()),
+        };
+        let observation = PaneStatusObservation::from_entry(&entry);
+
+        assert!(observation.for_pane_root(Some(current_root)).is_some());
+        assert!(
+            observation
+                .for_pane_root(Some(crate::identity::ProcId {
+                    pid: current_root.pid,
+                    birth: current_root.birth + 1,
+                }))
+                .is_none(),
+            "a reused pane-root pid cannot inherit the prior generation's status"
+        );
+
+        let uncertain = observation
+            .for_pane_root(None)
+            .expect("an unreadable process is doubt, not replacement proof");
+        assert_eq!(uncertain.state, AgentState::Working);
+        assert!(!uncertain.write_ready);
+        assert!(!uncertain.working_confirmed);
+        assert!(uncertain.agent.is_none());
+        assert!(uncertain.composer.binding.is_none());
+        assert_eq!(uncertain.composer.state, ComposerState::ComposerAmbiguous);
+        assert_eq!(uncertain.composer.proof, ComposerProof::Unprovable);
     }
 
     const FIXTURE: &str = r#"

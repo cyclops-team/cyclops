@@ -1952,9 +1952,10 @@ fn status_result_with_refresh(
     let mut diagnostics =
         crate::deadlock::status_diagnostics(messaging_status.deadlock_candidates());
     diagnostics.extend(inner.engine.notification_worker_diagnostics());
-    // Status joins durable notification state below. Clone the content-free
-    // fusion stamps first so no journal read runs under the detection lock.
-    let detections = inner.detections.lock().expect("detections lock").clone();
+    // Status joins durable notification state below. Snapshot typed,
+    // content-free fusion facts first so no journal read runs under the
+    // observation cache lock and this adapter never learns its representation.
+    let pane_observations = fusion::pane_status_observations(inner);
     let sessions = inner
         .active_session_slots()
         .into_iter()
@@ -1978,7 +1979,6 @@ fn status_result_with_refresh(
                     .map(|r| {
                         let pane = crate::PaneKey::new(session_idx, &r.pane_id);
                         let refresh_incomplete = incomplete_refreshes.contains(&pane);
-                        let entry = detections.get(&pane);
                         let recipient = instance_id.and_then(|instance_id| {
                             Some(RecipientKey::agent(
                                 inner.workspace_id,
@@ -1986,8 +1986,13 @@ fn status_result_with_refresh(
                                 r.pane_id.parse().ok()?,
                             ))
                         });
-                        let pane_root = identity::ProcId::of(r.pane_pid)
+                        let observed_root = identity::ProcId::of(r.pane_pid);
+                        let pane_root = observed_root
                             .and_then(|root| ProcessInstanceId::new(root.pid, root.birth).ok());
+                        let observation = pane_observations
+                            .get(&pane)
+                            .and_then(|observation| observation.for_pane_root(observed_root));
+                        let observation = observation.as_ref();
                         let adoption = recipient.and_then(|recipient| {
                             adoptions.iter().find(|adoption| {
                                 adoption.recipient == Some(recipient)
@@ -1996,41 +2001,37 @@ fn status_result_with_refresh(
                         });
                         let mut ps = r.to_status(
                             adoption.map(|adoption| adoption.label.clone()),
-                            entry.and_then(|e| e.manifest.clone()),
-                            entry
-                                .map(|e| e.detection.state)
+                            observation.and_then(|e| e.manifest.clone()),
+                            observation
+                                .map(|e| e.state)
                                 .unwrap_or(cyclops_proto::AgentState::Unknown),
                         );
                         // How long the pane has been in that state, from
                         // the change mark fusion keeps. The roster's
                         // elapsed column is this number and nothing else.
-                        ps.state_ms = entry.map(|e| e.since.elapsed().as_millis() as u64);
+                        ps.state_ms = observation.map(|e| e.state_ms);
                         // The second answer, carried from the same stamp
                         // the gate obeys. A pane with no cached detection
                         // has nothing behind it, so it stays refused.
-                        ps.write_ready = entry.is_some_and(|e| e.detection.write_ready);
-                        ps.write_block = entry.and_then(|e| e.detection.write_block.clone());
+                        ps.write_ready = observation.is_some_and(|e| e.write_ready);
+                        ps.write_block = observation.and_then(|e| e.write_block.clone());
                         // From the same cached verdict as the state itself,
                         // so the word and the reason for it can never come
                         // from two different moments.
-                        ps.unknown_reason = entry.and_then(|e| e.detection.unknown_reason.clone());
+                        ps.unknown_reason = observation.and_then(|e| e.unknown_reason.clone());
                         ps.working_confirmed = (ps.state == cyclops_proto::AgentState::Working)
-                            .then_some(entry.is_some_and(|e| e.working_confirmed));
+                            .then_some(observation.is_some_and(|e| e.working_confirmed));
                         ps.unread =
                             recipient.and_then(|recipient| messaging_status.unread_for(recipient));
-                        if let Some(entry) = entry {
-                            ps.composer = entry.composer.state;
-                            ps.composer_proof = entry.composer.proof;
-                            ps.notification_attempt = entry.composer.notification_attempt;
-                            ps.composer_reason = entry.composer.reason.map(str::to_string);
-                            ps.composer_candidates = entry.composer.candidate_count;
+                        if let Some(observation) = observation {
+                            ps.composer = observation.composer.state;
+                            ps.composer_proof = observation.composer.proof;
+                            ps.notification_attempt = observation.composer.notification_attempt;
+                            ps.composer_reason = observation.composer.reason.clone();
+                            ps.composer_candidates = observation.composer.candidate_count;
                         }
                         let binding = recipient.and_then(|recipient| {
-                            entry?
-                                .composer
-                                .binding
-                                .as_ref()?
-                                .notification_evidence(recipient)
+                            observation?.composer.notification_evidence(recipient)
                         });
                         let composer_status = messaging_status.composer_status(
                             recipient,
@@ -2071,14 +2072,14 @@ fn status_result_with_refresh(
                         // the detection lock across all of it. A pane that
                         // changes hands is republished by the recompute
                         // its own output triggers.
-                        let bound = entry.and_then(|e| e.manifest.as_deref());
+                        let bound = observation.and_then(|e| e.manifest.as_deref());
                         ps.hooks_verified = bound.and_then(|m| {
                             crate::selftest::hooks_verified_for(
                                 inner,
                                 &pane,
                                 adoption.is_some(),
                                 Some(m),
-                                entry.and_then(|e| e.agent),
+                                observation.and_then(|e| e.agent),
                             )
                         });
                         // The manifest's own display name, from the same
@@ -4844,8 +4845,13 @@ mod tests {
             .0;
         assert!(status.contains("messaging.status_snapshot("));
         assert!(status.contains("messaging_status.composer_status("));
+        assert!(status.contains("fusion::pane_status_observations(inner)"));
         for forbidden in [
             "inner.mailbox",
+            "inner.detections",
+            "DetEntry",
+            ".detection.",
+            "ComposerProjection",
             "ActiveComposerNotification",
             "ExactOwnedRecoveryAction",
             "active_composer_notifications_snapshot",
