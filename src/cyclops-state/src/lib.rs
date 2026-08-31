@@ -9,6 +9,12 @@
 //! relative to its open descriptor, refuses links and unexpected file types,
 //! and validates ownership before changing permissions or exposing bytes.
 
+pub mod coordinator_config;
+pub use coordinator_config::{
+    load_coordinator_config, parse_coordinator_document, parse_coordinator_values,
+    CoordinatorConfig, CoordinatorConfigDocument, CoordinatorConfigError, COORDINATOR_CONFIG_FILE,
+};
+
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{File, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};

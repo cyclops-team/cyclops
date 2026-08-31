@@ -143,13 +143,14 @@ fn check_name(name: &str) -> Result<(), String> {
 // Config
 // ---------------------------------------------------------------------------
 
-/// The config values these verbs need, read tolerantly.
+/// The config values these verbs need.
 ///
 /// This launcher owns `default_workspace`: it parses that key when a
 /// workspace command begins, supplies the fallback order below, and writes
 /// the first-run value. The shared file also carries coordinator settings
-/// needed to construct a workspace on the daemon's tmux server; the daemon
-/// owns their runtime validation.
+/// needed to construct a workspace on the daemon's tmux server. Those three
+/// settings are accepted only by the shared safety boundary, before a CLI
+/// command can select tmux's ambient server.
 pub struct Settings {
     /// `sessions`, in order.
     pub sessions: Vec<String>,
@@ -163,40 +164,24 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn read(home: &Path) -> Settings {
-        let mut s = Settings {
-            sessions: Vec::new(),
+    pub fn read(home: &Path) -> Result<Settings, String> {
+        let document = cyclops_state::load_coordinator_config(home)
+            .map_err(|error| format!("read {}: {error}", config_path(home).display()))?;
+        let mut settings = Settings {
+            sessions: document.coordinator.sessions,
             default_workspace: None,
-            server: Server::default(),
-            exists: false,
+            server: Server {
+                socket: document.coordinator.tmux_socket,
+                config_file: document.coordinator.tmux_config,
+            },
+            exists: document.exists,
         };
-        let Ok(text) = std::fs::read_to_string(config_path(home)) else {
-            return s;
-        };
-        s.exists = true;
-        let Ok(table) = text.parse::<toml::Table>() else {
-            return s;
-        };
-        if let Some(list) = table.get("sessions").and_then(toml::Value::as_array) {
-            s.sessions = list
-                .iter()
-                .filter_map(toml::Value::as_str)
-                .map(str::to_string)
-                .collect();
-        }
-        s.default_workspace = table
+        settings.default_workspace = document
+            .table
             .get("default_workspace")
             .and_then(toml::Value::as_str)
             .map(str::to_string);
-        s.server.socket = table
-            .get("tmux_socket")
-            .and_then(toml::Value::as_str)
-            .map(str::to_string);
-        s.server.config_file = table
-            .get("tmux_config")
-            .and_then(toml::Value::as_str)
-            .map(PathBuf::from);
-        s
+        Ok(settings)
     }
 
     /// Which workspace a bare `cyclops start` means: the explicit ask, the
@@ -216,20 +201,20 @@ impl Settings {
 
 /// Bind a semantic pane-focus request to this launcher's configured server.
 #[cfg(feature = "full-ui")]
-pub fn focus_adapter(home: &Path) -> cyclops_ui::FocusPane {
-    let server = Settings::read(home).server;
-    cyclops_ui::FocusPane::new(move |target| {
+pub fn focus_adapter(home: &Path) -> Result<cyclops_ui::FocusPane, String> {
+    let server = Settings::read(home)?.server;
+    Ok(cyclops_ui::FocusPane::new(move |target| {
         cyclops_tmux::focus_pane(
             server.socket.as_deref(),
             server.config_file.as_deref(),
             target,
         )
         .map_err(|error| error.to_string())
-    })
+    }))
 }
 
 pub fn config_path(home: &Path) -> PathBuf {
-    home.join("config.toml")
+    home.join(cyclops_state::COORDINATOR_CONFIG_FILE)
 }
 
 /// The size to build a detached session at: this terminal's, when there
@@ -712,7 +697,13 @@ pub fn run_start(
     start_daemon: bool,
 ) -> i32 {
     let home = cyclops_proto::cyclops_home();
-    let settings = Settings::read(&home);
+    let settings = match Settings::read(&home) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
 
     // 1.
     let name = settings.workspace_name(asked);
@@ -1116,7 +1107,13 @@ fn prepare_home(
 /// and because a machine without tmux should still finish installing.
 pub fn run_setup(json_out: bool, style: &Style, wire_hooks: bool) -> i32 {
     let home = cyclops_proto::cyclops_home();
-    let settings = Settings::read(&home);
+    let settings = match Settings::read(&home) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
     // The session the config will name. `start` with no arguments opens
     // this same one, so the config this writes is the config that run wants.
     let session = settings.workspace_name(None);
@@ -1478,7 +1475,13 @@ fn keep_names(
 ///    names only when somebody could answer for them.
 pub fn run_save(json_out: bool, style: &Style, name: Option<&str>, session: Option<&str>) -> i32 {
     let home = cyclops_proto::cyclops_home();
-    let settings = Settings::read(&home);
+    let settings = match Settings::read(&home) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
     // The session to read is the default workspace's unless --session
     // says otherwise. The positional argument names the FILE, so
     // `cyclops workspace save review-setup` saves the session you are in
@@ -1611,7 +1614,13 @@ pub fn run_restore(
     launch: bool,
 ) -> i32 {
     let home = cyclops_proto::cyclops_home();
-    let settings = Settings::read(&home);
+    let settings = match Settings::read(&home) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
     let name = settings.workspace_name(name);
     let session = session.map(str::to_string).unwrap_or_else(|| name.clone());
     for n in [&name, &session] {
@@ -2595,9 +2604,51 @@ mod tests {
         )
         .expect("write config");
 
-        assert_eq!(Settings::read(&home).workspace_name(None), "watched");
+        assert_eq!(
+            Settings::read(&home)
+                .expect("valid coordinator settings")
+                .workspace_name(None),
+            "watched"
+        );
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn coordinator_settings_keep_a_valid_nondefault_tmux_server() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-settings-configured-server");
+        let _ = std::fs::remove_dir_all(&home);
+        StateRoot::open_or_create(&home)
+            .expect("create safe home")
+            .replace_file(
+                Path::new("config.toml"),
+                b"sessions = [\"main\"]\ntmux_socket = \"configured\"\ntmux_config = \"/dev/null\"\n",
+            )
+            .expect("write safe config");
+
+        let settings = Settings::read(&home).expect("valid settings");
+        assert_eq!(settings.sessions, ["main"]);
+        assert_eq!(settings.server.socket.as_deref(), Some("configured"));
+        assert_eq!(
+            settings.server.config_file.as_deref(),
+            Some(Path::new("/dev/null"))
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn malformed_coordinator_config_refuses_before_workspace_can_default_tmux() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-settings-malformed-config");
+        let _ = std::fs::remove_dir_all(&home);
+        StateRoot::open_or_create(&home)
+            .expect("create safe home")
+            .replace_file(Path::new("config.toml"), b"tmux_socket = [")
+            .expect("write malformed config");
+
+        assert!(Settings::read(&home).is_err());
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
