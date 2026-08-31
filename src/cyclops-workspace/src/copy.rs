@@ -102,6 +102,53 @@ pub fn workspace_close_unconfirmed(name: &str, error: &dyn std::fmt::Display) ->
     format!("close not confirmed for workspace {name}: {error}; refreshing workspace state")
 }
 
+pub const WORKSPACE_CREATE_CONTROL_RECONNECTING: &str =
+    "new session is unavailable while the tmux connection is recovering";
+pub const WORKSPACE_CREATE_CONTROL_DISCONNECTED: &str =
+    "new session is unavailable because the tmux connection is no longer live";
+pub const WORKSPACE_CREATE_STATE_REFRESHING: &str =
+    "new session was not started while workspace state refreshes";
+pub const WORKSPACE_CREATE_ROUTE_STALE: &str =
+    "new session was not started because the active pane is no longer current; refreshing workspace state";
+
+pub fn workspace_create_folder_unavailable(error: &dyn std::fmt::Display) -> String {
+    format!(
+        "new session was not started because Cyclops could not read the active pane's directory: {error}; refreshing workspace state"
+    )
+}
+
+pub fn workspace_create_default_folder_unavailable(error: &dyn std::fmt::Display) -> String {
+    format!(
+        "new session was not started because Cyclops could not determine a default folder: {error}; refreshing workspace state"
+    )
+}
+
+pub fn workspace_create_unconfirmed(name: &str, error: &dyn std::fmt::Display) -> String {
+    format!("creation not confirmed for session {name}: {error}; refreshing workspace state")
+}
+
+pub fn workspace_switch_rejected(name: &str, error: &dyn std::fmt::Display) -> String {
+    format!(
+        "session {name} was created, but tmux did not switch to it: {error}; refreshing workspace state"
+    )
+}
+
+pub fn workspace_switch_unconfirmed(
+    name: &str,
+    switch_error: &dyn std::fmt::Display,
+    probe_error: &dyn std::fmt::Display,
+) -> String {
+    format!(
+        "session {name} was created, but switching to it was not confirmed: {switch_error}; Cyclops could not read tmux's current session: {probe_error}; refreshing workspace state"
+    )
+}
+
+pub fn workspace_switch_settling(name: &str, error: &dyn std::fmt::Display) -> String {
+    format!(
+        "session {name} was created; the switch response was uncertain: {error}; tmux then reported its current session, so the workspace is refreshing"
+    )
+}
+
 pub const WORKSPACE_RENAME_CONTROL_RECONNECTING: &str =
     "session rename is unavailable while the tmux connection is recovering";
 pub const WORKSPACE_RENAME_CONTROL_DISCONNECTED: &str =

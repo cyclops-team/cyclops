@@ -38,10 +38,10 @@ use crate::dialog::{
     ViewSwitches,
 };
 use crate::focus::{Decision as FocusDecision, Direction as FocusDirection, Effect as FocusEffect};
-use crate::naming;
 use crate::persist::SidebarTab;
 use crate::split::{Decision as SplitDecision, Effect as SplitEffect, Placement as SplitPlacement};
 use crate::workspace_close::{Decision as CloseDecision, Effect as CloseEffect};
+use crate::workspace_create::Decision as CreateDecision;
 use crate::workspace_rename::{Decision as RenameDecision, Effect as RenameEffect};
 
 /// What the caller must do after one action executed. Every field defaults
@@ -1213,58 +1213,169 @@ async fn select_tab(
     Ok(Outcome::default())
 }
 
-/// Create a workspace named after the focused pane's directory and switch
-/// to it — no prompt, the folder is the name.
+/// Create a workspace from one lifecycle decision, then reconcile tmux's
+/// authoritative result. The model is never patched optimistically.
 async fn new_workspace(app: &mut App, client: &ControlClient) -> Result<Outcome, TmuxError> {
-    let pane = app.model.active_tab().active_pane.clone();
-    let cwd = client
-        .display(&pane, "#{pane_current_path}")
-        .await
-        .map(|p| p.trim().to_string())
-        .unwrap_or_default();
-    let folder = if cwd.is_empty() {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
-    } else {
-        PathBuf::from(cwd)
+    let probe =
+        match crate::workspace_create::decide(&app.model, app.link_state, !app.needs_reconcile) {
+            CreateDecision::Probe(probe) => probe,
+            CreateDecision::Refresh => {
+                app.notice.show(
+                    crate::copy::WORKSPACE_CREATE_ROUTE_STALE,
+                    tokio::time::Instant::now(),
+                );
+                return Ok(Outcome::reconcile());
+            }
+            CreateDecision::Refused(crate::workspace_create::Refusal::Reconnecting) => {
+                app.notice.show(
+                    crate::copy::WORKSPACE_CREATE_CONTROL_RECONNECTING,
+                    tokio::time::Instant::now(),
+                );
+                return Ok(Outcome::default());
+            }
+            CreateDecision::Refused(crate::workspace_create::Refusal::ServerGone) => {
+                app.notice.show(
+                    crate::copy::WORKSPACE_CREATE_CONTROL_DISCONNECTED,
+                    tokio::time::Instant::now(),
+                );
+                return Ok(Outcome::default());
+            }
+            CreateDecision::Refused(crate::workspace_create::Refusal::Refreshing) => {
+                app.notice.show(
+                    crate::copy::WORKSPACE_CREATE_STATE_REFRESHING,
+                    tokio::time::Instant::now(),
+                );
+                return Ok(Outcome::reconcile());
+            }
+        };
+
+    let observed_folder = match client.pane_current_path(&probe.pane_id).await {
+        Ok(Some(folder)) => folder,
+        Ok(None) => {
+            app.reconcile_session_id = None;
+            app.notice.show(
+                crate::copy::WORKSPACE_CREATE_ROUTE_STALE,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::reconcile());
+        }
+        Err(error) => {
+            super::log_err(&app.home, &error.to_string());
+            app.reconcile_session_id = None;
+            app.notice.show(
+                crate::copy::workspace_create_folder_unavailable(&error),
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::reconcile());
+        }
     };
-    let taken: Vec<String> = app
-        .model
-        .workspaces
-        .iter()
-        .map(|w| w.name.clone())
-        .collect();
-    let name = naming::unique_session_name(&naming::session_name_from_folder(&folder), &taken);
-    let session_id = client.new_session(&name, &folder).await?;
-    client.switch_to_session(&name).await?;
-    if !app.prefs.folder_tracked.contains(&session_id) {
-        app.prefs.folder_tracked.push(session_id);
+    let folder = if observed_folder.is_empty() {
+        match std::env::current_dir() {
+            Ok(folder) => folder,
+            Err(error) => {
+                super::log_err(&app.home, &error.to_string());
+                app.reconcile_session_id = None;
+                app.notice.show(
+                    crate::copy::workspace_create_default_folder_unavailable(&error),
+                    tokio::time::Instant::now(),
+                );
+                return Ok(Outcome::reconcile());
+            }
+        }
+    } else {
+        PathBuf::from(observed_folder)
+    };
+    let effect = crate::workspace_create::prepare(probe, folder);
+    let session_id = match client.new_session(&effect.name, &effect.folder).await {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            super::log_err(&app.home, &error.to_string());
+            app.reconcile_session_id = None;
+            app.notice.show(
+                crate::copy::workspace_create_unconfirmed(&effect.name, &error),
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::reconcile());
+        }
+    };
+
+    // The id proves creation even if the following switch fails or becomes
+    // uncertain. Persist that durable fact before attempting the transition.
+    crate::workspace_create::settle(&effect, &session_id, &mut app.prefs);
+    if let Err(error) = client.switch_to_session(&session_id).await {
+        super::log_err(&app.home, &error.to_string());
+        if !switch_result_is_uncertain(&error) {
+            app.reconcile_session_id = None;
+            app.notice.show(
+                crate::copy::workspace_switch_rejected(&effect.name, &error),
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome {
+                reconcile: true,
+                persist: true,
+                ..Outcome::default()
+            });
+        }
+        let current_session = client.current_session_id().await;
+        if let Err(probe_error) = &current_session {
+            super::log_err(&app.home, &probe_error.to_string());
+        }
+        return Ok(settle_uncertain_workspace_switch(
+            app,
+            &effect.name,
+            &error,
+            current_session,
+        ));
     }
-    // Land the new row directly under whichever workspace was active when
-    // the operator asked for it, instead of wherever tmux's own session
-    // ordering happens to put it (often above). Rewritten wholesale from
-    // the model's current names — the same move `reorder_workspace` makes
-    // for a drag — because sidebar order lives only in preferences, and
-    // the reconcile this Outcome triggers re-applies that order over
-    // whatever tmux just handed back.
-    let mut order: Vec<String> = app
-        .model
-        .workspaces
-        .iter()
-        .map(|w| w.name.clone())
-        .collect();
-    let insert_at = app
-        .model
-        .workspaces
-        .get(app.model.active_workspace)
-        .map(|_| app.model.active_workspace + 1)
-        .unwrap_or(order.len());
-    order.insert(insert_at, name);
-    app.prefs.workspace_order = order;
+    app.reconcile_session_id = Some(session_id);
     Ok(Outcome {
         reconcile: true,
         persist: true,
         ..Outcome::default()
     })
+}
+
+/// `Command` is tmux's explicit `%error`, while `Io`, `Busy`, and `Protocol`
+/// stop before the command reaches tmux. Every other adapter error can leave
+/// the switch's effect unknown and must be reconciled from tmux's current
+/// state.
+fn switch_result_is_uncertain(error: &TmuxError) -> bool {
+    !matches!(
+        error,
+        TmuxError::Command(_) | TmuxError::Io(_) | TmuxError::Busy | TmuxError::Protocol(_)
+    )
+}
+
+/// Settle a switch whose command may have reached tmux. The caller supplies
+/// the one follow-up state read so this function can be tested without timing
+/// a control-mode server.
+fn settle_uncertain_workspace_switch(
+    app: &mut App,
+    name: &str,
+    switch_error: &TmuxError,
+    current_session: Result<String, TmuxError>,
+) -> Outcome {
+    match current_session {
+        Ok(current_session_id) => {
+            app.reconcile_session_id = Some(current_session_id);
+            app.notice.show(
+                crate::copy::workspace_switch_settling(name, switch_error),
+                tokio::time::Instant::now(),
+            );
+        }
+        Err(probe_error) => {
+            app.reconcile_session_id = None;
+            app.notice.show(
+                crate::copy::workspace_switch_unconfirmed(name, switch_error, &probe_error),
+                tokio::time::Instant::now(),
+            );
+        }
+    }
+    Outcome {
+        reconcile: true,
+        persist: true,
+        ..Outcome::default()
+    }
 }
 
 /// Decide and perform one confirmed workspace rename. The model remains a
@@ -3181,17 +3292,19 @@ mod tests {
         ]);
         let pane = pane_ids(&server, "host")[0].clone();
         let client = rig_client(&server, "host").await;
-        // "host" (the active tab's own session) sits first, with "alpha" and
-        // "beta" trailing behind it — but the active row is moved to
-        // "alpha", the middle of the three, so the splice target is neither
-        // the first nor the last row in the list.
+        // "host" is both the active tab's session and the middle sidebar row,
+        // so the snapshot stays coherent while proving that the splice target
+        // is neither the first nor the last row in the list.
         let mut model = one_tab_model("host", "@0", &pane, "$host");
-        model.workspaces.push(WorkspaceRow {
-            session_id: "$alpha".into(),
-            name: "alpha".into(),
-            tab_count: 1,
-            window_ids: Vec::new(),
-        });
+        model.workspaces.insert(
+            0,
+            WorkspaceRow {
+                session_id: "$alpha".into(),
+                name: "alpha".into(),
+                tab_count: 1,
+                window_ids: Vec::new(),
+            },
+        );
         model.workspaces.push(WorkspaceRow {
             session_id: "$beta".into(),
             name: "beta".into(),
@@ -3210,16 +3323,181 @@ mod tests {
         assert_eq!(
             app.prefs.workspace_order,
             vec![
-                "host".to_string(),
                 "alpha".to_string(),
+                "host".to_string(),
                 folder_name,
                 "beta".to_string(),
             ],
-            "the new row belongs directly after the active workspace (alpha), not at the front or back of the list"
+            "the new row belongs directly after the active workspace (host), not at the front or back of the list"
         );
 
         client.shutdown().await;
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[tokio::test]
+    async fn new_workspace_refuses_disconnected_and_refreshing_state_without_touching_tmux() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-new-workspace-refusals");
+        server.run_ok(&["new-session", "-d", "-s", "host", "/bin/sh"]);
+        let pane = pane_ids(&server, "host")[0].clone();
+        let client = rig_client(&server, "host").await;
+        let model = one_tab_model("host", "@0", &pane, "$host");
+        let mut app = test_app(model, scratch_home("exec-new-workspace-refusals-home"));
+
+        app.link_state = LinkState::Reconnecting { attempt: 1 };
+        let recovering = execute(&mut app, &client, Action::NewWorkspace)
+            .await
+            .expect("reconnecting refusal");
+        assert!(!recovering.reconcile);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::WORKSPACE_CREATE_CONTROL_RECONNECTING)
+        );
+
+        app.link_state = LinkState::ServerGone;
+        let disconnected = execute(&mut app, &client, Action::NewWorkspace)
+            .await
+            .expect("disconnected refusal");
+        assert!(!disconnected.reconcile);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::WORKSPACE_CREATE_CONTROL_DISCONNECTED)
+        );
+
+        app.link_state = LinkState::Live;
+        app.needs_reconcile = true;
+        let refreshing = execute(&mut app, &client, Action::NewWorkspace)
+            .await
+            .expect("refreshing refusal");
+        assert!(refreshing.reconcile);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::WORKSPACE_CREATE_STATE_REFRESHING)
+        );
+
+        assert_eq!(
+            String::from_utf8_lossy(
+                &server
+                    .run(&["list-sessions", "-F", "#{session_name}"])
+                    .stdout
+            )
+            .lines()
+            .collect::<Vec<_>>(),
+            vec!["host"],
+            "refusals must not create another session"
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn new_workspace_refuses_an_unreadable_focused_pane_without_falling_back() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-new-workspace-unreadable-pane");
+        server.run_ok(&["new-session", "-d", "-s", "host", "/bin/sh"]);
+        let client = rig_client(&server, "host").await;
+        let mut model = crate::sync::fetch_workspace_model(&client, "host")
+            .await
+            .expect("initial authoritative model");
+        // This is the model a just-vanished pane leaves behind: its exact id
+        // is still the focused route, but tmux cannot expand it anymore.
+        let vanished_pane = "%999999".to_string();
+        let active_tab = model.session.active_tab;
+        model.session.tabs[active_tab]
+            .active_pane
+            .clone_from(&vanished_pane);
+        assert_eq!(
+            client
+                .pane_current_path(&vanished_pane)
+                .await
+                .expect("target probe"),
+            None,
+            "tmux reports an absent pane as a blank successful expansion"
+        );
+        let home = scratch_home("exec-new-workspace-unreadable-pane-home");
+        let mut app = test_app(model, home.clone());
+
+        // The failed read must stop before `new-session`. A creation fallback
+        // here would use Cyclops' own cwd and create a session in the wrong
+        // project.
+        let outcome = execute(&mut app, &client, Action::NewWorkspace)
+            .await
+            .expect("unreadable folder probe settles visibly");
+
+        assert!(outcome.reconcile);
+        assert!(!outcome.persist, "no session identity was confirmed");
+        assert!(app.prefs.folder_tracked.is_empty());
+        assert!(app.prefs.workspace_order.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(
+                &server
+                    .run(&["list-sessions", "-F", "#{session_name}"])
+                    .stdout
+            )
+            .lines()
+            .collect::<Vec<_>>(),
+            vec!["host"],
+            "a failed folder probe must not create a session from the process cwd"
+        );
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::WORKSPACE_CREATE_ROUTE_STALE)
+        );
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn known_switch_failures_do_not_require_a_current_session_probe() {
+        assert!(!switch_result_is_uncertain(&TmuxError::Command(
+            "can't find session".into()
+        )));
+        assert!(!switch_result_is_uncertain(&TmuxError::Io(
+            std::io::Error::other("control command was not written")
+        )));
+        assert!(!switch_result_is_uncertain(&TmuxError::Busy));
+        assert!(!switch_result_is_uncertain(&TmuxError::Protocol(
+            "newline refused".into()
+        )));
+        assert!(switch_result_is_uncertain(&TmuxError::Timeout(
+            "switch-client -t '$2'".into()
+        )));
+    }
+
+    #[test]
+    fn timed_out_post_write_workspace_switch_reconciles_from_observed_tmux_state() {
+        // This is a local simulation of the adapter's post-write timeout
+        // result. It exercises recovery without adding a server-timing sleep:
+        // the only authoritative fact after that timeout is the follow-up
+        // current-session read.
+        let home = scratch_home("exec-new-workspace-timeout-recovery-home");
+        let mut app = test_app(one_tab_model("host", "@0", "%0", "$host"), home.clone());
+        let timeout = TmuxError::Timeout("switch-client -t '$created'".into());
+
+        let outcome = settle_uncertain_workspace_switch(
+            &mut app,
+            "created",
+            &timeout,
+            Ok("$actually-current".into()),
+        );
+
+        assert!(outcome.reconcile);
+        assert!(outcome.persist, "the created session identity was retained");
+        assert_eq!(
+            app.reconcile_session_id.as_deref(),
+            Some("$actually-current"),
+            "reconciliation follows tmux's observed current session, not a guessed switch target"
+        );
+        let notice = app.notice.text().expect("uncertainty is visible");
+        assert!(notice.contains("tmux reply timeout"));
+        assert!(notice.contains("tmux then reported its current session"));
+
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[tokio::test]
