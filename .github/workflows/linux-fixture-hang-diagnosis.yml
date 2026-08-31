@@ -1,0 +1,157 @@
+name: Linux fixture cleanup diagnosis
+
+# This is a one-shot diagnostic aid for PR #174's Ubuntu-only hang. It runs
+# only after an explicit push of its dedicated diagnostic branch, never for a
+# pull request, and its scope check refuses fixture changes.
+on:
+  push:
+    branches: [beta/ci/linux-fixture-hang-diagnosis]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-fixture-hang-diagnosis-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+  # Each manually dispatched run owns short paths. The captured filesystem
+  # state therefore identifies only this runner's tmux sockets and scratch.
+  CYCLOPS_TEST_TMP: /tmp/cyc-fixture-${{ github.run_id }}-${{ github.run_attempt }}
+  TMUX_TMPDIR: /tmp/cyc-tmux-${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  diagnose:
+    name: diagnose Linux fixture cleanup hang
+    runs-on: ubuntu-latest
+    # Three independently bounded stages can consume 24m45s. Keep enough
+    # runner time for setup, snapshots, and artifact upload after a timeout.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Confirm this is only the PR #174 diagnostic wrapper
+        env:
+          FIXTURE_REVISION: e4315d3baf414b28a8703f7290dc2f56ccb67135
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$FIXTURE_REVISION" HEAD
+          actual_paths="$(git diff --name-only "$FIXTURE_REVISION"..HEAD)"
+          expected_path=.github/workflows/linux-fixture-hang-diagnosis.yml
+          if [ "$actual_paths" != "$expected_path" ]; then
+            echo "This workflow must remain a wrapper around PR #174."
+            echo "Unexpected paths after $FIXTURE_REVISION:"
+            printf '%s\n' "$actual_paths"
+            exit 2
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.100
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Run separately bounded correctness stages
+        env:
+          DIAGNOSTIC_DIR: ${{ runner.temp }}/cyclops-fixture-hang-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          # The normal Ubuntu correctness step completed in five minutes on
+          # the immediately preceding green revision. Eight minutes per stage
+          # is a diagnostic ceiling for cold-cache variance, not a test wait.
+          readonly OUTER_TIMEOUT=8m
+          mkdir -p "$DIAGNOSTIC_DIR" "$CYCLOPS_TEST_TMP" "$TMUX_TMPDIR"
+
+          {
+            echo "fixture revision: e4315d3baf414b28a8703f7290dc2f56ccb67135"
+            echo "checked-out revision: $(git rev-parse HEAD)"
+            echo "tmux: $(tmux -V)"
+            echo "nextest: $(cargo nextest --version)"
+            echo "CYCLOPS_TEST_TMP=$CYCLOPS_TEST_TMP"
+            echo "TMUX_TMPDIR=$TMUX_TMPDIR"
+          } > "$DIAGNOSTIC_DIR/environment.txt"
+
+          capture_snapshot() {
+            local stage_name=$1
+            {
+              echo "stage: $stage_name"
+              date --utc --iso-8601=seconds
+              echo
+              echo "process tree (PID PPID PGID SID STAT ELAPSED COMMAND)"
+              ps -eo pid,ppid,pgid,sid,stat,etime,args --forest || true
+              echo
+              echo "pstree"
+              if command -v pstree >/dev/null; then
+                pstree -ap || true
+              else
+                echo "pstree is unavailable on this runner"
+              fi
+              echo
+              echo "tmux socket tree: $TMUX_TMPDIR"
+              find "$TMUX_TMPDIR" -maxdepth 4 -ls | sort || true
+              echo
+              echo "Cyclops scratch tree: $CYCLOPS_TEST_TMP"
+              find "$CYCLOPS_TEST_TMP" -maxdepth 4 -ls | sort || true
+            } > "$DIAGNOSTIC_DIR/${stage_name}-snapshot.txt" 2>&1
+          }
+
+          run_stage() {
+            local stage_name=$1
+            local pipeline_codes=()
+            shift
+            printf '%q ' "$@" > "$DIAGNOSTIC_DIR/${stage_name}-command.txt"
+            printf '\n' >> "$DIAGNOSTIC_DIR/${stage_name}-command.txt"
+
+            set +e
+            # Do not use --foreground: GNU timeout then owns this stage's
+            # command group. A cleanup owner that deliberately leaves that
+            # group remains visible in the snapshot after a timeout.
+            timeout --verbose --signal=TERM --kill-after=15s "$OUTER_TIMEOUT" "$@" \
+              2>&1 | tee "$DIAGNOSTIC_DIR/${stage_name}.log"
+            pipeline_codes=("${PIPESTATUS[@]}")
+            set -e
+
+            local stage_code=${pipeline_codes[0]}
+            local tee_code=${pipeline_codes[1]}
+            {
+              echo "stage: $stage_name"
+              echo "command exit: $stage_code"
+              echo "tee exit: $tee_code"
+              if [ "$stage_code" = 124 ]; then
+                echo "outer timeout reached"
+              elif [ "$stage_code" = 137 ]; then
+                echo "stage was killed; consult timeout's verbose log"
+              fi
+            } > "$DIAGNOSTIC_DIR/${stage_name}-result.txt"
+
+            if [ "$stage_code" -ne 0 ] || [ "$tee_code" -ne 0 ]; then
+              capture_snapshot "$stage_name"
+              if [ "$stage_code" -ne 0 ]; then
+                return "$stage_code"
+              fi
+              return "$tee_code"
+            fi
+          }
+
+          # Keep the ordinary correctness commands intact, while giving the
+          # build, nextest, and cyclopsd stages independent failure evidence.
+          status=0
+          run_stage build cargo build -p cyclops -p cyclopsd --bins || status=$?
+          run_stage nextest cargo nextest run --workspace \
+            -E 'not (package(cyclopsd) | binary_id(=cyclops-ui::perf) | binary_id(=cyclops-ui::queue_perf) | binary_id(=cyclops-workspace::perf_contract))' \
+            --no-fail-fast || status=$?
+          run_stage cyclopsd cargo test -p cyclopsd --all-targets --no-fail-fast -- --test-threads=4 || status=$?
+          exit "$status"
+      - name: Retain Linux hang diagnostics
+        if: ${{ always() }}
+        env:
+          DIAGNOSTIC_DIR: ${{ runner.temp }}/cyclops-fixture-hang-${{ github.run_id }}-${{ github.run_attempt }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-fixture-hang-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ env.DIAGNOSTIC_DIR }}
+          if-no-files-found: error
+          retention-days: 14
