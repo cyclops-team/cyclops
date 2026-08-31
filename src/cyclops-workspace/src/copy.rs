@@ -89,6 +89,19 @@ pub fn split_unconfirmed(pane: &str, error: &dyn std::fmt::Display) -> String {
     format!("split not confirmed for {pane}: {error}; refreshing workspace state")
 }
 
+pub const WORKSPACE_CLOSE_CONTROL_RECONNECTING: &str =
+    "workspace close is unavailable while the tmux connection is recovering";
+pub const WORKSPACE_CLOSE_CONTROL_DISCONNECTED: &str =
+    "workspace close is unavailable because the tmux connection is no longer live";
+pub const WORKSPACE_CLOSE_STATE_REFRESHING: &str =
+    "workspace close was not started while workspace state refreshes";
+pub const WORKSPACE_CLOSE_ROUTE_STALE: &str =
+    "workspace close was not started because that session is no longer in the current workspace state; refreshing workspace state";
+
+pub fn workspace_close_unconfirmed(name: &str, error: &dyn std::fmt::Display) -> String {
+    format!("close not confirmed for workspace {name}: {error}; refreshing workspace state")
+}
+
 pub const STREAM_RECONCILED: &str = "stream rebuilt from the durable tail";
 
 /// Workspace presentation for the shared Hello compatibility classification.

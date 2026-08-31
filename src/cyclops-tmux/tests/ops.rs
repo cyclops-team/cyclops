@@ -920,6 +920,98 @@ async fn kill_session_closes_exactly_that_session() {
 }
 
 #[tokio::test]
+async fn close_session_uses_the_confirmed_id_after_rename_and_name_reuse() {
+    let Some(srv) = TestServer::new("ops-close-session-id-reuse") else {
+        return;
+    };
+    srv.new_session("host");
+    srv.new_session("target");
+    let target_id = field(&srv, "target", "#{session_id}");
+    let (client, _n) = ControlClient::spawn(srv.config("host"))
+        .await
+        .expect("spawn");
+
+    srv.tmux_ok(&["rename-session", "-t", &target_id, "renamed-target"]);
+    srv.new_session("target");
+    let reused_id = field(&srv, "target", "#{session_id}");
+
+    client
+        .close_session_at(&target_id, None)
+        .await
+        .expect("close the confirmed identity");
+
+    let sessions = lines(
+        &srv,
+        &["list-sessions", "-F", "#{session_id} #{session_name}"],
+    );
+    assert!(
+        !sessions.iter().any(|row| row.starts_with(&target_id)),
+        "the renamed confirmed identity survived: {sessions:?}"
+    );
+    assert!(
+        sessions
+            .iter()
+            .any(|row| row == &format!("{reused_id} target")),
+        "the new session that reused the old name was closed: {sessions:?}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn close_active_session_selects_the_exact_fallback_before_killing() {
+    let Some(srv) = TestServer::new("ops-close-session-fallback") else {
+        return;
+    };
+    srv.new_session("target");
+    srv.new_session("fallback");
+    let target_id = field(&srv, "target", "#{session_id}");
+    let fallback_id = field(&srv, "fallback", "#{session_id}");
+    let (client, _n) = ControlClient::spawn(srv.config("target"))
+        .await
+        .expect("spawn");
+
+    client
+        .close_session_at(&target_id, Some(&fallback_id))
+        .await
+        .expect("switch and close");
+
+    let attached = lines(&srv, &["list-clients", "-F", "#{client_session}"]);
+    assert_eq!(attached, vec!["fallback"]);
+    let sessions = lines(&srv, &["list-sessions", "-F", "#{session_id}"]);
+    assert!(!sessions.contains(&target_id));
+    assert!(sessions.contains(&fallback_id));
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn missing_fallback_refuses_before_the_target_is_closed() {
+    let Some(srv) = TestServer::new("ops-close-session-missing-fallback") else {
+        return;
+    };
+    srv.new_session("target");
+    srv.new_session("fallback");
+    let target_id = field(&srv, "target", "#{session_id}");
+    let fallback_id = field(&srv, "fallback", "#{session_id}");
+    let (client, _n) = ControlClient::spawn(srv.config("target"))
+        .await
+        .expect("spawn");
+    srv.tmux_ok(&["kill-session", "-t", &fallback_id]);
+
+    let error = client
+        .close_session_at(&target_id, Some(&fallback_id))
+        .await
+        .expect_err("the exact fallback is gone");
+
+    assert!(matches!(error, TmuxError::Command(_)), "{error}");
+    let sessions = lines(&srv, &["list-sessions", "-F", "#{session_id}"]);
+    assert!(
+        sessions.contains(&target_id),
+        "target closed after fallback selection failed: {sessions:?}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
 async fn kill_window_closes_the_named_window() {
     let Some(srv) = TestServer::new("ops-kill-window") else {
         return;

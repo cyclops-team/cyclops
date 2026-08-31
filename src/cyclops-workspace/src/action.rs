@@ -259,11 +259,10 @@ pub enum Action {
     /// menu routing resolve here rather than to [`Action::CloseWorkspace`]
     /// directly.
     RequestCloseWorkspace {
-        session: String,
+        session_id: String,
     },
-    CloseWorkspace {
-        session: String,
-    },
+    /// Close the stable workspace identity the operator confirmed.
+    CloseWorkspace(crate::workspace_close::Intent),
     /// Reorder one sidebar workspace row. `session_id` is the stable tmux
     /// session id, not the (renameable) session name, so a reorder started
     /// before a folder-following rename lands on the right row regardless.
@@ -468,7 +467,8 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
         }
         BindingAction::CloseTab => {
             let window_id = ctx.tabs.get(ctx.active_tab)?.window_id.clone();
-            Some(resolve_close_tab(&window_id, ctx.tabs, ctx.session))
+            let workspace = active_workspace(ctx)?;
+            Some(resolve_close_tab(&window_id, ctx.tabs, workspace))
         }
         BindingAction::NextWorkspace => {
             resolve_adjacent_workspace(ctx.workspaces, ctx.active_workspace, 1)
@@ -482,9 +482,10 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
         BindingAction::RenameWorkspace => Some(Action::RequestRenameWorkspace {
             session: ctx.session.to_string(),
         }),
-        BindingAction::CloseWorkspace => Some(Action::RequestCloseWorkspace {
-            session: ctx.session.to_string(),
-        }),
+        BindingAction::CloseWorkspace => {
+            let workspace = active_workspace(ctx)?;
+            Some(request_close_workspace(workspace))
+        }
         BindingAction::ToggleSidebar => Some(Action::ToggleSidebar),
         BindingAction::ToggleMessages => Some(Action::ToggleMessages),
         BindingAction::ToggleTabBar => Some(Action::ToggleTabBar),
@@ -592,7 +593,9 @@ pub fn route_menu_item(
             .tabs
             .iter()
             .any(|tab| &tab.window_id == window_id)
-            .then(|| resolve_close_tab(window_id, ctx.tabs, ctx.session)),
+            .then(|| active_workspace(ctx))
+            .flatten()
+            .map(|workspace| resolve_close_tab(window_id, ctx.tabs, workspace)),
         (MenuState::WorkspaceMenu { session, .. }, BindingAction::RenameWorkspace) => ctx
             .workspaces
             .iter()
@@ -603,10 +606,8 @@ pub fn route_menu_item(
         (MenuState::WorkspaceMenu { session, .. }, BindingAction::CloseWorkspace) => ctx
             .workspaces
             .iter()
-            .any(|workspace| &workspace.name == session)
-            .then(|| Action::RequestCloseWorkspace {
-                session: session.clone(),
-            }),
+            .find(|workspace| &workspace.name == session)
+            .map(request_close_workspace),
         // Every menu's "New tab" opens the naming dialog; only the keyboard
         // binding creates one immediately (checked above this arm so it
         // still wins for `AppMenu`, matching current precedence).
@@ -668,9 +669,11 @@ pub fn route_dialog_confirm(dialog: &Dialog) -> Option<Action> {
                 name,
             })
         }
-        Dialog::ConfirmCloseWorkspace { session } => Some(Action::CloseWorkspace {
-            session: session.clone(),
-        }),
+        Dialog::ConfirmCloseWorkspace { session_id, .. } => {
+            Some(Action::CloseWorkspace(crate::workspace_close::Intent {
+                session_id: session_id.clone(),
+            }))
+        }
         // Enter applies the row the arrows are on, in the section that is
         // showing. An empty theme listing has nothing to apply, so Enter
         // dismisses like the keybinds card.
@@ -987,11 +990,21 @@ fn resolve_adjacent_workspace(
 /// Closing a session's only tab closes the workspace instead. This only
 /// reads the current tab count, so — unlike the has-agent confirmation
 /// check for either close — routing can make this decision itself.
-fn resolve_close_tab(window_id: &str, tabs: &[TabModel], session: &str) -> Action {
+fn active_workspace<'a>(ctx: &'a RouteContext<'a>) -> Option<&'a WorkspaceRow> {
+    ctx.workspaces
+        .get(ctx.active_workspace)
+        .filter(|workspace| workspace.name == ctx.session)
+}
+
+fn request_close_workspace(workspace: &WorkspaceRow) -> Action {
+    Action::RequestCloseWorkspace {
+        session_id: workspace.session_id.clone(),
+    }
+}
+
+fn resolve_close_tab(window_id: &str, tabs: &[TabModel], workspace: &WorkspaceRow) -> Action {
     if tabs.len() == 1 && tabs[0].window_id == window_id {
-        Action::RequestCloseWorkspace {
-            session: session.to_string(),
-        }
+        request_close_workspace(workspace)
     } else {
         Action::CloseTab {
             window_id: window_id.to_string(),
@@ -1488,7 +1501,7 @@ mod tests {
         assert_eq!(
             route_binding(BindingAction::CloseTab, &c),
             Some(Action::RequestCloseWorkspace {
-                session: "solo".into()
+                session_id: "$1".into(),
             })
         );
     }
@@ -1511,19 +1524,29 @@ mod tests {
         let tabs = [tab("@1")];
         let workspaces = [workspace("$1", "main")];
         let c = ctx(&tabs, 0, "%0", "main", &workspaces, 0);
+        let expected = Some(Action::RequestCloseWorkspace {
+            session_id: "$1".into(),
+        });
+        assert_eq!(route_binding(BindingAction::CloseWorkspace, &c), expected);
         assert_eq!(
-            route_binding(BindingAction::CloseWorkspace, &c),
-            Some(Action::RequestCloseWorkspace {
-                session: "main".into()
-            })
+            route_menu_item(
+                &MenuState::WorkspaceMenu {
+                    session: "main".into(),
+                    at: (0, 0),
+                },
+                BindingAction::CloseWorkspace,
+                &c,
+            ),
+            expected,
+            "keyboard and sidebar confirmation must carry the same stable id"
         );
         assert_eq!(
             route_dialog_confirm(&Dialog::ConfirmCloseWorkspace {
-                session: "main".into()
+                session_id: "$1".into(),
             }),
-            Some(Action::CloseWorkspace {
-                session: "main".into()
-            })
+            Some(Action::CloseWorkspace(crate::workspace_close::Intent {
+                session_id: "$1".into(),
+            }))
         );
     }
 

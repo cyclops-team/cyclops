@@ -446,6 +446,32 @@ impl ControlClient {
         .await
         .map(|_| ())
     }
+
+    /// Close one stable session identity, selecting an exact fallback first
+    /// when the attached client currently belongs to the target.
+    ///
+    /// The sequence lives here so workspace callers do not need to know how the
+    /// product chooses where its control client lands before destruction. A
+    /// returned error is not a claim that nothing happened: fallback selection
+    /// may already have landed before the close failed, and a failed close
+    /// reply may itself be uncertain. Callers must reconcile host state after
+    /// every attempted operation.
+    pub async fn close_session_at(
+        &self,
+        target_session_id: &str,
+        fallback_session_id: Option<&str>,
+    ) -> Result<(), TmuxError> {
+        if let Some(fallback_session_id) = fallback_session_id {
+            self.command(&format!(
+                "switch-client -t {}",
+                quote_arg(fallback_session_id)
+            ))
+            .await?;
+        }
+        self.command(&format!("kill-session -t {}", quote_arg(target_session_id)))
+            .await
+            .map(|_| ())
+    }
 }
 
 /// The single value a `-P -F` reply carries.
