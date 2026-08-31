@@ -265,8 +265,8 @@ revision. Push and manual evidence use unique keys and never cancel each other.
 The Ubuntu correctness lane owns formatting, Clippy, parallel-safe tests,
 daemon tests, Rust documentation compilation, documentation paths,
 exact-output parity, and focused relocated-root evidence. The normal nextest
-filter excludes the three performance executables. Those workloads retain
-their own metadata and history in scheduled and release evidence.
+filter excludes the four performance executables. Those workloads retain their
+own metadata and history in scheduled and release evidence.
 
 The old `cargo test --workspace --doc` command compiled every workspace crate
 and executed zero doctests. The replacement
@@ -282,14 +282,14 @@ warnings into a new blocking policy.
 | Website install, check, and build | Hosted installer parity and website type/build correctness | Stable `website` check runs the same commands only for website-facing inputs |
 | Installer lifecycle on both platforms | Installation, profile restoration, seeded assets, and uninstall | Both stable installer checks run the same lifecycle only for installer-owned inputs; release evidence repeats it with user journeys |
 | Complete Rust gate against tmux HEAD | Upstream tmux adapter compatibility | Pull requests run `cyclops-tmux`, `cyclops-workspace`, and the M0 tmux/daemon/socket journey; the retained `watcher_modes` contract still catches F25; scheduled evidence runs the full fast gate against tmux HEAD |
-| Three performance test binaries inside ordinary nextest | Frame, queue, control-write, flood, and terminal-restoration budgets | Scheduled and release runs execute the same binaries through `scripts/ci-performance.py` and retain comparable metadata |
+| Four performance test binaries inside ordinary nextest | Frame, queue, control-write, flood, terminal-restoration, and daemon cold-boot/replay behavior | Scheduled and release runs execute the same binaries through `scripts/ci-performance.py` and retain comparable metadata |
 | Zero-test doctest execution | Rust documentation compilation | `cargo doc` builds every workspace page; pre-existing warnings remain visible without becoming a new blocking policy |
 
 Path-classifier self-tests simulate unrelated website, installer, daemon,
 platform-client, documentation, domain-only, and workflow changes. They assert
 both selected and not-applicable lanes. The F25 test remains in the focused
 tmux HEAD package, and the performance script has been run locally through all
-three retained workloads with its JSON metadata contract checked. These are
+four retained workloads with its JSON metadata contract checked. These are
 small contract simulations, not mutation infrastructure.
 
 Run the complete normal gate locally with:
@@ -336,8 +336,31 @@ CYCLOPS_CI_REPEAT=10 ./scripts/ci-reliability.sh
 
 `scripts/ci-performance.py` records the commit, dirty state, Cyclops version,
 operating system, architecture, CPU count, Rust and Cargo versions, tmux
-version, runner image, workload command, result, output, and duration. GitHub
-retains the JSON artifact for 90 days under a commit-specific name.
+version, runner image, workload command, result, output, and duration. The
+`daemon-cold-start-replay` workload records three in-process daemon boot samples
+after 0, 1,000, and 10,000 operator-addressed FYI messages, alongside the
+workspace journal's byte and line counts. Each timed boot starts from a
+validated configuration after a clean daemon shutdown, then a separate
+body-free snapshot verifies replayed visibility. It is not a whole executable
+startup, client-connect, or terminal-notification measurement. The runner
+rejects a zero-exit daemon test that does not emit exactly one complete
+`CYCLOPS_DAEMON_COLD_START_REPLAY_JSON` report with the expected schema,
+kind, workload, and three replay measurements. Those records cover the 0,
+1,000, and 10,000-message journals, each with matching journal counts and
+three boot timings; the workload records the body-free replay check. A skipped,
+malformed, or incomplete measurement is failed evidence, not a successful
+performance artifact. Change that runner only with its focused contract check:
+
+```bash
+python3 scripts/ci-performance.py --selftest
+```
+
+GitHub retains the JSON artifact, including failed-evidence diagnostics, for 90
+days under a commit-specific name.
+
+The required Ubuntu pull-request check runs that fast self-test when the
+performance runner, its path classifier, or its PR workflow wiring changes. It
+does not run the performance workloads on ordinary pull requests.
 
 ## Release evidence
 

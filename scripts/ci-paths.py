@@ -23,6 +23,7 @@ LANES = (
     "tmux",
     "platform",
     "tmux_head",
+    "performance_runner",
 )
 
 
@@ -45,6 +46,14 @@ def classify(paths: list[str]) -> dict[str, bool]:
         }
         markdown = path.endswith(".md")
         cargo = path in {"Cargo.toml", "Cargo.lock"} or path.endswith("/Cargo.toml")
+
+        # This check is fast and only protects the retained-artifact runner;
+        # performance workloads themselves stay in scheduled/release lanes.
+        result["performance_runner"] |= path in {
+            ".github/workflows/ci.yml",
+            "scripts/ci-paths.py",
+            "scripts/ci-performance.py",
+        }
 
         result["rust"] |= control or cargo or path == ".config/nextest.toml" or under(
             path,
@@ -150,10 +159,16 @@ def selftest() -> None:
     assert not ordinary["website"] and not ordinary["installer"]
     assert not ordinary["tmux"] and not ordinary["platform"]
     assert not ordinary["tmux_head"]
-    assert all(classify(["scripts/ci-performance.py"]).values())
+    performance = classify(["scripts/ci-performance.py"])
+    assert all(performance.values())
+    assert performance["performance_runner"]
+    assert not classify(["docs/development/CI.md"])["performance_runner"]
     control = classify([".github/workflows/ci.yml"])
     assert all(control.values())
-    assert all(classify(["scripts/check-headless.sh"]).values())
+    assert control["performance_runner"]
+    headless = classify(["scripts/check-headless.sh"])
+    assert all(selected for lane, selected in headless.items() if lane != "performance_runner")
+    assert not headless["performance_runner"]
 
 
 def main() -> int:

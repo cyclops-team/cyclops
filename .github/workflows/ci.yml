@@ -31,6 +31,7 @@ jobs:
       tmux: ${{ steps.paths.outputs.tmux }}
       platform: ${{ steps.paths.outputs.platform }}
       tmux_head: ${{ steps.paths.outputs.tmux_head }}
+      performance_runner: ${{ steps.paths.outputs.performance_runner }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -115,6 +116,9 @@ jobs:
       - name: formatting
         if: ${{ needs.classify.outputs.rust == 'true' }}
         run: cargo fmt --all --check
+      - name: retained performance artifact contract
+        if: ${{ needs.classify.outputs.performance_runner == 'true' }}
+        run: python3 scripts/ci-performance.py --selftest
       - name: linting and compilation
         if: ${{ needs.classify.outputs.rust == 'true' }}
         run: cargo clippy --workspace --all-targets -- -D warnings
