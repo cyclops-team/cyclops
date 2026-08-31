@@ -102,6 +102,19 @@ pub fn workspace_close_unconfirmed(name: &str, error: &dyn std::fmt::Display) ->
     format!("close not confirmed for workspace {name}: {error}; refreshing workspace state")
 }
 
+pub const WORKSPACE_RENAME_CONTROL_RECONNECTING: &str =
+    "session rename is unavailable while the tmux connection is recovering";
+pub const WORKSPACE_RENAME_CONTROL_DISCONNECTED: &str =
+    "session rename is unavailable because the tmux connection is no longer live";
+pub const WORKSPACE_RENAME_STATE_REFRESHING: &str =
+    "session rename was not started while workspace state refreshes";
+pub const WORKSPACE_RENAME_ROUTE_STALE: &str =
+    "session rename was not started because that session is no longer in the current workspace state; refreshing workspace state";
+
+pub fn workspace_rename_unconfirmed(name: &str, error: &dyn std::fmt::Display) -> String {
+    format!("rename not confirmed for session {name}: {error}; refreshing workspace state")
+}
+
 pub const STREAM_RECONCILED: &str = "stream rebuilt from the durable tail";
 
 /// Workspace presentation for the shared Hello compatibility classification.

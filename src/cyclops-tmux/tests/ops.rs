@@ -615,6 +615,49 @@ async fn renaming_a_vanished_session_fails_instead_of_hitting_a_prefix_neighbour
 }
 
 #[tokio::test]
+async fn rename_session_keeps_the_stable_id_after_name_reuse() {
+    let Some(srv) = TestServer::new("ops-rename-session-id") else {
+        return;
+    };
+    srv.new_session("host");
+    srv.new_session("original");
+    let target_id = lines(
+        &srv,
+        &[
+            "list-sessions",
+            "-f",
+            "#{==:#{session_name},original}",
+            "-F",
+            "#{session_id}",
+        ],
+    )[0]
+    .clone();
+    srv.tmux_ok(&["rename-session", "-t", &target_id, "moved"]);
+    srv.new_session("original");
+    let (client, _n) = ControlClient::spawn(srv.config("host"))
+        .await
+        .expect("spawn");
+
+    client
+        .rename_session(&target_id, "review")
+        .await
+        .expect("rename stable identity");
+
+    let rows = lines(
+        &srv,
+        &["list-sessions", "-F", "#{session_id}\t#{session_name}"],
+    );
+    assert!(rows
+        .iter()
+        .any(|row| row == &format!("{target_id}\treview")));
+    assert!(
+        rows.iter().any(|row| row.ends_with("\toriginal")),
+        "the session that reused the old name must be untouched: {rows:?}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
 async fn swap_window_exchanges_the_two_positions() {
     let Some(srv) = TestServer::new("ops-swap") else {
         return;

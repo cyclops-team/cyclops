@@ -13,7 +13,7 @@
 //! context needed to name a stable target" to `Option<Action>`.
 //!
 //! Every variant that names a pane, tab, or workspace carries the stable
-//! tmux identity (`%pane`, `@window`, session name/id) it was resolved
+//! tmux identity (`%pane`, `@window`, or `$session`) it was resolved
 //! against at routing time, never a list position. A list position (a menu
 //! row, a keybinding's digit, a sidebar row's on-screen order) is exactly
 //! the kind of thing that goes stale between the keystroke and the moment
@@ -248,12 +248,9 @@ pub enum Action {
         session: String,
     },
     RequestRenameWorkspace {
-        session: String,
+        session_id: String,
     },
-    RenameWorkspace {
-        session: String,
-        name: String,
-    },
+    RenameWorkspace(crate::workspace_rename::Intent),
     /// Open the close-workspace confirmation. Unlike pane/tab closing, this
     /// UI confirms every workspace close unconditionally, so keyboard and
     /// menu routing resolve here rather than to [`Action::CloseWorkspace`]
@@ -479,9 +476,7 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
                 .map(|session| Action::SelectWorkspace { session })
         }
         BindingAction::NewWorkspace => Some(Action::NewWorkspace),
-        BindingAction::RenameWorkspace => Some(Action::RequestRenameWorkspace {
-            session: ctx.session.to_string(),
-        }),
+        BindingAction::RenameWorkspace => active_workspace(ctx).map(request_rename_workspace),
         BindingAction::CloseWorkspace => {
             let workspace = active_workspace(ctx)?;
             Some(request_close_workspace(workspace))
@@ -599,9 +594,7 @@ pub fn route_menu_item(
             .workspaces
             .iter()
             .find(|workspace| &workspace.session_id == session_id)
-            .map(|workspace| Action::RequestRenameWorkspace {
-                session: workspace.name.clone(),
-            }),
+            .map(request_rename_workspace),
         (MenuState::WorkspaceMenu { session_id, .. }, BindingAction::CloseWorkspace) => ctx
             .workspaces
             .iter()
@@ -662,12 +655,12 @@ pub fn route_dialog_confirm(dialog: &Dialog) -> Option<Action> {
                     body: c.body,
                 })
         }
-        Dialog::RenameWorkspace { session, buffer } => {
-            non_empty(buffer).map(|name| Action::RenameWorkspace {
-                session: session.clone(),
+        Dialog::RenameWorkspace { session_id, buffer } => non_empty(buffer).map(|name| {
+            Action::RenameWorkspace(crate::workspace_rename::Intent {
+                session_id: session_id.clone(),
                 name,
             })
-        }
+        }),
         Dialog::ConfirmCloseWorkspace { session_id, .. } => {
             Some(Action::CloseWorkspace(crate::workspace_close::Intent {
                 session_id: session_id.clone(),
@@ -997,6 +990,12 @@ fn active_workspace<'a>(ctx: &RouteContext<'a>) -> Option<&'a WorkspaceRow> {
 
 fn request_close_workspace(workspace: &WorkspaceRow) -> Action {
     Action::RequestCloseWorkspace {
+        session_id: workspace.session_id.clone(),
+    }
+}
+
+fn request_rename_workspace(workspace: &WorkspaceRow) -> Action {
+    Action::RequestRenameWorkspace {
         session_id: workspace.session_id.clone(),
     }
 }
@@ -1569,9 +1568,9 @@ mod tests {
         assert_eq!(
             route_menu_item(&menu, BindingAction::RenameWorkspace, &c),
             Some(Action::RequestRenameWorkspace {
-                session: "renamed".into(),
+                session_id: "$1".into(),
             }),
-            "rename resolves the clicked identity's current name"
+            "rename must keep the clicked identity after its old name is reused"
         );
     }
 
@@ -1630,7 +1629,7 @@ mod tests {
         );
         assert_eq!(
             route_dialog_confirm(&Dialog::RenameWorkspace {
-                session: "main".into(),
+                session_id: "$1".into(),
                 buffer: "".into(),
             }),
             None
@@ -1648,6 +1647,16 @@ mod tests {
                 window_id: "@1".into(),
                 name: "review".into(),
             })
+        );
+        assert_eq!(
+            route_dialog_confirm(&Dialog::RenameWorkspace {
+                session_id: "$1".into(),
+                buffer: "  review  ".into(),
+            }),
+            Some(Action::RenameWorkspace(crate::workspace_rename::Intent {
+                session_id: "$1".into(),
+                name: "review".into(),
+            }))
         );
     }
 
