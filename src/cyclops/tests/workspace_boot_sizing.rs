@@ -6,6 +6,8 @@
 //! A target-side tmux hook records the first resize, so a later reconcile
 //! cannot repair a bad boot declaration before the assertion observes it.
 
+#![cfg(feature = "full-ui")]
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};

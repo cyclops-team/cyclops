@@ -555,7 +555,7 @@ fn fits(list: &[&Entry], top: usize, sel: usize, sh: usize, comfortable: bool) -
 mod tests {
     use super::*;
     use crate::app::{App, View};
-    use crate::input::Key;
+    use crate::key::Key;
     use crate::stream::{EndpointFilter, Entry, EntryKind, Filter};
     use crate::theme::Theme;
     use cyclops_proto::{AgentState, DeliveryState};

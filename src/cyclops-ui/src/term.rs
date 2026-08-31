@@ -54,20 +54,6 @@ impl Term {
         Ok(Term { orig })
     }
 
-    /// Terminal size as (width, height) in cells, with a classic fallback.
-    pub fn size() -> (usize, usize) {
-        unsafe {
-            let mut ws = MaybeUninit::<libc::winsize>::uninit();
-            if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, ws.as_mut_ptr()) == 0 {
-                let ws = ws.assume_init();
-                if ws.ws_col > 0 && ws.ws_row > 0 {
-                    return (ws.ws_col as usize, ws.ws_row as usize);
-                }
-            }
-        }
-        (80, 24)
-    }
-
     /// Draw one frame: home the cursor, write every row with a reset in
     /// front (a clipped colored line cannot bleed) and a clear behind
     /// (shorter lines leave no ghosts). One write, one flush.

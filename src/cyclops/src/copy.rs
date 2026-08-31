@@ -14,6 +14,12 @@ pub use cyclops_proto::NOT_RUNNING;
 /// `cyclops daemon status` with nothing to report on.
 pub const DAEMON_DOWN: &str = "○ cyclopsd is not running · start it with: cyclops start";
 
+#[cfg(not(feature = "full-ui"))]
+pub const WORKSPACE_NOT_INCLUDED: &str = "the full-screen workspace is not included in this build. Run cyclops --help for headless commands, or install a full Cyclops build.";
+
+#[cfg(not(feature = "full-ui"))]
+pub const WATCH_NOT_INCLUDED: &str = "interactive watch is not included in this build. Use cyclops watch --json for the headless event stream, or install a full Cyclops build.";
+
 /// Said when the running daemon is too old to answer the restart
 /// handshake. Retrying this verb can only fail the same way, so the copy
 /// names the pair of commands that do cross, once.
@@ -338,6 +344,7 @@ pub const INBOX_SENDER_FILTER_UNAVAILABLE: &str = "the daemon did not prove the 
 
 pub const WATCH_JSON_FILTER_UNSUPPORTED: &str = "--from, --to, and --with filter the interactive TUI and are not available with --json. Use --kinds for the event stream or cyclops inbox next --from <recipient-key> for bounded receive automation.";
 
+#[cfg(feature = "full-ui")]
 pub fn unknown_watch_filters(asked: &[&str]) -> String {
     let names = asked
         .iter()
@@ -434,11 +441,13 @@ pub fn also_watching(sessions: &[String]) -> String {
 
 /// `cyclops ui` refuses --json: the machine stream lives on `watch`, and
 /// pointing there beats emitting a shape nothing should rely on.
+#[cfg(feature = "full-ui")]
 pub const UI_NO_JSON: &str =
     "cyclops ui has no --json form. The machine stream is: cyclops watch --json";
 
 /// Said on stderr every `cyclops ui` run, so scripts keep working while
 /// their authors learn the verb that replaced it.
+#[cfg(feature = "full-ui")]
 pub const UI_DEPRECATED: &str = "cyclops ui is deprecated; use cyclops watch";
 
 /// `cyclops daemon log` with no log file. Not an error state: it means no

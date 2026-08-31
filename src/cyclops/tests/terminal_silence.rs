@@ -17,6 +17,7 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
+#[cfg(feature = "full-ui")]
 use std::time::Duration;
 
 /// A theme file that cannot parse, so loading it warns.
@@ -173,6 +174,7 @@ fn a_one_shot_command_says_a_broken_theme_in_one_line() {
 }
 
 #[test]
+#[cfg(feature = "full-ui")]
 fn ui_reports_a_broken_theme_once() {
     let home = home_with_a_broken_theme("uitheme");
     // A socket nothing answers on: the UI starts, says what it has to say

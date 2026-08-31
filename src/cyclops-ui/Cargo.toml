@@ -4,14 +4,23 @@ version.workspace = true
 edition.workspace = true
 description = "Cyclops stream presentation and terminal application over authorized daemon projections."
 
+[features]
+default = ["watch"]
+presentation = [
+    "dep:cyclops-client",
+    "dep:cyclops-theme",
+    "dep:serde_json",
+    "dep:uuid",
+]
+watch = ["presentation", "dep:tokio"]
+
 [dependencies]
-cyclops-client.workspace = true
+cyclops-client = { workspace = true, optional = true }
 cyclops-proto.workspace = true
-uuid.workspace = true
-cyclops-theme.workspace = true
-tokio.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+uuid = { workspace = true, optional = true }
+cyclops-theme = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 libc.workspace = true
 
 [dev-dependencies]

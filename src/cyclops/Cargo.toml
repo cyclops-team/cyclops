@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 description = "The Cyclops CLI: thin NDJSON client over the daemon socket."
 
+[features]
+default = ["full-ui"]
+full-ui = ["dep:cyclops-workspace", "cyclops-ui/watch"]
+
 [dev-dependencies]
 # The silence tests need a real terminal on the child's stdout: the theme
 # is only read when stdout is a tty, so a piped run cannot see the warning.
@@ -26,7 +30,7 @@ cyclops-theme.workspace = true
 # Cyclops lives in the adapter crate.
 cyclops-tmux.workspace = true
 cyclops-ui.workspace = true
-cyclops-workspace.workspace = true
+cyclops-workspace = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

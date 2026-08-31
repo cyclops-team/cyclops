@@ -214,6 +214,7 @@ impl Settings {
 }
 
 /// Bind a semantic pane-focus request to this launcher's configured server.
+#[cfg(feature = "full-ui")]
 pub fn focus_adapter(home: &Path) -> cyclops_ui::FocusPane {
     let server = Settings::read(home).server;
     cyclops_ui::FocusPane::new(move |target| {

@@ -48,7 +48,7 @@ cyclops-state = { path = "src/cyclops-state" }
 cyclops-ledger = { path = "src/cyclops-ledger" }
 cyclops-theme = { path = "src/cyclops-theme" }
 cyclops-client = { path = "src/cyclops-client" }
-cyclops-ui = { path = "src/cyclops-ui" }
+cyclops-ui = { path = "src/cyclops-ui", default-features = false }
 cyclops-testrig = { path = "tests/testrig" }
 cyclops-workspace = { path = "src/cyclops-workspace" }
 

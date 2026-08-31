@@ -2372,6 +2372,7 @@ mod tests {
 
     /// Both live-pane surfaces use the shared eye vocabulary.
     #[test]
+    #[cfg(feature = "full-ui")]
     fn live_status_uses_the_shared_eye_vocabulary() {
         let cases = [
             (AgentState::Working, Vec::new(), Vec::new()),

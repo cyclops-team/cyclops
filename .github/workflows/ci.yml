@@ -118,6 +118,9 @@ jobs:
       - name: linting and compilation
         if: ${{ needs.classify.outputs.rust == 'true' }}
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: headless build boundary and command contracts
+        if: ${{ needs.classify.outputs.rust == 'true' }}
+        run: ./scripts/check-headless.sh
       - name: Rust correctness tests
         if: ${{ needs.classify.outputs.rust == 'true' }}
         run: |
