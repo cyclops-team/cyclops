@@ -62,6 +62,13 @@ candidate until the update path proves that it can replay the current journal.
 Health reports journal replay and rollback safety as `unproven` when no durable
 compatibility proof exists.
 
+When a distinct validated rollback candidate exists, the JSON
+`rollback.recommended_action` value contains `cyclops update --rollback` and
+explains that the command revalidates current journals before changing the
+selector. Health does not run that command. It remains a read-only report, and
+the current replay stays `unproven` until the operator runs the separate
+rollback command successfully.
+
 ## State safety
 
 Cyclops state inspection is rooted at one held directory descriptor. Every
@@ -96,8 +103,9 @@ The JSON report has these top-level objects:
 | `limits` | Every count, byte, and depth ceiling used by the report. |
 | `issues` | Stable issue codes with a message and path where applicable. |
 
-Health reports facts only. Use `cyclops start --setup-only --wire-hooks` for
-setup repair. Update and cleanup have separate mutation contracts.
+Health reports facts only. It can name a separate recovery command without
+running it. Use `cyclops start --setup-only --wire-hooks` for setup repair.
+Update and cleanup have separate mutation contracts.
 
 ## Safe cleanup
 

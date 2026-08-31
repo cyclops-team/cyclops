@@ -231,6 +231,27 @@ struct RollbackReport {
     error: Option<String>,
 }
 
+/// A recovery command health may name without running it.
+///
+/// Health keeps the current-journal replay result unproven. This recommendation
+/// points at the command that performs that proof before changing selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RollbackRecommendedAction {
+    command: &'static str,
+    reason: &'static str,
+}
+
+impl RollbackReport {
+    fn recommended_action(&self) -> Option<RollbackRecommendedAction> {
+        (self.state == "candidate" && self.candidate_available == Some(true)).then_some(
+            RollbackRecommendedAction {
+                command: "cyclops update --rollback",
+                reason: "This command revalidates current journals before changing the selector.",
+            },
+        )
+    }
+}
+
 struct HealthReport {
     binaries: BinaryReport,
     daemon: DaemonReport,
@@ -2502,7 +2523,7 @@ fn external_plain_state(report: &ExternalStateReport) -> &'static str {
 }
 
 fn rollback_json(report: &RollbackReport) -> Value {
-    json!({
+    let mut rollback = json!({
         "state": report.state,
         "prefix": report.prefix.as_ref().map(|path| path.display().to_string()),
         "selection": report.selection.as_ref().map(|path| path.display().to_string()),
@@ -2526,7 +2547,14 @@ fn rollback_json(report: &RollbackReport) -> Value {
         "rollback_safe": report.rollback_safe,
         "reason": report.reason.as_str(),
         "error": report.error.as_deref(),
-    })
+    });
+    if let Some(action) = report.recommended_action() {
+        rollback["recommended_action"] = json!({
+            "command": action.command,
+            "reason": action.reason,
+        });
+    }
+    rollback
 }
 
 fn render_rollback_plain(report: &RollbackReport) -> Vec<String> {
@@ -2582,6 +2610,10 @@ fn render_rollback_plain(report: &RollbackReport) -> Vec<String> {
     }
     if let Some(error) = &report.error {
         lines.push(format!("    proof error {error}"));
+    }
+    if let Some(action) = report.recommended_action() {
+        lines.push(format!("    next step {}", action.command));
+        lines.push(format!("    {}", action.reason));
     }
     lines
 }
@@ -2936,9 +2968,16 @@ mod tests {
         assert_eq!(report.journal_replay, "unproven");
         assert_eq!(report.install_replay, "unproven");
         assert_eq!(report.rollback_safe, None);
+        assert_eq!(
+            report.recommended_action(),
+            Some(RollbackRecommendedAction {
+                command: "cyclops update --rollback",
+                reason: "This command revalidates current journals before changing the selector.",
+            })
+        );
         assert_eq!(report.active_build.as_deref(), Some("active-build"));
         assert_eq!(report.known_good_build.as_deref(), Some("known-build"));
-        let json = rollback_json(&report).to_string();
+        let json = rollback_json(&report);
         let plain = render_rollback_plain(&report).join("\n");
         for fact in [
             "candidate",
@@ -2948,8 +2987,53 @@ mod tests {
             "pair.a",
             "pair.b",
         ] {
-            assert!(json.contains(fact));
+            assert!(json.to_string().contains(fact));
             assert!(plain.contains(fact));
+        }
+        assert_eq!(
+            json["recommended_action"]["command"],
+            "cyclops update --rollback"
+        );
+        assert_eq!(
+            json["recommended_action"]["reason"],
+            "This command revalidates current journals before changing the selector."
+        );
+        assert!(plain.contains("next step cyclops update --rollback"));
+        assert!(plain.contains("revalidates current journals before changing the selector"));
+    }
+
+    #[test]
+    fn rollback_recommendation_requires_a_validated_distinct_candidate() {
+        let public = binaries_with_public_selector(true);
+        let reports = [
+            inspect_rollback_with(&binaries_with_public_selector(false), |_| {
+                panic!("a direct pair has no public rollback selector")
+            }),
+            inspect_rollback_with(&public, |_| Ok(None)),
+            inspect_rollback_with(&public, |_| Ok(Some(descriptor(true, false)))),
+            inspect_rollback_with(&public, |_| Ok(Some(descriptor(false, false)))),
+            inspect_rollback_with(&public, |_| {
+                Err(crate::update::InstalledPairInspectionError::Invalid(
+                    "selected pair changed".into(),
+                ))
+            }),
+        ];
+
+        for report in reports {
+            assert_eq!(
+                report.recommended_action(),
+                None,
+                "{} must not offer rollback",
+                report.state
+            );
+            assert!(rollback_json(&report).get("recommended_action").is_none());
+            assert!(
+                !render_rollback_plain(&report)
+                    .iter()
+                    .any(|line| line.contains("next step")),
+                "{} rendered a rollback action",
+                report.state
+            );
         }
     }
 
