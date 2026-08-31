@@ -2895,7 +2895,7 @@ fn schedule_accepted_notifications(
 mod tests {
     use crate::fusion::PaneMessagingObservation;
     use crate::messaging_runtime::{
-        cached_entry_is_write_ready, record_unowned_notification, wait_and_queue_unclaimed_reminder,
+        record_unowned_notification, wait_and_queue_unclaimed_reminder,
     };
 
     use super::*;
@@ -3020,6 +3020,29 @@ mod tests {}
                 "{adapter} reached into composer recovery coordinator state"
             );
         }
+    }
+
+    /// Syntactic architecture lint: notification scheduling consumes one
+    /// immutable observation result instead of interpreting the fusion cache.
+    #[test]
+    fn notification_runtime_cannot_read_detection_cache_internals() {
+        let runtime = include_str!("messaging_runtime.rs");
+        for forbidden in [
+            ".detections",
+            "DetEntry",
+            ".detection.write_ready",
+            ".detection.stale",
+            ".detection.disagreement",
+        ] {
+            assert!(
+                !runtime.contains(forbidden),
+                "notification runtime recovered fusion cache knowledge: {forbidden}"
+            );
+        }
+        assert!(
+            runtime.contains("cached_notification_observation("),
+            "notification runtime bypassed its typed observation seam"
+        );
     }
 
     /// Syntactic architecture lint: fusion may identify immutable pane facts,
@@ -5244,24 +5267,6 @@ mod tests {}
         (accepted, context, head)
     }
 
-    fn binding(leader_birth: u64) -> crate::fusion::Binding {
-        crate::fusion::Binding {
-            pane_root: crate::identity::ProcId {
-                pid: 10,
-                birth: 100,
-            },
-            leader: crate::identity::ProcId {
-                pid: 20,
-                birth: leader_birth,
-            },
-            agent: crate::identity::ProcId {
-                pid: 30,
-                birth: 300,
-            },
-            manifest: "claude".into(),
-        }
-    }
-
     fn durable_observation(recipient: RecipientKey) -> NotificationPreWriteObservation {
         let pane_root = ProcessInstanceId::new(4000, 818_000).unwrap();
         NotificationPreWriteObservation {
@@ -5577,92 +5582,6 @@ mod tests {}
             .unwrap()
             .remove(0);
         assert!(has_first_durable_disposition(&submitted, &head, true));
-    }
-
-    #[test]
-    fn cached_readiness_belongs_to_one_complete_process_binding() {
-        let original = binding(200);
-        let entry = crate::DetEntry {
-            detection: cyclops_proto::Detection {
-                state: cyclops_proto::AgentState::Idle,
-                readings: Vec::new(),
-                disagreement: false,
-                decided_by: "fixture".into(),
-                unknown_reason: None,
-                stale: false,
-                write_ready: true,
-                write_block: None,
-                composer_semantic: Some(cyclops_proto::ComposerSemantic::Clean),
-            },
-            binding: Some(original.clone()),
-            manifest: Some("claude".into()),
-            occupant: Some(20),
-            agent: Some(original.agent),
-            in_mode: false,
-            quota_screen_clear: true,
-            hold: cyclops_proto::ComposerHold::Clear,
-            turn: None,
-            hold_owner: None,
-            composer: crate::ComposerProjection::default(),
-            working_confirmed: false,
-            since: std::time::Instant::now(),
-        };
-
-        assert!(cached_entry_is_write_ready(&entry, false, &original));
-        assert!(
-            !cached_entry_is_write_ready(&entry, false, &binding(201)),
-            "a reused leader pid with a new generation cannot inherit readiness"
-        );
-    }
-
-    #[test]
-    fn cached_working_readiness_keeps_a_stamped_composer_proof() {
-        let original = binding(200);
-        let mut entry = crate::DetEntry {
-            detection: cyclops_proto::Detection {
-                state: cyclops_proto::AgentState::Working,
-                readings: vec![
-                    cyclops_proto::SensorReading {
-                        sensor: cyclops_proto::Sensor::Screen,
-                        state: cyclops_proto::AgentState::Idle,
-                        rule: "composer_empty".into(),
-                        ts: 1,
-                    },
-                    cyclops_proto::SensorReading {
-                        sensor: cyclops_proto::Sensor::Title,
-                        state: cyclops_proto::AgentState::Working,
-                        rule: "title_working".into(),
-                        ts: 1,
-                    },
-                ],
-                disagreement: true,
-                decided_by: "title_working".into(),
-                unknown_reason: None,
-                stale: false,
-                write_ready: true,
-                write_block: None,
-                composer_semantic: Some(cyclops_proto::ComposerSemantic::Clean),
-            },
-            binding: Some(original.clone()),
-            manifest: Some("claude".into()),
-            occupant: Some(20),
-            agent: Some(original.agent),
-            in_mode: false,
-            quota_screen_clear: true,
-            hold: cyclops_proto::ComposerHold::Clear,
-            turn: None,
-            hold_owner: None,
-            composer: crate::ComposerProjection::default(),
-            working_confirmed: false,
-            since: std::time::Instant::now(),
-        };
-
-        assert!(
-            cached_entry_is_write_ready(&entry, false, &original),
-            "a stamped Working + clean-composer verdict remains usable from the cache"
-        );
-        entry.detection.stale = true;
-        assert!(!cached_entry_is_write_ready(&entry, false, &original));
     }
 
     #[test]

@@ -166,25 +166,11 @@ fn route_is_write_ready(
         },
         manifest: binding.manifest.to_string(),
     };
-    inner
-        .detections
-        .lock()
-        .expect("detections lock")
-        .get(&PaneKey::new(route.session_idx, &route.pane_id))
-        .is_some_and(|entry| cached_entry_is_write_ready(entry, route.row.in_mode, &expected))
-}
-
-pub(crate) fn cached_entry_is_write_ready(
-    entry: &crate::DetEntry,
-    pane_in_mode: bool,
-    expected: &crate::fusion::Binding,
-) -> bool {
-    // This trusts the stamped write verdict; its composer proof already adjudicates sensor disagreement.
-    !pane_in_mode
-        && entry.detection.write_ready
-        && !entry.detection.stale
-        && !entry.in_mode
-        && entry.binding.as_ref() == Some(expected)
+    crate::fusion::cached_notification_observation(
+        inner,
+        &PaneKey::new(route.session_idx, &route.pane_id),
+    )
+    .is_some_and(|observation| observation.write_ready_for(route.row.in_mode, &expected))
 }
 
 /// Whether the already-computed pane verdict lets the worker decide now.
@@ -198,20 +184,11 @@ fn cached_route_can_decide_now(inner: &Inner, route: &NotificationRoute) -> bool
     if route.row.in_mode {
         return false;
     }
-    inner
-        .detections
-        .lock()
-        .expect("detections lock")
-        .get(&PaneKey::new(route.session_idx, &route.pane_id))
-        .is_some_and(|entry| {
-            !entry.in_mode
-                && !entry.detection.stale
-                // A disagreement means the picture is not settled enough for an early receipt,
-                // even when the stamped write verdict has independently proved a clean composer.
-                && !entry.detection.disagreement
-                && (entry.detection.write_ready
-                    || entry.detection.state == cyclops_proto::AgentState::IdleWithInput)
-        })
+    crate::fusion::cached_notification_observation(
+        inner,
+        &PaneKey::new(route.session_idx, &route.pane_id),
+    )
+    .is_some_and(|observation| observation.can_decide_notification_now(route.row.in_mode))
 }
 
 fn enqueue_prepared_notification(
