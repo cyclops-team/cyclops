@@ -37,6 +37,27 @@ WORKLOADS = (
     ),
 )
 
+# The daemon workload crosses a process boundary. This is its retained artifact
+# contract, kept beside the runner that decides whether scheduled evidence is
+# honest. The Rust test emits these same facts in cold_start_replay_perf.rs.
+COLD_REPLAY_SCHEMA = 1
+COLD_REPLAY_KIND = "cyclops_daemon_cold_start_replay"
+COLD_REPLAY_MESSAGE_COUNTS = (0, 1_000, 10_000)
+COLD_REPLAY_SAMPLES_PER_COUNT = 3
+COLD_REPLAY_WORKLOAD = {
+    "fixture": "operator-addressed FYI messages accepted through WorkspaceMessaging",
+    "measurement": "cyclopsd::boot from an already-validated config after clean daemon shutdown",
+    "replay_validation": "a body-free snapshot sees every seeded message after every timed boot",
+    "samples_per_message_count": COLD_REPLAY_SAMPLES_PER_COUNT,
+    "excludes": [
+        "config parsing",
+        "executable-process launch",
+        "client connection",
+        "terminal notification latency",
+        "post-boot snapshot verification",
+    ],
+}
+
 # Most performance executables enforce a budget and need only a successful
 # exit. This workload also supplies a retained measurement. A clean test exit
 # after an environmental skip is not performance evidence, so the runner
@@ -75,6 +96,78 @@ def required_json(output: str, marker: str) -> tuple[dict[str, object] | None, s
     return parsed, None
 
 
+def positive_int(value: object) -> bool:
+    return type(value) is int and value > 0
+
+
+def exact_int(value: object, expected: int) -> bool:
+    return type(value) is int and value == expected
+
+
+def cold_replay_report_error(report: dict[str, object]) -> str | None:
+    """Reject a report that would not prove the retained replay workload ran."""
+    if not exact_int(report.get("schema"), COLD_REPLAY_SCHEMA):
+        return f"expected schema {COLD_REPLAY_SCHEMA}"
+    if report.get("kind") != COLD_REPLAY_KIND:
+        return f"expected kind {COLD_REPLAY_KIND!r}"
+    build_ref = report.get("benchmark_test_build_ref")
+    if not isinstance(build_ref, str) or not build_ref:
+        return "missing benchmark_test_build_ref"
+    version = report.get("cyclopsd_version")
+    if not isinstance(version, str) or not version:
+        return "missing cyclopsd_version"
+
+    workload = report.get("workload")
+    if not isinstance(workload, dict):
+        return "missing workload object"
+    for key, expected in COLD_REPLAY_WORKLOAD.items():
+        if workload.get(key) != expected:
+            return f"workload.{key} does not match the retained contract"
+
+    measurements = report.get("measurements")
+    if not isinstance(measurements, list) or len(measurements) != len(COLD_REPLAY_MESSAGE_COUNTS):
+        return f"expected {len(COLD_REPLAY_MESSAGE_COUNTS)} measurement records"
+    for count, record in zip(COLD_REPLAY_MESSAGE_COUNTS, measurements):
+        if not isinstance(record, dict):
+            return f"measurement {count} is not an object"
+        if not exact_int(record.get("accepted_message_count"), count):
+            return f"measurement {count} has the wrong accepted_message_count"
+
+        journal = record.get("workspace_journal")
+        if not isinstance(journal, dict):
+            return f"measurement {count} is missing workspace_journal"
+        bytes_count = journal.get("bytes")
+        if type(bytes_count) is not int or bytes_count < 0:
+            return f"measurement {count} has an invalid journal byte count"
+        if not exact_int(journal.get("lines"), count):
+            return f"measurement {count} has the wrong journal line count"
+        if (count == 0 and bytes_count != 0) or (count > 0 and bytes_count <= 0):
+            return f"measurement {count} has an implausible journal byte count"
+
+        boot = record.get("daemon_boot")
+        if not isinstance(boot, dict):
+            return f"measurement {count} is missing daemon_boot"
+        samples = boot.get("samples")
+        if (
+            boot.get("unit") != "microseconds"
+            or not exact_int(boot.get("sample_count"), COLD_REPLAY_SAMPLES_PER_COUNT)
+            or not isinstance(samples, list)
+            or len(samples) != COLD_REPLAY_SAMPLES_PER_COUNT
+            or not all(positive_int(sample) for sample in samples)
+        ):
+            return f"measurement {count} has incomplete boot timings"
+        ordered = sorted(samples)
+        p50 = ordered[(len(ordered) * 50 + 99) // 100 - 1]
+        p95 = ordered[(len(ordered) * 95 + 99) // 100 - 1]
+        if (
+            not exact_int(boot.get("p50"), p50)
+            or not exact_int(boot.get("p95"), p95)
+            or not exact_int(boot.get("max"), ordered[-1])
+        ):
+            return f"measurement {count} has inconsistent boot timing summaries"
+    return None
+
+
 def record_workload(
     name: str,
     command: list[str],
@@ -96,6 +189,8 @@ def record_workload(
     }
     if marker := REQUIRED_JSON_MARKERS.get(name):
         measurement, error = required_json(output, marker)
+        if measurement is not None and error is None:
+            error = cold_replay_report_error(measurement)
         result["required_json_marker"] = marker
         if error:
             result["status"] = proc.returncode or 1
@@ -105,9 +200,53 @@ def record_workload(
     return result
 
 
+def complete_cold_replay_report() -> dict[str, object]:
+    """One complete small report for the runner's artifact-contract check."""
+    measurements = []
+    for index, count in enumerate(COLD_REPLAY_MESSAGE_COUNTS):
+        samples = [100 + index, 120 + index, 110 + index]
+        ordered = sorted(samples)
+        measurements.append(
+            {
+                "accepted_message_count": count,
+                "workspace_journal": {
+                    "bytes": 0 if count == 0 else count * 8,
+                    "lines": count,
+                },
+                "daemon_boot": {
+                    "unit": "microseconds",
+                    "samples": samples,
+                    "sample_count": COLD_REPLAY_SAMPLES_PER_COUNT,
+                    "p50": ordered[1],
+                    "p95": ordered[-1],
+                    "max": ordered[-1],
+                },
+            }
+        )
+    return {
+        "schema": COLD_REPLAY_SCHEMA,
+        "kind": COLD_REPLAY_KIND,
+        "benchmark_test_build_ref": "selftest",
+        "cyclopsd_version": "0.1.0",
+        "workload": COLD_REPLAY_WORKLOAD,
+        "measurements": measurements,
+    }
+
+
 def selftest() -> None:
     """Prove a skipped measurement cannot become a successful artifact."""
     marker = REQUIRED_JSON_MARKERS["daemon-cold-start-replay"]
+
+    def rejected(payload: object) -> None:
+        result = record_workload(
+            "daemon-cold-start-replay",
+            ["fixture"],
+            subprocess.CompletedProcess(["fixture"], 0, f"{marker}={json.dumps(payload)}\n", ""),
+            0.0,
+        )
+        assert result["status"] == 1
+        assert "measurement_error" in result
+
     missing = record_workload(
         "daemon-cold-start-replay",
         ["fixture"],
@@ -119,23 +258,34 @@ def selftest() -> None:
     assert "measurement_error" in missing
     assert "measurement" not in missing
 
+    complete = complete_cold_replay_report()
     valid = record_workload(
         "daemon-cold-start-replay",
         ["fixture"],
-        subprocess.CompletedProcess(["fixture"], 0, f"{marker}={{\"schema\":1}}\n", ""),
+        subprocess.CompletedProcess(["fixture"], 0, f"{marker}={json.dumps(complete)}\n", ""),
         0.0,
     )
     assert valid["status"] == 0
-    assert valid["measurement"] == {"schema": 1}
+    assert valid["measurement"] == complete
 
-    malformed = record_workload(
-        "daemon-cold-start-replay",
-        ["fixture"],
-        subprocess.CompletedProcess(["fixture"], 0, f"{marker}=not-json\n", ""),
-        0.0,
-    )
-    assert malformed["status"] == 1
-    assert "measurement_error" in malformed
+    for incomplete in [{}, {"schema": 1}]:
+        rejected(incomplete)
+
+    wrong_workload = json.loads(json.dumps(complete))
+    wrong_workload["workload"]["replay_validation"] = "not verified"
+    rejected(wrong_workload)
+
+    incomplete_measurements = json.loads(json.dumps(complete))
+    incomplete_measurements["measurements"].pop()
+    rejected(incomplete_measurements)
+
+    wrong_journal = json.loads(json.dumps(complete))
+    wrong_journal["measurements"][2]["workspace_journal"]["lines"] = 9_999
+    rejected(wrong_journal)
+
+    inconsistent_timing = json.loads(json.dumps(complete))
+    inconsistent_timing["measurements"][1]["daemon_boot"]["p50"] = 0
+    rejected(inconsistent_timing)
 
 
 def main() -> int:

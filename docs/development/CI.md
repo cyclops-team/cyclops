@@ -343,9 +343,12 @@ workspace journal's byte and line counts. Each timed boot starts from a
 validated configuration after a clean daemon shutdown, then a separate
 body-free snapshot verifies replayed visibility. It is not a whole executable
 startup, client-connect, or terminal-notification measurement. The runner
-rejects a zero-exit daemon test that
-does not emit exactly one valid `CYCLOPS_DAEMON_COLD_START_REPLAY_JSON` object:
-a skipped or malformed measurement is failed evidence, not a successful
+rejects a zero-exit daemon test that does not emit exactly one complete
+`CYCLOPS_DAEMON_COLD_START_REPLAY_JSON` report with the expected schema,
+kind, workload, and three replay measurements. Those records cover the 0,
+1,000, and 10,000-message journals, each with matching journal counts and
+three boot timings; the workload records the body-free replay check. A skipped,
+malformed, or incomplete measurement is failed evidence, not a successful
 performance artifact. Change that runner only with its focused contract check:
 
 ```bash
@@ -354,6 +357,10 @@ python3 scripts/ci-performance.py --selftest
 
 GitHub retains the JSON artifact, including failed-evidence diagnostics, for 90
 days under a commit-specific name.
+
+The required Ubuntu pull-request check runs that fast self-test when the
+performance runner, its path classifier, or its PR workflow wiring changes. It
+does not run the performance workloads on ordinary pull requests.
 
 ## Release evidence
 
