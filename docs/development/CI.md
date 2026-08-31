@@ -265,7 +265,7 @@ revision. Push and manual evidence use unique keys and never cancel each other.
 The Ubuntu correctness lane owns formatting, Clippy, parallel-safe tests,
 daemon tests, Rust documentation compilation, documentation paths,
 exact-output parity, and focused relocated-root evidence. The normal nextest
-filter excludes the four performance executables. Those workloads, plus the
+filter excludes the five performance executables. Those workloads, plus the
 staged install-to-first-durable-handoff journey, retain their own metadata and
 history in scheduled and release evidence. The handoff journey never runs in a
 pull-request job.
@@ -284,14 +284,14 @@ warnings into a new blocking policy.
 | Website install, check, and build | Hosted installer parity and website type/build correctness | Stable `website` check runs the same commands only for website-facing inputs |
 | Installer lifecycle on both platforms | Installation, profile restoration, seeded assets, and uninstall | Both stable installer checks run the same lifecycle only for installer-owned inputs; release evidence repeats it with user journeys |
 | Complete Rust gate against tmux HEAD | Upstream tmux adapter compatibility | Pull requests run `cyclops-tmux`, `cyclops-workspace`, and the M0 tmux/daemon/socket journey; the retained `watcher_modes` contract still catches F25; scheduled evidence runs the full fast gate against tmux HEAD |
-| Four performance test binaries inside ordinary nextest, plus staged install-to-first-durable-handoff | Frame, queue, control-write, flood, terminal-restoration, daemon cold-boot/replay, and the installed durable-handoff journey | Scheduled and release runs execute the same binaries and staged journey through `scripts/ci-performance.py` and retain comparable metadata |
+| Five performance test binaries inside ordinary nextest, plus staged install-to-first-durable-handoff | Frame, queue, control-write, flood, terminal-restoration, daemon cold-boot/replay, concurrent durable mailbox acceptance, and the installed durable-handoff journey | Scheduled and release runs execute the same binaries and staged journey through `scripts/ci-performance.py` and retain comparable metadata |
 | Zero-test doctest execution | Rust documentation compilation | `cargo doc` builds every workspace page; pre-existing warnings remain visible without becoming a new blocking policy |
 
 Path-classifier self-tests simulate unrelated website, installer, daemon,
 platform-client, documentation, domain-only, and workflow changes. They assert
 both selected and not-applicable lanes. The F25 test remains in the focused
 tmux HEAD package, and the performance script has been run locally through all
-five retained workloads with their JSON metadata contracts checked. These are
+six retained workloads with their JSON metadata contracts checked. These are
 small contract simulations, not mutation infrastructure.
 
 Run the complete normal gate locally with:
@@ -363,6 +363,19 @@ days under a commit-specific name.
 The required Ubuntu pull-request check runs that fast self-test when the
 performance runner, its path classifier, or its PR workflow wiring changes. It
 does not run the performance workloads on ordinary pull requests.
+
+The `concurrent-mailbox-acceptance` workload runs three isolated samples with
+four concurrent callers and 32 messages per caller. Each caller waits for its
+own durable acceptance before submitting the next message. The retained record
+contains the raw per-request and per-workload timings, exact per-caller durable
+sequence order, a body-free mailbox snapshot, and observed global interleaving.
+It deliberately excludes socket authentication, agent routing, notification,
+terminal injection, and end-to-end user-journey timing. Its summaries describe
+the retained raw samples; they make no universal latency or fairness bound.
+
+The runner rejects a zero-exit concurrent workload unless its marker identifies
+the exact workload shape and contains every expected sequence, body-free
+snapshot, caller timing, and internally consistent timing/interleaving summary.
 
 The `install-first-durable-handoff` workload adds one structured measurement
 to that artifact. It uses the public source installer from the checked-out

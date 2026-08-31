@@ -51,6 +51,21 @@ WORKLOADS = (
         ["python3", "scripts/perf/install_first_handoff.py"],
         "CYCLOPS_INSTALL_FIRST_HANDOFF_JSON",
     ),
+    (
+        "concurrent-mailbox-acceptance",
+        [
+            "cargo",
+            "test",
+            "-p",
+            "cyclopsd",
+            "--test",
+            "concurrent_messaging_perf",
+            "--",
+            "--ignored",
+            "--nocapture",
+        ],
+        "CYCLOPS_CONCURRENT_MESSAGING_JSON",
+    ),
 )
 
 # The daemon workload crosses a process boundary. This is its retained artifact
@@ -109,6 +124,37 @@ INSTALL_HANDOFF_WORKLOAD = {
     ],
 }
 
+# This workload deliberately measures only durable mailbox acceptance. It
+# keeps raw request and workload timings, plus the exact body-free FIFO proof,
+# so a run cannot silently change into a terminal or user-journey benchmark.
+CONCURRENT_MESSAGING_SCHEMA = 1
+CONCURRENT_MESSAGING_KIND = "cyclops_concurrent_mailbox_acceptance"
+CONCURRENT_MESSAGING_CALLERS = 4
+CONCURRENT_MESSAGING_MESSAGES_PER_CALLER = 32
+CONCURRENT_MESSAGING_SAMPLE_COUNT = 3
+CONCURRENT_MESSAGING_MESSAGE_COUNT = (
+    CONCURRENT_MESSAGING_CALLERS * CONCURRENT_MESSAGING_MESSAGES_PER_CALLER
+)
+CONCURRENT_MESSAGING_WORKLOAD = {
+    "callers": CONCURRENT_MESSAGING_CALLERS,
+    "messages_per_caller": CONCURRENT_MESSAGING_MESSAGES_PER_CALLER,
+    "samples": CONCURRENT_MESSAGING_SAMPLE_COUNT,
+    "acceptance": "in-process Daemon::msg_send with resolved administrator identity",
+    "concurrency": "four scoped OS threads released by a two-phase barrier; one current-thread Tokio runtime per caller",
+    "ordering": "each caller sends its next message only after its prior durable acceptance",
+    "recipient": "administrator mailbox without an agent route",
+    "sample_isolation": "each sample owns a fresh Rig and shuts it down before the next sample",
+    "excludes": [
+        "socket authentication",
+        "agent route selection",
+        "notification scheduling",
+        "terminal injection",
+        "user journey timing",
+    ],
+    "timing": "raw per-request and per-workload samples plus p50, p95, and max summaries",
+    "bounds": "descriptive evidence only; no universal latency or interleaving bound is asserted",
+}
+
 
 def command_text(command: list[str]) -> str:
     proc = subprocess.run(command, check=False, capture_output=True, text=True)
@@ -153,6 +199,48 @@ def nonnegative_number(value: object) -> bool:
 
 def nonempty_string(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def nonnegative_int(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+def percentile(samples: list[int], numerator: int) -> int:
+    return sorted(samples)[(len(samples) * numerator + 99) // 100 - 1]
+
+
+def timing_distribution_error(
+    distribution: object, raw_samples: list[int], label: str
+) -> str | None:
+    """Require a retained summary to describe exactly its retained samples."""
+    if not isinstance(distribution, dict):
+        return f"{label} is not an object"
+    if set(distribution) != {"unit", "sample_count", "p50", "p95", "max"}:
+        return f"{label} has an unexpected shape"
+    if (
+        distribution.get("unit") != "microseconds"
+        or not exact_int(distribution.get("sample_count"), len(raw_samples))
+        or not all(nonnegative_int(sample) for sample in raw_samples)
+        or not exact_int(distribution.get("p50"), percentile(raw_samples, 50))
+        or not exact_int(distribution.get("p95"), percentile(raw_samples, 95))
+        or not exact_int(distribution.get("max"), max(raw_samples))
+    ):
+        return f"{label} does not describe its raw timings"
+    return None
+
+
+def max_consecutive(values: list[int]) -> int:
+    previous: int | None = None
+    run = 0
+    maximum = 0
+    for value in values:
+        if value == previous:
+            run += 1
+        else:
+            previous = value
+            run = 1
+        maximum = max(maximum, run)
+    return maximum
 
 
 def cold_replay_report_error(report: dict[str, object]) -> str | None:
@@ -290,11 +378,151 @@ def install_handoff_report_error(report: dict[str, object]) -> str | None:
     return None
 
 
+def concurrent_messaging_report_error(report: dict[str, object]) -> str | None:
+    """Reject a report that does not retain durable FIFO acceptance evidence."""
+    if set(report) != {
+        "schema",
+        "kind",
+        "benchmark_test_build_ref",
+        "cyclopsd_version",
+        "workload",
+        "latency",
+        "samples",
+    }:
+        return "concurrent messaging record has an unexpected shape"
+    if not exact_int(report.get("schema"), CONCURRENT_MESSAGING_SCHEMA):
+        return f"expected schema {CONCURRENT_MESSAGING_SCHEMA}"
+    if report.get("kind") != CONCURRENT_MESSAGING_KIND:
+        return f"expected kind {CONCURRENT_MESSAGING_KIND!r}"
+    if not nonempty_string(report.get("benchmark_test_build_ref")):
+        return "missing benchmark_test_build_ref"
+    if not nonempty_string(report.get("cyclopsd_version")):
+        return "missing cyclopsd_version"
+    if report.get("workload") != CONCURRENT_MESSAGING_WORKLOAD:
+        return "concurrent messaging record does not match the retained workload contract"
+
+    samples = report.get("samples")
+    if not isinstance(samples, list) or len(samples) != CONCURRENT_MESSAGING_SAMPLE_COUNT:
+        return f"expected {CONCURRENT_MESSAGING_SAMPLE_COUNT} concurrent samples"
+
+    workload_timings: list[int] = []
+    request_timings: list[int] = []
+    for sample_index, sample in enumerate(samples):
+        if not isinstance(sample, dict):
+            return f"sample {sample_index} is not an object"
+        if set(sample) != {
+            "sample",
+            "accepted_message_count",
+            "body_free_snapshot",
+            "fifo",
+            "callers",
+            "workload_elapsed_us",
+        }:
+            return f"sample {sample_index} has an unexpected shape"
+        if (
+            not exact_int(sample.get("sample"), sample_index)
+            or not exact_int(sample.get("accepted_message_count"), CONCURRENT_MESSAGING_MESSAGE_COUNT)
+            or not positive_int(sample.get("workload_elapsed_us"))
+        ):
+            return f"sample {sample_index} has invalid acceptance or workload timing"
+        workload_timings.append(sample["workload_elapsed_us"])
+
+        snapshot = sample.get("body_free_snapshot")
+        if snapshot != {
+            "visible_messages": CONCURRENT_MESSAGING_MESSAGE_COUNT,
+            "pending_entries": CONCURRENT_MESSAGING_MESSAGE_COUNT,
+            "rows_returned": CONCURRENT_MESSAGING_MESSAGE_COUNT,
+        }:
+            return f"sample {sample_index} is missing the complete body-free snapshot"
+
+        fifo = sample.get("fifo")
+        if not isinstance(fifo, dict) or set(fifo) != {
+            "per_caller_order",
+            "global_caller_interleaving",
+            "max_consecutive_acceptances_from_one_caller",
+        }:
+            return f"sample {sample_index} has incomplete FIFO evidence"
+        if fifo.get("per_caller_order") != "strictly increasing durable sequence":
+            return f"sample {sample_index} does not name the FIFO contract"
+        global_order = fifo.get("global_caller_interleaving")
+        if (
+            not isinstance(global_order, list)
+            or len(global_order) != CONCURRENT_MESSAGING_MESSAGE_COUNT
+            or not all(
+                type(caller) is int and 0 <= caller < CONCURRENT_MESSAGING_CALLERS
+                for caller in global_order
+            )
+        ):
+            return f"sample {sample_index} has invalid global caller interleaving"
+
+        callers = sample.get("callers")
+        if not isinstance(callers, list) or len(callers) != CONCURRENT_MESSAGING_CALLERS:
+            return f"sample {sample_index} has the wrong caller evidence"
+        sequence_to_caller: dict[int, int] = {}
+        for caller_index, caller in enumerate(callers):
+            if not isinstance(caller, dict) or set(caller) != {
+                "caller",
+                "acceptance_sequences",
+                "request_elapsed_us",
+            }:
+                return f"sample {sample_index} caller {caller_index} has an unexpected shape"
+            sequences = caller.get("acceptance_sequences")
+            timings = caller.get("request_elapsed_us")
+            if (
+                not exact_int(caller.get("caller"), caller_index)
+                or not isinstance(sequences, list)
+                or len(sequences) != CONCURRENT_MESSAGING_MESSAGES_PER_CALLER
+                or not all(positive_int(sequence) for sequence in sequences)
+                or any(left >= right for left, right in zip(sequences, sequences[1:]))
+                or not isinstance(timings, list)
+                or len(timings) != CONCURRENT_MESSAGING_MESSAGES_PER_CALLER
+                or not all(nonnegative_int(timing) for timing in timings)
+            ):
+                return f"sample {sample_index} caller {caller_index} has invalid FIFO or timing evidence"
+            for sequence in sequences:
+                if sequence in sequence_to_caller:
+                    return f"sample {sample_index} reuses durable sequence {sequence}"
+                sequence_to_caller[sequence] = caller_index
+            request_timings.extend(timings)
+
+        if set(sequence_to_caller) != set(range(1, CONCURRENT_MESSAGING_MESSAGE_COUNT + 1)):
+            return f"sample {sample_index} is missing or inventing a durable sequence"
+        expected_global_order = [
+            sequence_to_caller[sequence]
+            for sequence in range(1, CONCURRENT_MESSAGING_MESSAGE_COUNT + 1)
+        ]
+        if global_order != expected_global_order:
+            return f"sample {sample_index} global caller interleaving disagrees with durable sequences"
+        if not exact_int(
+            fifo.get("max_consecutive_acceptances_from_one_caller"),
+            max_consecutive(global_order),
+        ):
+            return f"sample {sample_index} has an inconsistent interleaving summary"
+
+    latency = report.get("latency")
+    if not isinstance(latency, dict) or set(latency) != {
+        "workload_elapsed_us",
+        "request_elapsed_us",
+    }:
+        return "concurrent messaging record has incomplete latency evidence"
+    if error := timing_distribution_error(
+        latency.get("workload_elapsed_us"), workload_timings, "workload_elapsed_us"
+    ):
+        return error
+    if error := timing_distribution_error(
+        latency.get("request_elapsed_us"), request_timings, "request_elapsed_us"
+    ):
+        return error
+    return None
+
+
 def report_error(name: str, report: dict[str, object]) -> str | None:
     if name == "daemon-cold-start-replay":
         return cold_replay_report_error(report)
     if name == "install-first-durable-handoff":
         return install_handoff_report_error(report)
+    if name == "concurrent-mailbox-acceptance":
+        return concurrent_messaging_report_error(report)
     return f"{name} has no retained-report validator"
 
 
@@ -407,6 +635,79 @@ def complete_install_handoff_report() -> dict[str, object]:
     }
 
 
+def complete_concurrent_messaging_report() -> dict[str, object]:
+    """One complete body-free concurrent report for the runner's contract check."""
+    samples = []
+    all_request_timings = []
+    workload_timings = []
+    for sample_index in range(CONCURRENT_MESSAGING_SAMPLE_COUNT):
+        global_order = [
+            sequence % CONCURRENT_MESSAGING_CALLERS
+            for sequence in range(CONCURRENT_MESSAGING_MESSAGE_COUNT)
+        ]
+        callers = []
+        for caller_index in range(CONCURRENT_MESSAGING_CALLERS):
+            sequences = [
+                sequence + 1
+                for sequence, caller in enumerate(global_order)
+                if caller == caller_index
+            ]
+            timings = [
+                sample_index * 1_000 + caller_index * 100 + ordinal
+                for ordinal in range(CONCURRENT_MESSAGING_MESSAGES_PER_CALLER)
+            ]
+            all_request_timings.extend(timings)
+            callers.append(
+                {
+                    "caller": caller_index,
+                    "acceptance_sequences": sequences,
+                    "request_elapsed_us": timings,
+                }
+            )
+        workload_elapsed_us = 100 + sample_index
+        workload_timings.append(workload_elapsed_us)
+        samples.append(
+            {
+                "sample": sample_index,
+                "accepted_message_count": CONCURRENT_MESSAGING_MESSAGE_COUNT,
+                "body_free_snapshot": {
+                    "visible_messages": CONCURRENT_MESSAGING_MESSAGE_COUNT,
+                    "pending_entries": CONCURRENT_MESSAGING_MESSAGE_COUNT,
+                    "rows_returned": CONCURRENT_MESSAGING_MESSAGE_COUNT,
+                },
+                "fifo": {
+                    "per_caller_order": "strictly increasing durable sequence",
+                    "global_caller_interleaving": global_order,
+                    "max_consecutive_acceptances_from_one_caller": max_consecutive(global_order),
+                },
+                "callers": callers,
+                "workload_elapsed_us": workload_elapsed_us,
+            }
+        )
+
+    def distribution(raw_samples: list[int]) -> dict[str, object]:
+        return {
+            "unit": "microseconds",
+            "sample_count": len(raw_samples),
+            "p50": percentile(raw_samples, 50),
+            "p95": percentile(raw_samples, 95),
+            "max": max(raw_samples),
+        }
+
+    return {
+        "schema": CONCURRENT_MESSAGING_SCHEMA,
+        "kind": CONCURRENT_MESSAGING_KIND,
+        "benchmark_test_build_ref": "selftest",
+        "cyclopsd_version": "0.1.0",
+        "workload": CONCURRENT_MESSAGING_WORKLOAD,
+        "latency": {
+            "workload_elapsed_us": distribution(workload_timings),
+            "request_elapsed_us": distribution(all_request_timings),
+        },
+        "samples": samples,
+    }
+
+
 def selftest() -> None:
     """Prove incomplete retained reports cannot become successful artifacts."""
 
@@ -426,7 +727,11 @@ def selftest() -> None:
         assert result["status"] == 1
         assert "measurement_error" in result
 
-    for name in ("daemon-cold-start-replay", "install-first-durable-handoff"):
+    for name in (
+        "daemon-cold-start-replay",
+        "install-first-durable-handoff",
+        "concurrent-mailbox-acceptance",
+    ):
         missing = fixture_result(name, None)
         assert missing["command_status"] == 0
         assert missing["status"] == 1
@@ -488,6 +793,24 @@ def selftest() -> None:
         "max_seconds": float("inf"),
     }
     rejected("install-first-durable-handoff", nonfinite_phase)
+
+    concurrent = complete_concurrent_messaging_report()
+    valid_concurrent = fixture_result("concurrent-mailbox-acceptance", concurrent)
+    assert valid_concurrent["status"] == 0
+    assert valid_concurrent["measurement"] == concurrent
+    rejected("concurrent-mailbox-acceptance", {})
+
+    changed_workload = json.loads(json.dumps(concurrent))
+    changed_workload["workload"]["recipient"] = "agent route"
+    rejected("concurrent-mailbox-acceptance", changed_workload)
+
+    missing_snapshot = json.loads(json.dumps(concurrent))
+    missing_snapshot["samples"][0].pop("body_free_snapshot")
+    rejected("concurrent-mailbox-acceptance", missing_snapshot)
+
+    reordered_sequence = json.loads(json.dumps(concurrent))
+    reordered_sequence["samples"][0]["callers"][0]["acceptance_sequences"][1] = 1
+    rejected("concurrent-mailbox-acceptance", reordered_sequence)
 
 
 def main() -> int:
