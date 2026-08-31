@@ -769,6 +769,81 @@ mod tests {
         reject_projection_request(listener, "events.backfill").await;
     }
 
+    /// A retained session journal is historical evidence, not a substitute for
+    /// the coordinator's current projection. If the daemon is unavailable,
+    /// `cyclops watch` must show the gap rather than reopen storage and make
+    /// old facts look current.
+    #[tokio::test]
+    async fn an_offline_stream_does_not_replay_local_history_as_current_state() {
+        let home = cyclops_proto::scratch::scratch_dir("ui-offline-history-boundary");
+        let _ = std::fs::remove_dir_all(&home);
+        let ledger = home.join(std::path::Path::new("ledger"));
+        std::fs::create_dir_all(&ledger).unwrap();
+        let historical = cyclops_proto::LedgerLine {
+            seq: 7,
+            boot_id: "old-daemon".into(),
+            id: "m-historical".into(),
+            ts: 1_000,
+            kind: cyclops_proto::Kind::Msg,
+            from: "codex".into(),
+            to: vec!["reviewer".into()],
+            subject: Some("a retained message".into()),
+            body: None,
+            reply_to: None,
+            deliveries: Vec::new(),
+            data: None,
+        };
+        std::fs::write(
+            ledger.join("main.ndjson"),
+            format!("{}\n", serde_json::to_string(&historical).unwrap()),
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let (reconnect_tx, reconnect_rx) = mpsc::channel(1);
+        reconnect_tx.send(()).await.unwrap();
+        let task = tokio::spawn(subscription_task(
+            tx,
+            home.join(cyclops_proto::SOCK_NAME),
+            reconnect_rx,
+            200,
+        ));
+
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("offline result was not reported")
+            .expect("subscription worker stopped before reporting")
+        {
+            UiMsg::StreamProjection(projection) => {
+                assert!(projection.seed.is_none());
+                assert!(
+                    projection.entries.is_empty(),
+                    "a local journal became a current stream projection"
+                );
+                assert!(
+                    projection
+                        .warning
+                        .as_deref()
+                        .is_some_and(|warning| warning.contains("state may be incomplete")),
+                    "the missing coordinator was not made visible"
+                );
+            }
+            _ => panic!("offline history produced a non-projection result"),
+        }
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("lost coordinator was not reported")
+            .expect("subscription worker stopped before reporting the lost coordinator")
+        {
+            UiMsg::ConnLost(message) => assert!(message.contains("cyclops isn't running")),
+            _ => panic!("offline history did not report the lost coordinator"),
+        }
+
+        task.abort();
+        let _ = task.await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
     #[test]
     fn daemon_backfill_projects_rows_and_preserves_explicit_gaps() {
         let result = StreamBackfillResult {
