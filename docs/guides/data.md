@@ -1,9 +1,13 @@
-# Inspect and export durable records
+# Inspect, export, and forget durable records
 
 Use this when you want to see the retained messaging record, keep a portable
-copy before changing machines, or confirm what an uninstall leaves behind.
-These commands run without a daemon and do not modify the source state. Find
-them under Operations in `cyclops commands`; start with `cyclops data inventory`.
+copy before changing machines, explicitly remove the journal scope, or confirm
+what an uninstall leaves behind. Inventory and export run without a daemon and
+do not modify the source state. To forget, stop and quiesce the daemon first,
+then preview without changing anything and use that exact confirmation while it
+remains stopped.
+Find these commands under Operations in `cyclops commands`; start with
+`cyclops data inventory`.
 
 ## See what Cyclops retains
 
@@ -27,8 +31,9 @@ durable record inventory
   session journals  0 files · 0 bytes
   scope      workspace and session NDJSON journals only; preferences, setup files, and managed installation assets are outside this export.
   ownership  Cyclops owns these append-only journals below its state home; workspace journals can contain message bodies.
-  retention  Cyclops preserves these records until a future explicit removal journey. This command does not delete, truncate, rewrite, or repair them.
+  retention  Cyclops preserves these records until an explicit confirmed forget operation. Inventory and export never delete, truncate, rewrite, or repair them.
   export     cyclops data export --to <new-directory>
+  forget     cyclops data forget --all
 ```
 
 An incomplete inventory exits nonzero and names the affected category. Export
@@ -74,7 +79,56 @@ Do not rely on an export while the marker exists or while completion is
 uncertain; inspect it or retry with another new destination. Source records
 are never modified by Cyclops either way.
 
-Cyclops retains these append-only records until an explicit future removal
-journey is available. The data commands do not delete, truncate, rewrite, or
-repair them. The current installer uninstall likewise preserves the Cyclops
-state home and its journals.
+The current installer uninstall preserves the Cyclops state home and its
+journals. Use the explicit journey below when you want to remove the journal
+scope, or follow the [uninstall guide](install.md#uninstall) for the wider
+manual removal of settings and vendor hooks.
+
+## Forget the retained journal scope
+
+`cyclops data forget --all` is an explicit, narrow removal operation. It
+selects exactly the workspace and session NDJSON journals shown in its preview.
+It does not remove preferences, layouts, setup files, logs, sockets, managed
+assets, installed binaries, or vendor configuration. Export first if you may
+need the records again.
+
+First stop and quiesce the daemon. A graceful stop can append final journal
+facts, so a preview made before it stops has a stale confirmation token:
+
+```bash
+cyclops daemon stop
+```
+
+Then preview the exact paths and byte total:
+
+```bash
+cyclops data forget --all
+```
+
+The preview changes nothing and prints a command containing its exact
+confirmation token. Keep the daemon stopped and paste that command unchanged:
+
+```bash
+cyclops data forget --all --confirm <token-from-preview>
+```
+
+The confirmation applies only to the previewed files. Cyclops records a
+private, content-free checkpoint before the first deletion and verifies every
+file's descriptor-bound identity again before removing it. A running daemon,
+an incomplete inventory, a journal locked by another writer, a changed path, a
+replaced journal, or a mismatched token stops the operation rather than
+broadening the scope.
+
+The daemon and confirmed removal hold the same journal lease. Once the removal
+has its lease, a daemon cannot start and write journals in the gap before
+deletion; do not start it between the preview and confirmation, and keep it
+stopped until the command reports its result.
+
+If the process is interrupted after confirmation, run `cyclops data forget
+--all` again. If it reports a pending checkpoint or a partial result, resolve
+the reported condition and rerun the same exact confirmation. If it does not
+report a pending checkpoint, make a fresh preview before confirming. Recovery
+considers only the original previewed paths: files created after the preview
+are left in place, and a changed planned file is left in place and reported as
+partial. A recovery report distinguishes files removed by that invocation from
+planned files that were already absent. Empty parent directories may remain.

@@ -100,7 +100,7 @@ use cyclops_proto::{
     SessionIdentityBinding, SessionInstanceId, StateReportParams, TmuxPaneId, TmuxSessionId,
     WireError, WorkspaceId,
 };
-use cyclops_state::{RepairSummary, StateRoot};
+use cyclops_state::{RepairSummary, StateFile, StateRoot};
 use cyclops_tmux::{
     pane_session_id, ControlConfig, PaneEvent, PaneField, PaneRow, SessionWatcher, TmuxError,
     TmuxVersion,
@@ -628,6 +628,10 @@ pub(crate) struct Inner {
     pub(crate) force_submit: ForceSubmitRuntime,
     /// Validated descriptor anchoring every session-ledger open in this daemon.
     pub(crate) state_root: Arc<StateRoot>,
+    /// Held for the full lifetime of any runtime task that can write a
+    /// journal. Keeping it on `Inner` prevents an unclean outer `Daemon`
+    /// drop from opening a removal window while detached tasks still run.
+    durable_record_forget_lease: StdMutex<Option<StateFile>>,
     /// One boot-wide aggregate recorded on each session's boot fact.
     pub(crate) state_repair: RepairSummary,
     /// Durable identity of this state root. Loaded before any mailbox or
@@ -2376,6 +2380,12 @@ impl Daemon {
         {
             let _ = cleanup.remove();
         }
+        let _ = self
+            .inner
+            .durable_record_forget_lease
+            .lock()
+            .expect("durable record forget lease lock")
+            .take();
         info!("cyclopsd stopped");
     }
 
@@ -3854,6 +3864,15 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     let boot_id = uuid::Uuid::new_v4().to_string();
     let started = Instant::now();
 
+    // Claim the writer/removal lease before probing tmux, binding the socket,
+    // or opening a journal. A confirmed forget holds it for its whole
+    // descriptor-bound removal transaction.
+    let state_root = Arc::new(
+        StateRoot::open_or_create(&cfg.home)
+            .map_err(|error| anyhow::anyhow!("open state root {}: {error}", cfg.home.display()))?,
+    );
+    let durable_record_forget_lease = hold_durable_record_forget_lease(&state_root)?;
+
     let tmux_version = match probe_tmux().await {
         Some(v) => {
             info!(
@@ -3875,11 +3894,6 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         }
     };
 
-    // Every session-ledger open is anchored to this validated state root.
-    let state_root = Arc::new(
-        StateRoot::open_or_create(&cfg.home)
-            .map_err(|error| anyhow::anyhow!("open state root {}: {error}", cfg.home.display()))?,
-    );
     let bound_socket = server::bind_socket(&state_root).await?;
     let repair = state_root
         .repair_descendant_permissions(Some(OsStr::new(cyclops_proto::SOCK_NAME)))
@@ -4044,6 +4058,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         cfg,
         force_submit,
         state_root,
+        durable_record_forget_lease: StdMutex::new(Some(durable_record_forget_lease)),
         state_repair: repair,
         workspace_id,
         session_identities: StdMutex::new(session_identities),
@@ -4159,6 +4174,27 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         unread_projection_task: StdMutex::new(Some(unread_projection_task)),
         socket_cleanup: StdMutex::new(Some(socket_cleanup)),
     })
+}
+
+/// Claim the journal writer/removal lease before the daemon opens any journal.
+///
+/// The lock is intentionally held until shutdown. A command that has already
+/// confirmed a record-removal preview obtains the same lease before it deletes
+/// anything, so a daemon cannot start in the gap after that command's initial
+/// liveness check.
+fn hold_durable_record_forget_lease(state_root: &StateRoot) -> anyhow::Result<StateFile> {
+    let lease = state_root
+        .open_append(Path::new(cyclops_proto::DURABLE_RECORD_FORGET_LEASE))
+        .map_err(|error| anyhow::anyhow!("open durable-record removal lease: {error}"))?;
+    match lease
+        .try_lock()
+        .map_err(|error| anyhow::anyhow!("lock durable-record removal lease: {error}"))?
+    {
+        true => Ok(lease),
+        false => anyhow::bail!(
+            "a confirmed durable-record removal is in progress; wait for it to finish before starting cyclopsd"
+        ),
+    }
 }
 
 /// Start watching a tmux session the daemon was not booted with.
@@ -6078,6 +6114,150 @@ pub(crate) fn unix_ms() -> u64 {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn daemon_boot_refuses_while_confirmed_record_removal_holds_the_journal_lease() {
+        let home = cyclops_proto::scratch::scratch_dir(&format!(
+            "cyc-data-forget-lease-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state_root = StateRoot::open_or_create(&home).unwrap();
+        let removal_lease = state_root
+            .open_append(Path::new(cyclops_proto::DURABLE_RECORD_FORGET_LEASE))
+            .unwrap();
+        assert!(removal_lease.try_lock().unwrap());
+
+        let error = match boot(Config::defaults(&home)).await {
+            Ok(daemon) => {
+                daemon.shutdown().await;
+                panic!("daemon booted while durable-record removal held the lease")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("confirmed durable-record removal is in progress"),
+            "{error:#}"
+        );
+        assert!(!home.join(cyclops_proto::SOCK_NAME).exists());
+
+        drop(removal_lease);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn unclean_drop_keeps_the_journal_lease_while_a_runtime_writer_is_in_flight() {
+        let home = cyclops_proto::scratch::scratch_dir(&format!(
+            "cyc-data-forget-unclean-drop-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let daemon = boot(Config::defaults(&home))
+            .await
+            .expect("boot daemon for unclean-drop lease test");
+        let (writer_started, writer_started_rx) = tokio::sync::oneshot::channel();
+        let (release_writer, release_writer_rx) = tokio::sync::oneshot::channel();
+        let writer_inner = Arc::clone(&daemon.inner);
+        let writer = tokio::spawn(async move {
+            let mut record = writer_inner
+                .state_root
+                .open_append(Path::new("ledger/unclean-drop.ndjson"))
+                .expect("open in-flight journal");
+            record
+                .append_bounded(b"{\"event\":\"in-flight\"}\n", 1024, 512)
+                .expect("append in-flight journal record");
+            writer_started
+                .send(())
+                .expect("test observes in-flight journal writer");
+            release_writer_rx
+                .await
+                .expect("test releases in-flight journal writer");
+        });
+        writer_started_rx
+            .await
+            .expect("in-flight journal writer starts");
+
+        // Quiesce every daemon-owned task without calling `shutdown`: the
+        // paused writer is the one remaining runtime owner when `Daemon` is
+        // dropped below.
+        daemon
+            .inner
+            .unread_projection_stopping
+            .store(true, Ordering::Release);
+        daemon.inner.unread_projection_wake.notify_one();
+        let _ = daemon.stop.send(true);
+        let tasks = std::mem::take(&mut *daemon.tasks.lock().expect("tasks lock"));
+        for task in tasks {
+            task.await.expect("daemon task stops");
+        }
+        let unread_projection_task = daemon
+            .unread_projection_task
+            .lock()
+            .expect("unread projection task lock")
+            .take();
+        if let Some(task) = unread_projection_task {
+            task.await.expect("unread projection task stops");
+        }
+
+        drop(daemon);
+        let state_root = StateRoot::open_existing(&home)
+            .expect("open state root after outer daemon drop")
+            .expect("state root remains present");
+        let contender = state_root
+            .open_append(Path::new(cyclops_proto::DURABLE_RECORD_FORGET_LEASE))
+            .expect("open removal contender lease");
+        let blocked_while_writer_lives = !contender.try_lock().expect("try contender lease");
+        if !blocked_while_writer_lives {
+            contender.unlock().expect("unlock wrongly acquired lease");
+        }
+
+        release_writer
+            .send(())
+            .expect("release in-flight journal writer");
+        writer.await.expect("in-flight journal writer exits");
+        let acquired_after_writer_exit = contender.try_lock().expect("try released lease");
+        if acquired_after_writer_exit {
+            contender.unlock().expect("unlock released lease");
+        }
+
+        let _ = std::fs::remove_dir_all(home);
+        assert!(
+            blocked_while_writer_lives,
+            "an outer Daemon drop released the journal lease while an in-flight writer still held the runtime"
+        );
+        assert!(
+            acquired_after_writer_exit,
+            "the journal lease remained held after the final runtime writer exited"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_shutdown_releases_the_journal_lease_after_runtime_tasks_stop() {
+        let home = cyclops_proto::scratch::scratch_dir(&format!(
+            "cyc-data-forget-clean-shutdown-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let daemon = boot(Config::defaults(&home))
+            .await
+            .expect("boot daemon for clean shutdown lease test");
+        daemon.shutdown().await;
+
+        let state_root = StateRoot::open_existing(&home)
+            .expect("open state root after clean shutdown")
+            .expect("state root remains present");
+        let contender = state_root
+            .open_append(Path::new(cyclops_proto::DURABLE_RECORD_FORGET_LEASE))
+            .expect("open removal contender lease");
+        assert!(
+            contender.try_lock().expect("try released lease"),
+            "clean shutdown must release the journal lease after its runtime tasks stop"
+        );
+        contender.unlock().expect("unlock released lease");
+
+        drop(contender);
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
     #[test]
     fn output_debounce_retains_the_newest_causal_timestamp() {
         let (tx, mut rx) = watch::channel(10);
@@ -6326,6 +6506,7 @@ mod tests {
             cfg: Config::defaults(&home),
             force_submit: ForceSubmitRuntime::new(false, 5_000),
             state_root,
+            durable_record_forget_lease: StdMutex::new(None),
             state_repair: RepairSummary::default(),
             workspace_id,
             session_identities: StdMutex::new(session_identities),

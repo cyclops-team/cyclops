@@ -19,7 +19,7 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
 
 use cyclops_state::{InspectedEntry, InspectedKind, InspectionLimits, StateInspector};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const INVENTORY_SCHEMA: u32 = 1;
@@ -33,7 +33,7 @@ const PRIVATE_FILE_MODE: u32 = 0o600;
 const OWNERSHIP: &str =
     "Cyclops owns these append-only journals below its state home; workspace journals can contain message bodies.";
 const RETENTION: &str =
-    "Cyclops preserves these records until a future explicit removal journey. This command does not delete, truncate, rewrite, or repair them.";
+    "Cyclops preserves these records until an explicit confirmed forget operation. Inventory and export never delete, truncate, rewrite, or repair them.";
 const SCOPE: &str =
     "workspace and session NDJSON journals only; preferences, setup files, and managed installation assets are outside this export.";
 const SNAPSHOT: &str =
@@ -62,12 +62,12 @@ impl RecordCategory {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RecordFile {
+pub(crate) struct RecordFile {
     category: RecordCategory,
-    relative: PathBuf,
-    path: String,
-    bytes: u64,
-    evidence: RecordEvidence,
+    pub(crate) relative: PathBuf,
+    pub(crate) path: String,
+    pub(crate) bytes: u64,
+    pub(crate) evidence: RecordEvidence,
 }
 
 /// Stable evidence captured before an export reads one live journal.
@@ -76,22 +76,23 @@ struct RecordFile {
 /// times detect an in-place rewrite that preserves the path and byte count.
 /// This is not a daemon epoch: a live writer can still change a record after
 /// the final recheck and before the command returns.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RecordEvidence {
-    device: u64,
-    inode: u64,
-    mode: u32,
-    uid: u32,
-    links: u64,
-    bytes: u64,
-    modified_seconds: i64,
-    modified_nanoseconds: i64,
-    changed_seconds: i64,
-    changed_nanoseconds: i64,
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecordEvidence {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) mode: u32,
+    pub(crate) uid: u32,
+    pub(crate) links: u64,
+    pub(crate) bytes: u64,
+    pub(crate) modified_seconds: i64,
+    pub(crate) modified_nanoseconds: i64,
+    pub(crate) changed_seconds: i64,
+    pub(crate) changed_nanoseconds: i64,
 }
 
 impl RecordEvidence {
-    fn from_metadata(metadata: &fs::Metadata) -> Self {
+    pub(crate) fn from_metadata(metadata: &fs::Metadata) -> Self {
         Self {
             device: metadata.dev(),
             inode: metadata.ino(),
@@ -106,7 +107,7 @@ impl RecordEvidence {
         }
     }
 
-    fn matches_entry(&self, entry: &InspectedEntry) -> bool {
+    pub(crate) fn matches_entry(&self, entry: &InspectedEntry) -> bool {
         self.device == entry.device
             && self.inode == entry.inode
             && self.mode == entry.mode
@@ -115,7 +116,7 @@ impl RecordEvidence {
             && self.bytes == entry.size
     }
 
-    fn matches_metadata(&self, metadata: &fs::Metadata) -> bool {
+    pub(crate) fn matches_metadata(&self, metadata: &fs::Metadata) -> bool {
         self == &Self::from_metadata(metadata)
     }
 }
@@ -139,25 +140,25 @@ impl RecordGroup {
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
-struct RecordInventory {
+pub(crate) struct RecordInventory {
     workspace: RecordGroup,
     session: RecordGroup,
 }
 
 impl RecordInventory {
-    fn complete(&self) -> bool {
+    pub(crate) fn complete(&self) -> bool {
         !self.workspace.truncated && !self.session.truncated
     }
 
-    fn records(&self) -> impl Iterator<Item = &RecordFile> {
+    pub(crate) fn records(&self) -> impl Iterator<Item = &RecordFile> {
         self.workspace.records.iter().chain(&self.session.records)
     }
 
-    fn files(&self) -> usize {
+    pub(crate) fn files(&self) -> usize {
         self.records().count()
     }
 
-    fn bytes(&self) -> Result<u64, String> {
+    pub(crate) fn bytes(&self) -> Result<u64, String> {
         self.workspace
             .bytes
             .checked_add(self.session.bytes)
@@ -165,10 +166,10 @@ impl RecordInventory {
     }
 }
 
-struct RecordSource {
-    home: PathBuf,
-    inspector: Option<StateInspector>,
-    inventory: RecordInventory,
+pub(crate) struct RecordSource {
+    pub(crate) home: PathBuf,
+    pub(crate) inspector: Option<StateInspector>,
+    pub(crate) inventory: RecordInventory,
 }
 
 #[derive(Serialize)]
@@ -374,7 +375,7 @@ fn print_error(json_output: bool, code: &str, error: &str) {
     }
 }
 
-fn inspect_records(home: &Path) -> Result<RecordSource, String> {
+pub(crate) fn inspect_records(home: &Path) -> Result<RecordSource, String> {
     let Some(inspector) = StateInspector::open_existing(home)
         .map_err(|error| format!("inspect Cyclops state at {}: {error}", home.display()))?
     else {
@@ -477,7 +478,7 @@ fn inspect_session_journals(inspector: &StateInspector) -> Result<RecordGroup, S
     Ok(group)
 }
 
-fn inspection_limits() -> InspectionLimits {
+pub(crate) fn inspection_limits() -> InspectionLimits {
     InspectionLimits::new(
         cyclops_state::INSPECTION_ENTRY_LIMIT_MAX,
         cyclops_state::INSPECTION_NAME_BYTES_LIMIT_MAX,
@@ -550,7 +551,7 @@ fn record_file(
     })
 }
 
-fn require_safe(entry: &InspectedEntry, what: &str) -> Result<(), String> {
+pub(crate) fn require_safe(entry: &InspectedEntry, what: &str) -> Result<(), String> {
     if entry.safe_beneath_owner_only_parent() {
         return Ok(());
     }
@@ -595,6 +596,11 @@ fn inventory_json(inventory: &RecordInventory) -> Value {
             "format": "raw NDJSON files plus manifest.json",
             "snapshot": SNAPSHOT,
         },
+        "forget": {
+            "command": "cyclops data forget --all",
+            "scope": "the exact journal inventory shown by its preview",
+            "requires": "a daemon stopped before preview and kept stopped through exact confirmation",
+        },
     })
 }
 
@@ -636,6 +642,7 @@ fn inventory_plain(inventory: &RecordInventory) -> String {
         output.push_str("  export     refused until a complete inventory is available\n");
     } else {
         output.push_str("  export     cyclops data export --to <new-directory>\n");
+        output.push_str("  forget     cyclops data forget --all\n");
     }
     output
 }

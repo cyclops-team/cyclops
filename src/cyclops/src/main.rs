@@ -42,6 +42,7 @@ mod consumer;
 mod copy;
 mod daemon;
 mod data;
+mod data_forget;
 mod hash;
 mod health;
 mod hook;
@@ -362,6 +363,16 @@ enum DataCmd {
         /// A new directory to create for this export. Cyclops refuses an existing path.
         #[arg(long, value_name = "DIR")]
         to: std::path::PathBuf,
+    },
+    /// Preview removal of every retained journal, then require its exact confirmation token.
+    Forget {
+        /// Confirm that the whole current durable-record inventory may be removed.
+        #[arg(long, required = true)]
+        all: bool,
+        /// Exact token emitted by a matching preview while the daemon stayed
+        /// stopped. Without this, Cyclops only previews.
+        #[arg(long, value_name = "TOKEN")]
+        confirm: Option<String>,
     },
 }
 
@@ -1021,6 +1032,9 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
         Cmd::Data {
             cmd: DataCmd::Export { to },
         } => data::run_export(cli.json, to),
+        Cmd::Data {
+            cmd: DataCmd::Forget { all: _, confirm },
+        } => data_forget::run(cli.json, confirm.as_deref()),
         // Cleanup has no arbitrary path input and does not need the daemon.
         Cmd::Cleanup { assets, apply } => cleanup::run(cli.json, assets, *apply),
         Cmd::Start(args) => workspace::run_start(
@@ -3762,6 +3776,19 @@ mod tests {
                 cmd: DataCmd::Export { to }
             }) if to == std::path::Path::new("new-record-export")
         ));
+
+        let forget = Cli::try_parse_from(["cyclops", "data", "forget", "--all"])
+            .expect("parse previewed durable record removal");
+        assert!(matches!(
+            forget.cmd,
+            Some(Cmd::Data {
+                cmd: DataCmd::Forget {
+                    all: true,
+                    confirm: None,
+                }
+            })
+        ));
+        assert!(Cli::try_parse_from(["cyclops", "data", "forget"]).is_err());
     }
 
     #[test]

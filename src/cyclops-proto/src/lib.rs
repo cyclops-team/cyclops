@@ -56,6 +56,11 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Default socket path relative to the cyclops home directory.
 pub const SOCK_NAME: &str = "sock";
 
+/// State lease shared by cyclopsd and the explicit durable-record forget
+/// operation. It prevents a live journal writer and confirmed removal from
+/// running at the same time.
+pub const DURABLE_RECORD_FORGET_LEASE: &str = "operations/data-forget.lock";
+
 /// Environment variable overriding the cyclops home (default `~/.cyclops`).
 /// Tests point this at a scratch directory so nothing touches the real home.
 pub const HOME_ENV: &str = "CYCLOPS_HOME";

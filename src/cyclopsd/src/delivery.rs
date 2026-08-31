@@ -11918,6 +11918,7 @@ composer_trailer_required_prefix = 1
             cfg: crate::Config::defaults(path),
             force_submit: crate::ForceSubmitRuntime::new(false, 5_000),
             state_root,
+            durable_record_forget_lease: StdMutex::new(None),
             state_repair: cyclops_state::RepairSummary::default(),
             workspace_id,
             session_identities: StdMutex::new(session_identities),

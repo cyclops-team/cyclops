@@ -10579,6 +10579,7 @@ regex = ['^IDLE']
             cfg: crate::Config::defaults(&home),
             force_submit: crate::ForceSubmitRuntime::new(false, 5_000),
             state_root,
+            durable_record_forget_lease: StdMutex::new(None),
             state_repair: cyclops_state::RepairSummary::default(),
             workspace_id,
             session_identities: StdMutex::new(session_identities),
