@@ -9,7 +9,8 @@
 //! second, and both should read this module rather than keep a private
 //! copy of any of the five things it owns:
 //!
-//! - connection-epoch backfill and live `events.subscribe` ordering ([`Intake`]);
+//! - connection-epoch backfill and live `events.subscribe` ordering
+//!   ([`crate::StreamProjectionState`]);
 //! - entry normalization and resolution rows ([`Entry::from_event`],
 //!   [`Entry::from_ledger`], [`Entry::cleared`] — the append-only second
 //!   line an alarm gets when it ends, `docs/development/INVARIANTS.md` rule 8);
@@ -826,7 +827,7 @@ fn other_detail(d: &Value) -> Option<String> {
 /// produced (a socket subscription for `cyclops watch`, a different one
 /// for a workspace panel), and gets back the same three-group ordering
 /// either way.
-pub struct Intake {
+pub(crate) struct Intake {
     backfilled: bool,
     pending: Vec<Entry>,
     pending_status: Option<Box<StatusSeed>>,
@@ -899,7 +900,7 @@ impl Intake {
 /// order: `replayed` is history and moves nothing but the screen, `seed`
 /// is the daemon's snapshot and replaces the register, `live` are the
 /// transitions that happened while the two were loading.
-pub struct Backfilled {
+pub(crate) struct Backfilled {
     pub replayed: Vec<Entry>,
     pub seed: Option<Box<StatusSeed>>,
     pub live: Vec<Entry>,
@@ -2212,9 +2213,9 @@ mod tests {
         assert_eq!(r.entries().next().unwrap().uid, 11);
     }
 
-    /// The seam a future workspace panel's parity test reuses: one
+    /// The seam a workspace panel's parity test reuses: one
     /// backfill-plus-live transcript, fed through the exact ordering
-    /// [`Intake`] enforces, has to yield the four guarantees any renderer
+    /// [`crate::StreamProjectionState`] exposes, has to yield the four guarantees any renderer
     /// depends on: row order, stable identity across the update, the
     /// resolution row an ending alarm gets, and a calm-view decision that
     /// answers to the register's CURRENT state rather than to a stale scan.

@@ -18,9 +18,9 @@ use std::path::Path;
 use crate::app::{App, View};
 use crate::data::{self, UiMsg};
 use crate::messages::MessageFollower;
-use crate::stream::{Entry, Intake};
+use crate::stream::Entry;
 use crate::theme::Theme;
-use crate::UiOptions;
+use crate::{StreamInput, StreamProjectionState, StreamUpdate, UiOptions};
 
 pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(crate::EVENT_CAPACITY);
@@ -38,7 +38,7 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
         View::Admin
     };
     let mut app = App::new(Theme::none(), view, opts.filter());
-    let mut intake = Intake::new();
+    let mut stream_projection = StreamProjectionState::new();
     let mut message_follower = MessageFollower::default();
     // The last eye line printed, so a change prints exactly once.
     let mut eye_printed: Option<Vec<String>> = None;
@@ -97,32 +97,20 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
                 }
             }
             UiMsg::ActionDone { .. } => {}
-            UiMsg::Entry(e) => {
-                for e in intake.entry(*e) {
-                    live(&mut app, e, &mut stdout);
-                }
-            }
+            UiMsg::Entry(e) => apply_stream_updates(
+                &mut app,
+                stream_projection.apply(StreamInput::Live(*e)),
+                &mut stdout,
+            ),
             UiMsg::StreamProjection(projection) => {
-                // One whole replacement per connection epoch. Plain mode exits
-                // on a lost connection, but shares the exact initial contract.
+                // The pure projection owns the epoch reset, ordering, and
+                // duplicate cursor. Plain mode only presents its updates.
                 app.clear_stream_projection();
-                intake = Intake::new();
-                if let Some(seed) = projection.seed {
-                    let _ = intake.status(seed);
-                }
-                let landed = intake.backfill(projection.entries, projection.max_seq);
-                for e in landed.replayed {
-                    replay(&mut app, e, &mut stdout);
-                }
-                if let Some(seed) = landed.seed {
-                    seed_status(&mut app, *seed, &mut stdout);
-                }
-                for e in landed.live {
-                    live(&mut app, e, &mut stdout);
-                }
-                if let Some(warning) = projection.warning {
-                    eprintln!("{warning}");
-                }
+                apply_stream_updates(
+                    &mut app,
+                    stream_projection.replace(*projection),
+                    &mut stdout,
+                );
             }
             UiMsg::ConnLost(text) => {
                 app.conn_lost = true;
@@ -154,10 +142,23 @@ pub async fn run(opts: &UiOptions, home: &Path) -> i32 {
             }
         }
         if let Some(text) = &lost {
-            if intake.is_backfilled() {
+            if stream_projection.is_backfilled() {
                 eprintln!("{text}");
                 return 1;
             }
+        }
+    }
+}
+
+/// Present ordered stream updates without knowing how the daemon facts were
+/// buffered, deduplicated, or reconciled.
+fn apply_stream_updates(app: &mut App, updates: Vec<StreamUpdate>, out: &mut impl Write) {
+    for update in updates {
+        match update {
+            StreamUpdate::Replay(entry) => replay(app, entry, out),
+            StreamUpdate::Status(seed) => seed_status(app, *seed, out),
+            StreamUpdate::Live(entry) => live(app, entry, out),
+            StreamUpdate::Notice(text) => eprintln!("{text}"),
         }
     }
 }

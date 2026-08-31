@@ -15,7 +15,10 @@ mod common;
 
 use common::{HomeGuard, TmuxGuard};
 use cyclops_proto::StatusResult;
-use cyclops_ui::{build, App, Entry, EntryKind, Eye, Filter, Intake, StatusSeed, Theme, View};
+use cyclops_ui::{
+    build, App, Entry, EntryKind, Eye, Filter, StatusSeed, StreamInput, StreamProjectionState,
+    StreamUpdate, Theme, View,
+};
 use serde_json::Value;
 
 /// A previous run's ledger with `chains` deliveries still in flight: msg
@@ -44,25 +47,34 @@ fn ledger_with_deliveries_in_flight(home: &std::path::Path, chains: &[(&str, &st
     std::fs::write(home.join("ledger/main.ndjson"), lines).expect("seed the previous run's ledger");
 }
 
-/// The UI's own startup, in the one order it can happen: the daemon's
-/// answer, then the replayed tail, then the seed over it (cyclops-ui
-/// `Intake`). `answer` is what `status` returned for this run.
+/// The UI's own startup feeds the daemon's answer before its retained tail.
+/// `StreamProjectionState` then emits replay rows before that current seed.
+/// `answer` is what `status` returned for this run.
 fn ui_after_startup(answer: &StatusResult, backfill: cyclops_proto::StreamBackfillResult) -> App {
     let mut app = App::new(Theme::none(), View::Admin, Filter::default());
-    let mut intake = Intake::new();
+    let mut projection = StreamProjectionState::new();
     let seed = StatusSeed::from_status(answer);
-    assert!(intake.status(Box::new(seed)).is_none());
+    assert!(projection
+        .apply(StreamInput::Status(Box::new(seed)))
+        .is_empty());
     let report = cyclops_ui::project_backfill(backfill);
     assert!(report.warning.is_none(), "{:?}", report.warning);
-    let landed = intake.backfill(report.entries, report.max_seq);
-    for e in landed.replayed {
-        app.replay(e);
-    }
-    for e in app.seed_status(*landed.seed.expect("the seed came back")) {
-        app.replay(e);
-    }
-    for e in landed.live {
-        app.live(e);
+    for update in projection.apply(StreamInput::Backfill {
+        entries: report.entries,
+        max_seq: report.max_seq,
+    }) {
+        match update {
+            StreamUpdate::Replay(entry) => app.replay(entry),
+            StreamUpdate::Status(seed) => {
+                for entry in app.seed_status(*seed) {
+                    app.replay(entry);
+                }
+            }
+            StreamUpdate::Live(entry) => {
+                let _ = app.live(entry);
+            }
+            StreamUpdate::Notice(text) => panic!("unexpected stream warning: {text}"),
+        }
     }
     // Settle the eye: the drawn glyph is what a frame shows.
     while app.tick_eye() {}

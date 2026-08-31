@@ -13,8 +13,8 @@
 
 use cyclops_proto::{AgentState, Delivery, DeliveryState, Kind, LedgerLine, OpenDelivery};
 use cyclops_ui::{
-    build, App, EndpointFilter, Entry, EntryKind, Eye, Filter, Intake, PaneSnapshot, StatusSeed,
-    Theme, View,
+    build, App, EndpointFilter, Entry, EntryKind, Eye, Filter, PaneSnapshot, StatusSeed,
+    StreamInput, StreamProjectionState, StreamUpdate, Theme, View,
 };
 
 const BASE: u64 = 43_000_000;
@@ -120,22 +120,35 @@ fn projected_tail(dir: &std::path::Path, limit: usize) -> (Vec<Entry>, Option<u6
 /// live entries that queued behind the two.
 fn started(dir: &std::path::Path, backfill: usize, seed: StatusSeed) -> App {
     let mut app = App::new(Theme::none(), View::Admin, Filter::default());
-    let mut intake = Intake::new();
-    // The seed arrives before the backfill; Intake orders it between the
+    let mut projection = StreamProjectionState::new();
+    // The seed arrives before the backfill; the projection orders it between the
     // replayed tail and the live backlog.
-    assert!(intake.status(Box::new(seed)).is_none());
+    assert!(projection
+        .apply(StreamInput::Status(Box::new(seed)))
+        .is_empty());
     let (entries, max_seq) = projected_tail(dir, backfill);
-    let landed = intake.backfill(entries, max_seq);
-    for e in landed.replayed {
-        app.replay(e);
-    }
-    for e in app.seed_status(*landed.seed.expect("the seed came back")) {
-        app.replay(e);
-    }
-    for e in landed.live {
-        app.live(e);
-    }
+    apply_stream_updates(
+        &mut app,
+        projection.apply(StreamInput::Backfill { entries, max_seq }),
+    );
     app
+}
+
+fn apply_stream_updates(app: &mut App, updates: Vec<StreamUpdate>) {
+    for update in updates {
+        match update {
+            StreamUpdate::Replay(entry) => app.replay(entry),
+            StreamUpdate::Status(seed) => {
+                for entry in app.seed_status(*seed) {
+                    app.replay(entry);
+                }
+            }
+            StreamUpdate::Live(entry) => {
+                app.live(entry);
+            }
+            StreamUpdate::Notice(_) => {}
+        }
+    }
 }
 
 /// The daemon's answer for this ledger: the panes it currently sees, and

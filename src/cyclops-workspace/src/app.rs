@@ -539,11 +539,11 @@ struct App {
     /// Data-driven avatar registry for resolving agent/sender initials and icons.
     avatar_registry: cyclops_ui::AvatarRegistry,
     /// Startup ordering and seq dedup for `record`
-    /// ([`cyclops_ui::Intake`]): live entries reaching the app before
+    /// ([`cyclops_ui::StreamProjectionState`]): live entries reaching the app before
     /// [`crate::event_record::boot`] lands its backfill buffer here, and
     /// ledger-backed duplicates arriving live during startup are dropped
     /// by seq instead of shown twice.
-    intake: cyclops_ui::Intake,
+    stream_projection: cyclops_ui::StreamProjectionState,
     /// An oversized event invalidates the stream once. A replacement is
     /// loaded off-loop and later gaps coalesce until that result lands.
     stream_reconciling: bool,
@@ -1340,7 +1340,7 @@ pub async fn run_async() -> i32 {
         messages_detail: None,
         messages_composer: cyclops_ui::ComposerState::default(),
         avatar_registry: cyclops_ui::AvatarRegistry::default(),
-        intake: cyclops_ui::Intake::new(),
+        stream_projection: cyclops_ui::StreamProjectionState::new(),
         stream_reconciling: false,
         cursor_style: None,
         term_size,
@@ -1383,9 +1383,11 @@ pub async fn run_async() -> i32 {
     }
     // The subscription at the top of this function is already queuing live
     // entries on the app channel; boot's backfill-then-seed lands before
-    // the loop below drains them, which is exactly the order the intake
-    // contract wants (crate::event_record's doc).
-    if let Some(warning) = crate::event_record::boot(&mut app.record, &mut app.intake, &app.home) {
+    // the loop below drains them, which is exactly the order the stream
+    // projection contract wants (crate::event_record's doc).
+    if let Some(warning) =
+        crate::event_record::boot(&mut app.record, &mut app.stream_projection, &app.home)
+    {
         app.notice.show(warning, Instant::now());
     }
     if following_at_boot {
@@ -3382,11 +3384,11 @@ async fn handle_app_msg(
         // `spawn_decoration_forwarder`'s doc). `Record::live` also moves
         // the record's own attention register by the one rule in
         // `cyclops_proto::attention`, the same rule `app.decoration`'s
-        // register answers to; neither side recomputes it. The intake
+        // register answers to; neither side recomputes it. The projection
         // between here and the record drops ledger-backed entries the
         // boot-time tail already replayed (crate::event_record).
         AppMsg::StreamEntry(entry) => {
-            crate::event_record::live(&mut app.record, &mut app.intake, *entry);
+            crate::event_record::live(&mut app.record, &mut app.stream_projection, *entry);
             arm(debounce);
         }
         AppMsg::MessagesChanged(changed) => {
@@ -3421,10 +3423,10 @@ async fn handle_app_msg(
             if !queued {
                 let bootstrap = crate::event_record::load(&app.home);
                 let mut record = cyclops_ui::Record::new();
-                let mut intake = cyclops_ui::Intake::new();
-                let warning = crate::event_record::install(&mut record, &mut intake, bootstrap);
+                let mut projection = cyclops_ui::StreamProjectionState::new();
+                let warning = crate::event_record::install(&mut record, &mut projection, bootstrap);
                 app.record = record;
-                app.intake = intake;
+                app.stream_projection = projection;
                 app.stream_reconciling = false;
                 app.notice.show(
                     warning.unwrap_or_else(|| copy::STREAM_RECONCILED.to_string()),
@@ -3435,10 +3437,10 @@ async fn handle_app_msg(
         }
         AppMsg::StreamReconciled(bootstrap) => {
             let mut record = cyclops_ui::Record::new();
-            let mut intake = cyclops_ui::Intake::new();
-            let warning = crate::event_record::install(&mut record, &mut intake, *bootstrap);
+            let mut projection = cyclops_ui::StreamProjectionState::new();
+            let warning = crate::event_record::install(&mut record, &mut projection, *bootstrap);
             app.record = record;
-            app.intake = intake;
+            app.stream_projection = projection;
             app.stream_reconciling = false;
             app.notice.show(
                 warning.unwrap_or_else(|| copy::STREAM_RECONCILED.to_string()),
@@ -7575,7 +7577,7 @@ mod tests {
             messages_detail: None,
             messages_composer: cyclops_ui::ComposerState::default(),
             avatar_registry: cyclops_ui::AvatarRegistry::default(),
-            intake: cyclops_ui::Intake::new(),
+            stream_projection: cyclops_ui::StreamProjectionState::new(),
             stream_reconciling: false,
             cursor_style: None,
             term_size: (40, 12),

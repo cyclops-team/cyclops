@@ -23,7 +23,7 @@
 //! both were green.
 //!
 //! [`Record`] is the backend-neutral event-stream model: entry
-//! normalization, backfill/live ordering ([`Intake`]), resolution rows,
+//! normalization, backfill/live ordering ([`StreamProjectionState`]), resolution rows,
 //! the calm/firehose decision, and stable row identity: everything a
 //! renderer needs and nothing about how one paints. `cyclops watch`
 //! (app.rs, frame.rs, entry.rs, plain.rs) is its first renderer; a
@@ -115,7 +115,10 @@ pub use messages::{
     rows_from_snapshot, FollowRequest, Link, MessageFollower, RefreshGate, RefreshRequest,
 };
 #[cfg(feature = "presentation")]
-pub use projection::{project_backfill, BackfillReport, StreamProjection};
+pub use projection::{
+    project_backfill, BackfillReport, StreamInput, StreamProjection, StreamProjectionState,
+    StreamUpdate,
+};
 #[cfg(feature = "presentation")]
 pub use queue::{
     Counts, Direction, FrozenTarget, HumanQueue, MailboxWord, QueueRow, QueueTarget, Scope,
@@ -123,8 +126,8 @@ pub use queue::{
 };
 #[cfg(feature = "presentation")]
 pub use stream::{
-    Backfilled, EndpointFilter, Entry, EntryKind, Filter, Intake, MessageEndpoints, PingDelivery,
-    Record, RosterSeed, StatusSeed,
+    EndpointFilter, Entry, EntryKind, Filter, MessageEndpoints, PingDelivery, Record, RosterSeed,
+    StatusSeed,
 };
 #[cfg(feature = "presentation")]
 pub use theme::Theme;
@@ -310,7 +313,7 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
         None
     };
 
-    let mut intake = Intake::new();
+    let mut stream_projection = StreamProjectionState::new();
     let mut message_follower = MessageFollower::default();
     let mut tick_armed = false;
     let mut key_open = true;
@@ -341,7 +344,7 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
             while let Some(msg) = queued.take() {
                 if handle(
                     &mut app,
-                    &mut intake,
+                    &mut stream_projection,
                     &mut message_follower,
                     &mut tick_armed,
                     &io.focus,
@@ -446,7 +449,7 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
 #[cfg(feature = "watch")]
 fn handle(
     app: &mut App,
-    intake: &mut Intake,
+    stream_projection: &mut StreamProjectionState,
     message_follower: &mut MessageFollower,
     tick_armed: &mut bool,
     focus: &tokio::sync::mpsc::Sender<String>,
@@ -474,32 +477,13 @@ fn handle(
             None => {}
         },
         UiMsg::Entry(e) => {
-            for e in intake.entry(*e) {
-                app.live(e);
-            }
+            apply_stream_updates(app, stream_projection.apply(StreamInput::Live(*e)))
         }
         UiMsg::StreamProjection(projection) => {
-            // One whole replacement per connection epoch. The replayed tail is
-            // history, the seed is the daemon's answer about now, and live
-            // entries buffered behind the subscription are newer than both.
+            // The presentation projection owns the epoch reset, ordering, and
+            // duplicate cursor. App owns its own roster and render state.
             app.clear_stream_projection();
-            *intake = Intake::new();
-            if let Some(seed) = projection.seed {
-                let _ = intake.status(seed);
-            }
-            let landed = intake.backfill(projection.entries, projection.max_seq);
-            for e in landed.replayed {
-                app.replay(e);
-            }
-            if let Some(seed) = landed.seed {
-                seed_status(app, *seed);
-            }
-            for e in landed.live {
-                app.live(e);
-            }
-            if let Some(warning) = projection.warning {
-                app.notice = Some(warning);
-            }
+            apply_stream_updates(app, stream_projection.replace(*projection));
         }
         // The acknowledgement closes the startup race: only now may the
         // snapshot socket open, because later changes cannot be missed.
@@ -561,6 +545,23 @@ fn handle(
         UiMsg::ThemeChanged => {}
     }
     false
+}
+
+/// Apply pure stream updates to this renderer's own state. The projection
+/// decides ordering and duplicate suppression; the application retains its
+/// roster, selection, and render-specific consequences of those facts.
+#[cfg(feature = "watch")]
+fn apply_stream_updates(app: &mut App, updates: Vec<StreamUpdate>) {
+    for update in updates {
+        match update {
+            StreamUpdate::Replay(entry) => app.replay(entry),
+            StreamUpdate::Status(seed) => seed_status(app, *seed),
+            StreamUpdate::Live(entry) => {
+                app.live(entry);
+            }
+            StreamUpdate::Notice(text) => app.notice = Some(text),
+        }
+    }
 }
 
 /// Apply the startup reconciliation and ingest the lines it wrote for
@@ -808,7 +809,7 @@ mod tests {
             watermark: 17,
             rows: Vec::new(),
         });
-        let mut intake = Intake::new();
+        let mut intake = StreamProjectionState::new();
         let mut message_follower = MessageFollower::default();
         let mut tick_armed = false;
         let (tx, _rx) = mpsc::channel(4);
@@ -846,7 +847,7 @@ mod tests {
     #[test]
     fn an_initial_connection_failure_is_visible_and_retryable() {
         let mut app = App::new(Theme::none(), View::Messages, Filter::default());
-        let mut intake = Intake::new();
+        let mut intake = StreamProjectionState::new();
         let mut message_follower = MessageFollower::default();
         let mut tick_armed = false;
         let (tx, _rx) = mpsc::channel(4);
@@ -889,7 +890,7 @@ mod tests {
             watermark: 17,
             rows: Vec::new(),
         });
-        let mut intake = Intake::new();
+        let mut intake = StreamProjectionState::new();
         let mut message_follower = MessageFollower::default();
         let mut tick_armed = false;
         let (focus, _focus_rx) = mpsc::channel(1);

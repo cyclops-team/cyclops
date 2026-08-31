@@ -5,9 +5,8 @@
 //! same way.
 //!
 //! One startup-plus-live transcript is driven, step by step, into two
-//! records: one fed exactly the way `cyclops watch`'s plain follow loop
-//! feeds its own (the three `UiMsg` arms in `src/cyclops-ui/src/plain.rs`,
-//! replicated verbatim here), one fed through the workspace's real
+//! records: one fed through the same pure projection that `cyclops watch`
+//! consumes, one fed through the workspace's real
 //! transport-to-model seam (`cyclops_workspace::event_record`, the
 //! functions `App` boot and the `AppMsg::StreamEntry` arm call in
 //! production). The transcript exercises the whole startup contract: a
@@ -19,7 +18,9 @@
 //! stop being identical.
 
 use cyclops_proto::{AgentState, NotifyLevel, PaneSnapshot};
-use cyclops_ui::{Entry, EntryKind, Intake, Record, StatusSeed, Theme};
+use cyclops_ui::{
+    Entry, EntryKind, Record, StatusSeed, StreamInput, StreamProjectionState, StreamUpdate, Theme,
+};
 use cyclops_workspace::event_record;
 
 fn msg(ts: u64, seq: Option<u64>, from: &str, to: &[&str], subject: &str) -> Entry {
@@ -123,47 +124,38 @@ fn transcript() -> Vec<Step> {
     ]
 }
 
-/// `cyclops watch`'s own feed: the live-entry and replacement-projection
-/// handling in `src/cyclops-ui/src/plain.rs`, expanded into its three ordered
-/// steps so the boundary stays directly testable.
-fn feed_like_watch(record: &mut Record, intake: &mut Intake, step: Step) {
-    match step {
-        Step::Live(e) => {
-            for e in intake.entry(e) {
-                record.live(e);
-            }
-        }
-        Step::Status(seed) => {
-            if let Some(seed) = intake.status(seed) {
-                for e in record.seed(&seed.panes, &seed.open) {
-                    record.replay(e);
+/// The watch adapter's only knowledge is how its `Record` uses semantic
+/// presentation updates. Ordering and sequence suppression stay in the shared
+/// projection state.
+fn feed_like_watch(record: &mut Record, projection: &mut StreamProjectionState, step: Step) {
+    let input = match step {
+        Step::Live(entry) => StreamInput::Live(entry),
+        Step::Status(seed) => StreamInput::Status(seed),
+        Step::Backfill(entries, max_seq) => StreamInput::Backfill { entries, max_seq },
+    };
+    for update in projection.apply(input) {
+        match update {
+            StreamUpdate::Replay(entry) => record.replay(entry),
+            StreamUpdate::Status(seed) => {
+                for entry in record.seed(&seed.panes, &seed.open) {
+                    record.replay(entry);
                 }
             }
-        }
-        Step::Backfill(entries, max_seq) => {
-            let landed = intake.backfill(entries, max_seq);
-            for e in landed.replayed {
-                record.replay(e);
+            StreamUpdate::Live(entry) => {
+                record.live(entry);
             }
-            if let Some(seed) = landed.seed {
-                for e in record.seed(&seed.panes, &seed.open) {
-                    record.replay(e);
-                }
-            }
-            for e in landed.live {
-                record.live(e);
-            }
+            StreamUpdate::Notice(_) => {}
         }
     }
 }
 
 /// The workspace's feed: the production seam itself.
-fn feed_like_workspace(record: &mut Record, intake: &mut Intake, step: Step) {
+fn feed_like_workspace(record: &mut Record, projection: &mut StreamProjectionState, step: Step) {
     match step {
-        Step::Live(e) => event_record::live(record, intake, e),
-        Step::Status(seed) => event_record::status(record, intake, seed),
+        Step::Live(e) => event_record::live(record, projection, e),
+        Step::Status(seed) => event_record::status(record, projection, seed),
         Step::Backfill(entries, max_seq) => {
-            event_record::backfill(record, intake, entries, max_seq)
+            event_record::backfill(record, projection, entries, max_seq)
         }
     }
 }
@@ -183,15 +175,15 @@ fn cyclops_watch_rows(record: &Record) -> Vec<String> {
 #[test]
 fn the_workspace_stream_acquires_and_shows_the_rows_cyclops_watch_does() {
     let mut watch_record = Record::new();
-    let mut watch_intake = Intake::new();
+    let mut watch_projection = StreamProjectionState::new();
     let mut stream_record = Record::new();
-    let mut stream_intake = Intake::new();
+    let mut stream_projection = StreamProjectionState::new();
 
     // Interleave per step (not per consumer) so the two `Record::seed`
     // wall-clock stamps land as close together as two calls can.
     for (watch_step, stream_step) in transcript().into_iter().zip(transcript()) {
-        feed_like_watch(&mut watch_record, &mut watch_intake, watch_step);
-        feed_like_workspace(&mut stream_record, &mut stream_intake, stream_step);
+        feed_like_watch(&mut watch_record, &mut watch_projection, watch_step);
+        feed_like_workspace(&mut stream_record, &mut stream_projection, stream_step);
     }
 
     let watch_rows = cyclops_watch_rows(&watch_record);
