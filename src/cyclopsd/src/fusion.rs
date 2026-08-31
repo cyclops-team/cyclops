@@ -443,6 +443,75 @@ impl PaneObservationRuntime {
     }
 }
 
+/// Immutable cached pane evidence used by notification scheduling.
+///
+/// The scheduler asks the observation owner two narrow questions instead of
+/// reading detection-cache fields itself. This keeps process-generation,
+/// freshness, terminal-mode, and composer-proof interpretation together with
+/// the observation that produced them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NotificationObservation {
+    binding: Option<Binding>,
+    state: AgentState,
+    stale: bool,
+    disagreement: bool,
+    write_ready: bool,
+    in_mode: bool,
+}
+
+impl NotificationObservation {
+    fn from_entry(entry: &DetEntry) -> Self {
+        Self {
+            binding: entry.binding.clone(),
+            state: entry.detection.state,
+            stale: entry.detection.stale,
+            disagreement: entry.detection.disagreement,
+            write_ready: entry.detection.write_ready,
+            in_mode: entry.in_mode,
+        }
+    }
+
+    /// Whether this cached verdict authorizes the same complete live binding.
+    ///
+    /// Sensor disagreement does not revoke a separately stamped clean-composer
+    /// proof. Staleness, terminal mode, or any process-generation difference
+    /// still refuses the write.
+    pub(crate) fn write_ready_for(&self, live_in_mode: bool, expected: &Binding) -> bool {
+        !live_in_mode
+            && self.write_ready
+            && !self.stale
+            && !self.in_mode
+            && self.binding.as_ref() == Some(expected)
+    }
+
+    /// Whether the cached pane state can produce the first durable disposition
+    /// without waiting for another observation.
+    ///
+    /// This is a latency hint, never write authority. Disagreement therefore
+    /// waits, while a proven clean composer or visible human draft can decide
+    /// immediately.
+    pub(crate) fn can_decide_notification_now(&self, live_in_mode: bool) -> bool {
+        !live_in_mode
+            && !self.in_mode
+            && !self.stale
+            && !self.disagreement
+            && (self.write_ready || self.state == AgentState::IdleWithInput)
+    }
+}
+
+/// Snapshot the notification-relevant facts for one exact pane route.
+pub(crate) fn cached_notification_observation(
+    inner: &Inner,
+    pane: &PaneKey,
+) -> Option<NotificationObservation> {
+    inner
+        .detections
+        .lock()
+        .expect("detections lock")
+        .get(pane)
+        .map(NotificationObservation::from_entry)
+}
+
 pub(crate) fn schedule_lifecycle_recheck(inner: &Arc<Inner>, pane: &PaneKey) {
     if *inner.stop.borrow() {
         return;
@@ -4843,6 +4912,100 @@ mod tests {
 
     fn pane() -> PaneKey {
         PaneKey::new(0, "%1")
+    }
+
+    fn notification_binding(leader_birth: u64) -> Binding {
+        Binding {
+            pane_root: crate::identity::ProcId {
+                pid: 10,
+                birth: 100,
+            },
+            leader: crate::identity::ProcId {
+                pid: 20,
+                birth: leader_birth,
+            },
+            agent: crate::identity::ProcId {
+                pid: 30,
+                birth: 300,
+            },
+            manifest: "claude".into(),
+        }
+    }
+
+    fn notification_entry(state: AgentState, binding: &Binding) -> DetEntry {
+        DetEntry {
+            detection: Detection {
+                state,
+                readings: Vec::new(),
+                disagreement: false,
+                decided_by: "fixture".into(),
+                unknown_reason: None,
+                stale: false,
+                write_ready: true,
+                write_block: None,
+                composer_semantic: Some(cyclops_proto::ComposerSemantic::Clean),
+            },
+            binding: Some(binding.clone()),
+            manifest: Some(binding.manifest.clone()),
+            occupant: Some(binding.leader.pid),
+            agent: Some(binding.agent),
+            in_mode: false,
+            quota_screen_clear: true,
+            hold: ComposerHold::Clear,
+            turn: None,
+            hold_owner: None,
+            composer: crate::ComposerProjection::default(),
+            working_confirmed: false,
+            since: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn notification_readiness_belongs_to_one_complete_process_binding() {
+        let original = notification_binding(200);
+        let observation =
+            NotificationObservation::from_entry(&notification_entry(AgentState::Idle, &original));
+
+        assert!(observation.write_ready_for(false, &original));
+        assert!(
+            !observation.write_ready_for(false, &notification_binding(201)),
+            "a reused leader pid with a new generation cannot inherit readiness"
+        );
+    }
+
+    #[test]
+    fn notification_readiness_keeps_proof_and_receipt_latency_conservative() {
+        let binding = notification_binding(200);
+        let mut entry = notification_entry(AgentState::Working, &binding);
+        entry.detection.disagreement = true;
+        let observation = NotificationObservation::from_entry(&entry);
+
+        assert!(
+            observation.write_ready_for(false, &binding),
+            "a stamped clean-composer proof survives unrelated sensor disagreement"
+        );
+        assert!(
+            !observation.can_decide_notification_now(false),
+            "disagreement cannot produce an early durable receipt"
+        );
+
+        entry.detection.disagreement = false;
+        entry.detection.stale = true;
+        let stale = NotificationObservation::from_entry(&entry);
+        assert!(!stale.write_ready_for(false, &binding));
+        assert!(!stale.can_decide_notification_now(false));
+    }
+
+    #[test]
+    fn a_visible_human_draft_can_decide_but_never_authorizes_a_write() {
+        let binding = notification_binding(200);
+        let mut entry = notification_entry(AgentState::IdleWithInput, &binding);
+        entry.detection.write_ready = false;
+        let observation = NotificationObservation::from_entry(&entry);
+
+        assert!(observation.can_decide_notification_now(false));
+        assert!(!observation.write_ready_for(false, &binding));
+        assert!(!observation.can_decide_notification_now(true));
     }
 
     const FIXTURE: &str = r#"
