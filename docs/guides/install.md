@@ -540,6 +540,11 @@ record. `current replay unproven` is still expected during ordinary health
 inspection. Cyclops proves the current journals again immediately before an
 operator requests rollback.
 
+When health finds a distinct validated rollback candidate, it names the
+read-only next step `cyclops update --rollback`. Health does not run the
+command. The command revalidates current journals before changing the selector,
+so a candidate remains distinct from a rollback already proven safe.
+
 ```bash
 cyclops health
 cyclops --json health
