@@ -2431,6 +2431,15 @@ impl WorkspaceMessaging {
         self.service.cancel_attention_resolution(attempt_id)
     }
 
+    /// Subscribe to one boot-local handoff after an exact resolution
+    /// reservation is released. Terminal scheduling receives this event, not
+    /// the mailbox service or its reservation set.
+    pub(crate) fn subscribe_attention_resolution_releases(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<NotificationAttemptId> {
+        self.service.subscribe_attention_resolution_releases()
+    }
+
     pub(crate) fn force_submit_target_is_pending(
         &self,
         target: &AttentionTarget,
@@ -2456,12 +2465,22 @@ impl WorkspaceMessaging {
         }
     }
 
+    /// Persist the one forced pre-key intent, releasing the boot-local
+    /// reservation if that append fails before the terminal boundary.
     pub(crate) fn record_forced_attention_resolution_intent(
         &self,
         target: &AttentionTarget,
     ) -> Result<(), MailboxServiceError> {
-        self.service
+        if let Err(error) = self
+            .service
             .record_forced_attention_resolution_intent(target)
+        {
+            let _ = self
+                .service
+                .cancel_attention_resolution(target.record.attempt_id);
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) fn record_attention_resolution_action_accepted(
@@ -4788,6 +4807,55 @@ mod tests {}
                 .begin_attention_resolution(&target, NotificationResolution::Complete)
                 .unwrap(),
             AttentionResolutionStart::Fresh
+        );
+        messaging
+            .cancel_attention_resolution(attention.attempt_id)
+            .unwrap();
+    }
+
+    #[test]
+    fn failed_forced_intent_append_releases_the_exact_reservation() {
+        let (_scratch, service, events, _reviewer, _) =
+            mailbox_service("forced-intent-append-failure", 8);
+        let effects = Arc::new(RecordingEffects::new(events));
+        let messaging =
+            WorkspaceMessaging::new(Arc::clone(&service), Arc::new(StdMutex::new(())), effects);
+        let (_accepted, context, _) = queued_attempt(&service);
+        context.record_gating().unwrap();
+        record_doorbell_write(&context);
+        let attention = context
+            .record_verify_attention(NotificationVerifyOutcome::ambiguous())
+            .unwrap();
+        let target = messaging
+            .attention_for_runtime(attention.attempt_id)
+            .unwrap();
+
+        assert_eq!(
+            messaging
+                .begin_attention_resolution(&target, NotificationResolution::Complete)
+                .unwrap(),
+            AttentionResolutionStart::Fresh
+        );
+        service.inject_notification_recovery_append_failure(attention.attempt_id);
+        assert!(messaging
+            .record_forced_attention_resolution_intent(&target)
+            .is_err());
+        assert_eq!(
+            service
+                .store_handle()
+                .lock()
+                .unwrap()
+                .projection()
+                .attention_resolution_intent(attention.attempt_id),
+            None,
+            "a failed pre-key append must not leave a durable forced intent"
+        );
+        assert_eq!(
+            messaging
+                .begin_attention_resolution(&target, NotificationResolution::Complete)
+                .unwrap(),
+            AttentionResolutionStart::Fresh,
+            "the next exact resolver may acquire the released reservation"
         );
         messaging
             .cancel_attention_resolution(attention.attempt_id)

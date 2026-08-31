@@ -4558,6 +4558,10 @@ pub struct MailboxService {
     store: Arc<StdMutex<MessageStore>>,
     changes: Option<MessageChangePublisher>,
     resolving_attention: StdMutex<HashSet<NotificationAttemptId>>,
+    /// Private handoff for work that lost the exact in-memory resolution
+    /// reservation. This is not a durable message event: a resolver may give
+    /// up before appending anything.
+    attention_resolution_releases: broadcast::Sender<NotificationAttemptId>,
     exact_reconciliation: StdMutex<ExactReconciliationRequests>,
     attention_consumption_candidates:
         StdMutex<HashMap<NotificationAttemptId, AttentionConsumptionCandidate>>,
@@ -4702,12 +4706,17 @@ impl MailboxService {
         store: MessageStore,
         changes: Option<MessageChangePublisher>,
     ) -> Self {
+        // One release edge is enough to prompt one blocked force-submit task
+        // to revalidate. The stream is shared, so lag is not proof that this
+        // attempt was released.
+        let (attention_resolution_releases, _) = broadcast::channel(1);
         Self {
             workspace_id: directory.workspace_id(),
             directory: RwLock::new(directory),
             store: Arc::new(StdMutex::new(store)),
             changes,
             resolving_attention: StdMutex::new(HashSet::new()),
+            attention_resolution_releases,
             exact_reconciliation: StdMutex::new(ExactReconciliationRequests::default()),
             attention_consumption_candidates: StdMutex::new(HashMap::new()),
         }
@@ -5972,10 +5981,7 @@ impl MailboxService {
                 ],
             );
         }
-        self.resolving_attention
-            .lock()
-            .map_err(|_| MailboxServiceError::Poisoned)?
-            .remove(&target.record.attempt_id);
+        self.release_attention_resolution(target.record.attempt_id)?;
         Ok(())
     }
 
@@ -6361,10 +6367,7 @@ impl MailboxService {
                 ],
             );
         }
-        self.resolving_attention
-            .lock()
-            .map_err(|_| MailboxServiceError::Poisoned)?
-            .remove(&target.record.attempt_id);
+        self.release_attention_resolution(target.record.attempt_id)?;
         Ok(())
     }
 
@@ -6468,10 +6471,33 @@ impl MailboxService {
         &self,
         attempt_id: NotificationAttemptId,
     ) -> Result<(), MailboxServiceError> {
-        self.resolving_attention
+        self.release_attention_resolution(attempt_id)
+    }
+
+    /// Subscribe before attempting a force-submit reservation. A matching
+    /// release requires the caller to revalidate the exact attempt; it says
+    /// nothing about durable settlement.
+    pub(crate) fn subscribe_attention_resolution_releases(
+        &self,
+    ) -> broadcast::Receiver<NotificationAttemptId> {
+        self.attention_resolution_releases.subscribe()
+    }
+
+    /// End one boot-local resolution reservation and wake exact waiters after
+    /// the ownership change. A cancellation can leave the journal unchanged,
+    /// so this must not be represented as `messages.changed`.
+    fn release_attention_resolution(
+        &self,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<(), MailboxServiceError> {
+        let released = self
+            .resolving_attention
             .lock()
             .map_err(|_| MailboxServiceError::Poisoned)?
             .remove(&attempt_id);
+        if released {
+            let _ = self.attention_resolution_releases.send(attempt_id);
+        }
         Ok(())
     }
 
@@ -15568,6 +15594,72 @@ mod tests {
         assert_eq!(
             signal.observation().map(|observation| observation.evidence),
             Some(NotificationResolutionConsumptionEvidence::ExactHookPrompt)
+        );
+    }
+
+    #[test]
+    fn cancelling_attention_resolution_releases_exact_waiters_without_writing_the_journal() {
+        let scratch = StoreScratch::new("attention-resolution-release");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, admin, bob, _) = test_context();
+        let message_id = MessageId::new("m-resolution-release").unwrap();
+        let attempt_id = attempt(1);
+        let mut store = MessageStore::open(&root, journal, workspace, "boot").unwrap();
+        store
+            .accept_at(message_id.clone(), draft(admin, vec![bob], "Body", None), 1)
+            .unwrap();
+        alarm_because(
+            &mut store,
+            &message_id,
+            bob,
+            attempt_id,
+            2,
+            NotificationAttentionCause::VerifyFailed,
+        );
+        let target = AttentionTarget {
+            record: store
+                .projection()
+                .alarm_by_attempt(attempt_id)
+                .unwrap()
+                .clone(),
+        };
+        let before = store.projection().last_sequence();
+        let directory = MailboxDirectory::new(
+            workspace,
+            [MailboxIdentity {
+                key: bob,
+                label: "bob".into(),
+            }],
+        )
+        .unwrap();
+        let service = MailboxService::new(directory, store);
+        let mut releases = service.subscribe_attention_resolution_releases();
+
+        assert_eq!(
+            service
+                .begin_attention_resolution(&target, NotificationResolution::Complete)
+                .unwrap(),
+            AttentionResolutionStart::Fresh
+        );
+        assert!(matches!(
+            service.begin_attention_resolution(&target, NotificationResolution::Complete),
+            Err(error) if error.notification_resolution_in_progress()
+        ));
+
+        service.cancel_attention_resolution(attempt_id).unwrap();
+
+        assert_eq!(releases.try_recv().unwrap(), attempt_id);
+        assert_eq!(
+            service.store().unwrap().projection().last_sequence(),
+            before
+        );
+        assert_eq!(
+            service
+                .begin_attention_resolution(&target, NotificationResolution::Complete)
+                .unwrap(),
+            AttentionResolutionStart::Fresh,
+            "the exact waiter may retry only after the release edge"
         );
     }
 

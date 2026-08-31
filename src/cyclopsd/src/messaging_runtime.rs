@@ -560,6 +560,26 @@ pub(crate) async fn wait_and_queue_unclaimed_reminder(
     }
 }
 
+/// Wait for a conflicting resolver to release this exact attempt.
+///
+/// A release is a boot-local ownership edge, not a durable mailbox change.
+/// Broadcast lag means a release edge was lost, not that this attempt was
+/// released. The caller revalidates after each matching edge rather than
+/// polling on a timer.
+async fn wait_for_attention_resolution_release(
+    releases: &mut tokio::sync::broadcast::Receiver<NotificationAttemptId>,
+    attempt_id: NotificationAttemptId,
+) -> bool {
+    loop {
+        match releases.recv().await {
+            Ok(released) if released == attempt_id => return true,
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => return true,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return false,
+        }
+    }
+}
+
 /// Arm the explicit post-paste escape hatch for one exact verify-failed
 /// doorbell. Multiple callers may arm the same attempt; durable resolution
 /// intent elects one key and makes every competing timer a no-op.
@@ -572,25 +592,34 @@ pub(crate) fn schedule_force_submit(inner: &Arc<Inner>, record: cyclops_proto::N
     };
     let task_inner = Arc::clone(inner);
     inner.engine.spawn_descendant_task(async move {
-        loop {
-            let (enabled, threshold_ms) = task_inner.force_submit.get();
-            if !enabled {
-                return;
-            }
-            let elapsed_ms = crate::unix_ms().saturating_sub(record.updated_at);
-            let remaining_ms = threshold_ms.saturating_sub(elapsed_ms);
-            if remaining_ms == 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(remaining_ms)).await;
-        }
-
         let pane_id = record
             .recipient
             .pane_id()
             .map(|pane_id| pane_id.to_string())
             .unwrap_or_default();
+        // Subscribe before trying to reserve the action. A release that races
+        // the conflict stays observable. If a successor acquires before this
+        // task revalidates, wait for that exact successor release too. This
+        // retries only reservation acquisition after an ownership edge, never
+        // a terminal action after intent or a key.
+        let mut releases = messaging.subscribe_attention_resolution_releases();
         let result = loop {
+            // A live settings update can lengthen the delay while another
+            // resolver owns this attempt. Re-enter the same due-time check on
+            // every release-driven revalidation so that update takes effect
+            // before this task can reserve or send a key.
+            loop {
+                let (enabled, threshold_ms) = task_inner.force_submit.get();
+                if !enabled {
+                    return;
+                }
+                let elapsed_ms = crate::unix_ms().saturating_sub(record.updated_at);
+                let remaining_ms = threshold_ms.saturating_sub(elapsed_ms);
+                if remaining_ms == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(remaining_ms)).await;
+            }
             let target = match messaging.attention_for_runtime(record.attempt_id) {
                 Ok(target) => target,
                 Err(_) => return,
@@ -598,17 +627,26 @@ pub(crate) fn schedule_force_submit(inner: &Arc<Inner>, record: cyclops_proto::N
             match crate::attention_resolution::force_complete(&task_inner, &messaging, &target)
                 .await
             {
-                Err(crate::attention_resolution::AttentionActionError::Store(error))
-                    if error.notification_resolution_in_progress() =>
-                {
-                    // The ordinary exact-evidence worker may already own this
-                    // attempt. It is bounded, and the forced path must wait
-                    // for that safer decision instead of losing its timer to
-                    // a transient in-memory reservation.
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                Err(crate::attention_resolution::AttentionActionError::ResolutionInProgress) => {
+                    delivery::inject_pause(
+                        &task_inner,
+                        "force_submit_waiting_for_resolution_release",
+                    )
+                    .await;
+                    if !wait_for_attention_resolution_release(&mut releases, record.attempt_id)
+                        .await
+                    {
+                        return;
+                    }
+                    // Test-only coordination seam. Production has no pause
+                    // installed here, so the next revalidation proceeds
+                    // without test coordination.
+                    delivery::inject_pause(&task_inner, "force_submit_after_resolution_release")
+                        .await;
+                    continue;
                 }
                 result => break result,
-            }
+            };
         };
         match result {
             Ok(_) => delivery::admin_notify(
@@ -732,4 +770,32 @@ pub(crate) fn schedule_claimed_notification_recovery(
         .await;
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wait_for_attention_resolution_release;
+    use cyclops_proto::NotificationAttemptId;
+
+    fn attempt(number: u64) -> NotificationAttemptId {
+        NotificationAttemptId::parse(&format!("att-00000000-0000-4000-8000-{number:012x}")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn force_submit_waits_for_the_matching_reservation_release() {
+        let (sender, mut releases) = tokio::sync::broadcast::channel(4);
+        let wanted = attempt(1);
+        sender.send(attempt(2)).unwrap();
+        sender.send(wanted).unwrap();
+
+        assert!(wait_for_attention_resolution_release(&mut releases, wanted).await);
+    }
+
+    #[tokio::test]
+    async fn force_submit_stops_when_its_reservation_handoff_closes() {
+        let (sender, mut releases) = tokio::sync::broadcast::channel(1);
+        drop(sender);
+
+        assert!(!wait_for_attention_resolution_release(&mut releases, attempt(1)).await);
+    }
 }

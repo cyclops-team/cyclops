@@ -600,8 +600,8 @@ async fn run_status_refresh_jobs(
     incomplete
 }
 
-/// Test seam: an async pause awaited inside the delivery injection path at
-/// a named phase ("pre_paste", "pre_submit"), installed via
+/// Test seam: an async pause awaited at a named recovery or terminal-mutation
+/// phase ("pre_paste", "pre_submit"), installed via
 /// [`Daemon::set_inject_pause`]. Always None in production.
 pub(crate) type InjectPause = Arc<
     dyn Fn(&'static str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
@@ -982,6 +982,12 @@ impl messaging::WorkspaceMessagingEffects for DaemonWorkspaceMessagingEffects {
                             %attempt_id,
                             "exact-owned composer cannot be cleared by this manifest"
                         )
+                    }
+                    Err(attention_resolution::AttentionActionError::ResolutionInProgress) => {
+                        if messaging.park_exact_attention_after_conflict(attempt_id) {
+                            continue;
+                        }
+                        return;
                     }
                     Err(attention_resolution::AttentionActionError::Store(error)) => {
                         if error.notification_resolution_in_progress() {
@@ -2773,8 +2779,8 @@ impl Daemon {
         Ok(json!({"notified": true, "seq": seq}))
     }
 
-    /// Test-only seam: pause a terminal mutation at a named phase so an
-    /// integration test can move the pane or stop the daemon at a precise
+    /// Test-only seam: pause a named recovery or terminal-mutation phase so
+    /// an integration test can move the pane or stop the daemon at a precise
     /// boundary. Not part of the public API surface.
     #[doc(hidden)]
     pub fn set_inject_pause<F>(&self, f: F)
