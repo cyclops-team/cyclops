@@ -33,10 +33,17 @@ MEASUREMENT_PREFIX = "CYCLOPS_INSTALL_FIRST_HANDOFF_JSON="
 SETUP_START = "== setting up "
 SETUP_COMPLETE = "✔ cyclops is set up"
 HANDOFF_BODY = "The installed pair reached durable messaging."
+FIXTURE_MANIFEST = "install-perf"
 
 
 class WorkloadError(RuntimeError):
     """A fixture boundary or durable-handoff assertion failed."""
+
+
+def confirms_fixture_manifest(response: object) -> bool:
+    """Accept only the manifest confirmation the fixture asked the daemon to persist."""
+
+    return isinstance(response, dict) and response.get("manifest") == FIXTURE_MANIFEST
 
 
 def repo_root() -> Path:
@@ -211,7 +218,7 @@ def write_fixture_manifest(home: Path, repo: Path) -> None:
     if not skill.is_file():
         raise WorkloadError(f"shipped Cyclops skill is missing: {skill}")
     manifest = f'''[agent]
-id = "install-perf"
+id = "{FIXTURE_MANIFEST}"
 display_name = "Install performance fixture"
 process_names = ["cycagent"]
 argv_basenames = ["cycagent"]
@@ -228,7 +235,7 @@ region = "bottom_non_empty_lines(4)"
 lifecycle_evidence = true
 regex = ['^']
 '''
-    (home / "manifests/install-perf.toml").write_text(manifest, encoding="utf-8")
+    (home / f"manifests/{FIXTURE_MANIFEST}.toml").write_text(manifest, encoding="utf-8")
 
 
 def start_agent(
@@ -278,29 +285,54 @@ def run_as_agent(
     return output
 
 
-def name_agent(client: Path, pane: str, label: str, repo: Path, env: dict[str, str]) -> None:
-    """Name only after the daemon's asynchronous pane census admits it."""
+def name_agent(
+    client: Path,
+    pane: str,
+    label: str,
+    repo: Path,
+    env: dict[str, str],
+) -> bool:
+    """Bind one known synthetic fixture through the public naming command."""
 
     last_error = ""
+    manifest_pinned = False
 
     def named() -> bool:
-        nonlocal last_error
+        nonlocal last_error, manifest_pinned
         proc = subprocess.run(
-            [str(client), "name", pane, label, "--plain"],
+            [
+                str(client),
+                "--json",
+                "name",
+                pane,
+                label,
+                "--manifest",
+                FIXTURE_MANIFEST,
+            ],
             cwd=repo,
             env=env,
             capture_output=True,
             text=True,
         )
-        if proc.returncode == 0:
-            return True
-        last_error = (proc.stdout or proc.stderr).strip()
-        return False
+        if proc.returncode:
+            last_error = (proc.stdout or proc.stderr).strip()
+            return False
+        try:
+            response = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            last_error = f"name returned invalid JSON: {proc.stdout.strip()}"
+            return False
+        if not confirms_fixture_manifest(response):
+            last_error = f"name did not confirm {FIXTURE_MANIFEST!r}: {response!r}"
+            return False
+        manifest_pinned = True
+        return True
 
     try:
         wait_for(f"daemon to name {label}", named)
     except WorkloadError as error:
         raise WorkloadError(f"{error}: {last_error}") from error
+    return manifest_pinned
 
 
 def stop_daemon(process: subprocess.Popen[str] | None) -> None:
@@ -324,6 +356,22 @@ def teardown_tmux(repo: Path, env: dict[str, str]) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+
+def fixture_name_response_requires_the_requested_manifest() -> None:
+    """A successful name command is insufficient without the exact pin confirmation."""
+
+    assert confirms_fixture_manifest({"manifest": FIXTURE_MANIFEST})
+    assert not confirms_fixture_manifest({"manifest": "other-fixture"})
+    assert not confirms_fixture_manifest({"pane_id": "%1"})
+
+
+def selftest() -> int:
+    """Run the no-daemon regression checks for the performance fixture."""
+
+    fixture_name_response_requires_the_requested_manifest()
+    print("install first handoff fixture self-test passed")
+    return 0
 
 
 def main() -> int:
@@ -455,8 +503,12 @@ def main() -> int:
         sender_control = start_agent("implementer", panes[0], root, fixture, env)
         reviewer_control = start_agent("reviewer", panes[1], root, fixture, env)
         wait_for("daemon pane discovery after fixture launch", daemon_sees_duo_panes)
-        name_agent(client, panes[0], "implementer", empty_dir, env)
-        name_agent(client, panes[1], "reviewer", empty_dir, env)
+        implementer_manifest_pinned = name_agent(
+            client, panes[0], "implementer", empty_dir, env
+        )
+        reviewer_manifest_pinned = name_agent(
+            client, panes[1], "reviewer", empty_dir, env
+        )
 
         def both_agents_detected() -> bool:
             status = status_json(client, repo, env)
@@ -466,9 +518,9 @@ def main() -> int:
                 str(pane.get("pane_id")): str(pane.get("manifest"))
                 for pane in as_panes(status)
             }
-            return all(known.get(pane) == "install-perf" for pane in panes)
+            return all(known.get(pane) == FIXTURE_MANIFEST for pane in panes)
 
-        wait_for("both fixture agents to be detected", both_agents_detected)
+        wait_for("both explicit fixture manifest bindings", both_agents_detected)
         detection_finished = time.monotonic_ns()
 
         send_started = time.monotonic_ns()
@@ -537,8 +589,8 @@ def main() -> int:
                 "source_acquisition": "not measured: this invokes the public installer from the checked-out source tree",
                 "cargo_target": "fresh isolated target directory; registry and toolchain caches may be warm",
                 "state": "fresh isolated prefix, HOME, CYCLOPS_HOME, tmux server, daemon, fixture agents, and journal",
-                "dataset": "two detected fixture agents; one durable direct message and one authenticated claim",
-                "fixture": "a test-only manifest and agent executable are prepared after installation; fixture setup is reported separately",
+                "dataset": "two explicit manifest-pinned fixture agents; one durable direct message and one authenticated claim",
+                "fixture": "a test-only manifest and agent executable are prepared after installation; each synthetic agent is bound with the public name --manifest command before the handoff",
                 "observation_resolution": "readiness and fixture completion use bounded 50ms test-rig probes; sub-50ms phases are not latency claims",
                 "sample_note": "one staged install sample per artifact; percentile fields equal the observed sample",
                 "comparison_baseline": "compare only artifacts with the same staged local-source workload, fresh target shape, and recorded environment; no universal target is asserted",
@@ -557,7 +609,7 @@ def main() -> int:
                 "fixture_setup": summary(fixture_setup_started, fixture_setup_finished, "test-only manifest and fixture-agent preparation"),
                 "daemon_readiness": summary(daemon_started, daemon_ready_at, "installed daemon process start to responding status"),
                 "session_adoption": summary(adoption_started, adoption_finished, "duo workspace command to daemon attached state"),
-                "agent_detection": summary(detection_started, detection_finished, "fixture agent spawn to both detected bindings"),
+                "agent_detection": summary(detection_started, detection_finished, "fixture agent spawn to both explicit manifest bindings"),
                 "durable_send": summary(send_started, send_finished, "agent send start to accepted journal record"),
                 "authenticated_claim": summary(claim_started, claim_finished, "recipient claim start to verified body"),
                 "first_durable_handoff_total": summary(install_started, claim_finished, "public installer start to recipient claim, including reported test-fixture setup"),
@@ -566,6 +618,9 @@ def main() -> int:
                 "installed_pair_matched": True,
                 "daemon_responded": True,
                 "session_attached": True,
+                "fixture_manifest_pinned": (
+                    implementer_manifest_pinned and reviewer_manifest_pinned
+                ),
                 "agents_detected": 2,
                 "message_durably_accepted": True,
                 "recipient_claimed": True,
@@ -583,6 +638,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--selftest"]:
+        raise SystemExit(selftest())
     try:
         raise SystemExit(main())
     except WorkloadError as error:

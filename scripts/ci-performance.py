@@ -111,8 +111,8 @@ INSTALL_HANDOFF_WORKLOAD = {
     "source_acquisition": "not measured: this invokes the public installer from the checked-out source tree",
     "cargo_target": "fresh isolated target directory; registry and toolchain caches may be warm",
     "state": "fresh isolated prefix, HOME, CYCLOPS_HOME, tmux server, daemon, fixture agents, and journal",
-    "dataset": "two detected fixture agents; one durable direct message and one authenticated claim",
-    "fixture": "a test-only manifest and agent executable are prepared after installation; fixture setup is reported separately",
+    "dataset": "two explicit manifest-pinned fixture agents; one durable direct message and one authenticated claim",
+    "fixture": "a test-only manifest and agent executable are prepared after installation; each synthetic agent is bound with the public name --manifest command before the handoff",
     "observation_resolution": "readiness and fixture completion use bounded 50ms test-rig probes; sub-50ms phases are not latency claims",
     "sample_note": "one staged install sample per artifact; percentile fields equal the observed sample",
     "comparison_baseline": "compare only artifacts with the same staged local-source workload, fresh target shape, and recorded environment; no universal target is asserted",
@@ -366,13 +366,14 @@ def install_handoff_report_error(report: dict[str, object]) -> str | None:
         "installed_pair_matched",
         "daemon_responded",
         "session_attached",
+        "fixture_manifest_pinned",
         "message_durably_accepted",
         "recipient_claimed",
     }
     if not isinstance(correctness, dict) or not all(correctness.get(proof) is True for proof in required_proofs):
         return "install handoff record is missing a durable-handoff proof"
     if not exact_int(correctness.get("agents_detected"), 2):
-        return "install handoff record did not detect two agents"
+        return "install handoff record did not bind two fixture agents"
     if not positive_int(correctness.get("journal_line_count_after_claim")):
         return "install handoff record has no durable journal proof"
     return None
@@ -627,6 +628,7 @@ def complete_install_handoff_report() -> dict[str, object]:
             "installed_pair_matched": True,
             "daemon_responded": True,
             "session_attached": True,
+            "fixture_manifest_pinned": True,
             "agents_detected": 2,
             "message_durably_accepted": True,
             "recipient_claimed": True,
@@ -711,6 +713,14 @@ def complete_concurrent_messaging_report() -> dict[str, object]:
 def selftest() -> None:
     """Prove incomplete retained reports cannot become successful artifacts."""
 
+    fixture_selftest = subprocess.run(
+        [sys.executable, "scripts/perf/install_first_handoff.py", "--selftest"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert fixture_selftest.returncode == 0, fixture_selftest.stderr or fixture_selftest.stdout
+
     def fixture_result(name: str, report: object | None) -> dict[str, object]:
         marker = next(marker for workload, _, marker in WORKLOADS if workload == name)
         output = "test skipped\n" if report is None else f"{marker}={json.dumps(report)}\n"
@@ -774,6 +784,10 @@ def selftest() -> None:
     missing_proof = json.loads(json.dumps(install))
     missing_proof["correctness"]["recipient_claimed"] = False
     rejected("install-first-durable-handoff", missing_proof)
+
+    missing_fixture_binding = json.loads(json.dumps(install))
+    missing_fixture_binding["correctness"]["fixture_manifest_pinned"] = False
+    rejected("install-first-durable-handoff", missing_fixture_binding)
 
     changed_isolation = json.loads(json.dumps(install))
     changed_isolation["workload"]["state"] = "shared operator HOME"
