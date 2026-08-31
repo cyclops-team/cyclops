@@ -17,7 +17,6 @@ use cyclops_state::{InspectedEntry, InspectedKind, InspectionLimits, StateInspec
 use serde_json::{json, Value};
 
 use crate::client::{Client, ClientError};
-use crate::hookset::CliKind;
 use crate::style::Style;
 
 const PATH_ENTRY_LIMIT: usize = 128;
@@ -243,40 +242,6 @@ struct HealthReport {
     operational: OperationalReport,
     issues: Vec<Issue>,
 }
-
-struct ConsumerSpec {
-    id: &'static str,
-    name: &'static str,
-    kind: CliKind,
-    required_receipt_tier: u8,
-}
-
-const CONSUMERS: &[ConsumerSpec] = &[
-    ConsumerSpec {
-        id: "claude",
-        name: "Claude Code",
-        kind: CliKind::Claude,
-        required_receipt_tier: 1,
-    },
-    ConsumerSpec {
-        id: "codex",
-        name: "Codex CLI",
-        kind: CliKind::Codex,
-        required_receipt_tier: 1,
-    },
-    ConsumerSpec {
-        id: "cursor",
-        name: "Cursor Agent CLI",
-        kind: CliKind::Cursor,
-        required_receipt_tier: 1,
-    },
-    ConsumerSpec {
-        id: "agy",
-        name: "Antigravity CLI",
-        kind: CliKind::Agy,
-        required_receipt_tier: 2,
-    },
-];
 
 pub fn run(json_out: bool) -> i32 {
     let report = collect();
@@ -1685,10 +1650,11 @@ fn inspect_setup(cyclops_home: &Path) -> SetupReport {
         };
     };
     let state_inspector = StateInspector::open_existing(cyclops_home);
-    let mut consumers = Vec::with_capacity(CONSUMERS.len());
-    for spec in CONSUMERS {
-        let installed_root = crate::consumer::root(spec.kind, &user_home);
-        let (installed, install_state) = match StateInspector::open_existing(&installed_root) {
+    let mut consumers = Vec::with_capacity(crate::consumer::SHIPPED.len());
+    for spec in crate::consumer::SHIPPED {
+        let locations = spec.locations(&user_home);
+        let installed_root = &locations.install_root;
+        let (installed, install_state) = match StateInspector::open_existing(installed_root) {
             Ok(Some(_)) => (true, "present"),
             Ok(None) => (false, "absent"),
             Err(_) => (true, "unproven"),
@@ -1727,11 +1693,11 @@ fn inspect_setup(cyclops_home: &Path) -> SetupReport {
                 }
             }
         };
-        let (hook_root, hook_relative, hook_path) = setup_hook_path(&user_home, spec.kind);
+        let hook_path = locations.hook.path();
         let hook_state = if !installed {
             "not_installed"
         } else {
-            match read_asset(&hook_root, &hook_relative) {
+            match read_asset(&locations.hook.root, &locations.hook.relative) {
                 AssetRead::Missing => "missing",
                 AssetRead::Unproven => "unproven",
                 AssetRead::Truncated => "truncated",
@@ -1741,10 +1707,9 @@ fn inspect_setup(cyclops_home: &Path) -> SetupReport {
             }
         };
         let hook_ready = !installed || hook_state == "current";
-        let (skill_root, skill_relative) = setup_skill_location(&user_home, spec.id);
-        let skill_path = skill_root.join(&skill_relative);
+        let skill_path = locations.skill.path();
         let (skill_state, skill_ready) = if installed {
-            inspect_skill(read_asset(&skill_root, &skill_relative))
+            inspect_skill(read_asset(&locations.skill.root, &locations.skill.relative))
         } else {
             ("not_installed", true)
         };
@@ -1761,8 +1726,7 @@ fn inspect_setup(cyclops_home: &Path) -> SetupReport {
                 }
             });
         let manifest_ready = matches!(manifest_state, "current" | "edited");
-        let receipt_ready =
-            !installed || spec.required_receipt_tier != 1 || ack_capable == Some(true);
+        let receipt_ready = !installed || spec.receipt.accepts(ack_capable);
         let complete = !installed
             || (install_state == "present"
                 && manifest_ready
@@ -1815,38 +1779,6 @@ fn read_asset_from(inspector: &StateInspector, relative: &Path) -> AssetRead {
         Ok(Some(file)) => AssetRead::Bytes(file.bytes),
         Ok(None) => AssetRead::Missing,
         Err(_) => AssetRead::Unproven,
-    }
-}
-
-fn setup_hook_path(home: &Path, kind: CliKind) -> (PathBuf, PathBuf, PathBuf) {
-    let (root, relative) = match kind {
-        CliKind::Claude => (home.join(".claude"), PathBuf::from("settings.json")),
-        CliKind::Codex => (
-            crate::consumer::root(kind, home),
-            PathBuf::from("hooks.json"),
-        ),
-        CliKind::Cursor => (home.join(".cursor"), PathBuf::from("hooks.json")),
-        CliKind::Agy => (home.join(".agents"), PathBuf::from("hooks.json")),
-    };
-    let path = root.join(&relative);
-    (root, relative, path)
-}
-
-fn setup_skill_location(home: &Path, id: &str) -> (PathBuf, PathBuf) {
-    match id {
-        "claude" => (
-            home.join(".claude"),
-            PathBuf::from("skills/cyclops/SKILL.md"),
-        ),
-        "codex" | "cursor" => (
-            home.join(".agents"),
-            PathBuf::from("skills/cyclops/SKILL.md"),
-        ),
-        "agy" => (
-            home.join(".gemini/antigravity-cli"),
-            PathBuf::from("skills/cyclops/SKILL.md"),
-        ),
-        _ => unreachable!("shipped consumer id"),
     }
 }
 

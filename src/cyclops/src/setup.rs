@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 
 use crate::copy;
-use crate::hookset::CliKind;
 use crate::style::Style;
 
 #[derive(Clone, Copy)]
@@ -50,7 +49,7 @@ struct ConsumerCheck {
     hook_path: Option<PathBuf>,
     hook_state: &'static str,
     hook_ready: bool,
-    required_receipt_tier: Option<u8>,
+    required_receipt: Option<crate::consumer::ReceiptRequirement>,
     skill_path: PathBuf,
     skill_state: &'static str,
     skill_ready: bool,
@@ -60,55 +59,15 @@ struct ConsumerCheck {
 
 impl ConsumerCheck {
     fn receipt_ready(&self) -> bool {
-        !self.installed || self.required_receipt_tier != Some(1) || self.manifest.ack_capable
+        !self.installed
+            || self
+                .required_receipt
+                .is_some_and(|requirement| requirement.accepts(Some(self.manifest.ack_capable)))
     }
 
     fn complete(&self) -> bool {
         self.manifest.state.ready()
             && (!self.installed || (self.hook_ready && self.skill_ready && self.receipt_ready()))
-    }
-}
-
-struct Spec {
-    id: &'static str,
-    name: &'static str,
-    kind: CliKind,
-    required_receipt_tier: u8,
-}
-
-const CONSUMERS: &[Spec] = &[
-    Spec {
-        id: "claude",
-        name: "Claude Code",
-        kind: CliKind::Claude,
-        required_receipt_tier: 1,
-    },
-    Spec {
-        id: "codex",
-        name: "Codex CLI",
-        kind: CliKind::Codex,
-        required_receipt_tier: 1,
-    },
-    Spec {
-        id: "cursor",
-        name: "Cursor Agent CLI",
-        kind: CliKind::Cursor,
-        required_receipt_tier: 1,
-    },
-    Spec {
-        id: "agy",
-        name: "Antigravity CLI",
-        kind: CliKind::Agy,
-        required_receipt_tier: 2,
-    },
-];
-
-fn skill_path(home: &Path, id: &str) -> PathBuf {
-    match id {
-        "claude" => crate::skillseed::skill_path(&home.join(".claude")),
-        "codex" | "cursor" => crate::skillseed::skill_path(&home.join(".agents")),
-        "agy" => crate::skillseed::skill_path(&home.join(".gemini/antigravity-cli")),
-        _ => unreachable!("shipped consumer id"),
     }
 }
 
@@ -167,8 +126,13 @@ fn skill_state(installed: bool, path: &Path) -> (&'static str, bool) {
     }
 }
 
-fn consumer_check(cyclops_home: &Path, user_home: &Path, spec: &Spec) -> ConsumerCheck {
-    let installed = crate::consumer::root(spec.kind, user_home).is_dir();
+fn consumer_check(
+    cyclops_home: &Path,
+    user_home: &Path,
+    spec: &crate::consumer::Spec,
+) -> ConsumerCheck {
+    let locations = spec.locations(user_home);
+    let installed = locations.install_root.is_dir();
     let manifest = manifest_check(cyclops_home, spec.id);
     let wiring = crate::hookset::inspect_wiring(spec.kind);
     let (hook_state, hook_ready) = if !installed {
@@ -176,8 +140,8 @@ fn consumer_check(cyclops_home: &Path, user_home: &Path, spec: &Spec) -> Consume
     } else {
         (wiring.state.word(), wiring.state.ready())
     };
-    let required_receipt_tier = installed.then_some(spec.required_receipt_tier);
-    let skill_path = skill_path(user_home, spec.id);
+    let required_receipt = installed.then_some(spec.receipt);
+    let skill_path = locations.skill.path();
     let (skill_state, skill_ready) = skill_state(installed, &skill_path);
     let mailbox_capability_path = manifest
         .mailbox_capability_file
@@ -196,7 +160,7 @@ fn consumer_check(cyclops_home: &Path, user_home: &Path, spec: &Spec) -> Consume
         hook_path: wiring.path,
         hook_state,
         hook_ready,
-        required_receipt_tier,
+        required_receipt,
         skill_path,
         skill_state,
         skill_ready,
@@ -215,7 +179,7 @@ pub fn run_check(json_out: bool, style: &Style) -> i32 {
         return 1;
     };
     let cyclops_home = cyclops_proto::cyclops_home();
-    let checks: Vec<ConsumerCheck> = CONSUMERS
+    let checks: Vec<ConsumerCheck> = crate::consumer::SHIPPED
         .iter()
         .map(|spec| consumer_check(&cyclops_home, &user_home, spec))
         .collect();
@@ -238,7 +202,7 @@ pub fn run_check(json_out: bool, style: &Style) -> i32 {
                     "hook": {
                         "path": check.hook_path.as_ref().map(|path| path.display().to_string()),
                         "state": check.hook_state,
-                        "required_receipt_tier": check.required_receipt_tier,
+                        "required_receipt_tier": check.required_receipt.map(|requirement| requirement.tier()),
                         "ack_capable": check.installed.then_some(check.manifest.ack_capable),
                         "receipt_ready": check.installed.then(|| check.receipt_ready()),
                     },
@@ -275,7 +239,10 @@ pub fn run_check(json_out: bool, style: &Style) -> i32 {
             human_state(check.manifest.state.word()),
             style.dim(&check.manifest.path.display().to_string())
         );
-        let receipt = match (check.required_receipt_tier, check.manifest.ack_capable) {
+        let receipt = match (
+            check.required_receipt.map(|requirement| requirement.tier()),
+            check.manifest.ack_capable,
+        ) {
             (Some(1), true) => "required tier 1 · ack capable".to_string(),
             (Some(1), false) => "required tier 1 · ack missing".to_string(),
             (Some(tier), _) => format!("required tier {tier}"),

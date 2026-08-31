@@ -21,15 +21,10 @@
 //! not write ([`EVER_SHIPPED_FNV64`], the same edit-detection rule as
 //! `crate::manifests`).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// The skill body the binary carries.
 pub(crate) const SHIPPED: &str = include_str!("../../../skills/cyclops/SKILL.md");
-
-/// Where the skill goes under the agent's dot-directory.
-pub fn skill_path(agent_dir: &Path) -> PathBuf {
-    agent_dir.join("skills").join("cyclops").join("SKILL.md")
-}
 
 /// FNV-1a 64 of every skill body this project has released, the current
 /// one included. Same contract as `crate::manifests::EVER_SHIPPED_FNV64`:
@@ -93,16 +88,15 @@ pub enum Outcome {
     Problem(String),
 }
 
-/// One seed attempt against one agent directory.
+/// One seed attempt against one canonical consumer destination.
 pub struct SeededSkill {
     pub consumer: &'static str,
     pub path: PathBuf,
     pub outcome: Outcome,
 }
 
-/// Put the shipped skill under `agent_dir`, keeping any operator edit.
-fn seed_into(consumer: &'static str, installed: bool, agent_dir: &Path) -> SeededSkill {
-    let path = skill_path(agent_dir);
+/// Put the shipped skill at `path`, keeping any operator edit.
+fn seed_into(consumer: &'static str, installed: bool, path: PathBuf) -> SeededSkill {
     if !installed {
         return SeededSkill {
             consumer,
@@ -150,22 +144,51 @@ pub fn seed() -> Vec<SeededSkill> {
         return Vec::new();
     };
     let home = PathBuf::from(home);
-    let claude = crate::consumer::root(crate::hookset::CliKind::Claude, &home);
-    let codex_installed = crate::consumer::root(crate::hookset::CliKind::Codex, &home).is_dir();
-    let cursor_installed = crate::consumer::root(crate::hookset::CliKind::Cursor, &home).is_dir();
+    let claude = crate::consumer::spec(crate::hookset::CliKind::Claude);
+    let claude_locations = claude.locations(&home);
+    let codex = crate::consumer::spec(crate::hookset::CliKind::Codex);
+    let codex_locations = codex.locations(&home);
+    let cursor = crate::consumer::spec(crate::hookset::CliKind::Cursor);
+    let cursor_locations = cursor.locations(&home);
+    let agy = crate::consumer::spec(crate::hookset::CliKind::Agy);
+    let agy_locations = agy.locations(&home);
+    let codex_installed = codex_locations.install_root.is_dir();
+    let cursor_installed = cursor_locations.install_root.is_dir();
     let (shared_consumer, shared_installed) = match (codex_installed, cursor_installed) {
         (true, true) => ("Codex and Cursor", true),
-        (true, false) => ("Codex", true),
-        (false, true) => ("Cursor", true),
+        (true, false) => (codex.skill_name, true),
+        (false, true) => (cursor.skill_name, true),
         (false, false) => ("Codex and Cursor", false),
     };
-    let shared = home.join(".agents");
-    let agy = crate::consumer::root(crate::hookset::CliKind::Agy, &home);
-    vec![
-        seed_into("Claude Code", claude.is_dir(), &claude),
-        seed_into(shared_consumer, shared_installed, &shared),
-        seed_into("Antigravity CLI", agy.is_dir(), &agy),
-    ]
+    let mut seeded = vec![seed_into(
+        claude.skill_name,
+        claude_locations.install_root.is_dir(),
+        claude_locations.skill.path(),
+    )];
+    if codex_locations.skill == cursor_locations.skill {
+        seeded.push(seed_into(
+            shared_consumer,
+            shared_installed,
+            codex_locations.skill.path(),
+        ));
+    } else {
+        seeded.push(seed_into(
+            codex.skill_name,
+            codex_installed,
+            codex_locations.skill.path(),
+        ));
+        seeded.push(seed_into(
+            cursor.skill_name,
+            cursor_installed,
+            cursor_locations.skill.path(),
+        ));
+    }
+    seeded.push(seed_into(
+        agy.skill_name,
+        agy_locations.install_root.is_dir(),
+        agy_locations.skill.path(),
+    ));
+    seeded
 }
 
 /// The note `cyclops start --setup-only` prints for one seed attempt.
@@ -198,6 +221,7 @@ pub fn json_word(outcome: &Outcome) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     /// The compiled-in copy has to be the file in the repo, and the file
     /// has to carry the frontmatter an agent skill loader looks for. A
@@ -241,16 +265,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create root");
         let agent_dir = root.join(".claude");
+        let skill = agent_dir.join("skills/cyclops/SKILL.md");
 
         // Not installed: nothing appears, not even the directory.
-        let absent = seed_into("test agent", agent_dir.is_dir(), &agent_dir);
+        let absent = seed_into("test agent", agent_dir.is_dir(), skill.clone());
         assert_eq!(absent.outcome, Outcome::NoAgent);
         assert!(!agent_dir.exists(), "seeding invented the vendor dir");
         assert_eq!(note(&absent), None);
 
         // Installed: the skill lands and says so.
         std::fs::create_dir_all(&agent_dir).expect("create agent dir");
-        let first = seed_into("test agent", agent_dir.is_dir(), &agent_dir);
+        let first = seed_into("test agent", agent_dir.is_dir(), skill.clone());
         assert_eq!(first.outcome, Outcome::Written);
         assert_eq!(
             std::fs::read_to_string(&first.path).expect("written"),
@@ -261,13 +286,13 @@ mod tests {
             .contains("installed the test agent skill"));
 
         // Rerun: current file, no write, no note.
-        let second = seed_into("test agent", agent_dir.is_dir(), &agent_dir);
+        let second = seed_into("test agent", agent_dir.is_dir(), skill.clone());
         assert_eq!(second.outcome, Outcome::Kept);
         assert_eq!(note(&second), None);
 
         // An operator edit outranks the shipped copy on every later run.
         std::fs::write(&first.path, "# my own notes\n").expect("edit");
-        let third = seed_into("test agent", agent_dir.is_dir(), &agent_dir);
+        let third = seed_into("test agent", agent_dir.is_dir(), skill);
         assert_eq!(third.outcome, Outcome::Kept);
         assert_eq!(
             std::fs::read_to_string(&first.path).unwrap(),
