@@ -27,8 +27,8 @@ use cyclops_manifest::{
 };
 use cyclops_proto::{
     AgentState, ComposerHold, ComposerProof, ComposerSemantic, ComposerState, Detection,
-    NotificationAttemptId, NotificationRouteEvidenceId, NotifyLevel, ProcessInstanceId,
-    RecipientKey, Sensor, SensorReading,
+    NotificationAttemptId, NotificationRouteEvidenceId, ProcessInstanceId, RecipientKey, Sensor,
+    SensorReading,
 };
 use cyclops_tmux::{PaneRow, SessionWatcher, TmuxError};
 use tracing::debug;
@@ -2412,37 +2412,34 @@ fn readiness_key(entry: &DetEntry) -> ReadinessKey {
 /// `detections` guard; this function never takes that lock, because several
 /// callers still hold it here.
 fn wake_readiness(
-    inner: &Arc<Inner>,
     session_idx: usize,
     pane_id: &str,
     prior: Option<ReadinessKey>,
     now: ReadinessKey,
     det: &Detection,
     route_evidence: Option<&NotificationRouteEvidenceId>,
-) -> Option<PaneMessagingObservation> {
+) -> ReadinessWake {
     let decision = readiness_wake_plan(prior.as_ref(), &now, route_evidence.is_some());
-    if decision.emit_public {
-        inner.emit(
-            "readiness",
-            serde_json::json!({
-                "pane_id": pane_id,
-                "session_idx": session_idx,
-                "write_ready": det.write_ready,
-                "write_block": det.write_block,
-            }),
-            None,
-        );
-    }
-    if !decision.reconcile_route {
-        return None;
-    }
-    route_evidence.map(|route_evidence| {
-        PaneMessagingObservation::route_evidence(crate::messaging::MessagingRouteEvidence::new(
-            session_idx,
-            pane_id,
-            route_evidence.clone(),
-        ))
-    })
+    let runtime = decision
+        .emit_public
+        .then(|| PaneRuntimeObservation::readiness_changed(session_idx, pane_id, det));
+    let messaging = decision
+        .reconcile_route
+        .then_some(route_evidence)
+        .flatten()
+        .map(|route_evidence| {
+            PaneMessagingObservation::route_evidence(crate::messaging::MessagingRouteEvidence::new(
+                session_idx,
+                pane_id,
+                route_evidence.clone(),
+            ))
+        });
+    ReadinessWake { runtime, messaging }
+}
+
+struct ReadinessWake {
+    runtime: Option<PaneRuntimeObservation>,
+    messaging: Option<PaneMessagingObservation>,
 }
 
 /// Publish a readiness mutation, minting one token only when it creates a
@@ -2458,15 +2455,18 @@ fn wake_readiness_after_mutation(
     let route_evidence = readiness_wake_decision(Some(&prior), &now)
         .reconcile_route
         .then(|| inner.advance_route_evidence(session_idx, pane_id));
-    if let Some(observation) = wake_readiness(
-        inner,
+    let wake = wake_readiness(
         session_idx,
         pane_id,
         Some(prior),
         now,
         det,
         route_evidence.as_ref(),
-    ) {
+    );
+    if let Some(observation) = wake.runtime {
+        crate::apply_pane_runtime_observation(inner, observation);
+    }
+    if let Some(observation) = wake.messaging {
         crate::apply_messaging_observation(inner, observation);
     }
 }
@@ -3168,25 +3168,6 @@ fn settle_turn(
     (next, stranded, missing_end_diagnostic)
 }
 
-/// Publish the one content-free operator warning reserved by `settle_turn`.
-///
-/// Reservation happens under the turn-end lock; journal and event IO happen
-/// only after both lifecycle and detection locks are released.
-fn notify_missing_lifecycle_end(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) {
-    let target = inner
-        .label_for_route(session_idx, pane_id)
-        .unwrap_or_else(|| pane_id.to_string());
-    crate::delivery::admin_notify(
-        inner,
-        NotifyLevel::ActionRequired,
-        &format!("{target}: matching lifecycle end missing"),
-        "A fresh screen shows the turn stopped and the composer clean, but no matching lifecycle end was recorded for the same process generation and turn. Terminal writes remain blocked; inspect the vendor hook configuration and lifecycle event payload.",
-        None,
-        Some(session_idx),
-        crate::delivery::About::pane(pane_id),
-    );
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ComposerCapture {
     NotRead,
@@ -3332,10 +3313,10 @@ fn pane_recompute_gate(inner: &Arc<Inner>, pane: &PaneKey) -> Arc<tokio::sync::M
     )
 }
 
-/// Recompute one pane's Detection, update the cache, and emit a "state"
-/// event when the fused state changed. Manifests with screen rules always run
-/// the full sensor set. `force_screen` additionally captures for title-only
-/// manifests used by explicit inspection paths.
+/// Recompute one pane's Detection, update the cache, and return immutable
+/// publication evidence when the fused state changed. Manifests with screen
+/// rules always run the full sensor set. `force_screen` additionally captures
+/// for title-only manifests used by explicit inspection paths.
 /// Returns None when the pane is gone from the table.
 ///
 /// `session_idx` is the caller's stable session-slot index, not re-derived
@@ -3482,7 +3463,8 @@ pub(crate) struct PaneRecoveredTurnEvidence {
 ///
 /// Fusion owns the physical correlation. The composition root hands this
 /// body-free value to the retained delivery adapter after the cache commit and
-/// any state event, without giving observation access to delivery handles.
+/// ordered runtime publication, without giving observation access to delivery
+/// handles.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PaneDispatchAckEvidence {
     session_idx: usize,
@@ -3583,6 +3565,80 @@ pub(crate) enum PaneMessagingObservation {
     },
 }
 
+/// One immutable, body-free runtime fact for the daemon composition root to
+/// publish after the pane cache commits.
+///
+/// Fusion decides only what was observed. It does not resolve participant
+/// labels, append records, choose notification mechanisms, or broadcast
+/// presentation events.
+pub(crate) enum PaneRuntimeObservation {
+    ReadinessChanged {
+        session_idx: usize,
+        pane_id: String,
+        write_ready: bool,
+        write_block: Option<String>,
+    },
+    MissingLifecycleEnd {
+        session_idx: usize,
+        pane_id: String,
+    },
+    StateChanged {
+        session_idx: usize,
+        pane_id: String,
+        state: AgentState,
+        disagreement: bool,
+        decided_by: String,
+        prior: Option<AgentState>,
+        cause: String,
+        source_agent: Option<crate::identity::ProcId>,
+        source_manifest: String,
+        working_confirmed: bool,
+    },
+}
+
+impl PaneRuntimeObservation {
+    fn readiness_changed(session_idx: usize, pane_id: &str, detection: &Detection) -> Self {
+        Self::ReadinessChanged {
+            session_idx,
+            pane_id: pane_id.to_string(),
+            write_ready: detection.write_ready,
+            write_block: detection.write_block.clone(),
+        }
+    }
+
+    fn missing_lifecycle_end(session_idx: usize, pane_id: &str) -> Self {
+        Self::MissingLifecycleEnd {
+            session_idx,
+            pane_id: pane_id.to_string(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn state_changed(
+        session_idx: usize,
+        pane_id: &str,
+        detection: &Detection,
+        prior: Option<AgentState>,
+        cause: &str,
+        source_agent: Option<crate::identity::ProcId>,
+        source_manifest: &str,
+        working_confirmed: bool,
+    ) -> Self {
+        Self::StateChanged {
+            session_idx,
+            pane_id: pane_id.to_string(),
+            state: detection.state,
+            disagreement: detection.disagreement,
+            decided_by: detection.decided_by.clone(),
+            prior,
+            cause: cause.to_string(),
+            source_agent,
+            source_manifest: source_manifest.to_string(),
+            working_confirmed,
+        }
+    }
+}
+
 impl PaneMessagingObservation {
     pub(crate) fn route_evidence(evidence: crate::messaging::MessagingRouteEvidence) -> Self {
         Self::RouteEvidenceObserved { evidence }
@@ -3640,6 +3696,7 @@ fn pane_messaging_observations(
 /// value.
 pub(crate) struct PaneObservation {
     detection: Detection,
+    runtime: Vec<PaneRuntimeObservation>,
     dispatch_acks: Vec<PaneDispatchAckEvidence>,
     messaging: Vec<PaneMessagingObservation>,
     repaint: bool,
@@ -3651,6 +3708,7 @@ impl PaneObservation {
         self,
     ) -> (
         Detection,
+        Vec<PaneRuntimeObservation>,
         Vec<PaneDispatchAckEvidence>,
         Vec<PaneMessagingObservation>,
         bool,
@@ -3658,6 +3716,7 @@ impl PaneObservation {
     ) {
         (
             self.detection,
+            self.runtime,
             self.dispatch_acks,
             self.messaging,
             self.repaint,
@@ -3925,8 +3984,7 @@ async fn observe_pane_with_evidence(
         }
         // Entering a mode refuses a write without touching the runtime
         // state, so this is the wake that has no state edge behind it.
-        let messaging_observation = wake_readiness(
-            inner,
+        let wake = wake_readiness(
             session_idx,
             pane_id,
             prior_ready,
@@ -3939,8 +3997,9 @@ async fn observe_pane_with_evidence(
         }
         return Some(PaneObservation {
             detection: det,
+            runtime: wake.runtime.into_iter().collect(),
             dispatch_acks: Vec::new(),
-            messaging: messaging_observation.into_iter().collect(),
+            messaging: wake.messaging.into_iter().collect(),
             repaint: false,
             recompute_guard,
         });
@@ -3999,8 +4058,7 @@ async fn observe_pane_with_evidence(
                         // was write-ready and is now refused on stale
                         // evidence has to wake whoever was gating on the
                         // old answer.
-                        let messaging_observation = wake_readiness(
-                            inner,
+                        let wake = wake_readiness(
                             session_idx,
                             pane_id,
                             prior_ready,
@@ -4013,8 +4071,9 @@ async fn observe_pane_with_evidence(
                         }
                         return Some(PaneObservation {
                             detection: p,
+                            runtime: wake.runtime.into_iter().collect(),
                             dispatch_acks: Vec::new(),
-                            messaging: messaging_observation.into_iter().collect(),
+                            messaging: wake.messaging.into_iter().collect(),
                             repaint: false,
                             recompute_guard,
                         });
@@ -4554,8 +4613,12 @@ async fn observe_pane_with_evidence(
             )
         }
     };
+    let mut runtime_observations = Vec::new();
     if missing_end_diagnostic {
-        notify_missing_lifecycle_end(inner, session_idx, pane_id);
+        runtime_observations.push(PaneRuntimeObservation::missing_lifecycle_end(
+            session_idx,
+            pane_id,
+        ));
     }
     // A readiness change under an UNCHANGED runtime state is still news
     // for anyone gating on it. The hold lifting is the case that matters:
@@ -4563,8 +4626,7 @@ async fn observe_pane_with_evidence(
     // a delivery sleeping on `not_write_ready:composer_hold` would sleep
     // through its own release. This wake is broadcast only. It is not a
     // state transition and must never be written to the ledger as one.
-    let route_observation = wake_readiness(
-        inner,
+    let readiness = wake_readiness(
         session_idx,
         pane_id,
         prior_ready,
@@ -4572,6 +4634,9 @@ async fn observe_pane_with_evidence(
         &detection,
         evidence.route,
     );
+    if let Some(observation) = readiness.runtime {
+        runtime_observations.push(observation);
+    }
     // First sight of a pane that reads Unknown is baseline, not a change.
     let state_changed = prior != Some(detection.state)
         && !(prior.is_none() && detection.state == AgentState::Unknown);
@@ -4586,7 +4651,7 @@ async fn observe_pane_with_evidence(
         .then(|| inner.recipient_key(session_idx, pane_id))
         .flatten();
     let messaging_observations = pane_messaging_observations(
-        route_observation,
+        readiness.messaging,
         exact_owned_recipient,
         quota_reset_recipient,
         session_idx,
@@ -4600,15 +4665,16 @@ async fn observe_pane_with_evidence(
             cause,
             "fused state changed"
         );
-        inner.emit_state(
+        runtime_observations.push(PaneRuntimeObservation::state_changed(
             session_idx,
             pane_id,
             &detection,
             prior,
             cause,
-            (admitted, source_manifest.as_str()),
+            admitted,
+            source_manifest.as_str(),
             working_confirmed,
-        );
+        ));
     }
     let dispatch_acks = confirmed_candidates
         .into_iter()
@@ -4628,6 +4694,7 @@ async fn observe_pane_with_evidence(
     }
     Some(PaneObservation {
         detection,
+        runtime: runtime_observations,
         dispatch_acks,
         messaging: messaging_observations,
         repaint: changed,
@@ -4696,6 +4763,26 @@ fn quota_reset_probe_needed(prior_screen_clear: bool, current: &Detection) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fusion_production_cannot_publish_runtime_effects_directly() {
+        let source = include_str!("fusion.rs");
+        let production = source
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or(source);
+
+        for forbidden in [
+            "inner.emit(",
+            "inner.emit_state(",
+            "crate::delivery::admin_notify(",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "fusion recovered a direct runtime publication mechanism through {forbidden}"
+            );
+        }
+    }
     use crate::StdMutex;
     use std::collections::HashMap;
     use std::path::Path;
@@ -5182,18 +5269,19 @@ line_regex = ['^ACTIVE']
         let ready_key: ReadinessKey = (true, None, false);
         let initial = inner.route_evidence_id(0, pane_id);
 
-        assert_eq!(
-            wake_readiness(
-                &inner,
-                0,
-                pane_id,
-                Some(held.clone()),
-                ready_key.clone(),
-                &ready,
-                None,
-            ),
-            None
+        let wake = wake_readiness(
+            0,
+            pane_id,
+            Some(held.clone()),
+            ready_key.clone(),
+            &ready,
+            None,
         );
+        assert!(wake.messaging.is_none());
+        assert!(matches!(
+            wake.runtime,
+            Some(PaneRuntimeObservation::ReadinessChanged { .. })
+        ));
         assert_eq!(inner.route_evidence_id(0, pane_id), initial);
 
         wake_readiness_after_mutation(&inner, 0, pane_id, held, ready_key, &ready);
@@ -5216,23 +5304,23 @@ line_regex = ['^ACTIVE']
             "a causal source token must not be consumed by an earlier tokenless observer"
         );
 
-        let inner = inner_with(BTreeMap::new());
         let mut detection = quota_detection(Sensor::Screen, AgentState::Idle);
         detection.write_ready = true;
         let evidence_id = NotificationRouteEvidenceId {
             boot_id: "boot".to_string(),
             generation: 9,
         };
+        let wake = wake_readiness(
+            2,
+            "%7",
+            Some(ready.clone()),
+            ready.clone(),
+            &detection,
+            Some(&evidence_id),
+        );
+        assert!(wake.runtime.is_none());
         assert_eq!(
-            wake_readiness(
-                &inner,
-                2,
-                "%7",
-                Some(ready.clone()),
-                ready.clone(),
-                &detection,
-                Some(&evidence_id),
-            ),
+            wake.messaging,
             Some(PaneMessagingObservation::route_evidence(
                 crate::messaging::MessagingRouteEvidence::new(2, "%7", evidence_id.clone())
             ))
@@ -5241,18 +5329,16 @@ line_regex = ['^ACTIVE']
         let unchanged_negative = readiness_wake_plan(Some(&held), &held, true);
         assert!(!unchanged_negative.emit_public);
         assert!(!unchanged_negative.reconcile_route);
-        assert_eq!(
-            wake_readiness(
-                &inner,
-                2,
-                "%7",
-                Some(held.clone()),
-                held,
-                &detection,
-                Some(&evidence_id),
-            ),
-            None
+        let wake = wake_readiness(
+            2,
+            "%7",
+            Some(held.clone()),
+            held,
+            &detection,
+            Some(&evidence_id),
         );
+        assert!(wake.runtime.is_none());
+        assert!(wake.messaging.is_none());
     }
 
     #[test]
@@ -7188,7 +7274,7 @@ contains = ["done"]
     }
 
     /// Gate 2: visual completion without this turn's exact lifecycle end
-    /// holds and emits one bounded, content-free diagnostic.
+    /// holds and reserves one bounded, content-free diagnostic.
     ///
     /// No duration threshold is involved. A legitimate long turn still has
     /// a live Working reading, so only the positive contradiction qualifies:
@@ -7196,7 +7282,7 @@ contains = ["done"]
     /// clean while the exact end is absent. Reservation is on the pinned
     /// pane, process generation, manifest, and TurnKey.
     #[test]
-    fn a_missing_or_mismatched_end_emits_one_bounded_diagnostic() {
+    fn a_missing_or_mismatched_end_reserves_one_body_free_diagnostic() {
         let screen = |state, semantic| Detection {
             state,
             readings: vec![SensorReading {
@@ -7226,8 +7312,6 @@ contains = ["done"]
         let turn = turnkey::TurnKey::for_test(&["session", "turn-1"]);
         let other = turnkey::TurnKey::for_test(&["session", "turn-2"]);
         let started = ComposerHold::TurnStarted { since_ms: 5 };
-        let inner = inner_with(BTreeMap::new());
-        let mut events = inner.events.subscribe();
         let armed = || {
             let mut ends = turnkey::Ends::new();
             assert!(turnkey::PaneEnds::pin(
@@ -7280,9 +7364,16 @@ contains = ["done"]
         );
         assert_eq!(first.0, started, "a missing end released the barrier");
         assert!(first.2, "the visually complete turn raised no diagnostic");
-        if first.2 {
-            notify_missing_lifecycle_end(&inner, 0, "%1");
-        }
+        let diagnostic = first
+            .2
+            .then(|| PaneRuntimeObservation::missing_lifecycle_end(0, "%1"));
+        assert!(matches!(
+            diagnostic,
+            Some(PaneRuntimeObservation::MissingLifecycleEnd {
+                session_idx: 0,
+                ref pane_id,
+            }) if pane_id == "%1"
+        ));
         let repeated = settle_turn(
             &mut ends,
             &pane(),
@@ -7296,9 +7387,6 @@ contains = ["done"]
             !repeated.2,
             "the same exact turn raised a second diagnostic"
         );
-        if repeated.2 {
-            notify_missing_lifecycle_end(&inner, 0, "%1");
-        }
 
         // A different turn's end is still missing evidence for this turn,
         // and receives the same one-shot treatment.
@@ -7349,19 +7437,8 @@ contains = ["done"]
         assert_eq!(settled.0, ComposerHold::Clear);
         assert!(!settled.2, "a matching end raised a diagnostic");
 
-        // The reserved diagnostic is the only one emitted, and it carries
-        // no turn key or terminal content.
-        let event = events.try_recv().expect("diagnostic event");
-        assert_eq!(event.event, "admin-notify");
-        assert_eq!(event.data["pane_id"], "%1");
-        assert_eq!(event.data["level"], "action_required");
-        let rendered = event.data.to_string();
-        assert!(!rendered.contains("turn-1"));
-        assert!(!rendered.contains("session"));
-        assert!(
-            events.try_recv().is_err(),
-            "a second diagnostic was emitted"
-        );
+        // The observation contains only the route needed by the composition
+        // root. It cannot expose the turn key or terminal content.
     }
 
     /// A hold waiting on evidence the store threw away says so.

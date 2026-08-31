@@ -123,13 +123,18 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 /// measured drops at ~2.5s of stall on the old 1024), while a truly wedged
 /// client still lags out and is dropped by the server.
 const EVENT_BUFFER: usize = 8192;
+const MISSING_LIFECYCLE_END_BODY: &str = concat!(
+    "A fresh screen shows the turn stopped and the composer clean, but no matching lifecycle ",
+    "end was recorded for the same process generation and turn. Terminal writes remain blocked; ",
+    "inspect the vendor hook configuration and lifecycle event payload."
+);
 
 /// Commit all consequences of one pane observation before optional tmux chrome.
 ///
-/// The cache commit and any state event already happened in fusion. Returned
-/// delivery ACKs commit first, followed by ordered messaging observations,
-/// before the first presentation await. A stalled or cancelled border write
-/// therefore cannot consume any immutable post-commit evidence.
+/// Fusion has already committed the cache. Runtime publications keep their
+/// observed order, followed by delivery ACKs and ordered messaging
+/// observations, before the first presentation await. A stalled or cancelled
+/// border write therefore cannot consume any immutable post-commit evidence.
 async fn apply_pane_observation(
     inner: &Arc<Inner>,
     session_idx: usize,
@@ -137,8 +142,17 @@ async fn apply_pane_observation(
     pane_id: &str,
     observed: fusion::PaneObservation,
 ) -> Detection {
-    let (detection, dispatch_acks, messaging_observations, repaint, recompute_guard) =
-        observed.into_parts();
+    let (
+        detection,
+        runtime_observations,
+        dispatch_acks,
+        messaging_observations,
+        repaint,
+        recompute_guard,
+    ) = observed.into_parts();
+    for observation in runtime_observations {
+        apply_pane_runtime_observation(inner, observation);
+    }
     for evidence in dispatch_acks {
         apply_dispatch_ack_evidence(inner, evidence);
     }
@@ -152,6 +166,70 @@ async fn apply_pane_observation(
     // complete durable-then-presentation sequence has finished.
     drop(recompute_guard);
     detection
+}
+
+/// Composition-root handoff from immutable pane facts to durable records and
+/// live runtime events.
+pub(crate) fn apply_pane_runtime_observation(
+    inner: &Arc<Inner>,
+    observation: fusion::PaneRuntimeObservation,
+) {
+    match observation {
+        fusion::PaneRuntimeObservation::ReadinessChanged {
+            session_idx,
+            pane_id,
+            write_ready,
+            write_block,
+        } => inner.emit(
+            "readiness",
+            json!({
+                "pane_id": pane_id,
+                "session_idx": session_idx,
+                "write_ready": write_ready,
+                "write_block": write_block,
+            }),
+            None,
+        ),
+        fusion::PaneRuntimeObservation::MissingLifecycleEnd {
+            session_idx,
+            pane_id,
+        } => {
+            let target = inner
+                .label_for_route(session_idx, &pane_id)
+                .unwrap_or_else(|| pane_id.clone());
+            delivery::admin_notify(
+                inner,
+                cyclops_proto::NotifyLevel::ActionRequired,
+                &format!("{target}: matching lifecycle end missing"),
+                MISSING_LIFECYCLE_END_BODY,
+                None,
+                Some(session_idx),
+                delivery::About::pane(&pane_id),
+            );
+        }
+        fusion::PaneRuntimeObservation::StateChanged {
+            session_idx,
+            pane_id,
+            state,
+            disagreement,
+            decided_by,
+            prior,
+            cause,
+            source_agent,
+            source_manifest,
+            working_confirmed,
+        } => inner.emit_state(
+            session_idx,
+            &pane_id,
+            state,
+            disagreement,
+            &decided_by,
+            prior,
+            &cause,
+            (source_agent, &source_manifest),
+            working_confirmed,
+        ),
+    }
 }
 
 /// Composition-root handoff from immutable pane evidence to the retained
@@ -1364,7 +1442,9 @@ impl Inner {
         &self,
         session_idx: usize,
         pane_id: &str,
-        det: &Detection,
+        state: AgentState,
+        disagreement: bool,
+        decided_by: &str,
         prior: Option<AgentState>,
         cause: &str,
         source: (Option<crate::identity::ProcId>, &str),
@@ -1384,10 +1464,10 @@ impl Inner {
                     "session_idx": session_idx,
                     "target": target,
                     "recipient": recipient,
-                    "state": det.state,
+                    "state": state,
                     "prior": prior,
-                    "disagreement": det.disagreement,
-                    "decided_by": det.decided_by,
+                    "disagreement": disagreement,
+                    "decided_by": decided_by,
                     "cause": cause,
                     "working_confirmed": working_confirmed,
                 }),
@@ -1407,10 +1487,10 @@ impl Inner {
                 "recipient": recipient,
                 "pane_id": pane_id,
                 "session_idx": session_idx,
-                "state": det.state,
+                "state": state,
                 "prior": prior,
-                "disagreement": det.disagreement,
-                "decided_by": det.decided_by,
+                "disagreement": disagreement,
+                "decided_by": decided_by,
                 "source_pid": source_agent.map(|a| a.pid),
                 "source_birth": source_agent.map(|a| a.birth),
                 "source_manifest": source_manifest,
@@ -5945,6 +6025,69 @@ mod tests {
         tokio::time::advance(OUTPUT_SETTLE).await;
 
         assert_eq!(settled.await.unwrap(), Some(40));
+    }
+
+    #[test]
+    fn runtime_observation_adapter_maps_body_free_facts_in_call_order() {
+        let inner = bare_inner("cyc-runtime-observation-publication");
+        let home = inner.cfg.home.clone();
+        let mut events = inner.events.subscribe();
+        for observation in [
+            fusion::PaneRuntimeObservation::MissingLifecycleEnd {
+                session_idx: 0,
+                pane_id: "%1".into(),
+            },
+            fusion::PaneRuntimeObservation::ReadinessChanged {
+                session_idx: 0,
+                pane_id: "%1".into(),
+                write_ready: true,
+                write_block: None,
+            },
+            fusion::PaneRuntimeObservation::StateChanged {
+                session_idx: 0,
+                pane_id: "%1".into(),
+                state: AgentState::Idle,
+                disagreement: false,
+                decided_by: "composer_empty".into(),
+                prior: Some(AgentState::Working),
+                cause: "output_settled".into(),
+                source_agent: Some(identity::ProcId { pid: 71, birth: 3 }),
+                source_manifest: "codex".into(),
+                working_confirmed: false,
+            },
+        ] {
+            apply_pane_runtime_observation(&inner, observation);
+        }
+
+        let diagnostic = events.try_recv().expect("missing-end diagnostic");
+        assert_eq!(diagnostic.event, "admin-notify");
+        assert_eq!(diagnostic.data["pane_id"], "%1");
+        assert_eq!(diagnostic.data["level"], "action_required");
+        assert_eq!(
+            diagnostic.data["subject"],
+            "%1: matching lifecycle end missing"
+        );
+        assert_eq!(diagnostic.data["body"], MISSING_LIFECYCLE_END_BODY);
+        let rendered = diagnostic.data.to_string();
+        assert!(!rendered.contains("turn-1"));
+        assert!(!rendered.contains("session"));
+
+        let readiness = events.try_recv().expect("readiness event");
+        assert_eq!(readiness.event, "readiness");
+        assert_eq!(readiness.data["write_ready"], true);
+        assert!(readiness.data["write_block"].is_null());
+
+        let state = events.try_recv().expect("state event");
+        assert_eq!(state.event, "state");
+        assert_eq!(state.data["state"], "idle");
+        assert_eq!(state.data["prior"], "working");
+        assert_eq!(state.data["source_pid"], 71);
+        assert_eq!(state.data["source_birth"], 3);
+        assert_eq!(state.data["source_manifest"], "codex");
+        assert!(events.try_recv().is_err(), "unexpected extra publication");
+
+        drop(inner);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
