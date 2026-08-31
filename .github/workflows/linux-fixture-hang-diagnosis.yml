@@ -16,7 +16,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: never
-  # Each manually dispatched run owns short paths. The captured filesystem
+  # Each diagnostic run owns short paths. The captured filesystem
   # state therefore identifies only this runner's tmux sockets and scratch.
   CYCLOPS_TEST_TMP: /tmp/cyc-fixture-${{ github.run_id }}-${{ github.run_attempt }}
   TMUX_TMPDIR: /tmp/cyc-tmux-${{ github.run_id }}-${{ github.run_attempt }}
@@ -63,6 +63,10 @@ jobs:
           # the immediately preceding green revision. Eight minutes per stage
           # is a diagnostic ceiling for cold-cache variance, not a test wait.
           readonly OUTER_TIMEOUT=8m
+          # Preserve a live process tree before `timeout` sends its signal.
+          # Ten seconds leaves enough room to name the stage and write a small
+          # local snapshot without extending the stage's eight-minute ceiling.
+          readonly PRE_TIMEOUT_SNAPSHOT_SECONDS=470
           mkdir -p "$DIAGNOSTIC_DIR" "$CYCLOPS_TEST_TMP" "$TMUX_TMPDIR"
 
           {
@@ -98,28 +102,84 @@ jobs:
             } > "$DIAGNOSTIC_DIR/${stage_name}-snapshot.txt" 2>&1
           }
 
+          # Sleep inside one Python process so cancelling a successful stage
+          # cannot orphan a shell-owned `sleep`. Once the marker exists, the
+          # caller waits for this snapshot instead of interrupting it.
+          start_pre_timeout_snapshot() {
+            local stage_name=$1
+            local marker=$2
+            local snapshot="$DIAGNOSTIC_DIR/${stage_name}-before-timeout-snapshot.txt"
+            python3 - "$PRE_TIMEOUT_SNAPSHOT_SECONDS" "$marker" "$snapshot" \
+              "$TMUX_TMPDIR" "$CYCLOPS_TEST_TMP" <<'PY' &
+          import datetime
+          import pathlib
+          import shutil
+          import subprocess
+          import sys
+          import time
+
+          delay, marker, snapshot, tmux_root, scratch_root = sys.argv[1:]
+          time.sleep(int(delay))
+          pathlib.Path(marker).write_text("before-timeout snapshot started\n", encoding="utf-8")
+
+          def capture(output, heading, command):
+              output.write(f"{heading}\n")
+              try:
+                  result = subprocess.run(command, text=True, capture_output=True, timeout=20)
+                  output.write(result.stdout)
+                  output.write(result.stderr)
+              except Exception as error:
+                  output.write(f"snapshot command failed: {error}\n")
+              output.write("\n")
+
+          with pathlib.Path(snapshot).open("w", encoding="utf-8") as output:
+              output.write("stage: pre-timeout\n")
+              output.write(f"timestamp: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n\n")
+              capture(output, "process tree (PID PPID PGID SID STAT ELAPSED COMMAND)",
+                      ["ps", "-eo", "pid,ppid,pgid,sid,stat,etime,args", "--forest"])
+              if shutil.which("pstree"):
+                  capture(output, "pstree", ["pstree", "-ap"])
+              else:
+                  output.write("pstree\npstree is unavailable on this runner\n\n")
+              capture(output, f"tmux socket tree: {tmux_root}",
+                      ["find", tmux_root, "-maxdepth", "4", "-ls"])
+              capture(output, f"Cyclops scratch tree: {scratch_root}",
+                      ["find", scratch_root, "-maxdepth", "4", "-ls"])
+          PY
+            PRE_TIMEOUT_SNAPSHOT_PID=$!
+          }
+
           run_stage() {
             local stage_name=$1
-            local pipeline_codes=()
+            local snapshot_pid
+            local stage_code
+            local snapshot_started
             shift
             printf '%q ' "$@" > "$DIAGNOSTIC_DIR/${stage_name}-command.txt"
             printf '\n' >> "$DIAGNOSTIC_DIR/${stage_name}-command.txt"
+            snapshot_started="$DIAGNOSTIC_DIR/${stage_name}-before-timeout.started"
+            rm -f "$snapshot_started"
+
+            # A live snapshot distinguishes an ordinary killable test hang
+            # from a cleanup owner that survives the timeout signal. On a
+            # successful stage, this sleeping helper is stopped below.
+            start_pre_timeout_snapshot "$stage_name" "$snapshot_started"
+            snapshot_pid=$PRE_TIMEOUT_SNAPSHOT_PID
 
             set +e
             # Do not use --foreground: GNU timeout then owns this stage's
             # command group. A cleanup owner that deliberately leaves that
-            # group remains visible in the snapshot after a timeout.
+            # group remains visible in the post-timeout snapshot. Redirect
+            # directly to the retained log: a surviving child that inherited
+            # a pipe must not prevent this shell from taking that snapshot.
             timeout --verbose --signal=TERM --kill-after=15s "$OUTER_TIMEOUT" "$@" \
-              2>&1 | tee "$DIAGNOSTIC_DIR/${stage_name}.log"
-            pipeline_codes=("${PIPESTATUS[@]}")
+              > "$DIAGNOSTIC_DIR/${stage_name}.log" 2>&1
+            stage_code=$?
             set -e
 
-            local stage_code=${pipeline_codes[0]}
-            local tee_code=${pipeline_codes[1]}
             {
               echo "stage: $stage_name"
               echo "command exit: $stage_code"
-              echo "tee exit: $tee_code"
               if [ "$stage_code" = 124 ]; then
                 echo "outer timeout reached"
               elif [ "$stage_code" = 137 ]; then
@@ -127,12 +187,22 @@ jobs:
               fi
             } > "$DIAGNOSTIC_DIR/${stage_name}-result.txt"
 
-            if [ "$stage_code" -ne 0 ] || [ "$tee_code" -ne 0 ]; then
-              capture_snapshot "$stage_name"
-              if [ "$stage_code" -ne 0 ]; then
-                return "$stage_code"
-              fi
-              return "$tee_code"
+            if [ "$stage_code" -ne 0 ]; then
+              # Capture the post-stage tree before waiting for the pre-timeout
+              # helper. A cleanup owner that escaped the stage group can
+              # otherwise exit during that wait and erase the evidence.
+              capture_snapshot "${stage_name}-after-timeout-or-failure"
+            fi
+
+            if [ -f "$snapshot_started" ]; then
+              wait "$snapshot_pid" 2>/dev/null || true
+            elif kill -0 "$snapshot_pid" 2>/dev/null; then
+              kill "$snapshot_pid" 2>/dev/null || true
+              wait "$snapshot_pid" 2>/dev/null || true
+            fi
+
+            if [ "$stage_code" -ne 0 ]; then
+              return "$stage_code"
             fi
           }
 
