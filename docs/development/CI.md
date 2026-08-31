@@ -432,7 +432,17 @@ running the performance workloads on a pull request.
 `.github/workflows/release-evidence.yml` does not merge, tag, or publish
 anything. It owns full clean-checkout validation on Linux and macOS,
 strict and lenient journal replay, daemon historical replay, installer
-lifecycle, real parity journeys, and a retained performance comparison.
+lifecycle, real parity journeys, a retained performance comparison, the full
+fast gate against tmux HEAD, and bounded repeated race, cleanup, soak, and
+long-history evidence. Those last two jobs run in the candidate's own workflow;
+a previous scheduled success cannot satisfy this release gate.
+
+The required pull-request workflow runs the release-topology self-test whenever
+a CI control input changes:
+
+```bash
+python3 scripts/ci-release-evidence.py --selftest
+```
 
 GitHub registers `workflow_dispatch` only from the default branch. Until this
 beta workflow reaches `main`, exercise the release lane by creating its
@@ -453,7 +463,7 @@ release_run="$(gh run list \
   --limit 20 \
   --json databaseId,headSha,workflowName \
   --jq "[.[] | select(.workflowName == \"release evidence\" and .headSha == \"$release_sha\")][0].databaseId")"
-if [ -z "$release_run" ]; then
+if [ -z "$release_run" ] || [ "$release_run" = null ]; then
   echo "release evidence for $release_sha is not registered yet" >&2
   exit 1
 fi
@@ -469,7 +479,8 @@ gh workflow run release-evidence.yml --ref beta/messaging-rework
 ```
 
 The final `beta release evidence complete` job becomes green only when every
-release responsibility succeeds. Operator approval is still required before
+release responsibility, including the candidate's tmux-HEAD and bounded
+reliability evidence, succeeds. Operator approval is still required before
 merging **beta/messaging-rework** into **main** or publishing a release.
 
 ## Final comparison record

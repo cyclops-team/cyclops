@@ -94,6 +94,48 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  # A release candidate must prove the upstream adapter against the same SHA.
+  # A prior scheduled success cannot stand in for this candidate-wide result.
+  tmux-head:
+    name: release tmux HEAD
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.100
+      - name: Build tmux from master
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libevent-dev ncurses-dev build-essential bison pkg-config autoconf automake
+          git clone --depth 1 https://github.com/tmux/tmux.git /tmp/tmux-head
+          cd /tmp/tmux-head && sh autogen.sh && ./configure && make -j
+          sudo make install
+          tmux -V
+      - name: Full correctness evidence against tmux HEAD
+        run: ./scripts/check.sh --fast
+
+  # This is deliberately repeated only for a release candidate. The bounded
+  # loop owns race, exact cleanup, soak, and long-history evidence together.
+  reliability:
+    name: release race and long-history evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Repeated race, forced-cleanup, soak, and long-history evidence
+        env:
+          CYCLOPS_CI_REPEAT: 10
+        run: ./scripts/ci-reliability.sh
+
   beta-release-gate:
     name: beta release evidence complete
     if: ${{ always() }}
@@ -102,6 +144,8 @@ jobs:
       - historical-journals
       - installer-and-journeys
       - performance
+      - tmux-head
+      - reliability
     runs-on: ubuntu-latest
     steps:
       - name: Require every release responsibility
@@ -110,9 +154,13 @@ jobs:
           JOURNALS: ${{ needs.historical-journals.result }}
           JOURNEYS: ${{ needs.installer-and-journeys.result }}
           PERFORMANCE: ${{ needs.performance.result }}
+          TMUX_HEAD: ${{ needs.tmux-head.result }}
+          RELIABILITY: ${{ needs.reliability.result }}
         run: |
           test "$CLEAN" = success
           test "$JOURNALS" = success
           test "$JOURNEYS" = success
           test "$PERFORMANCE" = success
+          test "$TMUX_HEAD" = success
+          test "$RELIABILITY" = success
           echo "Release evidence is complete. This workflow does not publish or merge anything."
