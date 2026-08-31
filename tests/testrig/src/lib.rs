@@ -31,7 +31,9 @@
 //! 6. One external cleanup owner per test executable records only that
 //!    executable's exact socket names. If the executable is terminated before
 //!    `Drop`, closing its registration pipe makes the owner remove the still
-//!    registered servers. Normal drops unregister after their own cleanup.
+//!    registered servers. The owner has its own process group, so cancellation
+//!    of the fixture's group does not kill the cleanup it needs. Normal drops
+//!    unregister after their own cleanup.
 //!
 //! It is its own crate because the sites that need it span both crates and
 //! kinds: integration tests in `cyclops-tmux` and `cyclopsd`, plus a unit
@@ -85,14 +87,22 @@ struct CleanupOwner {
 
 impl CleanupOwner {
     fn spawn() -> Self {
-        let mut process = Command::new("/bin/sh")
+        let mut command = Command::new("/bin/sh");
+        command
             .args(["-c", CLEANUP_OWNER_SCRIPT, "cyclops-cleanup", SHELL_HELPERS])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .env_remove("TMUX")
-            .spawn()
-            .expect("start exact tmux cleanup owner");
+            .env_remove("TMUX");
+        // A cancelled test runner can terminate its entire process group,
+        // which is the path that bypasses Rust Drop. The owner must not share
+        // that group or it dies before observing the closed registration pipe.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut process = command.spawn().expect("start exact tmux cleanup owner");
         let input = process
             .stdin
             .take()
