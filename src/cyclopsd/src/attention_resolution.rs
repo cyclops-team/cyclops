@@ -28,6 +28,8 @@ const POST_ACTION_EVENT_SCANS_PER_CHECKPOINT: usize = 8;
 pub(crate) enum AttentionActionError {
     #[error(transparent)]
     Store(#[from] MailboxServiceError),
+    #[error("this exact notification resolution is already in progress")]
+    ResolutionInProgress,
     #[error("the current terminal does not satisfy every attention evidence check")]
     Evidence(Box<AttentionShowResult>),
     #[error("this manifest has no measured whole-composer clear sequence")]
@@ -132,7 +134,14 @@ pub(crate) async fn force_complete(
             "attempt was claimed, withdrawn, replaced, or settled",
         ));
     }
-    let start = messaging.begin_attention_resolution(target, NotificationResolution::Complete)?;
+    let start = match messaging.begin_attention_resolution(target, NotificationResolution::Complete)
+    {
+        Ok(start) => start,
+        Err(error) if error.notification_resolution_in_progress() => {
+            return Err(AttentionActionError::ResolutionInProgress);
+        }
+        Err(error) => return Err(AttentionActionError::Store(error)),
+    };
     match start {
         AttentionResolutionStart::Fresh => {}
         AttentionResolutionStart::AcceptedUnconsumed => {
@@ -157,7 +166,9 @@ pub(crate) async fn force_complete(
             "recipient process or pane mode changed",
         ));
     }
-    messaging.record_forced_attention_resolution_intent(target)?;
+    if let Err(error) = messaging.record_forced_attention_resolution_intent(target) {
+        return Err(AttentionActionError::Store(error));
+    }
     delivery::inject_pause(inner, "force_submit_after_intent").await;
 
     if !inner.force_submit.get().0 {
@@ -179,16 +190,23 @@ pub(crate) async fn force_complete(
 
     let mut evidence_events = inner.events.subscribe();
     let dispatch_started_ms = unix_ms();
-    let expected_payload = messaging
-        .expected_attention_notification(target)
-        .ok_or(AttentionActionError::ForceRefused("payload is obsolete"))?;
-    let registration = messaging.register_attention_consumption(
+    let Some(expected_payload) = messaging.expected_attention_notification(target) else {
+        withdraw_pre_key(messaging, target, NotificationResolution::Complete)?;
+        return Err(AttentionActionError::ForceRefused("payload is obsolete"));
+    };
+    let registration = match messaging.register_attention_consumption(
         target,
         route.session_idx,
         route.row.pane_id.clone(),
         expected_payload,
         dispatch_started_ms,
-    )?;
+    ) {
+        Ok(registration) => registration,
+        Err(error) => {
+            withdraw_pre_key(messaging, target, NotificationResolution::Complete)?;
+            return Err(AttentionActionError::Store(error));
+        }
+    };
 
     if route
         .watcher
@@ -278,7 +296,9 @@ async fn resolve_selected(
     let attempt_id = target.record.attempt_id;
 
     match start {
-        AttentionResolutionStart::Fresh => {}
+        AttentionResolutionStart::Fresh => {
+            delivery::inject_pause(inner, "attention_after_reservation").await;
+        }
         AttentionResolutionStart::ReconcileOnly => {
             return reconcile_existing_intent(inner, messaging, target, resolution, false).await;
         }

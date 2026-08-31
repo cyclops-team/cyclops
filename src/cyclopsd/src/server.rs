@@ -1259,6 +1259,11 @@ fn attention_action_error(error: crate::attention_resolution::AttentionActionErr
 
     match error {
         AttentionActionError::Store(error) => mailbox_service_error(error),
+        AttentionActionError::ResolutionInProgress => WireError {
+            code: "conflict".to_string(),
+            message: error.to_string(),
+            data: None,
+        },
         AttentionActionError::Evidence(result) => WireError {
             code: "attention_evidence_failed".to_string(),
             message: "the staged notification did not pass every safety check".to_string(),

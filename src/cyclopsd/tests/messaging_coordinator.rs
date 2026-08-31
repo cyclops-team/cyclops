@@ -881,6 +881,138 @@ async fn force_submit_sends_one_enter_for_the_exact_verify_failed_attempt() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn force_submit_waits_for_the_exact_reservation_release_before_revalidating() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "workspace-force-submit-resolution-release",
+        CAT_MANIFEST,
+        &composer_pane(),
+        "delivery_retry_max = 0\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let (pre_tx, mut pre_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reservation_tx, mut reservation_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (force_waiting_tx, mut force_waiting_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pre_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let reservation_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let first_pre = Arc::new(AtomicBool::new(true));
+    let first_reservation = Arc::new(AtomicBool::new(true));
+    let first_force_wait = Arc::new(AtomicBool::new(true));
+    rig.daemon.set_inject_pause({
+        let pre_release = Arc::clone(&pre_release);
+        let reservation_release = Arc::clone(&reservation_release);
+        let first_pre = Arc::clone(&first_pre);
+        let first_reservation = Arc::clone(&first_reservation);
+        let first_force_wait = Arc::clone(&first_force_wait);
+        move |phase| {
+            let pre_tx = pre_tx.clone();
+            let reservation_tx = reservation_tx.clone();
+            let force_waiting_tx = force_waiting_tx.clone();
+            let pre_release = Arc::clone(&pre_release);
+            let reservation_release = Arc::clone(&reservation_release);
+            let pause_pre = phase == "pre_submit" && first_pre.swap(false, Ordering::SeqCst);
+            let pause_reservation = phase == "attention_after_reservation"
+                && first_reservation.swap(false, Ordering::SeqCst);
+            let report_force_wait = phase == "force_submit_waiting_for_resolution_release"
+                && first_force_wait.swap(false, Ordering::SeqCst);
+            Box::pin(async move {
+                if pause_pre {
+                    let _ = pre_tx.send(());
+                    pre_release.acquire_owned().await.unwrap().forget();
+                } else if pause_reservation {
+                    let _ = reservation_tx.send(());
+                    reservation_release.acquire_owned().await.unwrap().forget();
+                } else if report_force_wait {
+                    let _ = force_waiting_tx.send(());
+                }
+            })
+        }
+    });
+
+    let sent = send_workspace_message(
+        &rig,
+        "force-submit-resolution-release",
+        "Force submit waits for release",
+        "private body",
+    )
+    .await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    tokio::time::timeout(Duration::from_secs(5), pre_rx.recv())
+        .await
+        .expect("doorbell reached pre-submit")
+        .expect("pre-submit sender stayed open");
+    rig.tmux
+        .run_ok(&["send-keys", "-l", "-t", &pane, " trailing input"]);
+    rig.tmux.wait_screen("main", "trailing input");
+    pre_release.add_permits(1);
+
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::AttentionRequired).await;
+    tokio::time::timeout(Duration::from_secs(5), reservation_rx.recv())
+        .await
+        .expect("ordinary resolver acquired the exact reservation")
+        .expect("ordinary resolver sender stayed open");
+
+    let enabled = rig
+        .ctl
+        .request(
+            "notification.force_submit.set",
+            json!({"enabled": true, "delay_seconds": 0}),
+        )
+        .await;
+    assert_eq!(enabled["result"]["enabled"], true, "{enabled}");
+    tokio::time::timeout(Duration::from_secs(5), force_waiting_rx.recv())
+        .await
+        .expect("force-submit observed the conflicting reservation")
+        .expect("force-submit wait sender stayed open");
+    assert_eq!(
+        pane_history(&rig, &pane).matches("FAKETUI-WORKING").count(),
+        0,
+        "force-submit pressed Enter while another resolver still owned the attempt"
+    );
+
+    reservation_release.add_permits(1);
+    let intent = wait_for_workspace_fact(&rig, &message_id, "notification_resolution_intent").await;
+    assert_eq!(intent.data.as_ref().unwrap()["forced"], true);
+    wait_for_workspace_fact(&rig, &message_id, "notification_resolution_action_accepted").await;
+    rig.tmux.wait_screen("main", "FAKETUI-WORKING");
+
+    let lines = workspace_lines(&rig);
+    for fact_type in [
+        "notification_resolution_intent",
+        "notification_resolution_action_accepted",
+    ] {
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| {
+                    line.id == message_id
+                        && line
+                            .data
+                            .as_ref()
+                            .is_some_and(|data| data["type"] == fact_type)
+                })
+                .count(),
+            1,
+            "the exact release handoff appended {fact_type} more than once: {lines:#?}"
+        );
+    }
+    assert_eq!(
+        pane_history(&rig, &pane).matches("FAKETUI-WORKING").count(),
+        1,
+        "the release handoff pressed Enter more than once"
+    );
+
+    rig.daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn claiming_the_message_before_the_timer_cancels_force_submit() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
