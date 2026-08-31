@@ -391,6 +391,9 @@ thread_local! {
     static CRASH_AT_UPDATE_BOUNDARY: std::cell::Cell<Option<UpdateBoundary>> = const {
         std::cell::Cell::new(None)
     };
+    static FAIL_NEXT_SELECTOR_DIRECTORY_SYNC: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
 }
 
 fn crossed_update_boundary(boundary: UpdateBoundary) {
@@ -430,6 +433,115 @@ struct Selection {
     known_good_proof: Option<PairProof>,
     active_replay: Option<ReplayAttestation>,
     known_good_replay: Option<ReplayAttestation>,
+}
+
+/// The selector rename either has not become visible yet, or it has. Callers
+/// must not flatten those states into one generic failure: after the rename,
+/// the pair the public links resolve through may already have changed.
+#[derive(Debug)]
+enum SelectorPublicationError {
+    BeforeVisible(String),
+    Visible {
+        selection: Box<Selection>,
+        error: String,
+    },
+}
+
+impl SelectorPublicationError {
+    fn before(error: impl Into<String>) -> Self {
+        Self::BeforeVisible(error.into())
+    }
+
+    fn visible(selection: Selection, error: impl Into<String>) -> Self {
+        Self::Visible {
+            selection: Box::new(selection),
+            error: error.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for SelectorPublicationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BeforeVisible(error) => formatter.write_str(error),
+            Self::Visible { selection, error } => write!(
+                formatter,
+                "the active selector now names {}, but its durability confirmation failed: {error}",
+                selection.active
+            ),
+        }
+    }
+}
+
+/// A public pair-change failure that keeps selector visibility explicit. A
+/// caller must restore a prior selection before starting a daemon when this
+/// operation made a new selector visible.
+#[derive(Debug)]
+enum PairChangeError {
+    SelectorUnchanged(String),
+    SelectorVisible {
+        previous: Option<Box<Selection>>,
+        selection: Box<Selection>,
+        error: String,
+    },
+}
+
+impl PairChangeError {
+    fn unchanged(error: impl Into<String>) -> Self {
+        Self::SelectorUnchanged(error.into())
+    }
+
+    fn after_selector_publication(
+        previous: Option<Selection>,
+        error: SelectorPublicationError,
+    ) -> Self {
+        match error {
+            SelectorPublicationError::BeforeVisible(error) => Self::SelectorUnchanged(error),
+            SelectorPublicationError::Visible { selection, error } => Self::SelectorVisible {
+                previous: previous.map(Box::new),
+                selection,
+                error: format!("selector durability confirmation failed: {error}"),
+            },
+        }
+    }
+
+    fn after_visible_selector(
+        previous: Option<Selection>,
+        selection: Selection,
+        error: impl Into<String>,
+    ) -> Self {
+        Self::SelectorVisible {
+            previous: previous.map(Box::new),
+            selection: Box::new(selection),
+            error: error.into(),
+        }
+    }
+
+    fn selector_is_visible(&self) -> bool {
+        matches!(self, Self::SelectorVisible { .. })
+    }
+
+    fn previous(&self) -> Option<&Selection> {
+        match self {
+            Self::SelectorUnchanged(_) => None,
+            Self::SelectorVisible { previous, .. } => previous.as_deref(),
+        }
+    }
+}
+
+impl std::fmt::Display for PairChangeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SelectorUnchanged(error) => formatter.write_str(error),
+            Self::SelectorVisible {
+                selection, error, ..
+            } => write!(
+                formatter,
+                "the active selector now names {}, but the pair change did not finish: {error}",
+                selection.active
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1153,11 +1265,18 @@ impl PairStore {
 
     /// Move an existing direct installation behind the selector without ever
     /// changing the bytes either public name resolves to.
-    fn migrate_direct_pair(&self, candidate: &str) -> Result<(), String> {
-        self.require_root()?;
-        self.require_pair(candidate)?;
-        if self.selection()?.is_some() {
-            return self.repair_public_links();
+    fn migrate_direct_pair(&self, candidate: &str) -> Result<(), PairChangeError> {
+        self.require_root().map_err(PairChangeError::unchanged)?;
+        self.require_pair(candidate)
+            .map_err(PairChangeError::unchanged)?;
+        if self
+            .selection()
+            .map_err(PairChangeError::unchanged)?
+            .is_some()
+        {
+            return self
+                .repair_public_links()
+                .map_err(PairChangeError::unchanged);
         }
         let cli = self.prefix.join("cyclops");
         let daemon = self.prefix.join("cyclopsd");
@@ -1170,7 +1289,9 @@ impl PairStore {
                 .as_ref()
                 .is_some_and(|m| m.file_type().is_symlink())
         {
-            return Err("managed Cyclops links have no active selector".to_string());
+            return Err(PairChangeError::unchanged(
+                "managed Cyclops links have no active selector",
+            ));
         }
         match (cli_meta, daemon_meta) {
             (None, None) => Ok(()),
@@ -1178,27 +1299,34 @@ impl PairStore {
                 let source = self.prefix.clone();
                 let matched = prove_pair_identity(&source).is_ok();
                 let old = if matched {
-                    self.stage(&source)?
+                    self.stage(&source).map_err(PairChangeError::unchanged)?
                 } else {
-                    self.stage_legacy(&source)?
+                    self.stage_legacy(&source)
+                        .map_err(PairChangeError::unchanged)?
                 };
                 let selection = if matched {
-                    self.prepare_selection(&old, &old)?
+                    self.prepare_selection(&old, &old)
+                        .map_err(PairChangeError::unchanged)?
                 } else {
-                    self.prepare_legacy_selection(&old, candidate)?
+                    self.prepare_legacy_selection(&old, candidate)
+                        .map_err(PairChangeError::unchanged)?
                 };
-                self.select(&selection)?;
+                self.select(&selection)
+                    .map_err(|error| PairChangeError::after_selector_publication(None, error))?;
                 // The daemon path moves first but still resolves to the same
                 // copied bytes as the direct CLI. The second move completes
                 // the stable indirection without a mixed pair window.
-                self.replace_public_link("cyclopsd")?;
-                self.replace_public_link("cyclops")?;
+                self.replace_public_link("cyclopsd").map_err(|error| {
+                    PairChangeError::after_visible_selector(None, selection.clone(), error)
+                })?;
+                self.replace_public_link("cyclops").map_err(|error| {
+                    PairChangeError::after_visible_selector(None, selection.clone(), error)
+                })?;
                 Ok(())
             }
-            _ => Err(
-                "the install prefix contains only one Cyclops binary or an unsupported file type"
-                    .to_string(),
-            ),
+            _ => Err(PairChangeError::unchanged(
+                "the install prefix contains only one Cyclops binary or an unsupported file type",
+            )),
         }
     }
 
@@ -1206,15 +1334,18 @@ impl PairStore {
         &self,
         candidate: &str,
         replay: ReplayAttestation,
-    ) -> Result<Option<Selection>, String> {
-        self.require_root()?;
-        let candidate_proof = self.pair_proof(candidate)?;
-        verify_replay_attestation(&replay, &candidate_proof)?;
-        let previous = self.selection()?;
+    ) -> Result<Option<Selection>, PairChangeError> {
+        self.require_root().map_err(PairChangeError::unchanged)?;
+        let candidate_proof = self
+            .pair_proof(candidate)
+            .map_err(PairChangeError::unchanged)?;
+        verify_replay_attestation(&replay, &candidate_proof).map_err(PairChangeError::unchanged)?;
+        let previous = self.selection().map_err(PairChangeError::unchanged)?;
         if previous.as_ref().is_some_and(|value| {
             value.active == candidate && value.active_replay == Some(replay.clone())
         }) {
-            self.require_public_links()?;
+            self.require_public_links()
+                .map_err(PairChangeError::unchanged)?;
             return Ok(previous);
         }
         let (known_good, known_good_replay) = previous
@@ -1234,18 +1365,23 @@ impl PairStore {
                 }
             })
             .unwrap_or_else(|| (candidate.to_string(), Some(replay.clone())));
-        let selection = self.prepare_selection_with_replays(
-            candidate,
-            &known_good,
-            Some(replay),
-            known_good_replay,
-        )?;
-        self.select(&selection)?;
+        let selection = self
+            .prepare_selection_with_replays(candidate, &known_good, Some(replay), known_good_replay)
+            .map_err(PairChangeError::unchanged)?;
+        self.select(&selection).map_err(|error| {
+            PairChangeError::after_selector_publication(previous.clone(), error)
+        })?;
         if previous.is_none() {
-            self.replace_public_link("cyclopsd")?;
-            self.replace_public_link("cyclops")?;
+            self.replace_public_link("cyclopsd").map_err(|error| {
+                PairChangeError::after_visible_selector(previous.clone(), selection.clone(), error)
+            })?;
+            self.replace_public_link("cyclops").map_err(|error| {
+                PairChangeError::after_visible_selector(previous.clone(), selection.clone(), error)
+            })?;
         } else {
-            self.require_public_links()?;
+            self.require_public_links().map_err(|error| {
+                PairChangeError::after_visible_selector(previous.clone(), selection.clone(), error)
+            })?;
         }
         Ok(previous)
     }
@@ -1253,20 +1389,28 @@ impl PairStore {
     fn rollback(
         &self,
         restored_replay: ReplayAttestation,
-    ) -> Result<(Selection, Selection), String> {
-        let current = self.rollback_selection()?;
+    ) -> Result<(Selection, Selection), PairChangeError> {
+        let current = self
+            .rollback_selection()
+            .map_err(PairChangeError::unchanged)?;
         let known_good_proof = current
             .known_good_proof
             .as_ref()
-            .ok_or_else(|| "the known-good pair has no recorded identity".to_string())?;
-        verify_replay_attestation(&restored_replay, known_good_proof)?;
-        let restored = self.prepare_selection_with_replays(
-            &current.known_good,
-            &current.active,
-            Some(restored_replay),
-            current.active_replay.clone(),
-        )?;
-        self.select(&restored)?;
+            .ok_or_else(|| "the known-good pair has no recorded identity".to_string())
+            .map_err(PairChangeError::unchanged)?;
+        verify_replay_attestation(&restored_replay, known_good_proof)
+            .map_err(PairChangeError::unchanged)?;
+        let restored = self
+            .prepare_selection_with_replays(
+                &current.known_good,
+                &current.active,
+                Some(restored_replay),
+                current.active_replay.clone(),
+            )
+            .map_err(PairChangeError::unchanged)?;
+        self.select(&restored).map_err(|error| {
+            PairChangeError::after_selector_publication(Some(current.clone()), error)
+        })?;
         Ok((current, restored))
     }
 
@@ -1290,9 +1434,11 @@ impl PairStore {
         Ok(current)
     }
 
-    fn restore_selection(&self, selection: &Selection) -> Result<(), String> {
-        self.require_root()?;
-        self.require_selection(selection)?;
+    fn restore_selection(&self, selection: &Selection) -> Result<(), SelectorPublicationError> {
+        self.require_root()
+            .map_err(SelectorPublicationError::before)?;
+        self.require_selection(selection)
+            .map_err(SelectorPublicationError::before)?;
         self.select(selection)
     }
 
@@ -1477,19 +1623,28 @@ impl PairStore {
         Ok(Some(selection))
     }
 
-    fn select(&self, selection: &Selection) -> Result<(), String> {
-        self.require_root()?;
-        self.require_selection(selection)?;
-        let temporary = self
-            .root
-            .join(format!(".{ACTIVE_SELECTOR}.{}", random_hex()?));
-        std::os::unix::fs::symlink(&selection.id, &temporary)
-            .map_err(|error| format!("create selector {}: {error}", temporary.display()))?;
+    fn select(&self, selection: &Selection) -> Result<(), SelectorPublicationError> {
+        self.require_root()
+            .map_err(SelectorPublicationError::before)?;
+        self.require_selection(selection)
+            .map_err(SelectorPublicationError::before)?;
+        let temporary = self.root.join(format!(
+            ".{ACTIVE_SELECTOR}.{}",
+            random_hex().map_err(SelectorPublicationError::before)?
+        ));
+        std::os::unix::fs::symlink(&selection.id, &temporary).map_err(|error| {
+            SelectorPublicationError::before(format!(
+                "create selector {}: {error}",
+                temporary.display()
+            ))
+        })?;
         crossed_update_boundary(UpdateBoundary::SelectorTemporaryCreated);
-        std::fs::rename(&temporary, self.root.join(ACTIVE_SELECTOR))
-            .map_err(|error| format!("activate pair selector: {error}"))?;
+        std::fs::rename(&temporary, self.root.join(ACTIVE_SELECTOR)).map_err(|error| {
+            SelectorPublicationError::before(format!("activate pair selector: {error}"))
+        })?;
         crossed_update_boundary(UpdateBoundary::SelectorCommitted);
-        sync_directory(&self.root)?;
+        sync_selector_directory(&self.root)
+            .map_err(|error| SelectorPublicationError::visible(selection.clone(), error))?;
         crossed_update_boundary(UpdateBoundary::SelectorPublished);
         Ok(())
     }
@@ -2147,6 +2302,17 @@ fn sync_directory(path: &Path) -> Result<(), String> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| format!("sync {}: {error}", path.display()))
+}
+
+/// The selector is already observable after its rename. Keep the directory
+/// sync separate so tests can exercise the only error path where a pair change
+/// is visible but not yet confirmed durable.
+fn sync_selector_directory(path: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    if FAIL_NEXT_SELECTOR_DIRECTORY_SYNC.with(|fail| fail.replace(false)) {
+        return Err("injected selector directory sync failure".to_string());
+    }
+    sync_directory(path)
 }
 
 const MAX_PAIR_BINARY_BYTES: u64 = 256 * 1024 * 1024;
@@ -3160,6 +3326,74 @@ fn restart_pre_activation_pair(
     }
 }
 
+/// What recovery actually completed after a pair-change error.
+/// The caller reports these facts beside the original error instead of
+/// collapsing a visible selector change into a generic install failure.
+#[derive(Debug, Eq, PartialEq)]
+struct PairChangeRecovery {
+    prior_selector_restored: bool,
+    prior_daemon_restarted: bool,
+}
+
+/// Restore the exact prior selector before any daemon restart. A failed
+/// directory sync after rename leaves the selector observable but uncertain;
+/// in that case a second selector change must be confirmed before a daemon is
+/// allowed to start.
+fn recover_prior_pair_after_change_failure(
+    store: &PairStore,
+    fallback_previous: Option<&Selection>,
+    failure: &PairChangeError,
+    daemon_was_stopped: bool,
+    restart: impl FnOnce() -> Result<(), String>,
+) -> Result<PairChangeRecovery, String> {
+    let prior_selector_restored = if failure.selector_is_visible() {
+        let previous = failure.previous().or(fallback_previous).ok_or_else(|| {
+            "the new selector is visible, but there is no earlier selection to restore; do not start a daemon automatically"
+                .to_string()
+        })?;
+        store
+            .restore_selection(previous)
+            .map_err(|error| format!("selector recovery held: {error}"))?;
+        true
+    } else {
+        false
+    };
+    let prior_daemon_restarted = if daemon_was_stopped {
+        restart().map_err(|error| format!("previous daemon restart failed: {error}"))?;
+        true
+    } else {
+        false
+    };
+    Ok(PairChangeRecovery {
+        prior_selector_restored,
+        prior_daemon_restarted,
+    })
+}
+
+fn report_pair_change_recovery(recovery: &PairChangeRecovery) {
+    match (
+        recovery.prior_selector_restored,
+        recovery.prior_daemon_restarted,
+    ) {
+        (true, true) => {
+            eprintln!("  restored the prior selector and restarted its exact daemon");
+        }
+        (true, false) => {
+            eprintln!("  restored the prior selector; no daemon had been running");
+        }
+        (false, true) => {
+            eprintln!("  the selector was unchanged; restarted its exact daemon");
+        }
+        (false, false) => {}
+    }
+}
+
+fn discard_unselected_candidate(store: &PairStore, candidate: &str) {
+    if let Err(error) = store.discard(candidate) {
+        eprintln!("  staged candidate cleanup held: {error}");
+    }
+}
+
 fn run_install_pair(source: &Path, prefix: &Path, style: &Style) -> i32 {
     let scratch = match Scratch::create() {
         Ok(scratch) => scratch,
@@ -3253,14 +3487,23 @@ fn run_install_pair(source: &Path, prefix: &Path, style: &Style) -> i32 {
         }
     };
     if let Err(error) = store.migrate_direct_pair(&candidate) {
-        if stopped.is_some() {
-            let restart = restart_pre_activation_pair(&store, prefix, before_migration.as_ref());
-            if let Err(restart_error) = restart {
-                eprintln!("  previous daemon restart failed: {restart_error}");
+        eprintln!("install did not finish during direct-pair migration: {error}");
+        match recover_prior_pair_after_change_failure(
+            &store,
+            before_migration.as_ref(),
+            &error,
+            stopped.is_some(),
+            || restart_pre_activation_pair(&store, prefix, before_migration.as_ref()),
+        ) {
+            Ok(recovery) => {
+                report_pair_change_recovery(&recovery);
+                discard_unselected_candidate(&store, &candidate);
+            }
+            Err(recovery_error) => {
+                eprintln!("  recovery held: {recovery_error}");
+                eprintln!("  retained staged candidate {candidate} for inspection");
             }
         }
-        let _ = store.discard(&candidate);
-        eprintln!("install failed during direct-pair migration: {error}");
         return 1;
     }
     let previous = match store.selection() {
@@ -3279,30 +3522,64 @@ fn run_install_pair(source: &Path, prefix: &Path, style: &Style) -> i32 {
         }
     };
     if let Err(error) = store.activate(&candidate, replay) {
-        if let Some(previous) = previous.as_ref() {
-            let _ = store.restore_selection(previous);
+        eprintln!("install did not finish: {error}");
+        match recover_prior_pair_after_change_failure(
+            &store,
+            previous.as_ref(),
+            &error,
+            stopped.is_some(),
+            || restart_pre_activation_pair(&store, prefix, previous.as_ref()),
+        ) {
+            Ok(recovery) => {
+                report_pair_change_recovery(&recovery);
+                discard_unselected_candidate(&store, &candidate);
+            }
+            Err(recovery_error) => {
+                eprintln!("  recovery held: {recovery_error}");
+                eprintln!("  retained staged candidate {candidate} for inspection");
+            }
         }
-        if stopped.is_some() {
-            let _ = start_and_prove_selected(&store);
-        }
-        let _ = store.discard(&candidate);
-        eprintln!("install failed: {error}");
         return 1;
     }
     if stopped.is_some() {
         let started = start_and_prove_selected(&store);
         if let Err(error) = started {
+            eprintln!("install did not finish: candidate daemon did not take over: {error}");
             let candidate_stopped = match store.active_binary("cyclopsd") {
                 Ok(daemon) => crate::daemon::stop_selected_for_pair_change(&daemon),
                 Err(error) => Err(crate::daemon::RestartRefusal::Failed(error)),
             };
             if matches!(candidate_stopped, Ok(Some(_)) | Ok(None)) {
-                if let Some(previous) = previous.as_ref() {
-                    let _ = store.restore_selection(previous);
-                    let _ = start_and_prove_selected(&store);
+                match store.selection() {
+                    Ok(Some(selection)) => {
+                        let failure = PairChangeError::after_visible_selector(
+                            previous.clone(),
+                            selection,
+                            format!("candidate daemon did not take over: {error}"),
+                        );
+                        match recover_prior_pair_after_change_failure(
+                            &store,
+                            previous.as_ref(),
+                            &failure,
+                            true,
+                            || restart_pre_activation_pair(&store, prefix, previous.as_ref()),
+                        ) {
+                            Ok(recovery) => report_pair_change_recovery(&recovery),
+                            Err(recovery_error) => {
+                                eprintln!("  automatic rollback held: {recovery_error}");
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        eprintln!("  automatic rollback held: the active selector disappeared");
+                    }
+                    Err(selection_error) => {
+                        eprintln!(
+                            "  automatic rollback held: inspect active selector: {selection_error}"
+                        );
+                    }
                 }
             }
-            eprintln!("install failed: candidate daemon did not take over: {error}");
             if let Err(ref refusal) = candidate_stopped {
                 eprintln!("  automatic rollback held: {}", refusal.why());
             }
@@ -3408,25 +3685,57 @@ fn run_rollback(style: &Style) -> i32 {
     let (prior, restored) = match store.rollback(replay) {
         Ok(swapped) => swapped,
         Err(error) => {
-            if stopped.is_some() {
-                let _ = start_and_prove_selected(&store);
+            eprintln!("rollback did not finish: {error}");
+            match recover_prior_pair_after_change_failure(
+                &store,
+                None,
+                &error,
+                stopped.is_some(),
+                || start_and_prove_selected(&store),
+            ) {
+                Ok(recovery) => report_pair_change_recovery(&recovery),
+                Err(recovery_error) => eprintln!("  recovery held: {recovery_error}"),
             }
-            eprintln!("rollback failed: {error}");
             return 1;
         }
     };
     if stopped.is_some() {
         let started = start_and_prove_selected(&store);
         if let Err(error) = started {
+            eprintln!("rollback did not finish: restored daemon did not start: {error}");
             let restored_stopped = match store.active_binary("cyclopsd") {
                 Ok(daemon) => crate::daemon::stop_selected_for_pair_change(&daemon),
                 Err(error) => Err(crate::daemon::RestartRefusal::Failed(error)),
             };
             if matches!(restored_stopped, Ok(Some(_)) | Ok(None)) {
-                let _ = store.restore_selection(&prior);
-                let _ = start_and_prove_selected(&store);
+                match store.selection() {
+                    Ok(Some(selection)) => {
+                        let failure = PairChangeError::after_visible_selector(
+                            Some(prior.clone()),
+                            selection,
+                            format!("restored daemon did not start: {error}"),
+                        );
+                        match recover_prior_pair_after_change_failure(
+                            &store,
+                            Some(&prior),
+                            &failure,
+                            true,
+                            || start_and_prove_selected(&store),
+                        ) {
+                            Ok(recovery) => report_pair_change_recovery(&recovery),
+                            Err(recovery_error) => {
+                                eprintln!("  selector restoration held: {recovery_error}");
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        eprintln!("  selector restoration held: the active selector disappeared");
+                    }
+                    Err(selection_error) => {
+                        eprintln!("  selector restoration held: inspect active selector: {selection_error}");
+                    }
+                }
             }
-            eprintln!("rollback failed: restored daemon did not start: {error}");
             if let Err(ref refusal) = restored_stopped {
                 eprintln!("  selector restoration held: {}", refusal.why());
             }
@@ -4133,6 +4442,144 @@ sys.exit(43)"#,
     }
 
     #[test]
+    fn activation_reports_a_visible_selector_when_its_directory_sync_fails() {
+        let scratch = Scratch::create().unwrap();
+        let prefix = scratch.path().join("bin");
+        let old_source = scratch.path().join("old");
+        let candidate_source = scratch.path().join("candidate");
+        directory(&prefix);
+        pair_source(&old_source, "old-build");
+        pair_source(&candidate_source, "candidate-build");
+        let store = PairStore::open(&prefix).unwrap();
+        let old = store.stage(&old_source).unwrap();
+        store
+            .activate(&old, recorded_replay(&store, &old, 20))
+            .unwrap();
+        let before = store.selection().unwrap().unwrap();
+        let candidate = store.stage(&candidate_source).unwrap();
+
+        FAIL_NEXT_SELECTOR_DIRECTORY_SYNC.with(|fail| fail.set(true));
+        let error = store
+            .activate(&candidate, recorded_replay(&store, &candidate, 21))
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            PairChangeError::SelectorVisible { selection, .. } if selection.active == candidate
+        ));
+        assert!(error
+            .to_string()
+            .contains("selector durability confirmation failed"));
+        assert_eq!(store.selection().unwrap().unwrap().active, candidate);
+        assert_eq!(error.previous(), Some(&before));
+
+        let recovery = recover_prior_pair_after_change_failure(
+            &store,
+            Some(&before),
+            &error,
+            false,
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            recovery,
+            PairChangeRecovery {
+                prior_selector_restored: true,
+                prior_daemon_restarted: false,
+            }
+        );
+        assert_eq!(store.selection().unwrap(), Some(before));
+    }
+
+    #[test]
+    fn rollback_reports_a_visible_selector_when_its_directory_sync_fails() {
+        let scratch = Scratch::create().unwrap();
+        let prefix = scratch.path().join("bin");
+        let old_source = scratch.path().join("old");
+        let candidate_source = scratch.path().join("candidate");
+        directory(&prefix);
+        pair_source(&old_source, "old-build");
+        pair_source(&candidate_source, "candidate-build");
+        let store = PairStore::open(&prefix).unwrap();
+        let old = store.stage(&old_source).unwrap();
+        store
+            .activate(&old, recorded_replay(&store, &old, 22))
+            .unwrap();
+        let candidate = store.stage(&candidate_source).unwrap();
+        store
+            .activate(&candidate, recorded_replay(&store, &candidate, 23))
+            .unwrap();
+        let before = store.selection().unwrap().unwrap();
+
+        FAIL_NEXT_SELECTOR_DIRECTORY_SYNC.with(|fail| fail.set(true));
+        let error = store
+            .rollback(recorded_replay(&store, &before.known_good, 24))
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            PairChangeError::SelectorVisible { selection, .. } if selection.active == before.known_good
+        ));
+        assert!(error
+            .to_string()
+            .contains("selector durability confirmation failed"));
+        assert_eq!(
+            store.selection().unwrap().unwrap().active,
+            before.known_good
+        );
+        assert_eq!(error.previous(), Some(&before));
+
+        recover_prior_pair_after_change_failure(&store, None, &error, false, || Ok(())).unwrap();
+        assert_eq!(store.selection().unwrap(), Some(before));
+    }
+
+    #[test]
+    fn recovery_does_not_hide_a_restart_error_or_start_after_an_unconfirmed_restore() {
+        let scratch = Scratch::create().unwrap();
+        let prefix = scratch.path().join("bin");
+        let old_source = scratch.path().join("old");
+        let candidate_source = scratch.path().join("candidate");
+        directory(&prefix);
+        pair_source(&old_source, "old-build");
+        pair_source(&candidate_source, "candidate-build");
+        let store = PairStore::open(&prefix).unwrap();
+        let old = store.stage(&old_source).unwrap();
+        store
+            .activate(&old, recorded_replay(&store, &old, 25))
+            .unwrap();
+        let before = store.selection().unwrap().unwrap();
+        let candidate = store.stage(&candidate_source).unwrap();
+
+        FAIL_NEXT_SELECTOR_DIRECTORY_SYNC.with(|fail| fail.set(true));
+        let error = store
+            .activate(&candidate, recorded_replay(&store, &candidate, 26))
+            .unwrap_err();
+        let restart_error =
+            recover_prior_pair_after_change_failure(&store, Some(&before), &error, true, || {
+                Err("injected restart refusal".to_string())
+            })
+            .unwrap_err();
+        assert!(restart_error.contains("previous daemon restart failed: injected restart refusal"));
+        assert_eq!(store.selection().unwrap(), Some(before.clone()));
+
+        FAIL_NEXT_SELECTOR_DIRECTORY_SYNC.with(|fail| fail.set(true));
+        let error = store
+            .activate(&candidate, recorded_replay(&store, &candidate, 27))
+            .unwrap_err();
+        FAIL_NEXT_SELECTOR_DIRECTORY_SYNC.with(|fail| fail.set(true));
+        let restarted = std::cell::Cell::new(false);
+        let restore_error =
+            recover_prior_pair_after_change_failure(&store, Some(&before), &error, true, || {
+                restarted.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(restore_error.contains("selector recovery held"));
+        assert!(!restarted.get());
+        assert_eq!(store.selection().unwrap(), Some(before));
+    }
+
+    #[test]
     fn rollback_refuses_incompatible_current_journals_before_selector_change() {
         let scratch = Scratch::create().unwrap();
         let prefix = scratch.path().join("bin");
@@ -4200,6 +4647,44 @@ sys.exit(43)"#,
         assert!(!active.legacy_active);
         assert_eq!(active.active, candidate);
         assert_eq!(active.known_good, candidate);
+    }
+
+    #[test]
+    fn visible_legacy_migration_retains_its_known_good_candidate_for_recovery() {
+        let scratch = Scratch::create().unwrap();
+        let prefix = scratch.path().join("bin");
+        directory(&prefix);
+        pair_source(&prefix, "old-build");
+        std::fs::remove_file(prefix.join("cyclopsd")).unwrap();
+        write_new(
+            &prefix.join("cyclopsd"),
+            b"#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo 'cyclopsd 0.1.0'\n",
+            0o755,
+        )
+        .unwrap();
+        let store = PairStore::open(&prefix).unwrap();
+        let source = scratch.path().join("candidate");
+        pair_source(&source, "candidate-build");
+        let candidate = store.stage(&source).unwrap();
+
+        FAIL_NEXT_SELECTOR_DIRECTORY_SYNC.with(|fail| fail.set(true));
+        let error = store.migrate_direct_pair(&candidate).unwrap_err();
+
+        let visible = match &error {
+            PairChangeError::SelectorVisible { selection, .. } => selection,
+            PairChangeError::SelectorUnchanged(error) => {
+                panic!("migration never made its selector visible: {error}")
+            }
+        };
+        assert!(visible.legacy_active);
+        assert_eq!(visible.known_good, candidate);
+        assert_eq!(store.selection().unwrap(), Some((**visible).clone()));
+        let recovery =
+            recover_prior_pair_after_change_failure(&store, None, &error, false, || Ok(()))
+                .unwrap_err();
+        assert!(recovery.contains("no earlier selection to restore"));
+        assert!(store.root.join(&candidate).is_dir());
+        assert!(store.discard(&candidate).unwrap_err().contains("selected"));
     }
 
     #[test]
@@ -4332,21 +4817,6 @@ sys.exit(43)"#,
                 "{function} copied live journals before stopping the daemon"
             );
         }
-    }
-
-    #[test]
-    fn install_restarts_the_unchanged_pair_if_post_replay_selection_fails() {
-        let source = include_str!("update.rs");
-        let selection_failure = source
-            .split_once("    let previous = match store.selection() {")
-            .expect("post-replay selection read")
-            .1
-            .split_once("    if let Err(error) = store.activate")
-            .expect("activation follows selection read")
-            .0;
-
-        assert!(selection_failure.contains("restart_pre_activation_pair("));
-        assert!(selection_failure.contains("before_migration.as_ref()"));
     }
 
     #[test]
@@ -4675,12 +5145,20 @@ sys.exit(43)"#,
         let mut replay = recorded_replay(&store, &pair, 14);
         replay.pair.cyclops_sha256 = "0".repeat(64);
         let error = store.activate(&pair, replay).unwrap_err();
-        assert!(error.contains("does not name the recorded pair"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("does not name the recorded pair"),
+            "{error}"
+        );
 
         let mut replay = recorded_replay(&store, &pair, 15);
         replay.snapshot_sha256 = "not-a-digest".to_string();
         let error = store.activate(&pair, replay).unwrap_err();
-        assert!(error.contains("invalid snapshot identity"), "{error}");
+        assert!(
+            error.to_string().contains("invalid snapshot identity"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -4725,6 +5203,7 @@ sys.exit(43)"#,
         assert!(store
             .migrate_direct_pair(&old)
             .unwrap_err()
+            .to_string()
             .contains("does not match"));
         assert_eq!(
             std::fs::read(prefix.join("cyclops")).unwrap(),
@@ -4754,6 +5233,7 @@ sys.exit(43)"#,
         assert!(store
             .migrate_direct_pair(&old)
             .unwrap_err()
+            .to_string()
             .contains("outside the pair store"));
         assert_eq!(std::fs::read_link(prefix.join("cyclops")).unwrap(), outside);
     }
