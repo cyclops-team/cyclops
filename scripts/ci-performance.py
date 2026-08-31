@@ -438,10 +438,23 @@ def selftest() -> None:
     assert valid_cold["status"] == 0
     assert valid_cold["measurement"] == cold
     rejected("daemon-cold-start-replay", {})
+    rejected("daemon-cold-start-replay", {"schema": COLD_REPLAY_SCHEMA})
+
+    wrong_workload = json.loads(json.dumps(cold))
+    wrong_workload["workload"]["replay_validation"] = "not verified"
+    rejected("daemon-cold-start-replay", wrong_workload)
+
+    incomplete_measurements = json.loads(json.dumps(cold))
+    incomplete_measurements["measurements"].pop()
+    rejected("daemon-cold-start-replay", incomplete_measurements)
 
     wrong_journal = json.loads(json.dumps(cold))
     wrong_journal["measurements"][2]["workspace_journal"]["lines"] = 9_999
     rejected("daemon-cold-start-replay", wrong_journal)
+
+    inconsistent_timing = json.loads(json.dumps(cold))
+    inconsistent_timing["measurements"][1]["daemon_boot"]["p50"] = 0
+    rejected("daemon-cold-start-replay", inconsistent_timing)
 
     install = complete_install_handoff_report()
     valid_install = fixture_result("install-first-durable-handoff", install)
