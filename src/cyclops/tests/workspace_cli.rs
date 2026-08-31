@@ -243,6 +243,56 @@ fn cyclops_bounded(home: &Path, args: &[&str], within: std::time::Duration) -> O
     status.success().then_some(text)
 }
 
+/// The one real-daemon case below must run the pair the correctness gate just
+/// built. Cargo supplies this test's `cyclops` path but has no cross-package
+/// edge that would build `cyclopsd`; checking before the test owns a tmux
+/// server or scratch home makes a stale sibling actionable rather than a
+/// leaked failure path.
+fn require_matching_real_pair() {
+    let client = Path::new(env!("CARGO_BIN_EXE_cyclops"));
+    let daemon = client
+        .parent()
+        .expect("Cargo binary has a parent directory")
+        .join("cyclopsd");
+    assert!(
+        daemon.is_file(),
+        "workspace_cli starts a real daemon, but Cargo did not build its sibling:\n\
+         \n    {}\n\
+         \nBuild the matched pair before this test:\n\
+         \n    cargo build -p cyclops -p cyclopsd --bins",
+        daemon.display()
+    );
+    let identity = |binary: &Path, name: &str| {
+        let output = Command::new(binary)
+            .arg("--version")
+            .output()
+            .expect("read binary version");
+        assert!(
+            output.status.success(),
+            "{name} --version failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let line = String::from_utf8(output.stdout).expect("version is UTF-8");
+        let version = line
+            .trim()
+            .strip_prefix(&format!("{name} "))
+            .and_then(cyclops_client::RuntimeIdentity::parse)
+            .expect("version has an exact runtime identity");
+        version
+    };
+    let client_identity = identity(client, "cyclops");
+    let daemon_identity = identity(&daemon, "cyclopsd");
+    assert_eq!(
+        client_identity,
+        daemon_identity,
+        "workspace_cli would select stale sibling {} instead of the client at {}.\n\
+         \nBuild the matched pair before this test:\n\
+         \n    cargo build -p cyclops -p cyclopsd --bins",
+        daemon.display(),
+        client.display()
+    );
+}
+
 impl Drop for DaemonHome {
     fn drop(&mut self) {
         let daemon = self.pid.clone();
@@ -2560,6 +2610,7 @@ fn start_starts_a_daemon_when_none_is_running() {
     if !tmux_available() {
         return;
     }
+    require_matching_real_pair();
     let t = TmuxServer::new("ws-daemon");
     let home = scratch_home("ws-daemon");
     // Armed before anything can spawn: every exit from here on, panic

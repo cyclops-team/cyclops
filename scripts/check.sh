@@ -34,6 +34,10 @@ stage() {
 # executables belong to the retained scheduled and release evidence lanes.
 rust_tests() {
     status=0
+    # workspace_cli's real-daemon start assertion needs its sibling binary.
+    # workspace_boot_sizing's sizing assertion does not require a daemon and
+    # tolerates daemon-start failure.
+    cargo build -p cyclops -p cyclopsd --bins || status=$?
     cargo nextest run --workspace \
         -E 'not (package(cyclopsd) | binary_id(=cyclops-ui::perf) | binary_id(=cyclops-ui::queue_perf) | binary_id(=cyclops-workspace::perf_contract))' \
         --no-fail-fast || status=$?

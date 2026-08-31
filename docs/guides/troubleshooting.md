@@ -423,6 +423,7 @@ Run them with `--no-fail-fast`. Nextest must keep scheduling after a failure
 so one run reports the full set instead of hiding later failures:
 
 ```bash
+cargo build -p cyclops -p cyclopsd --bins
 cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
 cargo test -p cyclopsd --all-targets --no-fail-fast
 ```
