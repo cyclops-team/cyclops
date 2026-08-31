@@ -41,6 +41,7 @@ mod client;
 mod consumer;
 mod copy;
 mod daemon;
+mod data;
 mod hash;
 mod health;
 mod hook;
@@ -164,6 +165,12 @@ enum Cmd {
     /// Check installation and runtime problems without changing anything.
     #[command(display_order = 5)]
     Health,
+    /// Inventory retained durable records first, or export them without changing source files.
+    #[command(hide = true)]
+    Data {
+        #[command(subcommand)]
+        cmd: DataCmd,
+    },
     /// Inventory or remove bounded rebuildable assets. Dry-run is the default.
     #[command(hide = true)]
     Cleanup {
@@ -342,6 +349,18 @@ enum SizingCmd {
         /// Session to release. Defaults to the one this shell is in.
         #[arg(long)]
         session: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DataCmd {
+    /// List workspace and session journal files and their retained size.
+    Inventory,
+    /// Copy raw durable journals into one new private directory.
+    Export {
+        /// A new directory to create for this export. Cyclops refuses an existing path.
+        #[arg(long, value_name = "DIR")]
+        to: std::path::PathBuf,
     },
 }
 
@@ -995,6 +1014,12 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
             }
         },
         Cmd::Health => health::run(cli.json),
+        Cmd::Data {
+            cmd: DataCmd::Inventory,
+        } => data::run_inventory(cli.json),
+        Cmd::Data {
+            cmd: DataCmd::Export { to },
+        } => data::run_export(cli.json, to),
         // Cleanup has no arbitrary path input and does not need the daemon.
         Cmd::Cleanup { assets, apply } => cleanup::run(cli.json, assets, *apply),
         Cmd::Start(args) => workspace::run_start(
@@ -1182,6 +1207,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 | Cmd::Start(_)
                 | Cmd::Setup { .. }
                 | Cmd::Health
+                | Cmd::Data { .. }
                 | Cmd::Cleanup { .. }
                 | Cmd::Theme { .. }
                 | Cmd::Update { .. }
@@ -3713,6 +3739,28 @@ mod tests {
         let parsed = Cli::try_parse_from(["cyclops", "--json", "health"]).unwrap();
         assert!(parsed.json);
         assert!(matches!(parsed.cmd, Some(Cmd::Health)));
+    }
+
+    #[test]
+    fn durable_record_commands_do_not_require_a_daemon_command_family() {
+        let inventory = Cli::try_parse_from(["cyclops", "data", "inventory"])
+            .expect("parse durable record inventory");
+        assert!(matches!(
+            inventory.cmd,
+            Some(Cmd::Data {
+                cmd: DataCmd::Inventory
+            })
+        ));
+
+        let export =
+            Cli::try_parse_from(["cyclops", "data", "export", "--to", "new-record-export"])
+                .expect("parse durable record export");
+        assert!(matches!(
+            export.cmd,
+            Some(Cmd::Data {
+                cmd: DataCmd::Export { to }
+            }) if to == std::path::Path::new("new-record-export")
+        ));
     }
 
     #[test]
