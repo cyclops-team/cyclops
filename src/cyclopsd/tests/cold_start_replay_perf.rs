@@ -114,7 +114,9 @@ fn assert_replayed_message_count(daemon: &cyclopsd::Daemon, expected: u64) {
 
 /// Retained only in the scheduled and release performance lanes. The output
 /// joins `scripts/ci-performance.py` metadata, which identifies the exact
-/// commit, environment, command, and package version for every saved run.
+/// commit, environment, command, and package version for every saved run. A
+/// direct run may skip when tmux is unavailable; the evidence runner rejects
+/// that missing JSON report rather than retaining it as a successful measure.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "scheduled and release daemon cold-boot/replay measurement"]
 async fn daemon_cold_boot_replays_growing_workspace_journals() {
