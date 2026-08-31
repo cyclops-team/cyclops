@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import math
 import os
 import platform
 import subprocess
@@ -142,7 +143,7 @@ def exact_int(value: object, expected: int) -> bool:
 
 
 def nonnegative_number(value: object) -> bool:
-    return type(value) in (int, float) and value >= 0
+    return type(value) in (int, float) and math.isfinite(value) and value >= 0
 
 
 def nonempty_string(value: object) -> bool:
@@ -473,6 +474,17 @@ def selftest() -> None:
     inconsistent_summary = json.loads(json.dumps(install))
     inconsistent_summary["phases"]["setup"]["p95_seconds"] = 1.0
     rejected("install-first-durable-handoff", inconsistent_summary)
+
+    nonfinite_phase = json.loads(json.dumps(install))
+    nonfinite_phase["phases"]["setup"] = {
+        "boundary": "non-finite sample",
+        "samples_seconds": [float("inf")],
+        "sample_count": 1,
+        "p50_seconds": float("inf"),
+        "p95_seconds": float("inf"),
+        "max_seconds": float("inf"),
+    }
+    rejected("install-first-durable-handoff", nonfinite_phase)
 
 
 def main() -> int:
