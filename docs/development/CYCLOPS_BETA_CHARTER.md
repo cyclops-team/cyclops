@@ -1,16 +1,22 @@
 # Cyclops beta charter
 
-**Status:** Approved implementation authority
+**Status:** Approved implementation authority; implementation complete, final
+acceptance audit open
 
 **Approved:** 2026-08-30
 
 **Integration branch:** **beta/messaging-rework**
 
-This charter authorizes the remaining whole-product beta work. It uses the
+This charter authorizes and records the whole-product beta work. It uses the
 [whole-system architecture review](../CYCLOPS_SYSTEM_ARCHITECTURE_REVIEW.md)
 as supporting evidence without repeating it.
 The [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) remains the
 authority for accepted Track A behavior and compatibility.
+
+All approved implementation tracks are integrated into
+**beta/messaging-rework**. The final audit and its focused corrections decide
+whether to recommend a beta-to-`main` pull request; they do not authorize that
+pull request, a tag, or a release. [NEXT.md](NEXT.md) is the current queue.
 
 ## Outcome and user journeys
 
@@ -95,14 +101,17 @@ wire fields, journals, files, or every `WorkspaceId` use.
 | F14 weak test locality | Approved after owning production seams exist | Track I and each owning track |
 | F15 aging vendor evidence | Approved for beta | Track E |
 
-No reviewed finding is rejected. F13 no longer claims Linux has no evidence;
-the missing measurements are cold start, replay scaling, memory, concurrent
-messaging, first handoff, update and rollback, comparable cross-platform
-performance, and idle wake counts.
+No reviewed finding is rejected. F13 no longer describes the measurement suite
+as absent: the CI record covers daemon cold start and replay, concurrent
+mailbox acceptance, first durable handoff, and idle-observation counts. The
+remaining evidence gate is a fresh exact-candidate release run across Linux
+and macOS, with its retained performance comparison. Memory-growth and broad
+cross-platform performance conclusions remain intentionally unclaimed until
+comparable retained data supports them.
 
-## Execution and concurrency
+## Original execution plan (completed)
 
-Track A is accepted. The remaining product order is:
+Track A is accepted. The whole-product implementation sequence was:
 
 1. Direct user correctness: configured tmux focus, internal version identity,
    and representative journeys.
@@ -122,10 +131,8 @@ invariants, or an unsettled interface is serialized. Version identity precedes
 prebuilt or update work; first-handoff measurements precede a prebuilt-install
 decision; production seams precede test-only reorganization.
 
-The primary tracer is **beta/fix/tmux-focus-context**. The independent
-**beta/fix/version-identity** slice may proceed in parallel.
-After those slices merge, **beta/test/first-run-journeys** assigns the
-representative journeys to their cheapest honest evidence lanes before Track C.
+The tracer names below are retained as regression provenance. They are not the
+current execution queue.
 
 ## Approved P1 tracers
 

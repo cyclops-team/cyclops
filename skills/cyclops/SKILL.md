@@ -11,6 +11,10 @@ it to send: it names panes, durably accepts mailbox messages, writes a
 two-sentence preview plus an exact inbox claim when safe, and keeps
 append-only facts you can inspect.
 
+During the beta, the links in this skill intentionally point at
+`beta/messaging-rework`, not `main`. The safety doctrine is complete in this
+file; links are only further reading.
+
 Everything here is `cyclops <subcommand>`. Confirm the exact flags on your
 machine before relying on a command in this page: `cyclops --help` and
 `cyclops <subcommand> --help` are the source of truth, and they can drift
@@ -36,7 +40,7 @@ matches `$TMUX_PANE`, if you are inside tmux. The plain roster prints
 labels, not pane ids. If you are running
 without a name, `cyclops name <label> --self` registers you using the pane
 you are sitting in. Use this form for yourself because it needs no pane id
-lookup. Full detail: [docs/guides/panes.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/panes.md).
+lookup. Full detail: [docs/guides/panes.md](https://github.com/cyclops-team/cyclops/blob/beta/messaging-rework/docs/guides/panes.md).
 
 ## 1. Discover peers and inspect state
 
@@ -106,11 +110,11 @@ pane is genuinely in that state."
 
 Every command above, and every command below, takes `--json` for scripts
 and honors `--plain`/`NO_COLOR`. See
-[docs/guides/panes.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/panes.md) for naming and the roster, and
-[docs/guides/troubleshooting.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/troubleshooting.md) if a pane
+[docs/guides/panes.md](https://github.com/cyclops-team/cyclops/blob/beta/messaging-rework/docs/guides/panes.md) for naming and the roster, and
+[docs/guides/troubleshooting.md](https://github.com/cyclops-team/cyclops/blob/beta/messaging-rework/docs/guides/troubleshooting.md) if a pane
 reads `? unknown` (no manifest matches what is running there: a shell,
 not an agent, or a CLI cyclops has not been taught; see
-[docs/reference/MANIFESTS.md](https://github.com/cyclops-team/cyclops/blob/main/docs/reference/MANIFESTS.md)).
+[docs/reference/MANIFESTS.md](https://github.com/cyclops-team/cyclops/blob/beta/messaging-rework/docs/reference/MANIFESTS.md)).
 
 ## 2. Send a durable message
 
@@ -186,7 +190,7 @@ summary-bearing exact claim above.
 Both transports are one-shot. If the outcome is ambiguous, attention is
 raised. Never resend or requeue blindly. The full workflow and attention
 commands are in
-[docs/guides/send.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/send.md).
+[docs/guides/send.md](https://github.com/cyclops-team/cyclops/blob/beta/messaging-rework/docs/guides/send.md).
 
 Older full-payload session records may use `delivered_verified` and
 `delivered_unverified`. Current mailbox fallback uses `delivered_direct`; none
@@ -286,7 +290,7 @@ answer for whoever took over the pane).
 Message completion is a different fact. A claim proves an authenticated
 recipient fetched the payload, not that work finished. Use a reply or an
 explicit operator verdict when a workflow needs durable completion.
-Full detail: [docs/guides/wait.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/wait.md).
+Full detail: [docs/guides/wait.md](https://github.com/cyclops-team/cyclops/blob/beta/messaging-rework/docs/guides/wait.md).
 
 ## 5. Diagnose mailbox and notification state
 
@@ -336,13 +340,13 @@ pane state and legacy direct delivery, not the mailbox journal.
 
 If pane readiness is confusing, use `cyclops read <agent> --source detection
 --raw`. Human workflow details live in
-[docs/guides/send.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/send.md).
+[docs/guides/send.md](https://github.com/cyclops-team/cyclops/blob/beta/messaging-rework/docs/guides/send.md).
 
 ## 6. Safety rules you must never work around
 
 These are invariants, not preferences. Each one exists because breaking
 it already did something specific and bad
-([docs/development/INVARIANTS.md](https://github.com/cyclops-team/cyclops/blob/main/docs/development/INVARIANTS.md) has the full list
+([docs/development/INVARIANTS.md](https://github.com/cyclops-team/cyclops/blob/beta/messaging-rework/docs/development/INVARIANTS.md) has the full list
 and the proof).
 
 - **Never bypass the notification gate.** Do not `tmux send-keys` (or paste,
@@ -375,14 +379,14 @@ and the proof).
 
 ## Read more
 
-- [docs/guides/send.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/send.md), the mailbox, notification, and recovery workflow.
-- [docs/reference/MANIFESTS.md](https://github.com/cyclops-team/cyclops/blob/main/docs/reference/MANIFESTS.md): teaching cyclops a
+- [docs/guides/send.md](https://github.com/cyclops-team/cyclops/blob/beta/messaging-rework/docs/guides/send.md), the mailbox, notification, and recovery workflow.
+- [docs/reference/MANIFESTS.md](https://github.com/cyclops-team/cyclops/blob/beta/messaging-rework/docs/reference/MANIFESTS.md): teaching cyclops a
   new agent CLI (one TOML file, no code) when a pane reads `? unknown`.
-- [docs/guides/troubleshooting.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/troubleshooting.md): real
+- [docs/guides/troubleshooting.md](https://github.com/cyclops-team/cyclops/blob/beta/messaging-rework/docs/guides/troubleshooting.md): real
   output for every common failure, with the fix.
-- [docs/guides/wait.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/wait.md),
-  [docs/guides/history.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/history.md),
-  [docs/guides/panes.md](https://github.com/cyclops-team/cyclops/blob/main/docs/guides/panes.md): one page per verb.
+- [docs/guides/wait.md](https://github.com/cyclops-team/cyclops/blob/beta/messaging-rework/docs/guides/wait.md),
+  [docs/guides/history.md](https://github.com/cyclops-team/cyclops/blob/beta/messaging-rework/docs/guides/history.md),
+  [docs/guides/panes.md](https://github.com/cyclops-team/cyclops/blob/beta/messaging-rework/docs/guides/panes.md): one page per verb.
 
 Doc links point at the repository on GitHub, so this file works from
 wherever it is installed. `cyclops start --setup-only --wire-hooks` seeds it

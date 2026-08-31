@@ -1,26 +1,29 @@
 # Current beta execution queue
 
-**Status:** Whole-product beta implementation authorized
+**Status:** Final acceptance corrections and evidence
 
 **Integration branch:** **beta/messaging-rework**
 
-The [Cyclops Beta Charter](CYCLOPS_BETA_CHARTER.md) controls remaining scope,
-dependencies, stop conditions, and release gates. The
+The [Cyclops Beta Charter](CYCLOPS_BETA_CHARTER.md) controls beta scope,
+stop conditions, and release gates. The
 [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) continues to
 control accepted Track A behavior.
 
-## Current implementation set
+The approved implementation tracks are integrated into
+**beta/messaging-rework**. This page names only the next acceptance work;
+pull requests and their checks remain the authority for work in flight.
 
-The primary tracer is **beta/fix/tmux-focus-context**. The independent
-**beta/fix/version-identity** slice may run in parallel. Work in flight is
-reported by its pull request and checks rather than copied into this page.
+## Current acceptance work
 
-After those slices merge, **beta/test/first-run-journeys** assigns the
-representative journeys to their cheapest honest evidence lanes before Track C.
+1. Close any focused final-audit correction with its own regression evidence.
+2. Run the release-evidence lane against the exact resulting candidate.
+3. Reconcile release identity before naming or publishing a beta: the Cargo
+   workspace version, remote tag history, and GitHub Release state must agree.
 
-After direct user correctness, continue through Tracks C, D, F, B, E, G, H,
-and I, then run the final whole-beta responsibility and user-journey audit. The
-charter records their responsibilities and dependencies.
+The final audit is not a reason to weaken a contract. Preserve readable
+journals, honest uncertainty, no-silent-loss, `Daemon::deliver_payload`
+compatibility, all three messaging visibility modes, and the prohibition on
+automatic raw-tmux fallback.
 
 ## Working rule
 
@@ -34,6 +37,4 @@ at merge boundaries, not during routine implementation.
 
 Do not merge **beta/messaging-rework** into `main`, create or move a tag, choose
 the final public beta version, or publish a release without explicit operator
-approval. Preserve readable journals, honest uncertainty, no-silent-loss,
-`Daemon::deliver_payload` compatibility, all three messaging visibility modes,
-and the prohibition on automatic raw-tmux fallback.
+approval.

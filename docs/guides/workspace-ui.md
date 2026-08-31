@@ -482,6 +482,12 @@ stays open across the send and reports the receipt where the hint was, then
 leaves `@name ` in the field so a second message to the same agent is one
 keystroke of setup.
 
+If the sender identity changes while the Messages composer sends, Cyclops says
+that nothing was accepted and keeps the draft. It holds message actions until
+it has a fresh authoritative snapshot. Reopen the workspace after updating
+Cyclops, review the unchanged draft, and send it again only after the snapshot
+is current. A retained draft is not a receipt.
+
 Right-click chooses the object under the pointer, even when it is not
 active:
 
