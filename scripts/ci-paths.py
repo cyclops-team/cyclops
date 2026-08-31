@@ -70,8 +70,13 @@ def classify(paths: list[str]) -> dict[str, bool]:
             "website/static/install.sh",
             "src/cyclops/src/skillseed.rs",
             "src/cyclops/src/hookset.rs",
-        ) or path == "docs/guides/install.md"
-        result["tmux"] |= control or under(
+        ) or path in {
+            "docs/guides/install.md",
+            "tests/e2e/parity-check.sh",
+            "tests/e2e/parity_agent.rs",
+            "tests/e2e/lib/lib.sh",
+        }
+        result["tmux"] |= control or path == "src/cyclops/src/workspace.rs" or under(
             path,
             "src/cyclops-tmux/",
             "src/cyclops-workspace/",
@@ -124,11 +129,15 @@ def selftest() -> None:
     assert not classify(["website/src/routes/+page.svelte"])["installer"]
     assert classify(["scripts/install.sh"])["website"]
     assert classify(["scripts/install.sh"])["installer"]
+    assert classify(["tests/e2e/parity-check.sh"])["installer"]
+    assert classify(["tests/e2e/parity_agent.rs"])["installer"]
+    assert classify(["tests/e2e/lib/lib.sh"])["installer"]
     daemon = classify(["src/cyclopsd/src/messaging.rs"])
     assert daemon["rust"] and daemon["tmux"] and daemon["parity"]
     assert not daemon["platform"]
     client = classify(["src/cyclops-client/src/lib.rs"])
     assert client["platform"]
+    assert classify(["src/cyclops/src/workspace.rs"])["tmux"]
     assert classify(["src/cyclops/src/daemon.rs"])["platform"]
     assert classify(["src/cyclops/tests/e2e.rs"])["platform"]
     assert classify(["src/cyclops/tests/workspace_cli.rs"])["platform"]
