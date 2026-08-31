@@ -34,11 +34,16 @@ type RepairAfterInspect = Box<dyn FnOnce(&Path)>;
 type InspectAfterRead = Box<dyn FnOnce(&Path)>;
 
 #[cfg(test)]
+type IsolateRootBeforeRename = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
 thread_local! {
     static FAIL_NEXT_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static REPAIR_AFTER_INSPECT: std::cell::RefCell<Option<RepairAfterInspect>> =
         const { std::cell::RefCell::new(None) };
     static INSPECT_AFTER_READ: std::cell::RefCell<Option<InspectAfterRead>> =
+        const { std::cell::RefCell::new(None) };
+    static ISOLATE_ROOT_BEFORE_RENAME: std::cell::RefCell<Option<IsolateRootBeforeRename>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -74,6 +79,13 @@ pub enum StateError {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum CreateFileOutcome {
     Created,
+    AlreadyExists,
+}
+
+/// Result of creating a state root without opening an existing path.
+#[derive(Debug)]
+pub enum CreateStateRootOutcome {
+    Created(StateRoot),
     AlreadyExists,
 }
 
@@ -245,6 +257,19 @@ pub struct StateRoot {
     directory: File,
     path: PathBuf,
     owner: u32,
+}
+
+/// A state root moved to a private sibling namespace without replacement.
+///
+/// The two paths are for display and recovery records. The held
+/// [`Self::state_root`] and [`Self::inspector`] still name the exact directory
+/// moved by [`StateInspector::isolate_root_to_sibling`].
+#[derive(Debug)]
+pub struct StateRootIsolation {
+    original_path: PathBuf,
+    tombstone_path: PathBuf,
+    state_root: StateRoot,
+    inspector: StateInspector,
 }
 
 /// Cleanup authority for one validated root-level Unix socket.
@@ -810,6 +835,104 @@ impl StateInspector {
         self.bind_for_removal(expected, RemovalKind::EmptyDirectory)
     }
 
+    /// Atomically move this exact state root to one private sibling tombstone.
+    ///
+    /// This is deliberately narrower than a recursive remover. It only moves
+    /// the held, owner-only root after proving that both its path and parent
+    /// still name the inspected descriptors. The destination must be one
+    /// missing sibling name, so an existing file, directory, or symbolic link
+    /// is never replaced.
+    ///
+    /// A complete-removal operation can retain its checkpoint inside the
+    /// returned tombstone, then inspect and remove only its planned entries
+    /// through [`StateRootIsolation::inspector`]. The returned
+    /// [`StateRootIsolation::state_root`] can write the checkpoint that records
+    /// recovery progress. A later state root created at the original path is a
+    /// different namespace and is never covered by this isolation result.
+    pub fn isolate_root_to_sibling(
+        &self,
+        tombstone_name: &OsStr,
+    ) -> Result<StateRootIsolation, StateError> {
+        if self.root.kind != InspectedKind::Directory || self.root.uid != self.owner {
+            return Err(unsafe_path(
+                &self.path,
+                "state root is not one owned directory for isolation",
+            ));
+        }
+        if !self.root.safe() || !private_directory(&self.directory, &self.path, self.owner)? {
+            return Err(unsafe_path(
+                &self.path,
+                "state root is not private enough for isolation",
+            ));
+        }
+        if !self.path_matches_held_root()? {
+            return Err(unsafe_path(
+                &self.path,
+                "state root changed before isolation",
+            ));
+        }
+
+        let (parent, root_name, parent_path) = state_root_parent(&self.path)?;
+        if !state_root_parent_matches_held(&self.path, &parent)? {
+            return Err(unsafe_path(
+                &self.path,
+                "state root parent changed before isolation",
+            ));
+        }
+
+        let tombstone_path = parent_path.join(tombstone_name);
+        let tombstone_name = sibling_tombstone_name(&tombstone_path, tombstone_name)?;
+        if stat_at_optional(&parent, &tombstone_name, &tombstone_path)?.is_some() {
+            return Err(unsafe_path(
+                &tombstone_path,
+                "state root tombstone already exists",
+            ));
+        }
+
+        let before = stat_at(&parent, &root_name, &self.path)?;
+        validate_removal_stat(&before, &self.root, RemovalKind::EmptyDirectory)?;
+        validate_removal_descriptor(&self.directory, &self.root, RemovalKind::EmptyDirectory)?;
+
+        let state_directory = clone_file(&self.directory, &tombstone_path)?;
+        let inspector_directory = clone_file(&self.directory, &tombstone_path)?;
+        isolate_root_before_rename(&tombstone_path);
+        rename_no_replace(&parent, &root_name, &tombstone_name, &tombstone_path)?;
+
+        let mut root = self.root.clone();
+        root.path = tombstone_path.clone();
+        let after = stat_at(&parent, &tombstone_name, &tombstone_path)?;
+        validate_removal_stat(&after, &root, RemovalKind::EmptyDirectory).map_err(|_| {
+            unsafe_path(&tombstone_path, "isolated state root changed during rename")
+        })?;
+        validate_removal_descriptor(&state_directory, &root, RemovalKind::EmptyDirectory).map_err(
+            |_| unsafe_path(&tombstone_path, "isolated state root changed during rename"),
+        )?;
+        validate_removal_descriptor(&inspector_directory, &root, RemovalKind::EmptyDirectory)
+            .map_err(|_| {
+                unsafe_path(&tombstone_path, "isolated state root changed during rename")
+            })?;
+        sync_directory(&parent).map_err(|source| StateError::RemovalDurabilityUnknown {
+            path: tombstone_path.clone(),
+            source,
+        })?;
+
+        Ok(StateRootIsolation {
+            original_path: self.path.clone(),
+            tombstone_path: tombstone_path.clone(),
+            state_root: StateRoot {
+                directory: state_directory,
+                path: tombstone_path.clone(),
+                owner: self.owner,
+            },
+            inspector: StateInspector {
+                directory: inspector_directory,
+                path: tombstone_path,
+                owner: self.owner,
+                root,
+            },
+        })
+    }
+
     /// Atomically move one exact direct child directory to a private name.
     ///
     /// The move never replaces an existing entry. Callers can keep an
@@ -864,35 +987,7 @@ impl StateInspector {
             ));
         }
 
-        // SAFETY: both names are bounded direct children of the held parent.
-        #[cfg(target_os = "macos")]
-        let result = unsafe {
-            libc::renameatx_np(
-                self.directory.as_raw_fd(),
-                old_name.as_ptr(),
-                self.directory.as_raw_fd(),
-                new_name.as_ptr(),
-                libc::RENAME_EXCL,
-            )
-        };
-        // SAFETY: both names are bounded direct children of the held parent.
-        #[cfg(target_os = "linux")]
-        let result = unsafe {
-            libc::renameat2(
-                self.directory.as_raw_fd(),
-                old_name.as_ptr(),
-                self.directory.as_raw_fd(),
-                new_name.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        };
-        if result != 0 {
-            return Err(path_error(
-                &isolated_path,
-                std::io::Error::last_os_error(),
-                "could not isolate state directory without replacement",
-            ));
-        }
+        rename_no_replace(&self.directory, &old_name, &new_name, &isolated_path)?;
         let after = stat_at(&self.directory, &new_name, &isolated_path)?;
         validate_removal_stat(&after, expected, RemovalKind::EmptyDirectory).map_err(|_| {
             unsafe_path(
@@ -994,6 +1089,33 @@ impl StateInspector {
             expected: expected.clone(),
             kind,
         })
+    }
+}
+
+impl StateRootIsolation {
+    /// Original state-root path at the start of the atomic isolation.
+    pub fn original_path(&self) -> &Path {
+        &self.original_path
+    }
+
+    /// Sibling tombstone path at the start of the atomic isolation.
+    pub fn tombstone_path(&self) -> &Path {
+        &self.tombstone_path
+    }
+
+    /// Held state-root authority for recovery checkpoints in the tombstone.
+    pub fn state_root(&self) -> &StateRoot {
+        &self.state_root
+    }
+
+    /// Held authority for the exact directory that was isolated.
+    pub fn inspector(&self) -> &StateInspector {
+        &self.inspector
+    }
+
+    /// Consume the result into the held state root and inspector.
+    pub fn into_parts(self) -> (StateRoot, StateInspector) {
+        (self.state_root, self.inspector)
     }
 }
 
@@ -1207,6 +1329,77 @@ enum RemovalKind {
 }
 
 impl StateRoot {
+    /// Create one missing state root without opening or repairing an existing
+    /// path.
+    ///
+    /// This is the narrow companion to state-home isolation: a complete
+    /// removal can create a fresh guarded replacement only if no daemon or
+    /// other process has already recreated the root. An occupied final name of
+    /// any type returns [`CreateStateRootOutcome::AlreadyExists`] untouched.
+    pub fn create_new(path: &Path) -> Result<CreateStateRootOutcome, StateError> {
+        let owner = effective_uid();
+        let (parent, name, _) = state_root_parent(path)?;
+        if !state_root_parent_matches_held(path, &parent)? {
+            return Err(unsafe_path(
+                path,
+                "state root parent changed before exclusive creation",
+            ));
+        }
+
+        // SAFETY: parent and name are validated; mkdirat creates only this
+        // final child and never follows it.
+        let created = unsafe {
+            libc::mkdirat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                DIRECTORY_MODE as libc::mode_t,
+            )
+        };
+        if created != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                return Ok(CreateStateRootOutcome::AlreadyExists);
+            }
+            return Err(path_error(path, error, "could not create new state root"));
+        }
+
+        let result = (|| {
+            let root = open_directory_at(&parent, &name).map_err(|error| {
+                path_error(path, error, "new state root changed before validation")
+            })?;
+            validate_directory(&root, path, owner)?;
+            repair_descriptor_permissions(&root, path, DIRECTORY_MODE)?;
+            validate_directory(&root, path, owner)?;
+
+            let descriptor = root.metadata().map_err(|source| io_error(path, source))?;
+            let named = stat_at(&parent, &name, path)?;
+            if !metadata_matches_stat(&descriptor, &named) {
+                return Err(unsafe_path(
+                    path,
+                    "new state root changed before validation",
+                ));
+            }
+            root.sync_all().map_err(|source| io_error(path, source))?;
+            sync_directory(&parent).map_err(|source| StateError::CreationDurabilityUnknown {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            Ok(root)
+        })();
+        match result {
+            Ok(root) => Ok(CreateStateRootOutcome::Created(Self {
+                directory: root,
+                path: path.to_path_buf(),
+                owner,
+            })),
+            Err(error @ StateError::CreationDurabilityUnknown { .. }) => Err(error),
+            Err(error) => Err(StateError::CreationMayBeVisible {
+                path: path.to_path_buf(),
+                cause: error.to_string(),
+            }),
+        }
+    }
+
     /// Open or create the state root without following any path component.
     pub fn open_or_create(path: &Path) -> Result<Self, StateError> {
         Self::open_root(path, true)?.ok_or_else(|| StateError::Io {
@@ -2313,6 +2506,126 @@ fn sync_directory(directory: &File) -> std::io::Result<()> {
     }
 
     directory.sync_all()
+}
+
+/// Open the direct parent of one state-root path without following any
+/// component. The returned name is the root's final component beneath that
+/// held parent.
+fn state_root_parent(path: &Path) -> Result<(File, CString, PathBuf), StateError> {
+    let parts = inspection_root_parts(path)?;
+    let mut parent = open_start(path)?;
+    for part in &parts[..parts.len() - 1] {
+        let name = c_name(path, part)?;
+        parent = open_directory_at(&parent, &name).map_err(|error| {
+            path_error(
+                path,
+                error,
+                "state root contains a linked or non-directory component",
+            )
+        })?;
+    }
+    validate_root_parent(&parent, path)?;
+    let root_name = c_name(path, parts.last().expect("state root has one component"))?;
+    let parent_path = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    Ok((parent, root_name, parent_path))
+}
+
+/// Verify that a fresh no-follow traversal still reaches the held root parent.
+fn state_root_parent_matches_held(path: &Path, held_parent: &File) -> Result<bool, StateError> {
+    let (fresh_parent, _, _) = state_root_parent(path)?;
+    let held = held_parent
+        .metadata()
+        .map_err(|source| io_error(path, source))?;
+    let fresh = fresh_parent
+        .metadata()
+        .map_err(|source| io_error(path, source))?;
+    Ok(held.file_type().is_dir()
+        && fresh.file_type().is_dir()
+        && held.dev() == fresh.dev()
+        && held.ino() == fresh.ino())
+}
+
+/// Validate one bounded path component used as a state-root tombstone name.
+fn sibling_tombstone_name(path: &Path, name: &OsStr) -> Result<CString, StateError> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty()
+        || bytes == b"."
+        || bytes == b".."
+        || bytes.contains(&b'/')
+        || bytes.len() > 240
+    {
+        return Err(unsafe_path(
+            path,
+            "state root tombstone must be one bounded sibling name",
+        ));
+    }
+    c_name(path, name)
+}
+
+/// Rename one exact entry within a held parent without replacing a destination.
+fn rename_no_replace(
+    parent: &File,
+    source: &CString,
+    destination: &CString,
+    destination_path: &Path,
+) -> Result<(), StateError> {
+    // SAFETY: both names are validated direct children of the held parent.
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        libc::renameatx_np(
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    // SAFETY: both names are validated direct children of the held parent.
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::renameat2(
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        return Err(unsafe_path(
+            destination_path,
+            "isolation target already exists",
+        ));
+    }
+    Err(path_error(
+        destination_path,
+        error,
+        "could not isolate state directory without replacement",
+    ))
+}
+
+#[cfg(test)]
+fn isolate_root_before_rename(path: &Path) {
+    ISOLATE_ROOT_BEFORE_RENAME.with(|slot| {
+        if let Some(action) = slot.borrow_mut().take() {
+            action(path);
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn isolate_root_before_rename(_: &Path) {}
+
+#[cfg(test)]
+fn inject_isolate_root_before_rename(action: impl FnOnce(&Path) + 'static) {
+    ISOLATE_ROOT_BEFORE_RENAME.with(|slot| *slot.borrow_mut() = Some(Box::new(action)));
 }
 
 #[cfg(test)]
@@ -3989,6 +4302,286 @@ mod tests {
         fs::rename(&root_path, base.join("old-state")).unwrap();
         fs::create_dir(&root_path).unwrap();
         assert!(!inspector.path_matches_held_root().unwrap());
+    }
+
+    #[test]
+    fn root_isolation_moves_one_private_root_and_returns_held_tombstone_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let root = root_in(&temp);
+        let root_path = root.path().to_path_buf();
+        root.open_append(Path::new("operations/pending.json"))
+            .unwrap()
+            .append_bounded(b"pending\n", 1024, 512)
+            .unwrap();
+        drop(root);
+
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let isolation = inspector
+            .isolate_root_to_sibling(OsStr::new(".state-removing"))
+            .unwrap();
+        let tombstone = base.join(".state-removing");
+
+        assert_eq!(isolation.original_path(), root_path);
+        assert_eq!(isolation.tombstone_path(), tombstone);
+        assert!(!root_path.exists(), "the original state root was moved");
+        assert_eq!(
+            fs::read(tombstone.join("operations/pending.json")).unwrap(),
+            b"pending\n"
+        );
+        isolation
+            .state_root()
+            .replace_file(Path::new("operations/complete.json"), b"complete\n")
+            .unwrap();
+        assert_eq!(
+            fs::read(tombstone.join("operations/complete.json")).unwrap(),
+            b"complete\n"
+        );
+        assert!(isolation.state_root().path_matches_held_root().unwrap());
+        assert!(isolation.inspector().path_matches_held_root().unwrap());
+        assert!(
+            !inspector.path_matches_held_root().unwrap(),
+            "the original inspector cannot authorize the moved namespace"
+        );
+    }
+
+    #[test]
+    fn root_isolation_refuses_a_replaced_root_and_leaves_the_new_root_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let root = root_in(&temp);
+        let root_path = root.path().to_path_buf();
+        drop(root);
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+
+        let displaced = base.join("displaced-state");
+        fs::rename(&root_path, &displaced).unwrap();
+        let replacement = StateRoot::open_or_create(&root_path).unwrap();
+        replacement
+            .open_append(Path::new("new-state"))
+            .unwrap()
+            .append_bounded(b"keep\n", 1024, 512)
+            .unwrap();
+        drop(replacement);
+
+        let error = inspector
+            .isolate_root_to_sibling(OsStr::new(".state-removing"))
+            .unwrap_err();
+        assert!(matches!(error, StateError::UnsafePath { .. }));
+        assert_eq!(fs::read(root_path.join("new-state")).unwrap(), b"keep\n");
+        assert!(
+            displaced.exists(),
+            "the original held root was not renamed again"
+        );
+        assert!(!base.join(".state-removing").exists());
+    }
+
+    #[test]
+    fn root_isolation_never_reaches_a_new_root_created_after_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let root = root_in(&temp);
+        let root_path = root.path().to_path_buf();
+        root.open_append(Path::new("old-state"))
+            .unwrap()
+            .append_bounded(b"old\n", 1024, 512)
+            .unwrap();
+        drop(root);
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let isolation = inspector
+            .isolate_root_to_sibling(OsStr::new(".state-removing"))
+            .unwrap();
+
+        let replacement = StateRoot::open_or_create(&root_path).unwrap();
+        replacement
+            .open_append(Path::new("new-state"))
+            .unwrap()
+            .append_bounded(b"new\n", 1024, 512)
+            .unwrap();
+        drop(replacement);
+
+        assert_eq!(
+            fs::read(base.join(".state-removing/old-state")).unwrap(),
+            b"old\n"
+        );
+        assert_eq!(fs::read(root_path.join("new-state")).unwrap(), b"new\n");
+        assert!(isolation.inspector().path_matches_held_root().unwrap());
+    }
+
+    #[test]
+    fn root_isolation_never_replaces_an_existing_tombstone_or_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let root = root_in(&temp);
+        let root_path = root.path().to_path_buf();
+        drop(root);
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let tombstone = base.join(".state-removing");
+        let external = base.join("external");
+        fs::write(&tombstone, b"occupied\n").unwrap();
+        let occupied = inspector
+            .isolate_root_to_sibling(OsStr::new(".state-removing"))
+            .unwrap_err();
+        assert!(matches!(occupied, StateError::UnsafePath { .. }));
+        assert_eq!(fs::read(&tombstone).unwrap(), b"occupied\n");
+
+        fs::remove_file(&tombstone).unwrap();
+        fs::write(&external, b"outside\n").unwrap();
+        symlink(&external, &tombstone).unwrap();
+
+        let error = inspector
+            .isolate_root_to_sibling(OsStr::new(".state-removing"))
+            .unwrap_err();
+        assert!(matches!(error, StateError::UnsafePath { .. }));
+        assert!(root_path.exists(), "the source root remains in place");
+        assert!(tombstone.is_symlink(), "the existing target is untouched");
+        assert_eq!(fs::read(&external).unwrap(), b"outside\n");
+    }
+
+    #[test]
+    fn root_isolation_refuses_a_tombstone_created_at_the_rename_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let root = root_in(&temp);
+        let root_path = root.path().to_path_buf();
+        drop(root);
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let tombstone = base.join(".state-removing");
+        inject_isolate_root_before_rename(move |path| {
+            assert_eq!(path, tombstone);
+            fs::write(path, b"raced\n").unwrap();
+        });
+
+        let error = inspector
+            .isolate_root_to_sibling(OsStr::new(".state-removing"))
+            .unwrap_err();
+        assert!(matches!(error, StateError::UnsafePath { .. }));
+        assert!(root_path.exists(), "the source root remains in place");
+        assert_eq!(fs::read(base.join(".state-removing")).unwrap(), b"raced\n");
+    }
+
+    #[test]
+    fn root_isolation_refuses_a_non_private_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+        fs::create_dir(&root_path).unwrap();
+        set_mode(&root_path, 0o755);
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+
+        let error = inspector
+            .isolate_root_to_sibling(OsStr::new(".state-removing"))
+            .unwrap_err();
+        assert!(matches!(error, StateError::UnsafePath { .. }));
+        assert!(root_path.exists());
+    }
+
+    #[test]
+    fn root_isolation_reports_durability_uncertainty_after_a_visible_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let root = root_in(&temp);
+        let root_path = root.path().to_path_buf();
+        drop(root);
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let tombstone = base.join(".state-removing");
+        inject_next_directory_sync_failure();
+
+        let error = inspector
+            .isolate_root_to_sibling(OsStr::new(".state-removing"))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StateError::RemovalDurabilityUnknown { path, .. } if path == tombstone
+        ));
+        assert!(
+            !root_path.exists(),
+            "the rename was visible before sync failed"
+        );
+        assert!(
+            tombstone.exists(),
+            "the caller can inspect the named tombstone"
+        );
+    }
+
+    #[test]
+    fn exclusive_root_creation_creates_only_a_missing_private_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+
+        let root = match StateRoot::create_new(&root_path).unwrap() {
+            CreateStateRootOutcome::Created(root) => root,
+            CreateStateRootOutcome::AlreadyExists => panic!("missing root was not created"),
+        };
+        assert_eq!(mode(&root_path), 0o700);
+        root.open_append(Path::new("guard"))
+            .unwrap()
+            .append_bounded(b"held\n", 1024, 512)
+            .unwrap();
+        drop(root);
+
+        assert!(matches!(
+            StateRoot::create_new(&root_path).unwrap(),
+            CreateStateRootOutcome::AlreadyExists
+        ));
+        assert_eq!(fs::read(root_path.join("guard")).unwrap(), b"held\n");
+    }
+
+    #[test]
+    fn exclusive_root_creation_leaves_existing_files_and_links_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let root_path = base.join("state");
+        fs::write(&root_path, b"operator file\n").unwrap();
+        set_mode(&root_path, 0o644);
+
+        assert!(matches!(
+            StateRoot::create_new(&root_path).unwrap(),
+            CreateStateRootOutcome::AlreadyExists
+        ));
+        assert_eq!(fs::read(&root_path).unwrap(), b"operator file\n");
+        assert_eq!(mode(&root_path), 0o644);
+
+        fs::remove_file(&root_path).unwrap();
+        let external = base.join("external");
+        fs::create_dir(&external).unwrap();
+        symlink(&external, &root_path).unwrap();
+        assert!(matches!(
+            StateRoot::create_new(&root_path).unwrap(),
+            CreateStateRootOutcome::AlreadyExists
+        ));
+        assert!(root_path.is_symlink());
+        assert!(external.is_dir());
+    }
+
+    #[test]
+    fn exclusive_root_creation_reports_visible_creation_when_parent_sync_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+        inject_next_directory_sync_failure();
+
+        let error = StateRoot::create_new(&root_path).unwrap_err();
+        assert!(matches!(
+            error,
+            StateError::CreationDurabilityUnknown { path, .. } if path == root_path
+        ));
+        assert!(
+            root_path.exists(),
+            "the new root was visible before sync failed"
+        );
     }
 
     #[test]
