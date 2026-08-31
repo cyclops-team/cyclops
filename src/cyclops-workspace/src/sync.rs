@@ -1,6 +1,8 @@
 //! Reconcile workspace model from tmux.
 
-use cyclops_tmux::{ControlClient, HydrationBundle, SnapshotWindow, TmuxError, WorkspaceSnapshot};
+use cyclops_tmux::{
+    ControlClient, HydrationBundle, SnapshotSession, SnapshotWindow, TmuxError, WorkspaceSnapshot,
+};
 
 use crate::layout::{parse_layout, resolve_layout};
 use crate::model::{
@@ -27,6 +29,47 @@ pub async fn fetch_workspace_model(
     active_session: &str,
 ) -> Result<WorkspaceModel, TmuxError> {
     let snapshot = client.workspace_snapshot().await?;
+    workspace_model_from_snapshot(&snapshot, SessionSelector::Name(active_session))
+}
+
+/// [`fetch_workspace_model`] addressed by stable tmux session identity.
+///
+/// Use this when an adapter has already confirmed an exact session id. A
+/// session rename between the initiating action and this snapshot then changes
+/// only the name installed into the model; it cannot redirect or strand the
+/// reconciliation.
+pub async fn fetch_workspace_model_by_id(
+    client: &ControlClient,
+    active_session_id: &str,
+) -> Result<WorkspaceModel, TmuxError> {
+    let snapshot = client.workspace_snapshot().await?;
+    workspace_model_from_snapshot(&snapshot, SessionSelector::Id(active_session_id))
+}
+
+#[derive(Clone, Copy)]
+enum SessionSelector<'a> {
+    Name(&'a str),
+    Id(&'a str),
+}
+
+fn workspace_model_from_snapshot(
+    snapshot: &WorkspaceSnapshot,
+    selector: SessionSelector<'_>,
+) -> Result<WorkspaceModel, TmuxError> {
+    let active_workspace = snapshot
+        .sessions
+        .iter()
+        .position(|session| match selector {
+            SessionSelector::Name(name) => session.name == name,
+            SessionSelector::Id(id) => session.id == id,
+        })
+        .ok_or_else(|| {
+            let missing = match selector {
+                SessionSelector::Name(name) => format!("name {name}"),
+                SessionSelector::Id(id) => format!("id {id}"),
+            };
+            TmuxError::Protocol(format!("session not present in snapshot: {missing}"))
+        })?;
     let workspaces: Vec<WorkspaceRow> = snapshot
         .sessions
         .iter()
@@ -37,11 +80,7 @@ pub async fn fetch_workspace_model(
             window_ids: s.windows.iter().map(|w| w.id.clone()).collect(),
         })
         .collect();
-    let active_workspace = workspaces
-        .iter()
-        .position(|w| w.name == active_session)
-        .unwrap_or(0);
-    let session = session_model_from_snapshot(&snapshot, active_session)?;
+    let session = session_model_from_snapshot(&snapshot.sessions[active_workspace])?;
     Ok(WorkspaceModel {
         workspaces,
         active_workspace,
@@ -51,20 +90,10 @@ pub async fn fetch_workspace_model(
     })
 }
 
-/// Pick the named session's tabs out of an already-fetched snapshot. Kept
+/// Pick one resolved session's tabs out of an already-fetched snapshot. Kept
 /// separate from [`fetch_workspace_model`] so that function pays for exactly
 /// one snapshot, not two.
-fn session_model_from_snapshot(
-    snapshot: &WorkspaceSnapshot,
-    session_name: &str,
-) -> Result<SessionModel, TmuxError> {
-    let session = snapshot
-        .sessions
-        .iter()
-        .find(|s| s.name == session_name)
-        .ok_or_else(|| {
-            TmuxError::Protocol(format!("session not present in snapshot: {session_name}"))
-        })?;
+fn session_model_from_snapshot(session: &SnapshotSession) -> Result<SessionModel, TmuxError> {
     let mut tabs = Vec::with_capacity(session.windows.len());
     let mut active_tab = 0;
     for (i, window) in session.windows.iter().enumerate() {
@@ -74,7 +103,7 @@ fn session_model_from_snapshot(
         tabs.push(build_tab(window)?);
     }
     Ok(SessionModel {
-        session: session_name.to_string(),
+        session: session.name.clone(),
         tabs,
         active_tab,
     })

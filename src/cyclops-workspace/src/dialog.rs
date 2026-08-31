@@ -33,8 +33,8 @@ pub enum Dialog {
     ConfirmCloseTab { window_id: String },
     /// Rename one workspace (tmux session).
     RenameWorkspace { session: String, buffer: String },
-    /// Confirm closing a workspace that may host agents.
-    ConfirmCloseWorkspace { session: String },
+    /// Confirm closing one stable workspace identity.
+    ConfirmCloseWorkspace { session_id: String },
     /// Address a message from inside the workspace: `@reviewer ship it`.
     ///
     /// The recipient is part of the text rather than a separate field so

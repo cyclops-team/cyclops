@@ -1493,7 +1493,7 @@ mod tests {
         );
         let items = menu_items(
             &MenuState::WorkspaceMenu {
-                session: "cyclops".into(),
+                session_id: "$1".into(),
                 at: (0, 0),
             },
             MenuChecks::default(),
@@ -1889,7 +1889,7 @@ mod tests {
                 buffer: "main".into(),
             },
             Dialog::ConfirmCloseWorkspace {
-                session: "main".into(),
+                session_id: "$1".into(),
             },
             composer("@reviewer one\ntwo\nthree"),
             keybinds_card(40, 5),

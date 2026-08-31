@@ -41,6 +41,7 @@ use crate::focus::{Decision as FocusDecision, Direction as FocusDirection, Effec
 use crate::naming;
 use crate::persist::SidebarTab;
 use crate::split::{Decision as SplitDecision, Effect as SplitEffect, Placement as SplitPlacement};
+use crate::workspace_close::{Decision as CloseDecision, Effect as CloseEffect};
 
 /// What the caller must do after one action executed. Every field defaults
 /// to false ("nothing beyond what already happened"); an arm sets exactly
@@ -311,11 +312,11 @@ pub(super) async fn execute(
         Action::RenameWorkspace { session, name } => {
             rename_workspace(app, client, session, name).await
         }
-        Action::RequestCloseWorkspace { session } => {
-            app.open_dialog(Dialog::ConfirmCloseWorkspace { session });
+        Action::RequestCloseWorkspace { session_id } => {
+            app.open_dialog(Dialog::ConfirmCloseWorkspace { session_id });
             Ok(Outcome::default())
         }
-        Action::CloseWorkspace { session } => close_workspace(app, client, session).await,
+        Action::CloseWorkspace(intent) => execute_close_workspace(app, client, intent).await,
         Action::ReorderWorkspace {
             session_id,
             insertion,
@@ -1291,47 +1292,95 @@ async fn rename_workspace(
     })
 }
 
-/// Close one workspace. Always reached through [`Action::RequestCloseWorkspace`]
-/// first, so the dialog is unconditionally the one being answered here.
-async fn close_workspace(
+/// Decide and perform one confirmed workspace close. The adapter owns any
+/// fallback transition, and only a later host snapshot may remove the session
+/// from the application model.
+async fn execute_close_workspace(
     app: &mut App,
     client: &ControlClient,
-    session: String,
+    intent: crate::workspace_close::Intent,
 ) -> Result<Outcome, TmuxError> {
+    // Confirmation is one consumed gesture. Refusal and uncertainty are shown
+    // on the workspace notice line rather than hidden behind the same modal.
     app.dialog = None;
     app.hover = None;
-    let fallback = if session == app.model.session.session {
-        app.model
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.name != session)
-            .map(|workspace| workspace.name.clone())
-    } else {
-        None
+    let decision =
+        crate::workspace_close::decide(intent, &app.model, app.link_state, !app.needs_reconcile);
+    let effect = match decision {
+        CloseDecision::Refresh => {
+            app.notice.show(
+                crate::copy::WORKSPACE_CLOSE_ROUTE_STALE,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::reconcile());
+        }
+        CloseDecision::Refused(crate::workspace_close::Refusal::Reconnecting) => {
+            app.notice.show(
+                crate::copy::WORKSPACE_CLOSE_CONTROL_RECONNECTING,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::default());
+        }
+        CloseDecision::Refused(crate::workspace_close::Refusal::ServerGone) => {
+            app.notice.show(
+                crate::copy::WORKSPACE_CLOSE_CONTROL_DISCONNECTED,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::default());
+        }
+        CloseDecision::Refused(crate::workspace_close::Refusal::Refreshing) => {
+            app.notice.show(
+                crate::copy::WORKSPACE_CLOSE_STATE_REFRESHING,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::reconcile());
+        }
+        CloseDecision::Run(effect) => effect,
     };
-    let closed_session_id = app
-        .model
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.name == session)
-        .map(|workspace| workspace.session_id.clone());
-    if let Some(fallback) = &fallback {
-        client.switch_to_session(fallback).await?;
+
+    let attempt = perform_close_workspace(client, &effect).await;
+    if let Some(session_id) = attempt.confirmed_current_session_id.as_deref() {
+        // Preserve the adapter's stable fact all the way through the fresh
+        // snapshot. Converting it back to the model's cached name here would
+        // reintroduce a rename race before reconciliation begins.
+        app.reconcile_session_id = Some(session_id.to_string());
     }
-    client.kill_session(&session).await?;
-    let before_order = app.prefs.workspace_order.len();
-    app.prefs.workspace_order.retain(|name| name != &session);
-    let mut persist = app.prefs.workspace_order.len() != before_order;
-    if let Some(session_id) = closed_session_id {
-        let before_tracked = app.prefs.folder_tracked.len();
-        app.prefs.folder_tracked.retain(|id| id != &session_id);
-        persist |= app.prefs.folder_tracked.len() != before_tracked;
+    if let Err(error) = attempt.close_result {
+        super::log_err(&app.home, &error.to_string());
+        app.notice.show(
+            crate::copy::workspace_close_unconfirmed(&effect.target.name, &error),
+            tokio::time::Instant::now(),
+        );
+        return Ok(Outcome::reconcile());
     }
+
+    // `workspace_order` is still keyed by mutable names. The confirmed id may
+    // have been renamed while another session reused its old name, so deleting
+    // `target.name` here could erase the surviving session's preference. A
+    // missing name is harmless and ignored during reconciliation; only the
+    // identity-keyed tracking entry is safe to retire at this point.
+    let before_tracked = app.prefs.folder_tracked.len();
+    app.prefs
+        .folder_tracked
+        .retain(|id| id != &effect.target.session_id);
+    let persist = app.prefs.folder_tracked.len() != before_tracked;
     Ok(Outcome {
         reconcile: true,
         persist,
         ..Outcome::default()
     })
+}
+
+async fn perform_close_workspace(
+    client: &ControlClient,
+    effect: &CloseEffect,
+) -> cyclops_tmux::CloseSessionAttempt {
+    client
+        .close_session_at(
+            &effect.target.session_id,
+            effect.fallback_session_id.as_deref(),
+        )
+        .await
 }
 
 /// Reorder one sidebar workspace row. Purely local presentation order — tmux
@@ -1808,6 +1857,7 @@ mod tests {
             declared_client_size: None,
             sizing: crate::app::WindowSizing::default(),
             needs_reconcile: false,
+            reconcile_session_id: None,
             needs_hydrate: false,
             paste_seq: 0,
             home,
@@ -3111,6 +3161,300 @@ mod tests {
 
         client.shutdown().await;
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[tokio::test]
+    async fn confirmed_workspace_close_changes_tmux_but_waits_for_authoritative_model_settlement() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-close-workspace");
+        server.run_ok(&["new-session", "-d", "-s", "target", "/bin/sh"]);
+        server.run_ok(&["new-session", "-d", "-s", "fallback", "/bin/sh"]);
+        let client = rig_client(&server, "target").await;
+        let model = crate::sync::fetch_workspace_model(&client, "target")
+            .await
+            .expect("initial authoritative model");
+        let target_id = model
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == "target")
+            .expect("target row")
+            .session_id
+            .clone();
+        let fallback_id = model
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == "fallback")
+            .expect("fallback row")
+            .session_id
+            .clone();
+        let home = scratch_home("exec-close-workspace-home");
+        let mut app = test_app(model, home.clone());
+        app.prefs.workspace_order = vec!["target".into(), "fallback".into()];
+        app.prefs.folder_tracked = vec![target_id.clone(), fallback_id.clone()];
+        server.run_ok(&["rename-session", "-t", &fallback_id, "renamed-fallback"]);
+
+        let outcome = execute(
+            &mut app,
+            &client,
+            Action::CloseWorkspace(crate::workspace_close::Intent {
+                session_id: target_id.clone(),
+            }),
+        )
+        .await
+        .expect("confirmed close executes");
+
+        assert!(outcome.reconcile);
+        assert!(outcome.persist);
+        assert!(
+            app.model
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.session_id == target_id),
+            "only reconciliation may remove the closed workspace locally"
+        );
+        assert_eq!(
+            app.model.session.session, "target",
+            "no cached name is installed before the authoritative snapshot"
+        );
+        assert_eq!(
+            app.reconcile_session_id.as_deref(),
+            Some(fallback_id.as_str()),
+            "the confirmed fallback id must survive until reconciliation"
+        );
+        assert_eq!(
+            app.prefs.workspace_order,
+            vec!["target".to_string(), "fallback".to_string()],
+            "a name-keyed preference cannot be retired from an id-only confirmation"
+        );
+        assert_eq!(app.prefs.folder_tracked, vec![fallback_id.clone()]);
+        let sessions = server.run(&["list-sessions", "-F", "#{session_id}"]);
+        let sessions = String::from_utf8_lossy(&sessions.stdout);
+        assert!(!sessions.lines().any(|id| id == target_id));
+        assert!(sessions.lines().any(|id| id == fallback_id));
+        let attached = server.run(&["list-clients", "-F", "#{client_session}"]);
+        assert_eq!(
+            String::from_utf8_lossy(&attached.stdout).trim(),
+            "renamed-fallback"
+        );
+
+        app.needs_reconcile = false;
+        crate::app::reconcile(&mut app, &client)
+            .await
+            .expect("authoritative close settlement");
+        assert_eq!(app.model.session.session, "renamed-fallback");
+        assert_eq!(app.reconcile_session_id, None);
+        assert!(
+            !app.model
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.session_id == target_id),
+            "the authoritative snapshot removes the closed identity"
+        );
+        assert_eq!(
+            app.model.workspaces[app.model.active_workspace].session_id,
+            fallback_id
+        );
+
+        let second = execute(
+            &mut app,
+            &client,
+            Action::CloseWorkspace(crate::workspace_close::Intent {
+                session_id: target_id.clone(),
+            }),
+        )
+        .await
+        .expect("a stale second confirmation is refused");
+        assert!(second.reconcile);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::WORKSPACE_CLOSE_ROUTE_STALE)
+        );
+        let sessions = server.run(&["list-sessions", "-F", "#{session_id}"]);
+        assert!(
+            String::from_utf8_lossy(&sessions.stdout)
+                .lines()
+                .any(|id| id == fallback_id),
+            "the stale second action must not close the remaining workspace"
+        );
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn failed_workspace_close_is_visible_reconciled_and_keeps_preferences() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-close-workspace-failure");
+        server.run_ok(&["new-session", "-d", "-s", "target", "/bin/sh"]);
+        server.run_ok(&["new-session", "-d", "-s", "fallback", "/bin/sh"]);
+        // Keep the control connection on the surviving session while the
+        // application snapshot still represents target as active. This is
+        // the state after another client wins the close race, and lets the
+        // adapter confirm its fallback command before its target command
+        // reports the stale identity.
+        let client = rig_client(&server, "fallback").await;
+        let model = crate::sync::fetch_workspace_model(&client, "target")
+            .await
+            .expect("initial authoritative model");
+        let target_id = model
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == "target")
+            .expect("target row")
+            .session_id
+            .clone();
+        let fallback_id = model
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == "fallback")
+            .expect("fallback row")
+            .session_id
+            .clone();
+        let home = scratch_home("exec-close-workspace-failure-home");
+        let mut app = test_app(model, home.clone());
+        app.prefs.workspace_order = vec!["target".into(), "fallback".into()];
+        app.prefs.folder_tracked = vec![target_id.clone(), fallback_id.clone()];
+        app.dialog = Some(Dialog::ConfirmCloseWorkspace {
+            session_id: target_id.clone(),
+        });
+        // Simulate the target disappearing after confirmation. The adapter's
+        // fallback switch still lands, then its close command reports that
+        // the target is already gone.
+        server.run_ok(&["kill-session", "-t", &target_id]);
+
+        let outcome = execute(
+            &mut app,
+            &client,
+            Action::CloseWorkspace(crate::workspace_close::Intent {
+                session_id: target_id.clone(),
+            }),
+        )
+        .await
+        .expect("partial failure is a visible settled result");
+
+        assert!(outcome.reconcile, "host state may have changed");
+        assert!(!outcome.persist, "an unconfirmed close removes no prefs");
+        assert!(app.dialog.is_none(), "the confirmation was consumed");
+        assert_eq!(
+            app.prefs.workspace_order,
+            vec!["target".to_string(), "fallback".to_string()]
+        );
+        assert_eq!(
+            app.prefs.folder_tracked,
+            vec![target_id.clone(), fallback_id.clone()]
+        );
+        let notice = app.notice.text().expect("failure is visible");
+        assert!(notice.contains("close not confirmed for workspace target"));
+        assert!(notice.contains("refreshing workspace state"));
+        assert_eq!(
+            app.model.session.session, "target",
+            "partial failure leaves the cached presentation model untouched"
+        );
+        assert_eq!(
+            app.reconcile_session_id.as_deref(),
+            Some(fallback_id.as_str()),
+            "a landed switch still supplies the exact repair target"
+        );
+        let attached = server.run(&["list-clients", "-F", "#{client_session}"]);
+        assert_eq!(String::from_utf8_lossy(&attached.stdout).trim(), "fallback");
+        let sessions = server.run(&["list-sessions", "-F", "#{session_id}"]);
+        assert!(
+            !String::from_utf8_lossy(&sessions.stdout)
+                .lines()
+                .any(|id| id == target_id),
+            "the simulated race removes the target before the adapter close"
+        );
+        assert!(String::from_utf8_lossy(&sessions.stdout)
+            .lines()
+            .any(|id| id == fallback_id));
+
+        app.needs_reconcile = false;
+        crate::app::reconcile(&mut app, &client)
+            .await
+            .expect("authoritative partial-failure settlement");
+        assert_eq!(app.model.session.session, "fallback");
+        assert_eq!(app.reconcile_session_id, None);
+        assert_eq!(app.model.workspaces.len(), 1);
+        assert_eq!(app.model.workspaces[0].session_id, fallback_id);
+        assert_eq!(app.prefs.folder_tracked, vec![target_id, fallback_id]);
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn workspace_close_refuses_disconnected_and_refreshing_state_without_touching_tmux() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-close-workspace-refusals");
+        server.run_ok(&["new-session", "-d", "-s", "target", "/bin/sh"]);
+        server.run_ok(&["new-session", "-d", "-s", "fallback", "/bin/sh"]);
+        let client = rig_client(&server, "target").await;
+        let model = crate::sync::fetch_workspace_model(&client, "target")
+            .await
+            .expect("initial authoritative model");
+        let target_id = model
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == "target")
+            .expect("target row")
+            .session_id
+            .clone();
+        let home = scratch_home("exec-close-workspace-refusals-home");
+        let mut app = test_app(model, home.clone());
+        let intent = crate::workspace_close::Intent {
+            session_id: target_id.clone(),
+        };
+        app.dialog = Some(Dialog::ConfirmCloseWorkspace {
+            session_id: target_id.clone(),
+        });
+
+        app.link_state = LinkState::Reconnecting { attempt: 1 };
+        let recovering = execute(&mut app, &client, Action::CloseWorkspace(intent.clone()))
+            .await
+            .expect("reconnecting refusal");
+        assert!(!recovering.reconcile);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::WORKSPACE_CLOSE_CONTROL_RECONNECTING)
+        );
+        assert!(app.dialog.is_none(), "the confirmation was consumed");
+
+        app.link_state = LinkState::ServerGone;
+        let disconnected = execute(&mut app, &client, Action::CloseWorkspace(intent.clone()))
+            .await
+            .expect("disconnected refusal");
+        assert!(!disconnected.reconcile);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::WORKSPACE_CLOSE_CONTROL_DISCONNECTED)
+        );
+
+        app.link_state = LinkState::Live;
+        app.needs_reconcile = true;
+        let refreshing = execute(&mut app, &client, Action::CloseWorkspace(intent))
+            .await
+            .expect("refreshing refusal");
+        assert!(refreshing.reconcile);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::WORKSPACE_CLOSE_STATE_REFRESHING)
+        );
+
+        let sessions = server.run(&["list-sessions", "-F", "#{session_id}"]);
+        assert!(
+            String::from_utf8_lossy(&sessions.stdout)
+                .lines()
+                .any(|id| id == target_id),
+            "no refusal may reach the adapter"
+        );
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
     }
 
     // -- The sidebar: collapse, reopen, and which tab the stream chord
