@@ -6,6 +6,7 @@ description = "Descriptor-anchored access to owner-only Cyclops state files."
 
 [dependencies]
 libc.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

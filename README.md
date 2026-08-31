@@ -69,28 +69,51 @@ rollback, and uninstall.
 
 ## Uninstall completely
 
-The managed uninstall stops the matching daemon, removes the installed binary
-pair, and removes the installer-owned PATH block. It deliberately preserves
-your mailbox history, configuration, and vendor settings:
+For a state-preserving uninstall, the managed uninstall stops the matching
+daemon, removes the installed binary pair and installer-owned PATH block, and
+deliberately leaves mailbox history, configuration, and vendor settings:
 
 ```bash
 curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
 ```
 
-Before manually removing the whole state home, use
+For a complete uninstall, do the state-home steps below first, while the
+`cyclops` command is still installed. Use
 [`cyclops data inventory`](docs/guides/data.md) to see the retained journals
 and `cyclops data export --to <new-directory>` to make a portable copy. The
 same guide documents `cyclops data forget --all`: stop the daemon before its
 preview and keep it stopped through exact confirmation to remove only the
-journal scope, deliberately leaving configuration and other state behind. Then
-remove the Cyclops hook commands from
+journal scope, deliberately leaving configuration and other state behind.
+
+To remove the complete current state home, stop the daemon, preview its exact
+body-free inventory, then paste the confirmation it prints:
+
+```bash
+cyclops daemon stop
+cyclops data export --to <new-directory>
+cyclops remove --all
+cyclops remove --all --confirm <token-from-preview>
+```
+
+`cyclops remove --all` removes only the current state home. It does not remove
+installed binaries, the installer-owned PATH block, vendor configuration, or
+skill files in agent-owned directories, including a Cyclops-seeded copy. For
+the exact scope and interrupted-removal recovery boundary, follow the
+[complete state-home removal guide](docs/guides/data.md#remove-the-complete-current-state-home).
+Once that command has reported its result, run the managed uninstall:
+
+```bash
+curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
+```
+
+Then remove only the Cyclops hook commands from
 `~/.claude/settings.json`,
 `~/.codex/hooks.json`, `~/.agents/hooks.json`, and
 `~/.cursor/hooks.json` where those files exist, preserving every unrelated
-entry. Finally, delete `~/.cyclops`. This last step permanently removes local
-mailbox journals, configuration, themes, prepared hooks, and operational
-records. The [installation guide](docs/guides/install.md#uninstall) lists the
-full manual-removal boundary.
+entry. Skill files in agent-owned directories, including a Cyclops-seeded
+copy, are separately owned: remove one only when you have checked that it is
+not an operator customization. The [installation guide](docs/guides/install.md#uninstall)
+lists the full removal boundary.
 
 ## How to run Cyclops
 
