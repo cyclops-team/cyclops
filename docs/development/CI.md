@@ -265,8 +265,10 @@ revision. Push and manual evidence use unique keys and never cancel each other.
 The Ubuntu correctness lane owns formatting, Clippy, parallel-safe tests,
 daemon tests, Rust documentation compilation, documentation paths,
 exact-output parity, and focused relocated-root evidence. The normal nextest
-filter excludes the four performance executables. Those workloads retain their
-own metadata and history in scheduled and release evidence.
+filter excludes the four performance executables. Those workloads, plus the
+staged install-to-first-durable-handoff journey, retain their own metadata and
+history in scheduled and release evidence. The handoff journey never runs in a
+pull-request job.
 
 The old `cargo test --workspace --doc` command compiled every workspace crate
 and executed zero doctests. The replacement
@@ -282,14 +284,14 @@ warnings into a new blocking policy.
 | Website install, check, and build | Hosted installer parity and website type/build correctness | Stable `website` check runs the same commands only for website-facing inputs |
 | Installer lifecycle on both platforms | Installation, profile restoration, seeded assets, and uninstall | Both stable installer checks run the same lifecycle only for installer-owned inputs; release evidence repeats it with user journeys |
 | Complete Rust gate against tmux HEAD | Upstream tmux adapter compatibility | Pull requests run `cyclops-tmux`, `cyclops-workspace`, and the M0 tmux/daemon/socket journey; the retained `watcher_modes` contract still catches F25; scheduled evidence runs the full fast gate against tmux HEAD |
-| Four performance test binaries inside ordinary nextest | Frame, queue, control-write, flood, terminal-restoration, and daemon cold-boot/replay behavior | Scheduled and release runs execute the same binaries through `scripts/ci-performance.py` and retain comparable metadata |
+| Four performance test binaries inside ordinary nextest, plus staged install-to-first-durable-handoff | Frame, queue, control-write, flood, terminal-restoration, daemon cold-boot/replay, and the installed durable-handoff journey | Scheduled and release runs execute the same binaries and staged journey through `scripts/ci-performance.py` and retain comparable metadata |
 | Zero-test doctest execution | Rust documentation compilation | `cargo doc` builds every workspace page; pre-existing warnings remain visible without becoming a new blocking policy |
 
 Path-classifier self-tests simulate unrelated website, installer, daemon,
 platform-client, documentation, domain-only, and workflow changes. They assert
 both selected and not-applicable lanes. The F25 test remains in the focused
 tmux HEAD package, and the performance script has been run locally through all
-four retained workloads with its JSON metadata contract checked. These are
+five retained workloads with their JSON metadata contracts checked. These are
 small contract simulations, not mutation infrastructure.
 
 Run the complete normal gate locally with:
@@ -361,6 +363,29 @@ days under a commit-specific name.
 The required Ubuntu pull-request check runs that fast self-test when the
 performance runner, its path classifier, or its PR workflow wiring changes. It
 does not run the performance workloads on ordinary pull requests.
+
+The `install-first-durable-handoff` workload adds one structured measurement
+to that artifact. It uses the public source installer from the checked-out
+tree with a fresh private prefix, home, tmux server, daemon, fixture agents,
+journal, and Cargo target directory. It separately records source build, pair
+activation, setup, daemon readiness, session adoption, agent detection,
+durable send, and authenticated claim. The workload is a staged local-source
+install: its Cargo registry and toolchain may be warm, and it does not measure
+network download or Rust installation. Its synthetic two-agent fixture is
+reported as a separate setup phase. Readiness and fixture completion have a
+bounded 50 ms test-rig probe interval, so those small phase values are not
+latency claims. One staged sample is retained per run, so its p50, p95, and
+maximum are the same observed sample rather than a statistical confidence
+claim. Compare only artifacts with the same staged workload and recorded
+environment. In particular, it makes no sixty-second product claim.
+
+The runner rejects a zero-exit handoff journey unless it emits exactly one
+complete `CYCLOPS_INSTALL_FIRST_HANDOFF_JSON` report. That report must identify
+the checked-out commit, dirty state, environment, installed matched pair,
+staged workload limits, all named phases, durable journal acceptance, and the
+recipient's authenticated claim. The fast runner self-test rejects missing
+markers, phases, durable proofs, and inconsistent one-sample summaries without
+running the performance workloads on a pull request.
 
 ## Release evidence
 
