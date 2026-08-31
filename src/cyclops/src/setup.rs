@@ -51,6 +51,7 @@ fn asset_read_error(error: StateError) -> AssetRead {
         StateError::Io { .. }
         | StateError::ReplacementDurabilityUnknown { .. }
         | StateError::CreationDurabilityUnknown { .. }
+        | StateError::CreationMayBeVisible { .. }
         | StateError::RemovalDurabilityUnknown { .. } => AssetRead::Unreadable,
     }
 }
@@ -73,6 +74,15 @@ fn read_asset_from(inspector: &StateInspector, relative: &Path) -> AssetRead {
     match inspector.path_matches_held_root() {
         Ok(true) => asset,
         Ok(false) | Err(_) => AssetRead::ManualReview,
+    }
+}
+
+fn read_skill_asset(location: &crate::consumer::AssetLocation) -> AssetRead {
+    match crate::skillseed::inspect(location) {
+        crate::skillseed::SkillInspection::Missing => AssetRead::Missing,
+        crate::skillseed::SkillInspection::Bytes(bytes) => AssetRead::Bytes(bytes),
+        crate::skillseed::SkillInspection::Unreadable => AssetRead::Unreadable,
+        crate::skillseed::SkillInspection::ManualReview => AssetRead::ManualReview,
     }
 }
 
@@ -313,7 +323,7 @@ fn consumer_check(
     let (skill_state, skill_ready) = skill_state(
         installation,
         if installation == Installation::Present {
-            read_asset(&locations.skill.root, &locations.skill.relative)
+            read_skill_asset(&locations.skill)
         } else {
             AssetRead::Missing
         },

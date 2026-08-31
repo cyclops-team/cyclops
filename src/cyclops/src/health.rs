@@ -1713,7 +1713,7 @@ fn inspect_setup(cyclops_home: &Path) -> SetupReport {
         let hook_ready = !installed || hook_state == "current";
         let skill_path = locations.skill.path();
         let (skill_state, skill_ready) = if installed {
-            inspect_skill(read_asset(&locations.skill.root, &locations.skill.relative))
+            inspect_skill(read_skill_asset(&locations.skill))
         } else {
             ("not_installed", true)
         };
@@ -1772,6 +1772,17 @@ fn read_asset(root: &Path, relative: &Path) -> AssetRead {
         Ok(Some(inspector)) => read_asset_from(&inspector, relative),
         Ok(None) => AssetRead::Missing,
         Err(_) => AssetRead::Unproven,
+    }
+}
+
+/// Health uses the same private-parent boundary as setup. A skill below a
+/// missing or unsafe consumer parent cannot establish a healthy installation.
+fn read_skill_asset(location: &crate::consumer::AssetLocation) -> AssetRead {
+    match crate::skillseed::inspect(location) {
+        crate::skillseed::SkillInspection::Missing => AssetRead::Missing,
+        crate::skillseed::SkillInspection::Bytes(bytes) => AssetRead::Bytes(bytes),
+        crate::skillseed::SkillInspection::Unreadable
+        | crate::skillseed::SkillInspection::ManualReview => AssetRead::Unproven,
     }
 }
 

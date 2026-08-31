@@ -1186,6 +1186,7 @@ pub fn run_setup(json_out: bool, style: &Style, wire_hooks: bool) -> i32 {
                         "consumer": s.consumer,
                         "path": s.path.display().to_string(),
                         "outcome": crate::skillseed::json_word(&s.outcome),
+                        "detail": crate::skillseed::json_detail(&s.outcome),
                     })).collect::<Vec<_>>(),
             })
         );

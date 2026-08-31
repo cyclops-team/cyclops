@@ -308,11 +308,11 @@ enum Cmd {
         name: Option<String>,
     },
     /// Update Cyclops itself: fetch the source, rebuild, and replace the
-    /// installed binaries. Durable records and operator-edited setup files
-    /// are preserved. Untouched shipped themes, manifests, skills, and
-    /// Cyclops hook entries may be upgraded. Set CYCLOPS_NO_VENDOR_HOOKS=1
-    /// to skip vendor hook and skill wiring. A running daemon is safely
-    /// restarted; a stopped daemon stays stopped. An open workspace is untouched.
+    /// installed binaries. Durable records and existing manifests and skills
+    /// are preserved. Known unedited shipped themes and verified Cyclops-owned
+    /// hook entries may be refreshed. Set CYCLOPS_NO_VENDOR_HOOKS=1 to skip
+    /// vendor hook and skill wiring. A running daemon is safely restarted; a
+    /// stopped daemon stays stopped. An open workspace is untouched.
     #[command(hide = true)]
     Update {
         /// Reactivate a replay-proven retained pair. State is not rolled back.
@@ -397,7 +397,7 @@ enum DaemonCmd {
 enum SetupCmd {
     /// Report setup and whether messaging uses a doorbell or direct fallback.
     Check,
-    /// Preview manifest and installed-consumer skill seeding without writing files.
+    /// Preview manifests and final skill leaves below accepted private parents without writing files.
     Plan,
 }
 
@@ -936,9 +936,10 @@ fn seed_home_for_workspace() {
         eprintln!("{}", manifests::partly_installed(&seeded));
     }
     // The vendor homes too, when the installer's consent is on file: an
-    // agent CLI installed after cyclops gets its skill and hook config on
-    // this boot instead of never. Quiet unless something was written, so
-    // the front door stays silent on every ordinary open.
+    // agent CLI installed after Cyclops gets its hook config and, when it
+    // already owns a private skill parent, its final skill file on this boot.
+    // Quiet unless something was written, so the front door stays silent on
+    // every ordinary open.
     for note in workspace::finish_deferred_wiring(&home) {
         eprintln!("{note}");
     }

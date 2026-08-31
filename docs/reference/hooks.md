@@ -81,17 +81,23 @@ its own (`~/.claude/settings.json`, `$CODEX_HOME/hooks.json`,
 `~/.agents/hooks.json`, `~/.cursor/hooks.json`). It also seeds the same agent skill at each canonical
 destination: `~/.claude/skills/cyclops/SKILL.md`, one shared
 `~/.agents/skills/cyclops/SKILL.md` for Codex and Cursor, and
-`~/.gemini/antigravity-cli/skills/cyclops/SKILL.md` for AGY. It never creates
-duplicate vendor copies. A vendor directory that does not exist is never
-created, your own entries are merged around rather than replaced, and the
-original file is copied aside before the first edit.
+`~/.gemini/antigravity-cli/skills/cyclops/SKILL.md` for AGY. It creates only a
+missing final skill file below an existing private canonical parent, never a
+consumer skill directory or duplicate vendor copy. A vendor directory that
+does not exist is never created, your own entries are merged around rather
+than replaced, and the original file is copied aside before the first edit.
 
 The consent is recorded at `~/.cyclops/vendor-wiring-consented`, so an
 agent CLI installed after cyclops is not stranded: the next `cyclops` or
-`cyclops start` finds it, wires it the same way, and prints one line
-saying so: silence means nothing needed writing. Delete the marker to
-withdraw the consent; `CYCLOPS_NO_VENDOR_HOOKS=1` declines the whole
-step, at install time and after.
+`cyclops start` finds it, wires its hooks, and adds its skill only if the
+consumer has already made the private final parent. A missing or unsafe parent
+is manual review, never a directory Cyclops creates. Delete the marker to
+withdraw the consent; `CYCLOPS_NO_VENDOR_HOOKS=1` declines the whole step, at
+install time and after.
+
+With `cyclops --json start --setup-only --wire-hooks`, every reported skill
+has a stable `outcome`. A `problem` row adds `detail`, the manual-review
+reason; successful and unchanged outcomes leave that field null.
 
 ## Verify (did edges ever arrive?)
 
