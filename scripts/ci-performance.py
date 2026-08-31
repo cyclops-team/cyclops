@@ -15,11 +15,20 @@ from pathlib import Path
 
 
 WORKLOADS = (
-    ("stream-frame-10k", ["cargo", "test", "-p", "cyclops-ui", "--test", "perf", "--", "--nocapture"]),
-    ("message-queue-10k", ["cargo", "test", "-p", "cyclops-ui", "--test", "queue_perf", "--", "--nocapture"]),
+    (
+        "stream-frame-10k",
+        ["cargo", "test", "-p", "cyclops-ui", "--test", "perf", "--", "--nocapture"],
+        None,
+    ),
+    (
+        "message-queue-10k",
+        ["cargo", "test", "-p", "cyclops-ui", "--test", "queue_perf", "--", "--nocapture"],
+        None,
+    ),
     (
         "workspace-control-and-flood",
         ["cargo", "test", "-p", "cyclops-workspace", "--test", "perf_contract", "--", "--nocapture"],
+        None,
     ),
     (
         "daemon-cold-start-replay",
@@ -34,6 +43,12 @@ WORKLOADS = (
             "--ignored",
             "--nocapture",
         ],
+        "CYCLOPS_DAEMON_COLD_START_REPLAY_JSON",
+    ),
+    (
+        "install-first-durable-handoff",
+        ["python3", "scripts/perf/install_first_handoff.py"],
+        "CYCLOPS_INSTALL_FIRST_HANDOFF_JSON",
     ),
 )
 
@@ -58,12 +73,34 @@ COLD_REPLAY_WORKLOAD = {
     ],
 }
 
-# Most performance executables enforce a budget and need only a successful
-# exit. This workload also supplies a retained measurement. A clean test exit
-# after an environmental skip is not performance evidence, so the runner
-# requires the report marker before it can call this workload successful.
-REQUIRED_JSON_MARKERS = {
-    "daemon-cold-start-replay": "CYCLOPS_DAEMON_COLD_START_REPLAY_JSON",
+# The install journey is deliberately a staged local-source measurement, not a
+# claim about downloading source or provisioning a clean operating system.
+INSTALL_HANDOFF_SCHEMA = 1
+INSTALL_HANDOFF_KIND = "cyclops_install_first_durable_handoff"
+INSTALL_HANDOFF_PHASES = {
+    "source_build",
+    "pair_activation",
+    "setup",
+    "installer_total",
+    "fixture_setup",
+    "daemon_readiness",
+    "session_adoption",
+    "agent_detection",
+    "durable_send",
+    "authenticated_claim",
+    "first_durable_handoff_total",
+}
+INSTALL_HANDOFF_WORKLOAD_FIELDS = {
+    "install_mode",
+    "source_acquisition",
+    "cargo_target",
+    "state",
+    "dataset",
+    "fixture",
+    "observation_resolution",
+    "sample_note",
+    "comparison_baseline",
+    "excludes",
 }
 
 
@@ -104,6 +141,14 @@ def exact_int(value: object, expected: int) -> bool:
     return type(value) is int and value == expected
 
 
+def nonnegative_number(value: object) -> bool:
+    return type(value) in (int, float) and value >= 0
+
+
+def nonempty_string(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
 def cold_replay_report_error(report: dict[str, object]) -> str | None:
     """Reject a report that would not prove the retained replay workload ran."""
     if not exact_int(report.get("schema"), COLD_REPLAY_SCHEMA):
@@ -111,10 +156,10 @@ def cold_replay_report_error(report: dict[str, object]) -> str | None:
     if report.get("kind") != COLD_REPLAY_KIND:
         return f"expected kind {COLD_REPLAY_KIND!r}"
     build_ref = report.get("benchmark_test_build_ref")
-    if not isinstance(build_ref, str) or not build_ref:
+    if not nonempty_string(build_ref):
         return "missing benchmark_test_build_ref"
     version = report.get("cyclopsd_version")
-    if not isinstance(version, str) or not version:
+    if not nonempty_string(version):
         return "missing cyclopsd_version"
 
     workload = report.get("workload")
@@ -168,11 +213,99 @@ def cold_replay_report_error(report: dict[str, object]) -> str | None:
     return None
 
 
+def install_handoff_report_error(report: dict[str, object]) -> str | None:
+    """Reject an install record that does not prove a durable two-agent handoff."""
+    if not exact_int(report.get("schema"), INSTALL_HANDOFF_SCHEMA):
+        return f"expected schema {INSTALL_HANDOFF_SCHEMA}"
+    if report.get("kind") != INSTALL_HANDOFF_KIND:
+        return f"expected kind {INSTALL_HANDOFF_KIND!r}"
+    if not nonempty_string(report.get("commit")):
+        return "missing commit"
+    if type(report.get("dirty")) is not bool:
+        return "missing dirty state"
+
+    environment = report.get("environment")
+    if not isinstance(environment, dict):
+        return "missing environment"
+    for key in ("os", "machine", "rustc", "cargo", "tmux"):
+        if not nonempty_string(environment.get(key)):
+            return f"environment.{key} is missing"
+    if not positive_int(environment.get("cpu_count")):
+        return "environment.cpu_count is invalid"
+
+    installed_pair = report.get("installed_pair")
+    if not isinstance(installed_pair, dict):
+        return "missing installed_pair"
+    if not nonempty_string(installed_pair.get("cyclops")) or not nonempty_string(installed_pair.get("cyclopsd")):
+        return "installed pair is missing a version"
+    if installed_pair.get("matched") is not True:
+        return "installed pair is not matched"
+
+    workload = report.get("workload")
+    if not isinstance(workload, dict) or INSTALL_HANDOFF_WORKLOAD_FIELDS.difference(workload):
+        return "install handoff record is missing workload metadata"
+    if workload.get("install_mode") != "staged local source install":
+        return "install handoff record has the wrong install mode"
+    for key in INSTALL_HANDOFF_WORKLOAD_FIELDS - {"excludes"}:
+        if not nonempty_string(workload.get(key)):
+            return f"workload.{key} is missing"
+    excludes = workload.get("excludes")
+    if not isinstance(excludes, list) or not excludes or not all(nonempty_string(item) for item in excludes):
+        return "workload.excludes is missing"
+
+    phases = report.get("phases")
+    if not isinstance(phases, dict):
+        return "install handoff record has no phase map"
+    missing_phases = INSTALL_HANDOFF_PHASES.difference(phases)
+    if missing_phases:
+        return f"install handoff record is missing phases: {', '.join(sorted(missing_phases))}"
+    for name in INSTALL_HANDOFF_PHASES:
+        phase = phases.get(name)
+        if not isinstance(phase, dict):
+            return f"install handoff phase {name} is not an object"
+        samples = phase.get("samples_seconds")
+        if (
+            not nonempty_string(phase.get("boundary"))
+            or not exact_int(phase.get("sample_count"), 1)
+            or not isinstance(samples, list)
+            or len(samples) != 1
+            or not nonnegative_number(samples[0])
+        ):
+            return f"install handoff phase {name} has incomplete samples"
+        if any(phase.get(key) != samples[0] for key in ("p50_seconds", "p95_seconds", "max_seconds")):
+            return f"install handoff phase {name} has inconsistent summaries"
+
+    correctness = report.get("correctness")
+    required_proofs = {
+        "installed_pair_matched",
+        "daemon_responded",
+        "session_attached",
+        "message_durably_accepted",
+        "recipient_claimed",
+    }
+    if not isinstance(correctness, dict) or not all(correctness.get(proof) is True for proof in required_proofs):
+        return "install handoff record is missing a durable-handoff proof"
+    if not exact_int(correctness.get("agents_detected"), 2):
+        return "install handoff record did not detect two agents"
+    if not positive_int(correctness.get("journal_line_count_after_claim")):
+        return "install handoff record has no durable journal proof"
+    return None
+
+
+def report_error(name: str, report: dict[str, object]) -> str | None:
+    if name == "daemon-cold-start-replay":
+        return cold_replay_report_error(report)
+    if name == "install-first-durable-handoff":
+        return install_handoff_report_error(report)
+    return f"{name} has no retained-report validator"
+
+
 def record_workload(
     name: str,
     command: list[str],
     proc: subprocess.CompletedProcess[str],
     duration: float,
+    marker: str | None,
 ) -> dict[str, object]:
     """Turn a completed command into retained evidence with an honest status."""
     output = output_of(proc)
@@ -187,10 +320,10 @@ def record_workload(
         "status": proc.returncode,
         "output": output.splitlines(),
     }
-    if marker := REQUIRED_JSON_MARKERS.get(name):
+    if marker:
         measurement, error = required_json(output, marker)
         if measurement is not None and error is None:
-            error = cold_replay_report_error(measurement)
+            error = report_error(name, measurement)
         result["required_json_marker"] = marker
         if error:
             result["status"] = proc.returncode or 1
@@ -233,59 +366,113 @@ def complete_cold_replay_report() -> dict[str, object]:
     }
 
 
-def selftest() -> None:
-    """Prove a skipped measurement cannot become a successful artifact."""
-    marker = REQUIRED_JSON_MARKERS["daemon-cold-start-replay"]
+def complete_install_handoff_report() -> dict[str, object]:
+    """One complete staged handoff record for the runner's contract check."""
+    sample = 0.1
+    phase = {
+        "boundary": "self-test boundary",
+        "samples_seconds": [sample],
+        "sample_count": 1,
+        "p50_seconds": sample,
+        "p95_seconds": sample,
+        "max_seconds": sample,
+    }
+    return {
+        "schema": INSTALL_HANDOFF_SCHEMA,
+        "kind": INSTALL_HANDOFF_KIND,
+        "commit": "selftest",
+        "dirty": False,
+        "environment": {
+            "os": "selftest",
+            "machine": "selftest",
+            "cpu_count": 1,
+            "rustc": "selftest",
+            "cargo": "selftest",
+            "tmux": "selftest",
+        },
+        "installed_pair": {
+            "cyclops": "cyclops 0.1.0",
+            "cyclopsd": "cyclopsd 0.1.0",
+            "matched": True,
+        },
+        "workload": {
+            "install_mode": "staged local source install",
+            "source_acquisition": "not measured",
+            "cargo_target": "fresh",
+            "state": "isolated",
+            "dataset": "two agents",
+            "fixture": "test fixture",
+            "observation_resolution": "50ms",
+            "sample_note": "one sample",
+            "comparison_baseline": "same workload",
+            "excludes": ["network"],
+        },
+        "phases": {name: phase.copy() for name in INSTALL_HANDOFF_PHASES},
+        "correctness": {
+            "installed_pair_matched": True,
+            "daemon_responded": True,
+            "session_attached": True,
+            "agents_detected": 2,
+            "message_durably_accepted": True,
+            "recipient_claimed": True,
+            "journal_line_count_after_claim": 1,
+        },
+    }
 
-    def rejected(payload: object) -> None:
-        result = record_workload(
-            "daemon-cold-start-replay",
+
+def selftest() -> None:
+    """Prove incomplete retained reports cannot become successful artifacts."""
+
+    def fixture_result(name: str, report: object | None) -> dict[str, object]:
+        marker = next(marker for workload, _, marker in WORKLOADS if workload == name)
+        output = "test skipped\n" if report is None else f"{marker}={json.dumps(report)}\n"
+        return record_workload(
+            name,
             ["fixture"],
-            subprocess.CompletedProcess(["fixture"], 0, f"{marker}={json.dumps(payload)}\n", ""),
+            subprocess.CompletedProcess(["fixture"], 0, output, ""),
             0.0,
+            marker,
         )
+
+    def rejected(name: str, report: object) -> None:
+        result = fixture_result(name, report)
         assert result["status"] == 1
         assert "measurement_error" in result
 
-    missing = record_workload(
-        "daemon-cold-start-replay",
-        ["fixture"],
-        subprocess.CompletedProcess(["fixture"], 0, "test skipped\n", ""),
-        0.0,
-    )
-    assert missing["command_status"] == 0
-    assert missing["status"] == 1
-    assert "measurement_error" in missing
-    assert "measurement" not in missing
+    for name in ("daemon-cold-start-replay", "install-first-durable-handoff"):
+        missing = fixture_result(name, None)
+        assert missing["command_status"] == 0
+        assert missing["status"] == 1
+        assert "measurement_error" in missing
+        assert "measurement" not in missing
 
-    complete = complete_cold_replay_report()
-    valid = record_workload(
-        "daemon-cold-start-replay",
-        ["fixture"],
-        subprocess.CompletedProcess(["fixture"], 0, f"{marker}={json.dumps(complete)}\n", ""),
-        0.0,
-    )
-    assert valid["status"] == 0
-    assert valid["measurement"] == complete
+    cold = complete_cold_replay_report()
+    valid_cold = fixture_result("daemon-cold-start-replay", cold)
+    assert valid_cold["status"] == 0
+    assert valid_cold["measurement"] == cold
+    rejected("daemon-cold-start-replay", {})
 
-    for incomplete in [{}, {"schema": 1}]:
-        rejected(incomplete)
-
-    wrong_workload = json.loads(json.dumps(complete))
-    wrong_workload["workload"]["replay_validation"] = "not verified"
-    rejected(wrong_workload)
-
-    incomplete_measurements = json.loads(json.dumps(complete))
-    incomplete_measurements["measurements"].pop()
-    rejected(incomplete_measurements)
-
-    wrong_journal = json.loads(json.dumps(complete))
+    wrong_journal = json.loads(json.dumps(cold))
     wrong_journal["measurements"][2]["workspace_journal"]["lines"] = 9_999
-    rejected(wrong_journal)
+    rejected("daemon-cold-start-replay", wrong_journal)
 
-    inconsistent_timing = json.loads(json.dumps(complete))
-    inconsistent_timing["measurements"][1]["daemon_boot"]["p50"] = 0
-    rejected(inconsistent_timing)
+    install = complete_install_handoff_report()
+    valid_install = fixture_result("install-first-durable-handoff", install)
+    assert valid_install["status"] == 0
+    assert valid_install["measurement"] == install
+    rejected("install-first-durable-handoff", {})
+
+    missing_phase = json.loads(json.dumps(install))
+    missing_phase["phases"].pop("durable_send")
+    rejected("install-first-durable-handoff", missing_phase)
+
+    missing_proof = json.loads(json.dumps(install))
+    missing_proof["correctness"]["recipient_claimed"] = False
+    rejected("install-first-durable-handoff", missing_proof)
+
+    inconsistent_summary = json.loads(json.dumps(install))
+    inconsistent_summary["phases"]["setup"]["p95_seconds"] = 1.0
+    rejected("install-first-durable-handoff", inconsistent_summary)
 
 
 def main() -> int:
@@ -303,11 +490,11 @@ def main() -> int:
 
     results = []
     failed = False
-    for name, command in WORKLOADS:
+    for name, command, marker in WORKLOADS:
         start = time.monotonic()
         proc = subprocess.run(command, check=False, capture_output=True, text=True)
         duration = time.monotonic() - start
-        result = record_workload(name, command, proc, duration)
+        result = record_workload(name, command, proc, duration, marker)
         output = "\n".join(result["output"])
         print(f"== {name} ({duration:.3f}s)")
         print(output)
