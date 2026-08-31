@@ -1058,6 +1058,68 @@ fn watch_json_refuses_tui_only_display_filters_as_json() {
 }
 
 #[test]
+fn inbox_list_empty_state_invites_a_bounded_wait() {
+    let home = scratch_home("inbox-empty");
+    serve_once(&home, hello(1), move |req| {
+        assert_eq!(req["method"], "inbox.list");
+        (
+            vec![json!({"id": req["id"], "result": {"entries": []}}).to_string()],
+            false,
+        )
+    });
+
+    let out = run_cyclops(&home, &["inbox", "list", "--plain"]);
+
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "No pending messages. Wait for one: cyclops inbox next --timeout 30s\n"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_list_zero_limit_does_not_claim_the_inbox_is_empty() {
+    let home = scratch_home("inbox-zero");
+    serve_once(&home, hello(1), move |req| {
+        assert_eq!(req["method"], "inbox.list");
+        assert_eq!(req["params"]["limit"], 0);
+        (
+            vec![json!({"id": req["id"], "result": {"entries": []}}).to_string()],
+            false,
+        )
+    });
+
+    let out = run_cyclops(&home, &["inbox", "list", "--limit", "0", "--plain"]);
+
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty());
+    assert!(out.stdout.is_empty());
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_list_empty_json_stays_the_raw_daemon_result() {
+    let home = scratch_home("inbox-json-empty");
+    serve_once(&home, hello(1), move |req| {
+        assert_eq!(req["method"], "inbox.list");
+        assert_eq!(req["params"]["limit"], 0);
+        (
+            vec![json!({"id": req["id"], "result": {"entries": []}}).to_string()],
+            false,
+        )
+    });
+
+    let out = run_cyclops(&home, &["inbox", "list", "--limit", "0", "--json"]);
+
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "{\"entries\":[]}\n");
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
 fn inbox_next_subscribes_before_listing_and_claims_after_one_event() {
     let home = scratch_home("inx");
     let mut step = 0_u8;

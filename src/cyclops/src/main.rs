@@ -100,18 +100,19 @@ const VERSION: &str = cyclops_proto::VERSION_WITH_BUILD;
 #[command(
     name = "cyclops",
     version = VERSION,
-    about = "One eye on every agent"
+    about = "One eye on every agent",
+    subcommand_help_heading = "Everyday commands"
 )]
 #[cfg_attr(
     feature = "full-ui",
     command(
-        after_help = "With no command, opens the full-screen workspace (and starts the daemon if needed)."
+        after_help = "Run cyclops with no command to open the full-screen workspace (and start the daemon if needed).\nRun cyclops commands to see workspace, operations, and diagnostic commands."
     )
 )]
 #[cfg_attr(
     not(feature = "full-ui"),
     command(
-        after_help = "This build includes command-line and JSON operation. The full-screen workspace and interactive watch are not included."
+        after_help = "This build includes command-line and JSON operation. The full-screen workspace is not included.\nInteractive watch is not included in this build.\nRun cyclops commands to see workspace, operations, and diagnostic commands."
     )
 )]
 struct Cli {
@@ -130,16 +131,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Open the default workspace: restore it, or build it from a preset.
+    /// Build or adopt the default tmux session from a preset or saved layout.
     /// Safe to run twice; a session that is already there is left alone.
+    #[command(hide = true)]
     Start(StartArgs),
     /// Inspect manifests, hook wiring, and agent skill installation.
     /// Reads setup state without changing it.
+    #[command(hide = true)]
     Setup {
         #[command(subcommand)]
         cmd: SetupCmd,
     },
-    /// Save and restore the shape of a session: panes, sizes, names.
+    /// Save or restore a saved layout: panes, sizes, and names.
+    #[command(hide = true)]
     Workspace {
         #[command(subcommand)]
         cmd: WorkspaceCmd,
@@ -149,15 +153,19 @@ enum Cmd {
     /// A workspace sizes the windows it owns and restores them when it
     /// quits. Use this when one was killed hard and no workspace is coming
     /// back to tidy up, or when you are finished with Cyclops on a session.
+    #[command(hide = true)]
     Sizing {
         #[command(subcommand)]
         cmd: SizingCmd,
     },
-    /// What cyclops is watching and the state of every agent.
+    /// See who Cyclops is watching, what each agent is doing, and what needs you.
+    #[command(display_order = 4)]
     Status,
-    /// Inspect the installation, daemon, setup, and state without changing them.
+    /// Check installation and runtime problems without changing anything.
+    #[command(display_order = 5)]
     Health,
     /// Inventory or remove bounded rebuildable assets. Dry-run is the default.
+    #[command(hide = true)]
     Cleanup {
         /// List one or both asset classes.
         #[arg(value_enum, required = true)]
@@ -167,13 +175,17 @@ enum Cmd {
         apply: bool,
     },
     /// Name a pane so cyclops can address it. `--clear` gives it back.
+    #[command(hide = true)]
     Name(NameArgs),
     /// Every named agent: what it is called, how it is doing, what it is on.
     /// Inside tmux it scopes to your session; `--all` is every session.
+    #[command(hide = true)]
     List(ListArgs),
     /// Round-trip check against the daemon.
+    #[command(hide = true)]
     Ping,
     /// Read a pane: visible screen, recent output, or the detection view.
+    #[command(hide = true)]
     Read {
         /// Agent label or pane id, e.g. reviewer or %4.
         target: String,
@@ -196,6 +208,7 @@ enum Cmd {
         not(feature = "full-ui"),
         doc = " Live stream of daemon events as NDJSON with `--json`. Interactive watch is not included in this build."
     )]
+    #[command(hide = true)]
     Watch {
         /// Only these event kinds (prefix match), comma separated. JSON mode
         /// only; ignored when opening the TUI.
@@ -205,30 +218,41 @@ enum Cmd {
         ui: UiArgs,
     },
     /// Store a durable message in one or more recipient inboxes.
+    #[command(display_order = 1)]
     Send(SendArgs),
-    /// List or claim messages in the authenticated caller's inbox.
+    /// Check, wait for, or claim messages in your inbox.
+    #[command(display_order = 2)]
     Inbox(InboxArgs),
     /// Body-free inbox, outbound, and delivery state in one workspace snapshot.
+    #[command(hide = true)]
     Messages(MessagesArgs),
     /// Reply to a visible message using its sender and thread.
+    #[command(display_order = 3)]
     Reply(ReplyArgs),
     /// Requeue a message by identifier.
+    #[command(hide = true)]
     Requeue(RequeueArgs),
     /// Manage exact notification attempts.
+    #[command(hide = true)]
     Notification(NotificationArgs),
     /// Preview or clear delivery alarms.
+    #[command(hide = true)]
     Alarm(AlarmArgs),
     /// Inspect or resolve an exact staged notification attempt.
+    #[command(hide = true)]
     Attention(AttentionArgs),
     /// Messages from the record, newest last. Filter by agent or direction.
+    #[command(hide = true)]
     History(HistoryArgs),
     /// One message with its replies and delivery record, oldest first.
+    #[command(hide = true)]
     Thread {
         /// Message id, e.g. m-3f9c2a.
         id: String,
     },
     /// Wait for an agent to reach a state. Exit 0 when reached, 2 on
     /// timeout, 3 when the pane died or changed occupant mid-wait.
+    #[command(hide = true)]
     Wait {
         /// Agent label or pane id, e.g. reviewer or %4.
         target: String,
@@ -250,8 +274,10 @@ enum Cmd {
         not(feature = "full-ui"),
         doc = " Deprecated interactive alias. This build supports `cyclops watch --json` instead."
     )]
+    #[command(hide = true)]
     Ui(UiArgs),
     /// Relay a vendor hook event to cyclops. Silent, always exits 0.
+    #[command(hide = true)]
     Hook {
         /// Event name, e.g. Stop. An argument because agy payloads carry
         /// no event-name field; the payload arrives on stdin.
@@ -262,11 +288,13 @@ enum Cmd {
         agent: Option<String>,
     },
     /// Prepare vendor hook configs and prove they fire.
+    #[command(hide = true)]
     Hooks {
         #[command(subcommand)]
         cmd: HooksCmd,
     },
     /// Switch themes, or list them with a preview of each.
+    #[command(hide = true)]
     Theme {
         /// Theme to switch to, e.g. light. Omit to list what is there.
         name: Option<String>,
@@ -277,6 +305,7 @@ enum Cmd {
     /// Cyclops hook entries may be upgraded. Set CYCLOPS_NO_VENDOR_HOOKS=1
     /// to skip vendor hook and skill wiring. A running daemon is safely
     /// restarted; a stopped daemon stays stopped. An open workspace is untouched.
+    #[command(hide = true)]
     Update {
         /// Reactivate a replay-proven retained pair. State is not rolled back.
         #[arg(long)]
@@ -294,10 +323,14 @@ enum Cmd {
     },
     /// The daemon: stop it, ask after it, read its log. `cyclops start`
     /// starts one for you, so there is no `daemon start`.
+    #[command(hide = true)]
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCmd,
     },
+    /// Show workspace, operations, and diagnostic commands.
+    #[command(display_order = 6)]
+    Commands,
 }
 
 #[derive(Subcommand)]
@@ -903,8 +936,23 @@ fn ensure_daemon_for_workspace() {
     }
 }
 
+fn command_catalog() -> String {
+    let commands = Cmd::augment_subcommands(clap::Command::new("cyclops"));
+    copy::command_catalog(|name| {
+        commands
+            .find_subcommand(name)
+            .and_then(clap::Command::get_about)
+            .unwrap_or_else(|| panic!("command catalog names an undocumented command: {name}"))
+            .to_string()
+    })
+}
+
 fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
     match cmd {
+        Cmd::Commands => {
+            println!("{}", command_catalog());
+            0
+        }
         // Hook never prints and owns its transport handling: a hook that
         // fails loudly breaks the vendor CLI that invoked it. No Style is
         // built on this path, so a broken theme file cannot put a warning
@@ -1138,7 +1186,8 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 | Cmd::Theme { .. }
                 | Cmd::Update { .. }
                 | Cmd::Workspace { .. }
-                | Cmd::Sizing { .. } => {
+                | Cmd::Sizing { .. }
+                | Cmd::Commands => {
                     unreachable!("handled above")
                 }
             }
@@ -1895,6 +1944,10 @@ fn cmd_inbox(c: &mut Client, cli: &Cli, style: &Style, args: &InboxArgs) -> i32 
                 Ok(None) => return 0,
                 Err(code) => return code,
             };
+            if result.entries.is_empty() && *limit != Some(0) {
+                println!("{}", copy::EMPTY_INBOX);
+                return 0;
+            }
             for entry in result.entries {
                 let subject = entry.subject.as_deref().unwrap_or("(no subject)");
                 println!(
@@ -3660,6 +3713,102 @@ mod tests {
         let parsed = Cli::try_parse_from(["cyclops", "--json", "health"]).unwrap();
         assert!(parsed.json);
         assert!(matches!(parsed.cmd, Some(Cmd::Health)));
+    }
+
+    #[test]
+    fn top_level_help_leads_with_the_everyday_front_door() {
+        let error = match Cli::try_parse_from(["cyclops", "--help"]) {
+            Ok(_) => panic!("top-level help returned a command instead of help"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = error.to_string();
+
+        assert!(help.contains("Everyday commands:"), "{help}");
+        for command in ["send", "inbox", "reply", "status", "health", "commands"] {
+            assert!(
+                help.lines()
+                    .any(|line| line.trim_start().starts_with(command)),
+                "missing {command:?} in {help}"
+            );
+        }
+        for command in ["workspace", "notification", "daemon", "hook"] {
+            assert!(
+                !help
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(command)),
+                "advanced command {command:?} leaked into {help}"
+            );
+        }
+        assert!(help.contains("cyclops commands"), "{help}");
+    }
+
+    #[test]
+    fn advanced_command_spelling_keeps_its_own_help() {
+        let error = match Cli::try_parse_from(["cyclops", "help", "history"]) {
+            Ok(_) => panic!("subcommand help returned a command instead of help"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = error.to_string();
+        assert!(help.contains("Usage: cyclops history"), "{help}");
+        assert!(help.contains("Messages from the record"), "{help}");
+    }
+
+    #[test]
+    fn command_catalog_contains_every_supported_spelling() {
+        use std::collections::BTreeSet;
+
+        let command = Cmd::augment_subcommands(clap::Command::new("cyclops"));
+        let supported: BTreeSet<_> = command
+            .get_subcommands()
+            .map(|subcommand| subcommand.get_name())
+            .filter(|name| *name != "commands")
+            .collect();
+        let catalog = command_catalog();
+        let catalog_entries: Vec<_> = catalog
+            .lines()
+            .filter_map(|line| line.strip_prefix("  "))
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        let catalog: BTreeSet<_> = catalog_entries.iter().copied().collect();
+        assert_eq!(
+            catalog_entries.len(),
+            catalog.len(),
+            "command catalog contains a duplicate spelling"
+        );
+        assert_eq!(catalog, supported);
+
+        let catalog = command_catalog();
+        assert!(
+            catalog.contains(
+                "send          Store a durable message in one or more recipient inboxes."
+            ),
+            "{catalog}"
+        );
+        assert!(
+            catalog
+                .contains("reply         Reply to a visible message using its sender and thread."),
+            "{catalog}"
+        );
+        assert!(
+            catalog.contains("start         Build or adopt the default tmux session"),
+            "{catalog}"
+        );
+        assert!(
+            catalog.contains("workspace     Save or restore a saved layout"),
+            "{catalog}"
+        );
+
+        let visible: BTreeSet<_> = command
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+            .map(|subcommand| subcommand.get_name())
+            .collect();
+        assert_eq!(
+            visible,
+            BTreeSet::from(["commands", "health", "inbox", "reply", "send", "status"])
+        );
     }
 
     #[test]

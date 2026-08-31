@@ -276,7 +276,7 @@ fn agent_row(
     }
 }
 
-pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> String {
+pub fn render_status(res: &StatusResult, style: &Style, _config_path: &Path) -> String {
     let sep = style.dim("·");
     let names: Vec<String> = res
         .sessions
@@ -317,16 +317,13 @@ pub fn render_status(res: &StatusResult, style: &Style, config_path: &Path) -> S
     }
 
     if res.sessions.is_empty() {
-        // Empty state invites the next action instead of erroring. The
-        // backlog rows still ride along: no branch of this function may
-        // print a count with nothing behind it.
+        // Empty state names the command that creates or adopts a session.
+        // The backlog rows still ride along: no branch of this function
+        // may print a count with nothing behind it.
         let mut out = vec![
             header,
             String::new(),
-            format!(
-                "  No sessions yet. Name one in {} and cyclops will pick it up.",
-                config_path.display()
-            ),
+            "  No sessions yet. Build or adopt one with: cyclops start".to_string(),
         ];
         out.extend(blocked_notification_rows(res, style));
         out.extend(diagnostic_rows(res, style));
@@ -2516,14 +2513,14 @@ mod tests {
     }
 
     #[test]
-    fn status_empty_state_invites_config() {
+    fn status_empty_state_names_the_start_command() {
         let mut res = fixture();
         res.sessions.clear();
         let got = render_status(&res, &Style::none(), Path::new("/x/config.toml"));
         // No panes means nothing blocked: the empty rig is calm too.
         let expected = "‿ cyclops · watching nothing · tmux 3.6a · up 2m\n\
                         \n\
-                        \x20 No sessions yet. Name one in /x/config.toml and cyclops will pick it up.";
+                        \x20 No sessions yet. Build or adopt one with: cyclops start";
         assert_eq!(got, expected);
     }
 

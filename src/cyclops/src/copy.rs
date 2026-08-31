@@ -1,6 +1,7 @@
 //! Human-facing copy. Errors follow GOALS.md: what happened, why, next
 //! step. Sentence case, plain verbs, no protocol jargon, no apologies.
 
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use crate::client::ClientError;
@@ -131,6 +132,73 @@ pub fn attention_action_uncertain(
 /// it. `cyclops status` is the way to find the pane id to hand it.
 pub const NO_AGENTS: &str =
     "No agents yet. Name a pane: cyclops name %1 reviewer  (cyclops status lists the panes)";
+
+/// The complete command map behind the everyday top-level help. The
+/// descriptions come from clap's command help, so discovery and detailed
+/// help cannot quietly describe the same spelling two different ways.
+pub const COMMAND_GROUPS: &[(&str, &[&str])] = &[
+    ("Everyday", &["send", "inbox", "reply", "status", "health"]),
+    (
+        "Workspace",
+        &["start", "workspace", "sizing", "name", "list", "watch"],
+    ),
+    (
+        "Operations",
+        &["setup", "hooks", "theme", "daemon", "update", "cleanup"],
+    ),
+    (
+        "Diagnosis and compatibility",
+        &[
+            "ping",
+            "read",
+            "messages",
+            "requeue",
+            "notification",
+            "alarm",
+            "attention",
+            "history",
+            "thread",
+            "wait",
+            "ui",
+            "hook",
+        ],
+    ),
+];
+
+pub fn command_catalog(mut about: impl FnMut(&str) -> String) -> String {
+    let width = COMMAND_GROUPS
+        .iter()
+        .flat_map(|(_, commands)| commands.iter())
+        .map(|command| command.len())
+        .max()
+        .expect("command catalog is not empty");
+    let mut out = String::new();
+
+    for (group_index, (heading, commands)) in COMMAND_GROUPS.iter().enumerate() {
+        if group_index > 0 {
+            out.push('\n');
+        }
+        writeln!(out, "{heading}").expect("write command catalog heading");
+        for command in *commands {
+            let description = about(command);
+            let description = description.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut first_sentence = description
+                .split_once(". ")
+                .map(|(sentence, _)| format!("{sentence}."))
+                .unwrap_or(description);
+            if !first_sentence.ends_with(['.', '?', '!']) {
+                first_sentence.push('.');
+            }
+            writeln!(out, "  {command:width$}  {first_sentence}")
+                .expect("write command catalog entry");
+        }
+    }
+
+    out.push_str("\nRun cyclops <command> --help for details.");
+    out
+}
+
+pub const EMPTY_INBOX: &str = "No pending messages. Wait for one: cyclops inbox next --timeout 30s";
 
 /// The command that teaches cyclops what runs in a pane.
 ///
