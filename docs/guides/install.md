@@ -606,6 +606,11 @@ the matched pair remains active and the installer prints the exact
 `cyclops start --setup-only --wire-hooks` repair command. It does not report a
 generic update failure that implies activation never happened.
 
+If a selector rename is visible but its directory sync cannot be confirmed,
+update names that state exactly. It does not start a daemon or delete the
+candidate until it has confirmed restoration of the prior selector; a later
+update repairs only validated residue.
+
 Before changing `active`, update asks the authenticated daemon to quiesce. It
 stops only when the daemon's PID, kernel start value, boot id, and socket answer
 still identify the same process. The new daemon starts from the selected pair.
