@@ -20,6 +20,20 @@ WORKLOADS = (
         "workspace-control-and-flood",
         ["cargo", "test", "-p", "cyclops-workspace", "--test", "perf_contract", "--", "--nocapture"],
     ),
+    (
+        "daemon-cold-start-replay",
+        [
+            "cargo",
+            "test",
+            "-p",
+            "cyclopsd",
+            "--test",
+            "cold_start_replay_perf",
+            "--",
+            "--ignored",
+            "--nocapture",
+        ],
+    ),
 )
 
 
