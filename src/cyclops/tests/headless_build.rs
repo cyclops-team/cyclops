@@ -75,3 +75,52 @@ fn headless_help_does_not_promise_an_interactive_ui() {
         "{help}"
     );
 }
+
+#[test]
+fn headless_discovery_keeps_the_everyday_front_door_and_advanced_spellings() {
+    let home = scratch_home("discovery");
+    let help = run(&home, &["--help"]);
+    assert!(help.status.success());
+    assert!(help.stderr.is_empty());
+    let help = String::from_utf8_lossy(&help.stdout);
+    for command in ["send", "inbox", "reply", "status", "health", "commands"] {
+        assert!(
+            help.lines()
+                .any(|line| line.trim_start().starts_with(command)),
+            "missing {command:?} in {help}"
+        );
+    }
+    for command in ["workspace", "history", "daemon"] {
+        assert!(
+            !help
+                .lines()
+                .any(|line| line.trim_start().starts_with(command)),
+            "advanced command {command:?} leaked into {help}"
+        );
+    }
+
+    let catalog = run(&home, &["commands"]);
+    assert!(catalog.status.success());
+    assert!(catalog.stderr.is_empty());
+    let catalog = String::from_utf8_lossy(&catalog.stdout);
+    assert!(catalog.contains("Everyday\n"), "{catalog}");
+    assert!(catalog.contains("Workspace\n"), "{catalog}");
+    assert!(
+        catalog.contains("Diagnosis and compatibility\n"),
+        "{catalog}"
+    );
+    assert!(catalog.contains("history"), "{catalog}");
+
+    let history_help = run(&home, &["help", "history"]);
+    assert!(history_help.status.success());
+    assert!(history_help.stderr.is_empty());
+    let history_help = String::from_utf8_lossy(&history_help.stdout);
+    assert!(
+        history_help.contains("Usage: cyclops history"),
+        "{history_help}"
+    );
+    assert!(
+        !home.exists(),
+        "read-only command discovery created Cyclops state"
+    );
+}
