@@ -449,27 +449,41 @@ beta workflow reaches `main`, exercise the release lane by creating its
 disposable beta trigger branch at the exact integration commit:
 
 ```bash
-git fetch origin beta/messaging-rework
-release_sha="$(git rev-parse refs/remotes/origin/beta/messaging-rework)"
-git push origin "$release_sha":refs/heads/beta/test/release-evidence
+integration_ref=refs/heads/beta/messaging-rework
+trigger_ref=refs/heads/beta/test/release-evidence
+release_sha="$(git ls-remote --exit-code origin "$integration_ref" | awk 'NR == 1 { print $1}')"
+test -n "$release_sha"
+if git ls-remote --exit-code origin "$trigger_ref" >/dev/null; then
+  echo "release-evidence trigger branch already exists; inspect that run first" >&2
+  exit 1
+fi
+git push --force-with-lease="${trigger_ref}:" origin "${release_sha}:${trigger_ref}"
+trigger_sha="$(git ls-remote --exit-code origin "$trigger_ref" | awk 'NR == 1 { print $1}')"
+test "$trigger_sha" = "$release_sha"
 ```
 
-Identify, watch, and inspect the resulting `release evidence` run before
-removing the trigger branch:
+`git ls-remote` reads the remote ref directly, so this procedure cannot use a
+stale local tracking ref. Identify, watch, and inspect the resulting `release
+evidence` run before removing the trigger branch:
 
 ```bash
 release_run="$(gh run list \
-  --branch beta/test/release-evidence \
+  --branch "${trigger_ref#refs/heads/}" \
+  --event push \
   --limit 20 \
-  --json databaseId,headSha,workflowName \
-  --jq "[.[] | select(.workflowName == \"release evidence\" and .headSha == \"$release_sha\")][0].databaseId")"
+  --json databaseId,headBranch,headSha,workflowName \
+  --jq "[.[] | select(.workflowName == \"release evidence\" and .headBranch == \"${trigger_ref#refs/heads/}\" and .headSha == \"$release_sha\")][0].databaseId")"
 if [ -z "$release_run" ] || [ "$release_run" = null ]; then
   echo "release evidence for $release_sha is not registered yet" >&2
   exit 1
 fi
-gh run watch "$release_run" --exit-status
-gh run view "$release_run"
-git push origin --delete beta/test/release-evidence
+watch_status=0
+gh run watch "$release_run" --exit-status || watch_status=$?
+gh run view "$release_run" --log-failed || true
+remote_trigger="$(git ls-remote --exit-code origin "$trigger_ref" | awk 'NR == 1 { print $1}')"
+test "$remote_trigger" = "$release_sha"
+git push --force-with-lease="${trigger_ref}:${release_sha}" origin ":${trigger_ref}"
+test "$watch_status" = 0
 ```
 
 After the workflow reaches the default branch, use the ordinary manual form:
