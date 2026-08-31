@@ -145,10 +145,11 @@ fn check_name(name: &str) -> Result<(), String> {
 
 /// The config values these verbs need, read tolerantly.
 ///
-/// The daemon owns config validation (`cyclopsd::Config`), and the CLI
-/// cannot depend on the daemon. Same arrangement as the theme key, which
-/// `cyclops-theme` reads out of the same file for the same reason: a
-/// client reads the keys it needs and stays quiet about the rest.
+/// This launcher owns `default_workspace`: it parses that key when a
+/// workspace command begins, supplies the fallback order below, and writes
+/// the first-run value. The shared file also carries coordinator settings
+/// needed to construct a workspace on the daemon's tmux server; the daemon
+/// owns their runtime validation.
 pub struct Settings {
     /// `sessions`, in order.
     pub sessions: Vec<String>,
@@ -2580,6 +2581,21 @@ mod tests {
         s.default_workspace = Some("configured".into());
         assert_eq!(s.workspace_name(None), "configured");
         assert_eq!(s.workspace_name(Some("asked")), "asked");
+    }
+
+    #[test]
+    fn the_workspace_launcher_falls_back_when_default_workspace_is_not_a_string() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-default-workspace-owner");
+        std::fs::create_dir_all(&home).expect("create scratch home");
+        std::fs::write(
+            config_path(&home),
+            "sessions = [\"watched\"]\ndefault_workspace = 3\n",
+        )
+        .expect("write config");
+
+        assert_eq!(Settings::read(&home).workspace_name(None), "watched");
+
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
