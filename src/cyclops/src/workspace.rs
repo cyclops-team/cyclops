@@ -1081,8 +1081,9 @@ fn prepare_home(
 
     // 3. Manifests, every run and not only the first. A home that predates
     //    the seed gets them without a reinstall, and a shipped set that
-    //    gains a file reaches an existing home on the next run. Operator
-    //    edits stay unchanged. Known unedited shipped files may advance.
+    //    gains a file reaches an existing home on the next run. Every
+    //    existing manifest stays unchanged; a known old shipped seed reports
+    //    outdated for manual review.
     let seeded = crate::manifests::seed(home);
     if seeded.none_installed() {
         // The one note that contradicts the ready line above it: with no
@@ -1185,6 +1186,7 @@ pub fn run_setup(json_out: bool, style: &Style, wire_hooks: bool) -> i32 {
                         "consumer": s.consumer,
                         "path": s.path.display().to_string(),
                         "outcome": crate::skillseed::json_word(&s.outcome),
+                        "detail": crate::skillseed::json_detail(&s.outcome),
                     })).collect::<Vec<_>>(),
             })
         );

@@ -35,9 +35,10 @@ uses `~/.local/bin` and offers to add that directory to your shell profile,
 after making a timestamped backup.
 
 Setup also merges Cyclops-owned hook entries into detected agent CLI configs
-and places the Cyclops skill in each supported skill home. It preserves
-unrelated vendor settings, backs up a vendor config before its first edit, and
-does not create homes for agent CLIs that are not installed. Set
+and can add the final Cyclops skill file below an existing private canonical
+skill parent. It preserves unrelated vendor settings, backs up a vendor config
+before its first edit, and does not create homes or skill directories for agent
+CLIs that are not installed. Set
 `CYCLOPS_NO_VENDOR_HOOKS=1` to skip hook and skill wiring.
 
 To build a clone you already have:
@@ -109,10 +110,10 @@ copy of the current journals before changing the selector. Configuration,
 manifests, workspaces, and journals remain under `~/.cyclops`; rollback does
 not restore earlier state or promise compatibility beyond that replay proof.
 A running daemon is quiesced and restarted. A stopped daemon stays stopped.
-Operator-edited setup files stay unchanged. Known unedited shipped themes,
-manifests, hook artifacts, and skills may advance with the installed release.
-Update also refreshes Cyclops-owned vendor hook entries and known unedited
-skills unless `CYCLOPS_NO_VENDOR_HOOKS=1` is set.
+Existing setup files stay unchanged. Known unedited shipped themes and hook
+artifacts may advance with the installed release; manifests and skills remain
+in place and can report outdated state. Update also refreshes Cyclops-owned
+vendor hook entries unless `CYCLOPS_NO_VENDOR_HOOKS=1` is set.
 
 Pair activation is the update commit point. If later home setup needs repair,
 the matched pair remains active and the installer prints the exact

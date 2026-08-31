@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use cyclops_state::{StateError, StateInspector, INSPECTION_FILE_BYTES_LIMIT_MAX};
 use serde_json::json;
 
 use crate::copy;
@@ -13,6 +14,7 @@ enum FileState {
     Shipped(crate::managed_assets::ShippedState),
     Invalid,
     Unreadable,
+    ManualReview,
 }
 
 impl FileState {
@@ -22,11 +24,97 @@ impl FileState {
             FileState::Shipped(state) => state.word(),
             FileState::Invalid => "invalid",
             FileState::Unreadable => "unreadable",
+            FileState::ManualReview => "manual_review_required",
         }
     }
 
     fn ready(self) -> bool {
         matches!(self, FileState::Shipped(state) if state.ready())
+    }
+}
+
+/// A file result obtained only through a held, no-follow descriptor.
+///
+/// `ManualReview` is reserved for a link, ownership, hard-link, or other
+/// unsafe boundary. An ordinary read failure keeps the older `unreadable`
+/// machine contract without implying that Cyclops followed anything.
+enum AssetRead {
+    Missing,
+    Bytes(Vec<u8>),
+    Unreadable,
+    ManualReview,
+}
+
+fn asset_read_error(error: StateError) -> AssetRead {
+    match error {
+        StateError::UnsafePath { .. } => AssetRead::ManualReview,
+        StateError::Io { .. }
+        | StateError::ReplacementDurabilityUnknown { .. }
+        | StateError::CreationDurabilityUnknown { .. }
+        | StateError::CreationMayBeVisible { .. }
+        | StateError::RemovalDurabilityUnknown { .. } => AssetRead::Unreadable,
+    }
+}
+
+fn read_asset(root: &Path, relative: &Path) -> AssetRead {
+    match StateInspector::open_existing(root) {
+        Ok(Some(inspector)) => read_asset_from(&inspector, relative),
+        Ok(None) => AssetRead::Missing,
+        Err(error) => asset_read_error(error),
+    }
+}
+
+fn read_asset_from(inspector: &StateInspector, relative: &Path) -> AssetRead {
+    let asset = match inspector.read_file(relative, INSPECTION_FILE_BYTES_LIMIT_MAX) {
+        Ok(Some(file)) if file.truncated => AssetRead::Unreadable,
+        Ok(Some(file)) => AssetRead::Bytes(file.bytes),
+        Ok(None) => AssetRead::Missing,
+        Err(error) => asset_read_error(error),
+    };
+    match inspector.path_matches_held_root() {
+        Ok(true) => asset,
+        Ok(false) | Err(_) => AssetRead::ManualReview,
+    }
+}
+
+fn read_skill_asset(location: &crate::consumer::AssetLocation) -> AssetRead {
+    match crate::skillseed::inspect(location) {
+        crate::skillseed::SkillInspection::Missing => AssetRead::Missing,
+        crate::skillseed::SkillInspection::Bytes(bytes) => AssetRead::Bytes(bytes),
+        crate::skillseed::SkillInspection::Unreadable => AssetRead::Unreadable,
+        crate::skillseed::SkillInspection::ManualReview => AssetRead::ManualReview,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Installation {
+    Absent,
+    Present,
+    ManualReview,
+}
+
+impl Installation {
+    fn inspect(root: &Path) -> Self {
+        match StateInspector::open_existing(root) {
+            Ok(Some(inspector)) => match inspector.path_matches_held_root() {
+                Ok(true) => Self::Present,
+                Ok(false) | Err(_) => Self::ManualReview,
+            },
+            Ok(None) => Self::Absent,
+            Err(_) => Self::ManualReview,
+        }
+    }
+
+    fn installed(self) -> bool {
+        self != Self::Absent
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Present => "present",
+            Self::ManualReview => "manual_review_required",
+        }
     }
 }
 
@@ -40,6 +128,7 @@ struct ManifestCheck {
 struct ConsumerCheck {
     id: &'static str,
     name: &'static str,
+    installation: Installation,
     installed: bool,
     manifest: ManifestCheck,
     hook_path: Option<PathBuf>,
@@ -53,37 +142,100 @@ struct ConsumerCheck {
     mailbox_capability_ready: Option<bool>,
 }
 
+/// One setup-owned seed target, rendered without its file body.
+struct PlannedAsset {
+    kind: &'static str,
+    consumer: Option<&'static str>,
+    target: PathBuf,
+    decision: crate::managed_assets::SeedDecision,
+}
+
+fn planned_assets(cyclops_home: &Path, user_home: &Path) -> Vec<PlannedAsset> {
+    let mut assets: Vec<PlannedAsset> = crate::manifests::plan(cyclops_home)
+        .into_iter()
+        .map(|manifest| PlannedAsset {
+            kind: "manifest",
+            consumer: None,
+            target: manifest.path,
+            decision: manifest.decision,
+        })
+        .collect();
+    assets.extend(
+        crate::skillseed::plan(user_home)
+            .into_iter()
+            .map(|skill| PlannedAsset {
+                kind: "skill",
+                consumer: Some(skill.consumer),
+                target: skill.path,
+                decision: skill.decision,
+            }),
+    );
+    assets
+}
+
 impl ConsumerCheck {
     fn receipt_ready(&self) -> bool {
-        !self.installed
-            || self
+        match self.installation {
+            Installation::Absent => true,
+            Installation::Present => self
                 .required_receipt
-                .is_some_and(|requirement| requirement.accepts(Some(self.manifest.ack_capable)))
+                .is_some_and(|requirement| requirement.accepts(Some(self.manifest.ack_capable))),
+            Installation::ManualReview => false,
+        }
     }
 
     fn complete(&self) -> bool {
         self.manifest.state.ready()
-            && (!self.installed || (self.hook_ready && self.skill_ready && self.receipt_ready()))
+            && match self.installation {
+                Installation::Absent => true,
+                Installation::Present => {
+                    self.hook_ready && self.skill_ready && self.receipt_ready()
+                }
+                Installation::ManualReview => false,
+            }
     }
 }
 
 fn manifest_check(home: &Path, id: &str) -> ManifestCheck {
     let path = crate::manifests::dir(home).join(format!("{id}.toml"));
     let shipped = crate::manifests::shipped_body(id).expect("shipped consumer manifest");
-    let Ok(body) = std::fs::read_to_string(&path) else {
-        let state = if path.exists() {
-            FileState::Unreadable
-        } else {
-            FileState::Missing
-        };
+    let relative = Path::new("manifests").join(format!("{id}.toml"));
+    let body = match read_asset(home, &relative) {
+        AssetRead::Missing => {
+            return ManifestCheck {
+                path,
+                state: FileState::Missing,
+                ack_capable: false,
+                mailbox_capability_file: None,
+            };
+        }
+        AssetRead::Unreadable => {
+            return ManifestCheck {
+                path,
+                state: FileState::Unreadable,
+                ack_capable: false,
+                mailbox_capability_file: None,
+            };
+        }
+        AssetRead::ManualReview => {
+            return ManifestCheck {
+                path,
+                state: FileState::ManualReview,
+                ack_capable: false,
+                mailbox_capability_file: None,
+            };
+        }
+        AssetRead::Bytes(body) => body,
+    };
+    let Ok(body) = std::str::from_utf8(&body) else {
         return ManifestCheck {
             path,
-            state,
+            state: FileState::Invalid,
             ack_capable: false,
             mailbox_capability_file: None,
         };
     };
-    let parsed = match cyclops_manifest::Manifest::parse(&body, &path) {
+    let parsed = match cyclops_manifest::Manifest::parse(body, &path) {
         Ok(parsed) if parsed.agent.id == id => parsed,
         _ => {
             return ManifestCheck {
@@ -107,21 +259,43 @@ fn manifest_check(home: &Path, id: &str) -> ManifestCheck {
     }
 }
 
-fn skill_state(installed: bool, path: &Path) -> (&'static str, bool) {
-    if !installed {
-        return ("not_installed", true);
+fn skill_state(installation: Installation, asset: AssetRead) -> (&'static str, bool) {
+    match installation {
+        Installation::Absent => ("not_installed", true),
+        Installation::ManualReview => ("manual_review_required", false),
+        Installation::Present => match asset {
+            AssetRead::Missing => ("missing", false),
+            AssetRead::Unreadable => ("unreadable", false),
+            AssetRead::ManualReview => ("manual_review_required", false),
+            AssetRead::Bytes(body) => {
+                let state = crate::managed_assets::classify_seeded_bytes(
+                    &body,
+                    crate::skillseed::SHIPPED.as_bytes(),
+                    crate::skillseed::unedited_seed,
+                );
+                (state.word(), state.ready())
+            }
+        },
     }
-    match std::fs::read(path) {
-        Ok(body) => {
-            let state = crate::managed_assets::classify_seeded_bytes(
-                &body,
-                crate::skillseed::SHIPPED.as_bytes(),
-                crate::skillseed::unedited_seed,
-            );
-            (state.word(), state.ready())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ("missing", false),
-        Err(_) => ("unreadable", false),
+}
+
+fn hook_state(
+    installation: Installation,
+    kind: crate::hookset::CliKind,
+    asset: AssetRead,
+) -> (&'static str, bool) {
+    match installation {
+        Installation::Absent => ("not_installed", true),
+        Installation::ManualReview => ("manual_review_required", false),
+        Installation::Present => match asset {
+            AssetRead::Missing => ("missing", false),
+            AssetRead::Unreadable => ("unreadable", false),
+            AssetRead::ManualReview => ("manual_review_required", false),
+            AssetRead::Bytes(bytes) => {
+                let state = crate::hookset::inspect_wiring_bytes(kind, &bytes);
+                (state.word(), state.ready())
+            }
+        },
     }
 }
 
@@ -131,32 +305,45 @@ fn consumer_check(
     spec: &crate::consumer::Spec,
 ) -> ConsumerCheck {
     let locations = spec.locations(user_home);
-    let installed = locations.install_root.is_dir();
+    let installation = Installation::inspect(&locations.install_root);
+    let installed = installation.installed();
     let manifest = manifest_check(cyclops_home, spec.id);
-    let wiring = crate::hookset::inspect_wiring(spec.kind);
-    let (hook_state, hook_ready) = if !installed {
-        ("not_installed", true)
-    } else {
-        (wiring.state.word(), wiring.state.ready())
-    };
+    let hook_path = locations.hook.path();
+    let (hook_state, hook_ready) = hook_state(
+        installation,
+        spec.kind,
+        if installation == Installation::Present {
+            read_asset(&locations.hook.root, &locations.hook.relative)
+        } else {
+            AssetRead::Missing
+        },
+    );
     let required_receipt = installed.then_some(spec.receipt);
     let skill_path = locations.skill.path();
-    let (skill_state, skill_ready) = skill_state(installed, &skill_path);
+    let (skill_state, skill_ready) = skill_state(
+        installation,
+        if installation == Installation::Present {
+            read_skill_asset(&locations.skill)
+        } else {
+            AssetRead::Missing
+        },
+    );
     let mailbox_capability_path = manifest
         .mailbox_capability_file
         .as_deref()
         .and_then(|path| cyclops_manifest::mailbox_capability::resolve_path(path, user_home));
     let mailbox_capability_ready = installed.then(|| {
-        mailbox_capability_path
-            .as_deref()
-            .is_some_and(cyclops_manifest::mailbox_capability::is_current)
+        installation == Installation::Present
+            && mailbox_capability_path.as_deref() == Some(skill_path.as_path())
+            && skill_state == "current"
     });
     ConsumerCheck {
         id: spec.id,
         name: spec.name,
+        installation,
         installed,
         manifest,
-        hook_path: wiring.path,
+        hook_path: Some(hook_path),
         hook_state,
         hook_ready,
         required_receipt,
@@ -194,6 +381,7 @@ pub fn run_check(json_out: bool, style: &Style) -> i32 {
                     "id": check.id,
                     "name": check.name,
                     "installed": check.installed,
+                    "install_state": check.installation.word(),
                     "manifest": {
                         "path": check.manifest.path.display().to_string(),
                         "state": check.manifest.state.word(),
@@ -227,10 +415,10 @@ pub fn run_check(json_out: bool, style: &Style) -> i32 {
     };
     println!("{}", style.bold(heading));
     for check in &checks {
-        let installed = if check.installed {
-            "installed"
-        } else {
-            "not installed"
+        let installed = match check.installation {
+            Installation::Present => "installed",
+            Installation::Absent => "not installed",
+            Installation::ManualReview => "manual review required",
         };
         println!("  {} · {installed}", check.name);
         println!(
@@ -289,6 +477,70 @@ pub fn run_check(json_out: bool, style: &Style) -> i32 {
         );
     }
     i32::from(!complete)
+}
+
+/// Report only the safe setup-owned seeded-file decisions.
+///
+/// Config, hook wiring, themes, sounds, binaries, cleanup, and uninstall each
+/// retain their own lifecycle owners. This narrow preview is deliberately not
+/// a dry-run for every setup effect.
+pub fn run_plan(json_out: bool, style: &Style) -> i32 {
+    let Some(user_home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        eprintln!("setup plan needs a user home to locate installed consumers.");
+        return 1;
+    };
+    let cyclops_home = cyclops_proto::cyclops_home();
+    let assets = planned_assets(&cyclops_home, &user_home);
+
+    if json_out {
+        println!(
+            "{}",
+            json!({
+                "read_only": true,
+                "scope": "managed_asset_decisions_only",
+                "apply_available": false,
+                "assets": assets.iter().map(|asset| json!({
+                    "kind": asset.kind,
+                    "consumer": asset.consumer,
+                    "target": asset.target.display().to_string(),
+                    "observed_state": asset.decision.observed().word(),
+                    "action": asset.decision.action().word(),
+                    "ownership_reason": asset.decision.ownership_reason(),
+                })).collect::<Vec<_>>(),
+            })
+        );
+        return 0;
+    }
+
+    println!("{}", style.bold("setup plan · read-only"));
+    println!("  {}", style.dim("Managed asset decisions only."));
+    println!("  {}", style.dim("No apply command is available yet."));
+    for asset in &assets {
+        let label = match asset.consumer {
+            Some(consumer) => format!("{} · {consumer}", asset.kind),
+            None => asset.kind.to_string(),
+        };
+        println!("  {label}");
+        println!(
+            "    target    {}",
+            style.dim(&asset.target.display().to_string())
+        );
+        println!(
+            "    observed  {}",
+            asset.decision.observed().word().replace('_', " ")
+        );
+        println!(
+            "    action    {}",
+            asset.decision.action().word().replace('_', " ")
+        );
+        println!("    ownership {}", asset.decision.ownership_reason());
+    }
+    println!();
+    println!(
+        "  {}",
+        style.dim("No files were changed. This report has no apply capability yet.")
+    );
+    0
 }
 
 #[cfg(test)]

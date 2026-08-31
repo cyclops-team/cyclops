@@ -138,8 +138,7 @@ enum Cmd {
     /// Safe to run twice; a session that is already there is left alone.
     #[command(hide = true)]
     Start(StartArgs),
-    /// Inspect manifests, hook wiring, and agent skill installation.
-    /// Reads setup state without changing it.
+    /// Inspect setup state or preview safe seeded-file decisions without changing it.
     #[command(hide = true)]
     Setup {
         #[command(subcommand)]
@@ -309,11 +308,11 @@ enum Cmd {
         name: Option<String>,
     },
     /// Update Cyclops itself: fetch the source, rebuild, and replace the
-    /// installed binaries. Durable records and operator-edited setup files
-    /// are preserved. Untouched shipped themes, manifests, skills, and
-    /// Cyclops hook entries may be upgraded. Set CYCLOPS_NO_VENDOR_HOOKS=1
-    /// to skip vendor hook and skill wiring. A running daemon is safely
-    /// restarted; a stopped daemon stays stopped. An open workspace is untouched.
+    /// installed binaries. Durable records and existing manifests and skills
+    /// are preserved. Known unedited shipped themes and verified Cyclops-owned
+    /// hook entries may be refreshed. Set CYCLOPS_NO_VENDOR_HOOKS=1 to skip
+    /// vendor hook and skill wiring. A running daemon is safely restarted; a
+    /// stopped daemon stays stopped. An open workspace is untouched.
     #[command(hide = true)]
     Update {
         /// Reactivate a replay-proven retained pair. State is not rolled back.
@@ -398,6 +397,8 @@ enum DaemonCmd {
 enum SetupCmd {
     /// Report setup and whether messaging uses a doorbell or direct fallback.
     Check,
+    /// Preview manifests and final skill leaves below accepted private parents without writing files.
+    Plan,
 }
 
 #[derive(clap::Args)]
@@ -912,8 +913,9 @@ fn run(cli: &Cli) -> i32 {
 /// never there. Without manifests, every pane reads unknown and nothing can
 /// be delivered, which is indistinguishable from a broken install to a
 /// first-time visitor who ran bare `cyclops` after a binary-only copy.
-/// Operator-edited files stay unchanged. Known unedited shipped files may
-/// advance, and a current home costs no writes on open.
+/// Existing manifests stay unchanged, including known old shipped seeds;
+/// setup reports those as outdated for manual review. A current manifest home
+/// costs no writes on open. Themes and sounds retain their own update policy.
 ///
 /// A problem is a note, not an exit: a home without themes still renders in
 /// built-in colors, and a home without manifests still opens (the sidebar
@@ -934,9 +936,10 @@ fn seed_home_for_workspace() {
         eprintln!("{}", manifests::partly_installed(&seeded));
     }
     // The vendor homes too, when the installer's consent is on file: an
-    // agent CLI installed after cyclops gets its skill and hook config on
-    // this boot instead of never. Quiet unless something was written, so
-    // the front door stays silent on every ordinary open.
+    // agent CLI installed after Cyclops gets its hook config and, when it
+    // already owns a private skill parent, its final skill file on this boot.
+    // Quiet unless something was written, so the front door stays silent on
+    // every ordinary open.
     for note in workspace::finish_deferred_wiring(&home) {
         eprintln!("{note}");
     }
@@ -1004,6 +1007,9 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
         Cmd::Setup {
             cmd: SetupCmd::Check,
         } => setup::run_check(cli.json, &style_for(cli)),
+        Cmd::Setup {
+            cmd: SetupCmd::Plan,
+        } => setup::run_plan(cli.json, &style_for(cli)),
         // Health must not load a theme through an unchecked state path.
         Cmd::Sizing {
             cmd: SizingCmd::Release { session },
