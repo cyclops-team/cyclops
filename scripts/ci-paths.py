@@ -53,6 +53,7 @@ def classify(paths: list[str]) -> dict[str, bool]:
             ".github/workflows/ci.yml",
             "scripts/ci-paths.py",
             "scripts/ci-performance.py",
+            "scripts/perf/install_first_handoff.py",
         }
 
         result["rust"] |= control or cargo or path == ".config/nextest.toml" or under(
@@ -162,6 +163,7 @@ def selftest() -> None:
     performance = classify(["scripts/ci-performance.py"])
     assert all(performance.values())
     assert performance["performance_runner"]
+    assert classify(["scripts/perf/install_first_handoff.py"])["performance_runner"]
     assert not classify(["docs/development/CI.md"])["performance_runner"]
     control = classify([".github/workflows/ci.yml"])
     assert all(control.values())

@@ -363,6 +363,9 @@ performance artifact. Change that runner only with its focused contract check:
 python3 scripts/ci-performance.py --selftest
 ```
 
+That fast check also rejects a fixture name response that does not confirm the
+exact manifest pin before a retained handoff record can claim it.
+
 GitHub retains the JSON artifact, including failed-evidence diagnostics, for 90
 days under a commit-specific name.
 
@@ -387,11 +390,14 @@ The `install-first-durable-handoff` workload adds one structured measurement
 to that artifact. It uses the public source installer from the checked-out
 tree with a fresh private prefix, home, tmux server, daemon, fixture agents,
 journal, and Cargo target directory. It separately records source build, pair
-activation, setup, daemon readiness, session adoption, agent detection,
-durable send, and authenticated claim. The workload is a staged local-source
+activation, setup, daemon readiness, session adoption, explicit fixture-manifest
+binding, durable send, and authenticated claim. The workload is a staged local-source
 install: its Cargo registry and toolchain may be warm, and it does not measure
 network download or Rust installation. Its synthetic two-agent fixture is
-reported as a separate setup phase. Readiness and fixture completion have a
+reported as a separate setup phase and is explicitly bound through the public
+`cyclops name --manifest` command. That pin selects fixture rules; the later
+send and claim still require live process-ancestry authentication. Readiness
+and fixture completion have a
 bounded 50 ms test-rig probe interval, so those small phase values are not
 latency claims. One staged sample is retained per run, so its p50, p95, and
 maximum are the same observed sample rather than a statistical confidence
