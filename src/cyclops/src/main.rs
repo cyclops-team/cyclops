@@ -54,6 +54,7 @@ mod setup;
 mod sizing;
 mod skillseed;
 mod soundseed;
+mod state_remove;
 mod style;
 mod theme;
 mod themeseed;
@@ -171,6 +172,17 @@ enum Cmd {
     Data {
         #[command(subcommand)]
         cmd: DataCmd,
+    },
+    /// Preview removal of the complete current Cyclops state home, then require its exact confirmation.
+    #[command(hide = true)]
+    Remove {
+        /// Confirm that the complete state home shown by the current preview may be removed.
+        #[arg(long, required = true)]
+        all: bool,
+        /// Exact token emitted by a matching preview while the daemon stayed
+        /// stopped. Without this, Cyclops only previews.
+        #[arg(long, value_name = "TOKEN")]
+        confirm: Option<String>,
     },
     /// Inventory or remove bounded rebuildable assets. Dry-run is the default.
     #[command(hide = true)]
@@ -1041,6 +1053,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
         Cmd::Data {
             cmd: DataCmd::Forget { all: _, confirm },
         } => data_forget::run(cli.json, confirm.as_deref()),
+        Cmd::Remove { all: _, confirm } => state_remove::run(cli.json, confirm.as_deref()),
         // Cleanup has no arbitrary path input and does not need the daemon.
         Cmd::Cleanup { assets, apply } => cleanup::run(cli.json, assets, *apply),
         Cmd::Start(args) => workspace::run_start(
@@ -1229,6 +1242,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 | Cmd::Setup { .. }
                 | Cmd::Health
                 | Cmd::Data { .. }
+                | Cmd::Remove { .. }
                 | Cmd::Cleanup { .. }
                 | Cmd::Theme { .. }
                 | Cmd::Update { .. }

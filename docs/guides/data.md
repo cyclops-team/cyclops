@@ -81,8 +81,10 @@ are never modified by Cyclops either way.
 
 The current installer uninstall preserves the Cyclops state home and its
 journals. Use the explicit journey below when you want to remove the journal
-scope, or follow the [uninstall guide](install.md#uninstall) for the wider
-manual removal of settings and vendor hooks.
+scope, use [`cyclops remove --all`](#remove-the-complete-current-state-home)
+when you want to remove the complete current state home, or follow the
+[uninstall guide](install.md#uninstall) for separately owned binaries and
+vendor-hook cleanup.
 
 ## Forget the retained journal scope
 
@@ -132,3 +134,39 @@ considers only the original previewed paths: files created after the preview
 are left in place, and a changed planned file is left in place and reported as
 partial. A recovery report distinguishes files removed by that invocation from
 planned files that were already absent. Empty parent directories may remain.
+
+## Remove the complete current state home
+
+`cyclops remove --all` is separate from `cyclops data forget --all`. It
+previews the complete current state home, including configuration, layouts,
+themes, logs, prepared local assets, and retained journals. Its preview and
+checkpoint contain paths, counts, byte totals, and file identity evidence, not
+message bodies.
+
+Stop the daemon, export any history you need, then preview and confirm the
+same body-free plan:
+
+```bash
+cyclops daemon stop
+cyclops data export --to <new-directory>
+cyclops remove --all
+cyclops remove --all --confirm <token-from-preview>
+```
+
+The confirmation applies only to the exact inspected state root and entries.
+Cyclops refuses a live daemon, symlinks, hard links, mount-boundary changes,
+replaced files or directories, unpreviewed entries after a pending checkpoint,
+and stale confirmations. It first isolates the exact root to a private sibling
+without replacing an existing path. Any new `CYCLOPS_HOME` created after that
+is left untouched and reported as partial.
+
+Interrupted work resumes only from a durable body-free checkpoint bound to the
+original root identity. If a crash occurs after the final checkpoint is
+deleted, no later `cyclops remove` can safely resume the tombstone. Cyclops
+leaves it untouched. Do not delete it because of its `.removing` name; handle
+it outside Cyclops only if you independently establish what it is.
+
+This command does not remove installed binaries, the installer-owned PATH
+block, vendor configuration, or skill files in agent-owned directories,
+including a Cyclops-seeded copy. See the [uninstall guide](install.md#uninstall)
+for those separately owned steps.

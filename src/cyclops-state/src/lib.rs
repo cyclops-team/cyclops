@@ -82,13 +82,6 @@ pub enum CreateFileOutcome {
     AlreadyExists,
 }
 
-/// Result of creating a state root without opening an existing path.
-#[derive(Debug)]
-pub enum CreateStateRootOutcome {
-    Created(StateRoot),
-    AlreadyExists,
-}
-
 /// Totals from one recursive state permission repair.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct RepairSummary {
@@ -175,6 +168,66 @@ pub struct InspectedEntry {
     pub unsafe_reason: Option<&'static str>,
 }
 
+/// Stable identity and change-time evidence for one regular file selected by
+/// a destructive preview.
+///
+/// Descriptor-bound removal rechecks this evidence immediately before
+/// unlinking. This complements the inode and size checks in [`InspectedEntry`]
+/// so an in-place, same-length rewrite cannot be silently removed after a
+/// confirmation.
+#[derive(Debug, Clone, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegularFileEvidence {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    uid: u32,
+    links: u64,
+    bytes: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl RegularFileEvidence {
+    /// Capture evidence from one held regular-file descriptor.
+    pub fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.permissions().mode() & 0o7777,
+            uid: metadata.uid(),
+            links: metadata.nlink(),
+            bytes: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+
+    /// The byte count captured with this evidence.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Compare this evidence with the exact descriptor held for removal.
+    pub fn matches_metadata(&self, metadata: &std::fs::Metadata) -> bool {
+        self == &Self::from_metadata(metadata)
+    }
+
+    /// Check that the stable portion still agrees with an inspected entry.
+    pub fn matches_entry(&self, entry: &InspectedEntry) -> bool {
+        self.device == entry.device
+            && self.inode == entry.inode
+            && self.mode == entry.mode
+            && self.uid == entry.uid
+            && self.links == entry.links
+            && self.bytes == entry.size
+    }
+}
+
 impl InspectedEntry {
     pub fn safe(&self) -> bool {
         self.unsafe_reason.is_none()
@@ -248,6 +301,7 @@ pub struct BoundStateRemoval {
     name: CString,
     path: PathBuf,
     expected: InspectedEntry,
+    regular_evidence: Option<RegularFileEvidence>,
     kind: RemovalKind,
 }
 
@@ -818,7 +872,32 @@ impl StateInspector {
                 "removal target is not one owned single-link regular file",
             ));
         }
-        self.bind_for_removal(expected, RemovalKind::RegularFile)
+        self.bind_for_removal(expected, RemovalKind::RegularFile, None)
+    }
+
+    /// Bind one inspected regular file and carry its temporal preview evidence
+    /// through the final unlink.
+    ///
+    /// [`BoundStateRemoval::remove`] rechecks this evidence on the held file
+    /// descriptor immediately before it unlinks the matching name. Callers
+    /// that have a cooperative writer lease should acquire it between binding
+    /// and removal so a writer cannot change the same inode in that interval.
+    pub fn bind_regular_file_for_removal_with_evidence(
+        &self,
+        expected: &InspectedEntry,
+        evidence: &RegularFileEvidence,
+    ) -> Result<BoundStateRemoval, StateError> {
+        if expected.kind != InspectedKind::RegularFile
+            || expected.uid != self.owner
+            || expected.links != 1
+            || !evidence.matches_entry(expected)
+        {
+            return Err(unsafe_path(
+                &expected.path,
+                "removal target does not match owned regular-file preview evidence",
+            ));
+        }
+        self.bind_for_removal(expected, RemovalKind::RegularFile, Some(evidence))
     }
 
     /// Bind one inspected empty directory for one explicit removal attempt.
@@ -832,7 +911,7 @@ impl StateInspector {
                 "removal target is not one owned directory",
             ));
         }
-        self.bind_for_removal(expected, RemovalKind::EmptyDirectory)
+        self.bind_for_removal(expected, RemovalKind::EmptyDirectory, None)
     }
 
     /// Atomically move this exact state root to one private sibling tombstone.
@@ -1008,6 +1087,7 @@ impl StateInspector {
         &self,
         expected: &InspectedEntry,
         kind: RemovalKind,
+        regular_evidence: Option<&RegularFileEvidence>,
     ) -> Result<BoundStateRemoval, StateError> {
         let descendant = expected
             .path
@@ -1060,6 +1140,17 @@ impl StateInspector {
             })?,
         };
         validate_removal_descriptor(&target, expected, kind)?;
+        if let Some(evidence) = regular_evidence {
+            let metadata = target
+                .metadata()
+                .map_err(|source| io_error(&expected.path, source))?;
+            if !evidence.matches_metadata(&metadata) {
+                return Err(unsafe_path(
+                    &expected.path,
+                    "regular removal target changed after its preview",
+                ));
+            }
+        }
         let after = stat_at_optional(&parent, &name, &expected.path)?
             .ok_or_else(|| unsafe_path(&expected.path, "removal target changed before binding"))?;
         validate_removal_stat(&after, expected, kind)?;
@@ -1087,6 +1178,7 @@ impl StateInspector {
             name,
             path: expected.path.clone(),
             expected: expected.clone(),
+            regular_evidence: regular_evidence.cloned(),
             kind,
         })
     }
@@ -1116,6 +1208,22 @@ impl StateRootIsolation {
     /// Consume the result into the held state root and inspector.
     pub fn into_parts(self) -> (StateRoot, StateInspector) {
         (self.state_root, self.inspector)
+    }
+
+    /// Remove this exact tombstone only after its caller has made it empty.
+    ///
+    /// This is the final, non-recursive step of a state-home removal. The
+    /// inspector is deliberately dropped first, then the held root proves the
+    /// tombstone still names the same empty directory before unlinking that one
+    /// sibling entry.
+    pub fn remove_if_empty(self) -> Result<(), StateError> {
+        let Self {
+            state_root,
+            inspector,
+            ..
+        } = self;
+        drop(inspector);
+        state_root.remove_if_empty()
     }
 }
 
@@ -1329,75 +1437,107 @@ enum RemovalKind {
 }
 
 impl StateRoot {
-    /// Create one missing state root without opening or repairing an existing
-    /// path.
+    /// Clone descriptor-bound inspection authority for this exact state root.
     ///
-    /// This is the narrow companion to state-home isolation: a complete
-    /// removal can create a fresh guarded replacement only if no daemon or
-    /// other process has already recreated the root. An occupied final name of
-    /// any type returns [`CreateStateRootOutcome::AlreadyExists`] untouched.
-    pub fn create_new(path: &Path) -> Result<CreateStateRootOutcome, StateError> {
-        let owner = effective_uid();
-        let (parent, name, _) = state_root_parent(path)?;
-        if !state_root_parent_matches_held(path, &parent)? {
+    /// A confirmed operation can acquire a shared lease through `StateRoot`
+    /// and inspect or isolate through the returned value without reopening the
+    /// root by pathname. That keeps the lease and destructive authority tied
+    /// to the same directory even if a competing process renames or replaces
+    /// the visible path between setup steps.
+    pub fn inspector(&self) -> Result<StateInspector, StateError> {
+        if !self.path_matches_held_root()? {
             return Err(unsafe_path(
-                path,
-                "state root parent changed before exclusive creation",
+                &self.path,
+                "state root changed before descriptor-bound inspection",
+            ));
+        }
+        if !private_directory(&self.directory, &self.path, self.owner)? {
+            return Err(unsafe_path(
+                &self.path,
+                "state root is not private enough for descriptor-bound inspection",
+            ));
+        }
+        let metadata = self
+            .directory
+            .metadata()
+            .map_err(|source| io_error(&self.path, source))?;
+        let root = inspected_from_metadata(self.path.clone(), &metadata, self.owner);
+        Ok(StateInspector {
+            directory: clone_file(&self.directory, &self.path)?,
+            path: self.path.clone(),
+            owner: self.owner,
+            root,
+        })
+    }
+
+    /// Remove this exact state root only when it is empty.
+    ///
+    /// This is intentionally not a tree deleter. It checks the held root and
+    /// its parent again, inspects the directory with a one-entry bound, and
+    /// removes only the verified final root name. A visible removal whose
+    /// parent sync fails is reported as durability-unknown.
+    pub fn remove_if_empty(self) -> Result<(), StateError> {
+        if !self.path_matches_held_root()? {
+            return Err(unsafe_path(
+                &self.path,
+                "state root changed before empty-root removal",
+            ));
+        }
+        if !private_directory(&self.directory, &self.path, self.owner)? {
+            return Err(unsafe_path(
+                &self.path,
+                "state root is not private enough for empty-root removal",
             ));
         }
 
-        // SAFETY: parent and name are validated; mkdirat creates only this
-        // final child and never follows it.
-        let created = unsafe {
-            libc::mkdirat(
-                parent.as_raw_fd(),
-                name.as_ptr(),
-                DIRECTORY_MODE as libc::mode_t,
-            )
-        };
-        if created != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                return Ok(CreateStateRootOutcome::AlreadyExists);
-            }
-            return Err(path_error(path, error, "could not create new state root"));
+        let (parent, name, _) = state_root_parent(&self.path)?;
+        if !state_root_parent_matches_held(&self.path, &parent)? {
+            return Err(unsafe_path(
+                &self.path,
+                "state root parent changed before empty-root removal",
+            ));
         }
 
-        let result = (|| {
-            let root = open_directory_at(&parent, &name).map_err(|error| {
-                path_error(path, error, "new state root changed before validation")
-            })?;
-            validate_directory(&root, path, owner)?;
-            repair_descriptor_permissions(&root, path, DIRECTORY_MODE)?;
-            validate_directory(&root, path, owner)?;
-
-            let descriptor = root.metadata().map_err(|source| io_error(path, source))?;
-            let named = stat_at(&parent, &name, path)?;
-            if !metadata_matches_stat(&descriptor, &named) {
-                return Err(unsafe_path(
-                    path,
-                    "new state root changed before validation",
-                ));
-            }
-            root.sync_all().map_err(|source| io_error(path, source))?;
-            sync_directory(&parent).map_err(|source| StateError::CreationDurabilityUnknown {
-                path: path.to_path_buf(),
-                source,
-            })?;
-            Ok(root)
-        })();
-        match result {
-            Ok(root) => Ok(CreateStateRootOutcome::Created(Self {
-                directory: root,
-                path: path.to_path_buf(),
-                owner,
-            })),
-            Err(error @ StateError::CreationDurabilityUnknown { .. }) => Err(error),
-            Err(error) => Err(StateError::CreationMayBeVisible {
-                path: path.to_path_buf(),
-                cause: error.to_string(),
-            }),
+        let metadata = self
+            .directory
+            .metadata()
+            .map_err(|source| io_error(&self.path, source))?;
+        let expected = inspected_from_metadata(self.path.clone(), &metadata, self.owner);
+        validate_removal_descriptor(&self.directory, &expected, RemovalKind::EmptyDirectory)?;
+        let snapshot = inspect_directory_descriptor(
+            clone_file(&self.directory, &self.path)?,
+            self.path.clone(),
+            self.owner,
+            expected.clone(),
+            InspectionLimits::new(1, INSPECTION_NAME_BYTES_LIMIT_MAX)
+                .expect("empty-root inspection limits fit hard ceilings"),
+        )?;
+        if snapshot.truncated || !snapshot.entries.is_empty() {
+            return Err(unsafe_path(
+                &self.path,
+                "state root is not empty for removal",
+            ));
         }
+
+        let named = stat_at(&parent, &name, &self.path)?;
+        validate_removal_stat(&named, &expected, RemovalKind::EmptyDirectory)?;
+        validate_removal_descriptor(&self.directory, &expected, RemovalKind::EmptyDirectory)?;
+
+        // SAFETY: the held parent and immediately revalidated root name
+        // identify the empty state root. `AT_REMOVEDIR` cannot recurse.
+        let result =
+            unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+        if result != 0 {
+            return Err(path_error(
+                &self.path,
+                std::io::Error::last_os_error(),
+                "could not remove empty state root",
+            ));
+        }
+        sync_directory(&parent).map_err(|source| StateError::RemovalDurabilityUnknown {
+            path: self.path,
+            source,
+        })
     }
 
     /// Open or create the state root without following any path component.
@@ -1717,6 +1857,39 @@ impl StateRoot {
 
     /// Capture cleanup authority for one validated root-level socket.
     pub fn bound_socket_cleanup(&self, leaf: &OsStr) -> Result<BoundSocketCleanup, StateError> {
+        self.capture_root_socket_cleanup(leaf, None)
+    }
+
+    /// Capture cleanup authority for one exact inspected root-level socket.
+    ///
+    /// Complete state-home removal uses this form so a replacement socket is
+    /// left in place rather than becoming a newly authorized cleanup target.
+    pub fn bind_root_socket_for_removal(
+        &self,
+        expected: &InspectedEntry,
+    ) -> Result<BoundSocketCleanup, StateError> {
+        if expected.kind != InspectedKind::Socket
+            || expected.uid != self.owner
+            || expected.links != 1
+            || expected.path.parent() != Some(self.path.as_path())
+        {
+            return Err(unsafe_path(
+                &expected.path,
+                "removal target is not one owned root-level socket",
+            ));
+        }
+        let leaf = expected
+            .path
+            .file_name()
+            .ok_or_else(|| unsafe_path(&expected.path, "state socket has no file name"))?;
+        self.capture_root_socket_cleanup(leaf, Some(expected))
+    }
+
+    fn capture_root_socket_cleanup(
+        &self,
+        leaf: &OsStr,
+        expected: Option<&InspectedEntry>,
+    ) -> Result<BoundSocketCleanup, StateError> {
         let descendant = Path::new(leaf);
         let parts = descendant_parts(descendant)?;
         if parts.len() != 1 {
@@ -1736,6 +1909,20 @@ impl StateRoot {
         }
         if metadata.st_nlink != 1 {
             return Err(unsafe_path(&path, "state socket has multiple hard links"));
+        }
+        if let Some(expected) = expected {
+            let same = metadata.st_dev as u64 == expected.device
+                && stat_inode(&metadata) == expected.inode
+                && metadata.st_uid == expected.uid
+                && metadata.st_nlink as u64 == expected.links
+                && metadata.st_mode as u32 & 0o7777 == expected.mode
+                && u64::try_from(metadata.st_size).unwrap_or_default() == expected.size;
+            if !same {
+                return Err(unsafe_path(
+                    &path,
+                    "state socket changed before removal binding",
+                ));
+            }
         }
         Ok(BoundSocketCleanup {
             directory: clone_file(&self.directory, &path)?,
@@ -1947,6 +2134,18 @@ impl BoundStateRemoval {
     pub fn remove(self) -> Result<(), StateError> {
         validate_removal_descriptor(&self.target, &self.expected, self.kind)
             .map_err(|_| unsafe_path(&self.path, "bound removal target changed before removal"))?;
+        if let Some(evidence) = &self.regular_evidence {
+            let metadata = self
+                .target
+                .metadata()
+                .map_err(|source| io_error(&self.path, source))?;
+            if !evidence.matches_metadata(&metadata) {
+                return Err(unsafe_path(
+                    &self.path,
+                    "bound regular removal target changed after its preview",
+                ));
+            }
+        }
         let named = stat_at_optional(&self.parent, &self.name, &self.path)?.ok_or_else(|| {
             unsafe_path(&self.path, "bound removal target changed before removal")
         })?;
@@ -2854,7 +3053,7 @@ fn inspection_safety(
         InspectedKind::Symlink => return Some("state entry is a symbolic link"),
         InspectedKind::Other => return Some("state entry has an unsupported file type"),
         InspectedKind::RegularFile if links != 1 => {
-            return Some("state file has multiple hard links")
+            return Some("state file has multiple hard links");
         }
         InspectedKind::Socket if links != 1 => return Some("state socket has multiple hard links"),
         _ => {}
@@ -4518,70 +4717,81 @@ mod tests {
     }
 
     #[test]
-    fn exclusive_root_creation_creates_only_a_missing_private_root() {
-        let temp = tempfile::tempdir().unwrap();
-        let root_path = base(&temp).join("state");
-
-        let root = match StateRoot::create_new(&root_path).unwrap() {
-            CreateStateRootOutcome::Created(root) => root,
-            CreateStateRootOutcome::AlreadyExists => panic!("missing root was not created"),
-        };
-        assert_eq!(mode(&root_path), 0o700);
-        root.open_append(Path::new("guard"))
-            .unwrap()
-            .append_bounded(b"held\n", 1024, 512)
-            .unwrap();
-        drop(root);
-
-        assert!(matches!(
-            StateRoot::create_new(&root_path).unwrap(),
-            CreateStateRootOutcome::AlreadyExists
-        ));
-        assert_eq!(fs::read(root_path.join("guard")).unwrap(), b"held\n");
-    }
-
-    #[test]
-    fn exclusive_root_creation_leaves_existing_files_and_links_untouched() {
+    fn empty_root_removal_removes_only_the_held_empty_root() {
         let temp = tempfile::tempdir().unwrap();
         let base = base(&temp);
         let root_path = base.join("state");
-        fs::write(&root_path, b"operator file\n").unwrap();
-        set_mode(&root_path, 0o644);
+        let root = StateRoot::open_or_create(&root_path).unwrap();
 
-        assert!(matches!(
-            StateRoot::create_new(&root_path).unwrap(),
-            CreateStateRootOutcome::AlreadyExists
-        ));
-        assert_eq!(fs::read(&root_path).unwrap(), b"operator file\n");
-        assert_eq!(mode(&root_path), 0o644);
+        root.remove_if_empty().unwrap();
 
-        fs::remove_file(&root_path).unwrap();
-        let external = base.join("external");
-        fs::create_dir(&external).unwrap();
-        symlink(&external, &root_path).unwrap();
-        assert!(matches!(
-            StateRoot::create_new(&root_path).unwrap(),
-            CreateStateRootOutcome::AlreadyExists
-        ));
-        assert!(root_path.is_symlink());
-        assert!(external.is_dir());
+        assert!(!root_path.exists());
+        assert!(base.exists(), "empty-root removal never reaches its parent");
     }
 
     #[test]
-    fn exclusive_root_creation_reports_visible_creation_when_parent_sync_fails() {
+    fn empty_root_removal_refuses_a_replacement_or_nonempty_root() {
         let temp = tempfile::tempdir().unwrap();
-        let root_path = base(&temp).join("state");
-        inject_next_directory_sync_failure();
+        let base = base(&temp);
+        let root_path = base.join("state");
+        let held = StateRoot::open_or_create(&root_path).unwrap();
+        let displaced = base.join("displaced");
+        fs::rename(&root_path, &displaced).unwrap();
+        fs::create_dir(&root_path).unwrap();
 
-        let error = StateRoot::create_new(&root_path).unwrap_err();
-        assert!(matches!(
-            error,
-            StateError::CreationDurabilityUnknown { path, .. } if path == root_path
-        ));
+        assert!(held.remove_if_empty().is_err());
+        assert!(root_path.is_dir(), "the replacement root stays untouched");
         assert!(
-            root_path.exists(),
-            "the new root was visible before sync failed"
+            displaced.is_dir(),
+            "the held root stays available for recovery"
         );
+
+        let nonempty = StateRoot::open_existing(&root_path).unwrap().unwrap();
+        nonempty
+            .open_append(Path::new("keep"))
+            .unwrap()
+            .append_bounded(b"keep\n", 1024, 512)
+            .unwrap();
+        assert!(nonempty.remove_if_empty().is_err());
+        assert_eq!(fs::read(root_path.join("keep")).unwrap(), b"keep\n");
+    }
+
+    #[test]
+    fn isolated_empty_root_can_be_finalized_without_reopening_its_source_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let root = root_in(&temp);
+        let root_path = root.path().to_path_buf();
+        drop(root);
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let isolation = inspector
+            .isolate_root_to_sibling(OsStr::new(".state-removing"))
+            .unwrap();
+        let tombstone = base.join(".state-removing");
+
+        isolation.remove_if_empty().unwrap();
+
+        assert!(!root_path.exists());
+        assert!(!tombstone.exists());
+    }
+
+    #[test]
+    fn descriptor_bound_inspector_cannot_follow_a_replaced_root_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let held = root_in(&temp);
+        let root_path = held.path().to_path_buf();
+        let inspector = held.inspector().unwrap();
+        let displaced = base.join("displaced");
+        fs::rename(&root_path, &displaced).unwrap();
+        fs::create_dir(&root_path).unwrap();
+
+        assert!(!inspector.path_matches_held_root().unwrap());
+        assert!(held.inspector().is_err());
+        assert!(displaced.is_dir());
+        assert!(root_path.is_dir());
     }
 
     #[test]
@@ -4680,6 +4890,46 @@ mod tests {
         fs::write(&path, b"changed size").unwrap();
         assert!(removal.remove().is_err());
         assert_eq!(fs::read(&path).unwrap(), b"changed size");
+    }
+
+    #[test]
+    fn bound_regular_removal_with_evidence_refuses_a_same_size_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+        let path = root_path.join("entry");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(&path, b"before").unwrap();
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let snapshot = inspector.inspect_root(InspectionLimits::default()).unwrap();
+        let evidence = RegularFileEvidence::from_metadata(&fs::metadata(&path).unwrap());
+        let removal = inspector
+            .bind_regular_file_for_removal_with_evidence(&snapshot.entries[0], &evidence)
+            .unwrap();
+        assert!(removal.try_lock().unwrap());
+
+        fs::write(&path, b"after!").unwrap();
+        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: 1,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: 2,
+                tv_nsec: 0,
+            },
+        ];
+        // SAFETY: this test supplies a valid path and the two timestamps
+        // required by utimensat, using a fixed time rather than a sleep.
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, name.as_ptr(), times.as_ptr(), 0) },
+            0
+        );
+
+        assert!(removal.remove().is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"after!");
     }
 
     #[test]

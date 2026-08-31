@@ -703,11 +703,16 @@ and refuses unknown, linked, or ownership-changing entries instead of deleting
 an unproven tree. Both public names are removed only from one prefix, selected
 by `--prefix` or by the `cyclops` command on `PATH`. It never resolves a
 `cyclopsd` from another prefix. If only `cyclopsd` can be found, uninstall
-refuses and asks for an explicit prefix:
+refuses and asks for an explicit prefix.
+
+For a state-preserving uninstall, run:
 
 ```bash
 curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
 ```
+
+Do not run that command first when you intend to remove the complete state
+home: it removes the `cyclops` command needed for the state-home journey below.
 
 If you want to remove the retained journals but keep the rest of Cyclops
 state, start with the previewed
@@ -717,12 +722,37 @@ exact confirmation. It removes only the previewed workspace and session NDJSON
 journals, and deliberately leaves configuration and vendor wiring alone.
 Export first if you might need the history.
 
-If you also want to remove all Cyclops configuration and records, stop the
-daemon and copy out any history you want to keep before manually removing
-`~/.cyclops`. A complete uninstall must also remove only the Cyclops command
-hooks from installed vendor configuration. Check
+If you also want to remove all configuration and records in the current
+Cyclops state home, stop the daemon and copy out any history you want to keep.
+Then make the body-free preview and run only its exact confirmation:
+
+```bash
+cyclops daemon stop
+cyclops data export --to <new-directory>
+cyclops remove --all
+cyclops remove --all --confirm <token-from-preview>
+```
+
+This command removes only the selected current state home. It leaves installed
+binaries, the installer-owned PATH block, vendor configuration, and skill
+files in agent-owned directories, including a Cyclops-seeded copy, alone. For
+the exact scope and interrupted-removal recovery boundary, follow the
+[`cyclops remove --all` guide](data.md#remove-the-complete-current-state-home).
+
+After that state-home command reports its result, run the managed uninstall:
+
+```bash
+curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
+```
+
+The remaining complete-uninstall work is separately owned. Remove only the
+Cyclops command hooks from installed vendor configuration. Check
 `~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.agents/hooks.json`, and
 `~/.cursor/hooks.json` where those files exist. Delete entries whose command
 invokes a `cyclops` binary followed by `hook <Event>`, while preserving every
 unrelated key, hook, and setting. Removing the binaries before these entries
 leaves the vendor CLI reporting hook exit code 127.
+
+Skill files in agent-owned directories, including a Cyclops-seeded copy, are
+not part of either `cyclops remove --all` or the managed installer uninstall.
+Remove one only after checking whether it is an operator customization.
