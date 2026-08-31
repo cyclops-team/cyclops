@@ -91,17 +91,22 @@ INSTALL_HANDOFF_PHASES = {
     "authenticated_claim",
     "first_durable_handoff_total",
 }
-INSTALL_HANDOFF_WORKLOAD_FIELDS = {
-    "install_mode",
-    "source_acquisition",
-    "cargo_target",
-    "state",
-    "dataset",
-    "fixture",
-    "observation_resolution",
-    "sample_note",
-    "comparison_baseline",
-    "excludes",
+INSTALL_HANDOFF_WORKLOAD = {
+    "install_mode": "staged local source install",
+    "source_acquisition": "not measured: this invokes the public installer from the checked-out source tree",
+    "cargo_target": "fresh isolated target directory; registry and toolchain caches may be warm",
+    "state": "fresh isolated prefix, HOME, CYCLOPS_HOME, tmux server, daemon, fixture agents, and journal",
+    "dataset": "two detected fixture agents; one durable direct message and one authenticated claim",
+    "fixture": "a test-only manifest and agent executable are prepared after installation; fixture setup is reported separately",
+    "observation_resolution": "readiness and fixture completion use bounded 50ms test-rig probes; sub-50ms phases are not latency claims",
+    "sample_note": "one staged install sample per artifact; percentile fields equal the observed sample",
+    "comparison_baseline": "compare only artifacts with the same staged local-source workload, fresh target shape, and recorded environment; no universal target is asserted",
+    "excludes": [
+        "network source download",
+        "Rust toolchain installation",
+        "real vendor agent startup",
+        "notification or terminal-injection latency",
+    ],
 }
 
 
@@ -243,16 +248,8 @@ def install_handoff_report_error(report: dict[str, object]) -> str | None:
         return "installed pair is not matched"
 
     workload = report.get("workload")
-    if not isinstance(workload, dict) or INSTALL_HANDOFF_WORKLOAD_FIELDS.difference(workload):
-        return "install handoff record is missing workload metadata"
-    if workload.get("install_mode") != "staged local source install":
-        return "install handoff record has the wrong install mode"
-    for key in INSTALL_HANDOFF_WORKLOAD_FIELDS - {"excludes"}:
-        if not nonempty_string(workload.get(key)):
-            return f"workload.{key} is missing"
-    excludes = workload.get("excludes")
-    if not isinstance(excludes, list) or not excludes or not all(nonempty_string(item) for item in excludes):
-        return "workload.excludes is missing"
+    if workload != INSTALL_HANDOFF_WORKLOAD:
+        return "install handoff record does not match the retained workload contract"
 
     phases = report.get("phases")
     if not isinstance(phases, dict):
@@ -396,18 +393,7 @@ def complete_install_handoff_report() -> dict[str, object]:
             "cyclopsd": "cyclopsd 0.1.0",
             "matched": True,
         },
-        "workload": {
-            "install_mode": "staged local source install",
-            "source_acquisition": "not measured",
-            "cargo_target": "fresh",
-            "state": "isolated",
-            "dataset": "two agents",
-            "fixture": "test fixture",
-            "observation_resolution": "50ms",
-            "sample_note": "one sample",
-            "comparison_baseline": "same workload",
-            "excludes": ["network"],
-        },
+        "workload": INSTALL_HANDOFF_WORKLOAD,
         "phases": {name: phase.copy() for name in INSTALL_HANDOFF_PHASES},
         "correctness": {
             "installed_pair_matched": True,
@@ -470,6 +456,10 @@ def selftest() -> None:
     missing_proof = json.loads(json.dumps(install))
     missing_proof["correctness"]["recipient_claimed"] = False
     rejected("install-first-durable-handoff", missing_proof)
+
+    changed_isolation = json.loads(json.dumps(install))
+    changed_isolation["workload"]["state"] = "shared operator HOME"
+    rejected("install-first-durable-handoff", changed_isolation)
 
     inconsistent_summary = json.loads(json.dumps(install))
     inconsistent_summary["phases"]["setup"]["p95_seconds"] = 1.0
