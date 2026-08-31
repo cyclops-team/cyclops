@@ -402,7 +402,8 @@ pub(super) async fn execute(
             // Stored as the row count, so "off" is zero rows and "on" is
             // whatever it was last. There is no separate visibility flag to
             // fall out of step with the size.
-            app.prefs.files_rows = if app.prefs.files_rows == 0 {
+            let showing = app.prefs.files_rows == 0;
+            app.prefs.files_rows = if showing {
                 crate::persist::WorkspacePrefs::default().files_rows
             } else {
                 0
@@ -413,6 +414,9 @@ pub(super) async fn execute(
             // repaint is requested here and not folded into the resize.
             app.layout_changed();
             sync_view_switches(app);
+            if showing {
+                super::request_files_refresh(app, std::time::Duration::ZERO);
+            }
             Ok(Outcome {
                 persist: true,
                 ..Outcome::default()
@@ -610,6 +614,7 @@ pub(super) async fn execute(
                 app.prefs.files_rows = crate::persist::WorkspacePrefs::default().files_rows;
             }
             app.files_tree_mut().take_cursor();
+            super::request_files_refresh(app, std::time::Duration::ZERO);
             if was_hidden {
                 // The panel took columns back from the canvas, so tmux has
                 // to be told before the next frame paints panes at the old
@@ -667,6 +672,7 @@ pub(super) async fn execute(
             app.model.sidebar_visible = true;
             if was_visible {
                 // Same columns, different body: tmux has nothing to be told.
+                super::request_files_refresh(app, std::time::Duration::ZERO);
                 return Ok(Outcome {
                     persist: true,
                     ..Outcome::default()
@@ -684,6 +690,7 @@ pub(super) async fn execute(
             let tab = tab.available();
             app.sidebar_tab = tab;
             app.prefs.sidebar_tab = tab;
+            super::request_files_refresh(app, std::time::Duration::ZERO);
             Ok(Outcome {
                 persist: true,
                 ..Outcome::default()
@@ -781,6 +788,7 @@ async fn commit_sidebar_visibility(app: &mut App, client: &ControlClient) -> Out
     app.prefs.sidebar_visible = app.model.sidebar_visible;
     app.layout_changed();
     super::resize_client(app, client).await;
+    super::request_files_refresh(app, std::time::Duration::ZERO);
     Outcome {
         persist: true,
         ..Outcome::default()
@@ -1987,7 +1995,7 @@ mod tests {
             files: crate::files::FileTree::new(),
             files_pinned: crate::files::FileTree::new(),
             files_view: crate::files::FilesView::default(),
-            files_probe_at: None,
+            files_refresh_at: None,
             files_root_pending: false,
             dialog: None,
             theme_restore: None,
@@ -2900,6 +2908,10 @@ mod tests {
             .expect("flip it back by chord");
         assert!(app.prefs.files_rows > 0);
         assert!(view(&app).files, "the card reads the pref, not its memory");
+        assert!(
+            app.files_refresh_at.is_some(),
+            "showing Files requests one fresh snapshot"
+        );
 
         let _ = std::fs::remove_dir_all(&home);
         client.shutdown().await;

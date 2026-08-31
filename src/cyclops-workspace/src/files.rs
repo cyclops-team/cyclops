@@ -1,29 +1,14 @@
 //! The sidebar's file tree: what is on disk under one root, flattened into
 //! the rows a panel paints.
 //!
-//! Everything here is a pure function of a path and a set of expanded
-//! directories. It reads the filesystem and nothing else: no tmux, no
-//! daemon, no terminal. Painting belongs to `render::files`, and deciding
-//! what a click on a row DOES belongs to `app`.
-//!
-//! Reads are lazy. Only the root and the directories the operator has
-//! opened are listed, so the cost of the panel is the cost of what is on
-//! screen rather than the cost of the project. A repository with a hundred
-//! thousand files under it costs one `read_dir` until someone opens a
-//! folder.
+//! Everything here is pure navigation and view state: a root, expanded
+//! directories, history, and the rows a panel paints. The workspace's local
+//! filesystem adapter turns that state into a bounded snapshot. Painting
+//! belongs to `render::files`, and deciding what a click on a row DOES
+//! belongs to `app`.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-
-/// Entries read from any one directory. A directory with more than this
-/// gets a truncated listing and says so, which beats either freezing the
-/// frame or silently showing part of a folder as if it were all of it.
-const MAX_ENTRIES_PER_DIR: usize = 500;
-
-/// Depth the tree will descend to. Reached only by opening folders one at
-/// a time, so this is a backstop against a pathological tree, not a limit
-/// anyone navigates into.
-const MAX_DEPTH: u16 = 16;
 
 /// Folders remembered on either side of the current one. Deep enough that
 /// no real session reaches the end of it, bounded so a workspace left open
@@ -49,8 +34,8 @@ pub enum RowKind {
     /// Anything that is not a directory the tree will descend into:
     /// regular files, and symlinks of every kind. Clicking sends its path.
     File,
-    /// The tail of a directory whose listing was cut at
-    /// [`MAX_ENTRIES_PER_DIR`]. Not a path; clicking does nothing.
+    /// The tail of a directory whose listing reached the adapter's entry
+    /// limit. Not a path; clicking does nothing.
     Truncated { hidden: usize },
 }
 
@@ -154,16 +139,33 @@ pub struct FileTree {
     /// Session state only: where someone browsed is not worth restoring on
     /// the next launch, so [`crate::persist`] never sees these.
     forward: Vec<PathBuf>,
-    /// What the last read saw, for [`FileTree::refresh`] to compare
+    /// What the last local filesystem snapshot saw, for the adapter to compare
     /// against. Not a hash of file CONTENT: this panel reports what is in
     /// a folder, so a write that leaves name, size and mtime alone is not
     /// something it has anything to say about.
     stamp: u64,
 }
 
+/// One filesystem query the local adapter may satisfy.
+///
+/// The tree names what the operator chose to see. It does not decide how a
+/// directory is opened, sorted, or inspected.
+#[derive(Debug, Clone)]
+pub(crate) struct TreeQuery {
+    pub root: PathBuf,
+    pub expanded: BTreeSet<PathBuf>,
+}
+
+/// One bounded filesystem fact, ready for the tree to display.
+#[derive(Debug)]
+pub(crate) struct TreeSnapshot {
+    pub rows: Vec<FileRow>,
+    pub stamp: u64,
+}
+
 impl FileTree {
     /// An empty tree rooted nowhere. Paints as the "no folder yet" state
-    /// until [`FileTree::reroot`] gives it somewhere to look.
+    /// until the local adapter gives it a root and snapshot.
     pub fn new() -> Self {
         Self::default()
     }
@@ -184,17 +186,17 @@ impl FileTree {
         !self.root.as_os_str().is_empty()
     }
 
-    /// Point the tree at a different directory and read it.
+    /// Point the tree at a different directory.
     ///
     /// The scroll goes back to the top, because the row that was under the
     /// eye belonged to the old folder. `expanded` is kept: it is keyed by
     /// absolute path, so it only ever matches folders under a root that
     /// contains them, and walking up and back down again should not close
     /// everything on the way.
-    pub fn reroot(&mut self, root: impl Into<PathBuf>) {
+    pub(crate) fn reroot(&mut self, root: impl Into<PathBuf>) -> bool {
         let root = root.into();
         if root == self.root {
-            return;
+            return false;
         }
         // Standing somewhere is what makes it worth remembering. The first
         // reroot of a session moves off no folder at all, and a history
@@ -204,12 +206,13 @@ impl FileTree {
         }
         self.forward.clear();
         self.land_on(root);
+        true
     }
 
     /// Step back to the folder before this one. False when there is none,
     /// so a caller can paint the control as unavailable rather than
     /// offering a click that does nothing.
-    pub fn go_back(&mut self) -> bool {
+    pub(crate) fn go_back(&mut self) -> bool {
         let Some(previous) = self.back.pop() else {
             return false;
         };
@@ -219,7 +222,7 @@ impl FileTree {
     }
 
     /// Step forward again, undoing a [`FileTree::go_back`].
-    pub fn go_forward(&mut self) -> bool {
+    pub(crate) fn go_forward(&mut self) -> bool {
         let Some(next) = self.forward.pop() else {
             return false;
         };
@@ -236,13 +239,12 @@ impl FileTree {
         !self.forward.is_empty()
     }
 
-    /// Take up a new root and read it. The scroll goes back to the top for
+    /// Take up a new root. The scroll goes back to the top for
     /// the reason [`FileTree::reroot`] gives; history is the caller's to
     /// record, because stepping through history must not record itself.
     fn land_on(&mut self, root: PathBuf) {
         self.root = root;
         self.scroll = 0;
-        self.read();
     }
 
     /// Oldest entry falls off the front. Dropping the far end of a long
@@ -254,36 +256,19 @@ impl FileTree {
         }
     }
 
-    /// The directory above the current root, if there is one and it is
-    /// readable. `None` at a filesystem root, which is where climbing
-    /// stops.
+    /// The directory above the current root, if there is one. `None` at a
+    /// filesystem root, which is where climbing stops.
     pub fn parent(&self) -> Option<PathBuf> {
         self.root.parent().map(Path::to_path_buf)
     }
 
-    /// Open or close `path`, then re-read. A directory that is not in the
-    /// tree is ignored rather than added: the caller passes rows it was
-    /// painted, and a row that has since gone is not something to open.
-    pub fn toggle(&mut self, path: &Path) {
+    /// Open or close `path` in the next adapter query. The caller passes a
+    /// path from a painted directory row; an adapter snapshot decides whether
+    /// it is still visible.
+    pub(crate) fn toggle(&mut self, path: &Path) {
         if !self.expanded.remove(path) {
             self.expanded.insert(path.to_path_buf());
         }
-        self.read();
-    }
-
-    /// Re-read the tree and say whether anything a reader would see moved.
-    ///
-    /// This is the poll's whole job. It costs one `read_dir` per open
-    /// directory, and returns false almost every time, which is what lets
-    /// it run on a timer without turning the workspace into a spinning
-    /// redraw.
-    pub fn refresh(&mut self) -> bool {
-        if !self.has_root() {
-            return false;
-        }
-        let before = self.stamp;
-        self.read();
-        self.stamp != before
     }
 
     /// Scroll the visible window, clamped so the list cannot be scrolled
@@ -406,158 +391,36 @@ impl FileTree {
         }
     }
 
-    fn read(&mut self) {
-        let mut rows = Vec::new();
-        let mut stamp = Fnv::new();
-        stamp.write(self.root.to_string_lossy().as_bytes());
-        self.walk(&self.root.clone(), 0, &mut rows, &mut stamp);
-        // A poll can shorten the list under a cursor that was valid a
-        // moment ago, so it is clamped here rather than at every reader.
+    /// State the exact bounded directory view the local adapter should read.
+    pub(crate) fn query(&self) -> TreeQuery {
+        TreeQuery {
+            root: self.root.clone(),
+            expanded: self.expanded.clone(),
+        }
+    }
+
+    /// Replace visible rows with one external filesystem fact.
+    ///
+    /// A stale cursor must settle with the replacement rows, not in every
+    /// caller that notices a file changed underneath it.
+    pub(crate) fn install(&mut self, snapshot: TreeSnapshot) -> bool {
+        let changed = self.stamp != snapshot.stamp;
+        // An adapter snapshot can shorten the list under a cursor that was
+        // valid a moment ago, so it is clamped here rather than at every
+        // reader.
         if let Some(at) = self.cursor {
-            self.cursor = Some(at.min(rows.len().saturating_sub(1)));
+            self.cursor = Some(at.min(snapshot.rows.len().saturating_sub(1)));
         }
-        self.rows = rows;
-        self.stamp = stamp.finish();
-    }
-
-    fn walk(&self, dir: &Path, depth: u16, rows: &mut Vec<FileRow>, stamp: &mut Fnv) {
-        if depth >= MAX_DEPTH {
-            return;
-        }
-        let Some((entries, hidden)) = read_dir_sorted(dir) else {
-            // Unreadable: no rows, and the failure is part of the stamp so
-            // the poll notices when permission comes back.
-            stamp.write(b"\0unreadable\0");
-            stamp.write(dir.to_string_lossy().as_bytes());
-            return;
-        };
-        for entry in entries {
-            stamp.write(entry.name.as_bytes());
-            stamp.write(&[u8::from(entry.is_dir)]);
-            // Size and mtime for files only. A directory row shows a name
-            // and a chevron, and its own mtime bumps every time anything
-            // is written anywhere inside it — stamping that would report a
-            // change for a closed folder whose row did not move a pixel,
-            // and the poll would redraw the workspace on every write in
-            // the project. An OPEN folder's contents are stamped by the
-            // recursion below, so nothing visible goes unwatched.
-            if !entry.is_dir {
-                stamp.write(&entry.size.to_le_bytes());
-                stamp.write(&entry.modified.to_le_bytes());
-            }
-
-            let expanded = entry.is_dir && self.expanded.contains(&entry.path);
-            rows.push(FileRow {
-                name: entry.name,
-                depth,
-                kind: if entry.is_dir {
-                    RowKind::Dir { expanded }
-                } else {
-                    RowKind::File
-                },
-                path: entry.path.clone(),
-            });
-            if expanded {
-                self.walk(&entry.path, depth + 1, rows, stamp);
-            }
-        }
-        if hidden > 0 {
-            stamp.write(&hidden.to_le_bytes());
-            rows.push(FileRow {
-                path: dir.to_path_buf(),
-                name: String::new(),
-                depth,
-                kind: RowKind::Truncated { hidden },
-            });
-        }
-    }
-}
-
-/// One directory entry, reduced to what the tree sorts and stamps on.
-struct Entry {
-    path: PathBuf,
-    name: String,
-    is_dir: bool,
-    size: u64,
-    /// Seconds since the epoch, or 0 when the platform will not say.
-    modified: u64,
-}
-
-/// Read one directory: directories first, then files, each group ordered
-/// case-insensitively by name. Returns the entries and how many were cut.
-///
-/// `.git` is skipped. It is a directory of thousands of files that nobody
-/// navigates to and no agent should be handed a path into, and leaving it
-/// in would put a folder that dwarfs the project at the top of every tree.
-/// Every other dotfile is shown: they are the config an operator actually
-/// edits, and a tree that hides them is a tree you cannot trust.
-///
-/// Symlinks are leaves whatever they point at. Following them is how a
-/// tree walk finds a cycle, and one symlink to `..` would otherwise hang
-/// the frame that painted it.
-fn read_dir_sorted(dir: &Path) -> Option<(Vec<Entry>, usize)> {
-    let reader = std::fs::read_dir(dir).ok()?;
-    let mut entries: Vec<Entry> = Vec::new();
-    for entry in reader.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name == ".git" {
-            continue;
-        }
-        // `symlink_metadata` does not follow: a link reports as a link.
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        let is_symlink = meta.is_symlink();
-        let modified = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        entries.push(Entry {
-            path: entry.path(),
-            name,
-            is_dir: meta.is_dir() && !is_symlink,
-            size: meta.len(),
-            modified,
-        });
-    }
-    entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    let hidden = entries.len().saturating_sub(MAX_ENTRIES_PER_DIR);
-    entries.truncate(MAX_ENTRIES_PER_DIR);
-    Some((entries, hidden))
-}
-
-/// FNV-1a, the same 64-bit hash the manifest seeder uses. Not a checksum
-/// of anything anyone stores: it exists so a poll can answer "did this
-/// change" in one comparison instead of diffing two row lists.
-struct Fnv(u64);
-
-impl Fnv {
-    fn new() -> Self {
-        Fnv(0xcbf2_9ce4_8422_2325)
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.0 ^= u64::from(*byte);
-            self.0 = self.0.wrapping_mul(0x1000_0000_01b3);
-        }
-    }
-
-    fn finish(&self) -> u64 {
-        self.0
+        self.rows = snapshot.rows;
+        self.stamp = snapshot.stamp;
+        changed
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_adapter;
 
     /// A scratch directory that cleans itself up.
     struct Scratch(PathBuf);
@@ -587,7 +450,7 @@ mod tests {
 
         fn tree(&self) -> FileTree {
             let mut tree = FileTree::new();
-            tree.reroot(&self.0);
+            file_adapter::reroot(&mut tree, &self.0);
             tree
         }
     }
@@ -600,6 +463,39 @@ mod tests {
 
     fn names(tree: &FileTree) -> Vec<String> {
         tree.rows().iter().map(|r| r.name.clone()).collect()
+    }
+
+    fn snapshot(names: &[&str], stamp: u64) -> TreeSnapshot {
+        TreeSnapshot {
+            rows: names
+                .iter()
+                .map(|name| FileRow {
+                    path: PathBuf::from("/project").join(name),
+                    name: (*name).to_string(),
+                    depth: 0,
+                    kind: RowKind::File,
+                })
+                .collect(),
+            stamp,
+        }
+    }
+
+    /// The tree accepts one bounded fact from its adapter, keeps its own
+    /// navigation state, and settles an affected cursor with that fact.
+    #[test]
+    fn an_adapter_snapshot_replaces_rows_without_moving_navigation_state() {
+        let mut tree = FileTree::new();
+        assert!(tree.reroot("/project"));
+        tree.anchor_at("/project");
+        assert!(tree.install(snapshot(&["Cargo.toml", "README.md", "src"], 1)));
+        tree.take_cursor();
+        tree.move_cursor(2);
+
+        assert!(tree.install(snapshot(&["Cargo.toml"], 2)));
+        assert_eq!(tree.root(), Path::new("/project"));
+        assert_eq!(tree.anchor(), Path::new("/project"));
+        assert_eq!(tree.cursor(), Some(0), "the cursor follows the new end");
+        assert_eq!(names(&tree), vec!["Cargo.toml"]);
     }
 
     /// Directories first, then files, each case-insensitively by name. A
@@ -632,7 +528,7 @@ mod tests {
 
         assert_eq!(names(&tree), vec!["src", "README.md"]);
 
-        tree.toggle(&s.0.join("src"));
+        file_adapter::toggle(&mut tree, &s.0.join("src"));
         assert_eq!(names(&tree), vec!["src", "lib.rs", "main.rs", "README.md"]);
         assert_eq!(
             tree.rows()[1].depth,
@@ -644,11 +540,11 @@ mod tests {
             RowKind::Dir { expanded: true }
         ));
 
-        tree.toggle(&s.0.join("src"));
+        file_adapter::toggle(&mut tree, &s.0.join("src"));
         assert_eq!(names(&tree), vec!["src", "README.md"]);
     }
 
-    /// The poll's contract: cheap, and false unless a reader would see
+    /// The adapter refresh contract: it is false unless a reader would see
     /// something different.
     #[test]
     fn refresh_reports_only_changes_a_reader_would_see() {
@@ -656,24 +552,33 @@ mod tests {
         s.file("a.txt", "one");
         let mut tree = s.tree();
 
-        assert!(!tree.refresh(), "an untouched folder reports no change");
+        assert!(
+            !file_adapter::refresh(&mut tree),
+            "an untouched folder reports no change"
+        );
 
         s.file("b.txt", "two");
-        assert!(tree.refresh(), "a new file is a change");
+        assert!(file_adapter::refresh(&mut tree), "a new file is a change");
         assert_eq!(names(&tree), vec!["a.txt", "b.txt"]);
-        assert!(!tree.refresh(), "and only once");
+        assert!(!file_adapter::refresh(&mut tree), "and only once");
 
         std::fs::remove_file(s.0.join("a.txt")).expect("rm");
-        assert!(tree.refresh(), "a deleted file is a change");
+        assert!(
+            file_adapter::refresh(&mut tree),
+            "a deleted file is a change"
+        );
         assert_eq!(names(&tree), vec!["b.txt"]);
 
         // A folder nobody opened is not read, so churn inside it is not a
         // change this panel has anything to say about.
         s.dir("closed");
-        assert!(tree.refresh(), "the new folder itself shows");
+        assert!(
+            file_adapter::refresh(&mut tree),
+            "the new folder itself shows"
+        );
         s.file("closed/deep.txt", "");
         assert!(
-            !tree.refresh(),
+            !file_adapter::refresh(&mut tree),
             "but a file inside a closed folder is not on screen"
         );
     }
@@ -684,11 +589,11 @@ mod tests {
         let s = Scratch::new("files-refresh-open");
         s.dir("src");
         let mut tree = s.tree();
-        tree.toggle(&s.0.join("src"));
-        assert!(!tree.refresh());
+        file_adapter::toggle(&mut tree, &s.0.join("src"));
+        assert!(!file_adapter::refresh(&mut tree));
 
         s.file("src/new.rs", "");
-        assert!(tree.refresh());
+        assert!(file_adapter::refresh(&mut tree));
         assert_eq!(names(&tree), vec!["src", "new.rs"]);
     }
 
@@ -702,7 +607,7 @@ mod tests {
         s.dir("real");
         std::os::unix::fs::symlink(&s.0, s.0.join("real/loop")).expect("symlink");
         let mut tree = s.tree();
-        tree.toggle(&s.0.join("real"));
+        file_adapter::toggle(&mut tree, &s.0.join("real"));
 
         // Terminates, and the link is a leaf rather than a door.
         let rows = tree.rows();
@@ -731,12 +636,12 @@ mod tests {
     #[test]
     fn an_enormous_folder_is_cut_and_admits_it() {
         let s = Scratch::new("files-huge");
-        for n in 0..MAX_ENTRIES_PER_DIR + 25 {
+        for n in 0..file_adapter::MAX_ENTRIES_PER_DIR + 25 {
             s.file(&format!("f{n:05}.txt"), "");
         }
         let tree = s.tree();
 
-        assert_eq!(tree.rows().len(), MAX_ENTRIES_PER_DIR + 1);
+        assert_eq!(tree.rows().len(), file_adapter::MAX_ENTRIES_PER_DIR + 1);
         assert_eq!(
             tree.rows().last().map(|r| r.kind),
             Some(RowKind::Truncated { hidden: 25 })
@@ -769,11 +674,11 @@ mod tests {
         let s = Scratch::new("files-anchor");
         s.file("src/main.rs", "");
         let mut tree = FileTree::new();
-        tree.reroot(&s.0);
+        file_adapter::reroot(&mut tree, &s.0);
         tree.anchor_at(&s.0);
         assert_eq!(tree.reference(&s.0.join("src/main.rs")), "src/main.rs");
 
-        tree.reroot(s.0.join("src"));
+        file_adapter::reroot(&mut tree, s.0.join("src"));
         assert_eq!(
             tree.reference(&s.0.join("src/main.rs")),
             "src/main.rs",
@@ -781,7 +686,7 @@ mod tests {
         );
 
         // Climbing back out is the same story from the other side.
-        tree.reroot(&s.0);
+        file_adapter::reroot(&mut tree, &s.0);
         assert_eq!(tree.reference(&s.0.join("src/main.rs")), "src/main.rs");
     }
 
@@ -822,9 +727,8 @@ mod tests {
         assert_eq!(tree.cursor(), None, "Esc gives the keyboard back");
     }
 
-    /// A poll that shortens the list must not strand the cursor past its
-    /// end. The tree is re-read on a timer, so this happens without anyone
-    /// touching the keyboard.
+    /// An adapter snapshot that shortens the list must not strand the cursor
+    /// past its end.
     #[test]
     fn a_shrinking_list_pulls_the_cursor_back_with_it() {
         let s = Scratch::new("files-cursor-shrink");
@@ -839,7 +743,10 @@ mod tests {
         for n in 2..6 {
             std::fs::remove_file(s.0.join(format!("f{n}.txt"))).expect("rm");
         }
-        assert!(tree.refresh(), "the list really did change");
+        assert!(
+            file_adapter::refresh(&mut tree),
+            "the list really did change"
+        );
         assert_eq!(tree.cursor(), Some(1), "the cursor rides the new end");
         assert!(
             tree.cursor_row().is_some(),
@@ -858,7 +765,7 @@ mod tests {
         s.file("locked/secret.txt", "");
         let locked = s.0.join("locked");
         let mut tree = s.tree();
-        tree.toggle(&locked);
+        file_adapter::toggle(&mut tree, &locked);
         assert_eq!(names(&tree), vec!["locked", "secret.txt"]);
 
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
@@ -868,11 +775,17 @@ mod tests {
             std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("un");
             return;
         }
-        assert!(tree.refresh(), "losing access is a change");
+        assert!(
+            file_adapter::refresh(&mut tree),
+            "losing access is a change"
+        );
         assert_eq!(names(&tree), vec!["locked"], "the folder is still listed");
 
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("unlock");
-        assert!(tree.refresh(), "regaining access is a change too");
+        assert!(
+            file_adapter::refresh(&mut tree),
+            "regaining access is a change too"
+        );
         assert_eq!(names(&tree), vec!["locked", "secret.txt"]);
     }
 
@@ -884,14 +797,15 @@ mod tests {
         let s = Scratch::new("files-reroot");
         s.file("project/src/main.rs", "");
         let mut tree = FileTree::new();
-        tree.reroot(s.0.join("project"));
-        tree.toggle(&s.0.join("project/src"));
+        file_adapter::reroot(&mut tree, s.0.join("project"));
+        file_adapter::toggle(&mut tree, &s.0.join("project/src"));
         assert_eq!(names(&tree), vec!["src", "main.rs"]);
 
-        tree.reroot(tree.parent().expect("a parent above project"));
+        let parent = tree.parent().expect("a parent above project");
+        file_adapter::reroot(&mut tree, parent);
         assert_eq!(names(&tree), vec!["project"]);
 
-        tree.reroot(s.0.join("project"));
+        file_adapter::reroot(&mut tree, s.0.join("project"));
         assert_eq!(
             names(&tree),
             vec!["src", "main.rs"],
@@ -977,32 +891,32 @@ mod tests {
 
         // The first root is where the session starts, not somewhere it
         // came back from.
-        tree.reroot(&s.0);
+        file_adapter::reroot(&mut tree, &s.0);
         assert!(!tree.can_go_back(), "nothing precedes the first folder");
         assert!(!tree.can_go_forward());
 
-        tree.reroot(s.0.join("a"));
-        tree.reroot(s.0.join("a/deep"));
+        file_adapter::reroot(&mut tree, s.0.join("a"));
+        file_adapter::reroot(&mut tree, s.0.join("a/deep"));
         assert!(tree.can_go_back());
 
-        assert!(tree.go_back());
+        assert!(file_adapter::go_back(&mut tree));
         assert_eq!(tree.root(), s.0.join("a"));
         assert!(tree.can_go_forward(), "and forward is now open");
-        assert!(tree.go_back());
+        assert!(file_adapter::go_back(&mut tree));
         assert_eq!(tree.root(), s.0);
         assert!(!tree.can_go_back(), "back stops at the first folder");
         assert!(
-            !tree.go_back(),
+            !file_adapter::go_back(&mut tree),
             "and says so rather than doing nothing quietly"
         );
 
-        assert!(tree.go_forward());
+        assert!(file_adapter::go_forward(&mut tree));
         assert_eq!(tree.root(), s.0.join("a"));
 
         // A new move from here forks: `a/deep` was ahead and is not anymore.
-        tree.reroot(s.0.join("b"));
+        file_adapter::reroot(&mut tree, s.0.join("b"));
         assert!(!tree.can_go_forward(), "a new branch drops what was ahead");
-        assert!(tree.go_back());
+        assert!(file_adapter::go_back(&mut tree));
         assert_eq!(
             tree.root(),
             s.0.join("a"),
@@ -1018,11 +932,12 @@ mod tests {
         let s = Scratch::new("files-history-up");
         s.file("project/src/main.rs", "");
         let mut tree = FileTree::new();
-        tree.reroot(s.0.join("project/src"));
+        file_adapter::reroot(&mut tree, s.0.join("project/src"));
 
-        tree.reroot(tree.parent().expect("a parent above src"));
+        let parent = tree.parent().expect("a parent above src");
+        file_adapter::reroot(&mut tree, parent);
         assert_eq!(tree.root(), s.0.join("project"));
-        assert!(tree.go_back(), "the climb is undoable");
+        assert!(file_adapter::go_back(&mut tree), "the climb is undoable");
         assert_eq!(tree.root(), s.0.join("project/src"));
     }
 
@@ -1035,9 +950,9 @@ mod tests {
         let s = Scratch::new("files-history-still");
         s.dir("here");
         let mut tree = FileTree::new();
-        tree.reroot(s.0.join("here"));
+        file_adapter::reroot(&mut tree, s.0.join("here"));
         for _ in 0..5 {
-            tree.reroot(s.0.join("here"));
+            file_adapter::reroot(&mut tree, s.0.join("here"));
         }
         assert!(!tree.can_go_back());
     }
@@ -1047,6 +962,9 @@ mod tests {
         let mut tree = FileTree::new();
         assert!(!tree.has_root());
         assert!(tree.rows().is_empty());
-        assert!(!tree.refresh(), "nothing to poll until there is a root");
+        assert!(
+            !file_adapter::refresh(&mut tree),
+            "nothing to refresh until there is a root"
+        );
     }
 }

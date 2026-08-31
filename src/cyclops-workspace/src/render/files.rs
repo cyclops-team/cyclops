@@ -558,6 +558,7 @@ fn clip_head(text: &str, width: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_adapter;
     use crate::render::test_support::flatten;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -630,7 +631,7 @@ mod tests {
         let scratch = Scratch::new("files-view-chip");
         scratch.file("a.rs", "");
         let mut tree = FileTree::new();
-        tree.reroot(scratch.0.clone());
+        file_adapter::reroot(&mut tree, scratch.0.clone());
 
         let (buf, hits) = draw(&mut tree, None);
         let header = line(&buf, 0);
@@ -687,8 +688,8 @@ mod tests {
         s.file("src/main.rs", "");
         s.file("README.md", "");
         let mut tree = FileTree::new();
-        tree.reroot(&s.0);
-        tree.toggle(&s.0.join("src"));
+        file_adapter::reroot(&mut tree, &s.0);
+        file_adapter::toggle(&mut tree, &s.0.join("src"));
 
         let (buf, _) = draw(&mut tree, None);
         let flat = flatten(&buf);
@@ -715,7 +716,7 @@ mod tests {
         s.file("HELLO.md", "");
         s.file("a_very_long_module_name_indeed.rs", "");
         let mut tree = FileTree::new();
-        tree.reroot(&s.0);
+        file_adapter::reroot(&mut tree, &s.0);
 
         let (buf, _) = draw(&mut tree, None);
         let hello = line(&buf, row_of(&buf, "HELLO"));
@@ -741,7 +742,7 @@ mod tests {
         s.file("Makefile", "");
         s.file("main.rs", "");
         let mut tree = FileTree::new();
-        tree.reroot(&s.0);
+        file_adapter::reroot(&mut tree, &s.0);
 
         let (buf, _) = draw(&mut tree, None);
         assert_eq!(
@@ -758,7 +759,7 @@ mod tests {
         let s = Scratch::new("files-panel-badge-narrow");
         s.file("Cargo.toml", "");
         let mut tree = FileTree::new();
-        tree.reroot(&s.0);
+        file_adapter::reroot(&mut tree, &s.0);
 
         let (wide, _) = draw_sized(&mut tree, None, 22, 8);
         assert!(flatten(&wide).contains("(toml)"), "{}", flatten(&wide));
@@ -779,8 +780,8 @@ mod tests {
         let s = Scratch::new("files-panel-hits");
         s.file("src/main.rs", "");
         let mut tree = FileTree::new();
-        tree.reroot(&s.0);
-        tree.toggle(&s.0.join("src"));
+        file_adapter::reroot(&mut tree, &s.0);
+        file_adapter::toggle(&mut tree, &s.0.join("src"));
         let (buf, hits) = draw(&mut tree, None);
 
         // Away from the chevron column, so this reads the row's own target.
@@ -828,7 +829,7 @@ mod tests {
         let s = Scratch::new("files-panel-history");
         s.file("src/main.rs", "");
         let mut tree = FileTree::new();
-        tree.reroot(&s.0);
+        file_adapter::reroot(&mut tree, &s.0);
 
         let find = |hits: &HitMap, want: fn(&HitTarget) -> bool| {
             (0..PANEL.width)
@@ -848,7 +849,7 @@ mod tests {
             line(&fresh, 1)
         );
 
-        tree.reroot(s.0.join("src"));
+        file_adapter::reroot(&mut tree, s.0.join("src"));
         let (_, hits) = draw(&mut tree, None);
         let back = find(&hits, |t| matches!(t, HitTarget::FileBack))
             .expect("walking somewhere opens the way back");
@@ -858,7 +859,7 @@ mod tests {
         );
         assert_eq!(back.1, 1, "both live on the navigation row");
 
-        tree.go_back();
+        file_adapter::go_back(&mut tree);
         let (_, hits) = draw(&mut tree, None);
         assert!(
             find(&hits, |t| matches!(t, HitTarget::FileForward)).is_some(),
@@ -875,7 +876,7 @@ mod tests {
             s.file(&format!("f{n:02}.txt"), "");
         }
         let mut tree = FileTree::new();
-        tree.reroot(&s.0);
+        file_adapter::reroot(&mut tree, &s.0);
         tree.scroll_by(30, 8);
 
         let (_, hits) = draw(&mut tree, None);
@@ -896,7 +897,7 @@ mod tests {
             s.file(&format!("f{n:02}.txt"), "");
         }
         let mut tree = FileTree::new();
-        tree.reroot(&s.0);
+        file_adapter::reroot(&mut tree, &s.0);
 
         // Ten rows: header, navigation, then eight of body. The note claims
         // one of those eight, so seven entries show and 33 do not.
@@ -942,7 +943,7 @@ mod tests {
         let s = Scratch::new("files-panel-hover");
         s.file("README.md", "");
         let mut tree = FileTree::new();
-        tree.reroot(&s.0);
+        file_adapter::reroot(&mut tree, &s.0);
 
         let (rest, hits) = draw(&mut tree, None);
         let row = (0..PANEL.height)
@@ -981,7 +982,7 @@ mod tests {
         s.file("main.rs", "");
         s.file("notes.日本", "");
         let mut tree = FileTree::new();
-        tree.reroot(&s.0);
+        file_adapter::reroot(&mut tree, &s.0);
 
         let (buf, _) = draw(&mut tree, None);
         assert_eq!(
@@ -1000,7 +1001,7 @@ mod tests {
         let s = Scratch::new("files-panel-up-reach");
         s.file("src/main.rs", "");
         let mut tree = FileTree::new();
-        tree.reroot(&s.0);
+        file_adapter::reroot(&mut tree, &s.0);
 
         let (_, hits) = draw(&mut tree, None);
         let up: Vec<u16> = (0..PANEL.width)
@@ -1041,9 +1042,9 @@ mod tests {
         let s = Scratch::new("files-panel-motion");
         s.file("src/main.rs", "");
         let mut tree = FileTree::new();
-        tree.reroot(&s.0);
-        tree.toggle(&s.0.join("src"));
-        tree.reroot(s.0.join("src"));
+        file_adapter::reroot(&mut tree, &s.0);
+        file_adapter::toggle(&mut tree, &s.0.join("src"));
+        file_adapter::reroot(&mut tree, s.0.join("src"));
         let (buf, hits) = draw(&mut tree, None);
 
         for (label, y) in [
@@ -1085,7 +1086,7 @@ mod tests {
         s.file("Cargo.toml", "");
         s.file("src/main.rs", "");
         let mut tree = FileTree::new();
-        tree.reroot(&s.0);
+        file_adapter::reroot(&mut tree, &s.0);
         for height in 0..5u16 {
             for width in 0..5u16 {
                 let _ = draw_sized(&mut tree, None, width.max(1), height.max(1));

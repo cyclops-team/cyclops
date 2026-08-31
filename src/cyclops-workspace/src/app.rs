@@ -94,6 +94,14 @@ const RENDER_DEBOUNCE: Duration = Duration::from_millis(8);
 /// pushed back, so a noisy pane costs one tmux round trip per interval and
 /// an idle workspace costs no wakeups at all.
 const FOLDER_PROBE_DELAY: Duration = Duration::from_millis(600);
+/// How long Files waits after active-pane output before it asks tmux for the
+/// pane directory and re-reads the visible tree.
+///
+/// A shell echoes a `cd` before it finishes changing directory, so the
+/// output edge needs the same short delay as a folder-following workspace.
+/// This is one event-armed deadline, never a recurring timer: an idle
+/// workspace has no Files refresh wakeups.
+const FILES_REFRESH_DELAY: Duration = Duration::from_millis(600);
 /// How long a burst of daemon decoration events (state, label, delivery
 /// changes) is allowed to coalesce before `spawn_decoration_forwarder`
 /// issues one status fetch. Same rule as `RENDER_DEBOUNCE`/`arm()`: armed
@@ -491,10 +499,9 @@ struct App {
     files_pinned: crate::files::FileTree,
     /// Which of the two the panel is showing.
     files_view: crate::files::FilesView,
-    /// When the file tree is next re-read. `None` while nothing is armed;
-    /// see [`arm_files_probe`], which is what keeps this off the clock when
-    /// the panel is not on screen.
-    files_probe_at: Option<Instant>,
+    /// One requested Files refresh. `None` means no event currently warrants
+    /// a filesystem read; see [`request_files_refresh`].
+    files_refresh_at: Option<Instant>,
     /// The next file probe should also re-root the tree on the focused
     /// pane's folder. Set at boot and whenever the operator asks for it;
     /// cleared once the probe answers, so a pane that has since gone does
@@ -1319,12 +1326,12 @@ pub async fn run_async() -> i32 {
         files_pinned: {
             let mut pinned = crate::files::FileTree::new();
             if let Some(root) = &prefs.files_pinned_root {
-                pinned.reroot(root.clone());
+                crate::file_adapter::reroot(&mut pinned, root.clone());
             }
             pinned
         },
         files_view: crate::files::FilesView::default(),
-        files_probe_at: None,
+        files_refresh_at: None,
         files_root_pending: true,
         record: cyclops_ui::Record::new(),
         messages_queue: cyclops_ui::HumanQueue::default(),
@@ -1385,6 +1392,10 @@ pub async fn run_async() -> i32 {
         app.notice
             .show(copy::SIZING_FOLLOWER.to_string(), Instant::now());
     }
+    // The first Files snapshot is an explicit boot request, not a recurring
+    // clock. Later refreshes come from a pane-route event, pane output, or a
+    // Files interaction.
+    let _ = probe_files(&mut app, &client).await;
 
     let mut debounce: Option<Instant> = None;
     let mut reconnect_deadline: Option<Instant> = None;
@@ -1403,19 +1414,11 @@ pub async fn run_async() -> i32 {
         log_err(&app.home, &error);
     }
     while !detached {
-        // Every iteration, because everything that turns the file panel on
-        // is somewhere else: the sidebar reopening, the tab going back to
-        // Sessions, the menu toggle, the first frame needing a folder at
-        // all. Arming from each of those was four places to forget one; the
-        // call is a no-op when a probe is already armed or the panel is not
-        // on screen, so asking every time is both cheaper to reason about
-        // and the only version that cannot go stale.
-        arm_files_probe(&mut app);
         let next_deadline = soonest([
             debounce,
             reconnect_deadline,
             app.folder_probe_at,
-            app.files_probe_at,
+            app.files_refresh_at,
             app.notice.deadline(),
             motion.deadline(),
             // The resize settle window is a one-shot deadline like every
@@ -1635,12 +1638,9 @@ pub async fn run_async() -> i32 {
                         log_err(&app.home, &e);
                     }
                 }
-                if app.files_probe_at.is_some_and(|due| due <= now) {
-                    app.files_probe_at = None;
-                    // Only a change earns a frame. The poll runs once a
-                    // second and answers "nothing moved" nearly every time;
-                    // redrawing on each of those would be a workspace that
-                    // repaints forever over a folder nobody touched.
+                if take_files_refresh_request(&mut app, now) {
+                    // Only a changed, explicitly requested snapshot earns
+                    // a frame. This deadline never re-arms itself.
                     if probe_files(&mut app, &client).await {
                         if let Err(error) = renderer.frame(&mut app, &mut motion, Instant::now()) {
                             log_err(&app.home, &error);
@@ -3224,6 +3224,9 @@ async fn handle_app_msg(
         }
         AppMsg::SessionSwitched { session, name } => {
             apply_session_switched(app, session, name);
+            // The authoritative session snapshot below selects the new active
+            // pane. Keep the Files root request until that route is known.
+            app.files_root_pending = true;
             arm(debounce);
         }
         AppMsg::SessionRenamed { session, name } => {
@@ -3292,14 +3295,22 @@ async fn handle_app_msg(
                 .find(|t| t.window_id == window)
                 .map(|t| t.active_pane = pane)
                 .is_some();
+            app.files_root_pending = true;
             if !known {
                 app.needs_reconcile = true;
+            } else {
+                // A pane route is concrete evidence that the agent view may
+                // need a new root. This is one request, not an idle watch.
+                request_files_refresh(app, Duration::ZERO);
             }
             arm(debounce);
         }
         AppMsg::OutputBatch(output) => {
             let mut changed = false;
+            let active_pane = app.model.active_tab().active_pane.clone();
+            let mut active_pane_output = false;
             for (pane, bytes) in output {
+                active_pane_output |= pane == active_pane;
                 if app.is_visible_pane(&pane) {
                     if let Some(rt) = app.runtimes.get_mut(&pane) {
                         rt.feed(&bytes);
@@ -3310,6 +3321,12 @@ async fn handle_app_msg(
             if changed {
                 arm(debounce);
                 arm_folder_probe(app);
+            }
+            // tmux has no directory-change notification. Output from the
+            // active pane is the observable edge a shell `cd` produces, so
+            // it earns one coalesced Files snapshot.
+            if active_pane_output {
+                request_files_refresh(app, FILES_REFRESH_DELAY);
             }
         }
         AppMsg::LinkLost => {
@@ -4226,7 +4243,7 @@ async fn handle_mouse(
                 HitTarget::FileUp => {
                     app.close_menu();
                     if let Some(parent) = app.files_tree().parent() {
-                        app.files_tree_mut().reroot(parent);
+                        crate::file_adapter::reroot(app.files_tree_mut(), parent);
                         remember_pinned_root(app);
                     }
                     return Ok(());
@@ -4235,15 +4252,17 @@ async fn handle_mouse(
                     app.close_menu();
                     match app.files_view {
                         // Back to where the work is. Asking the pane where
-                        // it is costs a tmux round trip, so this only
-                        // records the request; the loop's next pass arms
-                        // the probe that answers it.
-                        crate::files::FilesView::Agent => app.files_root_pending = true,
+                        // it is costs a tmux round trip, so this records and
+                        // immediately requests one snapshot to answer it.
+                        crate::files::FilesView::Agent => {
+                            app.files_root_pending = true;
+                            request_files_refresh(app, Duration::ZERO);
+                        }
                         // Back to the folder the operator pinned. Saved
                         // state, no probe to wait for.
                         crate::files::FilesView::Pinned => {
                             if let Some(root) = app.prefs.files_pinned_root.clone() {
-                                app.files_pinned.reroot(root);
+                                crate::file_adapter::reroot(&mut app.files_pinned, root);
                             }
                         }
                     }
@@ -4257,20 +4276,20 @@ async fn handle_mouse(
                     // back, a mode nobody re-entered on purpose.
                     app.files_tree_mut().release_cursor();
                     app.files_view = app.files_view.other();
-                    // The probe follows the panel; a fresh view may need
-                    // its first root or a refresh right away.
-                    arm_files_probe(app);
+                    // A fresh view may need its first root or a fresh
+                    // listing, so this interaction requests one snapshot.
+                    request_files_refresh(app, Duration::ZERO);
                     return Ok(());
                 }
                 HitTarget::FileBack => {
                     app.close_menu();
-                    app.files_tree_mut().go_back();
+                    crate::file_adapter::go_back(app.files_tree_mut());
                     remember_pinned_root(app);
                     return Ok(());
                 }
                 HitTarget::FileForward => {
                     app.close_menu();
-                    app.files_tree_mut().go_forward();
+                    crate::file_adapter::go_forward(app.files_tree_mut());
                     remember_pinned_root(app);
                     return Ok(());
                 }
@@ -4279,7 +4298,7 @@ async fn handle_mouse(
                 HitTarget::FileDisclosure { path } => {
                     app.close_menu();
                     let path = std::path::PathBuf::from(path.clone());
-                    app.files_tree_mut().toggle(&path);
+                    crate::file_adapter::toggle(app.files_tree_mut(), &path);
                     return Ok(());
                 }
                 // The rest of a folder's row walks into it. The panel is
@@ -4288,7 +4307,7 @@ async fn handle_mouse(
                 HitTarget::FileRow { path, is_dir, .. } if *is_dir => {
                     app.close_menu();
                     let path = std::path::PathBuf::from(path.clone());
-                    app.files_tree_mut().reroot(path);
+                    crate::file_adapter::reroot(app.files_tree_mut(), path);
                     remember_pinned_root(app);
                     return Ok(());
                 }
@@ -4394,11 +4413,15 @@ async fn handle_mouse(
                 drag.is_active() && matches!(&drag.target, DragTarget::SidebarSplit)
             });
             if split_drag {
+                let was_hidden = app.prefs.files_rows == 0;
                 app.prefs.files_rows = files_rows_for_row(app, row);
                 app.layout_changed();
                 // No `resize_client`: this seam is inside the sidebar, so
                 // no column changed hands and no pane reflows.
                 app.save_prefs_or_log();
+                if was_hidden && app.prefs.files_rows > 0 {
+                    request_files_refresh(app, Duration::ZERO);
+                }
             }
             apply_live_divider(app, client).await?;
             if let Some(drag) = app.drag.take() {
@@ -4527,7 +4550,7 @@ async fn handle_files_key(
         // already navigates by mouse, on the keys that mean them.
         KeyCode::Left | KeyCode::Char('h') => {
             if let Some(parent) = app.files_tree().parent() {
-                app.files_tree_mut().reroot(parent);
+                crate::file_adapter::reroot(app.files_tree_mut(), parent);
                 remember_pinned_root(app);
             }
             Ok(Some(InputOutcome::Redraw))
@@ -4539,7 +4562,7 @@ async fn handle_files_key(
             match row.kind {
                 crate::files::RowKind::Dir { .. } => {
                     let path = row.path.clone();
-                    app.files_tree_mut().reroot(path);
+                    crate::file_adapter::reroot(app.files_tree_mut(), path);
                     remember_pinned_root(app);
                     Ok(Some(InputOutcome::Redraw))
                 }
@@ -5105,44 +5128,42 @@ async fn apply_live_sidebar(app: &mut App, client: &ControlClient) {
     }
 }
 
-/// How often the file panel re-reads what it is showing.
-///
-/// A poll rather than a filesystem watch, which is the same call the theme
-/// reload and the folder-follow already make. It costs one `read_dir` per
-/// OPEN directory and answers "nothing moved" with a single integer
-/// comparison ([`crate::files::FileTree::refresh`]), so a second is far
-/// more often than it needs to be and still cheap. A watch would mean a
-/// new dependency with a platform backend per OS, in a binary whose build
-/// time is already something the operator notices.
-const FILES_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+/// Whether the Files panel is currently visible to the operator.
+fn files_panel_visible(app: &App) -> bool {
+    app.model.sidebar_visible && app.sidebar_tab == SidebarTab::Sessions && app.prefs.files_rows > 0
+}
 
-/// Arm the next file-panel poll, unless one is already armed or the panel
-/// is not on screen to poll for.
+/// Request one Files snapshot from an observed route, active-pane output, or
+/// a Files interaction.
 ///
-/// Three ways to be off screen, and all three have to gate this or the
-/// loop wakes once a second forever to read a folder nobody is looking at:
-/// the sidebar collapsed, the sidebar showing the event stream, and the
-/// panel itself toggled shut. `files_root_pending` overrides them, because
-/// that request is a tmux round trip the panel needs answered before it
-/// can show anything at all, and it clears itself once it lands.
-fn arm_files_probe(app: &mut App) {
-    if app.files_probe_at.is_some() {
+/// The deadline deliberately does not move or recreate itself: the panel
+/// keeps its last snapshot until another relevant event arrives. A native
+/// filesystem watcher is a separate future capability, not an implicit poll.
+fn request_files_refresh(app: &mut App, delay: Duration) {
+    if app.files_refresh_at.is_some() {
         return;
     }
-    let showing = app.model.sidebar_visible
-        && app.sidebar_tab == SidebarTab::Sessions
-        && app.prefs.files_rows > 0;
-    if showing || app.files_root_pending {
-        app.files_probe_at = Some(Instant::now() + FILES_PROBE_INTERVAL);
+    if files_panel_visible(app) || app.files_root_pending {
+        app.files_refresh_at = Some(Instant::now() + delay);
+    }
+}
+
+/// Consume one due Files snapshot request without generating another one.
+fn take_files_refresh_request(app: &mut App, now: Instant) -> bool {
+    if app.files_refresh_at.is_some_and(|due| due <= now) {
+        app.files_refresh_at = None;
+        true
+    } else {
+        false
     }
 }
 
 /// Re-read the file panel, and keep the agent view where the agent is.
 ///
 /// Returns whether anything a reader would see moved, which is the only
-/// thing that earns a redraw. Nothing here is fatal: a tmux probe that
-/// fails leaves the request armed for the next poll, and an unreadable
-/// folder simply lists as empty.
+/// thing that earns a redraw. Nothing here is fatal: a tmux probe failure
+/// preserves the old tree and leaves a root request for the next relevant
+/// route, output, or Files interaction; an unreadable folder lists empty.
 async fn probe_files(app: &mut App, client: &ControlClient) -> bool {
     let mut changed = false;
     let pane = app.model.active_tab().active_pane.clone();
@@ -5154,8 +5175,8 @@ async fn probe_files(app: &mut App, client: &ControlClient) -> bool {
             // panes, or the pane cd'd — and the view goes where it went.
             // An answer matching the anchor is the agent standing still,
             // so browsing the operator did inside the view is left alone.
-            // (A cd has no tmux notification to subscribe to; this rides
-            // the same once-a-second probe the panel already runs.)
+            // A `cd` has no tmux notification to subscribe to; active-pane
+            // output requests the event-armed snapshot that notices it.
             let moved = app.files.anchor() != std::path::Path::new(cwd);
             if app.files_root_pending || moved {
                 app.files_root_pending = false;
@@ -5164,7 +5185,7 @@ async fn probe_files(app: &mut App, client: &ControlClient) -> bool {
                 // what references are written from, so it follows the pane
                 // rather than the browsing that happens after this.
                 app.files.anchor_at(cwd);
-                app.files.reroot(cwd);
+                crate::file_adapter::reroot(&mut app.files, cwd);
                 changed |= app.files.root() != before;
             }
             // References from the pinned view are sent to the same agent,
@@ -5175,11 +5196,11 @@ async fn probe_files(app: &mut App, client: &ControlClient) -> bool {
             // `remember_pinned_root`).
             app.files_pinned.anchor_at(cwd);
             if !app.files_pinned.has_root() {
-                app.files_pinned.reroot(cwd);
+                crate::file_adapter::reroot(&mut app.files_pinned, cwd);
             }
         }
     }
-    changed | app.files_tree_mut().refresh()
+    changed | crate::file_adapter::refresh(app.files_tree_mut())
 }
 
 /// A browse in the pinned view is what "pin it" means: the folder the
@@ -5511,6 +5532,11 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
     // Before the snapshot, not after: a session the daemon starts watching
     // now is one this same reconcile can already show agents for.
     ensure_sessions_watched(app);
+    // An unknown pane/session route is resolved only after the authoritative
+    // model lands. That one route event earns one Files snapshot.
+    if app.files_root_pending {
+        request_files_refresh(app, Duration::ZERO);
+    }
     // Keep what the last answer said when this one does not arrive: a
     // reconcile that cannot reach the daemon knows nothing new about the
     // roster, and blanking it would un-name every agent on screen.
@@ -7540,7 +7566,7 @@ mod tests {
             files: crate::files::FileTree::new(),
             files_pinned: crate::files::FileTree::new(),
             files_view: crate::files::FilesView::default(),
-            files_probe_at: None,
+            files_refresh_at: None,
             files_root_pending: true,
             record: cyclops_ui::Record::new(),
             messages_queue: cyclops_ui::HumanQueue::default(),
@@ -7614,6 +7640,36 @@ mod tests {
             sidebar_visible: true,
             messages_visible: false,
         }
+    }
+
+    #[test]
+    fn files_refresh_is_event_armed_and_never_rearms_itself() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-files-refresh-request");
+        let mut app = test_app(one_pane_model(), home.clone());
+        app.files_root_pending = false;
+
+        // A hidden panel has no reason to touch the filesystem.
+        app.model.sidebar_visible = false;
+        request_files_refresh(&mut app, Duration::ZERO);
+        assert!(app.files_refresh_at.is_none());
+
+        // A visible panel is an explicit request. A second event in the
+        // burst keeps the first deadline rather than sliding or queueing it.
+        app.model.sidebar_visible = true;
+        request_files_refresh(&mut app, Duration::ZERO);
+        let due = app.files_refresh_at.expect("visible Files request");
+        request_files_refresh(&mut app, FILES_REFRESH_DELAY);
+        assert_eq!(app.files_refresh_at, Some(due));
+
+        // Consuming the request leaves no hidden recurring deadline behind.
+        assert!(take_files_refresh_request(&mut app, due));
+        assert!(app.files_refresh_at.is_none());
+        assert!(!take_files_refresh_request(
+            &mut app,
+            due + FILES_REFRESH_DELAY
+        ));
+
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

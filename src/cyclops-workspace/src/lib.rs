@@ -11,6 +11,7 @@ mod decoration;
 mod dialog;
 mod drag;
 pub mod event_record;
+mod file_adapter;
 mod files;
 mod focus;
 mod input;
