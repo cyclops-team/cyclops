@@ -270,6 +270,12 @@ staged install-to-first-durable-handoff journey, retain their own metadata and
 history in scheduled and release evidence. The handoff journey never runs in a
 pull-request job.
 
+Immediately before its filtered nextest run, the correctness lane builds the
+matching `cyclops`/`cyclopsd` pair for
+`workspace_cli::start_starts_a_daemon_when_none_is_running`, the explicit
+real-daemon start assertion. `workspace_boot_sizing`'s sizing assertion does
+not require a daemon and tolerates daemon-start failure.
+
 The old `cargo test --workspace --doc` command compiled every workspace crate
 and executed zero doctests. The replacement
 `cargo doc --workspace --no-deps` directly protects the intended

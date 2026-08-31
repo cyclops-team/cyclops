@@ -5,6 +5,8 @@
 //! crosses the public binary entrypoint and `cyclops_workspace::run_async`.
 //! A target-side tmux hook records the first resize, so a later reconcile
 //! cannot repair a bad boot declaration before the assertion observes it.
+//! Its sizing assertion does not require a daemon and tolerates daemon-start
+//! failure.
 
 #![cfg(feature = "full-ui")]
 

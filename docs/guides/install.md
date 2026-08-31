@@ -460,6 +460,7 @@ cargo install cargo-nextest --locked --version 0.9.100
 ```
 
 ```bash
+cargo build -p cyclops -p cyclopsd --bins
 cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
 cargo test -p cyclopsd --all-targets --no-fail-fast
 cargo test --workspace --doc
@@ -491,6 +492,7 @@ elsewhere. Move it with `CYCLOPS_TEST_TMP`:
 
 ```bash
 mkdir -p /private/var/tmp/cyc-relocated
+cargo build -p cyclops -p cyclopsd --bins
 CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
 CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated cargo test -p cyclopsd --all-targets --no-fail-fast
 ```
