@@ -10,9 +10,7 @@ use crate::style::Style;
 #[derive(Clone, Copy)]
 enum FileState {
     Missing,
-    Current,
-    Outdated,
-    Edited,
+    Shipped(crate::managed_assets::ShippedState),
     Invalid,
     Unreadable,
 }
@@ -21,16 +19,14 @@ impl FileState {
     fn word(self) -> &'static str {
         match self {
             FileState::Missing => "missing",
-            FileState::Current => "current",
-            FileState::Outdated => "outdated",
-            FileState::Edited => "edited",
+            FileState::Shipped(state) => state.word(),
             FileState::Invalid => "invalid",
             FileState::Unreadable => "unreadable",
         }
     }
 
     fn ready(self) -> bool {
-        matches!(self, FileState::Current | FileState::Edited)
+        matches!(self, FileState::Shipped(state) if state.ready())
     }
 }
 
@@ -98,13 +94,11 @@ fn manifest_check(home: &Path, id: &str) -> ManifestCheck {
             };
         }
     };
-    let state = if body == shipped {
-        FileState::Current
-    } else if crate::manifests::unedited_seed(body.as_bytes()) {
-        FileState::Outdated
-    } else {
-        FileState::Edited
-    };
+    let state = FileState::Shipped(crate::managed_assets::classify_seeded_bytes(
+        body.as_bytes(),
+        shipped.as_bytes(),
+        crate::manifests::unedited_seed,
+    ));
     ManifestCheck {
         path,
         state,
@@ -118,9 +112,14 @@ fn skill_state(installed: bool, path: &Path) -> (&'static str, bool) {
         return ("not_installed", true);
     }
     match std::fs::read(path) {
-        Ok(body) if body == crate::skillseed::SHIPPED.as_bytes() => ("current", true),
-        Ok(body) if crate::skillseed::unedited_seed(&body) => ("outdated", false),
-        Ok(_) => ("edited", true),
+        Ok(body) => {
+            let state = crate::managed_assets::classify_seeded_bytes(
+                &body,
+                crate::skillseed::SHIPPED.as_bytes(),
+                crate::skillseed::unedited_seed,
+            );
+            (state.word(), state.ready())
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => ("missing", false),
         Err(_) => ("unreadable", false),
     }
@@ -299,9 +298,9 @@ mod tests {
     #[test]
     fn only_current_or_edited_owned_files_are_ready() {
         assert!(!FileState::Missing.ready());
-        assert!(FileState::Current.ready());
-        assert!(!FileState::Outdated.ready());
-        assert!(FileState::Edited.ready());
+        assert!(FileState::Shipped(crate::managed_assets::ShippedState::Current).ready());
+        assert!(!FileState::Shipped(crate::managed_assets::ShippedState::KnownOld).ready());
+        assert!(FileState::Shipped(crate::managed_assets::ShippedState::OperatorEdited).ready());
         assert!(!FileState::Invalid.ready());
         assert!(!FileState::Unreadable.ready());
     }

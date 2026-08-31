@@ -1666,30 +1666,34 @@ fn inspect_setup(cyclops_home: &Path) -> SetupReport {
             Ok(None) => AssetRead::Missing,
             Err(_) => AssetRead::Unproven,
         };
-        let (manifest_state, ack_capable, mailbox_capability) = match manifest_file {
-            AssetRead::Missing => ("missing", None, None),
-            AssetRead::Unproven => ("unproven", None, None),
-            AssetRead::Truncated => ("truncated", None, None),
+        let (manifest_state, manifest_ready, ack_capable, mailbox_capability) = match manifest_file
+        {
+            AssetRead::Missing => ("missing", false, None, None),
+            AssetRead::Unproven => ("unproven", false, None, None),
+            AssetRead::Truncated => ("truncated", false, None, None),
             AssetRead::Bytes(bytes) => {
                 let shipped = crate::manifests::shipped_body(spec.id)
                     .expect("shipped consumer manifest")
                     .as_bytes();
-                let state = if bytes == shipped {
-                    "current"
-                } else if crate::manifests::unedited_seed(&bytes) {
-                    "outdated"
-                } else {
-                    "edited"
-                };
+                let state = crate::managed_assets::classify_seeded_bytes(
+                    &bytes,
+                    shipped,
+                    crate::manifests::unedited_seed,
+                );
                 let parsed = std::str::from_utf8(&bytes)
                     .ok()
                     .and_then(|body| cyclops_manifest::Manifest::parse(body, &manifest_path).ok());
                 match parsed {
                     Some(parsed) if parsed.agent.id == spec.id => {
                         let ack = parsed.hooks.ack.is_some();
-                        (state, Some(ack), parsed.messaging.mailbox_capability_file)
+                        (
+                            state.word(),
+                            state.ready(),
+                            Some(ack),
+                            parsed.messaging.mailbox_capability_file,
+                        )
                     }
-                    _ => ("invalid", None, None),
+                    _ => ("invalid", false, None, None),
                 }
             }
         };
@@ -1725,7 +1729,6 @@ fn inspect_setup(cyclops_home: &Path) -> SetupReport {
                     "direct_payload"
                 }
             });
-        let manifest_ready = matches!(manifest_state, "current" | "edited");
         let receipt_ready = !installed || spec.receipt.accepts(ack_capable);
         let complete = !installed
             || (install_state == "present"
@@ -1787,9 +1790,14 @@ fn inspect_skill(asset: AssetRead) -> (&'static str, bool) {
         AssetRead::Missing => ("missing", false),
         AssetRead::Truncated => ("truncated", false),
         AssetRead::Unproven => ("unproven", false),
-        AssetRead::Bytes(body) if body == crate::skillseed::SHIPPED.as_bytes() => ("current", true),
-        AssetRead::Bytes(body) if crate::skillseed::unedited_seed(&body) => ("outdated", false),
-        AssetRead::Bytes(_) => ("edited", true),
+        AssetRead::Bytes(body) => {
+            let state = crate::managed_assets::classify_seeded_bytes(
+                &body,
+                crate::skillseed::SHIPPED.as_bytes(),
+                crate::skillseed::unedited_seed,
+            );
+            (state.word(), state.ready())
+        }
     }
 }
 
