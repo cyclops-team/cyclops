@@ -427,6 +427,38 @@ impl ControlClient {
         .map(|_| ())
     }
 
+    /// Read one exact pane's current directory.
+    ///
+    /// tmux expands an absent `-t %pane` target to an empty successful reply
+    /// rather than `%error`. Including the target's own id lets callers tell
+    /// that absence apart from a real pane whose path is temporarily blank.
+    pub async fn pane_current_path(&self, pane_id: &str) -> Result<Option<String>, TmuxError> {
+        let reply = self
+            .command(&format!(
+                "display-message -p -t {} {}",
+                quote_arg(pane_id),
+                quote_arg("#{pane_id}\t#{pane_current_path}")
+            ))
+            .await?;
+        parse_pane_current_path(&reply, pane_id)
+    }
+
+    /// Read the stable id of the session this control client currently
+    /// displays.
+    ///
+    /// A state read after an uncertain `switch-client` is the only honest way
+    /// for a caller to choose its reconciliation target: the switch may have
+    /// landed even when its acknowledgement did not.
+    pub async fn current_session_id(&self) -> Result<String, TmuxError> {
+        let reply = self
+            .command(&format!(
+                "display-message -p {}",
+                quote_arg("#{session_id}")
+            ))
+            .await?;
+        first_field(&reply, "display current session id")
+    }
+
     /// Create a detached session rooted in `cwd` and return its session id.
     ///
     /// The id comes back from `-P -F '#{session_id}'` because the name is
@@ -516,6 +548,37 @@ fn first_field(reply: &[String], what: &str) -> Result<String, TmuxError> {
         .ok_or_else(|| TmuxError::Protocol(format!("{what}: reply carried no id")))
 }
 
+fn parse_pane_current_path(
+    reply: &[String],
+    expected_pane_id: &str,
+) -> Result<Option<String>, TmuxError> {
+    let Some((row, continuation)) = reply.split_first() else {
+        return Ok(None);
+    };
+    if row.is_empty() {
+        return Ok(None);
+    }
+    let Some((pane_id, path)) = row.split_once('\t') else {
+        return Err(TmuxError::Protocol(
+            "tmux pane-directory reply omitted its identity".into(),
+        ));
+    };
+    if pane_id.is_empty() {
+        return Ok(None);
+    }
+    if pane_id != expected_pane_id {
+        return Err(TmuxError::Protocol(format!(
+            "tmux pane-directory reply named {pane_id:?}, expected {expected_pane_id:?}"
+        )));
+    }
+    let mut path = path.to_string();
+    for line in continuation {
+        path.push('\n');
+        path.push_str(line);
+    }
+    Ok(Some(path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,5 +607,27 @@ mod tests {
             Err(TmuxError::Protocol(msg)) => assert!(msg.contains("new-window")),
             other => panic!("expected a protocol error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pane_directory_reply_keeps_a_real_blank_path_distinct_from_an_absent_pane() {
+        assert_eq!(
+            parse_pane_current_path(&["%3\t".into()], "%3").unwrap(),
+            Some(String::new())
+        );
+        assert_eq!(parse_pane_current_path(&[], "%3").unwrap(), None);
+        assert_eq!(parse_pane_current_path(&["\t".into()], "%3").unwrap(), None);
+        assert_eq!(
+            parse_pane_current_path(&["%3\t/work".into(), "tree".into()], "%3").unwrap(),
+            Some("/work\ntree".into())
+        );
+    }
+
+    #[test]
+    fn pane_directory_reply_rejects_a_different_identity() {
+        assert!(matches!(
+            parse_pane_current_path(&["%4\t/work".into()], "%3"),
+            Err(TmuxError::Protocol(_))
+        ));
     }
 }

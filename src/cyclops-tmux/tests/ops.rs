@@ -907,6 +907,74 @@ async fn switch_to_session_moves_this_client() {
 }
 
 #[tokio::test]
+async fn switch_to_session_accepts_the_stable_session_id() {
+    let Some(srv) = TestServer::new("ops-switch-id") else {
+        return;
+    };
+    srv.new_session("alpha");
+    srv.new_session("beta");
+    let beta_id = field(&srv, "beta", "#{session_id}");
+    let (client, _n) = ControlClient::spawn(srv.config("alpha"))
+        .await
+        .expect("spawn");
+
+    assert_eq!(
+        client.current_session_id().await.expect("current alpha id"),
+        field(&srv, "alpha", "#{session_id}")
+    );
+
+    client
+        .switch_to_session(&beta_id)
+        .await
+        .expect("switch by stable id");
+
+    assert_eq!(
+        client.current_session_id().await.expect("current beta id"),
+        beta_id
+    );
+
+    let attached = lines(&srv, &["list-clients", "-F", "#{client_session}"]);
+    assert_eq!(attached, vec!["beta"], "the control client must move");
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn pane_current_path_reports_a_vanished_exact_pane_as_absent() {
+    let Some(srv) = TestServer::new("ops-pane-current-path") else {
+        return;
+    };
+    srv.new_session("host");
+    srv.tmux_ok(&["split-window", "-h", "-t", "host"]);
+    let panes = pane_ids(&srv, "host");
+    let live_pane = panes[0].clone();
+    let vanished_pane = panes[1].clone();
+    let (client, _n) = ControlClient::spawn(srv.config("host"))
+        .await
+        .expect("spawn");
+
+    srv.tmux_ok(&["kill-pane", "-t", &vanished_pane]);
+
+    assert!(
+        client
+            .pane_current_path(&live_pane)
+            .await
+            .expect("live pane read")
+            .is_some(),
+        "the still-live pane must not be treated as missing"
+    );
+    assert_eq!(
+        client
+            .pane_current_path(&vanished_pane)
+            .await
+            .expect("vanished pane read"),
+        None,
+        "tmux renders an absent exact pane as an empty successful expansion"
+    );
+
+    client.shutdown().await;
+}
+
+#[tokio::test]
 async fn new_session_returns_its_id_detached_in_the_requested_directory() {
     let Some(srv) = TestServer::new("ops-new-session") else {
         return;
