@@ -81,6 +81,26 @@ impl ControlClient {
             .map(|_| ())
     }
 
+    /// Focus the live neighbour of one exact source pane.
+    ///
+    /// Unlike [`Self::select_pane_toward`], this never borrows tmux's ambient
+    /// current pane. An input gesture can be queued behind another effect, so
+    /// the pane that was current when the gesture was routed must travel with
+    /// it or the direction can silently apply to a different pane.
+    pub async fn select_pane_toward_from(
+        &self,
+        pane_id: &str,
+        direction: PaneDirection,
+    ) -> Result<(), TmuxError> {
+        self.command(&format!(
+            "select-pane {} -t {}",
+            direction.flag(),
+            quote_arg(pane_id)
+        ))
+        .await
+        .map(|_| ())
+    }
+
     /// Focus one pane by id.
     ///
     /// A pane on a window that is not current stays invisible until that
@@ -91,6 +111,34 @@ impl ControlClient {
         self.command(&format!("select-pane -t {}", quote_arg(pane_id)))
             .await
             .map(|_| ())
+    }
+
+    /// Focus an exact pane in another window of this client's session.
+    ///
+    /// The sequence is adapter-owned because selecting a pane in a hidden
+    /// window does not make that window visible. Callers provide the route;
+    /// they do not need to know the host transition needed to realize it.
+    pub async fn focus_window_pane(&self, window_id: &str, pane_id: &str) -> Result<(), TmuxError> {
+        self.select_window(window_id).await?;
+        self.select_pane(pane_id).await
+    }
+
+    /// Focus an exact pane in another session.
+    ///
+    /// The stable tmux session id is the first target, then the window and pane
+    /// ids complete the route. A failure at any step is returned so the caller
+    /// can reconcile the authoritative state instead of pretending the whole
+    /// route landed. This route is defined in terms of the stable id; callers
+    /// must not substitute a mutable session name.
+    pub async fn focus_session_window_pane(
+        &self,
+        session_id: &str,
+        window_id: &str,
+        pane_id: &str,
+    ) -> Result<(), TmuxError> {
+        self.command(&format!("switch-client -t {}", quote_arg(session_id)))
+            .await?;
+        self.focus_window_pane(window_id, pane_id).await
     }
 
     /// Split `pane_id` and leave tmux focused on the new pane.

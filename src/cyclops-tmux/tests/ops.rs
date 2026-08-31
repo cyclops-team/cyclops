@@ -9,7 +9,7 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::TestServer;
-use cyclops_tmux::{ControlClient, PaneDirection, SplitDirection, TmuxError};
+use cyclops_tmux::{ControlClient, ControlConfig, PaneDirection, SplitDirection, TmuxError};
 
 /// Pane ids of a target, in layout order.
 fn pane_ids(srv: &TestServer, target: &str) -> Vec<String> {
@@ -155,6 +155,100 @@ async fn select_pane_by_id_focuses_that_pane() {
 
     assert_eq!(field(&srv, "s", "#{pane_id}"), first);
     client.shutdown().await;
+}
+
+#[tokio::test]
+async fn source_targeted_direction_does_not_borrow_the_ambient_current_pane() {
+    let Some(srv) = TestServer::new("ops-select-exact-source") else {
+        return;
+    };
+    srv.new_session("s");
+    srv.tmux_ok(&["split-window", "-h", "-t", "s"]);
+    srv.tmux_ok(&["split-window", "-h", "-t", "s"]);
+    let panes = pane_ids(&srv, "s");
+    let (left, middle, right) = (&panes[0], &panes[1], &panes[2]);
+    srv.tmux_ok(&["select-pane", "-t", right]);
+    let (client, _n) = ControlClient::spawn(srv.config("s")).await.expect("spawn");
+
+    client
+        .select_pane_toward_from(middle, PaneDirection::Left)
+        .await
+        .expect("select left of the captured source");
+
+    assert_eq!(field(&srv, "s", "#{pane_id}"), *left);
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn exact_focus_routes_stay_on_the_configured_server_and_config() {
+    let Some(ambient) = TestServer::new("ops-focus-route-ambient") else {
+        return;
+    };
+    let Some(configured) = TestServer::new("ops-focus-route-configured") else {
+        return;
+    };
+    ambient.new_session("same-name");
+    ambient.tmux_ok(&["split-window", "-h", "-t", "same-name"]);
+    let ambient_before = field(&ambient, "same-name", "#{pane_id}");
+
+    let root = scratch("cyclops-ops-focus-route-config");
+    let config_path = root.join("tmux.conf");
+    std::fs::write(&config_path, "set-option -g status-position top\n")
+        .expect("write configured tmux file");
+    let cfg = ControlConfig::new_session("same-name")
+        .on_socket(configured.sock().to_string())
+        .with_config_file(&config_path);
+    let (client, _n) = ControlClient::spawn(cfg)
+        .await
+        .expect("spawn configured client");
+    assert_eq!(
+        lines(&configured, &["show-options", "-gv", "status-position"]),
+        vec!["top"],
+        "the explicit config reached the same server as focus"
+    );
+
+    configured.tmux_ok(&["new-window", "-d", "-t", "same-name:", "-n", "second"]);
+    let second = lines(
+        &configured,
+        &["list-windows", "-t", "same-name", "-F", "#{window_id}"],
+    )[1]
+    .clone();
+    configured.tmux_ok(&["split-window", "-h", "-t", &second]);
+    let second_pane = pane_ids(&configured, &second)[0].clone();
+
+    client
+        .focus_window_pane(&second, &second_pane)
+        .await
+        .expect("focus exact window route");
+    assert_eq!(field(&configured, "same-name", "#{window_id}"), second);
+    assert_eq!(field(&configured, "same-name", "#{pane_id}"), second_pane);
+    assert_eq!(
+        field(&ambient, "same-name", "#{pane_id}"),
+        ambient_before,
+        "the same-shaped ambient server was untouched"
+    );
+
+    configured.new_session("background");
+    let background_id = field(&configured, "background", "#{session_id}");
+    let background_window = field(&configured, "background", "#{window_id}");
+    let background_pane = field(&configured, "background", "#{pane_id}");
+    configured.tmux_ok(&["rename-session", "-t", &background_id, "renamed-background"]);
+    configured.new_session("background");
+    client
+        .focus_session_window_pane(&background_id, &background_window, &background_pane)
+        .await
+        .expect("focus stable session route after name reuse");
+    assert_eq!(
+        lines(&configured, &["list-clients", "-F", "#{client_session}"]),
+        vec!["renamed-background"]
+    );
+    assert_eq!(
+        field(&configured, "renamed-background", "#{pane_id}"),
+        background_pane
+    );
+
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]

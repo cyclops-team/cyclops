@@ -67,6 +67,16 @@ pub fn pane_input_uncertain(pane: &str, error: &dyn std::fmt::Display) -> String
     format!("input may have reached {pane}; it will not be replayed: {error}")
 }
 
+pub const FOCUS_CONTROL_RECONNECTING: &str =
+    "focus is unavailable while the tmux connection is recovering";
+pub const FOCUS_CONTROL_DISCONNECTED: &str =
+    "focus is unavailable because the tmux connection is no longer live";
+pub const FOCUS_STATE_REFRESHING: &str = "focus is unchanged while workspace state refreshes";
+
+pub fn focus_unconfirmed(pane: &str, error: &dyn std::fmt::Display) -> String {
+    format!("focus not confirmed for {pane}: {error}; refreshing workspace state")
+}
+
 pub const STREAM_RECONCILED: &str = "stream rebuilt from the durable tail";
 
 /// Workspace presentation for the shared Hello compatibility classification.
