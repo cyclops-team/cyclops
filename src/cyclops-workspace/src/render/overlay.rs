@@ -1885,7 +1885,7 @@ mod tests {
                 window_id: "@0".into(),
             },
             Dialog::RenameWorkspace {
-                session: "main".into(),
+                session_id: "$1".into(),
                 buffer: "main".into(),
             },
             Dialog::ConfirmCloseWorkspace {

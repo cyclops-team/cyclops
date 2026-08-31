@@ -42,6 +42,7 @@ use crate::naming;
 use crate::persist::SidebarTab;
 use crate::split::{Decision as SplitDecision, Effect as SplitEffect, Placement as SplitPlacement};
 use crate::workspace_close::{Decision as CloseDecision, Effect as CloseEffect};
+use crate::workspace_rename::{Decision as RenameDecision, Effect as RenameEffect};
 
 /// What the caller must do after one action executed. Every field defaults
 /// to false ("nothing beyond what already happened"); an arm sets exactly
@@ -302,16 +303,26 @@ pub(super) async fn execute(
             client.switch_to_session(&session).await?;
             Ok(Outcome::reconcile())
         }
-        Action::RequestRenameWorkspace { session } => {
+        Action::RequestRenameWorkspace { session_id } => {
+            let Some(workspace) = app
+                .model
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.session_id == session_id)
+            else {
+                app.notice.show(
+                    crate::copy::WORKSPACE_RENAME_ROUTE_STALE,
+                    tokio::time::Instant::now(),
+                );
+                return Ok(Outcome::reconcile());
+            };
             app.open_dialog(Dialog::RenameWorkspace {
-                buffer: session.clone(),
-                session,
+                session_id: workspace.session_id.clone(),
+                buffer: workspace.name.clone(),
             });
             Ok(Outcome::default())
         }
-        Action::RenameWorkspace { session, name } => {
-            rename_workspace(app, client, session, name).await
-        }
+        Action::RenameWorkspace(intent) => execute_rename_workspace(app, client, intent).await,
         Action::RequestCloseWorkspace { session_id } => {
             app.open_dialog(Dialog::ConfirmCloseWorkspace { session_id });
             Ok(Outcome::default())
@@ -1256,40 +1267,88 @@ async fn new_workspace(app: &mut App, client: &ControlClient) -> Result<Outcome,
     })
 }
 
-/// Rename one workspace. An explicit rename means the human owns the name
-/// now, so a folder-following workspace stops following.
-async fn rename_workspace(
+/// Decide and perform one confirmed workspace rename. The model remains a
+/// tmux snapshot; only reconciliation installs the renamed structure.
+async fn execute_rename_workspace(
     app: &mut App,
     client: &ControlClient,
-    session: String,
-    name: String,
+    intent: crate::workspace_rename::Intent,
 ) -> Result<Outcome, TmuxError> {
-    client.rename_session(&session, &name).await?;
-    let mut persist =
-        crate::persist::migrate_order_entry(&mut app.prefs.workspace_order, &session, &name);
-    if let Some(session_id) = app
-        .model
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.name == session)
-        .map(|workspace| workspace.session_id.clone())
-    {
-        let before = app.prefs.folder_tracked.len();
-        app.prefs.folder_tracked.retain(|id| id != &session_id);
-        persist |= app.prefs.folder_tracked.len() != before;
-    }
-    // The model addresses the active session BY NAME; skip this and the
-    // reconcile that follows queries the old name.
-    if app.model.session.session == session {
-        app.model.session.session = name;
-    }
+    // Confirmation is one consumed gesture. Refusal and uncertainty are
+    // visible on the notice line rather than hidden behind the same modal.
     app.dialog = None;
     app.hover = None;
+    let decision =
+        crate::workspace_rename::decide(intent, &app.model, app.link_state, !app.needs_reconcile);
+    let effect = match decision {
+        RenameDecision::Refresh => {
+            app.notice.show(
+                crate::copy::WORKSPACE_RENAME_ROUTE_STALE,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::reconcile());
+        }
+        RenameDecision::Refused(crate::workspace_rename::Refusal::Reconnecting) => {
+            app.notice.show(
+                crate::copy::WORKSPACE_RENAME_CONTROL_RECONNECTING,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::default());
+        }
+        RenameDecision::Refused(crate::workspace_rename::Refusal::ServerGone) => {
+            app.notice.show(
+                crate::copy::WORKSPACE_RENAME_CONTROL_DISCONNECTED,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::default());
+        }
+        RenameDecision::Refused(crate::workspace_rename::Refusal::Refreshing) => {
+            app.notice.show(
+                crate::copy::WORKSPACE_RENAME_STATE_REFRESHING,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::reconcile());
+        }
+        RenameDecision::Run(effect) => effect,
+    };
+
+    // Preserve the active identity through both snapshots even if this
+    // operation renames it, or a separate rename lands before reconciliation.
+    app.reconcile_session_id = Some(effect.reconcile_session_id.clone());
+    if let Err(error) = perform_workspace_rename(client, &effect).await {
+        super::log_err(&app.home, &error.to_string());
+        app.notice.show(
+            crate::copy::workspace_rename_unconfirmed(&effect.target.name, &error),
+            tokio::time::Instant::now(),
+        );
+        return Ok(Outcome::reconcile());
+    }
+
+    // An explicit rename means the human owns this identity's name now, so
+    // a folder-following workspace stops following. `workspace_order` is
+    // still keyed by mutable names: another session may have reused the
+    // cached name before this exact-id command landed. The ordered rename
+    // notification migrates the entry when it has a current identity/name
+    // mapping; this effect path must not guess and steal a survivor's entry.
+    let before = app.prefs.folder_tracked.len();
+    app.prefs
+        .folder_tracked
+        .retain(|id| id != &effect.target.session_id);
+    let persist = app.prefs.folder_tracked.len() != before;
     Ok(Outcome {
         reconcile: true,
         persist,
         ..Outcome::default()
     })
+}
+
+async fn perform_workspace_rename(
+    client: &ControlClient,
+    effect: &RenameEffect,
+) -> Result<(), TmuxError> {
+    client
+        .rename_session(&effect.target.session_id, &effect.name)
+        .await
 }
 
 /// Decide and perform one confirmed workspace close. The adapter owns any
@@ -3161,6 +3220,184 @@ mod tests {
 
         client.shutdown().await;
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[tokio::test]
+    async fn workspace_rename_keeps_the_confirmed_identity_after_name_reuse() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-rename-workspace-identity");
+        server.run_ok(&["new-session", "-d", "-s", "target", "/bin/sh"]);
+        let client = rig_client(&server, "target").await;
+        let model = crate::sync::fetch_workspace_model(&client, "target")
+            .await
+            .expect("initial authoritative model");
+        let target_id = model
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == "target")
+            .expect("target row")
+            .session_id
+            .clone();
+        let home = scratch_home("exec-rename-workspace-identity-home");
+        let mut app = test_app(model, home.clone());
+        app.prefs.workspace_order = vec!["target".into()];
+        app.prefs.folder_tracked = vec![target_id.clone()];
+
+        let request = execute(
+            &mut app,
+            &client,
+            Action::RequestRenameWorkspace {
+                session_id: target_id.clone(),
+            },
+        )
+        .await
+        .expect("request opens a dialog");
+        assert!(!request.reconcile);
+        assert!(matches!(
+            &app.dialog,
+            Some(Dialog::RenameWorkspace { session_id, buffer })
+                if session_id == &target_id && buffer == "target"
+        ));
+
+        // The confirmed identity changes name while a new session takes its
+        // old name. A name-bearing dialog would now rename the new session.
+        server.run_ok(&["rename-session", "-t", &target_id, "moved"]);
+        server.run_ok(&["new-session", "-d", "-s", "target", "/bin/sh"]);
+
+        let outcome = execute(
+            &mut app,
+            &client,
+            Action::RenameWorkspace(crate::workspace_rename::Intent {
+                session_id: target_id.clone(),
+                name: "review".into(),
+            }),
+        )
+        .await
+        .expect("confirmed rename executes");
+
+        assert!(outcome.reconcile);
+        assert!(outcome.persist);
+        assert_eq!(
+            app.model.session.session, "target",
+            "only reconciliation may replace the cached workspace model"
+        );
+        assert_eq!(
+            app.reconcile_session_id.as_deref(),
+            Some(target_id.as_str())
+        );
+        assert_eq!(
+            app.prefs.workspace_order,
+            vec!["target".to_string()],
+            "the session that reused the old name keeps its name-keyed order entry"
+        );
+        assert!(app.prefs.folder_tracked.is_empty());
+        let sessions = server.run(&["list-sessions", "-F", "#{session_id}\t#{session_name}"]);
+        let sessions = String::from_utf8_lossy(&sessions.stdout);
+        assert!(sessions
+            .lines()
+            .any(|row| row == format!("{target_id}\treview")));
+        assert!(
+            sessions.lines().any(|row| row.ends_with("\ttarget")),
+            "the session that reused the old name must be untouched: {sessions}"
+        );
+
+        app.needs_reconcile = false;
+        crate::app::reconcile(&mut app, &client)
+            .await
+            .expect("authoritative rename settlement");
+        assert_eq!(app.model.session.session, "review");
+        assert_eq!(
+            app.model.workspaces[0].name, "target",
+            "the reused name still owns the retained name-keyed order entry"
+        );
+        assert_eq!(
+            app.model.workspaces[app.model.active_workspace].session_id,
+            target_id
+        );
+        assert_eq!(app.reconcile_session_id, None);
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_workspace_rename_is_visible_and_reconciles_the_active_identity() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-rename-workspace-failure");
+        server.run_ok(&["new-session", "-d", "-s", "host", "/bin/sh"]);
+        server.run_ok(&["new-session", "-d", "-s", "target", "/bin/sh"]);
+        let client = rig_client(&server, "host").await;
+        let model = crate::sync::fetch_workspace_model(&client, "host")
+            .await
+            .expect("initial authoritative model");
+        let host_id = model
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == "host")
+            .expect("host row")
+            .session_id
+            .clone();
+        let target_id = model
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == "target")
+            .expect("target row")
+            .session_id
+            .clone();
+        let home = scratch_home("exec-rename-workspace-failure-home");
+        let mut app = test_app(model, home.clone());
+        app.prefs.workspace_order = vec!["host".into(), "target".into()];
+        app.prefs.folder_tracked = vec![target_id.clone()];
+        app.dialog = Some(Dialog::RenameWorkspace {
+            session_id: target_id.clone(),
+            buffer: "review".into(),
+        });
+        server.run_ok(&["kill-session", "-t", &target_id]);
+
+        let outcome = execute(
+            &mut app,
+            &client,
+            Action::RenameWorkspace(crate::workspace_rename::Intent {
+                session_id: target_id.clone(),
+                name: "review".into(),
+            }),
+        )
+        .await
+        .expect("failed rename settles visibly");
+
+        assert!(outcome.reconcile);
+        assert!(!outcome.persist);
+        assert!(app.dialog.is_none());
+        assert_eq!(app.reconcile_session_id.as_deref(), Some(host_id.as_str()));
+        assert_eq!(
+            app.prefs.workspace_order,
+            vec!["host".to_string(), "target".to_string()]
+        );
+        assert_eq!(app.prefs.folder_tracked, vec![target_id.clone()]);
+        let notice = app.notice.text().expect("failure is visible");
+        assert!(notice.contains("rename not confirmed for session target"));
+        assert!(notice.contains("refreshing workspace state"));
+
+        app.needs_reconcile = false;
+        crate::app::reconcile(&mut app, &client)
+            .await
+            .expect("authoritative failure settlement");
+        assert_eq!(app.model.session.session, "host");
+        assert!(
+            !app.model
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.session_id == target_id),
+            "the authoritative snapshot removes the vanished target"
+        );
+        assert_eq!(app.reconcile_session_id, None);
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[tokio::test]

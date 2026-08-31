@@ -325,11 +325,12 @@ impl ControlClient {
         .map(|_| ())
     }
 
-    /// Rename one session.
+    /// Rename one session by exact name or stable `$session` id.
     ///
     /// The target is `=name`: without the `=`, tmux accepts a prefix match,
     /// so a rename aimed at a session that has just closed silently lands on
-    /// a neighbour whose name merely starts the same way.
+    /// a neighbour whose name merely starts the same way. A stable id remains
+    /// exact across rename and name reuse.
     pub async fn rename_session(&self, session: &str, name: &str) -> Result<(), TmuxError> {
         self.command(&format!(
             "rename-session -t {} {}",
