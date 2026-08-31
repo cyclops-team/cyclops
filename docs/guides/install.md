@@ -672,13 +672,18 @@ refuses and asks for an explicit prefix:
 curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
 ```
 
-If you also want to delete all Cyclops configuration and records, stop the
-daemon and copy out any history you want to keep before removing
-`~/.cyclops`. Canonical mailbox journals are under
-`~/.cyclops/workspaces/<workspace-id>/messages.ndjson`; session state and
-legacy direct-delivery records are under `~/.cyclops/ledger/`. Copy the whole
-Cyclops home if you need both. A complete uninstall must also remove only the
-Cyclops command hooks from installed vendor configuration. Check
+If you want to remove the retained journals but keep the rest of Cyclops
+state, start with the previewed
+[`cyclops data forget --all`](data.md#forget-the-retained-journal-scope)
+journey. Stop the daemon before its preview and keep it stopped through the
+exact confirmation. It removes only the previewed workspace and session NDJSON
+journals, and deliberately leaves configuration and vendor wiring alone.
+Export first if you might need the history.
+
+If you also want to remove all Cyclops configuration and records, stop the
+daemon and copy out any history you want to keep before manually removing
+`~/.cyclops`. A complete uninstall must also remove only the Cyclops command
+hooks from installed vendor configuration. Check
 `~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.agents/hooks.json`, and
 `~/.cursor/hooks.json` where those files exist. Delete entries whose command
 invokes a `cyclops` binary followed by `hook <Event>`, while preserving every

@@ -77,14 +77,20 @@ your mailbox history, configuration, and vendor settings:
 curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
 ```
 
-For a complete removal, first copy any history you want to keep. Then remove
-the Cyclops hook commands from `~/.claude/settings.json`,
+Before manually removing the whole state home, use
+[`cyclops data inventory`](docs/guides/data.md) to see the retained journals
+and `cyclops data export --to <new-directory>` to make a portable copy. The
+same guide documents `cyclops data forget --all`: stop the daemon before its
+preview and keep it stopped through exact confirmation to remove only the
+journal scope, deliberately leaving configuration and other state behind. Then
+remove the Cyclops hook commands from
+`~/.claude/settings.json`,
 `~/.codex/hooks.json`, `~/.agents/hooks.json`, and
 `~/.cursor/hooks.json` where those files exist, preserving every unrelated
 entry. Finally, delete `~/.cyclops`. This last step permanently removes local
 mailbox journals, configuration, themes, prepared hooks, and operational
 records. The [installation guide](docs/guides/install.md#uninstall) lists the
-records worth exporting before that irreversible step.
+full manual-removal boundary.
 
 ## How to run Cyclops
 

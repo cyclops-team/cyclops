@@ -3,10 +3,12 @@
 use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::thread;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -91,6 +93,7 @@ fn inventory_and_export_work_without_a_daemon_and_preserve_raw_journals() {
         inventory["export"]["command"],
         "cyclops data export --to <new-directory>"
     );
+    assert_eq!(inventory["forget"]["command"], "cyclops data forget --all");
 
     let destination = root.path().join("export");
     let destination_arg = destination.to_str().expect("export path is UTF-8");
@@ -127,4 +130,130 @@ fn inventory_and_export_work_without_a_daemon_and_preserve_raw_journals() {
         workspace
     );
     assert!(!destination.join("INCOMPLETE").exists());
+}
+
+#[test]
+fn forget_previews_the_exact_record_scope_then_requires_its_token() {
+    let root = scratch();
+    let home = root.path().join("home");
+    private_directory(&home);
+    let session = home.join("ledger/main.ndjson");
+    let workspace = home.join("workspaces/alpha/messages.ndjson");
+    let config = home.join("config.toml");
+    record(&session, b"{\"seq\":1}\n");
+    record(&workspace, b"{\"seq\":1,\"body\":\"keep\"}\n");
+    record(&config, b"theme = \"light\"\n");
+
+    let preview = run(&home, &["--json", "data", "forget", "--all"]);
+    assert!(preview.status.success(), "{preview:?}");
+    let preview = json(&preview);
+    assert_eq!(preview["state"], "preview");
+    assert_eq!(preview["files"], 2);
+    assert_eq!(preview["targets"].as_array().unwrap().len(), 2);
+    let confirmation = preview["confirmation"]
+        .as_str()
+        .expect("preview emits its exact confirmation")
+        .to_string();
+    assert!(confirmation.starts_with("forget-durable-records:"));
+    assert_eq!(fs::read(&session).unwrap(), b"{\"seq\":1}\n");
+    assert_eq!(
+        fs::read(&workspace).unwrap(),
+        b"{\"seq\":1,\"body\":\"keep\"}\n"
+    );
+    assert!(!home.join("operations").exists(), "preview created state");
+
+    let wrong = run(
+        &home,
+        &[
+            "--json",
+            "data",
+            "forget",
+            "--all",
+            "--confirm",
+            "forget-durable-records:not-the-preview",
+        ],
+    );
+    assert!(!wrong.status.success(), "{wrong:?}");
+    assert_eq!(json(&wrong)["state"], "confirmation_required");
+    assert!(
+        !home.join("operations").exists(),
+        "wrong token created state"
+    );
+    assert!(session.exists());
+    assert!(workspace.exists());
+
+    let applied = run(
+        &home,
+        &[
+            "--json",
+            "data",
+            "forget",
+            "--all",
+            "--confirm",
+            &confirmation,
+        ],
+    );
+    assert!(applied.status.success(), "{applied:?}");
+    let applied = json(&applied);
+    assert_eq!(applied["state"], "completed");
+    assert_eq!(applied["removed_files"], 2);
+    assert!(!session.exists());
+    assert!(!workspace.exists());
+    assert_eq!(fs::read(&config).unwrap(), b"theme = \"light\"\n");
+}
+
+#[test]
+fn forget_refuses_to_apply_while_an_authenticated_daemon_answers() {
+    let root = scratch();
+    let home = root.path().join("home");
+    private_directory(&home);
+    let journal = home.join("ledger/main.ndjson");
+    record(&journal, b"{\"seq\":1}\n");
+
+    let preview = json(&run(&home, &["--json", "data", "forget", "--all"]));
+    let confirmation = preview["confirmation"]
+        .as_str()
+        .expect("preview emits confirmation")
+        .to_string();
+
+    let listener = UnixListener::bind(home.join(cyclops_proto::SOCK_NAME))
+        .expect("bind scratch daemon socket");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept data removal check");
+        writeln!(
+            stream,
+            "{}",
+            json!({
+                "cyclops": "0.1.0",
+                "build": cyclops_proto::BUILD_REF,
+                "proto": cyclops_proto::PROTOCOL_VERSION,
+                "boot_id": "data-forget-live",
+            })
+        )
+        .expect("write daemon hello");
+    });
+
+    let applied = run(
+        &home,
+        &[
+            "--json",
+            "data",
+            "forget",
+            "--all",
+            "--confirm",
+            &confirmation,
+        ],
+    );
+    server.join().expect("daemon check server exits");
+    assert!(!applied.status.success(), "{applied:?}");
+    let applied = json(&applied);
+    assert_eq!(applied["state"], "refused");
+    assert!(applied["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("cyclopsd is running")));
+    assert_eq!(fs::read(&journal).unwrap(), b"{\"seq\":1}\n");
+    assert!(
+        !home.join("operations").exists(),
+        "a live daemon refusal created removal state"
+    );
 }
