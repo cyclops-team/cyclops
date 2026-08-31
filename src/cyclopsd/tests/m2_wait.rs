@@ -422,58 +422,86 @@ async fn send_wait_turn_ended_round_trip() {
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
 
-    // Fixture turn: once the payload lands in the pane, run one
-    // working-then-idle title cycle, as an agent CLI would.
-    let socket = rig.tmux.socket().to_string();
-    let pane_for_driver = pane.clone();
-    let driver = std::thread::spawn(move || {
-        let tmux = |args: &[&str]| {
-            let _ = std::process::Command::new("tmux")
-                .args(["-u", "-L", &socket, "-f", "/dev/null"])
-                .args(args)
-                .status();
-        };
-        let capture = || {
-            std::process::Command::new("tmux")
-                .args(["-u", "-L", &socket, "-f", "/dev/null"])
-                .args(["capture-pane", "-p", "-t", &pane_for_driver])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                .unwrap_or_default()
-        };
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !capture().contains("[cyclops") && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        std::thread::sleep(Duration::from_millis(200));
-        tmux(&[
-            "select-pane",
-            "-t",
-            &pane_for_driver,
-            "-T",
-            "WORKING the turn",
-        ]);
-        // Outlive the 1Hz subscription tick (F23) so the working phase is
-        // observable before the turn "ends".
-        std::thread::sleep(Duration::from_millis(2000));
-        tmux(&[
-            "select-pane",
-            "-t",
-            &pane_for_driver,
-            "-T",
-            "READY turn ended",
-        ]);
+    // Drive the turn from delivery boundaries rather than guessing when the
+    // payload will appear. `post_submit` proves the key crossed the terminal
+    // boundary; `pre_wait` proves the initial receipt snapshot is taken and
+    // the composed pane wait has not started. That gives the fixture one
+    // exact working-to-idle turn after submit without capture polling or
+    // sleeps.
+    let (submitted_tx, mut submitted_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (pre_wait_tx, mut pre_wait_rx) = tokio::sync::mpsc::unbounded_channel();
+    let submitted_release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let pre_wait_release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let submitted_pause = std::sync::Arc::clone(&submitted_release);
+    let pre_wait_pause = std::sync::Arc::clone(&pre_wait_release);
+    rig.daemon.set_inject_pause(move |phase| {
+        let submitted_tx = submitted_tx.clone();
+        let pre_wait_tx = pre_wait_tx.clone();
+        let submitted_pause = std::sync::Arc::clone(&submitted_pause);
+        let pre_wait_pause = std::sync::Arc::clone(&pre_wait_pause);
+        Box::pin(async move {
+            let (entered, release) = match phase {
+                "post_submit" => (submitted_tx, submitted_pause),
+                "pre_wait" => (pre_wait_tx, pre_wait_pause),
+                _ => return,
+            };
+            let _ = entered.send(());
+            release
+                .acquire_owned()
+                .await
+                .expect("delivery-boundary release")
+                .forget();
+        })
     });
 
-    let (result, _) = rig
-        .send(json!({
-            "to": ["worker"],
-            "subject": "run this",
-            "body": "a\nb",
-            "wait": {"until": "turn_ended", "timeout_ms": 10000},
-        }))
-        .await;
-    driver.join().expect("driver thread");
+    let params: cyclops_proto::MsgSendParams = serde_json::from_value(json!({
+        "to": ["worker"],
+        "subject": "run this",
+        "body": "a\nb",
+        "wait": {"until": "turn_ended", "timeout_ms": 10000},
+    }))
+    .expect("send params");
+    let daemon = &rig.daemon;
+    let tmux = &rig.tmux;
+    let events = &mut rig.ev;
+    let (result, ()) = tokio::join!(daemon.deliver_payload("admin", params), async {
+        tokio::time::timeout(Duration::from_secs(5), submitted_rx.recv())
+            .await
+            .expect("send crossed the submit boundary")
+            .expect("submit boundary signal exists");
+        tmux.run_ok(&["select-pane", "-t", &pane, "-T", "WORKING the turn"]);
+        events
+            .wait_event(Duration::from_secs(5), |event| {
+                event["event"] == "state"
+                    && event["data"]["pane_id"] == pane.as_str()
+                    && event["data"]["state"] == "working"
+                    && event["data"]["working_confirmed"] == true
+            })
+            .await;
+        submitted_release.add_permits(1);
+
+        events
+            .wait_event(Duration::from_secs(8), |event| {
+                event["event"] == "delivery-state"
+                    && event["data"]["to"] == "worker"
+                    && event["data"]["to_state"] == "delivered_unverified"
+            })
+            .await;
+        tokio::time::timeout(Duration::from_secs(5), pre_wait_rx.recv())
+            .await
+            .expect("send reached the pre-wait boundary")
+            .expect("pre-wait boundary signal exists");
+        tmux.run_ok(&["select-pane", "-t", &pane, "-T", "READY turn ended"]);
+        events
+            .wait_event(Duration::from_secs(5), |event| {
+                event["event"] == "state"
+                    && event["data"]["pane_id"] == pane.as_str()
+                    && event["data"]["state"] == "idle"
+            })
+            .await;
+        pre_wait_release.add_permits(1);
+    });
+    let result = result.expect("send-and-wait answers");
 
     let msg_id = result["msg_id"].as_str().expect("msg id").to_string();
     assert_eq!(
