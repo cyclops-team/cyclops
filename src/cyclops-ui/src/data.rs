@@ -17,7 +17,7 @@
 //! in the daemon; the UI receives a bounded, body-free projection. The
 //! ordering discipline that reconciles what it
 //! fetches (backfill tail, then the seed, then the live backlog) is
-//! backend-neutral and lives in `stream.rs` ([`crate::stream::Intake`]) so
+//! backend-neutral and lives in `projection.rs` ([`crate::StreamProjectionState`]) so
 //! a caller with a different transport gets the same guarantee.
 
 use std::path::Path;
