@@ -82,9 +82,11 @@ pub use delivery::render_payload;
 #[doc(hidden)]
 pub use delivery::{prove_composer_representation, ComposerRepresentationProof};
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -105,7 +107,7 @@ use cyclops_tmux::{
 };
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, watch, Notify};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, warn};
 
 /// Recompute a pane this long after its last output activity settles.
@@ -128,6 +130,13 @@ const MISSING_LIFECYCLE_END_BODY: &str = concat!(
     "end was recorded for the same process generation and turn. Terminal writes remain blocked; ",
     "inspect the vendor hook configuration and lifecycle event payload."
 );
+
+/// One `status` request refreshes every live pane under one bounded budget.
+/// The budget and concurrency cap are existing protocol behavior. They live
+/// with the runtime operation so a socket handler cannot independently own
+/// observation task lifetime or decide which panes to refresh.
+const STATUS_REFRESH_BUDGET: Duration = Duration::from_millis(250);
+const STATUS_REFRESH_CONCURRENCY: usize = 8;
 
 /// Commit all consequences of one pane observation before optional tmux chrome.
 ///
@@ -497,6 +506,81 @@ pub(crate) async fn observe_pane_from_output(
     )
     .await?;
     Some(apply_pane_observation(inner, session_idx, watcher, pane_id, observed).await)
+}
+
+type StatusRefreshFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
+type StatusRefreshJob = (PaneKey, StatusRefreshFuture);
+
+/// Refresh each live pane for one status request and return routes that did
+/// not finish inside the shared budget.
+///
+/// A refresh can append current runtime facts, so overdue work must finish in
+/// the daemon lifetime instead of being cancelled at the response boundary.
+/// The status projection treats every returned route as unknown until its
+/// next completed observation.
+pub(crate) async fn refresh_status_observations(inner: &Arc<Inner>) -> HashSet<PaneKey> {
+    let deadline = tokio::time::Instant::now() + STATUS_REFRESH_BUDGET;
+    let mut jobs = VecDeque::new();
+    for (session_idx, _) in inner.active_session_slots() {
+        let Some(watcher) = inner.watcher_of(session_idx) else {
+            continue;
+        };
+        for pane in watcher.snapshot() {
+            let pane_id = pane.pane_id;
+            let key = PaneKey::new(session_idx, &pane_id);
+            let inner = Arc::clone(inner);
+            let watcher = Arc::clone(&watcher);
+            jobs.push_back((
+                key,
+                Box::pin(async move {
+                    observe_pane(&inner, session_idx, &watcher, &pane_id, true, "status")
+                        .await
+                        .is_some()
+                }) as StatusRefreshFuture,
+            ));
+        }
+    }
+    run_status_refresh_jobs(&inner.engine, jobs, deadline, STATUS_REFRESH_CONCURRENCY).await
+}
+
+async fn run_status_refresh_jobs(
+    engine: &delivery::Engine,
+    mut pending: VecDeque<StatusRefreshJob>,
+    deadline: tokio::time::Instant,
+    concurrency: usize,
+) -> HashSet<PaneKey> {
+    let mut incomplete: HashSet<_> = pending.iter().map(|(pane, _)| pane.clone()).collect();
+    let mut running = JoinSet::new();
+    let concurrency = concurrency.max(1);
+
+    loop {
+        while running.len() < concurrency {
+            let Some((pane, refresh)) = pending.pop_front() else {
+                break;
+            };
+            running.spawn(engine.track_descendant(async move { (pane, refresh.await) }));
+        }
+        if running.is_empty() {
+            break;
+        }
+        match tokio::time::timeout_at(deadline, running.join_next()).await {
+            Ok(Some(Ok(Some((pane, true))))) => {
+                incomplete.remove(&pane);
+            }
+            Ok(Some(Ok(Some((_, false)))) | Some(Ok(None)) | Some(Err(_))) => {}
+            Ok(None) => break,
+            Err(_) => {
+                // Pane recomputation can publish state and journal facts. It
+                // is not cancellation-safe, so overdue work finishes in the
+                // background while this answer refuses its cached result.
+                // The daemon lifetime still owns it and cancels it before
+                // sealing the old boot's journals during shutdown.
+                running.detach_all();
+                break;
+            }
+        }
+    }
+    incomplete
 }
 
 /// Test seam: an async pause awaited inside the delivery injection path at
@@ -6024,6 +6108,64 @@ mod tests {
         tokio::time::advance(OUTPUT_SETTLE).await;
 
         assert_eq!(settled.await.unwrap(), Some(40));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn status_refresh_has_one_budget_and_bounded_concurrency() {
+        let engine = delivery::Engine::new();
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut jobs = VecDeque::new();
+        for index in 0..(STATUS_REFRESH_CONCURRENCY + 3) {
+            let started = Arc::clone(&started);
+            jobs.push_back((
+                PaneKey::new(0, &format!("%{index}")),
+                Box::pin(async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                    true
+                }) as StatusRefreshFuture,
+            ));
+        }
+        let budget = Duration::from_millis(25);
+        let before = tokio::time::Instant::now();
+
+        let incomplete =
+            run_status_refresh_jobs(&engine, jobs, before + budget, STATUS_REFRESH_CONCURRENCY)
+                .await;
+
+        assert_eq!(tokio::time::Instant::now() - before, budget);
+        assert_eq!(started.load(Ordering::SeqCst), STATUS_REFRESH_CONCURRENCY);
+        assert_eq!(incomplete.len(), STATUS_REFRESH_CONCURRENCY + 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overdue_status_refresh_finishes_after_the_response_budget() {
+        let engine = delivery::Engine::new();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let completed_by_job = Arc::clone(&completed);
+        let pane = PaneKey::new(0, "%1");
+        let jobs = VecDeque::from([(
+            pane.clone(),
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                completed_by_job.fetch_add(1, Ordering::SeqCst);
+                true
+            }) as StatusRefreshFuture,
+        )]);
+        let before = tokio::time::Instant::now();
+
+        let incomplete =
+            run_status_refresh_jobs(&engine, jobs, before + Duration::from_millis(25), 1).await;
+
+        assert_eq!(incomplete, HashSet::from([pane]));
+        assert_eq!(
+            tokio::time::Instant::now() - before,
+            Duration::from_millis(25)
+        );
+        assert_eq!(completed.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_millis(25)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
     }
 
     #[test]
