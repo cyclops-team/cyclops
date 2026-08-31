@@ -138,6 +138,23 @@ const MISSING_LIFECYCLE_END_BODY: &str = concat!(
 const STATUS_REFRESH_BUDGET: Duration = Duration::from_millis(250);
 const STATUS_REFRESH_CONCURRENCY: usize = 8;
 
+/// Application-level work performed by the pane observation runtime.
+///
+/// These counts deliberately do not describe operating-system scheduler
+/// wakeups, tmux internals, terminal-delivery captures, or client requests.
+/// They describe only watcher events and the state-observation work Cyclops
+/// starts in response.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ObservationWorkCounts {
+    /// Watcher [`PaneEvent`] values accepted by the daemon.
+    pub watcher_event_wakes: u64,
+    /// Pane observation transactions that acquired their per-route gate.
+    pub observation_recompute_starts: u64,
+    /// State-observation `capture-pane` commands issued through the tmux adapter.
+    pub screen_capture_requests: u64,
+}
+
 /// Commit all consequences of one pane observation before optional tmux chrome.
 ///
 /// Fusion has already committed the cache. Runtime publications keep their
@@ -2405,6 +2422,20 @@ impl Daemon {
     /// asks for it.
     pub fn status(&self, open_deliveries: bool) -> cyclops_proto::StatusResult {
         server::status_result(&self.inner, open_deliveries)
+    }
+
+    /// Reset application-level pane-observation work counters for a bounded
+    /// integration-test measurement window.
+    #[doc(hidden)]
+    pub fn reset_observation_work_counts_for_test(&self) {
+        self.inner.pane_observation_runtime.reset_work_counts();
+    }
+
+    /// Snapshot application-level pane-observation work since the last test
+    /// reset. This is not an operating-system wakeup or tmux-process metric.
+    #[doc(hidden)]
+    pub fn observation_work_counts_for_test(&self) -> ObservationWorkCounts {
+        self.inner.pane_observation_runtime.work_counts()
     }
 
     /// In-process body-free stream backfill, identical to the projection the
@@ -5701,6 +5732,7 @@ async fn handle_pane_event(
     debounce: &mut HashMap<String, watch::Sender<u64>>,
     ev: PaneEvent,
 ) -> bool {
+    inner.pane_observation_runtime.note_watcher_event_wake();
     match ev {
         PaneEvent::PaneAdded(row) => {
             inner

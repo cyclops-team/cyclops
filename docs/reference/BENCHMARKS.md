@@ -430,7 +430,15 @@ set flat at 7,664 KB. The tmux control client it owns reported `0:00.00` and
 measurable CPU, which is what rule 9 exists to produce.
 
 This is a single 60-second observation on one machine, not a certified
-number. Nothing in the test suite counts wakeups.
+number. Scheduled and release evidence now also runs a fixed quiet-pane
+measurement that counts Cyclops application work: watcher events,
+state-observation recompute starts, and state-observation `capture-pane`
+requests after a reset. Before that reset, a literal line sent to the isolated
+`cat` control fixture must raise each counter. A fresh isolated fixture then
+measures the quiet window, so a retained zero is not a vacuous uninstrumented
+result or delayed control cleanup. It does not count operating-system scheduler
+wakeups, tmux internals, client refreshes, or terminal-delivery captures, so it
+is not a replacement for a CPU or battery measurement.
 
 ### Record
 
@@ -481,16 +489,15 @@ Codex's was 3006ms. The p50s are the figures in that range (12ms and 37ms).
 Either the claim means p50, or it comes from a measurement outside this
 repo. It should be corrected or sourced.
 
-**Not measured anywhere, by anything:**
+**Not yet measured by a retained, comparable workload:**
 
-- Idle wakeup counts. Rule 9 is enforced by the debounce structure and by
-  review, not by a test that counts timer fires.
-- Cold start, ledger replay time at boot, and memory growth over a long
-  session.
-- Delivery under concurrency. Every measurement above is one delivery at a
-  time per recipient, which is also what the per-recipient FIFO guarantees.
-- Anything on Linux. Every figure here is macOS on Apple silicon. CI runs
-  the suites on Ubuntu but records no timings.
+- Operating-system scheduler wakeups, idle CPU time, battery use, and memory
+  growth over a long session. The quiet-pane workload counts only Cyclops
+  application-level observation work during one bounded window.
+- Terminal delivery under concurrency. The retained concurrent workload covers
+  durable mailbox acceptance, not route selection, notification, or injection.
+- Comparable Linux and macOS timing. The scheduled runner currently retains
+  performance artifacts on Linux; the macOS matrix is correctness evidence.
 - v1 under any condition except its best one. The comparison above gave v1
   an instantly-echoing target and a fresh prompt before every send.
 
