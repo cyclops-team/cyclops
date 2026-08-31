@@ -111,12 +111,15 @@ From a clone, use `./scripts/install.sh --uninstall`.
 ### With cargo instead
 
 ```bash
-cargo install --path src/cyclops
-cargo install --path src/cyclopsd
+cargo install --locked --path src/cyclops
+cargo install --locked --path src/cyclopsd
 ```
 
+Run both commands from the same checkout. `--locked` keeps Cargo from silently
+replacing that checkout's resolved dependency set while it builds either binary.
+
 Both go to `~/.cargo/bin`, and cargo warns when that is not on your PATH.
-`cargo install --root ~/.local --path src/cyclops` writes
+`cargo install --locked --root ~/.local --path src/cyclops` writes
 `~/.local/bin/cyclops` instead; the root is the prefix, not the directory,
 and cargo appends `bin`.
 
