@@ -1352,6 +1352,15 @@ async fn a_detached_codex_end_releases_only_after_a_fresh_clean_capture() {
     );
 
     held_socket.restore();
+    let availability = rig
+        .ctl
+        .request("session.watch", json!({"session": "main"}))
+        .await;
+    assert_eq!(
+        availability["result"]["added"],
+        json!(false),
+        "{availability}"
+    );
     rig.ev
         .wait_event(Duration::from_secs(15), |e| {
             e["event"] == "session" && e["data"]["attached"] == true

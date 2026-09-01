@@ -1089,6 +1089,18 @@ struct SessionRenamePause {
     release: Arc<std::sync::Barrier>,
 }
 
+#[cfg(test)]
+struct MissingSessionProbePause {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[cfg(test)]
+struct MissingSessionSettlementPause {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
 pub(crate) struct SessionSlot {
     /// Mutable so a followed session rename (`PaneEvent::SessionRenamed`,
     /// `handle_pane_event`) can update it in place: `session_index` then
@@ -1115,6 +1127,12 @@ pub(crate) struct SessionSlot {
     /// collision. The atomic above is the state; this channel is only the
     /// edge that makes a blocked task observe it immediately.
     alias_changed: watch::Sender<Option<usize>>,
+    /// An explicit `session.watch` request says its caller has just made this
+    /// name available for observation. A waiting slot consumes this edge
+    /// instead of retrying a tmux query on a clock. The counter coalesces
+    /// repeated requests while preserving a request that arrives before the
+    /// task reaches its wait.
+    availability_changed: watch::Sender<u64>,
     /// Configured sessions survive absence and wait for `cyclops start` to
     /// create them. Runtime sessions come from a live workspace and retire
     /// after that exact tmux session is positively gone, so reopening a
@@ -1124,6 +1142,29 @@ pub(crate) struct SessionSlot {
     observed_live: AtomicBool,
     retired: AtomicBool,
     retired_changed: watch::Sender<bool>,
+    /// One-shot test boundary at the exact point a task has confirmed a
+    /// missing session and is about to wait for `session.watch`. Production
+    /// never allocates or checks this hook.
+    #[cfg(test)]
+    missing_wait_entered: StdMutex<Option<Arc<Notify>>>,
+    #[cfg(test)]
+    missing_wait_active: AtomicBool,
+    /// Counts control-mode attach attempts at the exact call boundary. This
+    /// is test-only evidence that a missing server socket parks on the
+    /// availability edge instead of creating an empty tmux server.
+    #[cfg(test)]
+    control_connect_attempts: AtomicU64,
+    /// One-shot test boundary after tmux reports absence but before the task
+    /// decides whether an already-recorded availability edge requires one
+    /// recheck. It makes the startup-edge race deterministic in a unit test.
+    #[cfg(test)]
+    missing_probe_pause: StdMutex<Option<MissingSessionProbePause>>,
+    /// One-shot test boundary after a current missing probe returns but before
+    /// it takes the registration barrier to settle durable state. It proves a
+    /// followed rename cannot turn that old absence into cleanup of the new
+    /// canonical target.
+    #[cfg(test)]
+    missing_settlement_pause: StdMutex<Option<MissingSessionSettlementPause>>,
     #[cfg(test)]
     rename_pause: StdMutex<Option<SessionRenamePause>>,
     pub(crate) link: StdMutex<SessionLink>,
@@ -1173,6 +1214,7 @@ impl SessionSlot {
 
     fn new_with_persistence(name: String, ledger: Arc<LedgerWriter>, persistent: bool) -> Self {
         let (alias_changed, _) = watch::channel(None);
+        let (availability_changed, _) = watch::channel(0);
         let (retired_changed, _) = watch::channel(false);
         SessionSlot {
             name: StdMutex::new(name),
@@ -1180,10 +1222,21 @@ impl SessionSlot {
             boot_identity: StdMutex::new(None),
             alias_of: AtomicUsize::new(usize::MAX),
             alias_changed,
+            availability_changed,
             persistent: AtomicBool::new(persistent),
             observed_live: AtomicBool::new(false),
             retired: AtomicBool::new(false),
             retired_changed,
+            #[cfg(test)]
+            missing_wait_entered: StdMutex::new(None),
+            #[cfg(test)]
+            missing_wait_active: AtomicBool::new(false),
+            #[cfg(test)]
+            control_connect_attempts: AtomicU64::new(0),
+            #[cfg(test)]
+            missing_probe_pause: StdMutex::new(None),
+            #[cfg(test)]
+            missing_settlement_pause: StdMutex::new(None),
             #[cfg(test)]
             rename_pause: StdMutex::new(None),
             link: StdMutex::new(SessionLink::default()),
@@ -1244,6 +1297,117 @@ impl SessionSlot {
     fn alias_of(&self) -> Option<usize> {
         let idx = self.alias_of.load(Ordering::Acquire);
         (idx != usize::MAX).then_some(idx)
+    }
+
+    /// Subscribe before a task needs to wait, so an explicit watch request
+    /// received while it is checking tmux is retained as an observed edge.
+    fn availability_events(&self) -> watch::Receiver<u64> {
+        self.availability_changed.subscribe()
+    }
+
+    /// Wake an already-watched detached slot after a caller has created or
+    /// restored the requested tmux session. The caller is an event source,
+    /// not proof: the task still asks tmux once before it attaches.
+    fn session_may_be_available(&self) {
+        self.availability_changed
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    }
+
+    #[cfg(test)]
+    fn arm_missing_wait(&self) -> Arc<Notify> {
+        let entered = Arc::new(Notify::new());
+        *self
+            .missing_wait_entered
+            .lock()
+            .expect("missing wait hook lock") = Some(Arc::clone(&entered));
+        entered
+    }
+
+    #[cfg(test)]
+    fn mark_missing_wait_entered(&self) {
+        self.missing_wait_active.store(true, Ordering::Release);
+        if let Some(entered) = self
+            .missing_wait_entered
+            .lock()
+            .expect("missing wait hook lock")
+            .take()
+        {
+            entered.notify_one();
+        }
+    }
+
+    #[cfg(test)]
+    fn mark_missing_wait_exited(&self) {
+        self.missing_wait_active.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn missing_wait_is_active(&self) -> bool {
+        self.missing_wait_active.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn record_control_connect_attempt(&self) {
+        self.control_connect_attempts.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    fn control_connect_attempts(&self) -> u64 {
+        self.control_connect_attempts.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn arm_missing_probe_pause(&self) -> (Arc<Notify>, Arc<Notify>) {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        *self
+            .missing_probe_pause
+            .lock()
+            .expect("missing probe hook lock") = Some(MissingSessionProbePause {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        (entered, release)
+    }
+
+    #[cfg(test)]
+    async fn pause_after_missing_probe(&self) {
+        let pause = self
+            .missing_probe_pause
+            .lock()
+            .expect("missing probe hook lock")
+            .take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn arm_missing_settlement_pause(&self) -> (Arc<Notify>, Arc<Notify>) {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        *self
+            .missing_settlement_pause
+            .lock()
+            .expect("missing settlement pause lock") = Some(MissingSessionSettlementPause {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        (entered, release)
+    }
+
+    #[cfg(test)]
+    async fn pause_before_missing_settlement(&self) {
+        let pause = self
+            .missing_settlement_pause
+            .lock()
+            .expect("missing settlement pause lock")
+            .take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
     }
 
     fn is_canonical(&self) -> bool {
@@ -4246,20 +4410,15 @@ fn hold_durable_record_forget_lease(state_root: &StateRoot) -> anyhow::Result<St
 
 /// Start watching a tmux session the daemon was not booted with.
 ///
-/// `sessions` in `config.toml` is what the daemon watches AT BOOT; this is
-/// how a session created afterwards (the terminal workspace UI creates
-/// tmux sessions at runtime) joins that set. It does not rewrite
-/// `config.toml`: a restart watches the configured list again, not
-/// whatever a client added here in between.
+/// This does not rewrite `config.toml`: after a restart, the daemon watches
+/// only the configured list.
 ///
-/// Idempotent: watching an already-watched session neither opens a second
-/// ledger nor spawns a second task, it just hands back the existing index
-/// with `added: false`. Otherwise the ledger is opened exactly the way
-/// `boot` opens one (same [`LedgerWriter::open`] with the boot id, same
-/// id-preload so message ids stay unique across the whole daemon, not just
-/// within one session), and a failure to open it is a [`WireError`] rather
-/// than a silent no-watch: a daemon that cannot record must not watch,
-/// same rule `boot` follows when it fails the whole boot.
+/// Repeating a request for an existing slot returns it with `added: false`.
+/// When that slot is waiting after confirmed absence or an unavailable server,
+/// the request is also its availability edge: its existing task rechecks tmux
+/// without creating another owner or claiming that the session is live. A new
+/// slot opens durable ledger state and starts its watcher; if that setup fails,
+/// no slot is added.
 pub(crate) async fn watch_session(
     inner: &Arc<Inner>,
     name: &str,
@@ -4276,6 +4435,15 @@ pub(crate) async fn watch_session(
         });
     }
     if let Some(idx) = inner.session_index(name) {
+        // `cyclops start` creates the session before asking the daemon to
+        // watch it. For an already-watched slot this remains idempotent, but
+        // it is also the availability edge that releases an absence or
+        // unavailable-server wait. The task rechecks tmux before attaching,
+        // so a manual request for an absent name cannot manufacture a live
+        // route.
+        if let Some(slot) = inner.session(idx) {
+            slot.session_may_be_available();
+        }
         return Ok((idx, false));
     }
     // The watcher applies its own rename before the matching PaneEvent
@@ -4416,34 +4584,64 @@ pub(crate) fn no_manifests_warning(dir: Option<&Path>) -> String {
     )
 }
 
-/// Does this session not exist on the server the daemon is configured for?
+/// What one authoritative `has-session` probe establishes.
 ///
-/// Answers false on any tmux trouble, because the point is to soften one
-/// specific log line and a probe that cannot tell should not be the reason
-/// a real failure goes unreported. Runs off the reactor: it shells out to
-/// tmux, which blocks.
-async fn session_missing(inner: &Arc<Inner>, session: &str) -> bool {
-    tmux_session_missing(&inner.cfg, session).await
+/// `ServerUnavailable` and `Unknown` are deliberately distinct from a named
+/// missing-session reply. The former must not open control mode because tmux
+/// can create an empty server at a missing socket. Before first attachment,
+/// `Unknown` also waits for an explicit availability edge; after a live
+/// observation it keeps ordinary transient reconnect handling. Neither is
+/// evidence that an already attached session, its identity, or its delivery
+/// barriers disappeared.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TmuxSessionPresence {
+    Present,
+    Missing,
+    /// The configured server socket is absent. Opening control mode against
+    /// it could create an empty tmux server, so retain state and wait for an
+    /// explicit availability edge instead.
+    ServerUnavailable,
+    Unknown,
 }
 
-/// The same question asked of the config alone, so `boot` can ask it
-/// before `Inner` exists. True only when tmux positively says the session
-/// is not there; an error keeps the answer at false, because "could not
-/// ask" must never release anybody's label.
-async fn tmux_session_missing(cfg: &Config, session: &str) -> bool {
+/// Ask tmux once whether a session is present. Runs off the reactor because
+/// the adapter's one-shot command blocks. Only the adapter's exact
+/// missing-session reply is `Missing`; a measured missing-socket reply is
+/// `ServerUnavailable`; every other transport or command failure is honest
+/// uncertainty.
+async fn tmux_session_presence(cfg: &Config, session: &str) -> TmuxSessionPresence {
     let server = cyclops_tmux::layout::Server {
         socket: cfg.tmux_socket.clone(),
         config_file: cfg.tmux_config.clone(),
     };
     let session = session.to_string();
-    tokio::task::spawn_blocking(move || {
-        matches!(
-            cyclops_tmux::layout::session_exists(&server, &session),
-            Ok(false)
-        )
+    match tokio::task::spawn_blocking(move || {
+        cyclops_tmux::layout::session_missing(&server, &session)
     })
     .await
-    .unwrap_or(false)
+    {
+        Ok(Ok(true)) => TmuxSessionPresence::Missing,
+        Ok(Ok(false)) => TmuxSessionPresence::Present,
+        Ok(Err(error)) => {
+            if cyclops_tmux::layout::session_server_unavailable(&error) {
+                TmuxSessionPresence::ServerUnavailable
+            } else {
+                debug!(error = %error, "cannot establish tmux session presence");
+                TmuxSessionPresence::Unknown
+            }
+        }
+        Err(error) => {
+            debug!(error = %error, "tmux session-presence task failed");
+            TmuxSessionPresence::Unknown
+        }
+    }
+}
+
+/// The boot-only question before a [`SessionSlot`] exists. Unknown stays
+/// false: restart recovery may release an adoption only after positive
+/// missing-session evidence.
+async fn tmux_session_missing(cfg: &Config, session: &str) -> bool {
+    tmux_session_presence(cfg, session).await == TmuxSessionPresence::Missing
 }
 
 /// Release only adoptions whose physical pane loss was proven.
@@ -4479,17 +4677,424 @@ async fn reconnect_delay(stop: &mut watch::Receiver<bool>, delay: Duration) -> b
     }
 }
 
+/// Wait for the caller that created or restored a missing session.
+///
+/// A configured session is allowed to be absent while an external supervisor
+/// starts `cyclopsd` before `cyclops start`. That absence is a state, not a
+/// clock-driven retry condition: the task asks tmux once, then waits for the
+/// idempotent `session.watch` request `cyclops start` sends after creation.
+///
+/// The availability receiver is created before the probe, so a request that
+/// races with that one probe is retained. An alias must also wake the task:
+/// it means another live slot became the canonical owner and this task must
+/// exit without opening a duplicate watcher.
+async fn wait_for_session_availability(
+    stop: &mut watch::Receiver<bool>,
+    aliases: &mut watch::Receiver<Option<usize>>,
+    availability: &mut watch::Receiver<u64>,
+) -> bool {
+    if *stop.borrow() || aliases.borrow().is_some() {
+        return true;
+    }
+    tokio::select! {
+        changed = stop.changed() => changed.is_err() || *stop.borrow(),
+        changed = aliases.changed() => {
+            let _ = changed;
+            true
+        }
+        changed = availability.changed() => changed.is_err(),
+    }
+}
+
+/// Availability edges associated with one session task.
+///
+/// A `session.watch` while the slot is live is only idempotent registration,
+/// not a future creation edge. Before a later absence probe, old notices are
+/// consumed; an edge that races that probe remains unread and wakes the
+/// resulting wait. The startup epoch is separate because `watch::subscribe`
+/// otherwise marks an edge accepted before this task first runs as seen.
+struct SessionAvailability {
+    receiver: watch::Receiver<u64>,
+    retain_initial_availability: bool,
+    initial_availability_edge: bool,
+}
+
+impl SessionAvailability {
+    fn for_slot(slot: &SessionSlot) -> Self {
+        let mut receiver = slot.availability_events();
+        let initial_availability_edge = *receiver.borrow_and_update() != 0;
+        SessionAvailability {
+            receiver,
+            retain_initial_availability: true,
+            initial_availability_edge,
+        }
+    }
+
+    /// Discard a live-session notice before every probe except the first.
+    /// That first probe must retain an early creation edge until it decides
+    /// whether the configured session is absent.
+    fn prepare_probe(&mut self) {
+        if !std::mem::replace(&mut self.retain_initial_availability, false) {
+            let _ = self.receiver.borrow_and_update();
+        }
+    }
+
+    /// A present target or a stale renamed target consumes any old
+    /// availability notice: it cannot later wake an unrelated disappearance.
+    fn discard_after_nonmissing_probe(&mut self) {
+        self.initial_availability_edge = false;
+        let _ = self.receiver.borrow_and_update();
+    }
+
+    /// An early startup edge or a request that raced the probe earns one
+    /// immediate recheck. It never starts a timer-driven retry.
+    fn availability_edge_needs_recheck(&mut self) -> bool {
+        let recheck = std::mem::take(&mut self.initial_availability_edge)
+            || self.receiver.has_changed().unwrap_or(false);
+        if recheck {
+            let _ = self.receiver.borrow_and_update();
+        }
+        recheck
+    }
+}
+
+/// Ask tmux once about the target this slot still owns.
+///
+/// A normal slot follows its display-name rename, while an identity-bound
+/// recovery slot keeps its stable tmux-id target. A rename can race the
+/// blocking tmux question, so `None` means the normal target changed and the
+/// caller must rebuild its connection attempt rather than act on a stale
+/// absence result.
+struct SessionTargetPresence {
+    target: String,
+    presence: TmuxSessionPresence,
+}
+
+async fn session_presence_at_current_target(
+    inner: &Arc<Inner>,
+    slot: &SessionSlot,
+    availability: &mut SessionAvailability,
+) -> Option<SessionTargetPresence> {
+    let target = slot.connect_target();
+    // The first receiver snapshot may carry a `session.watch` which the RPC
+    // accepted before this spawned task got CPU time. It is a real creation
+    // edge, so retain it through this one probe. Later probes discard notices
+    // that arrived while the session was live.
+    availability.prepare_probe();
+    let presence = tmux_session_presence(&inner.cfg, &target).await;
+    #[cfg(test)]
+    if presence == TmuxSessionPresence::Missing {
+        slot.pause_after_missing_probe().await;
+    }
+    (slot.connect_target() == target).then_some(SessionTargetPresence { target, presence })
+}
+
+enum MissingSessionSettlement {
+    Settled,
+    TargetChanged,
+    Stop,
+}
+
+/// Clear durable live-session state only after tmux has positively confirmed
+/// that a session which was once observed is gone. A configured slot then
+/// waits for its creation edge; a runtime slot retires so the next watch of
+/// the same display name receives a fresh identity.
+fn settle_missing_session(
+    inner: &Arc<Inner>,
+    idx: usize,
+    slot: &Arc<SessionSlot>,
+    probed_target: &str,
+) -> MissingSessionSettlement {
+    // A concurrent followed rename can make this slot an alias while the
+    // one-shot tmux probe is in flight. Share the registration barrier with
+    // that rename so an alias never clears the canonical slot's route or
+    // releases its retained recovery facts.
+    let _registration = inner
+        .session_registration
+        .lock()
+        .expect("session registration lock");
+    if !slot.is_canonical() {
+        return MissingSessionSettlement::Stop;
+    }
+    // The target equality after the tmux query is only a snapshot. Recheck
+    // under the same barrier that publishes followed renames before deleting
+    // any state. Otherwise an old-name `Missing` result could clear the live
+    // canonical slot that a rename just moved to a different target.
+    if slot.connect_target() != probed_target {
+        return MissingSessionSettlement::TargetChanged;
+    }
+    // Read the human-facing name only once that target is protected. Registry
+    // cleanup must follow the same name as the canonical slot, not the name
+    // that happened to be current when the probe began.
+    let name = slot.name();
+    if !slot.has_observed_live() {
+        return MissingSessionSettlement::Settled;
+    }
+
+    // A missing session does not prove its panes died. tmux can move a pane
+    // into another session while preserving its id, root process and
+    // composer. Release only roots whose loss is independently proven.
+    let stale = !inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .in_session(&name)
+        .is_empty();
+    if stale {
+        let adoptions = inner
+            .registry
+            .lock()
+            .expect("registry lock")
+            .in_session(&name);
+        let mut gone = Vec::new();
+        for adoption in &adoptions {
+            match crate::composer_recovery::pane_root_gone(adoption) {
+                Ok(false) => {}
+                Ok(true) => {
+                    inner
+                        .hook_liveness
+                        .close(&PaneKey::new(idx, &adoption.pane_id));
+                    if let Some(recipient) = adoption.recipient {
+                        match inner
+                            .workspace_messaging()
+                            .ok_or("composer_recovery_store_unavailable")
+                            .and_then(|messaging| {
+                                messaging.retire_gone_composer_recipient(recipient)
+                            }) {
+                            Ok(()) => gone.push(recipient),
+                            Err(reason) => {
+                                warn!(session = %name, %reason, "cannot retire composer barrier for missing session");
+                            }
+                        }
+                    }
+                }
+                Err(reason) => {
+                    warn!(session = %name, pane = %adoption.pane_id, %reason, "cannot prove physical pane loss for missing session");
+                }
+            }
+        }
+        if !gone.is_empty() {
+            let mut reg = inner.registry.lock().expect("registry lock");
+            release_gone_recipients(&mut reg, gone);
+        }
+    }
+
+    update_mailbox_route(inner, || {
+        slot.last_panes.lock().expect("last panes lock").clear();
+        let mut link = slot.link.lock().expect("session link lock");
+        link.identity = None;
+        link.mailbox_panes.clear();
+    });
+    apply_messaging_availability_change(inner);
+    if slot.retire_if_runtime() {
+        info!(
+            session = %name,
+            session_idx = idx,
+            "retired runtime watcher after tmux session disappeared"
+        );
+        return MissingSessionSettlement::Stop;
+    }
+    MissingSessionSettlement::Settled
+}
+
+/// Record a confirmed disappearance when necessary, then park until the
+/// creator reports that it has made the session available again.
+async fn park_for_session_creation(
+    inner: &Arc<Inner>,
+    idx: usize,
+    slot: &Arc<SessionSlot>,
+    probed_target: &str,
+    stop: &mut watch::Receiver<bool>,
+    aliases: &mut watch::Receiver<Option<usize>>,
+    availability: &mut watch::Receiver<u64>,
+) -> SessionLifecycleDecision {
+    match settle_missing_session(inner, idx, slot, probed_target) {
+        MissingSessionSettlement::TargetChanged => return SessionLifecycleDecision::TargetChanged,
+        MissingSessionSettlement::Stop => return SessionLifecycleDecision::Stop,
+        MissingSessionSettlement::Settled => {}
+    }
+    let name = slot.name();
+    info!(session = %name, "waiting for session; create it, then call session.watch");
+    #[cfg(test)]
+    slot.mark_missing_wait_entered();
+    let stopped = wait_for_session_availability(stop, aliases, availability).await;
+    #[cfg(test)]
+    slot.mark_missing_wait_exited();
+    if stopped {
+        SessionLifecycleDecision::Stop
+    } else {
+        SessionLifecycleDecision::Recheck
+    }
+}
+
+/// Wait for an explicit availability edge without clearing durable state.
+///
+/// A configured daemon may begin before tmux exists, and an already-live
+/// server can later lose its configured socket. In both cases a control-mode
+/// attach would be destructive speculation: it can make a new empty tmux
+/// server. The creator's idempotent `session.watch` request is the real
+/// lifecycle edge, so wait for it while retaining any last-known identity,
+/// route, and delivery barriers.
+async fn wait_for_session_availability_without_settlement(
+    _slot: &Arc<SessionSlot>,
+    name: &str,
+    stop: &mut watch::Receiver<bool>,
+    aliases: &mut watch::Receiver<Option<usize>>,
+    availability: &mut watch::Receiver<u64>,
+) -> bool {
+    info!(session = %name, "waiting for session; create it, then call session.watch");
+    #[cfg(test)]
+    _slot.mark_missing_wait_entered();
+    let stop = wait_for_session_availability(stop, aliases, availability).await;
+    #[cfg(test)]
+    _slot.mark_missing_wait_exited();
+    stop
+}
+
+/// The one lifecycle decision a session task makes after an initial probe,
+/// control failure, or watcher disconnect.
+#[derive(Debug, Eq, PartialEq)]
+enum SessionLifecycleDecision {
+    /// The current target still exists; normal reconnect backoff is allowed.
+    Present,
+    /// Tmux could not establish whether a previously live target survived.
+    /// Preserve its durable state and use the ordinary transient reconnect
+    /// path rather than treating uncertainty as removal.
+    Unknown,
+    /// The caller created or restored the missing target and woke the task.
+    Recheck,
+    /// A followed rename changed a normal slot's target during the probe.
+    TargetChanged,
+    /// Shutdown, alias retirement, or runtime retirement ended this task.
+    Stop,
+}
+
+/// Make one presence decision for a real lifecycle edge. The result is never
+/// cached across iterations: a newly available target is rechecked before a
+/// control client attaches, and a rename invalidates a stale name probe.
+async fn session_lifecycle_decision(
+    inner: &Arc<Inner>,
+    idx: usize,
+    slot: &Arc<SessionSlot>,
+    stop: &mut watch::Receiver<bool>,
+    aliases: &mut watch::Receiver<Option<usize>>,
+    availability: &mut SessionAvailability,
+) -> SessionLifecycleDecision {
+    match session_presence_at_current_target(inner, slot, availability).await {
+        None => {
+            availability.discard_after_nonmissing_probe();
+            SessionLifecycleDecision::TargetChanged
+        }
+        Some(SessionTargetPresence {
+            presence: TmuxSessionPresence::Present,
+            ..
+        }) => {
+            availability.discard_after_nonmissing_probe();
+            SessionLifecycleDecision::Present
+        }
+        Some(SessionTargetPresence {
+            presence: TmuxSessionPresence::ServerUnavailable,
+            ..
+        }) => {
+            if availability.availability_edge_needs_recheck() {
+                return SessionLifecycleDecision::Recheck;
+            }
+            let name = slot.name();
+            if wait_for_session_availability_without_settlement(
+                slot,
+                &name,
+                stop,
+                aliases,
+                &mut availability.receiver,
+            )
+            .await
+            {
+                SessionLifecycleDecision::Stop
+            } else {
+                SessionLifecycleDecision::Recheck
+            }
+        }
+        Some(SessionTargetPresence {
+            presence: TmuxSessionPresence::Unknown,
+            ..
+        }) if !slot.has_observed_live() => {
+            // An absent server and an unreachable socket look the same to
+            // one-shot tmux. Before first attachment, preserving the
+            // no-first-client guarantee matters more than retrying a control
+            // attach; there is no live identity or barrier to clear here.
+            if availability.availability_edge_needs_recheck() {
+                return SessionLifecycleDecision::Recheck;
+            }
+            let name = slot.name();
+            if wait_for_session_availability_without_settlement(
+                slot,
+                &name,
+                stop,
+                aliases,
+                &mut availability.receiver,
+            )
+            .await
+            {
+                SessionLifecycleDecision::Stop
+            } else {
+                SessionLifecycleDecision::Recheck
+            }
+        }
+        Some(SessionTargetPresence {
+            presence: TmuxSessionPresence::Unknown,
+            ..
+        }) => {
+            availability.discard_after_nonmissing_probe();
+            SessionLifecycleDecision::Unknown
+        }
+        Some(SessionTargetPresence {
+            target,
+            presence: TmuxSessionPresence::Missing,
+        }) => {
+            // `watch::Receiver::subscribe` starts at the sender's current
+            // value. Preserve that startup epoch explicitly, then use the
+            // receiver's unread state for a request that raced this tmux
+            // probe. Either edge earns exactly one recheck; neither becomes
+            // a timer-driven retry.
+            if availability.availability_edge_needs_recheck() {
+                return SessionLifecycleDecision::Recheck;
+            }
+            #[cfg(test)]
+            slot.pause_before_missing_settlement().await;
+            park_for_session_creation(
+                inner,
+                idx,
+                slot,
+                &target,
+                stop,
+                aliases,
+                &mut availability.receiver,
+            )
+            .await
+        }
+    }
+}
+
 /// Own one configured session for the daemon's lifetime: attach, pump
-/// events, reattach with backoff when the connection dies or the session
-/// does not exist yet.
+/// events, and reconnect with backoff only after a failure against a session
+/// tmux still says exists or an unclassified transient failure. A confirmed
+/// missing session, or a measured unavailable tmux server, instead waits for
+/// the next explicit `session.watch` creation edge.
 async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<bool>) {
     // One snapshot of the Arc for the task's whole life: idx is append-only
     // stable, so this never needs to re-consult the sessions lock.
     let slot = inner
         .session(idx)
         .expect("session_idx valid: append-only, never removed");
+    // Subscribe before the initial tmux probe. `watch::subscribe` considers
+    // its current value seen, so preserve a nonzero sender epoch separately:
+    // an explicit `session.watch` can arrive after slot registration but
+    // before this spawned task first runs. The first confirmed absence uses
+    // that edge for one recheck instead of silently parking forever.
+    let mut availability = SessionAvailability::for_slot(&slot);
+    let mut aliases = slot.alias_changed.subscribe();
     let mut backoff = RECONNECT_MIN;
-    let mut announced_missing = false;
+    let mut need_availability_probe = true;
     loop {
         if *stop.borrow() {
             return;
@@ -4525,24 +5130,31 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
         // control-mode attach merely to learn that the first session is not
         // there yet: tmux can make that attach the server's first client,
         // then tear the empty server down while `start` is creating it.
-        //
-        // Once this slot has attached, retain the normal reconnect path
-        // below. It owns the stricter cleanup required when an observed
-        // session later disappears.
-        if !slot.has_observed_live() && session_missing(&inner, &target).await {
-            if announced_missing {
-                debug!(session = %name, "waiting for configured session to appear");
-            } else {
-                info!(session = %name, "waiting for session; cyclops start creates it");
-                announced_missing = true;
+        // Ask once for each startup or `session.watch` creation edge; never
+        // turn a confirmed absence into an interval poll.
+        if need_availability_probe {
+            match session_lifecycle_decision(
+                &inner,
+                idx,
+                &slot,
+                &mut stop,
+                &mut aliases,
+                &mut availability,
+            )
+            .await
+            {
+                SessionLifecycleDecision::Present | SessionLifecycleDecision::Unknown => {
+                    need_availability_probe = false
+                }
+                SessionLifecycleDecision::Recheck | SessionLifecycleDecision::TargetChanged => {
+                    continue;
+                }
+                SessionLifecycleDecision::Stop => return,
             }
-            if reconnect_delay(&mut stop, backoff).await {
-                return;
-            }
-            backoff = (backoff * 2).min(RECONNECT_MAX);
-            continue;
         }
 
+        #[cfg(test)]
+        slot.record_control_connect_attempt();
         match SessionWatcher::connect(ccfg).await {
             Ok(watcher) => {
                 let watcher = Arc::new(watcher);
@@ -4555,6 +5167,25 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                     Err(error) => {
                         warn!(session = %name, error = %error, "cannot establish durable session identity");
                         watcher.shutdown().await;
+                        match session_lifecycle_decision(
+                            &inner,
+                            idx,
+                            &slot,
+                            &mut stop,
+                            &mut aliases,
+                            &mut availability,
+                        )
+                        .await
+                        {
+                            SessionLifecycleDecision::Present
+                            | SessionLifecycleDecision::Unknown => {}
+                            SessionLifecycleDecision::Recheck
+                            | SessionLifecycleDecision::TargetChanged => {
+                                need_availability_probe = true;
+                                continue;
+                            }
+                            SessionLifecycleDecision::Stop => return,
+                        }
                         if reconnect_delay(&mut stop, backoff).await {
                             return;
                         }
@@ -4572,6 +5203,24 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                         "identity-bound rename target resolved to a different live session"
                     );
                     watcher.shutdown().await;
+                    match session_lifecycle_decision(
+                        &inner,
+                        idx,
+                        &slot,
+                        &mut stop,
+                        &mut aliases,
+                        &mut availability,
+                    )
+                    .await
+                    {
+                        SessionLifecycleDecision::Present | SessionLifecycleDecision::Unknown => {}
+                        SessionLifecycleDecision::Recheck
+                        | SessionLifecycleDecision::TargetChanged => {
+                            need_availability_probe = true;
+                            continue;
+                        }
+                        SessionLifecycleDecision::Stop => return,
+                    }
                     if reconnect_delay(&mut stop, backoff).await {
                         return;
                     }
@@ -4587,13 +5236,30 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                     if slot.alias_of().is_some() {
                         return;
                     }
+                    match session_lifecycle_decision(
+                        &inner,
+                        idx,
+                        &slot,
+                        &mut stop,
+                        &mut aliases,
+                        &mut availability,
+                    )
+                    .await
+                    {
+                        SessionLifecycleDecision::Present | SessionLifecycleDecision::Unknown => {}
+                        SessionLifecycleDecision::Recheck
+                        | SessionLifecycleDecision::TargetChanged => {
+                            need_availability_probe = true;
+                            continue;
+                        }
+                        SessionLifecycleDecision::Stop => return,
+                    }
                     if reconnect_delay(&mut stop, backoff).await {
                         return;
                     }
                     backoff = (backoff * 2).min(RECONNECT_MAX);
                     continue;
                 }
-                announced_missing = false;
                 backoff = RECONNECT_MIN;
                 // Keep the root generations captured while each pane was
                 // authoritative. A detached numeric PID must never be
@@ -4644,6 +5310,27 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                 if *stop.borrow() {
                     return;
                 }
+                // A watcher disconnect is the lifecycle event that lets us
+                // ask tmux once whether the session itself disappeared. If
+                // it did, do not turn that fact into a reconnect timer: wait
+                // for the creation edge from `cyclops start` instead.
+                match session_lifecycle_decision(
+                    &inner,
+                    idx,
+                    &slot,
+                    &mut stop,
+                    &mut aliases,
+                    &mut availability,
+                )
+                .await
+                {
+                    SessionLifecycleDecision::Present | SessionLifecycleDecision::Unknown => {}
+                    SessionLifecycleDecision::Recheck | SessionLifecycleDecision::TargetChanged => {
+                        need_availability_probe = true;
+                        continue;
+                    }
+                    SessionLifecycleDecision::Stop => return,
+                }
                 // Re-read: a rename during this attach already moved the
                 // slot on, and the reattach log line should say the name
                 // that is about to be dialed, not the one this attempt
@@ -4651,93 +5338,28 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                 warn!(session = %slot.name(), "tmux connection lost; reattaching");
             }
             Err(e) => {
-                if announced_missing {
-                    debug!(session = %name, error = %e, "attach retry failed");
+                // This failed attach is a lifecycle event. Ask tmux once to
+                // distinguish a session that vanished between the preflight
+                // and control attach from an existing session with a
+                // transient connection failure. Only the latter backs off.
+                match session_lifecycle_decision(
+                    &inner,
+                    idx,
+                    &slot,
+                    &mut stop,
+                    &mut aliases,
+                    &mut availability,
+                )
+                .await
+                {
+                    SessionLifecycleDecision::Present | SessionLifecycleDecision::Unknown => {}
+                    SessionLifecycleDecision::Recheck | SessionLifecycleDecision::TargetChanged => {
+                        need_availability_probe = true;
+                        continue;
+                    }
+                    SessionLifecycleDecision::Stop => return,
                 }
-                // A missing session does not prove its panes died. tmux can
-                // move a pane into another session while preserving its id,
-                // root process and composer. Release only roots whose loss is
-                // independently proven.
-                let stale = !inner
-                    .registry
-                    .lock()
-                    .expect("registry lock")
-                    .in_session(&name)
-                    .is_empty();
-                if stale || !announced_missing {
-                    let missing = session_missing(&inner, &name).await;
-                    if stale && missing {
-                        let adoptions = inner
-                            .registry
-                            .lock()
-                            .expect("registry lock")
-                            .in_session(&name);
-                        let mut gone = Vec::new();
-                        for adoption in &adoptions {
-                            match crate::composer_recovery::pane_root_gone(adoption) {
-                                Ok(false) => {}
-                                Ok(true) => {
-                                    inner
-                                        .hook_liveness
-                                        .close(&PaneKey::new(idx, &adoption.pane_id));
-                                    if let Some(recipient) = adoption.recipient {
-                                        match inner
-                                            .workspace_messaging()
-                                            .ok_or("composer_recovery_store_unavailable")
-                                            .and_then(|messaging| {
-                                                messaging.retire_gone_composer_recipient(recipient)
-                                            }) {
-                                            Ok(()) => gone.push(recipient),
-                                            Err(reason) => {
-                                                warn!(session = %name, %reason, "cannot retire composer barrier for missing session");
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(reason) => {
-                                    warn!(session = %name, pane = %adoption.pane_id, %reason, "cannot prove physical pane loss for missing session");
-                                }
-                            }
-                        }
-                        if !gone.is_empty() {
-                            let mut reg = inner.registry.lock().expect("registry lock");
-                            release_gone_recipients(&mut reg, gone);
-                        }
-                    }
-                    if missing {
-                        update_mailbox_route(&inner, || {
-                            slot.last_panes.lock().expect("last panes lock").clear();
-                            let mut link = slot.link.lock().expect("session link lock");
-                            link.identity = None;
-                            link.mailbox_panes.clear();
-                        });
-                        apply_messaging_availability_change(&inner);
-                        if slot.retire_if_runtime() {
-                            info!(
-                                session = %name,
-                                session_idx = idx,
-                                "retired runtime watcher after tmux session disappeared"
-                            );
-                            return;
-                        }
-                    }
-                    if !announced_missing {
-                        // Two different situations reach this arm, and only
-                        // one of them is trouble. A session that does not
-                        // exist yet is the ordinary case for a daemon started
-                        // before `cyclops start`, and it clears itself the
-                        // moment the session appears. Logging that at WARN as
-                        // "cannot attach" reads like a dead end, and an
-                        // operator who stops there never finds out that the
-                        // retry two seconds later succeeded.
-                        if missing {
-                            info!(session = %name, "waiting for session; cyclops start creates it");
-                        } else {
-                            warn!(session = %name, error = %e, "cannot attach; retrying with backoff");
-                        }
-                        announced_missing = true;
-                    }
-                }
+                warn!(session = %name, error = %e, "cannot attach; retrying with backoff");
             }
         }
         if reconnect_delay(&mut stop, backoff).await {
@@ -7724,6 +8346,724 @@ process_names = ["never"]
         .expect("session identity was not published")
     }
 
+    async fn wait_for_session_lifecycle(
+        events: &mut broadcast::Receiver<Event>,
+        name: &str,
+        attached: bool,
+    ) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = events
+                    .recv()
+                    .await
+                    .expect("session event stream stays open");
+                if event.event == "session"
+                    && event.data["name"] == name
+                    && event.data["attached"] == attached
+                {
+                    return;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("session {name:?} did not report attached={attached}"));
+    }
+
+    /// A configured daemon can start before the workspace exists, and a
+    /// workspace can disappear after it attached. Both absence paths must
+    /// park on an explicit `session.watch` creation edge instead of probing
+    /// tmux on a timer. The test pauses at that exact parked state before it
+    /// creates each session, so neither attach can be a lucky preflight race.
+    #[tokio::test]
+    async fn configured_session_waits_for_creation_edges_on_first_start_and_recreation() {
+        if !cyclops_testrig::tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let server = cyclops_testrig::TmuxServer::new("session-creation-edges");
+        // Keep this isolated tmux server alive while `main` is absent. The
+        // watcher must not be able to mistake server shutdown for a main
+        // session lifecycle event.
+        server.run_ok(&["new-session", "-d", "-s", "anchor", "/bin/sh"]);
+
+        let mut inner = bare_inner("cyc-session-creation-edges");
+        let home = inner.cfg.home.clone();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        {
+            let mutable = Arc::get_mut(&mut inner).expect("bare inner is unique");
+            mutable.cfg.tmux_socket = Some(server.socket().to_string());
+            mutable.cfg.tmux_config = Some(PathBuf::from("/dev/null"));
+            mutable.shutdown_request = stop_tx.clone();
+            mutable.stop = stop_rx;
+        }
+        let ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/main.ndjson"),
+            &inner.boot_id,
+        )
+        .expect("configured ledger opens");
+        let slot = Arc::new(SessionSlot::new("main".into(), Arc::new(ledger)));
+        let idx = {
+            let mut sessions = inner.sessions.lock().expect("sessions lock");
+            sessions.push(Arc::clone(&slot));
+            sessions.len() - 1
+        };
+        let mut events = inner.events.subscribe();
+
+        let first_wait = slot.arm_missing_wait();
+        let task = tokio::spawn(session_task(Arc::clone(&inner), idx, inner.stop.clone()));
+        tokio::time::timeout(Duration::from_secs(10), first_wait.notified())
+            .await
+            .expect("configured startup reaches the missing-session wait");
+        assert!(
+            !slot.link.lock().expect("session link lock").attached,
+            "an absent configured session never opens a live route"
+        );
+
+        server.run_ok(&["new-session", "-d", "-s", "main", "/bin/sh"]);
+        assert!(
+            slot.missing_wait_is_active(),
+            "creating a configured session alone leaves the task at its explicit availability wait"
+        );
+        let (watched_idx, added) = watch_session(&inner, "main")
+            .await
+            .expect("configured session accepts an idempotent creation watch");
+        assert_eq!(watched_idx, idx);
+        assert!(!added, "the configured slot keeps its ledger and task");
+        wait_for_session_lifecycle(&mut events, "main", true).await;
+        let first = slot
+            .link
+            .lock()
+            .expect("session link lock")
+            .identity
+            .clone()
+            .expect("first attachment publishes an identity");
+
+        let recreation_wait = slot.arm_missing_wait();
+        server.run_ok(&["kill-session", "-t", "=main"]);
+        wait_for_session_lifecycle(&mut events, "main", false).await;
+        tokio::time::timeout(Duration::from_secs(10), recreation_wait.notified())
+            .await
+            .expect("post-attachment removal reaches the creation wait");
+        assert!(
+            !slot.link.lock().expect("session link lock").attached,
+            "a removed session releases its live route before it is recreated"
+        );
+
+        server.run_ok(&["new-session", "-d", "-s", "main", "/bin/sh"]);
+        let (watched_idx, added) = watch_session(&inner, "main")
+            .await
+            .expect("recreated configured session accepts its creation watch");
+        assert_eq!(watched_idx, idx);
+        assert!(
+            !added,
+            "recreation reuses the configured slot, not a second watcher"
+        );
+        wait_for_session_lifecycle(&mut events, "main", true).await;
+        let second = slot
+            .link
+            .lock()
+            .expect("session link lock")
+            .identity
+            .clone()
+            .expect("recreated session publishes an identity");
+        assert_ne!(
+            first.session_instance_id(),
+            second.session_instance_id(),
+            "a recreated tmux session receives a fresh durable identity"
+        );
+
+        stop_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("configured session task stops")
+            .expect("configured session task does not panic");
+        let extra_tasks = std::mem::take(&mut *inner.extra_tasks.lock().expect("extra tasks lock"));
+        for task in extra_tasks {
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("session descendant task stops")
+                .expect("session descendant task does not panic");
+        }
+        drop(slot);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// An idempotent `session.watch` can be accepted after the configured
+    /// slot exists but before the spawned session task receives CPU time.
+    /// That creation edge must earn one recheck. Otherwise a daemon can
+    /// observe absence just before creation and wait forever for a second
+    /// identical request that its client already made.
+    #[tokio::test]
+    async fn an_availability_edge_before_task_start_rechecks_first_absence() {
+        if !cyclops_testrig::tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let server = cyclops_testrig::TmuxServer::new("session-startup-availability-edge");
+        server.run_ok(&["new-session", "-d", "-s", "anchor", "/bin/sh"]);
+
+        let mut inner = bare_inner("cyc-session-startup-availability-edge");
+        let home = inner.cfg.home.clone();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        {
+            let mutable = Arc::get_mut(&mut inner).expect("bare inner is unique");
+            mutable.cfg.tmux_socket = Some(server.socket().to_string());
+            mutable.cfg.tmux_config = Some(PathBuf::from("/dev/null"));
+            mutable.shutdown_request = stop_tx.clone();
+            mutable.stop = stop_rx;
+        }
+        let ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/main.ndjson"),
+            &inner.boot_id,
+        )
+        .expect("configured ledger opens");
+        let slot = Arc::new(SessionSlot::new("main".into(), Arc::new(ledger)));
+        let idx = {
+            let mut sessions = inner.sessions.lock().expect("sessions lock");
+            sessions.push(Arc::clone(&slot));
+            sessions.len() - 1
+        };
+        let mut events = inner.events.subscribe();
+
+        // This is the existing configured-slot path in the RPC: it does not
+        // add a ledger or task, but it records a real availability edge.
+        let (watched_idx, added) = watch_session(&inner, "main")
+            .await
+            .expect("configured session accepts the early creation edge");
+        assert_eq!(watched_idx, idx);
+        assert!(!added, "the configured slot already owns this session");
+
+        let (probe_entered, probe_release) = slot.arm_missing_probe_pause();
+        let task = tokio::spawn(session_task(Arc::clone(&inner), idx, inner.stop.clone()));
+        tokio::time::timeout(Duration::from_secs(10), probe_entered.notified())
+            .await
+            .expect("first tmux absence probe completes before creation");
+        server.run_ok(&["new-session", "-d", "-s", "main", "/bin/sh"]);
+        probe_release.notify_one();
+
+        wait_for_session_lifecycle(&mut events, "main", true).await;
+        assert!(
+            slot.link.lock().expect("session link lock").attached,
+            "the preserved startup edge triggers the one recheck that sees creation"
+        );
+
+        stop_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("configured session task stops")
+            .expect("configured session task does not panic");
+        let extra_tasks = std::mem::take(&mut *inner.extra_tasks.lock().expect("extra tasks lock"));
+        for task in extra_tasks {
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("session descendant task stops")
+                .expect("session descendant task does not panic");
+        }
+        drop(slot);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A followed rename can land after tmux confirms the old target is
+    /// missing but before lifecycle cleanup takes the registration barrier.
+    /// That old reply must restart the decision against the renamed target;
+    /// it cannot erase the canonical slot's route or identity and park it.
+    #[tokio::test]
+    async fn a_rename_after_a_missing_probe_preserves_the_live_slot() {
+        if !cyclops_testrig::tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let server = cyclops_testrig::TmuxServer::new("missing-probe-rename-settlement");
+        server.run_ok(&["new-session", "-d", "-s", "old", "/bin/sh"]);
+        server.run_ok(&["rename-session", "-t", "=old", "new"]);
+
+        let mut inner = bare_inner("cyc-missing-probe-rename-settlement");
+        let home = inner.cfg.home.clone();
+        {
+            let mutable = Arc::get_mut(&mut inner).expect("bare inner is unique");
+            mutable.cfg.tmux_socket = Some(server.socket().to_string());
+            mutable.cfg.tmux_config = Some(PathBuf::from("/dev/null"));
+        }
+        let ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/old.ndjson"),
+            &inner.boot_id,
+        )
+        .expect("configured ledger opens");
+        let slot = Arc::new(SessionSlot::new("old".into(), Arc::new(ledger)));
+        let binding = persist_test_binding(&inner, test_live_key(inner.workspace_id, 41, 7, "$1"));
+        let pane_pid = std::process::id() as i32;
+        let pane = ObservedPane::capture(test_pane("%0", pane_pid));
+        {
+            let mut link = slot.link.lock().expect("session link lock");
+            link.identity = Some(binding.clone());
+            link.mailbox_panes
+                .insert(pane.row.pane_id.clone(), pane.clone());
+        }
+        slot.last_panes
+            .lock()
+            .expect("last panes lock")
+            .insert(pane.row.pane_id.clone(), pane.clone());
+        slot.mark_observed_live();
+        let idx = {
+            let mut sessions = inner.sessions.lock().expect("sessions lock");
+            sessions.push(Arc::clone(&slot));
+            sessions.len() - 1
+        };
+
+        let (settlement_entered, settlement_release) = slot.arm_missing_settlement_pause();
+        let decision_inner = Arc::clone(&inner);
+        let decision_slot = Arc::clone(&slot);
+        let decision = tokio::spawn(async move {
+            let (_stop_tx, mut stop) = watch::channel(false);
+            let mut aliases = decision_slot.alias_changed.subscribe();
+            let mut availability = SessionAvailability::for_slot(&decision_slot);
+            session_lifecycle_decision(
+                &decision_inner,
+                idx,
+                &decision_slot,
+                &mut stop,
+                &mut aliases,
+                &mut availability,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), settlement_entered.notified())
+            .await
+            .expect("current old-target absence reaches the settlement seam");
+
+        assert!(
+            rename_session_slot(&inner, idx, "new".into()),
+            "the followed rename updates the canonical slot"
+        );
+        settlement_release.notify_one();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), decision)
+                .await
+                .expect("lifecycle decision resolves")
+                .expect("lifecycle decision does not panic"),
+            SessionLifecycleDecision::TargetChanged,
+            "the old missing result is discarded instead of settling the renamed slot"
+        );
+        assert_eq!(slot.name(), "new");
+        {
+            let link = slot.link.lock().expect("session link lock");
+            assert_eq!(
+                link.identity.as_ref(),
+                Some(&binding),
+                "the old missing result cannot clear the renamed slot identity"
+            );
+            assert!(
+                link.mailbox_panes.contains_key(&pane.row.pane_id),
+                "the old missing result cannot clear the renamed live route"
+            );
+        }
+        assert!(
+            slot.last_panes
+                .lock()
+                .expect("last panes lock")
+                .contains_key(&pane.row.pane_id),
+            "the old missing result cannot clear retained pane evidence"
+        );
+        assert!(
+            !slot.missing_wait_is_active(),
+            "a changed target retries instead of parking on the old absence"
+        );
+
+        let (_stop_tx, mut stop) = watch::channel(false);
+        let mut aliases = slot.alias_changed.subscribe();
+        let mut availability = SessionAvailability::for_slot(&slot);
+        assert_eq!(
+            session_lifecycle_decision(
+                &inner,
+                idx,
+                &slot,
+                &mut stop,
+                &mut aliases,
+                &mut availability,
+            )
+            .await,
+            SessionLifecycleDecision::Present,
+            "the retry asks tmux about the current renamed target"
+        );
+
+        let mut events = inner.events.subscribe();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(session_task(Arc::clone(&inner), idx, stop_rx));
+        wait_for_session_lifecycle(&mut events, "new", true).await;
+        assert!(
+            slot.link.lock().expect("session link lock").attached,
+            "the session task attaches the renamed live target without another session.watch"
+        );
+        stop_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("renamed session task stops")
+            .expect("renamed session task does not panic");
+        let extra_tasks = std::mem::take(&mut *inner.extra_tasks.lock().expect("extra tasks lock"));
+        for task in extra_tasks {
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("session descendant task stops")
+                .expect("session descendant task does not panic");
+        }
+
+        drop(slot);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A missing configured socket after a session was live is not proof that
+    /// the session or its durable identity was removed. The prior broad
+    /// `session_exists == false` mapping cleared this identity before a later
+    /// explicit availability edge could prove what survived.
+    #[tokio::test]
+    async fn unreachable_tmux_keeps_an_observed_session_identity() {
+        if !cyclops_testrig::tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let mut inner = bare_inner("cyc-unreachable-session-presence");
+        let home = inner.cfg.home.clone();
+        Arc::get_mut(&mut inner)
+            .expect("bare inner is unique")
+            .cfg
+            .tmux_socket = Some(format!(
+            "cyclops-unreachable-presence-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/main.ndjson"),
+            &inner.boot_id,
+        )
+        .expect("configured ledger opens");
+        let slot = Arc::new(SessionSlot::new("main".into(), Arc::new(ledger)));
+        let binding = persist_test_binding(&inner, test_live_key(inner.workspace_id, 41, 7, "$1"));
+        slot.mark_observed_live();
+        slot.link.lock().expect("session link lock").identity = Some(binding.clone());
+        let mut availability = SessionAvailability::for_slot(&slot);
+
+        assert_eq!(
+            session_presence_at_current_target(&inner, &slot, &mut availability)
+                .await
+                .map(|probe| probe.presence),
+            Some(TmuxSessionPresence::ServerUnavailable)
+        );
+        assert_eq!(
+            slot.link
+                .lock()
+                .expect("session link lock")
+                .identity
+                .as_ref(),
+            Some(&binding),
+            "an unreachable tmux socket cannot clear an observed identity"
+        );
+
+        drop(slot);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// Losing the configured tmux server after attachment must not let the
+    /// daemon create an empty replacement while it retries. It retains the
+    /// exact route and active delivery barrier until the creator rebuilds
+    /// tmux and sends the explicit availability edge.
+    #[tokio::test]
+    async fn a_vanished_tmux_server_waits_for_an_availability_edge() {
+        use cyclops_proto::{
+            NotificationBinding, NotificationManifestId, NotificationState, NotificationTransport,
+            DOORBELL_FORMAT_COMPACT_CLAIM,
+        };
+
+        if !cyclops_testrig::tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let server = cyclops_testrig::TmuxServer::new("vanished-server-availability");
+        server.run_ok(&["new-session", "-d", "-s", "main", "sleep 60"]);
+        let socket_path = server.socket_path().expect("live tmux socket path");
+
+        let mut inner = bare_inner("cyc-vanished-server-availability");
+        enable_mailbox(&mut inner);
+        let home = inner.cfg.home.clone();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        {
+            let mutable = Arc::get_mut(&mut inner).expect("bare inner is unique");
+            mutable.cfg.tmux_socket = Some(server.socket().to_string());
+            mutable.cfg.tmux_config = Some(PathBuf::from("/dev/null"));
+            mutable.shutdown_request = stop_tx.clone();
+            mutable.stop = stop_rx;
+        }
+        let ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/main.ndjson"),
+            &inner.boot_id,
+        )
+        .expect("configured ledger opens");
+        let slot = Arc::new(SessionSlot::new("main".into(), Arc::new(ledger)));
+        let idx = {
+            let mut sessions = inner.sessions.lock().expect("sessions lock");
+            sessions.push(Arc::clone(&slot));
+            sessions.len() - 1
+        };
+        let mut events = inner.events.subscribe();
+        let task = tokio::spawn(session_task(Arc::clone(&inner), idx, inner.stop.clone()));
+        wait_for_session_lifecycle(&mut events, "main", true).await;
+
+        let binding = slot
+            .link
+            .lock()
+            .expect("session link lock")
+            .identity
+            .clone()
+            .expect("attached session publishes identity");
+        let row = slot
+            .link
+            .lock()
+            .expect("session link lock")
+            .watcher
+            .as_ref()
+            .expect("attached watcher")
+            .snapshot()
+            .into_iter()
+            .next()
+            .expect("one watched pane");
+        let pane: TmuxPaneId = row.pane_id.parse().expect("pane id");
+        let process = identity::ProcId::of(row.pane_pid).expect("live pane process");
+        let process_instance =
+            ProcessInstanceId::new(process.pid, process.birth).expect("process instance");
+        set_test_label(&inner, "main", pane, process.pid, "worker");
+        let recipient =
+            RecipientKey::agent(inner.workspace_id, binding.session_instance_id(), pane);
+        let service = inner.mailbox.as_ref().expect("mailbox enabled");
+        let accepted = send_test_message(service, "worker".into()).expect("message accepted");
+        let queued = service
+            .prepare_oldest_notification(recipient)
+            .expect("notification preparation")
+            .expect("one notification");
+        let durable_binding = NotificationBinding {
+            recipient,
+            pane_root: Some(process_instance),
+            leader: Some(process_instance),
+            agent: process_instance,
+            manifest: NotificationManifestId::new("test").expect("manifest id"),
+        };
+        {
+            let store = service.store_handle();
+            let mut store = store.lock().expect("mailbox store lock");
+            store
+                .advance_notification(
+                    accepted.message_id.clone(),
+                    recipient,
+                    queued.attempt_id,
+                    NotificationState::Gating,
+                    None,
+                    None,
+                )
+                .expect("notification enters gating");
+            store
+                .advance_notification_with_transport(
+                    accepted.message_id,
+                    recipient,
+                    queued.attempt_id,
+                    NotificationState::Writing,
+                    durable_binding,
+                    NotificationTransport::Doorbell,
+                    Some(DOORBELL_FORMAT_COMPACT_CLAIM),
+                )
+                .expect("notification owns barrier");
+        }
+        assert_eq!(
+            service
+                .active_notification_barriers()
+                .expect("barriers readable")
+                .len(),
+            1,
+            "fixture creates an active delivery barrier"
+        );
+
+        let connect_attempts_before_loss = slot.control_connect_attempts();
+        let unavailable_wait = slot.arm_missing_wait();
+        server.simulate_server_loss();
+        wait_for_session_lifecycle(&mut events, "main", false).await;
+        tokio::time::timeout(Duration::from_secs(10), unavailable_wait.notified())
+            .await
+            .expect("vanished server reaches the explicit availability wait");
+        assert_eq!(
+            slot.control_connect_attempts(),
+            connect_attempts_before_loss,
+            "a vanished server cannot reach SessionWatcher::connect while parked"
+        );
+        // tmux may leave a stale socket pathname while the server is already
+        // gone. The counter above proves Cyclops did not attach; this
+        // passive connect proves no replacement server is listening there.
+        let no_server_listens =
+            !socket_path.exists() || std::os::unix::net::UnixStream::connect(&socket_path).is_err();
+        assert!(
+            no_server_listens,
+            "the parked daemon did not leave an empty tmux server listening at {}",
+            socket_path.display()
+        );
+        assert!(
+            slot.missing_wait_is_active(),
+            "the task is parked on an event, not a reconnect timer"
+        );
+        assert_eq!(
+            slot.link
+                .lock()
+                .expect("session link lock")
+                .identity
+                .as_ref(),
+            Some(&binding),
+            "an unavailable server cannot clear the last observed identity"
+        );
+        assert_eq!(
+            service
+                .active_notification_barriers()
+                .expect("barriers readable")
+                .len(),
+            1,
+            "an unavailable server cannot retire the active delivery barrier"
+        );
+
+        server.run_ok(&["new-session", "-d", "-s", "main", "sleep 60"]);
+        assert!(
+            slot.missing_wait_is_active(),
+            "recreating tmux alone does not wake the parked task"
+        );
+        let (watched_idx, added) = watch_session(&inner, "main")
+            .await
+            .expect("configured slot accepts the availability edge");
+        assert_eq!(watched_idx, idx);
+        assert!(!added, "the configured slot keeps its ledger and task");
+        wait_for_session_lifecycle(&mut events, "main", true).await;
+        assert_eq!(
+            slot.control_connect_attempts(),
+            connect_attempts_before_loss + 1,
+            "only the explicit availability edge permits the next control attach"
+        );
+
+        stop_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("session task stops")
+            .expect("session task does not panic");
+        let extra_tasks = std::mem::take(&mut *inner.extra_tasks.lock().expect("extra tasks lock"));
+        for task in extra_tasks {
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("session descendant task stops")
+                .expect("session descendant task does not panic");
+        }
+        drop(slot);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A followed rename changes a normal slot's reconnect target. If its
+    /// control client later disconnects while the renamed session remains
+    /// live, the daemon must reconnect to that live target without waiting
+    /// for a new `session.watch` creation edge.
+    #[tokio::test]
+    async fn a_renamed_live_session_reconnects_without_a_creation_watch() {
+        if !cyclops_testrig::tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let server = cyclops_testrig::TmuxServer::new("renamed-session-reconnect");
+        server.run_ok(&["new-session", "-d", "-s", "anchor", "/bin/sh"]);
+        server.run_ok(&["new-session", "-d", "-s", "main", "/bin/sh"]);
+        server.run_ok(&["set-option", "-g", "exit-empty", "off"]);
+        server.run_ok(&["set-option", "-g", "exit-unattached", "off"]);
+
+        let mut inner = bare_inner("cyc-renamed-session-reconnect");
+        let home = inner.cfg.home.clone();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        {
+            let mutable = Arc::get_mut(&mut inner).expect("bare inner is unique");
+            mutable.cfg.tmux_socket = Some(server.socket().to_string());
+            mutable.cfg.tmux_config = Some(PathBuf::from("/dev/null"));
+            mutable.shutdown_request = stop_tx.clone();
+            mutable.stop = stop_rx;
+        }
+        let ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/main.ndjson"),
+            &inner.boot_id,
+        )
+        .expect("configured ledger opens");
+        let slot = Arc::new(SessionSlot::new("main".into(), Arc::new(ledger)));
+        let idx = {
+            let mut sessions = inner.sessions.lock().expect("sessions lock");
+            sessions.push(Arc::clone(&slot));
+            sessions.len() - 1
+        };
+        let mut events = inner.events.subscribe();
+        let task = tokio::spawn(session_task(Arc::clone(&inner), idx, inner.stop.clone()));
+        wait_for_session_lifecycle(&mut events, "main", true).await;
+        let original = slot
+            .link
+            .lock()
+            .expect("session link lock")
+            .identity
+            .clone()
+            .expect("attach lifecycle event publishes the session identity");
+
+        server.run_ok(&["rename-session", "-t", "=main", "hidden"]);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while slot.name() != "hidden" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("followed rename reaches the slot before control disconnect");
+
+        // This closes the watcher's tmux client, not the renamed session.
+        // The two lifecycle events below prove the daemon reconnects to
+        // `hidden` on its own; no `session.watch` request is sent here.
+        server.run_ok(&["detach-client", "-s", "hidden"]);
+        wait_for_session_lifecycle(&mut events, "hidden", false).await;
+        wait_for_session_lifecycle(&mut events, "hidden", true).await;
+        assert!(
+            slot.link.lock().expect("session link lock").attached,
+            "the still-live renamed session reattaches without a creation edge"
+        );
+        assert_eq!(slot.name(), "hidden");
+        assert_eq!(
+            slot.link
+                .lock()
+                .expect("session link lock")
+                .identity
+                .as_ref()
+                .expect("reattached session has an identity")
+                .session_instance_id(),
+            original.session_instance_id(),
+            "a control reconnect preserves the renamed session's identity"
+        );
+
+        stop_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("configured session task stops")
+            .expect("configured session task does not panic");
+        let extra_tasks = std::mem::take(&mut *inner.extra_tasks.lock().expect("extra tasks lock"));
+        for task in extra_tasks {
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("session descendant task stops")
+                .expect("session descendant task does not panic");
+        }
+        drop(slot);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
     fn assert_current_mailbox_route(
         inner: &Arc<Inner>,
         slot: &SessionSlot,
@@ -8532,8 +9872,17 @@ process_names = ["never"]
             first.session_instance_id()
         );
 
+        let restart_wait = slot.arm_missing_wait();
         let tmux = tmux.restart();
+        tokio::time::timeout(Duration::from_secs(10), restart_wait.notified())
+            .await
+            .expect("server replacement reaches the configured-session wait");
         tmux.run_ok(&["new-session", "-d", "-s", "after"]);
+        let (watched_idx, added) = watch_session(&daemon.inner, "after")
+            .await
+            .expect("recreated configured session accepts the creation edge");
+        assert_eq!(watched_idx, 0);
+        assert!(!added, "the followed configured slot remains the owner");
         let second = wait_for_session_binding(&slot, Some(first.session_instance_id())).await;
         let second_pane: TmuxPaneId = slot
             .link
@@ -8561,8 +9910,17 @@ process_names = ["never"]
         );
 
         tmux.run_ok(&["new-session", "-d", "-s", "anchor"]);
+        let recreation_wait = slot.arm_missing_wait();
         tmux.run_ok(&["kill-session", "-t", "=after"]);
+        tokio::time::timeout(Duration::from_secs(10), recreation_wait.notified())
+            .await
+            .expect("session removal reaches the configured-session wait");
         tmux.run_ok(&["new-session", "-d", "-s", "after"]);
+        let (watched_idx, added) = watch_session(&daemon.inner, "after")
+            .await
+            .expect("post-attachment recreation accepts the creation edge");
+        assert_eq!(watched_idx, 0);
+        assert!(!added, "the configured watcher is not duplicated");
         let third = wait_for_session_binding(&slot, Some(second.session_instance_id())).await;
         let third_pane: TmuxPaneId = slot
             .link

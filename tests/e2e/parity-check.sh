@@ -906,7 +906,7 @@ duo_tmx() { duo tmux -u -f "$DUO_TMUX_CONFIG" "$@"; }
 duo_daemon_up() { duo "$CYC" --json status >/dev/null 2>&1; }
 duo_attached() { duo "$CYC" --json status | jq -e '.sessions[0].attached == true' >/dev/null; }
 duo_waiting_for_session() {
-  grep -Fq 'waiting for session; cyclops start creates it' "$DUO_HOME/cyclopsd.log"
+  grep -Fq 'waiting for session; create it, then call session.watch' "$DUO_HOME/cyclopsd.log"
 }
 duo_roster_has() { duo "$CYC" --json list | jq -e --arg a "$1" '[.agents[].agent] | index($a)' >/dev/null; }
 duo_pane_has_text() { duo_tmx capture-pane -p -t "$1" | grep -Fq -- "$2"; }

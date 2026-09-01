@@ -965,9 +965,11 @@ fn seed_home_for_workspace() {
 ///
 /// Unlike `start`, this runs before the session exists, because the
 /// workspace creates or attaches its own session after this returns. The
-/// cost is the daemon's attach retry rather than an immediate attach; it
-/// converges within seconds, and the workspace asks it to watch whatever
-/// session it lands on (`session.watch`) regardless of what was configured.
+/// workspace then sends `session.watch` after creation or adoption only when
+/// the daemon reports `NotYet`; it leaves `Elsewhere` alone so it does not
+/// turn the existing configuration hint into a runtime watch. That explicit
+/// availability edge lets the daemon attach without treating a confirmed
+/// missing session as a retry loop, regardless of what was configured at boot.
 ///
 /// A failure is a note, not an exit. The workspace is still usable without
 /// a daemon, and its sidebar says `cyclopsd offline` for as long as none
