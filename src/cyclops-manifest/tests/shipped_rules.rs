@@ -693,11 +693,11 @@ fn agy_working_outranks_the_cleared_composer() {
     assert_eq!(r.state, AgentState::Idle);
 }
 
-/// MEASURED 2026-09-01 (AGY 1.1.23): a narrow pane wraps an active
-/// doorbell across the blue prompt row and two unstyled continuation rows.
-/// The divider and status row below it mean the input rule needs a five-row
-/// window to see the prompt. The fixture is synthetic and redacted: it keeps
-/// only the measured layout and styling that classification depends on.
+/// MEASURED 2026-09-01 (AGY 1.1.23): a 100-column pane wraps active input
+/// across the blue prompt row and two unstyled continuation rows. The divider
+/// and status row below it mean the input rule needs a five-row window to see
+/// the prompt. The fixture is a scrubbed `capture-pane -p -e -J` capture from
+/// an isolated probe: its staged text and private probe root are redacted.
 #[test]
 fn agy_wrapped_active_composer_input_uses_the_full_window() {
     let agy = &shipped()["agy"];
@@ -711,10 +711,10 @@ fn agy_wrapped_active_composer_input_uses_the_full_window() {
     assert_eq!(active.state, AgentState::IdleWithInput);
     assert_eq!(active.composer_semantic, Some(ComposerSemantic::HumanInput));
 
-    // A submitted AGY prompt is echoed in the transcript with a different
-    // style. The enlarged window may now include that past row, but it must
-    // still classify the current empty composer as clean rather than treating
-    // transcript residue as input.
+    // This synthetic negative control models a submitted AGY prompt echoed in
+    // the transcript with a different style. The enlarged window may now
+    // include that past row, but it must still classify the current empty
+    // composer as clean rather than treating transcript residue as input.
     let transcript_esc = "\u{1b}[1m\u{1b}[34m> [redacted transcript echo]\u{1b}[39m\n\
         \u{1b}[94m>\u{1b}[39m\n\
         \u{1b}[90m────────────────────────────────────────────────────────\u{1b}[39m\n\

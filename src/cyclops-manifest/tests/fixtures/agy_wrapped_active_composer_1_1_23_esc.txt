@@ -1,5 +1,5 @@
-[94m>[39m [redacted staged input]
-  [redacted continuation one]
-  [redacted continuation two]
-[90m────────────────────────────────────────────────────────[39m
-[38;2;152;193;217mGemini 3.7 Flash[39m [38;5;251m·[39m [38;5;217mHigh[39m [38;5;251m·[39m [38;5;151m<workspace>[39m [38;5;251m·[39m [38;5;182mFull[39m [38;5;251m·[39m [38;5;151mCtx: 100%[39m
+[94m>[39m [redacted staged input] [redacted staged input] [redacted staged input] [redacted staged input]
+  [redacted staged input] [redacted staged input] [redacted staged input] [redacted staged input]
+  [redacted staged input] [redacted staged input]
+[90m────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;2;174;198;207mGemini 3.7 Flash[38;2;200;200;200m · [38;2;255;179;186mHigh[38;2;200;200;200m · [38;2;168;230;163m<probe-root>[38;2;200;200;200m · [38;2;203;170;203mFull[38;2;200;200;200m · [38;2;168;230;163mCtx: 100%[38;2;200;200;200m · 100% 5h, 54%
