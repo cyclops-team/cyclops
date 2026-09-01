@@ -114,8 +114,9 @@ pub(crate) async fn resolve_automatic(
 /// This deliberately bypasses composer-content proof, and nothing else. The
 /// exact recipient, pane process generation, admitted agent generation,
 /// manifest, live pane, and tmux mode are checked before and after the durable
-/// intent. Intent is appended before the key, so a crash can lose the action
-/// but can never authorize a second key.
+/// intent. After the final proofs, one durable reservation shares the
+/// `inbox.claim` lock before the key. A crash can lose the action but can never
+/// authorize a second key.
 pub(crate) async fn force_complete(
     inner: &Arc<Inner>,
     messaging: &WorkspaceMessaging,
@@ -207,6 +208,18 @@ pub(crate) async fn force_complete(
             return Err(AttentionActionError::Store(error));
         }
     };
+
+    // This append and inbox.claim share the workspace journal lock. It is the
+    // final claim-ordering boundary: an earlier claim prevents terminal IO;
+    // a later claim is a normal retrieval but cannot revoke the one key now
+    // reserved for this forced action.
+    if !messaging.reserve_forced_attention_resolution_action(target)? {
+        withdraw_pre_key(messaging, target, NotificationResolution::Complete)?;
+        return Err(AttentionActionError::ForceRefused(
+            "attempt was claimed, withdrawn, replaced, or settled",
+        ));
+    }
+    delivery::inject_pause(inner, "force_submit_after_terminal_key_reservation").await;
 
     if route
         .watcher
