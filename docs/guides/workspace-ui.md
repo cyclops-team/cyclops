@@ -164,24 +164,22 @@ depends on color. Cyclops never writes the pane title to show any of
 this, the title remains a sensor. See [panes.md](panes.md) for naming and
 identity rules.
 
-Cyclops paints every cell your terminal gives it, and also asks the
-terminal to make its own default background the theme's chrome color
-(OSC 11). That is what fills the few pixels of window padding a terminal
-reserves outside the character grid, which no amount of cell painting can
-reach. It is handed back (OSC 111) on every exit path, panic included, so
-your shell gets its own background returned. Cyclops does not read terminal
-input to discover colors. If your terminal ignores OSC 111 but accepts OSC
-11, set both `terminal_default_fg` and `terminal_default_bg` under
-`[workspace]` as `#rrggbb` values; Cyclops then restores that explicit pair
-with OSC 10/11. A partial or malformed pair falls back to OSC 110/111. A
-terminal that does not understand these sequences ignores them and shows its
-own padding color as before.
+Cyclops paints every cell your terminal gives it. The few pixels of window
+padding outside the character grid keep the terminal's own color by default:
+Cyclops does not change a host palette unless it can restore it exactly. To
+theme that padding, set both `terminal_default_fg` and
+`terminal_default_bg` under `[workspace]` as `#rrggbb` values. Cyclops then
+uses OSC 10/11 to apply the theme while focused and restores that explicit
+pair on every exit path, panic included, and on focus loss. A partial or
+malformed pair leaves the host palette untouched. Cyclops never reads terminal
+input to discover colors.
 
-The color also follows your focus. Switch to another tab or window of the
-same terminal and the background is handed back the moment focus leaves,
-so whatever you switched to wears the terminal's own color; come back and
-the theme's ground is reapplied. This rides terminal focus reporting, so
-a terminal without it simply keeps the color until exit, as before.
+When an exact pair enabled host-palette theming, the color also follows your
+focus. Switch to another tab or window of the same terminal and the configured
+defaults are handed back the moment focus leaves; come back and the theme's
+ground is reapplied. This rides terminal focus reporting, so a terminal
+without it simply keeps the color until exit. Without that pair, only the
+workspace grid is themed and there is no host palette to hand back.
 
 Pane content still maps one terminal cell to one tmux cell. The gutter is
 removed from the client size reported to tmux; it never scales or covers a

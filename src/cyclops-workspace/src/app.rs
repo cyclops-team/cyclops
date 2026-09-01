@@ -159,7 +159,8 @@ enum AppMsg {
         mouse: MouseEvent,
     },
     /// The terminal's focus moved onto (`true`) or off (`false`) the
-    /// workspace's tab. Drives the host palette only: the theme's ink and
+    /// workspace's tab. Drives the opt-in host palette only: when the
+    /// operator supplied an exact restoration pair, the theme's ink and
     /// ground are handed to the terminal while the workspace is looked at
     /// and both defaults return the moment it is not, so a shell in another
     /// tab of the same window never wears the workspace's colors.
@@ -284,9 +285,10 @@ struct MessagesDraftIdentity {
 enum HostPaletteState {
     /// Nothing has been emitted since this process acquired or regained the surface.
     Unknown,
-    /// The terminal owns both defaults (OSC 110/111 was emitted).
+    /// The terminal owns both defaults because Cyclops left them alone or
+    /// restored the operator-provided exact pair.
     Defaults,
-    /// Cyclops owns both defaults with this exact theme pair.
+    /// Cyclops requested this theme pair when host palette theming is enabled.
     Theme(crate::theme::HostPalette),
 }
 
@@ -3195,8 +3197,8 @@ async fn handle_app_msg(
             app.window_focused = focused;
             if focused {
                 // Forget what the terminal was last told so the next draw
-                // re-emits the theme's ground even though it has not
-                // changed since focus left.
+                // re-emits the theme's ground when host palette theming is
+                // enabled, even though it has not changed since focus left.
                 app.window_palette = HostPaletteState::Unknown;
                 // Another program owned this surface while focus was away
                 // and may have written over it.
@@ -6127,7 +6129,8 @@ fn draw<B: Backend>(
     // Only while focus is here: a frame drawn for output arriving in an
     // unfocused tab must not restyle the terminal the operator is using
     // for something else (`AppMsg::Focus` hands both defaults back on leave
-    // and clears `window_palette` so return reapplies it).
+    // and clears `window_palette` so return reapplies it when the operator
+    // enabled host palette theming).
     let palette = app
         .paint
         .host_palette_rgb()

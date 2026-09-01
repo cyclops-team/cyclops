@@ -30,13 +30,13 @@ versions are unreleased until admin cuts a tag.
   `composer_semantic_ambiguous` reason. Later complete, write-ready route
   evidence can reopen the same wake once. Mid-turn ambiguity never
   escalates because working frames do not reach the idle arm.
-- Detaching or quitting the workspace left the theme's ground on the
-  shell underneath on terminals that accept an OSC 11 background *set* but
-  ignore the OSC 110/111 *reset*. The workspace now accepts an optional,
-  read-only `[workspace]` `terminal_default_fg` and
-  `terminal_default_bg` pair and restores those exact colors through OSC
-  10/11 on exit and focus loss. It never reads terminal input to discover
-  colors; an absent or invalid pair keeps the OSC 110/111 fallback.
+- Detaching or quitting the workspace could leave the theme's ground on the
+  shell underneath when a terminal accepted an OSC 11 background *set* but
+  ignored its reset. Host-palette theming now requires a complete, read-only
+  `[workspace]` `terminal_default_fg` and `terminal_default_bg` pair. Cyclops
+  applies the theme while focused and restores that exact pair through OSC
+  10/11 on exit and focus loss. Without a valid pair it leaves the host
+  palette untouched, and it never reads terminal input to discover colors.
 - The Messages pane's current-session view told sessions apart by pane id
   alone, so after a tmux server restart the new `main` showed the messages
   of the `main` that died before it: tmux hands `%0`, `%1`, … out again,
