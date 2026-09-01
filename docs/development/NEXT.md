@@ -1,9 +1,15 @@
 # Current beta execution queue
 
-**Status:** Technical beta-acceptance decision complete for the audited
-candidate; operator release decision required
+**Status:** Technical beta-acceptance decision complete for the current
+functional candidate; release identity is the sole remaining operator gate
 
 **Integration branch:** **beta/messaging-rework**
+
+**Current functional candidate:** `2c88b823c5ff25a0094a3006f409b0d73de52d86`
+
+**Full release evidence:**
+[33475085967](https://github.com/cyclops-team/cyclops/actions/runs/33475085967),
+completed successfully at 2026-09-01T06:01:40Z
 
 The [Cyclops Beta Charter](CYCLOPS_BETA_CHARTER.md) controls beta scope,
 stop conditions, and release gates. The

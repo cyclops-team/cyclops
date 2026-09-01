@@ -1,17 +1,23 @@
 # Cyclops beta final acceptance audit
 
-**Status:** Technical beta-acceptance decision complete for the functional
-candidate reviewed here, not release authorization. A public release remains
-an operator decision.
+**Status:** Technical beta-acceptance decision complete for the exact
+functional candidate reviewed here, not release authorization. A public release
+remains an operator decision.
 
-**Functional candidate:** `b5f128fa70c67ce4bf9609b188643b71c44d236b`
+**Functional candidate:** `2c88b823c5ff25a0094a3006f409b0d73de52d86`
 
-**Release-evidence run:** [33437854813](https://github.com/cyclops-team/cyclops/actions/runs/33437854813)
+**Release-evidence run:**
+[33475085967](https://github.com/cyclops-team/cyclops/actions/runs/33475085967),
+completed successfully at 2026-09-01T06:01:40Z
 
-This is the final cross-track acceptance record for the Cyclops Beta Rework.
-It audits the functional candidate above, including the merged work from
-pull requests #101 through #187. The behavioral contracts remain the authority
-when this audit and a contract differ.
+This is the current final cross-track acceptance record for the Cyclops Beta
+Rework. It supersedes the earlier audit of
+`b5f128fa70c67ce4bf9609b188643b71c44d236b` and records the post-audit delta
+merged in pull requests #188 through #194: final-audit documentation,
+installer lifecycle fixes, force-submit ordering fixes, session-recreation
+handling, and full-gate documentation. An independent delta review found no
+product, compatibility, or safety blocker. The behavioral contracts remain the
+authority when this audit and a contract differ.
 
 The independent architecture, regression and migration, user-journey and
 performance, and standards audits identified no unresolved implementation
@@ -42,17 +48,17 @@ Do not name or publish a beta until an operator reconciles those facts.
 
 | Area | Evidence | Result |
 |---|---|---|
-| Clean checkout | Linux and macOS full repository gates in release run 33437854813 | Passed |
+| Clean checkout | Linux and macOS full repository gates in release run 33475085967 | Passed |
 | Compatibility | Strict and lenient replay plus daemon historical-journal contracts | Passed |
 | Journeys | Linux and macOS installer lifecycle and real user journeys | Passed |
 | Reliability | Repeated race, cleanup, soak, and long-history evidence | Passed |
 | tmux | Full correctness evidence against tmux HEAD | Passed |
-| Performance | Retained `release-performance-b5f128fa70c67ce4bf9609b188643b71c44d236b-1` artifact | Passed with recorded environment and workload metadata |
+| Performance | Retained `release-performance-2c88b823c5ff25a0094a3006f409b0d73de52d86-1` artifact | Passed with recorded environment and workload metadata |
 | Aggregate | `beta release evidence complete` | Passed |
 
-The release run was a push of the exact candidate SHA to a disposable beta
-trigger branch. It completed successfully at 2026-08-31T20:56:58Z and did not
-merge, tag, or publish anything.
+The full release run was a push of the exact candidate SHA to a disposable
+beta trigger branch. It completed successfully at 2026-09-01T06:01:40Z and
+did not merge, tag, or publish anything.
 
 The performance artifact records the clean commit, Ubuntu 24, x86-64, four
 CPUs, Rust 1.98.0, tmux 3.4, and seven bounded workloads. Its results are
