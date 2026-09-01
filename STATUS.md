@@ -72,11 +72,14 @@ The paired build is for the explicit real-daemon start assertion in
 `workspace_cli::start_starts_a_daemon_when_none_is_running`.
 `workspace_boot_sizing`'s sizing assertion does not require a daemon and
 tolerates daemon-start failure.
+The headless check keeps the no-default-feature CLI free of interactive UI
+dependencies while exercising its retained command contracts.
 
 ```bash
 ./tests/e2e/messaging-docs-parity.sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+./scripts/check-headless.sh
 python3 scripts/check-doc-paths.py
 cargo build -p cyclops -p cyclopsd --bins
 cargo nextest run --workspace -E 'not (package(cyclopsd) | binary_id(=cyclops-ui::perf) | binary_id(=cyclops-ui::queue_perf) | binary_id(=cyclops-workspace::perf_contract))' --no-fail-fast

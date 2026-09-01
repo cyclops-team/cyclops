@@ -262,12 +262,13 @@ fails, each stable check fails instead of silently skipping.
 Pull-request runs share a workflow-and-PR concurrency key and cancel an older
 revision. Push and manual evidence use unique keys and never cancel each other.
 
-The Ubuntu correctness lane owns formatting, Clippy, parallel-safe tests,
-daemon tests, Rust documentation compilation, documentation paths,
-exact-output parity, and focused relocated-root evidence. The normal nextest
-filter excludes the six performance executables. Those workloads, plus the
-staged install-to-first-durable-handoff journey, retain their own metadata and
-history in scheduled and release evidence. The handoff journey never runs in a
+The Ubuntu correctness lane owns formatting, Clippy, the headless build
+boundary and command contracts, parallel-safe tests, daemon tests, Rust
+documentation compilation, documentation paths, exact-output parity, and
+focused relocated-root evidence. The normal nextest filter excludes the six
+performance executables. Those workloads, plus the staged
+install-to-first-durable-handoff journey, retain their own metadata and history
+in scheduled and release evidence. The handoff journey never runs in a
 pull-request job.
 
 Immediately before its filtered nextest run, the correctness lane builds the
