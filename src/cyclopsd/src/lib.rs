@@ -5903,6 +5903,14 @@ async fn run_session(
         .await;
         apply_route_evidence_observation(inner, idx, &row.pane_id, &route_evidence);
     }
+    // Boot scans durable force-submit candidates before watcher tasks attach.
+    // Once this watcher has published its current routes, re-arm those exact
+    // candidates so a transient missing route did not discard the one-shot
+    // fallback. The messaging Module selects candidates; the runtime still
+    // rechecks binding and reserves the only terminal key.
+    if let Some(messaging) = inner.workspace_messaging() {
+        messaging.force_submit_routes_available();
+    }
     // Per-pane debounce kickers for output activity.
     let mut debounce: HashMap<String, watch::Sender<u64>> = HashMap::new();
     loop {

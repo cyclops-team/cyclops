@@ -882,6 +882,106 @@ async fn force_submit_sends_one_enter_for_the_exact_verify_failed_attempt() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn force_submit_rearms_an_existing_exact_candidate_after_boot_routes_its_pane() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "workspace-force-submit-boot-recovery",
+        CAT_MANIFEST,
+        &composer_pane(),
+        "delivery_retry_max = 0\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let (pre_tx, mut pre_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pre_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let first_pre = Arc::new(AtomicBool::new(true));
+    rig.daemon.set_inject_pause({
+        let pre_release = Arc::clone(&pre_release);
+        let first_pre = Arc::clone(&first_pre);
+        move |phase| {
+            let pre_tx = pre_tx.clone();
+            let pre_release = Arc::clone(&pre_release);
+            let pause_pre = phase == "pre_submit" && first_pre.swap(false, Ordering::SeqCst);
+            Box::pin(async move {
+                if pause_pre {
+                    let _ = pre_tx.send(());
+                    pre_release.acquire_owned().await.unwrap().forget();
+                }
+            })
+        }
+    });
+
+    let sent = send_workspace_message(
+        &rig,
+        "force-submit-boot-recovery",
+        "Force submit after boot",
+        "private body",
+    )
+    .await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    tokio::time::timeout(Duration::from_secs(5), pre_rx.recv())
+        .await
+        .expect("doorbell reached pre-submit")
+        .expect("pre-submit sender stayed open");
+    rig.tmux
+        .run_ok(&["send-keys", "-l", "-t", &pane, " trailing input"]);
+    rig.tmux.wait_screen("main", "trailing input");
+    pre_release.add_permits(1);
+
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::AttentionRequired).await;
+    assert_eq!(
+        pane_history(&rig, &pane).matches("FAKETUI-WORKING").count(),
+        0,
+        "force-submit is off before the reboot"
+    );
+
+    rig.rewrite_config(
+        "delivery_retry_max = 0\nforce_notification_submit = \"on\"\nforce_notification_submit_delay_ms = 0\n",
+    );
+    let mut rig = rig.reboot().await;
+    rig.wait_attached(1).await;
+
+    let intent = wait_for_workspace_fact(&rig, &message_id, "notification_resolution_intent").await;
+    assert_eq!(intent.data.as_ref().unwrap()["forced"], true);
+    wait_for_workspace_fact(&rig, &message_id, "notification_resolution_action_accepted").await;
+    rig.tmux.wait_screen("main", "FAKETUI-WORKING");
+
+    let lines = workspace_lines(&rig);
+    for fact_type in [
+        "notification_resolution_intent",
+        "notification_resolution_action_accepted",
+    ] {
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| {
+                    line.id == message_id
+                        && line
+                            .data
+                            .as_ref()
+                            .is_some_and(|data| data["type"] == fact_type)
+                })
+                .count(),
+            1,
+            "the recovered candidate appended {fact_type} more than once: {lines:#?}"
+        );
+    }
+    assert_eq!(
+        pane_history(&rig, &pane).matches("FAKETUI-WORKING").count(),
+        1,
+        "the recovered candidate pressed Enter more than once"
+    );
+
+    rig.daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn force_submit_waits_for_the_exact_reservation_release_before_revalidating() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");

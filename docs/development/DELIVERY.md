@@ -307,8 +307,11 @@ locator.
 
    `notification.force_submit` is a separately documented default-off,
    administrator-controlled fallback for one exact current `verify_failed`
-   doorbell. It never pastes or replaces bytes. After exact binding and route
-   checks, it records durable intent. After its final route and payload proofs,
+   doorbell. It never pastes or replaces bytes. Boot may discover a durable
+   candidate before a watcher has a current route; that temporary absence does
+   not settle or discard the candidate, which is reconsidered once the watcher
+   publishes its route. After exact binding and route checks, it records durable
+   intent. After its final route and payload proofs,
    it appends a content-free `notification_resolution_action_reserved` fact
    under the same workspace journal lock as `inbox.claim`, then may send one
    manifest submit key without composer-content proof. It can therefore submit
