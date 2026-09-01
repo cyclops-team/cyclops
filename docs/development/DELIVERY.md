@@ -295,10 +295,15 @@ locator.
    On the ordinary notification path, automatic submit runs the full proof
    immediately before the reservation and again after it. Both checks require
    the same pane-root, terminal leader, agent generation, and manifest; no pane
-   mode; a current manifest state of `idle` or `idle_with_input`; and the exact
-   attempt-owned staged barrier with no live lifecycle or blocked-state
-   conflict. A refusal withholds Enter and settles once as `verify_failed`. It
-   is never retried.
+   mode; and the exact attempt-owned staged barrier with no live blocked-state
+   conflict. `idle` and `idle_with_input` qualify normally. A current
+   `working` state also qualifies only when this same in-flight notification
+   was admitted immediately before paste by a fresh screen `working` reading
+   plus a positive clean or ghost composer proof. That narrow capability does
+   not survive retries, recovery, or operator resolution. The final capture
+   must still prove the exact staged doorbell; a human or ambiguous change
+   fails that proof and withholds Enter as `verify_failed`. A refusal is never
+   retried.
 
    `notification.force_submit` is a separately documented default-off,
    administrator-controlled fallback for one exact current `verify_failed`

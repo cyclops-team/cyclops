@@ -7,15 +7,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{
-    composer_pane, faketui_path, hold_script, manual_lifecycle_composer_pane,
-    swallowing_animated_composer_pane, tmux_available, wait_pane_state, Rig, TestClient,
-    CAT_MANIFEST, HOOK_MANIFEST, LIVENESS_MANIFEST, MODAL_MANIFEST, QUOTA_MANIFEST,
+    composer_pane, faketui_path, hold_script, swallowing_animated_composer_pane, tmux_available,
+    wait_pane_state, HomeGuard, Rig, TestClient, CAT_MANIFEST, HOOK_MANIFEST, LIVENESS_MANIFEST,
+    MODAL_MANIFEST, QUOTA_MANIFEST,
 };
 use cyclops_proto::{
     Kind, LedgerLine, MessageId, MsgSendParams, NotificationAttemptId, NotificationState,
     RecipientKey,
 };
 use serde_json::{json, Value};
+use tokio::net::UnixDatagram;
 
 /// The escaped Codex composer distinction from the live `/model` incident:
 /// dim text is a ghost suggestion, while bare text is a human draft. The
@@ -4663,15 +4664,29 @@ async fn a_user_prompt_submit_records_liveness_but_stays_working_until_a_termina
 /// blanket refusal, and it is not permission: an ambiguous or missing
 /// composer proof still follows the fail-closed path.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_working_pane_with_a_proven_clean_composer_accepts_a_notification() {
+async fn a_working_pane_with_a_proven_clean_composer_submits_one_doorbell() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
+    let event_dir = cyclops_proto::scratch::scratch_dir(&format!(
+        "working-clean-composer-submit-event-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&event_dir).unwrap();
+    let _event_guard = HomeGuard(event_dir.clone());
+    let submit_event_path = event_dir.join("submit.sock");
+    let submit_events =
+        UnixDatagram::bind(&submit_event_path).expect("bind fake composer submit event socket");
+    let pane_command = format!(
+        "python3 {} --manual-lifecycle --submit-event-socket {}",
+        faketui_path(),
+        submit_event_path.display()
+    );
     let mut rig = Rig::new(
         "workspace-working-clean-composer",
         LIVENESS_MANIFEST,
-        &manual_lifecycle_composer_pane(),
+        &pane_command,
         "delivery_retry_max = 0\n",
     )
     .await;
@@ -4701,8 +4716,42 @@ async fn a_working_pane_with_a_proven_clean_composer_accepts_a_notification() {
 
     wait_for_notification_state(&mut rig, &message_id, NotificationState::Writing).await;
     wait_for_doorbell(&rig, &pane, &message_id).await;
-
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::Submitted).await;
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::Submitted),
+        1,
+        "the exact doorbell must reserve and send only one Enter"
+    );
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::AttentionRequired),
+        0,
+        "a Working pane with a positively clean composer must not become verify_failed"
+    );
+    let mut event = [0_u8; 16];
+    let received = tokio::time::timeout(Duration::from_secs(5), submit_events.recv(&mut event))
+        .await
+        .expect("the fake composer did not receive Enter")
+        .expect("read fake composer submit event");
+    assert_eq!(
+        &event[..received],
+        b"submit",
+        "the fake composer must report the submitted Enter"
+    );
+    // Shutdown drains or aborts all delivery workers before this test-owned
+    // terminal checkpoint. The fixture receives terminal input in order, so a
+    // duplicate Enter already queued by Cyclops would report `submit` before
+    // the checkpoint. No timer or filesystem poll is needed to prove it.
     rig.daemon.shutdown().await;
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "C-q"]);
+    let received = tokio::time::timeout(Duration::from_secs(5), submit_events.recv(&mut event))
+        .await
+        .expect("the fake composer did not acknowledge the terminal checkpoint")
+        .expect("read fake composer checkpoint event");
+    assert_eq!(
+        &event[..received],
+        b"checkpoint",
+        "the fake composer received an extra Enter before the shutdown checkpoint"
+    );
 }
 
 /// An opt-in stale reminder is another run of the ordinary notification

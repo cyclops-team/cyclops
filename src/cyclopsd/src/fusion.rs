@@ -2309,7 +2309,36 @@ pub(crate) fn staged_action_ready(
         .is_some_and(|entry| staged_entry_ready(entry, owner, expected, manifest))
 }
 
+/// Confirm that the exact staged barrier still belongs to its original pane
+/// binding and remains observable. Callers add their own frame-specific
+/// evidence; this function alone never authorizes a terminal key.
+pub(crate) fn staged_action_binding_ready(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    pane_id: &str,
+    owner: &str,
+    agent: cyclops_proto::ProcessInstanceId,
+    manifest: &str,
+) -> bool {
+    let expected = crate::identity::ProcId {
+        pid: agent.pid(),
+        birth: agent.birth(),
+    };
+    let map = inner.detections.lock().expect("detections lock");
+    map.get(&PaneKey::new(session_idx, pane_id))
+        .is_some_and(|entry| staged_entry_binding_ready(entry, owner, expected, manifest))
+}
+
 fn staged_entry_ready(
+    entry: &DetEntry,
+    owner: &str,
+    agent: crate::identity::ProcId,
+    manifest: &str,
+) -> bool {
+    staged_entry_binding_ready(entry, owner, agent, manifest) && staged_frame_is_quiet(entry)
+}
+
+fn staged_entry_binding_ready(
     entry: &DetEntry,
     owner: &str,
     agent: crate::identity::ProcId,
@@ -2319,7 +2348,8 @@ fn staged_entry_ready(
         && entry.hold_owner.as_deref() == Some(owner)
         && entry.agent == Some(agent)
         && entry.manifest.as_deref() == Some(manifest)
-        && staged_frame_is_quiet(entry)
+        && !entry.in_mode
+        && !entry.detection.stale
 }
 
 /// Release this attempt's composer barrier after a guarded resolution.
@@ -9215,6 +9245,61 @@ regex = ['^']
             "att-1",
         );
         assert!(staged_entry_ready(&idle_with_input, "att-1", agent, "fix"));
+    }
+
+    #[test]
+    fn a_staged_doorbell_keeps_its_exact_binding_for_a_clean_working_submit() {
+        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
+        // The staged doorbell now occupies the composer, so its current
+        // semantic is human_input. The normal delivery path separately
+        // proves these exact bytes, the current Working frame, and carries
+        // the pre-paste clean proof.
+        let working = staged_entry(
+            AgentState::Working,
+            Some(ComposerSemantic::HumanInput),
+            vec![
+                screen_reading(AgentState::Working),
+                screen_reading(AgentState::IdleWithInput),
+            ],
+            false,
+            false,
+            "att-1",
+        );
+        assert!(
+            !staged_entry_ready(&working, "att-1", agent, "fix"),
+            "the quiet action path must remain unavailable while Working"
+        );
+        assert!(staged_entry_binding_ready(&working, "att-1", agent, "fix"));
+
+        let stale = staged_entry(
+            AgentState::Working,
+            Some(ComposerSemantic::HumanInput),
+            vec![screen_reading(AgentState::Working)],
+            true,
+            false,
+            "att-1",
+        );
+        assert!(!staged_entry_binding_ready(&stale, "att-1", agent, "fix"));
+
+        let in_mode = staged_entry(
+            AgentState::Working,
+            Some(ComposerSemantic::HumanInput),
+            vec![screen_reading(AgentState::Working)],
+            false,
+            true,
+            "att-1",
+        );
+        assert!(!staged_entry_binding_ready(&in_mode, "att-1", agent, "fix"));
+        assert!(!staged_entry_binding_ready(&working, "att-2", agent, "fix"));
+        assert!(!staged_entry_binding_ready(
+            &working,
+            "att-1",
+            crate::identity::ProcId { pid: 8, birth: 80 },
+            "fix"
+        ));
+        assert!(!staged_entry_binding_ready(
+            &working, "att-1", agent, "other"
+        ));
     }
     /// Ordinary idle composer frames never end an authenticated confirmed
     /// start. One manifest-declared terminal winner may do so.

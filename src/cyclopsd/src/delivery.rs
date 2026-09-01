@@ -1097,6 +1097,12 @@ pub(crate) struct DeliveryHandle {
     /// A readiness edge observed while this claimed-barrier run was active.
     /// Consumed only after the attempt index releases this handle.
     claimed_notification_rerun_requested: AtomicBool,
+    /// This ordinary notification was admitted immediately before paste while
+    /// the pane was visibly Working and its composer was positively clean or
+    /// ghosted. The staged doorbell naturally reads as input afterward, so
+    /// this one-attempt capability carries the pre-paste proof to the final
+    /// exact-byte submit check. It is never restored or used by recovery.
+    working_clean_submit_admitted: AtomicBool,
 }
 
 /// Evidence from a vendor hook that landed before the worker consumed it.
@@ -1327,6 +1333,7 @@ impl DeliveryHandle {
             write_boundary_crossed: AtomicBool::new(false),
             worker_recoveries: AtomicU64::new(0),
             claimed_notification_rerun_requested: AtomicBool::new(false),
+            working_clean_submit_admitted: AtomicBool::new(false),
         })
     }
 
@@ -1351,6 +1358,15 @@ impl DeliveryHandle {
             .notification_transport
             .lock()
             .expect("notification transport lock")
+    }
+
+    fn set_working_clean_submit_admitted(&self, admitted: bool) {
+        self.working_clean_submit_admitted
+            .store(admitted, Ordering::SeqCst);
+    }
+
+    fn working_clean_submit_admitted(&self) -> bool {
+        self.working_clean_submit_admitted.load(Ordering::SeqCst)
     }
 
     fn restore_claimed_notification_barrier(&self) {
@@ -4183,6 +4199,9 @@ async fn attempt_delivery(
     manifest_id: &str,
     admitted_pid: i32,
 ) -> AttemptOutcome {
+    // This capability belongs only to the capture immediately before this
+    // attempt's paste. A later retry must earn it again from fresh evidence.
+    handle.set_working_clean_submit_admitted(false);
     let watcher = match exact_prewrite_watcher(inner, handle, manifest_id) {
         Ok(watcher) => watcher,
         Err(failure) => return AttemptOutcome::Failed(failure),
@@ -4294,6 +4313,16 @@ async fn attempt_delivery(
                 }
                 return AttemptOutcome::Failed(AttemptFailure::pane_rebound_before_paste());
             }
+            // A Working runtime is safe only in this narrow, positive shape.
+            // Keep that admission with the in-flight notification: after the
+            // paste, the exact doorbell itself naturally renders as input and
+            // cannot repeat the clean-composer proof that made the write safe.
+            handle.set_working_clean_submit_admitted(
+                handle.notification.is_some()
+                    && det.state == AgentState::Working
+                    && det.write_ready
+                    && det.screen_proves_write_safe_composer(),
+            );
         }
         None => {
             injector.discard().await;
@@ -4591,7 +4620,8 @@ async fn attempt_delivery(
         gate_line(inner, handle, "rebound", None, Some(&detail));
         return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
     }
-    if let Err(detail) = notification_staged_action_safe(inner, handle, manifest, &recheck, &proven)
+    if let Err(detail) =
+        notification_staged_action_safe(inner, handle, manifest, &recheck, &proven, true)
     {
         unregister_ack(inner, handle);
         gate_line(inner, handle, "rebound", None, Some(&detail));
@@ -4652,7 +4682,7 @@ async fn attempt_delivery(
                     ));
                 }
                 if let Err(detail) =
-                    notification_staged_action_safe(inner, handle, manifest, &now, &proven)
+                    notification_staged_action_safe(inner, handle, manifest, &now, &proven, true)
                 {
                     gate_line(
                         inner,
@@ -4891,13 +4921,16 @@ fn finish_attempt_delivery_inject_failure(
 /// staged composer. The caller separately compares the normalized bytes.
 /// This check binds that content to the current process generations and
 /// manifest, requires a terminal-safe visual state, and refuses any live
-/// lifecycle or blocked-state conflict retained by fusion.
+/// lifecycle or blocked-state conflict retained by fusion. Only the ordinary
+/// in-flight submit passes `allow_inflight_working_admission`; recovery and
+/// terminal clear paths stay on the quiet-frame rule.
 fn notification_staged_action_safe(
     inner: &Arc<Inner>,
     handle: &DeliveryHandle,
     manifest: &Manifest,
     capture: &str,
     proven: &fusion::Binding,
+    allow_inflight_working_admission: bool,
 ) -> Result<(), String> {
     let Some(notification) = &handle.notification else {
         return Ok(());
@@ -4921,20 +4954,34 @@ fn notification_staged_action_safe(
     let state = manifest
         .evaluate_esc(&row.title, &strip_csi(capture), Some(capture))
         .map(|rule| rule.state);
-    if !matches!(state, Some(AgentState::Idle | AgentState::IdleWithInput)) {
+    let working_clean_submit = allow_inflight_working_admission
+        && state == Some(AgentState::Working)
+        && handle.working_clean_submit_admitted();
+    if !matches!(state, Some(AgentState::Idle | AgentState::IdleWithInput)) && !working_clean_submit
+    {
         return Err("staged_manifest_state_unsafe".to_string());
     }
     let Some(agent) = process_instance_id(proven.agent) else {
         return Err("binding_unprovable".to_string());
     };
-    if !fusion::staged_action_ready(
+    let quiet_staged_action = fusion::staged_action_ready(
         inner,
         handle.session_idx,
         &handle.pane_id,
         &notification.attempt_id().to_string(),
         agent,
         &proven.manifest,
-    ) {
+    );
+    let working_staged_action = working_clean_submit
+        && fusion::staged_action_binding_ready(
+            inner,
+            handle.session_idx,
+            &handle.pane_id,
+            &notification.attempt_id().to_string(),
+            agent,
+            &proven.manifest,
+        );
+    if !quiet_staged_action && !working_staged_action {
         return Err("staged_action_unsafe".to_string());
     }
     Ok(())
@@ -5177,7 +5224,7 @@ async fn reconcile_claimed_notification_barrier<I: Injector>(
                 ));
             }
             if let Err(cause) =
-                notification_staged_action_safe(inner, handle, manifest, &staged, proven)
+                notification_staged_action_safe(inner, handle, manifest, &staged, proven, false)
             {
                 return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
             }
@@ -5347,7 +5394,8 @@ async fn observe_exact_composer_clear<I: Injector>(
         }
         if !row.in_mode
             && clean_composer_proof(manifest, &capture)
-            && notification_staged_action_safe(inner, handle, manifest, &capture, proven).is_ok()
+            && notification_staged_action_safe(inner, handle, manifest, &capture, proven, false)
+                .is_ok()
         {
             return true;
         }

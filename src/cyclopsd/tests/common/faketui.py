@@ -49,6 +49,14 @@ observable result.
 `--submit-log <path>` appends one line for every submit key the fixture
 receives. It lets recovery tests prove that reconciliation sends no second key.
 
+`--submit-event-socket <path>` sends one Unix datagram after the fixture
+consumes each submit key. It lets a test wait for the observed Enter rather
+than polling a log file.
+
+With that event socket, Ctrl-Q emits a `checkpoint` datagram after all earlier
+terminal input. Tests use it only after shutting down the delivery worker, so
+the checkpoint makes any duplicate queued Enter observable without a sleep.
+
 `--manual-lifecycle` consumes a successful submit but stays visually idle.
 Lifecycle tests then use Ctrl-T and Ctrl-Y to choose the observed start and
 end without wall-clock races.
@@ -65,6 +73,7 @@ current frame. Cyclops itself sends none of these keys.
 """
 
 import os
+import socket
 import sys
 import termios
 import time
@@ -76,6 +85,11 @@ STATUS_ALT = "\x1b[38;5;152mModel x · Ctx: 77%\x1b[39m"
 WORKING = "FAKETUI-WORKING"
 START = b"\x1b[200~"
 END = b"\x1b[201~"
+
+
+def emit_event(path, event):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as event_socket:
+        event_socket.sendto(event, path)
 
 
 class Stream:
@@ -202,6 +216,9 @@ def main():
     submit_log = None
     if "--submit-log" in sys.argv:
         submit_log = sys.argv[sys.argv.index("--submit-log") + 1]
+    submit_event_socket = None
+    if "--submit-event-socket" in sys.argv:
+        submit_event_socket = sys.argv[sys.argv.index("--submit-event-socket") + 1]
     swallowed = False
     forced_working = False
     fd = sys.stdin.fileno()
@@ -256,6 +273,12 @@ def main():
                 draw(transcript, staged, working=forced_working, hidden=hidden)
                 if not chunk:
                     continue
+            if b"\x11" in chunk:
+                chunk = chunk.replace(b"\x11", b"")
+                if submit_event_socket is not None:
+                    emit_event(submit_event_socket, b"checkpoint")
+                if not chunk:
+                    continue
             for kind, payload in stream.feed(chunk):
                 if kind == "text":
                     for char in payload.decode("utf-8", "replace"):
@@ -269,6 +292,8 @@ def main():
                     if submit_log is not None:
                         with open(submit_log, "a", encoding="utf-8") as log:
                             log.write("submit\n")
+                    if submit_event_socket is not None:
+                        emit_event(submit_event_socket, b"submit")
                     if swallow or (swallow_once and not swallowed):
                         # The key arrived and was accepted. Nothing else
                         # happens: the composer keeps its text and no turn

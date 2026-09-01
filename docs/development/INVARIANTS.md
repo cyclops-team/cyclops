@@ -491,6 +491,15 @@ running turn may write only when the same fresh capture contains a live screen
 Hook-derived idle or Working without that proof never authorizes an ordinary
 write.**
 
+For an ordinary mailbox doorbell admitted in that exact Working-plus-proof
+shape, the same in-flight proof also permits its final Enter while the current
+frame remains Working. The paste itself now occupies the composer, so the
+final screen cannot repeat the clean proof; it must instead prove the exact
+attempt-owned doorbell bytes, the same binding, and no mode or blocked state.
+This is not a recovery or operator-resolution permission. A human or
+ambiguous composer never gains it, and any changed staged bytes still withhold
+Enter as `verify_failed`.
+
 What breaks: the same damage as rule 3, reached from the opposite
 direction. Rule 3 holds when the screen sensor SEES staged text. This rule
 covers the case where it sees nothing usable and something else says idle
