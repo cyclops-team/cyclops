@@ -504,9 +504,14 @@ conflict and also withholds Enter, even if the screen still paints `working`.
 Only a screen `idle` or `idle_with_input` reading that describes the owned
 staged composer may coexist with the current Screen `working` reading. The
 same current `working` observation may mark that owned barrier
-`staged_during_turn`; that marker remains eligible only for the already-
-admitted in-flight submit, never for a quiet, recovery, or human-draft path.
-final proof may take its bounded capture rereads to pass a partial terminal
+`staged_during_turn`. While that frame is Working, the marker is eligible only
+for the already-admitted in-flight submit. If a later fresh quiet frame still
+shows the same exact attempt-owned doorbell, ordinary reconciliation may
+re-open only that owner. It must re-prove the recorded binding, manifest, no
+mode or stale conflict, and the exact visible bytes before reserving one
+existing key. It never makes the pane generally write-ready; human, changed,
+hidden, modal, or unprovable content still withholds Enter. The final proof may
+take its bounded capture rereads to pass a partial terminal
 repaint, but that re-observation never repeats the paste or Enter: only a
 current frame with the same exact bytes can authorize the one reserved key.
 

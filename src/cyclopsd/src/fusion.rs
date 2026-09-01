@@ -2347,8 +2347,10 @@ fn staged_entry_binding_ready(
     agent: crate::identity::ProcId,
     manifest: &str,
 ) -> bool {
-    entry.hold == ComposerHold::Staged
-        && entry.hold_owner.as_deref() == Some(owner)
+    matches!(
+        entry.hold,
+        ComposerHold::Staged | ComposerHold::StagedDuringTurn
+    ) && entry.hold_owner.as_deref() == Some(owner)
         && entry.agent == Some(agent)
         && entry.manifest.as_deref() == Some(manifest)
         && !entry.in_mode
@@ -2358,9 +2360,9 @@ fn staged_entry_binding_ready(
 /// The Working-plus-clean submit path may retain its own barrier after fusion
 /// sees the exact staged doorbell as input during the already-running turn.
 /// That observation changes `Staged` to `StagedDuringTurn`; it does not make
-/// a human draft safe. Only the in-flight path, which separately carries its
-/// pre-paste clean admission and re-proves the exact bytes, may use this
-/// binding. Quiet, recovery, and operator paths remain `Staged`-only above.
+/// a human draft safe. The in-flight path separately carries its pre-paste
+/// clean admission. A later quiet frame can re-open only this exact owner,
+/// whose ordinary reconciliation re-proves the current binding and bytes.
 fn staged_entry_working_clean_binding_ready(
     entry: &DetEntry,
     owner: &str,
@@ -2487,11 +2489,18 @@ pub(crate) async fn resolve_staged_hold(
 /// requested and a claimed doorbell is never cleared.
 type ReadinessKey = (bool, Option<String>, bool);
 
-/// Is this pane's own staged hold ready for its owner's action? The same
+/// Should this pane wake the exact owner to recheck its staged hold? The same
 /// evidence `staged_entry_ready` demands, minus the owner and binding
-/// identity, which the reconciliation seam re-proves itself.
+/// identity, which the reconciliation seam re-proves itself. This wake never
+/// authorizes a terminal action. A hold staged during an older running turn
+/// remains held generally; only the exact owner may recheck it once the
+/// current frame is quiet.
 fn staged_hold_ready(entry: &DetEntry) -> bool {
-    entry.hold == ComposerHold::Staged && entry.hold_owner.is_some() && staged_frame_is_quiet(entry)
+    matches!(
+        entry.hold,
+        ComposerHold::Staged | ComposerHold::StagedDuringTurn
+    ) && entry.hold_owner.is_some()
+        && staged_frame_is_quiet(entry)
 }
 
 /// Is this frame quiet enough for the owner's own action on its staged
@@ -9170,6 +9179,27 @@ regex = ['^']
             "exact end then unknown plus exact proof clears once"
         );
         assert!(staged_hold_ready(&ok));
+        // An exact doorbell may have appeared while an unrelated turn was
+        // still running. The generic hold stays distinct to protect later
+        // human text, but once this frame proves that turn is gone, the exact
+        // owner may recheck the same bytes.
+        let mut after_old_turn = ok.clone();
+        after_old_turn.hold = ComposerHold::StagedDuringTurn;
+        assert!(
+            staged_entry_ready(&after_old_turn, "att-1", agent, "fix"),
+            "a quiet frame reopens only the exact owned doorbell"
+        );
+        assert!(staged_hold_ready(&after_old_turn));
+        let mut no_owner = after_old_turn.clone();
+        no_owner.hold_owner = None;
+        assert!(
+            !staged_entry_ready(&no_owner, "att-1", agent, "fix"),
+            "a human hold never passes the exact-owner check"
+        );
+        assert!(
+            !staged_hold_ready(&no_owner),
+            "a human hold never becomes an automatic action"
+        );
         // exact end then unknown: a retained idle hook reading is still quiet
         let ended = staged_entry(
             AgentState::Unknown,
@@ -9334,12 +9364,13 @@ regex = ['^']
         // Once fusion re-observes the exact doorbell, ordinary composer-hold
         // semantics correctly remember that it appeared during this old
         // Working turn. The one in-flight Working admission keeps its exact
-        // binding; the quiet path must stay closed.
+        // binding; the quiet path remains closed while the frame is Working.
+        // A later fresh quiet frame can re-open only this exact owner.
         let mut reobserved = working.clone();
         reobserved.hold = ComposerHold::StagedDuringTurn;
         assert!(
             !staged_entry_ready(&reobserved, "att-1", agent, "fix"),
-            "the quiet action path must reject a staged-during-turn barrier"
+            "the quiet action path must remain unavailable while the frame is Working"
         );
         assert!(staged_entry_working_clean_action_ready(
             &reobserved,
