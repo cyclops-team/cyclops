@@ -70,9 +70,11 @@ pub(crate) struct HookEntry {
     /// immediately, but a later visual Working observation must confirm it
     /// before delivery or `wait --until turn-ended` may rely on it.
     confirmed_start: bool,
-    /// This reading is a conclusive end for one exact turn. It remains an
-    /// edge, not a persistent Idle level: a later current visual Working
-    /// observation supersedes it.
+    /// This reading is a conclusive end for this binding, and for one exact
+    /// turn when `active_turn` is present. It remains an edge, not a
+    /// persistent Idle level: a later current visual Working observation
+    /// normally supersedes it. An owned doorbell staged during that Working
+    /// frame retains an exactly keyed end only as a final-submit conflict.
     authoritative_end: bool,
     /// The exact turn when the manifest can name it. `None` can describe a
     /// binding-scoped confirmed lifecycle or provisional dispatch evidence,
@@ -194,6 +196,21 @@ impl HookEntry {
         HookEntry {
             authoritative_end: true,
             active_turn: Some(turn),
+            ..HookEntry::bound(pane_pid, manifest, reading)
+        }
+    }
+
+    /// A confirmed terminal edge from a vendor that cannot name individual
+    /// turns. It can describe the current runtime until a newer visual frame
+    /// supersedes it, but it cannot be joined to a message attempt.
+    pub(crate) fn unkeyed_turn_ended(
+        pane_pid: crate::identity::ProcId,
+        manifest: Option<String>,
+        reading: SensorReading,
+    ) -> HookEntry {
+        debug_assert_eq!(reading.state, AgentState::Idle);
+        HookEntry {
+            authoritative_end: true,
             ..HookEntry::bound(pane_pid, manifest, reading)
         }
     }
@@ -2111,6 +2128,11 @@ pub(crate) fn set_hold_owned(
         }
         let prior_ready = readiness_key(entry);
         entry.hold = hold;
+        entry.final_submit_conflict_owner = retained_final_submit_conflict_owner(
+            entry.final_submit_conflict_owner.take(),
+            entry.hold,
+            entry.hold_owner.as_deref(),
+        );
         entry.detection = entry.detection.clone().stamped(entry.in_mode, hold);
         (prior_ready, readiness_key(entry), entry.detection.clone())
     };
@@ -2180,6 +2202,11 @@ pub(crate) fn bind_turn(
         if entry.hold.is_waiting() {
             entry.hold = ComposerHold::TurnStarted { since_ms };
         }
+        entry.final_submit_conflict_owner = retained_final_submit_conflict_owner(
+            entry.final_submit_conflict_owner.take(),
+            entry.hold,
+            entry.hold_owner.as_deref(),
+        );
         entry.detection = entry.detection.clone().stamped(entry.in_mode, entry.hold);
         (
             prior_ready,
@@ -2246,6 +2273,11 @@ pub(crate) fn claim_hold(
         let prior_ready = readiness_key(entry);
         entry.hold_owner = Some(owner.to_string());
         entry.hold = ComposerHold::Staged;
+        entry.final_submit_conflict_owner = retained_final_submit_conflict_owner(
+            entry.final_submit_conflict_owner.take(),
+            entry.hold,
+            entry.hold_owner.as_deref(),
+        );
         entry.detection = entry.detection.clone().stamped(entry.in_mode, entry.hold);
         (prior_ready, readiness_key(entry), entry.detection.clone())
     };
@@ -2281,6 +2313,7 @@ pub(crate) fn release_unwritten_hold(
         let prior_ready = readiness_key(entry);
         entry.hold = ComposerHold::Clear;
         entry.hold_owner = None;
+        entry.final_submit_conflict_owner = None;
         entry.detection = entry.detection.clone().stamped(entry.in_mode, entry.hold);
         (prior_ready, readiness_key(entry), entry.detection.clone())
     };
@@ -2332,6 +2365,58 @@ pub(crate) fn staged_working_clean_action_ready(
         })
 }
 
+/// Record a confirmed, exactly keyed terminal edge that arrived after one
+/// exact doorbell was staged, but before its one final Enter. The edge cannot
+/// authorize a write and it does not change public pane state. It only
+/// prevents that same in-flight Working-submit path from treating its earlier
+/// admission as current after the terminal fact arrived.
+///
+/// A report origin is already authenticated to this pane route, root, agent,
+/// and manifest. Match that cached route here so an old end cannot attach
+/// itself to another attempt that later occupies the pane. The final action
+/// gate separately re-proves the complete current binding.
+pub(crate) fn record_final_submit_conflict(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    pane_id: &str,
+    pane_root: crate::identity::ProcId,
+    agent: crate::identity::ProcId,
+    manifest: &str,
+) -> Option<String> {
+    let mut map = inner.detections.lock().expect("detections lock");
+    let entry = map.get_mut(&PaneKey::new(session_idx, pane_id))?;
+    let binding = entry.binding.as_ref()?;
+    let owner = entry.hold_owner.clone()?;
+    let exact_staged_owner = matches!(
+        entry.hold,
+        ComposerHold::Staged | ComposerHold::StagedDuringTurn
+    ) && entry.agent == Some(agent)
+        && entry.manifest.as_deref() == Some(manifest)
+        && binding.pane_root == pane_root
+        && binding.agent == agent
+        && binding.manifest == manifest;
+    if exact_staged_owner {
+        entry.final_submit_conflict_owner = Some(owner.clone());
+        Some(owner)
+    } else {
+        None
+    }
+}
+
+/// Keep a final-submit conflict only while it still names this exact staged
+/// barrier. A pane may keep the same agent and manifest while a different
+/// delivery claims its composer, so the owner comparison is essential.
+fn retained_final_submit_conflict_owner(
+    conflict_owner: Option<String>,
+    hold: ComposerHold,
+    hold_owner: Option<&str>,
+) -> Option<String> {
+    conflict_owner.filter(|conflict_owner| {
+        matches!(hold, ComposerHold::Staged | ComposerHold::StagedDuringTurn)
+            && hold_owner == Some(conflict_owner.as_str())
+    })
+}
+
 fn staged_entry_ready(
     entry: &DetEntry,
     owner: &str,
@@ -2381,9 +2466,9 @@ fn staged_entry_working_clean_binding_ready(
 
 /// The staged doorbell itself may legitimately make the screen's composer
 /// rule read idle-with-input, but the live runtime must still be an explicitly
-/// current, conflict-free Working frame. In particular, a late hook Stop is
-/// an Idle reading from a non-composer sensor, not a harmless description of
-/// the staged row.
+/// current, conflict-free Working frame. A confirmed, exactly keyed Stop may
+/// later be superseded in public detection, so its exact attempt marker below
+/// independently denies the final Enter.
 fn staged_entry_working_clean_action_ready(
     entry: &DetEntry,
     owner: &str,
@@ -2409,6 +2494,7 @@ fn staged_entry_working_clean_action_ready(
         && permitted_staged_block
         && current_screen_working
         && no_live_conflict
+        && entry.final_submit_conflict_owner.as_deref() != Some(owner)
 }
 
 /// Release this attempt's composer barrier after a guarded resolution.
@@ -2458,6 +2544,7 @@ pub(crate) async fn resolve_staged_hold(
         let prior_ready = readiness_key(entry);
         entry.hold = ComposerHold::Clear;
         entry.hold_owner = None;
+        entry.final_submit_conflict_owner = None;
         entry.turn = None;
         entry.detection = entry.detection.clone().stamped(entry.in_mode, entry.hold);
         (prior_ready, readiness_key(entry), entry.detection.clone())
@@ -4232,8 +4319,10 @@ async fn observe_pane_with_evidence(
         // this pane had before the human started scrolling.
         let det = match map.get_mut(&route) {
             Some(e) => {
-                let same_binding = unobservable
+                let same_agent_manifest = unobservable
                     || (e.agent == admitted && e.manifest.as_deref() == manifest_id.as_deref());
+                let same_complete_binding =
+                    unobservable || e.binding.as_ref() == observed_binding.as_ref();
                 // Only an observation that answered may rewrite the
                 // binding: overwriting it with the nothing a failed
                 // lookup returned would strand the hold it protects.
@@ -4243,8 +4332,11 @@ async fn observe_pane_with_evidence(
                     e.occupant = occupant;
                     e.agent = admitted;
                 }
-                if !same_binding {
+                if !same_agent_manifest {
                     e.quota_screen_clear = false;
+                }
+                if !same_complete_binding {
+                    e.final_submit_conflict_owner = None;
                 }
                 e.in_mode = true;
                 e.detection = e.detection.clone().stamped(true, e.hold);
@@ -4302,6 +4394,7 @@ async fn observe_pane_with_evidence(
                         hold: ComposerHold::default(),
                         turn: None,
                         hold_owner: None,
+                        final_submit_conflict_owner: None,
                         composer,
                         working_confirmed: false,
                         since: std::time::Instant::now(),
@@ -4832,6 +4925,21 @@ async fn observe_pane_with_evidence(
                 )
             }
         };
+        // A confirmed Stop is a conflict only for the exact staged attempt
+        // that was live when it arrived. Preserve it across an unproven
+        // observation, but a proven binding change or a different barrier
+        // starts clean even when the agent and manifest names coincide.
+        let carried_final_submit_conflict_owner = match &frozen {
+            Some(entry) => entry.final_submit_conflict_owner.clone(),
+            None => carried
+                .filter(|entry| entry.binding.as_ref() == observed_binding.as_ref())
+                .and_then(|entry| entry.final_submit_conflict_owner.clone()),
+        };
+        let carried_final_submit_conflict_owner = retained_final_submit_conflict_owner(
+            carried_final_submit_conflict_owner,
+            hold,
+            final_owner.as_deref(),
+        );
         // Stamped BEFORE it is cached, because the cache is what the gate
         // and every status surface read. Stamping afterwards would leave
         // them all reading a verdict nobody finished.
@@ -4941,6 +5049,7 @@ async fn observe_pane_with_evidence(
                 // cleared hold owns nothing, so the next attempt is free
                 // to take it.
                 hold_owner: final_owner,
+                final_submit_conflict_owner: carried_final_submit_conflict_owner,
                 composer,
                 working_confirmed,
                 since,
@@ -5203,6 +5312,7 @@ mod tests {
             hold: ComposerHold::Clear,
             turn: None,
             hold_owner: None,
+            final_submit_conflict_owner: None,
             composer: crate::ComposerProjection::default(),
             working_confirmed: false,
             since: std::time::Instant::now(),
@@ -5908,6 +6018,7 @@ line_regex = ['^ACTIVE']
                 hold: ComposerHold::Clear,
                 turn: None,
                 hold_owner: None,
+                final_submit_conflict_owner: None,
                 composer: ComposerProjection::default(),
                 working_confirmed: true,
                 since: std::time::Instant::now(),
@@ -6188,6 +6299,7 @@ contains = ["done"]
                 hold: ComposerHold::Staged,
                 turn: None,
                 hold_owner: Some("claude".into()),
+                final_submit_conflict_owner: None,
                 composer: ComposerProjection::default(),
                 working_confirmed: false,
                 since: std::time::Instant::now(),
@@ -6257,6 +6369,7 @@ contains = ["done"]
                 hold: ComposerHold::Staged,
                 turn: None,
                 hold_owner: Some("claude".into()),
+                final_submit_conflict_owner: None,
                 composer: ComposerProjection::default(),
                 working_confirmed: false,
                 since: std::time::Instant::now(),
@@ -6323,6 +6436,7 @@ contains = ["done"]
                 hold: ComposerHold::Staged,
                 turn: None,
                 hold_owner: Some("claude".into()),
+                final_submit_conflict_owner: None,
                 composer: ComposerProjection::default(),
                 working_confirmed: false,
                 since: std::time::Instant::now(),
@@ -8213,6 +8327,7 @@ contains = ["done"]
             quota_screen_clear: false,
             hold,
             hold_owner: owner.map(str::to_string),
+            final_submit_conflict_owner: None,
             composer: ComposerProjection::default(),
             working_confirmed: false,
             since: std::time::Instant::now(),
@@ -8372,6 +8487,7 @@ contains = ["done"]
             quota_screen_clear: false,
             hold,
             hold_owner: owner.map(str::to_string),
+            final_submit_conflict_owner: None,
             composer: ComposerProjection::default(),
             working_confirmed: false,
             since: std::time::Instant::now(),
@@ -8390,14 +8506,35 @@ contains = ["done"]
             let e = map.get(&pane()).expect("entry");
             (e.hold, e.hold_owner.clone())
         };
+        let conflict_now = || {
+            inner
+                .detections
+                .lock()
+                .expect("detections lock")
+                .get(&pane())
+                .and_then(|entry| entry.final_submit_conflict_owner.clone())
+        };
 
         // Clear and unowned: the only shape a fresh claim may take.
         put(entry(ComposerHold::Clear, None));
         assert!(claim_hold(&inner, 0, "%1", "m-1#1", agent, Some("bash")));
         assert_eq!(hold_now(), (ComposerHold::Staged, Some("m-1#1".into())));
 
+        inner
+            .detections
+            .lock()
+            .expect("detections lock")
+            .get_mut(&pane())
+            .expect("claimed entry")
+            .final_submit_conflict_owner = Some("m-1#1".into());
+
         // Same owner, already staged: idempotent.
         assert!(claim_hold(&inner, 0, "%1", "m-1#1", agent, Some("bash")));
+        assert_eq!(
+            conflict_now(),
+            Some("m-1#1".into()),
+            "the same attempt retains its own terminal conflict"
+        );
 
         // A different delivery may not take a barrier that is held.
         assert!(!claim_hold(&inner, 0, "%1", "m-2#1", agent, Some("bash")));
@@ -8413,6 +8550,17 @@ contains = ["done"]
             &inner, 0, "%1", "m-1#1", admitted, "bash"
         ));
         assert_eq!(hold_now(), (ComposerHold::Clear, None));
+        assert_eq!(
+            conflict_now(),
+            None,
+            "releasing the barrier clears its terminal conflict"
+        );
+        assert!(claim_hold(&inner, 0, "%1", "m-2#1", agent, Some("bash")));
+        assert_eq!(
+            conflict_now(),
+            None,
+            "a later delivery cannot inherit the previous attempt's conflict"
+        );
         assert!(!release_unwritten_hold(
             &inner, 0, "%1", "m-1#1", admitted, "bash"
         ));
@@ -8582,6 +8730,7 @@ contains = ["done"]
                 quota_screen_clear: false,
                 hold: ComposerHold::Clear,
                 hold_owner: None,
+                final_submit_conflict_owner: None,
                 composer: ComposerProjection::default(),
                 working_confirmed: false,
                 since,
@@ -8645,6 +8794,7 @@ contains = ["done"]
             quota_screen_clear: false,
             hold: ComposerHold::Clear,
             hold_owner: None,
+            final_submit_conflict_owner: None,
             turn: None,
             composer: ComposerProjection::default(),
             working_confirmed: false,
@@ -9145,6 +9295,7 @@ regex = ['^']
             quota_screen_clear: false,
             hold: ComposerHold::Staged,
             hold_owner: Some(owner.to_string()),
+            final_submit_conflict_owner: None,
             composer: ComposerProjection::default(),
             working_confirmed: false,
             since: std::time::Instant::now(),
@@ -9396,6 +9547,57 @@ regex = ['^']
         assert!(
             !staged_entry_working_clean_action_ready(&late_stop, "att-1", agent, "fix"),
             "a late hook Stop is a live conflict, not composer context"
+        );
+
+        let mut exact_terminal_conflict = reobserved.clone();
+        exact_terminal_conflict.final_submit_conflict_owner = Some("att-1".into());
+        assert!(
+            !staged_entry_working_clean_action_ready(
+                &exact_terminal_conflict,
+                "att-1",
+                agent,
+                "fix"
+            ),
+            "a confirmed terminal edge blocks only the same in-flight doorbell"
+        );
+
+        let mut different_attempt_conflict = reobserved.clone();
+        different_attempt_conflict.final_submit_conflict_owner = Some("att-2".into());
+        assert!(
+            staged_entry_working_clean_action_ready(
+                &different_attempt_conflict,
+                "att-1",
+                agent,
+                "fix"
+            ),
+            "a terminal edge for another attempt cannot block this owner"
+        );
+        assert_eq!(
+            retained_final_submit_conflict_owner(
+                Some("att-1".into()),
+                ComposerHold::Staged,
+                Some("att-1"),
+            ),
+            Some("att-1".into()),
+            "the exact staged owner retains its conflict through a fresh observation"
+        );
+        assert_eq!(
+            retained_final_submit_conflict_owner(
+                Some("att-1".into()),
+                ComposerHold::Staged,
+                Some("att-2"),
+            ),
+            None,
+            "a replacement owner must not inherit the prior conflict"
+        );
+        assert_eq!(
+            retained_final_submit_conflict_owner(
+                Some("att-1".into()),
+                ComposerHold::TurnStarted { since_ms: 2 },
+                Some("att-1"),
+            ),
+            None,
+            "a staged barrier that binds a new turn no longer carries the final-submit conflict"
         );
 
         let mut blocked = reobserved.clone();
@@ -10699,6 +10901,7 @@ regex = ['^IDLE']
                 hold: ComposerHold::TurnStarted { since_ms: 8 },
                 turn: Some(turn.clone()),
                 hold_owner: Some(queued.attempt_id.to_string()),
+                final_submit_conflict_owner: None,
                 composer: ComposerProjection::default(),
                 working_confirmed: false,
                 since: std::time::Instant::now(),
@@ -10797,6 +11000,7 @@ regex = ['^IDLE']
                 hold: ComposerHold::TurnStarted { since_ms: 8 },
                 turn: Some(turn.clone()),
                 hold_owner: Some(attempt_id.to_string()),
+                final_submit_conflict_owner: None,
                 composer: ComposerProjection::default(),
                 working_confirmed: false,
                 since: std::time::Instant::now(),
@@ -11233,6 +11437,7 @@ regex = ['^IDLE']
             hold: ComposerHold::Clear,
             turn: None,
             hold_owner: None,
+            final_submit_conflict_owner: None,
             composer: ComposerProjection::default(),
             working_confirmed: false,
             since: std::time::Instant::now(),

@@ -380,6 +380,7 @@ pub(crate) async fn handle_report(
         Some(turnkey::TurnCorrelation::Exact(turn)) => Some(turn.clone()),
         _ => None,
     };
+    let keyed_confirmed_end = is_turn_end && lifecycle_confirmed && exact_turn.is_some();
     let unkeyed_dispatch_start = is_turn_start
         && matches!(
             lifecycle,
@@ -527,7 +528,6 @@ pub(crate) async fn handle_report(
         let conflicting_active = readings.get(&pane).is_some_and(|current| {
             current.active_start_for(origin.agent, origin.manifest.as_deref()) && !matching_end
         });
-        let keyed_confirmed_end = is_turn_end && lifecycle_confirmed && exact_turn.is_some();
         let should_insert = if keyed_confirmed_end {
             matching_end || (start_confirmed_by_end.is_some() && !conflicting_active)
         } else {
@@ -572,6 +572,12 @@ pub(crate) async fn handle_report(
                     reading,
                     exact_turn.clone().expect("keyed end has a turn"),
                 )
+            } else if is_turn_end && lifecycle_confirmed {
+                fusion::HookEntry::unkeyed_turn_ended(
+                    origin.agent,
+                    origin.manifest.clone(),
+                    reading,
+                )
             } else {
                 fusion::HookEntry::bound(origin.agent, origin.manifest.clone(), reading)
             };
@@ -583,6 +589,23 @@ pub(crate) async fn handle_report(
             applied_state = None;
         }
         drop(readings);
+    }
+    // A confirmed, exactly keyed Stop can arrive after Cyclops safely staged one
+    // doorbell but before that in-flight path sends its final Enter. Record
+    // that causal conflict only after this hook passed correlation, dedupe,
+    // and current-terminal admission. It is a private check for the exact
+    // staged owner, not a replacement for the pane's current visual state.
+    if keyed_confirmed_end && applied_state == Some(AgentState::Idle) {
+        if let Some(manifest) = origin.manifest.as_deref() {
+            let _ = fusion::record_final_submit_conflict(
+                inner,
+                session_idx,
+                &pane_id,
+                origin.pane_root,
+                origin.agent,
+                manifest,
+            );
+        }
     }
     if let (Some(previous_edge), Some(manifest_id)) =
         (replaced_provisional_edge, origin.manifest.as_deref())
