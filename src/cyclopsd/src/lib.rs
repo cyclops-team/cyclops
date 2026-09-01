@@ -1266,6 +1266,16 @@ impl SessionSlot {
         self.observed_live.store(true, Ordering::Release);
     }
 
+    /// Has this slot ever attached to a live tmux session?
+    ///
+    /// The distinction matters before the first attach. A configured daemon
+    /// may boot before `cyclops start` creates its session; probing that
+    /// absence with a control-mode attach can become the first tmux client
+    /// and briefly create an empty server of its own.
+    fn has_observed_live(&self) -> bool {
+        self.observed_live.load(Ordering::Acquire)
+    }
+
     fn retire_if_runtime(&self) -> bool {
         if self.persistent.load(Ordering::Acquire) || !self.observed_live.load(Ordering::Acquire) {
             return false;
@@ -4509,6 +4519,30 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
         if let Some(f) = &inner.cfg.tmux_config {
             ccfg = ccfg.with_config_file(f.clone());
         }
+
+        // `cyclopsd` is allowed to start under an external supervisor before
+        // `cyclops start` builds the configured session. Do not use a
+        // control-mode attach merely to learn that the first session is not
+        // there yet: tmux can make that attach the server's first client,
+        // then tear the empty server down while `start` is creating it.
+        //
+        // Once this slot has attached, retain the normal reconnect path
+        // below. It owns the stricter cleanup required when an observed
+        // session later disappears.
+        if !slot.has_observed_live() && session_missing(&inner, &target).await {
+            if announced_missing {
+                debug!(session = %name, "waiting for configured session to appear");
+            } else {
+                info!(session = %name, "waiting for session; cyclops start creates it");
+                announced_missing = true;
+            }
+            if reconnect_delay(&mut stop, backoff).await {
+                return;
+            }
+            backoff = (backoff * 2).min(RECONNECT_MAX);
+            continue;
+        }
+
         match SessionWatcher::connect(ccfg).await {
             Ok(watcher) => {
                 let watcher = Arc::new(watcher);

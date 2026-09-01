@@ -136,15 +136,24 @@ cleanup() {
         tail -30 "$log" | sed 's/^/   /'
       fi
     done
-    # The nested rigs log their daemon to a file nobody prints. When the
-    # failure is "the daemon never came up", this is the only place that
-    # says what it said on the way down.
+    # Nested daemons write structured lifecycle events under their private
+    # homes; their launch redirection is still useful for an early process
+    # failure. Show both when a nested journey fails.
     for nested in duo stock installed; do
-      if [ -s "$ROOT/$nested/daemon.log" ]; then
-        echo
-        echo "== $nested daemon.log (last 20):"
-        tail -20 "$ROOT/$nested/daemon.log" | sed 's/^/   /'
+      if [ "$nested" = installed ]; then
+        structured_log="${INST_HOME:-}"
+        [ -n "$structured_log" ] && structured_log="$structured_log/cyclopsd.log"
+      else
+        structured_log="$ROOT/$nested/home/cyclopsd.log"
       fi
+      for log in "$structured_log" "$ROOT/$nested/daemon.log"; do
+        if [ -z "$log" ] || [ ! -s "$log" ]; then
+          continue
+        fi
+        echo
+        echo "== $log (last 20):"
+        tail -20 "$log" | sed 's/^/   /'
+      done
     done
     if [ -s "$ROOT/notification-state.json" ]; then
       echo
@@ -891,10 +900,14 @@ echo "#### The first run docs/guides/QUICKSTART.md walks, from outside the repo"
 # status, teach a manifest, name, send, read the receipt.
 mkdir -p "$ROOT/duo/home" "$ROOT/duo/tmux" "$ROOT/duo/elsewhere"
 DUO_HOME="$ROOT/duo/home"
+DUO_TMUX_CONFIG="$ROOT/duo/tmux.conf"
 duo() { ( cd "$ROOT/duo/elsewhere" && CYCLOPS_HOME="$DUO_HOME" TMUX_TMPDIR="$ROOT/duo/tmux" "$@" ); }
-duo_tmx() { duo tmux -u "$@"; }
+duo_tmx() { duo tmux -u -f "$DUO_TMUX_CONFIG" "$@"; }
 duo_daemon_up() { duo "$CYC" --json status >/dev/null 2>&1; }
 duo_attached() { duo "$CYC" --json status | jq -e '.sessions[0].attached == true' >/dev/null; }
+duo_waiting_for_session() {
+  grep -Fq 'waiting for session; cyclops start creates it' "$DUO_HOME/cyclopsd.log"
+}
 duo_roster_has() { duo "$CYC" --json list | jq -e --arg a "$1" '[.agents[].agent] | index($a)' >/dev/null; }
 duo_pane_has_text() { duo_tmx capture-pane -p -t "$1" | grep -Fq -- "$2"; }
 duo_pane_matches() { duo_tmx capture-pane -p -t "$1" | grep -Eq -- "$2"; }
@@ -960,10 +973,11 @@ stop_duo_daemon() {
   DUO_PID=""
 }
 
-# The order scripts/install.sh and the README hand out: set the home up,
-# start the daemon, then open the workspace. Started the other way round
-# the first `start` has no daemon to register a name with, and naming
-# takes a second run (rung 1 covers that path).
+# The external-supervisor path: set the home up, start the daemon, then
+# create its configured session with --no-daemon. This is distinct from the
+# ordinary one-command journey below. The fixture config holds an empty tmux
+# server open so a control attach made before the session exists is observable
+# rather than disappearing before this test can inspect it.
 printf '\n$ cd ~/scratch && cyclops start --setup-only\n'
 duo "$CYC" start --setup-only --plain > "$OUT" 2>&1
 cat "$OUT"
@@ -971,9 +985,17 @@ check "setup writes the config"           'wrote .*/config\.toml$'
 check "and installs the manifests"        '^  wrote 4 detection manifests to .*/manifests$'
 check_absent "and opens nothing"          'workspace ready'
 
+printf '%s\n' 'set-option -g exit-empty off' 'set-option -g exit-unattached off' \
+  > "$DUO_TMUX_CONFIG"
+printf '\ntmux_config = "%s"\n' "$DUO_TMUX_CONFIG" >> "$DUO_HOME/config.toml"
+
 # The daemon runs from the same empty directory. Nothing in the config
 # names a manifest directory, so it has to find the one setup just wrote.
 start_duo_daemon
+wait_for "the external daemon to wait for main" 50 duo_waiting_for_session
+find "$ROOT/duo/tmux" -type s -print > "$OUT"
+cat "$OUT"
+check_absent "waiting for main does not create a tmux server" '.'
 
 printf '\n$ cyclopsd &\n$ cyclops start --preset duo\n'
 duo "$CYC" start --preset duo --no-daemon --plain > "$OUT" 2>&1
