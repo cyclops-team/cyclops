@@ -4284,6 +4284,90 @@ async fn a_manifest_without_composer_ownership_blocks_once_and_withdrawal_advanc
     rig.daemon.shutdown().await;
 }
 
+/// The 2026-08-30 Cursor repro, generalized: a manifest whose composer rule
+/// can only ever say `ambiguous` left a wake invisibly "checking readiness"
+/// for 16+ hours against a visibly idle pane. Ambiguity that outlives the
+/// settle window must settle as a durable `composer_semantic_ambiguous`
+/// pre-write block — named, operator-visible, withdrawable — and the gate
+/// must first hold under its own named cause, never paste, and never ring
+/// the doorbell. Mid-turn ambiguity is exempt by construction (the Working
+/// arm owns those frames); this test locks the idle path.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_indefinitely_ambiguous_idle_composer_settles_as_a_durable_pre_write_block() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let manifest = CAT_MANIFEST.replace(
+        "composer_semantic = \"clean\"",
+        "composer_semantic = \"ambiguous\"",
+    );
+    let mut rig = Rig::new(
+        "workspace-composer-ambiguous",
+        &manifest,
+        &composer_pane(),
+        "delivery_retry_max = 0\nambiguous_composer_settle_ms = 300",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let pair = send_waiting_pair(&rig, "composer-ambiguous").await;
+    wait_for_notification_state(&mut rig, &pair.first, NotificationState::BlockedPreWrite).await;
+    assert_only_oldest_attempt_exists(&rig, &pair);
+    let blocked = notification_transition(&rig, &pair.first, NotificationState::BlockedPreWrite)
+        .expect("settled ambiguity is durable");
+    let fact = blocked.data.as_ref().expect("blocked transition has data");
+    assert_eq!(fact["pre_write_cause"], "write_readiness_changed");
+    assert_eq!(fact["pre_write_observation"]["selected_manifest"], "fix");
+    assert!(fact["pre_write_observation"]["binding"].is_object());
+    assert_eq!(
+        fact["pre_write_observation"]["write_block"],
+        "composer_semantic_ambiguous"
+    );
+    for state in [
+        NotificationState::Writing,
+        NotificationState::Staged,
+        NotificationState::Submitting,
+        NotificationState::Submitted,
+    ] {
+        assert_eq!(notification_state_count(&rig, &pair.first, state), 0);
+    }
+    assert!(!pane_history(&rig, &pane).contains(&compact_doorbell(&rig, &pair.first)));
+
+    // The block was an escalation, not a first answer: the gate held under
+    // its own named cause for the settle window before settling.
+    assert!(
+        rig.ledger_lines().iter().any(|line| {
+            line["kind"] == "gate"
+                && line["id"] == pair.first.as_str()
+                && line["data"]["action"] == "hold"
+                && line["data"]["cause"] == "not_write_ready:composer_semantic_ambiguous"
+        }),
+        "the settle window must be visible as a named gate hold"
+    );
+
+    let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
+    let first = snapshot["result"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["message_id"].as_str() == Some(pair.first.as_str()))
+        .expect("blocked message remains visible");
+    assert_eq!(
+        first["recipients"][0]["notification"]["pre_write_cause"],
+        "write_readiness_changed"
+    );
+    assert_eq!(
+        first["recipients"][0]["notification"]["pre_write_block"],
+        "composer_semantic_ambiguous"
+    );
+    assert_eq!(first["recipients"][0]["can_withdraw_notification"], true);
+
+    rig.daemon.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn newly_proven_binding_reopens_the_same_blocked_attempt_once() {
     if !tmux_available() {

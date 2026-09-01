@@ -7,6 +7,54 @@ versions are unreleased until admin cuts a tag.
 
 ### Fixed
 
+- A clean idle Cursor Agent composer could never prove itself write-safe:
+  the manifest's dim-placeholder rule carried `composer_semantic =
+  "ambiguous"`, so every wake to an idle Cursor pane was held on
+  `no_write_safe_composer_evidence` forever — a reviewer → tests handoff
+  sat "checking readiness" for 16+ hours against a visibly idle pane. A
+  new `composer_clean_idle` rule now proves the composer empty AND at
+  rest with an end-anchored escaped match: Cursor paints its `ctrl+c to
+  stop` hint on the composer line for exactly the duration of a turn, so
+  the anchor cannot match a working frame, and mid-turn frames — where
+  Cursor injection is unmeasured — keep failing closed on the ambiguous
+  rule below it. Locked against the live capture in
+  `cursor_clean_idle_composer_esc.txt` (cursor-agent 2026.08.25-3e8eec8).
+- A wake whose composer kept reading `ambiguous` on an idle pane waited
+  in memory as "checking readiness" indefinitely, invisible to `cyclops
+  status` and to the reopen scheduler. The gate now gives continuous idle
+  ambiguity one configurable, one-shot grace
+  (`ambiguous_composer_settle_ms`, default 10 seconds), then records an
+  operator-visible, withdrawable pre-write block. The established
+  `write_readiness_changed` journal cause remains compatible with existing
+  readers; the optional observation carries the exact
+  `composer_semantic_ambiguous` reason. Later complete, write-ready route
+  evidence can reopen the same wake once. Mid-turn ambiguity never
+  escalates because working frames do not reach the idle arm.
+- Detaching or quitting the workspace left the theme's ground on the
+  shell underneath on terminals that accept an OSC 11 background *set* but
+  ignore the OSC 110/111 *reset*. The workspace now accepts an optional,
+  read-only `[workspace]` `terminal_default_fg` and
+  `terminal_default_bg` pair and restores those exact colors through OSC
+  10/11 on exit and focus loss. It never reads terminal input to discover
+  colors; an absent or invalid pair keeps the OSC 110/111 fallback.
+- The Messages pane's current-session view told sessions apart by pane id
+  alone, so after a tmux server restart the new `main` showed the messages
+  of the `main` that died before it: tmux hands `%0`, `%1`, … out again,
+  and an old row addressed to `%1` matched the new session's pane set.
+  The view now addresses the session by the durable identity the daemon
+  bound to it together with its panes, on the sender, the recipient, and
+  the recipient's current route alike. The earlier session's rows are
+  untouched in the durable history and in the all-sessions view.
+- A workspace that owned two sessions, which is what reopening Cyclops
+  from another terminal produces once it takes over `main` and reopens the
+  last-active session, answered every `%layout-change` with another
+  `resize-window` for every window it owned. tmux answers each of those
+  with a `%layout-change` whether or not the size changed (F82), so the
+  canvas jumped continuously with the workspace and the tmux server each
+  on half a core. The background session's window was being read as
+  "not at its target" because it has no tab in the displayed model.
+  Divergence is now judged only for windows on screen, and a target tmux
+  clamps rather than gives is asked for once more at most.
 - A `[workspace.bindings]` rebinding onto a chord a default already used
   left both actions on the chord, and which one fired depended on hash
   order: it worked in one process and did nothing in the next. The

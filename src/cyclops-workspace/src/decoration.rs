@@ -38,6 +38,14 @@ pub struct PrimaryStatus {
 #[derive(Debug, Clone, Default)]
 pub struct DecorationSnapshot {
     pub panes: HashMap<String, PaneDecoration>,
+    /// The durable identity of every live session the daemon has bound,
+    /// under the session's tmux id (`$3`). The Messages session filter
+    /// addresses the session it shows by this together with its panes,
+    /// never by the panes alone: tmux reuses pane ids across server
+    /// restarts, and the identity is what tells this incarnation of `main`
+    /// from the one before it. A session the daemon has not identified is
+    /// absent here.
+    pub sessions: HashMap<String, cyclops_proto::SessionInstanceId>,
     /// Live display routes for durable mailboxes from the daemon.
     pub mailbox_routes: Vec<cyclops_proto::StatusMailboxRoute>,
     /// The daemon's attention register.
@@ -235,7 +243,14 @@ fn snapshot_from_status(status: &StatusResult) -> DecorationSnapshot {
         })
         .collect();
     let mut panes = HashMap::new();
+    let mut sessions = HashMap::new();
     for session in &status.sessions {
+        if let Some(identity) = &session.identity {
+            sessions.insert(
+                identity.live_session_key().tmux_session_id().to_string(),
+                identity.session_instance_id(),
+            );
+        }
         for pane in &session.panes {
             let needs_attention = attention_panes.contains_key(&pane.pane_id);
             panes.insert(pane.pane_id.clone(), pane_decoration(pane, needs_attention));
@@ -244,6 +259,7 @@ fn snapshot_from_status(status: &StatusResult) -> DecorationSnapshot {
     DecorationSnapshot {
         online: true,
         panes,
+        sessions,
         attention,
         mailbox_routes: status.mailbox_routes.clone(),
     }
@@ -333,6 +349,41 @@ mod tests {
             pid: None,
             mailbox_attention: Vec::new(),
         }
+    }
+
+    /// The daemon names each live session's durable identity on the
+    /// status answer; the snapshot keeps it under the tmux session id so
+    /// the Messages filter can address the session the workspace shows.
+    /// A session the daemon has not identified is simply absent.
+    #[test]
+    fn a_snapshot_keeps_each_identified_sessions_durable_identity_by_tmux_id() {
+        use cyclops_proto::{
+            LiveSessionKey, OsBootId, ProcessInstanceId, SessionIdentityBinding, SessionInstanceId,
+            WorkspaceId,
+        };
+        let workspace: WorkspaceId = "11111111-1111-4111-8111-111111111111".parse().unwrap();
+        let instance: SessionInstanceId = "22222222-2222-4222-8222-222222222201".parse().unwrap();
+        let binding = SessionIdentityBinding::new(
+            LiveSessionKey::new(
+                workspace,
+                OsBootId::new("boot-a").unwrap(),
+                ProcessInstanceId::new(4242, 7).unwrap(),
+                "$4".parse().unwrap(),
+            ),
+            instance,
+        );
+        let mut status = status_with(vec![pane("%0", "@0", None, AgentState::Idle)]);
+        status.sessions[0].identity = Some(binding);
+        status.sessions.push(SessionStatus {
+            name: "unidentified".into(),
+            attached: true,
+            identity: None,
+            panes: vec![pane("%9", "@9", None, AgentState::Idle)],
+        });
+
+        let snapshot = snapshot_from_status(&status);
+        assert_eq!(snapshot.sessions.get("$4"), Some(&instance));
+        assert_eq!(snapshot.sessions.len(), 1, "{:?}", snapshot.sessions);
     }
 
     #[test]

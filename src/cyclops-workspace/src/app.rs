@@ -946,6 +946,10 @@ fn boot_target(reopen: &persist::ReopenTarget) -> (String, bool) {
 /// Run the workspace on a tty. Returns the process exit code.
 pub async fn run_async() -> i32 {
     let home = cyclops_proto::cyclops_home();
+    // Exact terminal defaults are an operator-provided configuration pair.
+    // The workspace never reads terminal input to discover them, so the
+    // input thread below remains the sole owner of keystrokes and paste.
+    crate::term_guard::configure_default_palette(&home);
     let state_root = match cyclops_state::StateRoot::open_or_create(&home) {
         Ok(root) => std::sync::Arc::new(root),
         Err(error) => {
@@ -1251,7 +1255,7 @@ pub async fn run_async() -> i32 {
     // fight the declaration. `chrome_for` is the one geometry both read.
     apply_saved_workspace_visibility(&mut model, &prefs);
     let declared_client_size =
-        declare_initial_client_size(term_size, &model, &prefs, &sizing, &client, &home).await;
+        declare_initial_client_size(term_size, &model, &prefs, &mut sizing, &client, &home).await;
     if declared_client_size.is_some() {
         if let Err(error) = sizing.recover_geometry(&client, &home, None).await {
             log_err(&home, &format!("boot post-resize recovery failed: {error}"));
@@ -2412,7 +2416,7 @@ async fn declare_initial_client_size(
     term_size: (u16, u16),
     model: &WorkspaceModel,
     prefs: &WorkspacePrefs,
-    sizing: &WindowSizing,
+    sizing: &mut WindowSizing,
     client: &ControlClient,
     home: &std::path::Path,
 ) -> Option<(u16, u16)> {
@@ -4862,6 +4866,11 @@ fn messages_session_filter(app: &App) -> Option<cyclops_ui::SessionFilter> {
         return None;
     }
     let workspace = app.model.workspaces.get(app.model.active_workspace)?;
+    // Pane ids are reused after a tmux server restart. The daemon's durable
+    // session identity is therefore required alongside the current panes;
+    // while it is absent, the scoped view deliberately shows no addressable
+    // rows instead of guessing from a recycled `%` id.
+    let session = app.decoration.sessions.get(&workspace.session_id).copied();
     let panes = app
         .decoration
         .panes
@@ -4870,6 +4879,7 @@ fn messages_session_filter(app: &App) -> Option<cyclops_ui::SessionFilter> {
         .map(|pane| pane.pane_id.clone());
     Some(cyclops_ui::SessionFilter::new(
         workspace.name.clone(),
+        session,
         panes,
     ))
 }
@@ -7181,6 +7191,196 @@ mod tests {
         let _ = std::fs::remove_dir_all(home);
     }
 
+    /// The next `%layout-change` tmux sends for `window`, shaped the way the
+    /// event loop hands it to [`apply_layout_change`]. The deadline is a
+    /// fixture failure boundary, not a timing guess: the test has an exact
+    /// event it must observe before it can make the next assertion.
+    async fn next_layout_change(
+        rx: &mut cyclops_tmux::NotificationReceiver,
+        window: &str,
+    ) -> (String, Option<String>) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let Some(notification) = rx.recv().await else {
+                    panic!("tmux closed the stream before a %layout-change for {window}");
+                };
+                if let Some(AppMsg::LayoutChanged {
+                    window: changed,
+                    layout,
+                    flags,
+                }) = structural_message(notification)
+                {
+                    if changed == window {
+                        return (layout, flags);
+                    }
+                }
+            }
+        })
+        .await
+        .expect("tmux sent no %layout-change for the window it resized")
+    }
+
+    /// Ownership can span sessions while the model only shows one. A
+    /// background window has no displayed layout, so it must remain
+    /// reversible ownership without becoming a resize target or a reason to
+    /// reissue the shown window's resize forever.
+    #[tokio::test]
+    async fn two_owned_sessions_without_a_displayed_background_tab_do_not_loop() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-two-owned-no-loop");
+        for session in ["main", "agent"] {
+            server.run_ok(&[
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-x",
+                "120",
+                "-y",
+                "40",
+                "/bin/sh",
+            ]);
+        }
+        let config = ControlConfig::attach("agent")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, mut rx) = ControlClient::spawn(config).await.expect("attach");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-two-owned-no-loop-home");
+
+        let mut sizing = WindowSizing::default();
+        let main_tabs = fetch_workspace_model(&client, "main")
+            .await
+            .expect("main model")
+            .session
+            .tabs;
+        adopt_windows(&mut sizing, &client, "main", &main_tabs, &home).await;
+        let model = fetch_workspace_model(&client, "agent")
+            .await
+            .expect("agent model");
+        adopt_windows(&mut sizing, &client, "agent", &model.session.tabs, &home).await;
+        assert!(
+            sizing.owns("main") && sizing.owns("agent"),
+            "the fixture must give one workspace reversible ownership of both sessions"
+        );
+
+        let shown = model.active_tab().window_id.clone();
+        let mut app = test_app(model, home.clone());
+        app.term_size = (120, 40);
+        app.sizing = sizing;
+
+        let boot = resize_client(&mut app, &client).await;
+        assert_eq!(
+            boot.succeeded.len(),
+            1,
+            "only the visible session has a layout this workspace may size"
+        );
+        assert!(boot.failed.is_empty(), "{:#?}", boot.failed);
+
+        let (layout, flags) = next_layout_change(&mut rx, &shown).await;
+        assert!(apply_layout_change(
+            &mut app,
+            &shown,
+            &layout,
+            flags.as_deref()
+        ));
+
+        let settled = resize_client(&mut app, &client).await;
+        assert!(
+            settled.succeeded.is_empty() && settled.failed.is_empty(),
+            "an unchanged layout with a background owned session reissued a resize: {settled:#?}"
+        );
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// tmux clamps a target below a layout's minimum rather than rejecting
+    /// it. After the one follow-up pass sees that stable clamped layout, the
+    /// owner must leave it alone until the target or layout changes.
+    #[tokio::test]
+    async fn a_target_tmux_declines_is_asked_for_once_not_forever() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-clamped-target");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "120",
+            "-y",
+            "40",
+            "/bin/sh",
+        ]);
+        for _ in 0..5 {
+            server.run_ok(&["split-window", "-v", "-t", "s"]);
+            server.run_ok(&["select-layout", "-t", "s", "even-vertical"]);
+        }
+        let config = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, mut rx) = ControlClient::spawn(config).await.expect("attach");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-clamped-target-home");
+        let model = fetch_workspace_model(&client, "s").await.expect("model");
+        let mut sizing = WindowSizing::default();
+        adopt_windows(&mut sizing, &client, "s", &model.session.tabs, &home).await;
+        assert!(sizing.owns("s"));
+
+        let window = model.active_tab().window_id.clone();
+        let mut app = test_app(model, home.clone());
+        app.term_size = (80, 18);
+        app.sizing = sizing;
+        let canvas = app.chrome(Rect::new(0, 0, 80, 18)).tmux_sizing_canvas();
+        let target = crate::render::tmux_client_size(canvas, app.model.active_tab());
+        assert!(
+            declarable(target) && target.1 < 11,
+            "the fixture needs a declarable target tmux cannot give: {target:?}"
+        );
+
+        for pass in 0..2 {
+            let outcome = resize_client(&mut app, &client).await;
+            assert!(
+                outcome.failed.is_empty(),
+                "pass {pass}: {:#?}",
+                outcome.failed
+            );
+            if outcome.succeeded.is_empty() {
+                break;
+            }
+            let (layout, flags) = next_layout_change(&mut rx, &window).await;
+            assert!(apply_layout_change(
+                &mut app,
+                &window,
+                &layout,
+                flags.as_deref()
+            ));
+        }
+        let laid_out = app.model.active_tab().layout.rect();
+        assert!(
+            laid_out.height >= 11 && laid_out.height != target.1,
+            "the fixture needs tmux to clamp the ask: {laid_out:?} for {target:?}"
+        );
+
+        let settled = resize_client(&mut app, &client).await;
+        assert!(
+            settled.succeeded.is_empty() && settled.failed.is_empty(),
+            "a target tmux declined was asked again: {settled:#?}"
+        );
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
     /// A tab opened later is pinned AND reported, because pinning alone
     /// leaves it holding whatever size it had.
     ///
@@ -9032,7 +9232,7 @@ mod tests {
         // Enter through the exact production cold-boot calculation and
         // write, after persisted visibility has been installed on the model.
         let declared =
-            declare_initial_client_size((100, 30), &model, &prefs, &sizing, &client, &home)
+            declare_initial_client_size((100, 30), &model, &prefs, &mut sizing, &client, &home)
                 .await
                 .expect("fixture has a declarable cold-boot target");
         let layout = nested_tmux_layout(&server, &window_id);
@@ -11815,6 +12015,7 @@ mod tests {
             OwnedSession {
                 pinned: std::collections::BTreeSet::from(["@0".into()]),
                 blocked: std::collections::BTreeSet::new(),
+                settled: std::collections::BTreeMap::new(),
             },
         );
         app.decoration = DecorationSnapshot {

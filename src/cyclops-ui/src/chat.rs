@@ -1594,7 +1594,8 @@ mod tests {
     use super::*;
     use crate::queue::{Direction, QueueTarget, Scope, SessionFilter, Snapshot};
     use cyclops_proto::{
-        MessageId, NotificationAttentionCause, NotificationPreWriteCause, RecipientKey,
+        MessageId, MessageRecipientRoute, NotificationAttentionCause, NotificationPreWriteCause,
+        RecipientKey, SessionInstanceId,
     };
 
     trait FixtureParse: Sized {
@@ -1755,9 +1756,16 @@ mod tests {
         let all = queue.counts();
         assert_eq!(all.total, 3);
 
+        // Every fixture row is addressed in this one session.
+        let session: SessionInstanceId = "00000000-0000-0000-0000-000000000002".parse().unwrap();
+
         // %2 (codex) is the only pane in this session: the broadcast
         // reaches it, the direct message to claude (%1) does not.
-        queue.set_session_filter(Some(SessionFilter::new("beta", ["%2".to_string()])));
+        queue.set_session_filter(Some(SessionFilter::new(
+            "beta",
+            Some(session),
+            ["%2".to_string()],
+        )));
         let narrowed = queue.counts();
         assert_eq!(narrowed.total, 1, "one row has a party in %2");
         assert_eq!(narrowed.visible, 1);
@@ -1767,13 +1775,106 @@ mod tests {
         assert!(!frame.contains("Direct instruction"), "{frame}");
 
         // The sender's pane counts too: the operator sits in %0.
-        queue.set_session_filter(Some(SessionFilter::new("alpha", ["%0".to_string()])));
+        queue.set_session_filter(Some(SessionFilter::new(
+            "alpha",
+            Some(session),
+            ["%0".to_string()],
+        )));
         assert_eq!(queue.counts().total, 3, "every row was sent from %0");
 
         queue.set_session_filter(None);
         assert_eq!(queue.counts(), all);
         let frame = render_chat(&queue, ChatRenderContext::new(&registry), 80, 20).join("\n");
         assert!(frame.contains("all sessions"), "{frame}");
+    }
+
+    /// tmux hands pane ids out again after a server restart, so the
+    /// session that died and the one that replaced it both have a `%0`
+    /// and a `%1`. Narrowed to the current session, the drawer shows
+    /// only the rows addressed in it: a pane id alone admits nothing,
+    /// and neither does an earlier recipient's live route through that
+    /// pane. Widened again, the earlier session's history is still there.
+    #[test]
+    fn a_reused_pane_id_does_not_bring_an_earlier_sessions_messages_into_the_current_one() {
+        let earlier: SessionInstanceId = "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let current: SessionInstanceId = "00000000-0000-0000-0000-000000000003".parse().unwrap();
+        let key = |session: SessionInstanceId, pane: &str| {
+            RecipientKey::parse(&format!(
+                "agent:00000000-0000-0000-0000-000000000001/{session}/{pane}"
+            ))
+            .unwrap()
+        };
+        let route = |pane: &str| {
+            Some(MessageRecipientRoute {
+                label: "claude".into(),
+                pane_id: pane.parse().unwrap(),
+            })
+        };
+        let m1 = MessageId::parse("m-0000000000000001").unwrap();
+        let m2 = MessageId::parse("m-0000000000000002").unwrap();
+        let old_row = QueueRow {
+            target: QueueTarget::new(m1.clone(), key(earlier, "%1")),
+            message_id: m1.clone(),
+            recipient: key(earlier, "%1"),
+            recipient_label: "claude".into(),
+            sender: key(earlier, "%0"),
+            sender_label: "operator".into(),
+            thread_root: m1,
+            subject: Some("Before the restart".into()),
+            // The old recipient's route still names the pane the new
+            // session's agent now sits in.
+            current_route: route("%1"),
+            seq: 1,
+            ..Default::default()
+        };
+        let new_row = QueueRow {
+            target: QueueTarget::new(m2.clone(), key(current, "%1")),
+            message_id: m2.clone(),
+            recipient: key(current, "%1"),
+            recipient_label: "claude".into(),
+            sender: key(current, "%0"),
+            sender_label: "operator".into(),
+            thread_root: m2,
+            subject: Some("After the restart".into()),
+            current_route: route("%1"),
+            seq: 2,
+            ..Default::default()
+        };
+        let mut queue = HumanQueue::default();
+        queue.replace(Snapshot {
+            watermark: 2,
+            rows: vec![old_row, new_row],
+        });
+        queue.set_scope(Scope::All);
+        assert_eq!(queue.counts().total, 2);
+
+        let panes = ["%0".to_string(), "%1".to_string()];
+        queue.set_session_filter(Some(SessionFilter::new(
+            "main",
+            Some(current),
+            panes.clone(),
+        )));
+        assert_eq!(
+            queue.counts().total,
+            1,
+            "the earlier session's row shares every pane id and belongs to another session"
+        );
+        assert!(
+            queue
+                .visible()
+                .all(|row| row.recipient == key(current, "%1")),
+            "only the row addressed in the current session is shown"
+        );
+
+        // A session the daemon has not identified yet has no mailboxes,
+        // so nothing can be addressed in it: the pane ids alone admit
+        // nothing.
+        queue.set_session_filter(Some(SessionFilter::new("main", None, panes)));
+        assert_eq!(queue.counts().total, 0);
+
+        // Durable history is untouched: every session shows both.
+        queue.set_session_filter(None);
+        assert_eq!(queue.counts().total, 2);
     }
 
     #[test]

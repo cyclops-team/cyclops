@@ -80,6 +80,19 @@ pub struct OwnedSession {
     /// applies, no owner exists, and no later workspace can tell what it
     /// was. Holding the mark keeps it visibly somebody's problem.
     pub blocked: BTreeSet<String>,
+    /// Per displayed window, the last target we asked tmux for and the
+    /// layout we observed at that time. A rejected geometric target can be
+    /// clamped successfully by tmux, which otherwise makes an unchanged
+    /// `%layout-change` reissue the same resize forever.
+    pub settled: BTreeMap<String, AskedSize>,
+}
+
+/// One successful resize request, retained only to distinguish a live
+/// disagreement from a target tmux has already declined to honor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AskedSize {
+    pub target: (u16, u16),
+    pub laid_out: (u16, u16),
 }
 
 impl OwnedSession {
@@ -109,7 +122,7 @@ impl WindowSizing {
 
     /// Resize every window this process can still prove it owns.
     pub(crate) async fn resize_owned(
-        &self,
+        &mut self,
         client: &ControlClient,
         canvas: Rect,
         tabs: &[TabModel],
@@ -123,17 +136,18 @@ impl WindowSizing {
     pub(crate) fn any_window_diverged(&self, canvas: Rect, tabs: &[TabModel]) -> bool {
         self.owned.values().any(|owned| {
             owned.pinned.iter().any(|window_id| {
-                if let Some(tab) = tabs.iter().find(|tab| &tab.window_id == window_id) {
-                    let target = crate::render::window_target_size_for_layout(
-                        canvas,
-                        &tab.layout,
-                        tab.zoomed,
-                    );
-                    let rect = tab.layout.rect();
-                    rect.width != target.0 || rect.height != target.1
-                } else {
-                    true
-                }
+                let Some(tab) = tabs.iter().find(|tab| &tab.window_id == window_id) else {
+                    // A background session has no displayed layout. It may
+                    // remain owned, but this workspace has no evidence for
+                    // a target and therefore must not resize it.
+                    return false;
+                };
+                let target =
+                    crate::render::window_target_size_for_layout(canvas, &tab.layout, tab.zoomed);
+                let rect = tab.layout.rect();
+                let laid_out = (rect.width, rect.height);
+                laid_out != target
+                    && owned.settled.get(window_id) != Some(&AskedSize { target, laid_out })
             })
         })
     }
@@ -386,21 +400,24 @@ impl SizingOutcome {
 /// Push per-window topology-derived target sizes to every window this workspace owns,
 /// in every session it owns. Returns exact per-window successes and failures.
 pub(crate) async fn size_owned_windows(
-    sizing: &WindowSizing,
+    sizing: &mut WindowSizing,
     client: &ControlClient,
     canvas: Rect,
     tabs: &[TabModel],
     home: &std::path::Path,
 ) -> SizingOutcome {
     let mut outcome = SizingOutcome::default();
-    for owned in sizing.owned.values() {
+    for owned in sizing.owned.values_mut() {
         for window_id in &owned.pinned {
-            let target_size = if let Some(tab) = tabs.iter().find(|t| &t.window_id == window_id) {
-                crate::render::window_target_size_for_layout(canvas, &tab.layout, tab.zoomed)
-            } else {
-                let inner = crate::render::pane_canvas(canvas);
-                (inner.width, inner.height)
+            let Some(tab) = tabs.iter().find(|tab| &tab.window_id == window_id) else {
+                // An owned window outside the displayed model is still
+                // reversible ownership, not a license to infer its size.
+                // Skip it until a snapshot supplies its layout.
+                owned.settled.remove(window_id);
+                continue;
             };
+            let target_size =
+                crate::render::window_target_size_for_layout(canvas, &tab.layout, tab.zoomed);
 
             if !declarable(target_size) {
                 continue;
@@ -411,9 +428,18 @@ pub(crate) async fn size_owned_windows(
                 .await
             {
                 Ok(()) => {
+                    let rect = tab.layout.rect();
+                    owned.settled.insert(
+                        window_id.clone(),
+                        AskedSize {
+                            target: target_size,
+                            laid_out: (rect.width, rect.height),
+                        },
+                    );
                     outcome.succeeded.insert(window_id.clone());
                 }
                 Err(error) => {
+                    owned.settled.remove(window_id);
                     log_err(home, &error);
                     outcome.failed.insert(window_id.clone(), error);
                 }

@@ -2045,6 +2045,20 @@ needs, clearing the host surface and resetting the diff baseline
 `get_cursor_position` calls rather than asserting a spelling, so any future
 invalidation may change how it clears and may not start reading to do it.
 
+### Explicit limitation: terminal palette restoration is configured
+
+The workspace input thread is the sole terminal-input owner. A startup OSC
+10/11 query would return through that same input stream, so Cyclops does not
+read terminal replies to discover default colors. Instead an operator may
+provide the complete `[workspace]` `terminal_default_fg` and
+`terminal_default_bg` pair. The guard restores that exact pair on focus loss
+and exit, or keeps the OSC 110/111 fallback when it is absent or invalid.
+
+This is an intentional safety boundary, not a claim that every terminal honors
+OSC reset. In particular, automatic restoration behavior on Terminal.app needs
+a dedicated interactive probe before it can be represented as a measured
+cross-terminal guarantee.
+
 ## F76. A window's size is its panes' size, so no viewer may vote on it
 
 MEASURED 2026-08-26 on isolated tmux servers, tmux 3.6a and next-3.8
@@ -2291,3 +2305,22 @@ activation. With the fallback, it removes only that new private destination,
 performs a direct byte copy, compares the source and staged bytes, and then
 completes the normal pair validation and installation. The regression checks
 the installed client and daemon byte-for-byte against the built pair.
+
+## F82. tmux reports every `resize-window`, including a clamped one (MEASURED)
+
+MEASURED 2026-08-30 on an isolated tmux 3.7b server with one control-mode
+observer. Repeating `resize-window` at an unchanged size still produced one
+`%layout-change` per command. A six-pane vertical layout accepted a target
+below its eleven-row minimum, left the window at eleven rows, and reported
+success plus another layout-change.
+
+That makes two otherwise plausible checks unsafe: treating an owned window
+outside the displayed model as divergent, and repeatedly asking for a target
+tmux has already clamped. Either turns the workspace's own layout-change into
+the next resize request. The sizing owner now skips windows without a current
+tab and remembers the target and observed layout for each successful request;
+it may retry a changed layout once, but does not loop over an unchanged clamp.
+
+Probes: `two_owned_sessions_without_a_displayed_background_tab_do_not_loop`
+and `a_target_tmux_declines_is_asked_for_once_not_forever` in
+`src/cyclops-workspace/src/app.rs` exercise the real tmux notification seam.

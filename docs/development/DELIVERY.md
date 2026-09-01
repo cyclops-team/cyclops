@@ -175,8 +175,9 @@ completion or resolves any other post-write alarm.
 
 ### Gate (amendments b, f, g; GOALS invariants)
 
-Runs immediately when the fused state changes to a decidable one; never on a
-timer. In order:
+Runs immediately when the fused state changes to a decidable one. Its only
+timer-driven entry is the named, cancellable one-shot idle-ambiguous-composer
+settle deadline described below; otherwise it never runs on a timer. In order:
 
 1. Resolve target label to pane id. Missing pane: attention_required
    (cause: no_such_pane).
@@ -212,6 +213,17 @@ timer. In order:
      refused until a turn end with a clean screen reading consumes it, or a
      settled output observation proves that the operator erased the visible
      composer (INVARIANTS rule 12).
+     An idle `composer_semantic: ambiguous` reading holds for one continuous
+     `ambiguous_composer_settle_ms` grace (10 seconds by default). A changed
+     verdict, cancellation, or ordinary terminal outcome cancels that
+     one-shot deadline. If ambiguity still holds at the deadline, the wake
+     becomes a content-free `blocked_pre_write` record with the established
+     `write_readiness_changed` cause and
+     `write_block: composer_semantic_ambiguous` observation. Keeping the
+     detail in the optional observation preserves older strict journal
+     readers. No paste, doorbell, or submit key is attempted while the block
+     remains. Only later, complete route evidence that is write-ready may
+     reopen that exact attempt once.
 4. Just before pasting, re-read title and capture once more (the gate
    snapshot must be fresher than any human keystroke round-trip). The
    admitted pid is the agent's, resolved fresh; a process table that

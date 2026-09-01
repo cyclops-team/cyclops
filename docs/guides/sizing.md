@@ -40,6 +40,13 @@ on stale cached state across disconnections:
    window resize caused tmux to automatically reflow them. Panes with no
    provenance or malformed records fail closed: manual 1-row heights are
    preserved rather than guessed or automatically uncrushed.
+5. **One ask per disagreement, for windows on screen:** A window that is not
+   laid out the way the canvas wants it is re-sized on the next pass, but only
+   a window with a tab in the displayed session can be judged, and a size tmux
+   has already declined (a layout has a minimum, and `resize-window` below it
+   is clamped, not refused) is asked for once more at most. tmux answers every
+   `resize-window` with a `%layout-change` whether or not the size changed
+   (F82), so any check that can say "still wrong" forever is a loop.
 
 ## Local Messages pane chrome
 
