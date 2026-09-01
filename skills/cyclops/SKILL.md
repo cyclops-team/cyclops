@@ -198,9 +198,11 @@ of those states means an authenticated claim occurred.
 
 ## 3. List, claim, and reply
 
-The current wake line names the exact notification attempt. Running it claims
-the bound message without exposing a mutable alias or truncated message id.
-List pending metadata if you need the queue:
+The current wake line names the exact notification attempt. When its `cyclops
+inbox claim m-att_...` command is visible in your pane, run that command once
+and continue from the returned canonical `m-...` envelope. It is not a cue to
+use `inbox next` to wake the pane or look for a second message. List pending
+metadata if you need the queue:
 
 ```console
 $ cyclops inbox list
@@ -232,20 +234,22 @@ $ cyclops reply m-d7e4ba \
 accepted m-42b817
 ```
 
-For a bounded automation step, wait for and claim the oldest pending message
-through the daemon socket:
+For a bounded unattended automation step, wait for and claim the oldest
+pending message through the daemon socket:
 
 ```
 $ cyclops inbox next --timeout 30s
 ```
 
 The command subscribes before checking the inbox, claims at most one message,
-and exits `2` if none arrives before the deadline. It never writes to the pane.
-Claiming the body through `inbox next` does not cancel the separately queued
-human-visible pane notification. Cyclops still stages that notification when
-the composer is safe, even if the body was already claimed through the socket.
-Prefer the normal pane wake for interactive agent work; use bounded `inbox
-next` only when an automation genuinely needs a socket wait.
+and exits `2` if none arrives before the deadline. It never writes to or wakes
+a pane. A visible exact `m-att_...` command takes precedence: claim that
+locator once; `inbox next` is never a substitute for the notification or a
+terminal wake. Claiming the body through `inbox next` does not cancel the
+separately queued human-visible pane notification. Cyclops still stages that
+notification when the composer is safe, even if the body was already claimed
+through the socket. Prefer the normal pane wake for interactive agent work; use
+bounded `inbox next` only when an automation genuinely needs a socket wait.
 
 For one sender, copy the canonical `sender` key from `cyclops inbox list
 --json` and use `inbox next --from <recipient-key>`. Do not pass a display
