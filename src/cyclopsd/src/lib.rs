@@ -1060,6 +1060,10 @@ impl Inner {
 pub(crate) struct ForceSubmitRuntime {
     enabled: AtomicBool,
     delay_ms: AtomicU64,
+    /// Orders a persisted setting change with the one durable forced-key
+    /// reservation. The only nested lock order is this gate, then the mailbox
+    /// store inside the reservation callback.
+    reservation_gate: StdMutex<()>,
 }
 
 impl ForceSubmitRuntime {
@@ -1067,6 +1071,7 @@ impl ForceSubmitRuntime {
         Self {
             enabled: AtomicBool::new(enabled),
             delay_ms: AtomicU64::new(delay_ms.min(20_000)),
+            reservation_gate: StdMutex::new(()),
         }
     }
 
@@ -1077,7 +1082,40 @@ impl ForceSubmitRuntime {
         )
     }
 
-    pub(crate) fn set(&self, enabled: bool, delay_ms: u64) {
+    /// Persist and publish a setting change before another forced action may
+    /// reserve its terminal key. The caller performs no async work here.
+    pub(crate) fn save_and_set(
+        &self,
+        enabled: bool,
+        delay_ms: u64,
+        save: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let _gate = self
+            .reservation_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        save()?;
+        self.set(enabled, delay_ms);
+        Ok(())
+    }
+
+    /// Reserve a forced key only while the setting remains enabled. The
+    /// callback is synchronous and owns the mailbox-side linearization.
+    pub(crate) fn reserve_if_enabled<E>(
+        &self,
+        reserve: impl FnOnce() -> Result<bool, E>,
+    ) -> Result<Option<bool>, E> {
+        let _gate = self
+            .reservation_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.enabled.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        reserve().map(Some)
+    }
+
+    fn set(&self, enabled: bool, delay_ms: u64) {
         self.delay_ms.store(delay_ms.min(20_000), Ordering::Release);
         self.enabled.store(enabled, Ordering::Release);
     }

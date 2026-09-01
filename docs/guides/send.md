@@ -118,9 +118,9 @@ pane process generation, manifest, and tmux mode, then reserves one key with
 notification. A claim, withdrawal, replacement attempt, or settled barrier
 that wins before the reservation makes the timer a no-op. A later claim still
 retrieves the message and may count as consumption only after the key is
-accepted. If the timer sees the setting off at its final pre-reservation check,
-it does not reserve a key; a later setting change does not retract one already
-reserved. The durable reservation prevents duplicate timers or a restart from
+accepted. A successful disable ordered before the reservation withholds the
+key; a later setting change does not retract one already reserved. The durable
+reservation prevents duplicate timers or a restart from
 pressing a second key.
 
 This setting intentionally bypasses composer-content proof. At 0 seconds it can

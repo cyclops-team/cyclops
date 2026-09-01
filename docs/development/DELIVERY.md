@@ -301,9 +301,9 @@ locator.
    reserved key or count as consumption until the accepted-action fact exists.
    Reservation is not terminal acceptance or composer consumption: a crash
    after reservation and before `notification_resolution_action_accepted`
-   remains uncertain and authorizes no second key. A disabled setting observed
-   before reservation refuses; a later setting change does not revoke a durable
-   reservation. The existing accepted-action, consumption, and settlement rules
+   remains uncertain and authorizes no second key. A successfully saved disable
+   ordered before reservation refuses; a later setting change does not revoke a
+   durable reservation. The existing accepted-action, consumption, and settlement rules
    apply after it.
 
 An exact start normally ends on its matching hook end. When a measured vendor
@@ -640,9 +640,9 @@ final proofs it records a durable forced reservation under the same workspace
 journal lock as `inbox.claim`. A claim, withdrawal, replacement, or settlement
 ordered before that reservation prevents terminal IO. A later claim remains a
 normal retrieval and may count as consumption only after the key's
-accepted-action fact. The setting is checked before reservation: an observed
-disabled setting refuses, while a later disable does not revoke a reservation.
-Stronger disable/reservation linearization is a separate follow-up.
+accepted-action fact. The saved setting update and reservation share one gate:
+a successful disable ordered before reservation refuses, while a later disable
+does not revoke a reservation.
 
 Before a terminal-key action, the daemon records one content-free resolution
 intent. If the terminal accepts the key, it records a separate content-free

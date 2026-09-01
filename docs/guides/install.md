@@ -350,9 +350,9 @@ attempt, bound process generation, manifest, pane, and tmux mode, checks the
 setting one final time, records durable intent, and reserves one key under the
 same lock as `inbox.claim`. It then presses the manifest submit key at most
 once. Claim, withdrawal, replacement, or settlement that occurs before the
-reservation makes the timer obsolete. A timer that sees the setting off at its
-pre-reservation check also stops; a later claim remains a normal retrieval, and
-a later setting change does not retract the reserved key. This deliberately
+reservation makes the timer obsolete. A successful disable ordered before the
+reservation also stops the timer; a later claim remains a normal retrieval,
+and a later setting change does not retract the reserved key. This deliberately
 bypasses composer-content proof, so 0 milliseconds may submit human input that
 appeared after the paste. The workspace Settings card exposes the same choice
 as a 0 to 20 second slider.

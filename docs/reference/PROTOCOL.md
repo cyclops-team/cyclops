@@ -863,11 +863,10 @@ is still pending, before sending the manifest submit key, then uses the
 ordinary action-accepted, consumption, and settlement facts. The reservation,
 not intent alone, is the final claim-ordering boundary. A claim, withdrawal,
 replacement, or settlement ordered before reservation refuses without terminal
-IO. A disabled setting seen by the timer's pre-reservation setting check also
-refuses. A claim ordered after reservation is still a normal authenticated
-retrieval, but it does not cancel the one reserved key; neither does a later
-setting change. The setting check and reservation are not currently one atomic
-operation; stronger disable/reservation linearization is a separate follow-up.
+IO. The persisted setting update and reservation share one gate, so a
+successful disable ordered before reservation also refuses. A claim ordered
+after reservation is still a normal authenticated retrieval, but it does not
+cancel the one reserved key; neither does a later setting change.
 The forced path bypasses only composer-content proof and may therefore submit
 human input.
 
