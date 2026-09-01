@@ -309,9 +309,13 @@ locator.
    screen `idle` or `idle_with_input` reading may describe the exact staged
    composer row only because the owner and bytes are separately re-proven.
    When that same current `working` observation marks the owned barrier
-   `staged_during_turn`, it remains eligible only for this already-admitted
-   in-flight submit. It does not broaden the quiet, recovery, or human-draft
-   rules.
+   `staged_during_turn`, it remains eligible for this already-admitted
+   in-flight submit while that frame is Working. If a later fresh quiet frame
+   still shows the exact attempt-owned doorbell, ordinary reconciliation may
+   re-open only that owner. It re-proves the recorded binding, manifest, no
+   mode or stale conflict, and exact visible bytes before selecting one
+   existing action. This never makes the pane generally write-ready; human,
+   changed, hidden, modal, or unprovable content still withholds Enter.
    The final proof uses the same bounded capture sequence as post-paste
    verification: a terminal repaint can expose a partial frame, but only a
    later current frame with the same exact doorbell can proceed. These are
