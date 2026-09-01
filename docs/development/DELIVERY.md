@@ -291,10 +291,20 @@ locator.
    `notification.force_submit` is a separately documented default-off,
    administrator-controlled fallback for one exact current `verify_failed`
    doorbell. It never pastes or replaces bytes. After exact binding and route
-   checks, it records durable intent and may send one manifest submit key
-   without composer-content proof. It can therefore submit trailing human
-   input. Claim, withdrawal, replacement, settlement, a disabled setting, or
-   an uncertain outcome prevents another terminal action.
+   checks, it records durable intent. After its final route and payload proofs,
+   it appends a content-free `notification_resolution_action_reserved` fact
+   under the same workspace journal lock as `inbox.claim`, then may send one
+   manifest submit key without composer-content proof. It can therefore submit
+   trailing human input. A claim, withdrawal, replacement, or settlement
+   ordered before that reservation prevents terminal IO. A claim ordered after
+   it remains a normal mailbox retrieval but cannot revoke the one already
+   reserved key or count as consumption until the accepted-action fact exists.
+   Reservation is not terminal acceptance or composer consumption: a crash
+   after reservation and before `notification_resolution_action_accepted`
+   remains uncertain and authorizes no second key. A disabled setting observed
+   before reservation refuses; a later setting change does not revoke a durable
+   reservation. The existing accepted-action, consumption, and settlement rules
+   apply after it.
 
 An exact start normally ends on its matching hook end. When a measured vendor
 path emits no end hook, a manifest may mark one exact screen rule as lifecycle
@@ -620,13 +630,19 @@ clear. The mailbox choice and durable intent share one lock. On that ordinary
 path, human, trailing, changed, or unprovable content never reaches a terminal
 key.
 
-The separate `notification.force_submit` fallback is default off and
-administrator-controlled. It never writes or replaces composer bytes, but for
-one exact `verify_failed` attempt it may submit one key without composer-content
-proof and may therefore submit trailing human input. It still requires the
-exact binding and route, durable intent before terminal IO, at-most-once key
-ownership, and cancellation on claim, withdrawal, replacement, settlement, or
-disable.
+Ordinary attention terminal actions use accepted-key ordering: only a claim
+ordered after `notification_resolution_action_accepted` may count as
+consumption. The separate `notification.force_submit` fallback is default off
+and administrator-controlled. It never writes or replaces composer bytes, but
+for one exact `verify_failed` attempt it may submit one key without
+composer-content proof and may therefore submit trailing human input. After its
+final proofs it records a durable forced reservation under the same workspace
+journal lock as `inbox.claim`. A claim, withdrawal, replacement, or settlement
+ordered before that reservation prevents terminal IO. A later claim remains a
+normal retrieval and may count as consumption only after the key's
+accepted-action fact. The setting is checked before reservation: an observed
+disabled setting refuses, while a later disable does not revoke a reservation.
+Stronger disable/reservation linearization is a separate follow-up.
 
 Before a terminal-key action, the daemon records one content-free resolution
 intent. If the terminal accepts the key, it records a separate content-free

@@ -113,11 +113,15 @@ The workspace Settings card has an optional `Force staged submit` escape hatch
 for a narrower failure: Cyclops already pasted the exact notification, but its
 normal verification could not confirm Enter. It is off by default. When enabled,
 the daemon waits the selected 0 to 20 seconds, rechecks the exact recipient,
-pane process generation, manifest, and tmux mode, then presses the manifest's
-submit key once without re-pasting the notification. A claim, withdrawal,
-replacement attempt, settled barrier, or disabled setting makes the timer a
-no-op. The durable resolution intent prevents duplicate timers or a restart
-from pressing a second key.
+pane process generation, manifest, and tmux mode, then reserves one key with
+`inbox.claim` before pressing the manifest's submit key without re-pasting the
+notification. A claim, withdrawal, replacement attempt, or settled barrier
+that wins before the reservation makes the timer a no-op. A later claim still
+retrieves the message and may count as consumption only after the key is
+accepted. If the timer sees the setting off at its final pre-reservation check,
+it does not reserve a key; a later setting change does not retract one already
+reserved. The durable reservation prevents duplicate timers or a restart from
+pressing a second key.
 
 This setting intentionally bypasses composer-content proof. At 0 seconds it can
 submit human input that appeared after the notification was pasted. Use it only

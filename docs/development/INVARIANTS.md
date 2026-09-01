@@ -72,10 +72,11 @@ bytes cannot be compared. It never authorizes Enter.
 `notification.force_submit` is the separately documented default-off,
 administrator-controlled exception. It never pastes or replaces bytes. For one
 exact current `verify_failed` attempt, it rechecks the route and binding,
-records durable intent, then may send one submit key without composer-content
-proof. It can therefore submit trailing human input. Its exact-attempt,
-at-most-once, and cancellation checks remain mandatory; see
-[DELIVERY.md](DELIVERY.md).
+records durable intent, and atomically reserves one forced key with
+`inbox.claim` before it may send without composer-content proof. It can
+therefore submit trailing human input. A claim ordered before reservation
+withholds the key; a later claim stays a normal retrieval. See
+[DELIVERY.md](DELIVERY.md) for the accepted-action and setting boundaries.
 
 The irreversible boundary changes retry policy. A detach, missing manifest,
 pre-paste occupant rebind, or spool failure is proven before the pane write
@@ -154,8 +155,8 @@ The default-off `notification.force_submit` recovery setting is deliberately
 outside this ordinary proof path. It does not add a paste or replace visible
 bytes, but it may send one submit key without composer-content proof for an
 exact `verify_failed` attempt and may therefore submit later human input. Its
-administrator setting, binding checks, durable intent, and cancellation rules
-are described in [DELIVERY.md](DELIVERY.md).
+administrator setting, binding checks, forced reservation, and acceptance
+boundaries are described in [DELIVERY.md](DELIVERY.md).
 
 - Enforced at: `src/cyclopsd/src/delivery.rs`, the `AgentState::
   IdleWithInput` arm of `gate`; `src/cyclopsd/src/fusion.rs` supplies
@@ -358,8 +359,13 @@ after it fires:
   durable change, and ends. More than one caller may arm a force-submit
   deadline for the same exact `verify_failed` attempt. Each is one-shot; a
   scheduler waits for a matching resolution-release event only after another
-  resolver owns the attempt, then rechecks or exits. Durable intent elects at
-  most one terminal key, and no scheduler repeats a terminal action.
+  resolver owns the attempt, then rechecks or exits. Durable intent limits
+  competing resolvers; its final forced key reservation elects at most one
+  terminal key. That reservation and `inbox.claim`
+  share the workspace journal lock: a claim ordered first prevents terminal
+  IO, while a later claim cannot revoke the already-reserved key. A reserved
+  but unaccepted key remains uncertain; a later claim becomes consumption only
+  after acceptance, and no scheduler repeats the key.
 - **Post-action evidence checkpoints.** `attention_resolution.rs` arms the
   bounded checkpoints for one named resolution action. They collect the
   evidence required to settle that action, then terminate; they do not keep

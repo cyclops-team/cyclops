@@ -811,7 +811,18 @@ no terminal key. Unsupported extraction, hidden content, an unprovable layout,
 or typed content never qualifies. Before a terminal-key action, the daemon
 appends a content-free `notification_resolution_intent` fact. A known refusal
 before the key appends `notification_resolution_intent_withdrawn` and may be
-retried. When the
+retried. Ordinary `attention.complete` and keyed `attention.discard` actions
+use accepted-key ordering: only a claim ordered after
+`notification_resolution_action_accepted` may count as consumption. The
+force-submit fallback instead adds one content-free
+`notification_resolution_action_reserved` fact after its final proofs and
+before terminal IO. That reservation is appended under the same workspace
+journal lock as `inbox.claim`: a claim ordered before it prevents terminal IO,
+while a later claim retrieves the message without revoking the one reserved
+key. That later claim may count as consumption only after the accepted-action
+fact. Reservation proves neither terminal acceptance nor composer consumption;
+a reserved but unaccepted action remains uncertain and cannot send a second key
+after recovery. When the
 terminal accepts the action key, the daemon appends a content-free
 `notification_resolution_action_accepted` fact. Acceptance is not composer
 consumption or settlement. A fresh Complete must then observe either an
@@ -846,11 +857,19 @@ Doorbell Format 3 or 4 attempt in `attention_required` with cause
 The timer rechecks that the mailbox entry is pending and that the recipient,
 pane process generation, agent generation, manifest, live pane, and tmux mode
 still match. It appends `notification_resolution_intent` with `forced: true`
-before sending the manifest submit key, then uses the ordinary action-accepted,
-consumption, and settlement facts. Durable intent admits at most one key across
-competing timers and restart. Claim, withdrawal, replacement, settlement, or a
-disabled setting refuses without terminal IO. The forced path bypasses only
-composer-content proof and may therefore submit human input.
+before its final route and payload proofs. It then appends
+`notification_resolution_action_reserved` only while that exact mailbox entry
+is still pending, before sending the manifest submit key, then uses the
+ordinary action-accepted, consumption, and settlement facts. The reservation,
+not intent alone, is the final claim-ordering boundary. A claim, withdrawal,
+replacement, or settlement ordered before reservation refuses without terminal
+IO. A disabled setting seen by the timer's pre-reservation setting check also
+refuses. A claim ordered after reservation is still a normal authenticated
+retrieval, but it does not cancel the one reserved key; neither does a later
+setting change. The setting check and reservation are not currently one atomic
+operation; stronger disable/reservation linearization is a separate follow-up.
+The forced path bypasses only composer-content proof and may therefore submit
+human input.
 
 ### msg.history and msg.thread
 

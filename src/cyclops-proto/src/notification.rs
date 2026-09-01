@@ -641,8 +641,9 @@ impl NotificationRecord {
     /// rendered doorbell, and action-safe composer before it may send a key.
     /// The separately configured force-submit fallback uses this predicate as a
     /// narrow candidate selector, but deliberately bypasses composer-content
-    /// proof after its own binding checks and durable intent. This predicate
-    /// only selects the durable attempt class that supports either path.
+    /// proof after its own binding checks, durable intent, and forced key
+    /// reservation. This predicate only selects the durable attempt class that
+    /// supports either path.
     pub fn needs_exact_owned_reconciliation(&self) -> bool {
         self.state == NotificationState::AttentionRequired
             && self.cause == Some(NotificationAttentionCause::VerifyFailed)
@@ -791,6 +792,21 @@ pub enum NotificationFact {
         /// audit distinction; it does not weaken projection validation.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         forced: bool,
+    },
+    /// Durable final reservation of one forced Complete key.
+    ///
+    /// This remains a pre-key fact: it proves neither terminal acceptance nor
+    /// composer consumption. It is the claim-ordering boundary for the
+    /// default-off force-submit fallback, so an earlier authenticated claim
+    /// cancels the action while a later claim retrieves its message without
+    /// cancelling the already-reserved key. That later claim can count as
+    /// consumption only after an action-accepted fact exists.
+    NotificationResolutionActionReserved {
+        record_version: u32,
+        attempt_id: NotificationAttemptId,
+        message_id: MessageId,
+        recipient: RecipientKey,
+        resolution: NotificationResolution,
     },
     /// Durable proof that the terminal action key was accepted by the terminal.
     ///
@@ -1880,6 +1896,16 @@ mod tests {
                     forced: false,
                 },
                 "notification_resolution_intent",
+            ),
+            (
+                NotificationFact::NotificationResolutionActionReserved {
+                    record_version: 1,
+                    attempt_id,
+                    message_id: message_id.clone(),
+                    recipient,
+                    resolution: NotificationResolution::Complete,
+                },
+                "notification_resolution_action_reserved",
             ),
             (
                 NotificationFact::NotificationResolutionActionAccepted {

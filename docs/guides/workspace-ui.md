@@ -408,11 +408,13 @@ switching sections never resizes it.
   0 to 20 second delay. Select `Delay` and use `←`/`→` to move the slider.
   This escape hatch applies only after Cyclops has pasted an exact notification
   and ordinary verification fails. It does not paste again. At expiry the
-  daemon rechecks the exact attempt and bound pane process, then presses Enter
-  once. A claim, withdrawal, replacement, or disabled setting cancels it. The
-  warning is literal: because this bypasses composer-content proof, it may
-  submit human input that appeared after the notification was pasted. At 0
-  seconds the key is attempted immediately.
+  daemon rechecks the exact attempt and bound pane process, then reserves one
+  key with `inbox.claim` before pressing Enter once. A claim, withdrawal, or
+  replacement that wins before the reservation stops it. A later claim still
+  retrieves the message, and a later setting change does not retract the
+  reserved key. The warning is literal: because this bypasses composer-content
+  proof, it may submit human input that appeared after the notification was
+  pasted. At 0 seconds the key is attempted immediately.
 
 `show_settings` is the binding name; `show_themes`, from when the card
 was only a theme picker, still works in an existing config.

@@ -582,7 +582,8 @@ async fn wait_for_attention_resolution_release(
 
 /// Arm the explicit post-paste escape hatch for one exact verify-failed
 /// doorbell. Multiple callers may arm the same attempt; durable resolution
-/// intent elects one key and makes every competing timer a no-op.
+/// intent limits competing resolvers, and the final durable reservation elects
+/// one key and makes every competing timer a no-op.
 pub(crate) fn schedule_force_submit(inner: &Arc<Inner>, record: cyclops_proto::NotificationRecord) {
     if !record.needs_exact_owned_reconciliation() || !inner.force_submit.get().0 {
         return;

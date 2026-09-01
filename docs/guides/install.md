@@ -346,12 +346,16 @@ restart or duplicate timer from writing more than one reminder.
 exact notification that crossed the paste boundary and then reached
 `verify_failed`. It never pastes a second notification. After
 `force_notification_submit_delay_ms`, the daemon revalidates the exact pending
-attempt, bound process generation, manifest, pane, and tmux mode, records a
-durable forced resolution intent, and presses the manifest submit key at most
-once. Claim, withdrawal, replacement, settlement, or switching the setting off
-makes the timer obsolete. This deliberately bypasses composer-content proof,
-so 0 milliseconds may submit human input that appeared after the paste. The
-workspace Settings card exposes the same choice as a 0 to 20 second slider.
+attempt, bound process generation, manifest, pane, and tmux mode, checks the
+setting one final time, records durable intent, and reserves one key under the
+same lock as `inbox.claim`. It then presses the manifest submit key at most
+once. Claim, withdrawal, replacement, or settlement that occurs before the
+reservation makes the timer obsolete. A timer that sees the setting off at its
+pre-reservation check also stops; a later claim remains a normal retrieval, and
+a later setting change does not retract the reserved key. This deliberately
+bypasses composer-content proof, so 0 milliseconds may submit human input that
+appeared after the paste. The workspace Settings card exposes the same choice
+as a 0 to 20 second slider.
 
 Unknown keys warn and are ignored. The file is data; nothing in it executes.
 

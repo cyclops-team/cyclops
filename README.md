@@ -193,9 +193,11 @@ daemon-owned recovery barrier remains blocked.
 For operators who prefer liveness over that final content guarantee, Settings
 includes a default-off `Force staged submit` timer from 0 to 20 seconds. It
 applies only after an exact notification was pasted but normal verification
-failed. The daemon rechecks the exact attempt and pane process, then presses
-Enter once without pasting again. A claim or replacement cancels it. This mode
-can submit human input, especially at 0 seconds, so it is never enabled by
+failed. The daemon rechecks the exact attempt and pane process, then reserves
+one key atomically with `inbox.claim` before pressing Enter without pasting
+again. A claim or replacement that wins before that reservation stops it. Once
+reserved, a later claim or setting change does not retract the one key. This
+mode can submit human input, especially at 0 seconds, so it is never enabled by
 default.
 
 <!-- Media slot: docs/public/images/composer-hold.png

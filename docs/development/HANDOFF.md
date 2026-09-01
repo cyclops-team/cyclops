@@ -407,9 +407,10 @@ bounded timers inside a live delivery, one event-armed candidate lifecycle
 settle timer per pane, one unclaimed reminder per attempt, optional exact
 force-submit deadlines, and bounded post-action evidence checkpoints. Competing
 force-submit schedulers wait for a resolution-release event when needed; durable
-intent elects at most one terminal key. The lifecycle worker evaluates each
-candidate generation once per observation and then parks. This is not an
-inventory of every bounded deadline in an explicit command or recovery action.
+intent limits competing resolvers, and a final forced reservation elects at
+most one terminal key. The lifecycle worker evaluates each candidate generation
+once per observation and then parks. This is not an inventory of every bounded
+deadline in an explicit command or recovery action.
 
 **Rejected:** a 1Hz reconcile loop, which is the obvious design and would
 have been simpler.

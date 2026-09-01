@@ -2483,6 +2483,27 @@ impl WorkspaceMessaging {
         Ok(())
     }
 
+    /// Reserve one forced Complete key at the mailbox/claim linearization
+    /// point. The terminal adapter only receives the key after this returns
+    /// true.
+    pub(crate) fn reserve_forced_attention_resolution_action(
+        &self,
+        target: &AttentionTarget,
+    ) -> Result<bool, MailboxServiceError> {
+        match self
+            .service
+            .reserve_forced_attention_resolution_action(target)
+        {
+            Ok(reserved) => Ok(reserved),
+            Err(error) => {
+                let _ = self
+                    .service
+                    .cancel_attention_resolution(target.record.attempt_id);
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) fn record_attention_resolution_action_accepted(
         &self,
         target: &AttentionTarget,
@@ -4949,6 +4970,7 @@ mod tests {}
             "service.record_attention_resolution_intent(",
             "service.record_automatic_attention_resolution_intent(",
             "service.record_forced_attention_resolution_intent(",
+            "service.reserve_forced_attention_resolution_action(",
             "service.record_attention_resolution_action_accepted(",
             "service.record_attention_resolution_consumption_observed(",
             "service.resolve_attention(",
