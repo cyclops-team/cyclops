@@ -99,7 +99,7 @@ sidebar_visible = true
 sidebar_width = 28
 tab_bar_visible = true
 motion = true
-terminal_default_fg = "#3a2b26" # optional exact terminal palette pair
+terminal_default_fg = "#3a2b26" # opt in to themed terminal window padding
 terminal_default_bg = "#000000"
 ```
 
@@ -107,9 +107,10 @@ Motion fades pane borders, status ink, and dissolving notices instead of
 snapping, and turns itself off under `NO_COLOR` or without truecolor. See
 [Configuration](/reference/configuration) for the rest, including
 `files_pinned_root` and custom `[workspace.bindings]`. The optional terminal
-palette pair lets a terminal that ignores OSC 111 restore its default colors
-through an explicit OSC 10/11 set. Both values are required, and Cyclops
-never queries terminal input for them.
+palette pair themes the window padding while the workspace is focused and
+restores the supplied colors through OSC 10/11. Both values are required;
+without them Cyclops leaves the host palette untouched and never queries
+terminal input for colors.
 
 ## Related
 

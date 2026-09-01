@@ -2045,19 +2045,21 @@ needs, clearing the host surface and resetting the diff baseline
 `get_cursor_position` calls rather than asserting a spelling, so any future
 invalidation may change how it clears and may not start reading to do it.
 
-### Explicit limitation: terminal palette restoration is configured
+### Decision: host-palette theming requires an exact restoration pair
 
 The workspace input thread is the sole terminal-input owner. A startup OSC
 10/11 query would return through that same input stream, so Cyclops does not
-read terminal replies to discover default colors. Instead an operator may
-provide the complete `[workspace]` `terminal_default_fg` and
-`terminal_default_bg` pair. The guard restores that exact pair on focus loss
-and exit, or keeps the OSC 110/111 fallback when it is absent or invalid.
+read terminal replies to discover default colors. Instead the complete
+`[workspace]` `terminal_default_fg` and `terminal_default_bg` pair is an
+explicit opt-in: Cyclops applies the host palette while focused and restores
+that exact pair on focus loss and exit. When the pair is absent, partial, or
+invalid, it emits neither the host-palette set nor a reset request.
 
 This is an intentional safety boundary, not a claim that every terminal honors
-OSC reset. In particular, automatic restoration behavior on Terminal.app needs
-a dedicated interactive probe before it can be represented as a measured
-cross-terminal guarantee.
+OSC reset. An unconfigured terminal keeps its own padding color, but it cannot
+retain Cyclops colors because Cyclops never changed them. Terminal-specific
+automatic theming needs a dedicated interactive probe before it can be
+represented as a measured cross-terminal guarantee.
 
 ## F76. A window's size is its panes' size, so no viewer may vote on it
 

@@ -112,12 +112,25 @@ pub fn apply_cursor_style(shape: CursorShape, blink: bool) {
 /// including a panic. Leaving a shell with the workspace's palette would
 /// be a worse bug than the padding it fixes.
 ///
-/// Unsupported terminals ignore the sequences, so there is nothing to
-/// detect and no fallback to write.
+/// Cyclops writes this pair only when the operator supplied the complete
+/// palette it must restore. Without that pair, the terminal's defaults stay
+/// untouched: an unknown reset implementation cannot leave the shell wearing
+/// the workspace colors.
 pub fn apply_window_palette(fg: (u8, u8, u8), bg: (u8, u8, u8)) {
     let mut out = io::stdout();
-    write_window_palette(&mut out, fg, bg);
+    write_apply_palette(&mut out, original_palette(), fg, bg);
     let _ = out.flush();
+}
+
+fn write_apply_palette(
+    out: &mut impl Write,
+    original: Option<(Rgb, Rgb)>,
+    fg: (u8, u8, u8),
+    bg: (u8, u8, u8),
+) {
+    if original.is_some() {
+        write_window_palette(out, fg, bg);
+    }
 }
 
 fn write_window_palette(out: &mut impl Write, fg: (u8, u8, u8), bg: (u8, u8, u8)) {
@@ -135,8 +148,8 @@ fn write_window_palette(out: &mut impl Write, fg: (u8, u8, u8), bg: (u8, u8, u8)
 type Rgb = (u8, u8, u8);
 
 /// The terminal's own default foreground and background when an operator
-/// explicitly configured both values. An unset cell means there is no
-/// override, so restoration uses the terminal's OSC 110/111 reset request.
+/// explicitly configured both values. A valid pair opts into changing the
+/// host palette because Cyclops can then restore it exactly.
 static ORIGINAL_PALETTE: OnceLock<Option<(Rgb, Rgb)>> = OnceLock::new();
 
 fn original_palette() -> Option<(Rgb, Rgb)> {
@@ -147,8 +160,8 @@ fn original_palette() -> Option<(Rgb, Rgb)> {
 /// settings. The UI never writes these keys and never asks the terminal to
 /// report them, so input still has exactly one owner.
 ///
-/// Both values are required. A partial or malformed pair deliberately falls
-/// back to OSC 110/111 rather than guessing the terminal's defaults.
+/// Both values are required. A partial or malformed pair leaves the host
+/// palette alone rather than guessing the terminal's defaults.
 pub fn configure_default_palette(home: &Path) {
     let _ = ORIGINAL_PALETTE.set(configured_default_palette(home));
 }
@@ -186,18 +199,15 @@ fn parse_hex_color(value: &str) -> Option<Rgb> {
 /// Hand the terminal's default foreground and background back.
 ///
 /// When the operator configured exact defaults, set those back with OSC
-/// 10/11. This supports terminals that ignore OSC 110/111. Otherwise ask
-/// the terminal to reset to its own defaults with OSC 110/111.
+/// 10/11. Otherwise the workspace never changed the host palette, so there
+/// is nothing to reset.
 fn reset_window_palette(out: &mut impl Write) {
     write_reset(out, original_palette());
 }
 
 fn write_reset(out: &mut impl Write, original: Option<(Rgb, Rgb)>) {
-    match original {
-        Some((fg, bg)) => write_window_palette(out, fg, bg),
-        None => {
-            let _ = write!(out, "\x1b]110\x1b\\\x1b]111\x1b\\");
-        }
+    if let Some((fg, bg)) = original {
+        write_window_palette(out, fg, bg);
     }
 }
 
@@ -298,25 +308,26 @@ mod tests {
     use super::*;
     use std::io::IsTerminal;
 
-    /// The four escapes are the exact pairs a terminal needs to change its
-    /// default foreground/background and hand both back.
-    ///
-    /// Pinned as bytes because this is the one thing the workspace writes
-    /// that outlives the process. A malformed set is a cosmetic bug; a
-    /// malformed or missing reset leaves the operator's shell wearing the
-    /// workspace's background after cyclops exits, which is the failure
-    /// that matters. ST terminates rather than BEL so a terminal that does
-    /// not understand the sequence stays silent instead of ringing.
+    /// Without a complete exact restoration pair, the workspace must not
+    /// write any host-palette escape. That keeps a reset-ignoring terminal
+    /// from retaining the workspace colors after exit.
     #[test]
-    fn the_palette_escapes_set_and_hand_back() {
+    fn an_unconfigured_workspace_never_mutates_the_host_palette() {
         let mut out: Vec<u8> = Vec::new();
-        reset_window_palette(&mut out);
+        write_apply_palette(&mut out, None, (0x3a, 0x2b, 0x26), (0xfa, 0xf6, 0xe6));
+        write_reset(&mut out, None);
         assert_eq!(
-            String::from_utf8(out).unwrap(),
-            "\x1b]110\x1b\\\x1b]111\x1b\\",
-            "OSC 110 and 111 with ST terminators return both defaults"
+            out, b"",
+            "without an exact restoration pair, an unsupported reset cannot leave the host themed"
         );
+    }
 
+    /// A configured host palette sets both foreground and background with
+    /// lowercase, zero-padded RGB values. ST terminates rather than BEL so a
+    /// terminal that does not understand the sequence stays silent instead
+    /// of ringing.
+    #[test]
+    fn the_palette_escape_sets_both_host_channels() {
         let mut out: Vec<u8> = Vec::new();
         write_window_palette(&mut out, (0x3a, 0x2b, 0x26), (0xfa, 0xf6, 0xe6));
         assert_eq!(
@@ -336,18 +347,6 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "\x1b]10;#3a2b26\x1b\\\x1b]11;#000000\x1b\\",
             "an operator-provided default must be set back exactly"
-        );
-    }
-
-    /// With no valid operator override, ask the terminal to reset itself.
-    #[test]
-    fn an_unknown_default_falls_back_to_the_reset_request() {
-        let mut out: Vec<u8> = Vec::new();
-        write_reset(&mut out, None);
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            "\x1b]110\x1b\\\x1b]111\x1b\\",
-            "no operator default means ask the terminal to reset to its own"
         );
     }
 
