@@ -175,14 +175,17 @@ async fn foreground_watch_gates_the_doorbell_but_socket_pull_claims_the_message(
     );
     assert_eq!(claimed["result"]["message"]["body"], secret);
 
-    let status = rig.ctl.request("status", json!({})).await;
+    // The claim response proves the public socket operation. Check the cached
+    // observation separately: socket `status` first performs a bounded live
+    // refresh and may honestly report `unknown` when that refresh is late.
+    let status = json!({"result": rig.daemon.status(false)});
     let target = status["result"]["sessions"][0]["panes"]
         .as_array()
         .unwrap()
         .iter()
         .find(|candidate| candidate["pane_id"] == pane)
-        .expect("target pane remains in status");
-    assert_eq!(target["state"], "working");
+        .expect("target pane remains in cached status");
+    assert_eq!(target["state"], "working", "{status}");
 
     let capture = rig.tmux.capture(&pane);
     assert!(
