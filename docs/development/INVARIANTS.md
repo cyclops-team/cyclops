@@ -74,8 +74,9 @@ administrator-controlled exception. It never pastes or replaces bytes. For one
 exact current `verify_failed` attempt, it rechecks the route and binding,
 records durable intent, and atomically reserves one forced key with
 `inbox.claim` before it may send without composer-content proof. It can
-therefore submit trailing human input. A claim ordered before reservation
-withholds the key; a later claim stays a normal retrieval. See
+therefore submit trailing human input. A successful disable ordered before
+reservation withholds the key; a later claim stays a normal retrieval. After
+the durable reservation, neither a setting change nor a claim revokes it. See
 [DELIVERY.md](DELIVERY.md) for the accepted-action and setting boundaries.
 
 The irreversible boundary changes retry policy. A detach, missing manifest,

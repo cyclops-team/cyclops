@@ -176,6 +176,7 @@ pub(crate) async fn force_complete(
         withdraw_pre_key(messaging, target, NotificationResolution::Complete)?;
         return Err(AttentionActionError::ForceRefused("setting was disabled"));
     }
+    delivery::inject_pause(inner, "force_submit_after_setting_check_before_reservation").await;
     let Some(route) = force_action_route(inner, messaging, target) else {
         withdraw_pre_key(messaging, target, NotificationResolution::Complete)?;
         return Err(AttentionActionError::ForceRefused(
@@ -209,11 +210,17 @@ pub(crate) async fn force_complete(
         }
     };
 
-    // This append and inbox.claim share the workspace journal lock. It is the
-    // final claim-ordering boundary: an earlier claim prevents terminal IO;
-    // a later claim is a normal retrieval but cannot revoke the one key now
-    // reserved for this forced action.
-    if !messaging.reserve_forced_attention_resolution_action(target)? {
+    // The setting gate is held through this append, whose callback shares the
+    // workspace journal lock with inbox.claim. A saved disable ordered before
+    // this boundary withholds terminal IO; a claim ordered first does too.
+    let Some(reserved) = inner
+        .force_submit
+        .reserve_if_enabled(|| messaging.reserve_forced_attention_resolution_action(target))?
+    else {
+        withdraw_pre_key(messaging, target, NotificationResolution::Complete)?;
+        return Err(AttentionActionError::ForceRefused("setting was disabled"));
+    };
+    if !reserved {
         withdraw_pre_key(messaging, target, NotificationResolution::Complete)?;
         return Err(AttentionActionError::ForceRefused(
             "attempt was claimed, withdrawn, replaced, or settled",

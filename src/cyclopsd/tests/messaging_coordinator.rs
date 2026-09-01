@@ -1409,13 +1409,140 @@ async fn claiming_after_forced_intent_withholds_the_submit_key() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn claiming_after_the_forced_key_reservation_keeps_the_one_reserved_key() {
+async fn disabling_force_submit_before_the_forced_key_reservation_withholds_the_key() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
     let mut rig = Rig::new(
-        "workspace-force-submit-claim-after-reservation",
+        "workspace-force-submit-disable-before-reservation",
+        CAT_MANIFEST,
+        &composer_pane(),
+        "delivery_retry_max = 0\nforce_notification_submit = \"on\"\nforce_notification_submit_delay_ms = 0\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let (pre_tx, mut pre_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (setting_tx, mut setting_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pre_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let setting_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let first_pre = Arc::new(AtomicBool::new(true));
+    let first_setting = Arc::new(AtomicBool::new(true));
+    rig.daemon.set_inject_pause({
+        let pre_release = Arc::clone(&pre_release);
+        let setting_release = Arc::clone(&setting_release);
+        let first_pre = Arc::clone(&first_pre);
+        let first_setting = Arc::clone(&first_setting);
+        move |phase| {
+            let pre_tx = pre_tx.clone();
+            let setting_tx = setting_tx.clone();
+            let key_tx = key_tx.clone();
+            let pre_release = Arc::clone(&pre_release);
+            let setting_release = Arc::clone(&setting_release);
+            let pause_pre = phase == "pre_submit" && first_pre.swap(false, Ordering::SeqCst);
+            let pause_setting = phase == "force_submit_after_setting_check_before_reservation"
+                && first_setting.swap(false, Ordering::SeqCst);
+            let sent_key = phase == "force_submit_after_key_before_accepted";
+            Box::pin(async move {
+                if pause_pre {
+                    let _ = pre_tx.send(());
+                    pre_release.acquire_owned().await.unwrap().forget();
+                } else if pause_setting {
+                    let _ = setting_tx.send(());
+                    setting_release.acquire_owned().await.unwrap().forget();
+                } else if sent_key {
+                    let _ = key_tx.send(());
+                }
+            })
+        }
+    });
+
+    let sent = send_workspace_message(
+        &rig,
+        "force-submit-disable-before-reservation",
+        "Disable before forced key reservation",
+        "private body",
+    )
+    .await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    tokio::time::timeout(Duration::from_secs(5), pre_rx.recv())
+        .await
+        .expect("doorbell reached pre-submit")
+        .expect("pre-submit sender stayed open");
+    rig.tmux
+        .run_ok(&["send-keys", "-l", "-t", &pane, " trailing input"]);
+    rig.tmux.wait_screen("main", "trailing input");
+    pre_release.add_permits(1);
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::AttentionRequired).await;
+
+    tokio::time::timeout(Duration::from_secs(5), setting_rx.recv())
+        .await
+        .expect("force-submit read the enabled setting before reservation")
+        .expect("setting-check sender stayed open");
+    let disabled = rig
+        .ctl
+        .request(
+            "notification.force_submit.set",
+            json!({"enabled": false, "delay_seconds": 0}),
+        )
+        .await;
+    assert_eq!(disabled["result"]["enabled"], false, "{disabled}");
+    setting_release.add_permits(1);
+
+    let withdrawn = wait_for_workspace_fact(
+        &rig,
+        &message_id,
+        "notification_resolution_intent_withdrawn",
+    );
+    tokio::pin!(withdrawn);
+    tokio::select! {
+        _ = key_rx.recv() => panic!(
+            "a successful force-submit disable still reached the terminal key"
+        ),
+        _ = &mut withdrawn => {}
+    }
+
+    let lines = workspace_lines(&rig);
+    for fact_type in [
+        "notification_resolution_action_reserved",
+        "notification_resolution_action_accepted",
+    ] {
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| {
+                    line.id == message_id
+                        && line
+                            .data
+                            .as_ref()
+                            .is_some_and(|data| data["type"] == fact_type)
+                })
+                .count(),
+            0,
+            "disable must withdraw before {fact_type}: {lines:#?}"
+        );
+    }
+    assert_eq!(
+        pane_history(&rig, &pane).matches("FAKETUI-WORKING").count(),
+        0,
+        "a successful disable still pressed Enter"
+    );
+
+    rig.daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn later_disable_or_claim_cannot_revoke_the_forced_key_reservation() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "workspace-force-submit-events-after-reservation",
         CAT_MANIFEST,
         &composer_pane(),
         "delivery_retry_max = 0\nforce_notification_submit = \"on\"\nforce_notification_submit_delay_ms = 0\n",
@@ -1458,8 +1585,8 @@ async fn claiming_after_the_forced_key_reservation_keeps_the_one_reserved_key() 
 
     let sent = send_workspace_message(
         &rig,
-        "force-submit-claim-after-reservation",
-        "Claim after forced key reservation",
+        "force-submit-events-after-reservation",
+        "Events after forced key reservation",
         "private body",
     )
     .await;
@@ -1478,6 +1605,16 @@ async fn claiming_after_the_forced_key_reservation_keeps_the_one_reserved_key() 
         .await
         .expect("forced key reservation is durable before terminal IO")
         .expect("reservation sender stayed open");
+    // A completed settings request affects future timers. It cannot revoke
+    // this key because the durable reservation is already the commit point.
+    let disabled = rig
+        .ctl
+        .request(
+            "notification.force_submit.set",
+            json!({"enabled": false, "delay_seconds": 0}),
+        )
+        .await;
+    assert_eq!(disabled["result"]["enabled"], false, "{disabled}");
     rig.daemon
         .claim_message_for_test("worker", &message_id)
         .expect("recipient claims after the forced key reservation");
@@ -1548,7 +1685,7 @@ async fn claiming_after_the_forced_key_reservation_keeps_the_one_reserved_key() 
                     .as_ref()
                     .is_none_or(|data| data["type"] != "notification_resolution_intent_withdrawn")
         }),
-        "a claim after reservation must not revoke its forced key: {lines:#?}"
+        "events after reservation must not revoke its forced key: {lines:#?}"
     );
     assert_eq!(
         pane_history(&rig, &pane).matches("FAKETUI-WORKING").count(),

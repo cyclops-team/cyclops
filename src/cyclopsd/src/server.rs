@@ -832,11 +832,16 @@ pub(crate) async fn dispatch(
                 );
             }
             let delay_ms = u64::from(params.delay_seconds) * 1_000;
-            if let Err(error) = crate::config::save_force_notification_submit(
-                &inner.cfg.home,
-                params.enabled,
-                delay_ms,
-            ) {
+            if let Err(error) = inner
+                .force_submit
+                .save_and_set(params.enabled, delay_ms, || {
+                    crate::config::save_force_notification_submit(
+                        &inner.cfg.home,
+                        params.enabled,
+                        delay_ms,
+                    )
+                })
+            {
                 return (
                     Response::err(
                         id,
@@ -846,7 +851,6 @@ pub(crate) async fn dispatch(
                     None,
                 );
             }
-            inner.force_submit.set(params.enabled, delay_ms);
             if params.enabled {
                 if let Some(messaging) = inner.workspace_messaging() {
                     messaging.force_submit_enabled();
