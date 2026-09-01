@@ -6119,9 +6119,11 @@ fn draw<B: Backend>(
     // read per frame is cheap, it cannot desynchronise from what the menu
     // just wrote, and it also covers a `config.toml` edited under a
     // running workspace.
-    // Repaint the host terminal's defaults when the theme's ink or ground
-    // changes. The ground fills the window padding around the grid; the ink
-    // keeps unstyled host text readable against it.
+    // When host palette theming is enabled, repaint the terminal's defaults
+    // when the theme's ink or ground changes. The ground fills the window
+    // padding around the grid; the ink keeps unstyled host text readable
+    // against it. Without an exact restoration pair, this leaves the host
+    // palette alone.
     // Here rather than at each theme site because the paint changes through
     // three of them: boot, the ThemeWatch reload, and the picker's live
     // preview. One comparison catches all three and emits nothing on the
