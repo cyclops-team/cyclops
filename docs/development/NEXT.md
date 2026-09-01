@@ -1,6 +1,7 @@
 # Current beta execution queue
 
-**Status:** Final acceptance corrections and evidence
+**Status:** Technical beta-acceptance decision complete for the audited
+candidate; operator release decision required
 
 **Integration branch:** **beta/messaging-rework**
 
@@ -10,15 +11,16 @@ stop conditions, and release gates. The
 control accepted Track A behavior.
 
 The approved implementation tracks are integrated into
-**beta/messaging-rework**. This page names only the next acceptance work;
-pull requests and their checks remain the authority for work in flight.
+**beta/messaging-rework**. The [final beta acceptance audit](CYCLOPS_BETA_FINAL_AUDIT.md)
+records the completed technical decision. Pull requests and their checks remain
+the authority for work in flight.
 
-## Current acceptance work
+## Current work
 
-1. Close any focused final-audit correction with its own regression evidence.
-2. Run the release-evidence lane against the exact resulting candidate.
-3. Reconcile release identity before naming or publishing a beta: the Cargo
+1. Reconcile release identity before naming or publishing a beta: the Cargo
    workspace version, remote tag history, and GitHub Release state must agree.
+2. If a candidate-relevant merge lands, run the release-evidence lane against
+   that exact resulting candidate before treating it as release-ready.
 
 The final audit is not a reason to weaken a contract. Preserve readable
 journals, honest uncertainty, no-silent-loss, `Daemon::deliver_payload`

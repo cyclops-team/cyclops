@@ -14,7 +14,9 @@ whole-product beta scope, dependencies, stop conditions, and release boundary.
 [NEXT.md](NEXT.md) is the current whole-beta execution queue. The
 [Messaging Beta audit](MESSAGING_BETA_AUDIT.md) preserves the original
 completion evidence, the independently found gaps, and the evidence that
-closed them.
+closed them. The [final beta acceptance audit](CYCLOPS_BETA_FINAL_AUDIT.md)
+records the technical beta-acceptance decision for the audited candidate, not
+release authorization, and the remaining operator release gate.
 
 The
 [messaging architecture review](../MESSAGING_ARCHITECTURE_REVIEW.md) and its
@@ -68,6 +70,7 @@ contracts, and historical records separate:
 | Approved implementation authority | [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) and [Cyclops Beta Charter](CYCLOPS_BETA_CHARTER.md) | The messaging charter controls accepted Track A behavior. The beta charter controls remaining scope, dependencies, stop conditions, and release gates. |
 | Current execution queue | [NEXT.md](NEXT.md) | Active track, authorized order, release boundary, and explicit exclusions. |
 | Messaging beta audit | [Messaging Beta audit](MESSAGING_BETA_AUDIT.md) | Revision-bound architecture, regression, performance, migration, reliability, and journey evidence, including the focused Track A acceptance corrections. |
+| Final beta acceptance | [Final beta acceptance audit](CYCLOPS_BETA_FINAL_AUDIT.md) | Revision-bound whole-product acceptance record, release evidence, remaining known limits, and operator release gate. |
 | Supporting design records | [Whole-system architecture review](../CYCLOPS_SYSTEM_ARCHITECTURE_REVIEW.md), [messaging architecture review](../MESSAGING_ARCHITECTURE_REVIEW.md), and [addendum](../ADDENDUM_REVIEW.md) | Revision-bound reasoning behind the charters, not independent implementation authority. |
 | CI design record | [CI and test architecture review](CI_TEST_ARCHITECTURE_REVIEW.md) | Evidence and rationale behind the implemented [CI contract](CI.md), not messaging authority. |
 | Measured evidence | [findings.md](../../findings.md) | Probe-backed constraints on current code. This is live evidence, not a roadmap or archive. |
@@ -125,7 +128,7 @@ are a rule implemented in a crate that should not have known about it.
 | `cyclops-proto` | Wire types, mailbox and journal schema, the legacy delivery state machine, the agent state model, the attention rule (what needs a human), scratch paths | Any IO. It does not know tmux exists, and it renders nothing |
 | `cyclops-manifest` | Manifest TOML schema, compiled rules, region parsing, priority evaluation | Deciding a pane's state (that is fusion), reading panes, hot reload (the daemon's job) |
 | `cyclops-tmux` | **Every tmux invocation in the product.** Control mode, reply correlation, flow control, the zero-polling pane table, layout capture and apply, focus | What an agent is. It has never heard of manifests, deliveries, or the ledger |
-| `cyclops-ledger` | Append, fsync, monotonic seq, torn-tail sealing, the cursor reader | What a line MEANS. The schema is `cyclops-proto`'s |
+| `cyclops-ledger` | Append, fsync, monotonic seq, strict and lenient torn-tail recovery, the cursor reader | What a line MEANS. The schema is `cyclops-proto`'s |
 | `cyclops-theme` | The semantic token vocabulary, the state-to-group mapping, theme files, selection, the reload rule | Painting. It resolves a token to a color; renderers turn colors into escape sequences |
 | `cyclops-client` | Hello-first daemon connection facts, bounded frames, request correlation, shared timeout defaults and certainty, refusal decoding, post-write uncertainty, and stream-gap classification | Domain policy, presentation, application retry schedules, projection restoration, or journal reads |
 | `cyclopsd` | The daemon: fusion, durable mailboxes, the notification worker, the legacy direct-delivery pipeline, the socket server, sender identity, the adoption registry, pane border chrome, hooks self-test, and journal read side | tmux specifics (adapter), the wire schema (proto), the attention rule (proto). It renders exactly one string: the border format |
@@ -380,11 +383,13 @@ taken from cmux's `events.jsonl` rather than invented.
 
 **Why:** the record is the product. It has to be readable with `less` and
 queryable with `jq` by a person who has never heard of Cyclops, months
-after the fact, possibly out of a bug report attachment. It has to survive
-a crash mid-write, which append-only gets nearly for free: a torn final
-line is sealed with a newline on the next open and skipped by readers, and
-nothing acknowledged is ever lost. And an audit you can edit is not an
-audit.
+after the fact, possibly out of a bug report attachment. It has to survive a
+crash mid-write, which append-only gets nearly for free. Every acknowledged
+append ends in a newline and is fsynced; newline-terminated records are
+immutable. An unterminated final tail was never acknowledged: lenient replay
+adds its terminating newline and retains it when it validates, otherwise skips
+it; strict workspace replay removes only that tail and logs a warning. Neither
+path alters a complete record. And an audit you can edit is not an audit.
 
 **Measured, so it is not a guess:** no index is needed. A 10,000-line scan
 takes 7.3ms, which is why `msg.history` is a scan and not a database.
@@ -397,9 +402,14 @@ rather than an offset.
 
 **Chosen:** state changes arrive as control-mode notifications and
 subscription pushes; reconciliation is triggered by an event or a request.
-One 30ms debounce, one-shot timers inside a live delivery, and one
-event-armed candidate lifecycle settle timer per pane. The lifecycle worker
-evaluates each candidate generation once per observation and then parks.
+The long-lived coordination timers are named one-shots: one 30ms debounce,
+bounded timers inside a live delivery, one event-armed candidate lifecycle
+settle timer per pane, one unclaimed reminder per attempt, optional exact
+force-submit deadlines, and bounded post-action evidence checkpoints. Competing
+force-submit schedulers wait for a resolution-release event when needed; durable
+intent elects at most one terminal key. The lifecycle worker evaluates each
+candidate generation once per observation and then parks. This is not an
+inventory of every bounded deadline in an explicit command or recovery action.
 
 **Rejected:** a 1Hz reconcile loop, which is the obvious design and would
 have been simpler.

@@ -9,10 +9,12 @@ Track A, the Messaging Beta Rework, is accepted. `WorkspaceMessaging` now owns
 current durable messaging policy. Retained session-journal discovery and replay
 go through the narrow compatibility-history adapter.
 
-The whole-product implementation tracks are integrated. The
-[Cyclops Beta Charter](docs/development/CYCLOPS_BETA_CHARTER.md) now governs
-final acceptance corrections and release evidence. No beta version or release
-name has been assigned: the Cargo version, existing `v0.2.0-beta` tag, and
+The whole-product implementation tracks and technical beta-acceptance decision
+are complete for the audited candidate, not release authorization. The
+[final beta acceptance audit](docs/development/CYCLOPS_BETA_FINAL_AUDIT.md)
+records the evidence and remaining known limits. No version or release name has
+been assigned for this candidate: the Cargo version, existing `v0.2.0-beta`
+tag at historical ancestor `1155a50ce1db9256b114b1f89d203935324ceb52`, and
 absence of GitHub Release objects still require operator-directed reconciliation.
 
 ## Built

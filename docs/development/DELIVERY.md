@@ -280,12 +280,21 @@ locator.
    manifest's submit key. Only successful terminal IO advances the attempt to
    `submitted`.
 
-   Automatic notification submit runs the full proof immediately before the
-   reservation and again after it. Both checks require the same pane-root,
-   terminal leader, agent generation, and manifest; no pane mode; a current
-   manifest state of `idle` or `idle_with_input`; and the exact attempt-owned
-   staged barrier with no live lifecycle or blocked-state conflict. A refusal
-   withholds Enter and settles once as `verify_failed`. It is never retried.
+   On the ordinary notification path, automatic submit runs the full proof
+   immediately before the reservation and again after it. Both checks require
+   the same pane-root, terminal leader, agent generation, and manifest; no pane
+   mode; a current manifest state of `idle` or `idle_with_input`; and the exact
+   attempt-owned staged barrier with no live lifecycle or blocked-state
+   conflict. A refusal withholds Enter and settles once as `verify_failed`. It
+   is never retried.
+
+   `notification.force_submit` is a separately documented default-off,
+   administrator-controlled fallback for one exact current `verify_failed`
+   doorbell. It never pastes or replaces bytes. After exact binding and route
+   checks, it records durable intent and may send one manifest submit key
+   without composer-content proof. It can therefore submit trailing human
+   input. Claim, withdrawal, replacement, settlement, a disabled setting, or
+   an uncertain outcome prevents another terminal action.
 
 An exact start normally ends on its matching hook end. When a measured vendor
 path emits no end hook, a manifest may mark one exact screen rule as lifecycle
@@ -604,11 +613,20 @@ durable recipient of that attempt and never enter the journal or daemon log.
 Complete and discard remain administrator-only. Requeue and alarm clearance
 remain explicit operator actions and never create an automatic retry loop.
 
-An exact-attempt `verify_failed` doorbell uses the same proof and settlement
-path automatically. Pending work selects one submit. An exact recipient claim
-ordered after the write selects one measured clear. The mailbox choice and
-durable intent share one lock. Human, trailing, changed, or unprovable content
-never reaches a terminal key.
+On the ordinary automatic recovery path, an exact-attempt `verify_failed`
+doorbell uses the same proof and settlement path. Pending work selects one
+submit. An exact recipient claim ordered after the write selects one measured
+clear. The mailbox choice and durable intent share one lock. On that ordinary
+path, human, trailing, changed, or unprovable content never reaches a terminal
+key.
+
+The separate `notification.force_submit` fallback is default off and
+administrator-controlled. It never writes or replaces composer bytes, but for
+one exact `verify_failed` attempt it may submit one key without composer-content
+proof and may therefore submit trailing human input. It still requires the
+exact binding and route, durable intent before terminal IO, at-most-once key
+ownership, and cancellation on claim, withdrawal, replacement, settlement, or
+disable.
 
 Before a terminal-key action, the daemon records one content-free resolution
 intent. If the terminal accepts the key, it records a separate content-free
