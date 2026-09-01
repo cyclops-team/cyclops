@@ -60,7 +60,7 @@ const RECEIPT_NAME: &str = ".cyclops-prepared.json";
 /// Sequence for same-directory temporary artifact names.
 static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum CliKind {
     Claude,
     Codex,
@@ -154,16 +154,7 @@ pub fn render_shared(kind: CliKind, cyclops_bin: &str) -> String {
 /// sessions permanently without lifecycle hooks.
 fn vendor_hook_file(kind: CliKind) -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    match kind {
-        CliKind::Claude => Some(home.join(".claude").join("settings.json")),
-        // User level, and not the project-local alternative. MEASURED
-        // Project-local .codex/hooks.json does not load until
-        // the directory is trusted, and in a non-interactive run that
-        // dialog can never be answered, so the hooks silently never fire.
-        CliKind::Codex => Some(crate::consumer::root(kind, &home).join("hooks.json")),
-        CliKind::Agy => Some(home.join(".agents").join("hooks.json")),
-        CliKind::Cursor => Some(crate::consumer::root(kind, &home).join("hooks.json")),
-    }
+    Some(crate::consumer::spec(kind).locations(&home).hook.path())
 }
 
 /// True for a hook entry this project wrote.
@@ -333,7 +324,6 @@ fn merge_into(dst: &mut serde_json::Value, src: &serde_json::Value) {
 
 #[derive(Clone, Copy)]
 pub(crate) enum WiringState {
-    Missing,
     Current,
     NeedsUpdate,
     Invalid,
@@ -343,7 +333,6 @@ pub(crate) enum WiringState {
 impl WiringState {
     pub(crate) fn word(self) -> &'static str {
         match self {
-            WiringState::Missing => "missing",
             WiringState::Current => "current",
             WiringState::NeedsUpdate => "needs_update",
             WiringState::Invalid => "invalid",
@@ -354,11 +343,6 @@ impl WiringState {
     pub(crate) fn ready(self) -> bool {
         matches!(self, WiringState::Current)
     }
-}
-
-pub(crate) struct WiringCheck {
-    pub path: Option<PathBuf>,
-    pub state: WiringState,
 }
 
 /// Evaluate hook wiring from bytes obtained by a caller-owned safe reader.
@@ -382,35 +366,6 @@ pub(crate) fn inspect_wiring_bytes(kind: CliKind, bytes: &[u8]) -> WiringState {
         WiringState::Current
     } else {
         WiringState::NeedsUpdate
-    }
-}
-
-/// Inspect fixed wiring by applying the current merge in memory.
-pub(crate) fn inspect_wiring(kind: CliKind) -> WiringCheck {
-    let Some(path) = vendor_hook_file(kind) else {
-        return WiringCheck {
-            path: None,
-            state: WiringState::Unreadable,
-        };
-    };
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return WiringCheck {
-                path: Some(path),
-                state: WiringState::Missing,
-            };
-        }
-        Err(_) => {
-            return WiringCheck {
-                path: Some(path),
-                state: WiringState::Unreadable,
-            };
-        }
-    };
-    WiringCheck {
-        path: Some(path),
-        state: inspect_wiring_bytes(kind, text.as_bytes()),
     }
 }
 

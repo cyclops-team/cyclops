@@ -6,7 +6,7 @@
 //! calm/firehose decision) is not this file's. [`crate::stream::Record`]
 //! owns it, backend-neutral, so a future workspace panel reads the same
 //! ordering and the same judgement. `App` holds one and is otherwise this
-//! renderer's own state: the sidebar roster and the focus-jump map (both
+//! renderer's own state: the sidebar roster and the pane-focus map (both
 //! navigation, not the record), and the key handling that turns keyboard
 //! and mouse input into that state moving.
 
@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use cyclops_proto::{Attention, AttentionItem, Eye};
 
-use crate::input::Key;
+use crate::key::Key;
 use crate::stream::{EndpointFilter, Entry, EntryKind, Filter, Record, StatusSeed};
 use crate::theme::Theme;
 
@@ -113,7 +113,7 @@ impl RosterRow {
 pub enum RowTarget {
     #[default]
     Nothing,
-    /// A sidebar agent row: click jumps focus to the pane.
+    /// A sidebar agent row: click focuses the pane.
     Agent(String),
     /// A stream entry row: click selects it.
     Entry(u64),
@@ -176,7 +176,7 @@ pub enum Command {
     /// Open a fresh event subscription. Only ever from a keystroke: the
     /// UI does not retry a dead socket on its own.
     Reconnect,
-    /// Jump focus to this pane id or agent label.
+    /// Focus this pane id or agent label.
     Focus(String),
 }
 
@@ -218,7 +218,7 @@ pub struct App {
     record: Record,
     eye: Eye,
     /// Agent label -> exact route, harvested from status and events only
-    /// (zero polling). Backs the focus jump.
+    /// (zero polling). Backs pane focus.
     panes: HashMap<String, PaneRoute>,
     /// Every watched pane, keyed by exact route: the sidebar's rows. Seeded
     /// from the one status answer, then moved by live events alone, the
@@ -240,13 +240,10 @@ pub struct App {
     /// Never a bare action. Resolving at drain time read whatever detail
     /// was open by then, so confirming on one row, leaving, and opening
     /// another built the first row's verb against the second's target.
-    pending: Option<(
-        crate::action_io::RequestToken,
-        crate::action_io::ActionRequest,
-    )>,
+    pending: Option<(crate::action::RequestToken, crate::action::ActionRequest)>,
     /// The one request that is out. Its answer is the only one allowed
     /// to touch the detail.
-    in_flight: Option<crate::action_io::RequestToken>,
+    in_flight: Option<crate::action::RequestToken>,
     /// The size the last frame was drawn at.
     ///
     /// Kept so the key handler can ask the same question the renderer
@@ -342,10 +339,7 @@ impl App {
 
     /// Persistent health copy followed by the current transient notice.
     pub fn notice_text(&self) -> Option<String> {
-        let health = self
-            .build_health
-            .as_ref()
-            .and_then(crate::health::BuildHealth::notice);
+        let health = self.build_health.as_ref().and_then(crate::health::notice);
         match (health, self.notice.as_deref()) {
             (Some(health), Some(notice)) => Some(format!("{health}; {notice}")),
             (Some(health), None) => Some(health),
@@ -355,7 +349,7 @@ impl App {
     }
 
     /// The request that is out, if any.
-    pub fn in_flight(&self) -> Option<&crate::action_io::RequestToken> {
+    pub fn in_flight(&self) -> Option<&crate::action::RequestToken> {
         self.in_flight.as_ref()
     }
 
@@ -382,10 +376,10 @@ impl App {
     /// nothing about it reaches the screen.
     pub fn apply_action(
         &mut self,
-        token: crate::action_io::RequestToken,
-        outcome: crate::action_io::ActionOutcome,
+        token: crate::action::RequestToken,
+        outcome: crate::action::ActionOutcome,
     ) {
-        use crate::action_io::ActionOutcome;
+        use crate::action::ActionOutcome;
         if self.in_flight.as_ref() != Some(&token) {
             return;
         }
@@ -450,11 +444,8 @@ impl App {
     /// and reloading it after its facts moved cannot drift apart.
     pub fn detail_read(
         &self,
-    ) -> Option<(
-        crate::action_io::RequestToken,
-        crate::action_io::ActionRequest,
-    )> {
-        use crate::action_io::{ActionRequest, RequestKind, RequestToken};
+    ) -> Option<(crate::action::RequestToken, crate::action::ActionRequest)> {
+        use crate::action::{ActionRequest, RequestKind, RequestToken};
         use crate::queue::{Direction, MailboxWord};
 
         let detail = self.detail.as_ref()?;
@@ -503,25 +494,22 @@ impl App {
     fn resolve_action(
         &mut self,
         action: crate::detail::Action,
-    ) -> Option<(
-        crate::action_io::RequestToken,
-        crate::action_io::ActionRequest,
-    )> {
-        use crate::action_io::{RequestKind, RequestToken};
+    ) -> Option<(crate::action::RequestToken, crate::action::ActionRequest)> {
+        use crate::action::{RequestKind, RequestToken};
         use crate::detail::Action;
         let detail = self.detail.as_mut()?;
         let frozen = detail.target().clone();
         let request = match (frozen.attempt, action) {
             (_, Action::Reply) => {
                 let key = detail.draft_mut().key_for_send(next_client_key);
-                crate::action_io::ActionRequest::Reply {
+                crate::action::ActionRequest::Reply {
                     message_id: frozen.target.message_id.clone(),
                     body: detail.draft().text().to_string(),
                     client_key: key,
                 }
             }
             (Some(attempt_id), Action::WithdrawNotification) => {
-                crate::action_io::ActionRequest::WithdrawNotification {
+                crate::action::ActionRequest::WithdrawNotification {
                     attempt_id,
                     recipient: frozen.target.recipient,
                 }
@@ -531,13 +519,13 @@ impl App {
             // under a new attempt, and the operator confirmed against the
             // evidence they were shown.
             (Some(attempt_id), Action::ClearAlarm) => {
-                crate::action_io::ActionRequest::ClearAlarm { attempt_id }
+                crate::action::ActionRequest::ClearAlarm { attempt_id }
             }
             (Some(attempt_id), Action::AttentionComplete) => {
-                crate::action_io::ActionRequest::AttentionComplete { attempt_id }
+                crate::action::ActionRequest::AttentionComplete { attempt_id }
             }
             (Some(attempt_id), Action::AttentionDiscard) => {
-                crate::action_io::ActionRequest::AttentionDiscard { attempt_id }
+                crate::action::ActionRequest::AttentionDiscard { attempt_id }
             }
             // An attention verb with no attempt frozen never becomes a
             // request.
@@ -567,10 +555,7 @@ impl App {
     /// matched back to it.
     pub fn take_pending(
         &mut self,
-    ) -> Option<(
-        crate::action_io::RequestToken,
-        crate::action_io::ActionRequest,
-    )> {
+    ) -> Option<(crate::action::RequestToken, crate::action::ActionRequest)> {
         if self.in_flight.is_some() {
             return None;
         }
@@ -582,10 +567,7 @@ impl App {
     /// The read a detail is owed, marked in flight.
     pub fn take_detail_read(
         &mut self,
-    ) -> Option<(
-        crate::action_io::RequestToken,
-        crate::action_io::ActionRequest,
-    )> {
+    ) -> Option<(crate::action::RequestToken, crate::action::ActionRequest)> {
         if !self.refresh.may_mutate() || self.in_flight.is_some() || !self.detail_read_owed() {
             return None;
         }
@@ -735,6 +717,19 @@ impl App {
         self.eye != self.eye_target()
     }
 
+    /// Forget every value owned by the stream projection before installing a
+    /// daemon snapshot for a new subscription epoch. Mailbox state is separate
+    /// and is replaced by `messages.snapshot` on its own cursor contract.
+    pub fn clear_stream_projection(&mut self) {
+        self.record = Record::new();
+        self.panes.clear();
+        self.roster.clear();
+        self.admin_unread = 0;
+        self.filter_routes.clear();
+        self.selected = None;
+        self.top = None;
+    }
+
     /// One line replayed from the record: it goes on the screen and
     /// nowhere else ([`crate::stream::Record::replay`]).
     pub fn replay(&mut self, e: Entry) {
@@ -744,7 +739,7 @@ impl App {
 
     /// One live event from the daemon: it goes on the record AND moves the
     /// register ([`crate::stream::Record::live`]). This renderer's own
-    /// navigation state (the sidebar row and the focus-jump map) moves
+    /// navigation state (the sidebar row and the pane-focus map) moves
     /// on the same live edge, and only live: a replayed line is old news
     /// and must not restart anyone's clock.
     ///
@@ -780,7 +775,7 @@ impl App {
     }
 
     /// Harvest the label -> pane map from a State entry, replayed or live
-    /// alike: a replayed line may still be the freshest naming the jump
+    /// alike: a replayed line may still be the freshest naming the pane
     /// has. The seed lands after the replayed tail and live events after
     /// the seed, so the newest naming always wins.
     fn observe_pane_name(&mut self, e: &Entry) {
@@ -838,7 +833,7 @@ impl App {
     /// Startup reconciliation from the daemon's one status answer.
     ///
     /// This renderer's own navigation state first: the sidebar roster (1)
-    /// and the focus-jump map (2) are seeded fresh from the same answer,
+    /// and the pane-focus map (2) are seeded fresh from the same answer,
     /// for the same reason the register is replaced whole rather than
     /// merged (anything the answer does not list is gone). Replacing the
     /// register and writing the lines and clearances every count on
@@ -882,7 +877,7 @@ impl App {
                 )
             })
             .collect();
-        // 2. Refresh the jump map, which outlives the roster: a label the
+        // 2. Refresh the pane-focus map, which outlives the roster: a label the
         //    answer still names points at the pane the answer named.
         for p in &seed.roster {
             self.panes
@@ -1301,7 +1296,7 @@ impl App {
             }
             Key::Char('a') => self.show_roster = !self.show_roster,
             // A click means what the clicked cell means: a sidebar agent
-            // jumps focus (the act the sidebar exists for), a stream entry
+            // focuses the pane (the act the sidebar exists for), a stream entry
             // becomes the selection, dead space does nothing. The frame
             // wrote row_targets as it laid the screen out, so the mouse
             // and the eye agree about what is where; x picks the half.
@@ -1350,7 +1345,7 @@ impl App {
                 }
                 // Resolution may have left a more specific notice already.
                 if self.notice.is_none() {
-                    self.notice = Some("nothing to jump to on this line".into());
+                    self.notice = Some("no pane to focus on this line".into());
                 }
             }
             _ => {}
@@ -2046,7 +2041,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_jumps_via_the_harvested_pane_map() {
+    fn enter_focuses_via_the_harvested_pane_map() {
         let mut a = app();
         a.view = View::Firehose;
         a.seed_status(seed(&[("codex", "%7", AgentState::Idle)], Vec::new()));

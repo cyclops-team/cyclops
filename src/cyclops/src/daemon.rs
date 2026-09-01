@@ -81,22 +81,26 @@ pub fn ensure_running(home: &Path) -> Result<Started, String> {
 
 /// Start the daemon from an already validated active pair.
 pub fn ensure_running_from(home: &Path, exe: &Path) -> Result<Started, String> {
-    start_and_prove_from(home, exe, crate::BUILD_REF)
+    start_and_prove_from(
+        home,
+        exe,
+        &cyclops_client::RuntimeIdentity::current_client(),
+    )
 }
 
-/// Start one exact daemon and retain ownership until its executable and build
-/// match the selected pair. A failed proof drops the guard, which kills and
-/// reaps only the process this call spawned.
+/// Start one exact daemon and retain ownership until its executable, Cargo
+/// version, and source build match the selected pair. A failed proof drops the
+/// guard, which kills and reaps only the process this call spawned.
 pub(crate) fn start_and_prove_from(
     home: &Path,
     exe: &Path,
-    build: &str,
+    identity: &cyclops_client::RuntimeIdentity,
 ) -> Result<Started, String> {
     if is_up() {
         return Ok(Started::AlreadyRunning);
     }
     let mut child = spawn_daemon(home, exe)?;
-    if let Err(error) = prove_running_pair_generation(exe, build, child.process()) {
+    if let Err(error) = prove_running_pair_generation(exe, identity, child.process()) {
         return Err(format!(
             "spawned daemon failed selected-pair proof and was stopped: {error}"
         ));
@@ -130,7 +134,7 @@ fn spawn_daemon(home: &Path, exe: &Path) -> Result<SpawnedDaemon, String> {
         .map_err(|e| format!("start {}: {e}", exe.display()))?;
     wait_for_spawned_daemon(child, &log, BOOT_WAIT, || match Client::connect() {
         Ok(client) => Ok(BootSocket::Answering(client.hello().daemon_process)),
-        Err(ClientError::NotRunning | ClientError::ConnectTimeout(_)) => Ok(BootSocket::Absent),
+        Err(ClientError::NotRunning(_) | ClientError::ConnectTimeout(_)) => Ok(BootSocket::Absent),
         Err(error) => Err(crate::copy::client_error(&error, None)),
     })
 }
@@ -353,7 +357,7 @@ const GENERATION_REQUIRED: &str = "the running cyclopsd does not report an exact
 struct AuthenticatedDaemon {
     client: Client,
     process: ProcessInstanceId,
-    build: Option<String>,
+    identity: cyclops_client::RuntimeIdentity,
     executable: String,
     boot_id: String,
 }
@@ -373,7 +377,7 @@ fn authenticate(mut client: Client) -> Result<AuthenticatedDaemon, Authenticatio
         .daemon_executable
         .clone()
         .ok_or(AuthenticationError::Predates)?;
-    let hello_build = client.hello().build.clone();
+    let hello_identity = cyclops_client::RuntimeIdentity::from_hello(client.hello());
     let hello_boot = client.hello().boot_id.clone();
     let status: StatusResult =
         serde_json::from_value(client.request("status", serde_json::json!({})).map_err(
@@ -381,7 +385,8 @@ fn authenticate(mut client: Client) -> Result<AuthenticatedDaemon, Authenticatio
         )?)
         .map_err(|error| AuthenticationError::Failed(format!("decode daemon status: {error}")))?;
     if status.daemon_process != Some(hello_process)
-        || status.daemon_build != hello_build
+        || status.daemon_version != hello_identity.version
+        || status.daemon_build != hello_identity.build
         || status.daemon_executable.as_deref() != Some(hello_executable.as_str())
         || status.boot_id != hello_boot
     {
@@ -398,7 +403,7 @@ fn authenticate(mut client: Client) -> Result<AuthenticatedDaemon, Authenticatio
     Ok(AuthenticatedDaemon {
         client,
         process: hello_process,
-        build: hello_build,
+        identity: hello_identity,
         executable: hello_executable,
         boot_id: hello_boot,
     })
@@ -406,15 +411,29 @@ fn authenticate(mut client: Client) -> Result<AuthenticatedDaemon, Authenticatio
 
 fn prove_running_pair_generation(
     executable: &Path,
-    build: &str,
+    identity: &cyclops_client::RuntimeIdentity,
     process: ProcessInstanceId,
 ) -> Result<(), String> {
-    prove_running_pair_expected(executable, build, Some(process))
+    prove_running_pair_expected(executable, identity, Some(process))
+}
+
+fn prove_runtime_identity(
+    expected: &cyclops_client::RuntimeIdentity,
+    running: &cyclops_client::RuntimeIdentity,
+) -> Result<(), String> {
+    if running == expected {
+        return Ok(());
+    }
+    Err(format!(
+        "running daemon identity {} does not match selected identity {}",
+        running.description(),
+        expected.description()
+    ))
 }
 
 fn prove_running_pair_expected(
     executable: &Path,
-    build: &str,
+    identity: &cyclops_client::RuntimeIdentity,
     expected_process: Option<ProcessInstanceId>,
 ) -> Result<(), String> {
     let expected = std::fs::canonicalize(executable)
@@ -441,12 +460,7 @@ fn prove_running_pair_expected(
             running.executable
         ));
     }
-    if running.build.as_deref() != Some(build) {
-        return Err(format!(
-            "running daemon build {:?} does not match selected build {build}",
-            running.build
-        ));
-    }
+    prove_runtime_identity(identity, &running.identity)?;
     Ok(())
 }
 
@@ -554,7 +568,12 @@ pub fn restart(home: &Path) -> Result<u32, RestartRefusal> {
     })?;
     let pid = stop_selected_for_pair_change(&executable)?
         .ok_or_else(|| RestartRefusal::Failed("cyclopsd is not running.".to_string()))?;
-    let started = start_and_prove_from(home, &executable, crate::BUILD_REF).map_err(|error| {
+    let started = start_and_prove_from(
+        home,
+        &executable,
+        &cyclops_client::RuntimeIdentity::current_client(),
+    )
+    .map_err(|error| {
         RestartRefusal::Failed(format!(
             "original daemon pid {pid} is stopped; restart candidate did not remain active: {error}"
         ))
@@ -597,7 +616,7 @@ fn stop_for_pair_change_expected(
         Duration::from_millis(QUIESCE_ASK_MS + 5_000),
     ) {
         Ok(client) => client,
-        Err(ClientError::NotRunning) => return Ok(None),
+        Err(ClientError::NotRunning(_)) => return Ok(None),
         Err(error) => {
             return Err(RestartRefusal::Failed(crate::copy::client_error(
                 &error, None,
@@ -674,7 +693,7 @@ pub fn stop() -> Result<u32, String> {
             Err(AuthenticationError::Predates) => return Err(GENERATION_REQUIRED.to_string()),
             Err(AuthenticationError::Failed(error)) => return Err(error),
         },
-        Err(ClientError::NotRunning) => return Err("cyclopsd is not running.".to_string()),
+        Err(ClientError::NotRunning(_)) => return Err("cyclopsd is not running.".to_string()),
         Err(e) => return Err(crate::copy::client_error(&e, None)),
     };
     if !generation_matches(running.process, observe_process(running.process.pid())) {
@@ -819,6 +838,16 @@ mod tests {
         assert!(generation_matches(expected, Some(expected)));
         assert!(!generation_matches(expected, Some(reused)));
         assert!(!generation_matches(expected, None));
+    }
+
+    #[test]
+    fn startup_refuses_semantic_version_drift_even_when_the_build_matches() {
+        let selected = cyclops_client::RuntimeIdentity::new("0.1.0", Some("same-build"));
+        let running = cyclops_client::RuntimeIdentity::new("0.0.9", Some("same-build"));
+
+        let error = prove_runtime_identity(&selected, &running).unwrap_err();
+        assert!(error.contains("0.1.0 (same-build)"), "{error}");
+        assert!(error.contains("0.0.9 (same-build)"), "{error}");
     }
 
     #[cfg(target_os = "linux")]

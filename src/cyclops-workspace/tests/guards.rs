@@ -45,3 +45,27 @@ fn no_direct_tmux_invocation_in_workspace() {
         );
     }
 }
+
+/// This syntactic tripwire checks only the spellings listed below. It does
+/// not prove Files behavior or exclude every filesystem API; review enforces
+/// the broader ownership rule.
+#[test]
+fn file_tree_model_does_not_name_listed_filesystem_spellings() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/files.rs");
+    let text = std::fs::read_to_string(&path).expect("read file tree model");
+    let production = text
+        .split_once("#[cfg(test)]")
+        .map_or(text.as_str(), |(production, _)| production);
+    for forbidden in [
+        "std::fs::",
+        "std::time::UNIX_EPOCH",
+        "read_dir(",
+        ".metadata(",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "filesystem operation {forbidden:?} found in {}",
+            path.display()
+        );
+    }
+}

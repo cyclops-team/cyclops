@@ -6,13 +6,13 @@ description = "Cyclops terminal workspace: pane VT runtimes and the full-screen 
 
 [dependencies]
 alacritty_terminal = "0.26"
+cyclops-client.workspace = true
 cyclops-proto.workspace = true
 cyclops-state.workspace = true
 cyclops-theme.workspace = true
 cyclops-tmux.workspace = true
-cyclops-ui.workspace = true
+cyclops-ui = { workspace = true, features = ["watch"] }
 crossterm = "0.29"
-libc.workspace = true
 ratatui = "0.30"
 serde_json.workspace = true
 thiserror.workspace = true

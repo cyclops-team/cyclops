@@ -12,7 +12,7 @@ cyclops-testrig.workspace = true
 # The stream reader, so the restart path can be driven end to end: what
 # the daemon writes at boot has to be read by the surface that draws the
 # eye, or the two only agree in a hand-written fixture.
-cyclops-ui.workspace = true
+cyclops-ui = { workspace = true, features = ["presentation"] }
 
 [dependencies]
 cyclops-proto.workspace = true

@@ -1,11 +1,11 @@
-//! Data plumbing: the daemon subscription and the startup reconciliation,
-//! each on its own task feeding bounded result lanes. The event loop only
-//! ever receives; it never blocks on the daemon.
+//! Data plumbing: the daemon subscription owns each connection epoch's
+//! reconciliation, while action and message workers feed separate bounded
+//! result lanes. The event loop only ever receives; it never blocks on the
+//! daemon.
 //!
-//! Zero polling: the subscription pushes, the status request and ledger
-//! backfill run once, and message snapshots run only after a subscription
-//! acknowledgement or a pushed invalidation. No task owns a repeating
-//! timer.
+//! Zero polling: the subscription pushes, status and daemon backfill run once
+//! per acknowledged connection, and message snapshots run only after that
+//! acknowledgement or a pushed invalidation. No task owns a repeating timer.
 //!
 //! Because that request runs ONCE, everything the register learns after
 //! startup arrives on the subscription, including the fact that a pane is
@@ -13,26 +13,25 @@
 //! the same question, and it is the answer this file is not allowed to
 //! give: see `cyclops_proto::attention`, "what may feed the register".
 //!
-//! This is `cyclops watch`'s own transport: a Unix socket and an NDJSON
-//! ledger directory. The ordering discipline that reconciles what it
+//! This is `cyclops watch`'s concrete socket adapter. Journal ownership stays
+//! in the daemon; the UI receives a bounded, body-free projection. The
+//! ordering discipline that reconciles what it
 //! fetches (backfill tail, then the seed, then the live backlog) is
-//! backend-neutral and lives in `stream.rs` ([`crate::stream::Intake`]) so
+//! backend-neutral and lives in `projection.rs` ([`crate::StreamProjectionState`]) so
 //! a caller with a different transport gets the same guarantee.
 
 use std::path::Path;
+use std::sync::Arc;
 
-use cyclops_proto::{Event, MessagesChangedData, StatusResult};
-use cyclops_state::StateRoot;
-use serde_json::Value;
-use tokio::io::AsyncWriteExt;
-use tokio::net::UnixStream;
+use cyclops_proto::{Event, MessagesChangedData, StatusResult, StreamBackfillResult};
 use tokio::sync::mpsc;
 
-use crate::input::Key;
+use crate::key::Key;
 use crate::messages::RefreshRequest;
+use crate::projection::{project_backfill, BackfillReport, StreamProjection};
 use crate::stream::Entry;
 use crate::stream::StatusSeed;
-use crate::wire::{encode_json, FrameReader};
+use cyclops_client::{AsyncClient, ClientError};
 
 type UiError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -40,12 +39,9 @@ type UiError = Box<dyn std::error::Error + Send + Sync>;
 pub enum UiMsg {
     Key(Key),
     Entry(Box<Entry>),
-    Backfill {
-        entries: Vec<Entry>,
-        max_seq: Option<u64>,
-    },
-    /// The one-shot startup reconciliation.
-    Status(Box<StatusSeed>),
+    /// One daemon-owned, bounded replacement for the stream projection.
+    /// It lands atomically before live events from the same subscription.
+    StreamProjection(Box<StreamProjection>),
     /// The event subscription is acknowledged and can no longer miss an
     /// invalidation before the first snapshot starts on its own socket.
     Subscribed,
@@ -91,16 +87,9 @@ pub enum UiMsg {
     /// A detail read or action came back, under the token it was sent
     /// with. The token is what decides whether it may be applied.
     ActionDone {
-        token: crate::action_io::RequestToken,
-        outcome: Box<crate::action_io::ActionOutcome>,
+        token: crate::action::RequestToken,
+        outcome: Box<crate::action::ActionOutcome>,
     },
-}
-
-pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// The event loop starts at most one request of each kind. A single slot
@@ -120,8 +109,38 @@ pub struct UiSinks {
 /// Requests for generation-stamped message snapshots.
 pub type MessagesRefresh = mpsc::Sender<RefreshRequest>;
 
-/// Spawn the IO tasks. `home` is the cyclops home (socket + ledger).
-pub fn spawn_io(sinks: &UiSinks, home: &Path, backfill: usize) -> Io {
+/// Concrete launcher-owned pane focus effect. Presentation emits a target;
+/// the terminal adapter decides how that target is reached.
+type FocusEffect = dyn Fn(&str) -> Result<(), String> + Send + Sync;
+
+#[derive(Clone)]
+pub struct FocusPane {
+    focus: Arc<FocusEffect>,
+}
+
+impl FocusPane {
+    /// Wrap the launcher's pane-focus effect without exposing its terminal
+    /// connection details to the view.
+    pub fn new(focus: impl Fn(&str) -> Result<(), String> + Send + Sync + 'static) -> FocusPane {
+        FocusPane {
+            focus: Arc::new(focus),
+        }
+    }
+
+    /// Ask the launcher to focus one exact pane id.
+    pub fn focus(&self, target: &str) -> Result<(), String> {
+        (self.focus)(target)
+    }
+}
+
+impl std::fmt::Debug for FocusPane {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("FocusPane(..)")
+    }
+}
+
+/// Spawn the IO tasks. `home` supplies the daemon socket location.
+pub fn spawn_io(sinks: &UiSinks, home: &Path, backfill: usize, focus: Option<FocusPane>) -> Io {
     let sock = home.join(cyclops_proto::SOCK_NAME);
     let (reconnect_tx, reconnect_rx) = mpsc::channel(REQUEST_CAPACITY);
     reconnect_tx
@@ -131,11 +150,6 @@ pub fn spawn_io(sinks: &UiSinks, home: &Path, backfill: usize) -> Io {
         sinks.events.clone(),
         sock.clone(),
         reconnect_rx,
-    ));
-    tokio::spawn(seed_task(
-        sinks.snapshots.clone(),
-        sock.clone(),
-        home.join("ledger"),
         backfill,
     ));
     let (refresh_tx, refresh_rx) = mpsc::channel(REQUEST_CAPACITY);
@@ -153,7 +167,7 @@ pub fn spawn_io(sinks: &UiSinks, home: &Path, backfill: usize) -> Io {
     let (action_tx, action_rx) = mpsc::channel(REQUEST_CAPACITY);
     tokio::spawn(action_task(sinks.actions.clone(), sock, action_rx));
     let (focus_tx, focus_rx) = mpsc::channel(REQUEST_CAPACITY);
-    tokio::spawn(focus_task(sinks.actions.clone(), focus_rx));
+    tokio::spawn(focus_task(sinks.actions.clone(), focus_rx, focus));
     Io {
         reconnect: reconnect_tx,
         refresh: refresh_tx,
@@ -169,24 +183,37 @@ pub struct Io {
     pub reconnect: mpsc::Sender<()>,
     pub refresh: MessagesRefresh,
     pub follow: mpsc::Sender<crate::messages::FollowRequest>,
-    pub action: mpsc::Sender<(
-        crate::action_io::RequestToken,
-        crate::action_io::ActionRequest,
-    )>,
+    pub action: mpsc::Sender<(crate::action::RequestToken, crate::action::ActionRequest)>,
     /// One active tmux focus call and at most one queued request.
     pub focus: mpsc::Sender<String>,
 }
 
-async fn focus_task(tx: mpsc::Sender<UiMsg>, mut rx: mpsc::Receiver<String>) {
+async fn focus_task(
+    tx: mpsc::Sender<UiMsg>,
+    mut rx: mpsc::Receiver<String>,
+    focus: Option<FocusPane>,
+) {
     while let Some(pane) = rx.recv().await {
         let target = pane.clone();
-        let result =
-            tokio::task::spawn_blocking(move || cyclops_tmux::focus_pane(None, None, &target))
-                .await;
+        let result = match focus.clone() {
+            Some(focus) => tokio::task::spawn_blocking(move || focus.focus(&target)).await,
+            None => {
+                if tx
+                    .send(UiMsg::Notice(format!(
+                        "can't focus {pane}: this launcher has no pane-focus adapter"
+                    )))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                continue;
+            }
+        };
         let notice = match result {
             Ok(Ok(())) => continue,
-            Ok(Err(error)) => format!("can't jump to {pane}: {error}"),
-            Err(error) => format!("can't jump to {pane}: focus worker failed: {error}"),
+            Ok(Err(error)) => format!("can't focus {pane}: {error}"),
+            Err(error) => format!("can't focus {pane}: focus worker failed: {error}"),
         };
         if tx.send(UiMsg::Notice(notice)).await.is_err() {
             return;
@@ -236,10 +263,7 @@ async fn follow_task(
 async fn action_task(
     tx: mpsc::Sender<UiMsg>,
     sock: std::path::PathBuf,
-    mut rx: mpsc::Receiver<(
-        crate::action_io::RequestToken,
-        crate::action_io::ActionRequest,
-    )>,
+    mut rx: mpsc::Receiver<(crate::action::RequestToken, crate::action::ActionRequest)>,
 ) {
     while let Some((token, request)) = rx.recv().await {
         let outcome = crate::action_io::perform(&sock, request).await;
@@ -311,95 +335,14 @@ async fn messages_task(
 /// good snapshot stays on screen either way. They are split so there is
 /// one timeout contract to reason about rather than two.
 async fn messages_snapshot(sock: &Path) -> Result<cyclops_proto::MessagesSnapshotResult, UiError> {
-    let open = tokio::time::timeout(crate::action_io::OPEN_TIMEOUT, snapshot_open(sock));
-    let (mut lines, mut w) = match open.await {
-        Ok(opened) => opened?,
-        Err(_) => {
-            return Err(format!(
-                "no connection within {}s",
-                crate::action_io::OPEN_TIMEOUT.as_secs()
-            )
-            .into())
-        }
-    };
-    let answer = tokio::time::timeout(
-        crate::action_io::ANSWER_TIMEOUT,
-        snapshot_ask(&mut lines, &mut w),
-    );
-    match answer.await {
-        Ok(result) => result,
-        Err(_) => Err(format!(
-            "no answer within {}s",
-            crate::action_io::ANSWER_TIMEOUT.as_secs()
+    let mut client = open_client(sock).await?;
+    let result = client
+        .request(
+            "messages.snapshot",
+            serde_json::json!({}),
+            crate::action_io::ANSWER_TIMEOUT,
         )
-        .into()),
-    }
-}
-
-async fn messages_follow(
-    sock: &Path,
-    request: crate::messages::FollowRequest,
-) -> Result<cyclops_proto::MessagesFollowResult, UiError> {
-    let open = tokio::time::timeout(crate::action_io::OPEN_TIMEOUT, snapshot_open(sock));
-    let (mut lines, mut w) = match open.await {
-        Ok(opened) => opened?,
-        Err(_) => {
-            return Err(format!(
-                "no connection within {}s",
-                crate::action_io::OPEN_TIMEOUT.as_secs()
-            )
-            .into())
-        }
-    };
-    let answer = tokio::time::timeout(
-        crate::action_io::ANSWER_TIMEOUT,
-        follow_ask(&mut lines, &mut w, request),
-    );
-    match answer.await {
-        Ok(result) => result,
-        Err(_) => Err(format!(
-            "no answer within {}s",
-            crate::action_io::ANSWER_TIMEOUT.as_secs()
-        )
-        .into()),
-    }
-}
-
-type SnapshotReader = FrameReader<tokio::net::unix::OwnedReadHalf>;
-
-/// Connect and read the greeting. Nothing has been asked for yet.
-async fn snapshot_open(
-    sock: &Path,
-) -> Result<(SnapshotReader, tokio::net::unix::OwnedWriteHalf), UiError> {
-    let stream = UnixStream::connect(sock).await?;
-    let (r, w) = stream.into_split();
-    let mut frames = FrameReader::new(r);
-    // Same rule as action_io: the greeting has to be one. A socket that
-    // closes before greeting, or something else listening on the path,
-    // is a failed read and says so, rather than a snapshot request
-    // written into whatever is on the other end.
-    match frames.next_frame().await? {
-        Some(frame) => {
-            serde_json::from_slice::<cyclops_proto::Hello>(&frame)
-                .map_err(|_| "not a cyclops daemon")?;
-        }
-        None => return Err("closed before the hello".into()),
-    }
-    Ok((frames, w))
-}
-
-/// Ask, then read until the answer rather than an event.
-async fn snapshot_ask(
-    frames: &mut SnapshotReader,
-    w: &mut tokio::net::unix::OwnedWriteHalf,
-) -> Result<cyclops_proto::MessagesSnapshotResult, UiError> {
-    w.write_all(b"{\"id\":1,\"method\":\"messages.snapshot\",\"params\":{}}\n")
         .await?;
-    let frame = frames
-        .next_frame()
-        .await?
-        .ok_or("messages.snapshot connection closed before an answer")?;
-    let result = response_result(&frame, "messages.snapshot")?;
     let snapshot: cyclops_proto::MessagesSnapshotResult = serde_json::from_value(result)?;
     let queue_rows = snapshot.rows.iter().fold(0usize, |count, row| {
         count.saturating_add(row.recipients.len())
@@ -414,27 +357,21 @@ async fn snapshot_ask(
     Ok(snapshot)
 }
 
-async fn follow_ask(
-    frames: &mut SnapshotReader,
-    w: &mut tokio::net::unix::OwnedWriteHalf,
+async fn messages_follow(
+    sock: &Path,
     request: crate::messages::FollowRequest,
 ) -> Result<cyclops_proto::MessagesFollowResult, UiError> {
-    let request_line = serde_json::json!({
-        "id": 1,
-        "method": "messages.follow",
-        "params": {
-            "after_seq": request.after_seq(),
-            "limit": request.limit(),
-        }
-    });
-    let mut request_line = encode_json(&request_line)?;
-    request_line.push(b'\n');
-    w.write_all(&request_line).await?;
-    let frame = frames
-        .next_frame()
-        .await?
-        .ok_or("messages.follow returned no answer")?;
-    let result = response_result(&frame, "messages.follow")?;
+    let mut client = open_client(sock).await?;
+    let result = client
+        .request(
+            "messages.follow",
+            serde_json::json!({
+                "after_seq": request.after_seq(),
+                "limit": request.limit(),
+            }),
+            crate::action_io::ANSWER_TIMEOUT,
+        )
+        .await?;
     let page: cyclops_proto::MessagesFollowResult = serde_json::from_value(result)?;
     if page.rows.len() > request.limit() as usize {
         return Err(format!(
@@ -447,21 +384,11 @@ async fn follow_ask(
     Ok(page)
 }
 
-fn response_result(frame: &[u8], method: &str) -> Result<Value, UiError> {
-    let response: cyclops_proto::Response = serde_json::from_slice(frame)
-        .map_err(|error| format!("{method} returned malformed JSON: {error}"))?;
-    if response.id != 1 {
-        return Err(format!("{method} returned the wrong response id").into());
-    }
-    if let Some(error) = response.error {
-        return Err(format!("{method} {}: {}", error.code, error.message).into());
-    }
-    response
-        .result
-        .ok_or_else(|| format!("{method} returned no result").into())
+async fn open_client(sock: &Path) -> Result<AsyncClient, ClientError> {
+    AsyncClient::connect(sock, crate::action_io::OPEN_TIMEOUT).await
 }
 
-/// The startup reconciliation, in the one order that can be right.
+/// One connection epoch's reconciliation, in the one order that can be right.
 ///
 /// 1. Ask the daemon where things stand. Its answer names the sessions it
 ///    watches, where every pane is, and every delivery its fold still
@@ -471,55 +398,42 @@ fn response_result(frame: &[u8], method: &str) -> Result<Value, UiError> {
 ///    from a session nobody watches would put lines on screen that no
 ///    count owns and no event can ever clear, so the two halves have to
 ///    agree on which sessions exist, and the daemon's list is the one.
-/// 3. Send the seed first, the tail second. `Intake` orders them back:
-///    the tail is history, the seed is now, live entries are newer still.
+/// 3. Return both as one replacement projection. The consumer applies the
+///    tail as history, the seed as now, then live entries from this connection.
 ///
-/// A daemon that does not answer costs the scope, not the tail: the
-/// backfill falls back to a bounded set of ledger files on disk, and the
-/// surface reports any omitted or unreadable history as a gap.
-async fn seed_task(
-    tx: mpsc::Sender<UiMsg>,
-    sock: std::path::PathBuf,
-    ledger_dir: std::path::PathBuf,
-    backfill: usize,
-) {
-    let seed = match status_seed(&sock).await {
+/// A daemon that does not answer leaves both projections unavailable. The
+/// surface reports that gap and points to the durable history command; it
+/// never guesses journal paths or reads storage behind the daemon.
+async fn stream_projection(sock: &Path, backfill: usize) -> StreamProjection {
+    let mut warnings = Vec::new();
+    let seed = match status_seed(sock).await {
         Ok(seed) => Some(seed),
         Err(error) => {
-            if tx
-                .send(UiMsg::Notice(format!(
-                    "startup status unavailable; state may be incomplete: {error}"
-                )))
-                .await
-                .is_err()
-            {
-                return;
-            }
+            warnings.push(format!(
+                "status snapshot unavailable; state may be incomplete: {error}"
+            ));
             None
         }
     };
-    let watched = seed.as_ref().map(|s| s.watched.clone());
-    if let Some(seed) = seed {
-        if tx.send(UiMsg::Status(Box::new(seed))).await.is_err() {
-            return;
-        }
+    let report = match stream_backfill(sock, backfill).await {
+        Ok(result) => project_backfill(result),
+        Err(error) => BackfillReport {
+            entries: Vec::new(),
+            max_seq: None,
+            warning: Some(format!(
+                "backfill unavailable; stream history has a gap: {error}. Use cyclops history for the durable record"
+            )),
+        },
+    };
+    if let Some(warning) = report.warning {
+        warnings.push(warning);
     }
-    let _ = tokio::task::spawn_blocking(move || {
-        let report = read_backfill_report(&ledger_dir, backfill, watched.as_deref());
-        if tx
-            .blocking_send(UiMsg::Backfill {
-                entries: report.entries,
-                max_seq: report.max_seq,
-            })
-            .is_err()
-        {
-            return;
-        }
-        if let Some(warning) = report.warning {
-            let _ = tx.blocking_send(UiMsg::Notice(warning));
-        }
-    })
-    .await;
+    StreamProjection {
+        seed: seed.map(Box::new),
+        entries: report.entries,
+        max_seq: report.max_seq,
+        warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
+    }
 }
 
 /// The live stream: acknowledge subscription, then forward records and
@@ -529,17 +443,67 @@ async fn subscription_task(
     tx: mpsc::Sender<UiMsg>,
     sock: std::path::PathBuf,
     mut reconnect: mpsc::Receiver<()>,
+    backfill: usize,
 ) {
     // This is the only owner of an event socket. A capacity-one command
     // lane coalesces repeated R presses without creating overlapping
     // generations or an unbounded queue of future retries.
+    let mut projection_landed = false;
     while reconnect.recv().await.is_some() {
         while reconnect.try_recv().is_ok() {}
-        let text = match subscribe_loop(&tx, &sock).await {
-            Ok(()) => broken_words("the connection closed; the live stream may have a gap"),
-            Err(e) if e.starts_with("cyclops isn't running") => e,
-            Err(e) => broken_words(&format!("{e}; the live stream may have a gap")),
+        let (text, this_projection_landed) = match subscribe_loop(&tx, &sock, backfill).await {
+            Ok(landed) => (
+                broken_words("the connection closed; the live stream may have a gap"),
+                landed,
+            ),
+            Err(failure) if failure.cause.starts_with("cyclops isn't running") => {
+                projection_landed |= failure.projection_landed;
+                if !projection_landed
+                    && tx
+                        .send(UiMsg::StreamProjection(Box::new(StreamProjection {
+                            seed: None,
+                            entries: Vec::new(),
+                            max_seq: None,
+                            warning: Some(format!(
+                                "stream snapshot unavailable; state may be incomplete: {}",
+                                failure.cause
+                            )),
+                        })))
+                        .await
+                        .is_err()
+                {
+                    return;
+                }
+                (failure.cause, failure.projection_landed)
+            }
+            Err(failure) => {
+                projection_landed |= failure.projection_landed;
+                if !projection_landed
+                    && tx
+                        .send(UiMsg::StreamProjection(Box::new(StreamProjection {
+                            seed: None,
+                            entries: Vec::new(),
+                            max_seq: None,
+                            warning: Some(format!(
+                                "stream snapshot unavailable; state may be incomplete: {}",
+                                failure.cause
+                            )),
+                        })))
+                        .await
+                        .is_err()
+                {
+                    return;
+                }
+                (
+                    broken_words(&format!(
+                        "{}; the live stream may have a gap",
+                        failure.cause
+                    )),
+                    failure.projection_landed,
+                )
+            }
         };
+        projection_landed |= this_projection_landed;
         if tx.send(UiMsg::ConnLost(text)).await.is_err() {
             return;
         }
@@ -550,101 +514,71 @@ fn broken_words(cause: &str) -> String {
     format!("lost the connection to cyclops: {cause}. Check that cyclopsd is still running, then retry.")
 }
 
-async fn subscribe_loop(tx: &mpsc::Sender<UiMsg>, sock: &Path) -> Result<(), String> {
-    let opened = tokio::time::timeout(crate::action_io::OPEN_TIMEOUT, subscribe_open(sock))
+async fn subscribe_loop(
+    tx: &mpsc::Sender<UiMsg>,
+    sock: &Path,
+    backfill: usize,
+) -> Result<bool, SubscriptionFailure> {
+    let mut client = open_client(sock)
         .await
-        .map_err(|_| {
-            format!(
-                "no connection within {}s",
-                crate::action_io::OPEN_TIMEOUT.as_secs()
-            )
-        })??;
-    let (mut frames, mut w, hello) = opened;
+        .map_err(|error| SubscriptionFailure {
+            cause: client_words(error),
+            projection_landed: false,
+        })?;
     // Hello first (S2). The protocol remains tolerant, but build drift is
     // persistent UI health rather than a warning lost before raw mode starts.
     if tx
-        .send(UiMsg::BuildHealth(crate::health::BuildHealth::from_hello(
-            &hello,
-        )))
+        .send(UiMsg::BuildHealth(client.hello_compatibility()))
         .await
         .is_err()
     {
-        return Ok(());
+        return Ok(false);
     }
-    w.write_all(b"{\"id\":1,\"method\":\"events.subscribe\",\"params\":{}}\n")
+    client
+        .subscribe(serde_json::json!({}), crate::action_io::ANSWER_TIMEOUT)
         .await
-        .map_err(|e| e.to_string())?;
-    tokio::time::timeout(crate::action_io::ANSWER_TIMEOUT, subscribe_ack(&mut frames))
+        .map_err(|error| SubscriptionFailure {
+            cause: client_words(error),
+            projection_landed: false,
+        })?;
+    // The subscription is already established, so changes that happen while
+    // these bounded snapshot reads run wait on this socket. Replacing the
+    // projection before reading those events closes both startup and reconnect
+    // gaps without treating the ephemeral event stream as retained truth.
+    let projection = stream_projection(sock, backfill).await;
+    if tx
+        .send(UiMsg::StreamProjection(Box::new(projection)))
         .await
-        .map_err(|_| {
-            format!(
-                "events.subscribe did not answer within {}s",
-                crate::action_io::ANSWER_TIMEOUT.as_secs()
-            )
-        })??;
+        .is_err()
+    {
+        return Ok(true);
+    }
     if tx.send(UiMsg::Subscribed).await.is_err() {
-        return Ok(());
+        return Ok(true);
     }
-    while let Some(frame) = frames.next_frame().await.map_err(|e| e.to_string())? {
-        let ev: Event = serde_json::from_slice(&frame)
-            .map_err(|error| format!("malformed event frame: {error}"))?;
-        if !forward_event(tx, ev).await? {
-            return Ok(());
+    loop {
+        let frame = client
+            .next_event()
+            .await
+            .map_err(|error| SubscriptionFailure {
+                cause: client_words(error),
+                projection_landed: true,
+            })?;
+        if !forward_event(tx, frame.event)
+            .await
+            .map_err(|cause| SubscriptionFailure {
+                cause,
+                projection_landed: true,
+            })?
+        {
+            return Ok(true);
         }
     }
-    Ok(())
 }
 
-async fn subscribe_open(
-    sock: &Path,
-) -> Result<
-    (
-        FrameReader<tokio::net::unix::OwnedReadHalf>,
-        tokio::net::unix::OwnedWriteHalf,
-        cyclops_proto::Hello,
-    ),
-    String,
-> {
-    let stream = UnixStream::connect(sock).await.map_err(connect_words)?;
-    let (r, w) = stream.into_split();
-    let mut frames = FrameReader::new(r);
-    let frame = frames
-        .next_frame()
-        .await
-        .map_err(|error| format!("hello: {error}"))?
-        .ok_or_else(|| "the connection closed before hello".to_string())?;
-    let hello = serde_json::from_slice(&frame).map_err(|_| "not a cyclops daemon".to_string())?;
-    Ok((frames, w, hello))
-}
-
-async fn subscribe_ack(
-    frames: &mut FrameReader<tokio::net::unix::OwnedReadHalf>,
-) -> Result<(), String> {
-    let frame = frames
-        .next_frame()
-        .await
-        .map_err(|error| format!("events.subscribe: {error}"))?
-        .ok_or_else(|| "the connection closed before the subscribe acknowledgement".to_string())?;
-    let response: cyclops_proto::Response = serde_json::from_slice(&frame)
-        .map_err(|error| format!("events.subscribe returned malformed JSON: {error}"))?;
-    if response.id != 1 {
-        return Err("events.subscribe returned the wrong response id".into());
-    }
-    if let Some(error) = response.error {
-        return Err(format!(
-            "events.subscribe {}: {}",
-            error.code, error.message
-        ));
-    }
-    if response
-        .result
-        .as_ref()
-        .and_then(|result| result.get("subscribed"))
-        != Some(&Value::Bool(true))
-    {
-        return Err("events.subscribe returned no acknowledgement".into());
-    }
-    Ok(())
+struct SubscriptionFailure {
+    cause: String,
+    projection_landed: bool,
 }
 
 /// Forward one typed event. Invalidation edges wake the queue but never
@@ -659,39 +593,42 @@ async fn forward_event(tx: &mpsc::Sender<UiMsg>, ev: Event) -> Result<bool, Stri
         "messages.route_changed" => Ok(tx.send(UiMsg::MessagesRouteChanged).await.is_ok()),
         "session" | "pane-removed" => Ok(tx.send(UiMsg::MessagesRouteChanged).await.is_ok()
             && tx
-                .send(UiMsg::Entry(Box::new(Entry::from_event(&ev, now_ms()))))
+                .send(UiMsg::Entry(Box::new(Entry::from_event(
+                    &ev,
+                    crate::stream::now_ms(),
+                ))))
                 .await
                 .is_ok()),
         _ => Ok(tx
-            .send(UiMsg::Entry(Box::new(Entry::from_event(&ev, now_ms()))))
+            .send(UiMsg::Entry(Box::new(Entry::from_event(
+                &ev,
+                crate::stream::now_ms(),
+            ))))
             .await
             .is_ok()),
     }
 }
 
 /// One status request at startup: the sessions the daemon watches, the
-/// label -> pane map behind the focus jump, where every pane stands, and
+/// label -> pane map behind the focus request, where every pane stands, and
 /// the deliveries still waiting on a human. A failed or malformed answer is
 /// visible because it changes the scope and freshness of the read model.
 async fn status_seed(sock: &Path) -> Result<StatusSeed, UiError> {
-    let open = tokio::time::timeout(crate::action_io::OPEN_TIMEOUT, snapshot_open(sock));
-    let (mut frames, mut w) = match open.await {
-        Ok(opened) => opened?,
-        Err(_) => return Err("status connection timed out before hello".into()),
-    };
+    let mut client = open_client(sock).await?;
 
     // Any surface that shows the eye must ask for the delivery half; it
     // is half the rule (cyclops_proto::attention). open_deliveries is an
     // additive param: a daemon that predates it ignores it and answers
     // without the field, which decodes as an empty backlog. Tolerant
     // protocol, both directions.
-    w.write_all(b"{\"id\":1,\"method\":\"status\",\"params\":{\"open_deliveries\":true}}\n")
-        .await?;
-    let frame = tokio::time::timeout(crate::action_io::ANSWER_TIMEOUT, frames.next_frame())
+    let result = client
+        .request(
+            "status",
+            serde_json::json!({"open_deliveries": true}),
+            crate::action_io::ANSWER_TIMEOUT,
+        )
         .await
-        .map_err(|_| "status answer timed out")??
-        .ok_or("status connection closed early")?;
-    let result = response_result(&frame, "status")?;
+        .map_err(|error| -> UiError { Box::new(error) })?;
     let status: StatusResult = serde_json::from_value(result)?;
     let status_items = status
         .sessions
@@ -714,264 +651,18 @@ async fn status_seed(sock: &Path) -> Result<StatusSeed, UiError> {
     Ok(StatusSeed::from_status(&status))
 }
 
-/// The ledger tail: the watched sessions' files under `dir`, mapped onto
-/// stream entries, merged by timestamp, last `n` kept. The cursor for
-/// dedupe against the live stream is the highest replayed seq, meaningful
-/// only while exactly one session file exists (seq is per-file).
-///
-/// `watched` is the daemon's own session list, and it is the definition of
-/// the watched set on both sides: the daemon folds the attention backlog
-/// from exactly these sessions. The daemon writes one ledger per watched
-/// session at `<home>/ledger/<session>.ndjson` (cyclopsd/src/lib.rs), so
-/// the file stem is the session name. None means the daemon did not
-/// answer, and the tail falls back to a bounded set of files on disk.
-///
-/// Compatibility helper for callers that only render entries. Interactive
-/// surfaces must use [`read_backfill_report`] so a truncated tail is visible.
-pub fn read_backfill(
-    dir: &Path,
-    n: usize,
-    watched: Option<&[String]>,
-) -> (Vec<Entry>, Option<u64>) {
-    let report = read_backfill_report(dir, n, watched);
-    (report.entries, report.max_seq)
-}
-
-/// Backfill never retains more than the live ring can display, even when a
-/// caller supplies a larger `--backfill` value.
-const BACKFILL_ITEM_CAP: usize = crate::stream::RING_CAP;
-/// Aggregate encoded bytes retained while merging ledger tails.
-const BACKFILL_BYTE_CAP: usize = 16 << 20;
-/// Bound fallback directory traversal when startup status is unavailable.
-const BACKFILL_FILE_CAP: usize = 256;
-
-/// A bounded ledger tail plus any loss of requested history.
-#[derive(Debug)]
-pub struct BackfillReport {
-    /// Entries retained in timestamp order.
-    pub entries: Vec<Entry>,
-    /// Highest retained sequence when exactly one file supplied the tail.
-    pub max_seq: Option<u64>,
-    /// Visible gap text when requested history could not be represented whole.
-    pub warning: Option<String>,
-}
-
-#[derive(Default)]
-struct BackfillFaults {
-    malformed: usize,
-    unreadable: usize,
-    files_omitted: usize,
-    entries_omitted: usize,
-}
-
-impl BackfillFaults {
-    fn warning(&self) -> Option<String> {
-        let mut facts = Vec::new();
-        if self.malformed > 0 {
-            facts.push(format!("{} malformed or oversized lines", self.malformed));
-        }
-        if self.unreadable > 0 {
-            facts.push(format!("{} unreadable files", self.unreadable));
-        }
-        if self.files_omitted > 0 {
-            facts.push(format!(
-                "{} files beyond the scan limit",
-                self.files_omitted
-            ));
-        }
-        if self.entries_omitted > 0 {
-            facts.push(format!(
-                "{} entries beyond the retained UI limits",
-                self.entries_omitted
-            ));
-        }
-        (!facts.is_empty()).then(|| {
-            format!(
-                "backfill incomplete; stream history has a gap: {}. Use cyclops history for the durable record",
-                facts.join(", ")
-            )
-        })
-    }
-}
-
-/// Read a bounded ledger tail while preserving gap information for a UI.
-pub fn read_backfill_report(dir: &Path, n: usize, watched: Option<&[String]>) -> BackfillReport {
-    let empty = |warning| BackfillReport {
-        entries: Vec::new(),
-        max_seq: None,
-        warning,
-    };
-    let Some(home) = dir.parent() else {
-        return empty(None);
-    };
-    let state_root = match StateRoot::open_existing(home) {
-        Ok(Some(root)) => root,
-        Ok(None) => return empty(None),
-        Err(error) => {
-            return empty(Some(format!(
-                "backfill unavailable; stream history has a gap: {error}. Use cyclops history for the durable record"
-            )))
-        }
-    };
-    let Some(directory_name) = dir.file_name() else {
-        return empty(None);
-    };
-    let mut faults = BackfillFaults::default();
-    let mut files = backfill_files(dir, Path::new(directory_name), watched, &mut faults);
-    files.sort();
-    let retained_items = n.min(BACKFILL_ITEM_CAP);
-    let mut retained = std::collections::BTreeMap::<(u64, u64), (Entry, usize)>::new();
-    let mut retained_bytes = 0usize;
-    let mut ordinal = 0u64;
-    for descendant in &files {
-        let Ok(Some(file)) = state_root.open_read(descendant) else {
-            faults.unreadable += 1;
-            continue;
-        };
-        let mut reader = std::io::BufReader::new(file);
-        loop {
-            let frame = match next_ledger_frame(&mut reader) {
-                Ok(Some(frame)) => frame,
-                Ok(None) => break,
-                Err(_) => {
-                    faults.malformed += 1;
-                    break;
-                }
-            };
-            if frame.iter().all(u8::is_ascii_whitespace) {
-                continue;
-            }
-            let Ok(line) = serde_json::from_slice::<cyclops_proto::LedgerLine>(&frame) else {
-                faults.malformed += 1;
-                continue;
-            };
-            let Some(entry) = Entry::from_ledger(&line) else {
-                continue;
-            };
-            if retained_items == 0 {
-                continue;
-            }
-            ordinal = ordinal.wrapping_add(1);
-            let wire_bytes = frame.len();
-            retained_bytes = retained_bytes.saturating_add(wire_bytes);
-            retained.insert((entry.ts, ordinal), (entry, wire_bytes));
-            while retained.len() > retained_items {
-                let Some((_, (_, removed_bytes))) = retained.pop_first() else {
-                    break;
-                };
-                retained_bytes = retained_bytes.saturating_sub(removed_bytes);
-                if n > BACKFILL_ITEM_CAP {
-                    faults.entries_omitted += 1;
-                }
-            }
-            while retained_bytes > BACKFILL_BYTE_CAP {
-                let Some((_, (_, removed_bytes))) = retained.pop_first() else {
-                    break;
-                };
-                retained_bytes = retained_bytes.saturating_sub(removed_bytes);
-                faults.entries_omitted += 1;
-            }
-        }
-    }
-    let tail: Vec<Entry> = retained.into_values().map(|(entry, _)| entry).collect();
-    let max_seq = if files.len() == 1 {
-        tail.iter().filter_map(|e| e.seq).max()
-    } else {
-        None
-    };
-    BackfillReport {
-        entries: tail,
-        max_seq,
-        warning: faults.warning(),
-    }
-}
-
-fn backfill_files(
-    dir: &Path,
-    directory_name: &Path,
-    watched: Option<&[String]>,
-    faults: &mut BackfillFaults,
-) -> Vec<std::path::PathBuf> {
-    match watched {
-        Some(watched) => {
-            faults.files_omitted = watched.len().saturating_sub(BACKFILL_FILE_CAP);
-            watched
-                .iter()
-                .take(BACKFILL_FILE_CAP)
-                .map(|session| directory_name.join(format!("{session}.ndjson")))
-                .collect()
-        }
-        None => {
-            let entries = match std::fs::read_dir(dir) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-                Err(_) => {
-                    faults.unreadable += 1;
-                    return Vec::new();
-                }
-            };
-            let mut files = Vec::new();
-            for entry in entries {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(_) => {
-                        faults.unreadable += 1;
-                        continue;
-                    }
-                };
-                let name = entry.file_name();
-                if Path::new(&name).extension().and_then(|e| e.to_str()) != Some("ndjson") {
-                    continue;
-                }
-                if files.len() == BACKFILL_FILE_CAP {
-                    faults.files_omitted += 1;
-                    continue;
-                }
-                files.push(directory_name.join(name));
-            }
-            files
-        }
-    }
-}
-
-fn next_ledger_frame(reader: &mut impl std::io::BufRead) -> std::io::Result<Option<Vec<u8>>> {
-    let mut frame = Vec::with_capacity(8 * 1024);
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            return if frame.is_empty() {
-                Ok(None)
-            } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "ledger frame ended without a newline",
-                ))
-            };
-        }
-        if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
-            if frame.len().saturating_add(newline) > crate::wire::MAX_FRAME_BYTES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "ledger frame exceeds the byte limit",
-                ));
-            }
-            frame.extend_from_slice(&available[..newline]);
-            reader.consume(newline + 1);
-            if frame.last() == Some(&b'\r') {
-                frame.pop();
-            }
-            return Ok(Some(frame));
-        }
-        if frame.len().saturating_add(available.len()) > crate::wire::MAX_FRAME_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "ledger frame exceeds the byte limit",
-            ));
-        }
-        let consumed = available.len();
-        frame.extend_from_slice(available);
-        reader.consume(consumed);
-    }
+async fn stream_backfill(sock: &Path, limit: usize) -> Result<StreamBackfillResult, UiError> {
+    let mut client = open_client(sock).await?;
+    let limit = u32::try_from(limit).unwrap_or(u32::MAX);
+    let result = client
+        .request(
+            "events.backfill",
+            serde_json::json!({"limit": limit}),
+            crate::action_io::ANSWER_TIMEOUT,
+        )
+        .await
+        .map_err(|error| -> UiError { Box::new(error) })?;
+    serde_json::from_value(result).map_err(|error| -> UiError { Box::new(error) })
 }
 
 /// Connection errors in the CLI's words: what happened, next step.
@@ -979,12 +670,10 @@ fn next_ledger_frame(reader: &mut impl std::io::BufRead) -> std::io::Result<Opti
 /// The sentence is cyclops_proto's, not a copy of it. A copy lived here
 /// and would have gone on naming `cyclopsd &` after `cyclops start` took
 /// over starting the daemon.
-fn connect_words(e: std::io::Error) -> String {
-    match e.kind() {
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
-            cyclops_proto::NOT_RUNNING.to_string()
-        }
-        _ => e.to_string(),
+fn client_words(error: ClientError) -> String {
+    match error {
+        ClientError::NotRunning(_) => cyclops_proto::NOT_RUNNING.to_string(),
+        other => other.cause(),
     }
 }
 
@@ -993,11 +682,48 @@ mod tests {
     use super::*;
     use crate::messages::RefreshGate;
     use crate::stream::EntryKind;
-    use std::io::Write as _;
+    use serde_json::Value;
     use std::str::FromStr;
     use std::time::Duration;
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn a_failed_focus_is_reported_and_the_worker_accepts_the_next_request() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let focus = FocusPane::new(move |target| {
+            let attempt = observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match attempt {
+                0 => Err("configured tmux server refused the pane".into()),
+                1 => Ok(()),
+                _ => Err(format!("later failure for {target}")),
+            }
+        });
+        let (notice_tx, mut notice_rx) = mpsc::channel(4);
+        let (focus_tx, focus_rx) = mpsc::channel(4);
+        let worker = tokio::spawn(focus_task(notice_tx, focus_rx, Some(focus)));
+
+        focus_tx.send("%7".into()).await.unwrap();
+        match notice_rx.recv().await.unwrap() {
+            UiMsg::Notice(notice) => assert_eq!(
+                notice,
+                "can't focus %7: configured tmux server refused the pane"
+            ),
+            _ => panic!("focus failure did not remain visible"),
+        }
+
+        focus_tx.send("%8".into()).await.unwrap();
+        focus_tx.send("%9".into()).await.unwrap();
+        match notice_rx.recv().await.unwrap() {
+            UiMsg::Notice(notice) => assert_eq!(notice, "can't focus %9: later failure for %9"),
+            _ => panic!("focus worker did not continue after a failed request"),
+        }
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        drop(focus_tx);
+        worker.await.unwrap();
+    }
 
     /// A real greeting; the reader rejects anything else.
     fn test_hello() -> String {
@@ -1012,102 +738,144 @@ mod tests {
         format!("{}\n", serde_json::to_string(&hello).unwrap())
     }
 
-    fn write_session(ledger: &Path, session: &str, subjects: &[&str]) {
-        let home = ledger.parent().expect("ledger has state root");
-        let state_root = StateRoot::open_or_create(home).unwrap();
-        let descendant = Path::new(ledger.file_name().expect("ledger dir name"))
-            .join(format!("{session}.ndjson"));
-        let w = cyclops_ledger::LedgerWriter::open(&state_root, &descendant, "b-test").unwrap();
-        for (i, subject) in subjects.iter().enumerate() {
-            w.append(cyclops_proto::LedgerLine {
-                seq: 0,
-                boot_id: String::new(),
-                id: format!("m-{session}-{i}"),
-                ts: 1000 + i as u64,
+    /// Answer one projection request with an explicit unsupported error. The
+    /// subscription still becomes usable, but its replacement snapshot must
+    /// carry the gap instead of falling back to local storage.
+    async fn reject_projection_request(listener: &UnixListener, method: &str) {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        write.write_all(test_hello().as_bytes()).await.unwrap();
+        let mut lines = BufReader::new(read).lines();
+        let request: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(request["method"], method);
+        write
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "id": request["id"],
+                        "error": {"code": -32601, "message": "unsupported in fixture"}
+                    })
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn reject_projection(listener: &UnixListener) {
+        reject_projection_request(listener, "status").await;
+        reject_projection_request(listener, "events.backfill").await;
+    }
+
+    /// A retained session journal is historical evidence, not a substitute for
+    /// the coordinator's current projection. If the daemon is unavailable,
+    /// `cyclops watch` must show the gap rather than reopen storage and make
+    /// old facts look current.
+    #[tokio::test]
+    async fn an_offline_stream_does_not_replay_local_history_as_current_state() {
+        let home = cyclops_proto::scratch::scratch_dir("ui-offline-history-boundary");
+        let _ = std::fs::remove_dir_all(&home);
+        let ledger = home.join(std::path::Path::new("ledger"));
+        std::fs::create_dir_all(&ledger).unwrap();
+        let historical = cyclops_proto::LedgerLine {
+            seq: 7,
+            boot_id: "old-daemon".into(),
+            id: "m-historical".into(),
+            ts: 1_000,
+            kind: cyclops_proto::Kind::Msg,
+            from: "codex".into(),
+            to: vec!["reviewer".into()],
+            subject: Some("a retained message".into()),
+            body: None,
+            reply_to: None,
+            deliveries: Vec::new(),
+            data: None,
+        };
+        std::fs::write(
+            ledger.join("main.ndjson"),
+            format!("{}\n", serde_json::to_string(&historical).unwrap()),
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let (reconnect_tx, reconnect_rx) = mpsc::channel(1);
+        reconnect_tx.send(()).await.unwrap();
+        let task = tokio::spawn(subscription_task(
+            tx,
+            home.join(cyclops_proto::SOCK_NAME),
+            reconnect_rx,
+            200,
+        ));
+
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("offline result was not reported")
+            .expect("subscription worker stopped before reporting")
+        {
+            UiMsg::StreamProjection(projection) => {
+                assert!(projection.seed.is_none());
+                assert!(
+                    projection.entries.is_empty(),
+                    "a local journal became a current stream projection"
+                );
+                assert!(
+                    projection
+                        .warning
+                        .as_deref()
+                        .is_some_and(|warning| warning.contains("state may be incomplete")),
+                    "the missing coordinator was not made visible"
+                );
+            }
+            _ => panic!("offline history produced a non-projection result"),
+        }
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("lost coordinator was not reported")
+            .expect("subscription worker stopped before reporting the lost coordinator")
+        {
+            UiMsg::ConnLost(message) => assert!(message.contains("cyclops isn't running")),
+            _ => panic!("offline history did not report the lost coordinator"),
+        }
+
+        task.abort();
+        let _ = task.await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn daemon_backfill_projects_rows_and_preserves_explicit_gaps() {
+        let result = StreamBackfillResult {
+            lines: vec![cyclops_proto::LedgerLine {
+                seq: 7,
+                boot_id: "b-test".into(),
+                id: "m-one".into(),
+                ts: 1_000,
                 kind: cyclops_proto::Kind::Msg,
                 from: "codex".into(),
                 to: vec!["reviewer".into()],
-                subject: Some((*subject).into()),
+                subject: Some("focused review".into()),
                 body: None,
                 reply_to: None,
                 deliveries: Vec::new(),
                 data: None,
-            })
-            .unwrap();
-        }
-    }
-
-    #[test]
-    fn backfill_reads_the_tail_of_one_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let ledger = std::fs::canonicalize(dir.path()).unwrap().join("ledger");
-        write_session(&ledger, "main", &["s0", "s1", "s2", "s3", "s4"]);
-        let watched = ["main".to_string()];
-        let (entries, max_seq) = read_backfill(&ledger, 3, Some(&watched));
-        assert_eq!(entries.len(), 3);
-        assert_eq!(max_seq, Some(5));
-        assert!(matches!(&entries[0].kind, EntryKind::Msg { subject, .. } if subject == "s2"));
-        // A missing directory reads as an empty backfill, not an error.
-        let (entries, max_seq) = read_backfill(&dir.path().join("nope"), 3, Some(&watched));
-        assert!(entries.is_empty());
-        assert_eq!(max_seq, None);
-    }
-
-    /// The daemon folds the attention backlog from the sessions it
-    /// watches. Replaying a session it does not watch puts lines on
-    /// screen that no count owns and no event can ever clear, so the
-    /// watched set has one definition and it is the daemon's.
-    #[test]
-    fn backfill_replays_only_the_sessions_the_daemon_watches() {
-        let dir = tempfile::tempdir().unwrap();
-        let ledger = std::fs::canonicalize(dir.path()).unwrap().join("ledger");
-        write_session(&ledger, "main", &["watched"]);
-        write_session(&ledger, "abandoned", &["stale"]);
-
-        let subjects = |entries: &[Entry]| -> Vec<String> {
-            entries
-                .iter()
-                .filter_map(|e| match &e.kind {
-                    EntryKind::Msg { subject, .. } => Some(subject.clone()),
-                    _ => None,
-                })
-                .collect()
+            }],
+            max_seq: Some(7),
+            gap: Some(cyclops_proto::StreamBackfillGap {
+                unreadable_sources: 1,
+                omitted_rows: 2,
+            }),
         };
 
-        let watched = ["main".to_string()];
-        let (entries, max_seq) = read_backfill(&ledger, 10, Some(&watched));
-        assert_eq!(subjects(&entries), vec!["watched"]);
-        assert_eq!(max_seq, Some(1), "one watched file dedupes by seq");
-
-        // The daemon watching nothing is an answer, not a missing one.
-        let (entries, _) = read_backfill(&ledger, 10, Some(&[]));
-        assert!(entries.is_empty());
-
-        // No answer at all: show what is on disk rather than an empty
-        // screen. The header already says the connection is gone.
-        let (entries, max_seq) = read_backfill(&ledger, 10, None);
-        assert_eq!(subjects(&entries), vec!["stale", "watched"]);
-        assert_eq!(max_seq, None, "per-file seqs collide across files");
-    }
-
-    #[test]
-    fn malformed_backfill_is_retained_as_an_explicit_gap() {
-        let dir = tempfile::tempdir().unwrap();
-        let ledger = std::fs::canonicalize(dir.path()).unwrap().join("ledger");
-        write_session(&ledger, "main", &["kept"]);
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(ledger.join("main.ndjson"))
-            .unwrap();
-        file.write_all(b"{malformed}\n").unwrap();
-        drop(file);
-
-        let watched = ["main".to_string()];
-        let report = read_backfill_report(&ledger, 10, Some(&watched));
-        assert_eq!(report.entries.len(), 1);
-        let warning = report.warning.expect("the skipped line must be visible");
-        assert!(warning.contains("stream history has a gap"), "{warning}");
-        assert!(warning.contains("malformed"), "{warning}");
+        let report = project_backfill(result);
+        assert_eq!(report.max_seq, Some(7));
+        assert!(
+            matches!(&report.entries[0].kind, EntryKind::Msg { subject, .. } if subject == "focused review")
+        );
+        let warning = report.warning.expect("the daemon gap stays visible");
+        assert!(warning.contains("1 unreadable sources"), "{warning}");
+        assert!(warning.contains("2 rows beyond"), "{warning}");
     }
 
     fn changed_event(seq: u64) -> Event {
@@ -1274,9 +1042,10 @@ mod tests {
         drop(write);
     }
 
-    /// The subscription socket must acknowledge before the snapshot socket
-    /// opens. An edge sent immediately behind the acknowledgement is folded
-    /// into the first request rather than falling into a startup gap.
+    /// The subscription socket must acknowledge before any snapshot socket
+    /// opens. An edge sent immediately behind the acknowledgement waits while
+    /// the bounded replacement is loaded, then lands after it instead of
+    /// falling into a startup gap.
     #[tokio::test]
     async fn subscription_acknowledgement_precedes_the_first_snapshot_socket() {
         let home = cyclops_proto::scratch::scratch_dir("ui-message-subscribe-race");
@@ -1288,7 +1057,12 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let (reconnect_tx, reconnect_rx) = tokio::sync::mpsc::channel(1);
         reconnect_tx.try_send(()).unwrap();
-        let subscribe = tokio::spawn(subscription_task(tx.clone(), sock.clone(), reconnect_rx));
+        let subscribe = tokio::spawn(subscription_task(
+            tx.clone(),
+            sock.clone(),
+            reconnect_rx,
+            200,
+        ));
         let (refresh_tx, refresh_rx) = tokio::sync::mpsc::channel(1);
         let snapshots = tokio::spawn(messages_task(tx, sock.clone(), refresh_rx));
 
@@ -1322,11 +1096,27 @@ mod tests {
             .await
             .unwrap();
 
+        reject_projection(&listener).await;
+
         let mut gate = RefreshGate::new();
         assert!(matches!(
             rx.recv().await.unwrap(),
-            UiMsg::BuildHealth(crate::health::BuildHealth::LegacyDaemon { .. })
+            UiMsg::BuildHealth(crate::health::BuildHealth::UnverifiedDaemon { .. })
         ));
+        match rx.recv().await.unwrap() {
+            UiMsg::StreamProjection(projection) => {
+                assert!(projection.seed.is_none());
+                assert!(projection.entries.is_empty());
+                assert!(
+                    projection
+                        .warning
+                        .as_deref()
+                        .is_some_and(|warning| warning.contains("unsupported in fixture")),
+                    "the missing daemon projection was not explicit"
+                );
+            }
+            _ => panic!("subscription did not replace its stream projection"),
+        }
         assert!(matches!(rx.recv().await.unwrap(), UiMsg::Subscribed));
         gate.connected();
         match rx.recv().await.unwrap() {
@@ -1399,7 +1189,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let (reconnect_tx, reconnect_rx) = tokio::sync::mpsc::channel(1);
         reconnect_tx.try_send(()).unwrap();
-        let controller = tokio::spawn(subscription_task(tx, sock.clone(), reconnect_rx));
+        let controller = tokio::spawn(subscription_task(tx, sock.clone(), reconnect_rx, 200));
 
         let (first, _) = listener.accept().await.unwrap();
         let (first_read, mut first_write) = first.into_split();
@@ -1415,7 +1205,12 @@ mod tests {
             .write_all(b"{\"id\":1,\"result\":{\"subscribed\":true}}\n")
             .await
             .unwrap();
+        reject_projection(&listener).await;
         assert!(matches!(rx.recv().await.unwrap(), UiMsg::BuildHealth(_)));
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            UiMsg::StreamProjection(_)
+        ));
         assert!(matches!(rx.recv().await.unwrap(), UiMsg::Subscribed));
 
         first_write.write_all(b"{malformed}\n").await.unwrap();
@@ -1453,7 +1248,12 @@ mod tests {
             .write_all(b"{\"id\":1,\"result\":{\"subscribed\":true}}\n")
             .await
             .unwrap();
+        reject_projection(&listener).await;
         assert!(matches!(rx.recv().await.unwrap(), UiMsg::BuildHealth(_)));
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            UiMsg::StreamProjection(_)
+        ));
         assert!(matches!(rx.recv().await.unwrap(), UiMsg::Subscribed));
 
         drop(second_write);

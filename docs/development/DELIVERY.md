@@ -70,9 +70,26 @@ throughout the hold.
 
 The terminal write is only a notification transport. Mailbox acceptance,
 claim, reply, ordering, and replay do not depend on the full-screen workspace
-UI. Raw tmux injection remains a manual emergency path outside this contract:
-Cyclops never falls back to an unrecorded paste after an uncertain daemon
-outcome.
+UI.
+
+## Raw-tmux emergency doctrine
+
+Normal agent communication uses Cyclops. Raw tmux is outside the messaging
+contract and is never an automatic fallback.
+
+1. A slow delivery, safety hold, ambiguous daemon outcome, or inconvenient
+   recipient state does not authorize a bypass.
+2. Only a human operator may authorize an exact raw pane write, and only after
+   confirming that Cyclops is unavailable or broken. An agent cannot grant
+   itself this authority.
+3. Name the exact target pane and label the write unrecorded before acting.
+4. Do not claim a Cyclops receipt, durable acceptance, FIFO ordering, replay,
+   claim, reply ancestry, or completion for the raw write.
+5. Never retry an ambiguous Cyclops write through raw tmux without a new,
+   explicit human decision that accounts for possible duplication.
+
+This emergency lane changes terminal state but writes no Cyclops messaging
+fact. Return to Cyclops as soon as the coordinator is available.
 
 Current terminal-action settlements append `notification_resolved` with
 `proof_version: 1` and replay only after the exact intent, action, and required
@@ -158,8 +175,9 @@ completion or resolves any other post-write alarm.
 
 ### Gate (amendments b, f, g; GOALS invariants)
 
-Runs immediately when the fused state changes to a decidable one; never on a
-timer. In order:
+Runs immediately when the fused state changes to a decidable one. Its only
+timer-driven entry is the named, cancellable one-shot idle-ambiguous-composer
+settle deadline described below; otherwise it never runs on a timer. In order:
 
 1. Resolve target label to pane id. Missing pane: attention_required
    (cause: no_such_pane).
@@ -195,6 +213,17 @@ timer. In order:
      refused until a turn end with a clean screen reading consumes it, or a
      settled output observation proves that the operator erased the visible
      composer (INVARIANTS rule 12).
+     An idle `composer_semantic: ambiguous` reading holds for one continuous
+     `ambiguous_composer_settle_ms` grace (10 seconds by default). A changed
+     verdict, cancellation, or ordinary terminal outcome cancels that
+     one-shot deadline. If ambiguity still holds at the deadline, the wake
+     becomes a content-free `blocked_pre_write` record with the established
+     `write_readiness_changed` cause and
+     `write_block: composer_semantic_ambiguous` observation. Keeping the
+     detail in the optional observation preserves older strict journal
+     readers. No paste, doorbell, or submit key is attempted while the block
+     remains. Only later, complete route evidence that is write-ready may
+     reopen that exact attempt once.
 4. Just before pasting, re-read title and capture once more (the gate
    snapshot must be fresher than any human keystroke round-trip). The
    admitted pid is the agent's, resolved fresh; a process table that
@@ -263,12 +292,31 @@ locator.
    manifest's submit key. Only successful terminal IO advances the attempt to
    `submitted`.
 
-   Automatic notification submit runs the full proof immediately before the
-   reservation and again after it. Both checks require the same pane-root,
-   terminal leader, agent generation, and manifest; no pane mode; a current
-   manifest state of `idle` or `idle_with_input`; and the exact attempt-owned
-   staged barrier with no live lifecycle or blocked-state conflict. A refusal
-   withholds Enter and settles once as `verify_failed`. It is never retried.
+   On the ordinary notification path, automatic submit runs the full proof
+   immediately before the reservation and again after it. Both checks require
+   the same pane-root, terminal leader, agent generation, and manifest; no pane
+   mode; a current manifest state of `idle` or `idle_with_input`; and the exact
+   attempt-owned staged barrier with no live lifecycle or blocked-state
+   conflict. A refusal withholds Enter and settles once as `verify_failed`. It
+   is never retried.
+
+   `notification.force_submit` is a separately documented default-off,
+   administrator-controlled fallback for one exact current `verify_failed`
+   doorbell. It never pastes or replaces bytes. After exact binding and route
+   checks, it records durable intent. After its final route and payload proofs,
+   it appends a content-free `notification_resolution_action_reserved` fact
+   under the same workspace journal lock as `inbox.claim`, then may send one
+   manifest submit key without composer-content proof. It can therefore submit
+   trailing human input. A claim, withdrawal, replacement, or settlement
+   ordered before that reservation prevents terminal IO. A claim ordered after
+   it remains a normal mailbox retrieval but cannot revoke the one already
+   reserved key or count as consumption until the accepted-action fact exists.
+   Reservation is not terminal acceptance or composer consumption: a crash
+   after reservation and before `notification_resolution_action_accepted`
+   remains uncertain and authorizes no second key. A successfully saved disable
+   ordered before reservation refuses; a later setting change does not revoke a
+   durable reservation. The existing accepted-action, consumption, and settlement rules
+   apply after it.
 
 An exact start normally ends on its matching hook end. When a measured vendor
 path emits no end hook, a manifest may mark one exact screen rule as lifecycle
@@ -371,6 +419,58 @@ includes a `CurrentCommand` edge when an exec-in-place changes the foreground
 command or selected manifest without changing the pane root or readiness tuple.
 Tokenless lifecycle, status, and inspection recomputes may publish a readiness
 change, but they neither advance route evidence nor reconcile delivery.
+When a later serialized source recompute supplies its causal token, a positive
+write-ready or owned-staged observation still reconciles the route even if the
+tokenless observer already made the cached readiness tuple identical. The
+durable token comparison makes this idempotent and prevents observation
+ordering from consuming the positive source edge. An unchanged negative
+observation remains quiet.
+A fresh pane observation returns every messaging-relevant fact as an ordered,
+immutable collection. The daemon composition root applies that collection
+before presentation and before releasing the pane recompute guard. A state or
+composer edge therefore reaches `WorkspaceMessaging` as exact-owned evidence
+instead of letting fusion select candidates or elect a worker. A simultaneous
+quota-reset edge remains a separate observation in the same collection, so
+neither consequence suppresses the other. Exact-owned evidence is applied
+first, preserving the ordering of the earlier direct handoff without exposing
+its policy to the observer.
+When the same pane result carries causal readiness-route evidence, that typed
+observation precedes exact-owned and quota-reset evidence. Cache-only hold
+mutations mint the same evidence type and immediately pass it through the
+composition root. Fusion decides only whether the physical readiness edge
+exists; `WorkspaceMessaging` owns route reconciliation. Tokenless observations
+and unchanged negative causal observations still produce no messaging item.
+The surrounding tmux event source follows the same rule for route and pane-size
+edges that do not originate as a fusion consequence. It publishes the causal
+route token and exact durable recipient as body-free evidence. Only
+`WorkspaceMessaging` may inspect whether the recipient has a durable width
+block and select reconciliation. Route-directory and daemon-replay lifecycle
+edges likewise report availability; the Module selects pending recipients,
+unclaimed reminders, and force-submit candidates before asking the retained
+runtime adapter to host the work.
+Participant-directory publication uses the same Module boundary. Adoption,
+clear, attach, rebind, and exact process replacement supply current physical
+routes and registry identities while `WorkspaceMessaging` owns durable
+directory replacement and the synchronization that authenticated reads share.
+This preserves the existing publish-before-attach and mutate-before-republish
+ordering without exposing the concrete mailbox service or publication lock to
+participant lifecycle code. Force-submit settings authenticate through this
+same boundary.
+Composer recovery uses a synchronous evidence boundary because its result must
+stamp the same serialized pane-cache commit. Fusion supplies only immutable
+binding, clean-composer, legacy-readiness, and exact lifecycle-start evidence
+to the composition-root adapter. The adapter obtains opaque durable probes and
+delegates recovery, retirement, and coordinator decisions to
+`WorkspaceMessaging`; fusion cannot access the messaging Module, journal
+records, recovery variants, or recovery locks. The returned body-free barrier
+update is merged before the cache becomes visible, preserving the prior
+fail-closed ordering without leaving messaging policy in observation.
+After that cache commit, confirmed dispatch starts leave fusion as exact,
+body-free ACK evidence. The composition root passes each item to the retained
+delivery mechanism after any state event and before ordered
+`WorkspaceMessaging` observations or any chrome await. A stalled or cancelled
+repaint therefore cannot consume a confirmed receipt, while fusion cannot
+reach delivery handles or commit delivery transitions itself.
 The immediate post-append reconciliation also reuses the current identity, so
 unchanged evidence is a no-op while an edge that raced ahead of the append is not
 lost. A later generation may reopen even when its complete process binding is
@@ -535,11 +635,26 @@ durable recipient of that attempt and never enter the journal or daemon log.
 Complete and discard remain administrator-only. Requeue and alarm clearance
 remain explicit operator actions and never create an automatic retry loop.
 
-An exact-attempt `verify_failed` doorbell uses the same proof and settlement
-path automatically. Pending work selects one submit. An exact recipient claim
-ordered after the write selects one measured clear. The mailbox choice and
-durable intent share one lock. Human, trailing, changed, or unprovable content
-never reaches a terminal key.
+On the ordinary automatic recovery path, an exact-attempt `verify_failed`
+doorbell uses the same proof and settlement path. Pending work selects one
+submit. An exact recipient claim ordered after the write selects one measured
+clear. The mailbox choice and durable intent share one lock. On that ordinary
+path, human, trailing, changed, or unprovable content never reaches a terminal
+key.
+
+Ordinary attention terminal actions use accepted-key ordering: only a claim
+ordered after `notification_resolution_action_accepted` may count as
+consumption. The separate `notification.force_submit` fallback is default off
+and administrator-controlled. It never writes or replaces composer bytes, but
+for one exact `verify_failed` attempt it may submit one key without
+composer-content proof and may therefore submit trailing human input. After its
+final proofs it records a durable forced reservation under the same workspace
+journal lock as `inbox.claim`. A claim, withdrawal, replacement, or settlement
+ordered before that reservation prevents terminal IO. A later claim remains a
+normal retrieval and may count as consumption only after the key's
+accepted-action fact. The saved setting update and reservation share one gate:
+a successful disable ordered before reservation refuses, while a later disable
+does not revoke a reservation.
 
 Before a terminal-key action, the daemon records one content-free resolution
 intent. If the terminal accepts the key, it records a separate content-free

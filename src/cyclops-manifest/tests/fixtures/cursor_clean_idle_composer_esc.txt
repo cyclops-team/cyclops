@@ -12,4 +12,3 @@
   [2mCursor Grok 4.5 High[0m [2m·[0m [2m11.9%[0m   [35mRun Everything[39m
   [2m~/Desktop/Code/rfq-automation-agent · [0m
   [2mcyclops-video-take[0m
-

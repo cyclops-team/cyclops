@@ -1,8 +1,22 @@
 # Status
 
-Updated 2026-08-28. Cyclops is pre-release software at version `0.1.0`.
-The Rust implementation on `main` is the current product; the shell/Python
+Updated 2026-09-01. Cyclops is pre-release software; the Cargo workspace
+currently declares `0.1.0-beta`. `main` is the stable line and
+**beta/messaging-rework** is the active beta integration line. The shell/Python
 implementation remains available as the read-only `v1-final` tag.
+
+Track A, the Messaging Beta Rework, is accepted. `WorkspaceMessaging` now owns
+current durable messaging policy. Retained session-journal discovery and replay
+go through the narrow compatibility-history adapter.
+
+The whole-product implementation tracks and technical beta-acceptance decision
+are complete for the audited candidate. The
+[final beta acceptance audit](docs/development/CYCLOPS_BETA_FINAL_AUDIT.md)
+records the evidence and remaining known limits. The selected release identity
+is `0.1.0-beta` / `v0.1.0-beta`. Exact-SHA release evidence and a later
+explicit operator authorization are required before merging `main`, tagging,
+creating a GitHub Release, or publishing. The historical `v0.2.0-beta` tag
+remains attached to its older source commit and does not name this candidate.
 
 ## Built
 
@@ -55,35 +69,40 @@ implementation remains available as the read-only `v1-final` tag.
 
 The required local gates are:
 
+The paired build is for the explicit real-daemon start assertion in
+`workspace_cli::start_starts_a_daemon_when_none_is_running`.
+`workspace_boot_sizing`'s sizing assertion does not require a daemon and
+tolerates daemon-start failure.
+The headless check keeps the no-default-feature CLI free of interactive UI
+dependencies while exercising its retained command contracts.
+
 ```bash
-cargo fmt --all
+./tests/e2e/messaging-docs-parity.sh
+cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
-cargo test -p cyclopsd --all-targets --no-fail-fast
-cargo test --workspace --doc
+./scripts/check-headless.sh
 python3 scripts/check-doc-paths.py
+cargo build -p cyclops -p cyclopsd --bins
+cargo nextest run --workspace -E 'not (package(cyclopsd) | binary_id(=cyclops-ui::perf) | binary_id(=cyclops-ui::queue_perf) | binary_id(=cyclops-workspace::perf_contract))' --no-fail-fast
+cargo test -p cyclopsd --all-targets --no-fail-fast
+cargo doc --workspace --no-deps
 ./tests/e2e/parity-check.sh
 ```
 
-CI runs those checks on Linux and macOS, reruns the suite with relocated
-scratch storage, verifies the installer with
-`./tests/e2e/parity-check.sh --with-installer`, and builds and checks the
-website. An advisory job also tests against tmux built from its current
-development branch.
+The six stable pull-request check names always report. Path classification
+decides whether macOS, installer, website, and tmux HEAD checks run substantive
+evidence or return an explicit successful not-applicable result. The required
+Ubuntu lane runs the commands above plus focused relocated-root evidence.
+Scheduled and release workflows own the full platform matrix, complete tmux
+HEAD evidence, reliability repetitions, soak, performance history, historical
+replay, installer lifecycle, and release journeys. The current routing,
+commands, and measured baseline live in
+[docs/development/CI.md](docs/development/CI.md).
 
-The final stabilization head `0492d7a` passed the fast repository gate with
-1,848 nextest tests plus the daemon integration suites and doctests. A matched
-CLI and daemon built from that SHA were installed and restarted. A live fresh
-Codex 0.150.1 and AGY 1.1.22 exercise proved durable send, exact Format 3
-claim, reply, visible human-input hold, partial-backspace refusal, and
-same-attempt release after the final character became settled and exactly
-empty. The opt-in frozen transport component passed on that SHA. The separate
-Gate 7 stage-and-clear component reported `Limitation`, not `Passed`, because
-its authenticated vendor subprocess cells were not all executable.
-
-The parity walk currently contains 123 checks before the optional installer
-exercise. Test counts are intentionally not pinned here because they change
-whenever coverage grows.
+Historical stabilization, CI, release, performance, and live-vendor results
+remain tied to their named revisions in the records that produced them. They
+are evidence for those revisions, not a claim that the current integration
+head has already rerun every campaign.
 
 ## Known limits
 
@@ -121,8 +140,8 @@ whenever coverage grows.
   | Cursor Agent CLI | 2026.07.23-e383d2b | No installed binary on the evidence host | Installed current binary, full matrix, and paired start and end hook payloads |
 
   The soak proves staging verification and cleanup only. It does not promote a
-  whole manifest to the newer version. Detection gaps remain tracked in
-  [issue #7](https://github.com/cyclops-team/cyclops/issues/7).
+  whole manifest to the newer version. Track E owns the remaining current
+  vendor-capability evidence and conservative manifest updates.
 
 For the repository map and design boundaries, read
 [docs/development/HANDOFF.md](docs/development/HANDOFF.md). For user-facing

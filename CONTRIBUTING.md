@@ -26,24 +26,36 @@ cargo install cargo-nextest --locked --version 0.9.100
 
 ## The loop
 
-Five gates, in this order. They are the same five core CI gates, so a green
-run here is a green run there. The Rust test gate uses nextest for executable
-tests and Cargo for doctests, which nextest does not run.
+The full local gate runs the same required correctness contracts as CI.
+Performance executables are retained in scheduled and release evidence instead
+of running as ordinary correctness tests. The Rust documentation step compiles
+the complete workspace directly; the former doctest command built the same
+documentation and executed zero doctests.
+The headless check keeps the no-default-feature CLI free of interactive UI
+dependencies while exercising its retained command contracts.
+
+The paired build below is for
+`workspace_cli::start_starts_a_daemon_when_none_is_running`, which intentionally
+starts and asserts a real daemon. `workspace_boot_sizing`'s sizing assertion
+does not require a daemon and tolerates daemon-start failure.
 
 ```bash
-cargo fmt --all
+./tests/e2e/messaging-docs-parity.sh
+cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
-cargo test -p cyclopsd --all-targets --no-fail-fast
-cargo test --workspace --doc
+./scripts/check-headless.sh
 python3 scripts/check-doc-paths.py
+cargo build -p cyclops -p cyclopsd --bins
+cargo nextest run --workspace -E 'not (package(cyclopsd) | binary_id(=cyclops-ui::perf) | binary_id(=cyclops-ui::queue_perf) | binary_id(=cyclops-workspace::perf_contract))' --no-fail-fast
+cargo test -p cyclopsd --all-targets --no-fail-fast
+cargo doc --workspace --no-deps
 ./tests/e2e/parity-check.sh
 ```
 
 Clippy and the test suite take a few minutes; the rest are usually quick.
 Run formatting and clippy while you work.
 
-One command runs all five in that order, cheapest first, with per-gate
+One command runs the complete gate in that order, cheapest first, with per-gate
 timing: `./scripts/check.sh`. Its `--fast` flag stops after the test
 suite, which is the right pass while iterating; the full run is for the
 moment before a push. Neither changes any flag CI uses.
@@ -89,7 +101,6 @@ $ cyclops start
 ✓ workspace ready · 1 agent
   wrote /private/tmp/cyclops-parity.tMpeYD/home/config.toml
 ...
-== 115/115 checks passed
 == docs and binaries agree
 ```
 
@@ -112,13 +123,13 @@ use cyclops_testrig::{tmux_available, TmuxServer};
 if !tmux_available() {
     return;                                // skip cleanly, never fail
 }
-let rig = TmuxServer::new("my-feature");   // -L cyc-my-feature-<pid>
+let rig = TmuxServer::new("my-feature");   // -L cyc-my-feature-<pid>-<sequence>
 rig.run_ok(&["new-session", "-d", "-s", "demo"]);
 // teardown is Drop: stop the server, then unlink the socket file
 ```
 
 The reasons are all measured, and they are written out in that crate's
-header. The short version: `-L cyc-<tag>-<pid>` keeps concurrent test
+header. The short version: `-L cyc-<tag>-<pid>-<sequence>` keeps concurrent test
 binaries off each other, `-f /dev/null` keeps your tmux config from
 changing behavior, `-u` stops tmux sanitizing tabs and non-ASCII to `_`
 (F14, which silently destroys the title sensor), and teardown must both
@@ -132,13 +143,15 @@ time an assertion fails.
 Homes work the same way: point `CYCLOPS_HOME` at a scratch directory. A
 test that writes to the real one corrupts your own message history.
 
-There are two guards, and they exist because this rule was fixed three
+There are three guards, and they exist because this rule was fixed three
 times and kept getting copied back in:
 
 - `tests/testrig/tests/teardown_has_one_home.rs` fails if any
   other Rust file starts or kills a tmux server.
 - `tests/testrig/tests/shell_teardown.rs` holds `tests/e2e/lib/lib.sh`,
   the shell home of the same rule, to the same contract.
+- `tests/testrig/tests/interrupted_owner.rs` kills a fixture before `Drop`
+  and proves its external owner removes only that fixture's exact resources.
 
 Shell and Python go through `tests/e2e/lib/lib.sh`. Source it, never paste from it.
 
@@ -162,33 +175,32 @@ states that once, and `CYCLOPS_TEST_TMP` overrides it.
 
 That is F24, and it cost two milestones and two red CI runs to learn.
 
-Prove it still holds by relocating the root and running the suite again.
-On macOS a relocated run takes the same code path Linux does:
+Prove it still holds with the focused relocated-root command. On macOS the
+relocated run takes the same code path Linux does:
 
 ```bash
 mkdir -p /private/var/tmp/cyc-relocated
-CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
-CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated cargo test -p cyclopsd --all-targets --no-fail-fast
+CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated ./scripts/test-relocated-scratch.sh
 ```
 
-CI runs the whole suite twice for this reason, once relocated.
+The command proves the override itself, rejects direct temp APIs in real-tmux
+fixtures, and runs one real tmux plus daemon-socket journey. CI runs this
+focused evidence on both platforms instead of repeating every unrelated test.
 
 ## Demos
 
-`demos/` holds runnable end-to-end scripts, one per milestone. Each one
-builds an isolated rig, drives a real scenario, and prints what happened.
+`demos/` holds maintained end-to-end journeys. Each script builds an
+isolated rig, drives a real scenario, and prints what happened.
 
 ```bash
-./demos/m1-send.sh        # a message from send to verified receipt
+./demos/m1-send.sh        # durable mailbox acceptance without either UI
 ./demos/m4-workspace.sh   # build, name, save, kill, restore a workspace
 ./demos/m5-theme.sh       # a theme switch reaching a real pane border
 ```
 
-All of them need `tmux`; the ones that read the ledger back
-(`m1-send.sh`, `m2-conversation.sh`, and `m3-stream.sh`)
-also need `jq`, and the first three need `python3`. They check for what
-they use and say so. None of them touches your tmux server or your home,
-and all are safe to run repeatedly.
+All of them need `tmux`; each script checks any additional dependencies it
+uses and says what is missing. None of them touches your tmux server or your
+home, and all are safe to run repeatedly.
 
 Write one when you ship anything a user will do end to end. This is not
 ceremony: on this codebase the demos have found defects that reading the
@@ -201,27 +213,33 @@ disk, and that is where the bugs were.
 
 ## What CI runs
 
-`.github/workflows/ci.yml`, on ubuntu-latest and macos-latest, with
-`fail-fast: false` so one platform failing cannot cancel the other and
-throw away the signal that tells a portability bug from a real regression.
+`.github/workflows/ci.yml` keeps six stable pull-request check names. A path
+classifier sends each change to the cheapest honest evidence and makes every
+conditional check report a successful not-applicable result when its inputs did
+not change. The full matrix and expensive reliability work remain inspectable
+in the scheduled and release workflows. Responsibilities, commands, and the
+measured beta baseline are recorded in
+[CI evidence lanes and baseline](docs/development/CI.md).
 
 | Step | Fails when |
 |---|---|
 | `cargo fmt --all --check` | Formatting drifted |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Any lint fires, including in tests |
-| `cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast` | Any parallel-safe test fails, on either OS |
+| `cargo build -p cyclops -p cyclopsd --bins` | `workspace_cli::start_starts_a_daemon_when_none_is_running` cannot use its matching sibling daemon |
+| `cargo nextest run --workspace` with the normal-PR filter | Any parallel-safe correctness test fails; retained performance executables are excluded |
 | `cargo test -p cyclopsd --all-targets --no-fail-fast` | Any daemon test fails under its process-isolated rig contract |
-| `cargo test --workspace --doc` | A Rust doctest fails |
+| `cargo doc --workspace --no-deps` | Workspace Rust documentation fails to compile |
 | `python3 scripts/check-doc-paths.py` | A doc points at a file this repo does not have, or a page exists that no front door links to. `--selftest` proves the checker still catches, so a green run cannot mean it stopped looking |
+| `./tests/e2e/messaging-docs-parity.sh` | Messaging authority or terminology drifts into a known stale or contradictory form |
 | `./tests/e2e/parity-check.sh` | A doc quotes output the binaries no longer print |
-| The whole suite again with `CYCLOPS_TEST_TMP` relocated | Something hardcoded a scratch path (F24) |
+| `./scripts/test-relocated-scratch.sh` with `CYCLOPS_TEST_TMP` set | Root selection broke, a real-tmux fixture bypassed the helper, or the relocated tmux/daemon/socket journey failed (F24) |
 | `./tests/e2e/parity-check.sh --with-installer` | `scripts/install.sh` stopped doing what install.md says, or left a shell profile changed after `--uninstall`. Its own job: it does a release build |
 | `cmp scripts/install.sh website/static/install.sh`, then `npm run check` and `npm run build` in `website/` | The hosted installer drifted from the tested installer, or the website no longer type-checks or builds |
 
-Another job builds tmux from master and runs the suite against it. It is
-`continue-on-error`, so it warns rather than blocks: tmux is not this
-repo's to fix. It has earned its keep once already (F25), so when it goes
-red, read it rather than assuming it is the usual noise.
+The stable `tmux-head` pull-request check runs a focused adapter contract when
+tmux-owned inputs change. The scheduled workflow builds tmux from master and
+runs the full fast gate. The pull-request check remains advisory because tmux
+is not this repo's to fix, but a red result still needs inspection (F25).
 
 Local green plus red CI is not a flaky-CI story until the logs say so.
 

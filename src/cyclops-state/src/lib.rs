@@ -9,6 +9,12 @@
 //! relative to its open descriptor, refuses links and unexpected file types,
 //! and validates ownership before changing permissions or exposing bytes.
 
+pub mod coordinator_config;
+pub use coordinator_config::{
+    load_coordinator_config, parse_coordinator_document, parse_coordinator_values,
+    CoordinatorConfig, CoordinatorConfigDocument, CoordinatorConfigError, COORDINATOR_CONFIG_FILE,
+};
+
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{File, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -34,11 +40,16 @@ type RepairAfterInspect = Box<dyn FnOnce(&Path)>;
 type InspectAfterRead = Box<dyn FnOnce(&Path)>;
 
 #[cfg(test)]
+type IsolateRootBeforeRename = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
 thread_local! {
     static FAIL_NEXT_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static REPAIR_AFTER_INSPECT: std::cell::RefCell<Option<RepairAfterInspect>> =
         const { std::cell::RefCell::new(None) };
     static INSPECT_AFTER_READ: std::cell::RefCell<Option<InspectAfterRead>> =
+        const { std::cell::RefCell::new(None) };
+    static ISOLATE_ROOT_BEFORE_RENAME: std::cell::RefCell<Option<IsolateRootBeforeRename>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -61,6 +72,8 @@ pub enum StateError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("state creation may be visible at {path}: {cause}")]
+    CreationMayBeVisible { path: PathBuf, cause: String },
     #[error("state removal is visible at {path}, but directory sync failed: {source}")]
     RemovalDurabilityUnknown {
         path: PathBuf,
@@ -161,6 +174,66 @@ pub struct InspectedEntry {
     pub unsafe_reason: Option<&'static str>,
 }
 
+/// Stable identity and change-time evidence for one regular file selected by
+/// a destructive preview.
+///
+/// Descriptor-bound removal rechecks this evidence immediately before
+/// unlinking. This complements the inode and size checks in [`InspectedEntry`]
+/// so an in-place, same-length rewrite cannot be silently removed after a
+/// confirmation.
+#[derive(Debug, Clone, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegularFileEvidence {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    uid: u32,
+    links: u64,
+    bytes: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl RegularFileEvidence {
+    /// Capture evidence from one held regular-file descriptor.
+    pub fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.permissions().mode() & 0o7777,
+            uid: metadata.uid(),
+            links: metadata.nlink(),
+            bytes: metadata.len(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+
+    /// The byte count captured with this evidence.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Compare this evidence with the exact descriptor held for removal.
+    pub fn matches_metadata(&self, metadata: &std::fs::Metadata) -> bool {
+        self == &Self::from_metadata(metadata)
+    }
+
+    /// Check that the stable portion still agrees with an inspected entry.
+    pub fn matches_entry(&self, entry: &InspectedEntry) -> bool {
+        self.device == entry.device
+            && self.inode == entry.inode
+            && self.mode == entry.mode
+            && self.uid == entry.uid
+            && self.links == entry.links
+            && self.bytes == entry.size
+    }
+}
+
 impl InspectedEntry {
     pub fn safe(&self) -> bool {
         self.unsafe_reason.is_none()
@@ -212,6 +285,20 @@ pub struct StateInspector {
     root: InspectedEntry,
 }
 
+/// Descriptor-relative authority to publish one file below an existing,
+/// private consumer directory.
+///
+/// Consumer directories are not Cyclops state roots: their permissions and
+/// unrelated entries belong to the consumer. The accepted parent is already
+/// owner-only, so this type never repairs it or creates descendants. It can
+/// create one missing final regular-file entry through the held descriptor.
+#[derive(Debug)]
+pub struct ManagedAssetRoot {
+    directory: File,
+    path: PathBuf,
+    owner: u32,
+}
+
 /// One exact inspected file or empty directory bound for explicit removal.
 /// Dropping the handle without calling [`BoundStateRemoval::remove`] changes nothing.
 pub struct BoundStateRemoval {
@@ -220,6 +307,7 @@ pub struct BoundStateRemoval {
     name: CString,
     path: PathBuf,
     expected: InspectedEntry,
+    regular_evidence: Option<RegularFileEvidence>,
     kind: RemovalKind,
 }
 
@@ -229,6 +317,19 @@ pub struct StateRoot {
     directory: File,
     path: PathBuf,
     owner: u32,
+}
+
+/// A state root moved to a private sibling namespace without replacement.
+///
+/// The two paths are for display and recovery records. The held
+/// [`Self::state_root`] and [`Self::inspector`] still name the exact directory
+/// moved by [`StateInspector::isolate_root_to_sibling`].
+#[derive(Debug)]
+pub struct StateRootIsolation {
+    original_path: PathBuf,
+    tombstone_path: PathBuf,
+    state_root: StateRoot,
+    inspector: StateInspector,
 }
 
 /// Cleanup authority for one validated root-level Unix socket.
@@ -321,6 +422,39 @@ impl StateInspector {
             && current.ino() == self.root.inode
             && current.uid() == self.owner
             && current.file_type().is_dir())
+    }
+
+    /// Whether this held directory remains a private, stable publication
+    /// parent for one managed consumer asset.
+    ///
+    /// This does not repair consumer-owned permissions or ACLs. A broader
+    /// mode, extended ACL, or path change is a manual-review boundary.
+    pub fn private_and_stable(&self) -> Result<bool, StateError> {
+        if !self.root.safe() || !self.path_matches_held_root()? {
+            return Ok(false);
+        }
+        private_directory(&self.directory, &self.path, self.owner)
+    }
+
+    /// Transfer one verified, private directory into the narrowly scoped
+    /// authority used to publish a declared managed asset.
+    ///
+    /// This is intentionally not a general consumer-directory writer: the
+    /// resulting value can create only one missing final regular-file entry
+    /// through its held descriptor. A consumer-owned parent with wider access
+    /// stays a manual-review boundary rather than becoming Cyclops state.
+    pub fn into_managed_asset_root(self) -> Result<ManagedAssetRoot, StateError> {
+        if !self.private_and_stable()? {
+            return Err(unsafe_path(
+                &self.path,
+                "managed asset parent is not private or changed before publication",
+            ));
+        }
+        Ok(ManagedAssetRoot {
+            directory: self.directory,
+            path: self.path,
+            owner: self.owner,
+        })
     }
 
     /// Inspect the state root's direct children within explicit hard bounds.
@@ -744,7 +878,32 @@ impl StateInspector {
                 "removal target is not one owned single-link regular file",
             ));
         }
-        self.bind_for_removal(expected, RemovalKind::RegularFile)
+        self.bind_for_removal(expected, RemovalKind::RegularFile, None)
+    }
+
+    /// Bind one inspected regular file and carry its temporal preview evidence
+    /// through the final unlink.
+    ///
+    /// [`BoundStateRemoval::remove`] rechecks this evidence on the held file
+    /// descriptor immediately before it unlinks the matching name. Callers
+    /// that have a cooperative writer lease should acquire it between binding
+    /// and removal so a writer cannot change the same inode in that interval.
+    pub fn bind_regular_file_for_removal_with_evidence(
+        &self,
+        expected: &InspectedEntry,
+        evidence: &RegularFileEvidence,
+    ) -> Result<BoundStateRemoval, StateError> {
+        if expected.kind != InspectedKind::RegularFile
+            || expected.uid != self.owner
+            || expected.links != 1
+            || !evidence.matches_entry(expected)
+        {
+            return Err(unsafe_path(
+                &expected.path,
+                "removal target does not match owned regular-file preview evidence",
+            ));
+        }
+        self.bind_for_removal(expected, RemovalKind::RegularFile, Some(evidence))
     }
 
     /// Bind one inspected empty directory for one explicit removal attempt.
@@ -758,7 +917,105 @@ impl StateInspector {
                 "removal target is not one owned directory",
             ));
         }
-        self.bind_for_removal(expected, RemovalKind::EmptyDirectory)
+        self.bind_for_removal(expected, RemovalKind::EmptyDirectory, None)
+    }
+
+    /// Atomically move this exact state root to one private sibling tombstone.
+    ///
+    /// This is deliberately narrower than a recursive remover. It only moves
+    /// the held, owner-only root after proving that both its path and parent
+    /// still name the inspected descriptors. The destination must be one
+    /// missing sibling name, so an existing file, directory, or symbolic link
+    /// is never replaced.
+    ///
+    /// A complete-removal operation can retain its checkpoint inside the
+    /// returned tombstone, then inspect and remove only its planned entries
+    /// through [`StateRootIsolation::inspector`]. The returned
+    /// [`StateRootIsolation::state_root`] can write the checkpoint that records
+    /// recovery progress. A later state root created at the original path is a
+    /// different namespace and is never covered by this isolation result.
+    pub fn isolate_root_to_sibling(
+        &self,
+        tombstone_name: &OsStr,
+    ) -> Result<StateRootIsolation, StateError> {
+        if self.root.kind != InspectedKind::Directory || self.root.uid != self.owner {
+            return Err(unsafe_path(
+                &self.path,
+                "state root is not one owned directory for isolation",
+            ));
+        }
+        if !self.root.safe() || !private_directory(&self.directory, &self.path, self.owner)? {
+            return Err(unsafe_path(
+                &self.path,
+                "state root is not private enough for isolation",
+            ));
+        }
+        if !self.path_matches_held_root()? {
+            return Err(unsafe_path(
+                &self.path,
+                "state root changed before isolation",
+            ));
+        }
+
+        let (parent, root_name, parent_path) = state_root_parent(&self.path)?;
+        if !state_root_parent_matches_held(&self.path, &parent)? {
+            return Err(unsafe_path(
+                &self.path,
+                "state root parent changed before isolation",
+            ));
+        }
+
+        let tombstone_path = parent_path.join(tombstone_name);
+        let tombstone_name = sibling_tombstone_name(&tombstone_path, tombstone_name)?;
+        if stat_at_optional(&parent, &tombstone_name, &tombstone_path)?.is_some() {
+            return Err(unsafe_path(
+                &tombstone_path,
+                "state root tombstone already exists",
+            ));
+        }
+
+        let before = stat_at(&parent, &root_name, &self.path)?;
+        validate_removal_stat(&before, &self.root, RemovalKind::EmptyDirectory)?;
+        validate_removal_descriptor(&self.directory, &self.root, RemovalKind::EmptyDirectory)?;
+
+        let state_directory = clone_file(&self.directory, &tombstone_path)?;
+        let inspector_directory = clone_file(&self.directory, &tombstone_path)?;
+        isolate_root_before_rename(&tombstone_path);
+        rename_no_replace(&parent, &root_name, &tombstone_name, &tombstone_path)?;
+
+        let mut root = self.root.clone();
+        root.path = tombstone_path.clone();
+        let after = stat_at(&parent, &tombstone_name, &tombstone_path)?;
+        validate_removal_stat(&after, &root, RemovalKind::EmptyDirectory).map_err(|_| {
+            unsafe_path(&tombstone_path, "isolated state root changed during rename")
+        })?;
+        validate_removal_descriptor(&state_directory, &root, RemovalKind::EmptyDirectory).map_err(
+            |_| unsafe_path(&tombstone_path, "isolated state root changed during rename"),
+        )?;
+        validate_removal_descriptor(&inspector_directory, &root, RemovalKind::EmptyDirectory)
+            .map_err(|_| {
+                unsafe_path(&tombstone_path, "isolated state root changed during rename")
+            })?;
+        sync_directory(&parent).map_err(|source| StateError::RemovalDurabilityUnknown {
+            path: tombstone_path.clone(),
+            source,
+        })?;
+
+        Ok(StateRootIsolation {
+            original_path: self.path.clone(),
+            tombstone_path: tombstone_path.clone(),
+            state_root: StateRoot {
+                directory: state_directory,
+                path: tombstone_path.clone(),
+                owner: self.owner,
+            },
+            inspector: StateInspector {
+                directory: inspector_directory,
+                path: tombstone_path,
+                owner: self.owner,
+                root,
+            },
+        })
     }
 
     /// Atomically move one exact direct child directory to a private name.
@@ -815,35 +1072,7 @@ impl StateInspector {
             ));
         }
 
-        // SAFETY: both names are bounded direct children of the held parent.
-        #[cfg(target_os = "macos")]
-        let result = unsafe {
-            libc::renameatx_np(
-                self.directory.as_raw_fd(),
-                old_name.as_ptr(),
-                self.directory.as_raw_fd(),
-                new_name.as_ptr(),
-                libc::RENAME_EXCL,
-            )
-        };
-        // SAFETY: both names are bounded direct children of the held parent.
-        #[cfg(target_os = "linux")]
-        let result = unsafe {
-            libc::renameat2(
-                self.directory.as_raw_fd(),
-                old_name.as_ptr(),
-                self.directory.as_raw_fd(),
-                new_name.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        };
-        if result != 0 {
-            return Err(path_error(
-                &isolated_path,
-                std::io::Error::last_os_error(),
-                "could not isolate state directory without replacement",
-            ));
-        }
+        rename_no_replace(&self.directory, &old_name, &new_name, &isolated_path)?;
         let after = stat_at(&self.directory, &new_name, &isolated_path)?;
         validate_removal_stat(&after, expected, RemovalKind::EmptyDirectory).map_err(|_| {
             unsafe_path(
@@ -864,6 +1093,7 @@ impl StateInspector {
         &self,
         expected: &InspectedEntry,
         kind: RemovalKind,
+        regular_evidence: Option<&RegularFileEvidence>,
     ) -> Result<BoundStateRemoval, StateError> {
         let descendant = expected
             .path
@@ -916,6 +1146,17 @@ impl StateInspector {
             })?,
         };
         validate_removal_descriptor(&target, expected, kind)?;
+        if let Some(evidence) = regular_evidence {
+            let metadata = target
+                .metadata()
+                .map_err(|source| io_error(&expected.path, source))?;
+            if !evidence.matches_metadata(&metadata) {
+                return Err(unsafe_path(
+                    &expected.path,
+                    "regular removal target changed after its preview",
+                ));
+            }
+        }
         let after = stat_at_optional(&parent, &name, &expected.path)?
             .ok_or_else(|| unsafe_path(&expected.path, "removal target changed before binding"))?;
         validate_removal_stat(&after, expected, kind)?;
@@ -943,9 +1184,241 @@ impl StateInspector {
             name,
             path: expected.path.clone(),
             expected: expected.clone(),
+            regular_evidence: regular_evidence.cloned(),
             kind,
         })
     }
+}
+
+impl StateRootIsolation {
+    /// Original state-root path at the start of the atomic isolation.
+    pub fn original_path(&self) -> &Path {
+        &self.original_path
+    }
+
+    /// Sibling tombstone path at the start of the atomic isolation.
+    pub fn tombstone_path(&self) -> &Path {
+        &self.tombstone_path
+    }
+
+    /// Held state-root authority for recovery checkpoints in the tombstone.
+    pub fn state_root(&self) -> &StateRoot {
+        &self.state_root
+    }
+
+    /// Held authority for the exact directory that was isolated.
+    pub fn inspector(&self) -> &StateInspector {
+        &self.inspector
+    }
+
+    /// Consume the result into the held state root and inspector.
+    pub fn into_parts(self) -> (StateRoot, StateInspector) {
+        (self.state_root, self.inspector)
+    }
+
+    /// Remove this exact tombstone only after its caller has made it empty.
+    ///
+    /// This is the final, non-recursive step of a state-home removal. The
+    /// inspector is deliberately dropped first, then the held root proves the
+    /// tombstone still names the same empty directory before unlinking that one
+    /// sibling entry.
+    pub fn remove_if_empty(self) -> Result<(), StateError> {
+        let Self {
+            state_root,
+            inspector,
+            ..
+        } = self;
+        drop(inspector);
+        state_root.remove_if_empty()
+    }
+}
+
+impl ManagedAssetRoot {
+    /// Check that the user-visible root path still names this held directory.
+    fn path_matches_held_root(&self) -> Result<bool, StateError> {
+        let parts = inspection_root_parts(&self.path)?;
+        let mut directory = open_start(&self.path)?;
+        for part in parts {
+            let name = c_name(&self.path, part)?;
+            directory = match open_directory_at(&directory, &name) {
+                Ok(next) => next,
+                Err(_) => return Ok(false),
+            };
+        }
+        let held = self
+            .directory
+            .metadata()
+            .map_err(|source| io_error(&self.path, source))?;
+        let current = directory
+            .metadata()
+            .map_err(|source| io_error(&self.path, source))?;
+        Ok(current.file_type().is_dir()
+            && current.dev() == held.dev()
+            && current.ino() == held.ino()
+            && current.uid() == self.owner)
+    }
+
+    /// Create a managed file only when its final leaf is absent.
+    ///
+    /// The file is visible as soon as `openat(O_EXCL)` succeeds, so the
+    /// parent must already be private. This deliberately does not publish by
+    /// a mutable named temporary file or create a consumer-tree directory.
+    /// Any raced or unsafe leaf stays exactly where it is. Callers must
+    /// re-inspect it before deciding whether another action is permitted.
+    pub fn create_file_once(
+        &self,
+        descendant: &Path,
+        contents: &[u8],
+    ) -> Result<CreateFileOutcome, StateError> {
+        let parts = inspection_descendant_parts(descendant)?;
+        let display_path = self.path.join(descendant);
+        if parts.len() != 1 {
+            return Err(unsafe_path(
+                &display_path,
+                "managed asset publication must name one final leaf",
+            ));
+        }
+        self.validate_private_parent(&display_path)?;
+        let directory = clone_file(&self.directory, &display_path)?;
+
+        let leaf = c_name(
+            &display_path,
+            parts
+                .last()
+                .expect("managed asset descendant has one component"),
+        )?;
+        let flags =
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        // SAFETY: `directory` is held and `leaf` is one validated component.
+        // O_EXCL gives this call sole authority over a new final entry.
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                leaf.as_ptr(),
+                flags,
+                FILE_MODE as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                return Ok(CreateFileOutcome::AlreadyExists);
+            }
+            return Err(path_error(
+                &display_path,
+                error,
+                "could not create managed asset file",
+            ));
+        }
+        // SAFETY: `fd` is a fresh successful `openat` result owned here.
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let result = (|| {
+            // This descriptor names the leaf just created with O_EXCL, so
+            // normalizing its mode and inherited ACL is safe even though the
+            // parent belongs to another tool.
+            repair_descriptor_permissions(&file, &display_path, FILE_MODE)?;
+            validate_regular(&file, &display_path, self.owner)?;
+            file.write_all(contents)
+                .map_err(|source| io_error(&display_path, source))?;
+            file.sync_all()
+                .map_err(|source| io_error(&display_path, source))?;
+            self.validate_private_parent(&display_path)?;
+            validate_created_leaf(&directory, &file, &leaf, &display_path, self.owner)?;
+            sync_directory(&directory).map_err(|source| StateError::CreationDurabilityUnknown {
+                path: display_path.clone(),
+                source,
+            })?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => Ok(CreateFileOutcome::Created),
+            Err(error @ StateError::CreationDurabilityUnknown { .. }) => Err(error),
+            Err(error) => {
+                let cause = match remove_created_leaf(
+                    &directory,
+                    &file,
+                    &leaf,
+                    &display_path,
+                    self.owner,
+                ) {
+                    Ok(()) => format!("{error}; the created leaf was removed"),
+                    Err(cleanup) => format!("{error}; cleanup also failed: {cleanup}"),
+                };
+                Err(StateError::CreationMayBeVisible {
+                    path: display_path,
+                    cause,
+                })
+            }
+        }
+    }
+
+    fn validate_private_parent(&self, display_path: &Path) -> Result<(), StateError> {
+        if !self.path_matches_held_root()? {
+            return Err(unsafe_path(
+                &self.path,
+                "managed asset parent changed before publication",
+            ));
+        }
+        if !private_directory(&self.directory, display_path, self.owner)? {
+            return Err(unsafe_path(
+                display_path,
+                "managed asset parent is not private",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Confirm that the leaf still names the exact descriptor created with
+/// `O_EXCL`. The final lookup never follows a link.
+fn validate_created_leaf(
+    parent: &File,
+    file: &File,
+    name: &CString,
+    path: &Path,
+    owner: u32,
+) -> Result<(), StateError> {
+    validate_regular(file, path, owner)?;
+    let descriptor = file.metadata().map_err(|source| io_error(path, source))?;
+    let named = stat_at(parent, name, path)?;
+    validate_regular_stat(&named, path, owner)?;
+    if descriptor.dev() != named.st_dev as u64 || descriptor.ino() != named.st_ino {
+        return Err(unsafe_path(
+            path,
+            "managed asset leaf changed during publication",
+        ));
+    }
+    Ok(())
+}
+
+/// Remove only the exact incomplete leaf this publisher created.
+///
+/// Cleanup is best effort because a failed create attempt may already have
+/// been visible to the consumer. The caller therefore reports uncertainty
+/// even when this unlink succeeds.
+fn remove_created_leaf(
+    parent: &File,
+    file: &File,
+    name: &CString,
+    path: &Path,
+    owner: u32,
+) -> Result<(), StateError> {
+    validate_created_leaf(parent, file, name, path, owner)?;
+    // SAFETY: the held parent and identity-checked name identify the file
+    // this invocation created. `unlinkat` does not follow a final symlink.
+    let result = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+    if result != 0 {
+        return Err(path_error(
+            path,
+            std::io::Error::last_os_error(),
+            "could not remove incomplete managed asset file",
+        ));
+    }
+    sync_directory(parent).map_err(|source| StateError::RemovalDurabilityUnknown {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 struct SocketIdentity {
@@ -970,6 +1443,109 @@ enum RemovalKind {
 }
 
 impl StateRoot {
+    /// Clone descriptor-bound inspection authority for this exact state root.
+    ///
+    /// A confirmed operation can acquire a shared lease through `StateRoot`
+    /// and inspect or isolate through the returned value without reopening the
+    /// root by pathname. That keeps the lease and destructive authority tied
+    /// to the same directory even if a competing process renames or replaces
+    /// the visible path between setup steps.
+    pub fn inspector(&self) -> Result<StateInspector, StateError> {
+        if !self.path_matches_held_root()? {
+            return Err(unsafe_path(
+                &self.path,
+                "state root changed before descriptor-bound inspection",
+            ));
+        }
+        if !private_directory(&self.directory, &self.path, self.owner)? {
+            return Err(unsafe_path(
+                &self.path,
+                "state root is not private enough for descriptor-bound inspection",
+            ));
+        }
+        let metadata = self
+            .directory
+            .metadata()
+            .map_err(|source| io_error(&self.path, source))?;
+        let root = inspected_from_metadata(self.path.clone(), &metadata, self.owner);
+        Ok(StateInspector {
+            directory: clone_file(&self.directory, &self.path)?,
+            path: self.path.clone(),
+            owner: self.owner,
+            root,
+        })
+    }
+
+    /// Remove this exact state root only when it is empty.
+    ///
+    /// This is intentionally not a tree deleter. It checks the held root and
+    /// its parent again, inspects the directory with a one-entry bound, and
+    /// removes only the verified final root name. A visible removal whose
+    /// parent sync fails is reported as durability-unknown.
+    pub fn remove_if_empty(self) -> Result<(), StateError> {
+        if !self.path_matches_held_root()? {
+            return Err(unsafe_path(
+                &self.path,
+                "state root changed before empty-root removal",
+            ));
+        }
+        if !private_directory(&self.directory, &self.path, self.owner)? {
+            return Err(unsafe_path(
+                &self.path,
+                "state root is not private enough for empty-root removal",
+            ));
+        }
+
+        let (parent, name, _) = state_root_parent(&self.path)?;
+        if !state_root_parent_matches_held(&self.path, &parent)? {
+            return Err(unsafe_path(
+                &self.path,
+                "state root parent changed before empty-root removal",
+            ));
+        }
+
+        let metadata = self
+            .directory
+            .metadata()
+            .map_err(|source| io_error(&self.path, source))?;
+        let expected = inspected_from_metadata(self.path.clone(), &metadata, self.owner);
+        validate_removal_descriptor(&self.directory, &expected, RemovalKind::EmptyDirectory)?;
+        let snapshot = inspect_directory_descriptor(
+            clone_file(&self.directory, &self.path)?,
+            self.path.clone(),
+            self.owner,
+            expected.clone(),
+            InspectionLimits::new(1, INSPECTION_NAME_BYTES_LIMIT_MAX)
+                .expect("empty-root inspection limits fit hard ceilings"),
+        )?;
+        if snapshot.truncated || !snapshot.entries.is_empty() {
+            return Err(unsafe_path(
+                &self.path,
+                "state root is not empty for removal",
+            ));
+        }
+
+        let named = stat_at(&parent, &name, &self.path)?;
+        validate_removal_stat(&named, &expected, RemovalKind::EmptyDirectory)?;
+        validate_removal_descriptor(&self.directory, &expected, RemovalKind::EmptyDirectory)?;
+
+        // SAFETY: the held parent and immediately revalidated root name
+        // identify the empty state root. `AT_REMOVEDIR` cannot recurse.
+        let result =
+            unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+        if result != 0 {
+            return Err(path_error(
+                &self.path,
+                std::io::Error::last_os_error(),
+                "could not remove empty state root",
+            ));
+        }
+        sync_directory(&parent).map_err(|source| StateError::RemovalDurabilityUnknown {
+            path: self.path,
+            source,
+        })
+    }
+
     /// Open or create the state root without following any path component.
     pub fn open_or_create(path: &Path) -> Result<Self, StateError> {
         Self::open_root(path, true)?.ok_or_else(|| StateError::Io {
@@ -1287,6 +1863,39 @@ impl StateRoot {
 
     /// Capture cleanup authority for one validated root-level socket.
     pub fn bound_socket_cleanup(&self, leaf: &OsStr) -> Result<BoundSocketCleanup, StateError> {
+        self.capture_root_socket_cleanup(leaf, None)
+    }
+
+    /// Capture cleanup authority for one exact inspected root-level socket.
+    ///
+    /// Complete state-home removal uses this form so a replacement socket is
+    /// left in place rather than becoming a newly authorized cleanup target.
+    pub fn bind_root_socket_for_removal(
+        &self,
+        expected: &InspectedEntry,
+    ) -> Result<BoundSocketCleanup, StateError> {
+        if expected.kind != InspectedKind::Socket
+            || expected.uid != self.owner
+            || expected.links != 1
+            || expected.path.parent() != Some(self.path.as_path())
+        {
+            return Err(unsafe_path(
+                &expected.path,
+                "removal target is not one owned root-level socket",
+            ));
+        }
+        let leaf = expected
+            .path
+            .file_name()
+            .ok_or_else(|| unsafe_path(&expected.path, "state socket has no file name"))?;
+        self.capture_root_socket_cleanup(leaf, Some(expected))
+    }
+
+    fn capture_root_socket_cleanup(
+        &self,
+        leaf: &OsStr,
+        expected: Option<&InspectedEntry>,
+    ) -> Result<BoundSocketCleanup, StateError> {
         let descendant = Path::new(leaf);
         let parts = descendant_parts(descendant)?;
         if parts.len() != 1 {
@@ -1306,6 +1915,20 @@ impl StateRoot {
         }
         if metadata.st_nlink != 1 {
             return Err(unsafe_path(&path, "state socket has multiple hard links"));
+        }
+        if let Some(expected) = expected {
+            let same = metadata.st_dev as u64 == expected.device
+                && stat_inode(&metadata) == expected.inode
+                && metadata.st_uid == expected.uid
+                && metadata.st_nlink as u64 == expected.links
+                && metadata.st_mode as u32 & 0o7777 == expected.mode
+                && u64::try_from(metadata.st_size).unwrap_or_default() == expected.size;
+            if !same {
+                return Err(unsafe_path(
+                    &path,
+                    "state socket changed before removal binding",
+                ));
+            }
         }
         Ok(BoundSocketCleanup {
             directory: clone_file(&self.directory, &path)?,
@@ -1517,6 +2140,18 @@ impl BoundStateRemoval {
     pub fn remove(self) -> Result<(), StateError> {
         validate_removal_descriptor(&self.target, &self.expected, self.kind)
             .map_err(|_| unsafe_path(&self.path, "bound removal target changed before removal"))?;
+        if let Some(evidence) = &self.regular_evidence {
+            let metadata = self
+                .target
+                .metadata()
+                .map_err(|source| io_error(&self.path, source))?;
+            if !evidence.matches_metadata(&metadata) {
+                return Err(unsafe_path(
+                    &self.path,
+                    "bound regular removal target changed after its preview",
+                ));
+            }
+        }
         let named = stat_at_optional(&self.parent, &self.name, &self.path)?.ok_or_else(|| {
             unsafe_path(&self.path, "bound removal target changed before removal")
         })?;
@@ -2078,6 +2713,126 @@ fn sync_directory(directory: &File) -> std::io::Result<()> {
     directory.sync_all()
 }
 
+/// Open the direct parent of one state-root path without following any
+/// component. The returned name is the root's final component beneath that
+/// held parent.
+fn state_root_parent(path: &Path) -> Result<(File, CString, PathBuf), StateError> {
+    let parts = inspection_root_parts(path)?;
+    let mut parent = open_start(path)?;
+    for part in &parts[..parts.len() - 1] {
+        let name = c_name(path, part)?;
+        parent = open_directory_at(&parent, &name).map_err(|error| {
+            path_error(
+                path,
+                error,
+                "state root contains a linked or non-directory component",
+            )
+        })?;
+    }
+    validate_root_parent(&parent, path)?;
+    let root_name = c_name(path, parts.last().expect("state root has one component"))?;
+    let parent_path = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    Ok((parent, root_name, parent_path))
+}
+
+/// Verify that a fresh no-follow traversal still reaches the held root parent.
+fn state_root_parent_matches_held(path: &Path, held_parent: &File) -> Result<bool, StateError> {
+    let (fresh_parent, _, _) = state_root_parent(path)?;
+    let held = held_parent
+        .metadata()
+        .map_err(|source| io_error(path, source))?;
+    let fresh = fresh_parent
+        .metadata()
+        .map_err(|source| io_error(path, source))?;
+    Ok(held.file_type().is_dir()
+        && fresh.file_type().is_dir()
+        && held.dev() == fresh.dev()
+        && held.ino() == fresh.ino())
+}
+
+/// Validate one bounded path component used as a state-root tombstone name.
+fn sibling_tombstone_name(path: &Path, name: &OsStr) -> Result<CString, StateError> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty()
+        || bytes == b"."
+        || bytes == b".."
+        || bytes.contains(&b'/')
+        || bytes.len() > 240
+    {
+        return Err(unsafe_path(
+            path,
+            "state root tombstone must be one bounded sibling name",
+        ));
+    }
+    c_name(path, name)
+}
+
+/// Rename one exact entry within a held parent without replacing a destination.
+fn rename_no_replace(
+    parent: &File,
+    source: &CString,
+    destination: &CString,
+    destination_path: &Path,
+) -> Result<(), StateError> {
+    // SAFETY: both names are validated direct children of the held parent.
+    #[cfg(target_os = "macos")]
+    let result = unsafe {
+        libc::renameatx_np(
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    // SAFETY: both names are validated direct children of the held parent.
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::renameat2(
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::AlreadyExists {
+        return Err(unsafe_path(
+            destination_path,
+            "isolation target already exists",
+        ));
+    }
+    Err(path_error(
+        destination_path,
+        error,
+        "could not isolate state directory without replacement",
+    ))
+}
+
+#[cfg(test)]
+fn isolate_root_before_rename(path: &Path) {
+    ISOLATE_ROOT_BEFORE_RENAME.with(|slot| {
+        if let Some(action) = slot.borrow_mut().take() {
+            action(path);
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn isolate_root_before_rename(_: &Path) {}
+
+#[cfg(test)]
+fn inject_isolate_root_before_rename(action: impl FnOnce(&Path) + 'static) {
+    ISOLATE_ROOT_BEFORE_RENAME.with(|slot| *slot.borrow_mut() = Some(Box::new(action)));
+}
+
 #[cfg(test)]
 fn inject_next_directory_sync_failure() {
     FAIL_NEXT_DIRECTORY_SYNC.with(|fail| fail.set(true));
@@ -2175,6 +2930,21 @@ fn validate_directory(file: &File, path: &Path, owner: u32) -> Result<(), StateE
         return Err(unsafe_path(path, "state directory belongs to another user"));
     }
     Ok(())
+}
+
+/// Confirm the descriptor names an owner-only directory with no extended
+/// access policy. Consumer directories are never repaired into this state.
+fn private_directory(file: &File, path: &Path, owner: u32) -> Result<bool, StateError> {
+    let metadata = file.metadata().map_err(|source| io_error(path, source))?;
+    validate_directory(file, path, owner)?;
+    if metadata.mode() & 0o7777 & !DIRECTORY_MODE != 0 {
+        return Ok(false);
+    }
+    #[cfg(target_os = "macos")]
+    if !has_no_extended_acl(file, path)? {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn validate_directory_stat(
@@ -2289,7 +3059,7 @@ fn inspection_safety(
         InspectedKind::Symlink => return Some("state entry is a symbolic link"),
         InspectedKind::Other => return Some("state entry has an unsupported file type"),
         InspectedKind::RegularFile if links != 1 => {
-            return Some("state file has multiple hard links")
+            return Some("state file has multiple hard links");
         }
         InspectedKind::Socket if links != 1 => return Some("state socket has multiple hard links"),
         _ => {}
@@ -3160,6 +3930,32 @@ fn remove_extended_acl(file: &File, path: &Path) -> Result<(), StateError> {
     Ok(())
 }
 
+/// macOS mode bits do not describe an extended ACL that can grant another
+/// principal access. A managed consumer parent must have none: Cyclops does
+/// not own that directory and therefore must not clear or rewrite its ACL.
+#[cfg(target_os = "macos")]
+fn has_no_extended_acl(file: &File, path: &Path) -> Result<bool, StateError> {
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    let Some(acl) = std::ptr::NonNull::new(acl).map(ExtendedAcl) else {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ENOENT) {
+            Ok(true)
+        } else {
+            Err(io_error(path, error))
+        };
+    };
+    let mut entry = std::ptr::null_mut();
+    // SAFETY: `acl` is a live ACL handle and `entry` is writable storage for
+    // the opaque entry pointer. ACL_FIRST_ENTRY is the documented iterator
+    // start value.
+    let result = unsafe { acl_get_entry(acl.0.as_ptr(), ACL_FIRST_ENTRY, &mut entry) };
+    match result {
+        0 => Ok(false),
+        -1 if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) => Ok(true),
+        _ => Err(io_error(path, std::io::Error::last_os_error())),
+    }
+}
+
 #[cfg(target_os = "macos")]
 struct ExtendedAcl(std::ptr::NonNull<libc::c_void>);
 
@@ -3174,9 +3970,21 @@ impl Drop for ExtendedAcl {
 #[cfg(target_os = "macos")]
 unsafe extern "C" {
     fn acl_init(count: libc::c_int) -> *mut libc::c_void;
+    fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut libc::c_void;
+    fn acl_get_entry(
+        acl: *mut libc::c_void,
+        entry_id: libc::c_int,
+        entry: *mut *mut libc::c_void,
+    ) -> libc::c_int;
     fn acl_set_fd(fd: libc::c_int, acl: *mut libc::c_void) -> libc::c_int;
     fn acl_free(object: *mut libc::c_void) -> libc::c_int;
 }
+
+#[cfg(target_os = "macos")]
+const ACL_FIRST_ENTRY: libc::c_int = 0;
+
+#[cfg(target_os = "macos")]
+const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
 
 fn clone_file(file: &File, path: &Path) -> Result<File, StateError> {
     file.try_clone().map_err(|source| io_error(path, source))
@@ -3702,6 +4510,297 @@ mod tests {
     }
 
     #[test]
+    fn root_isolation_moves_one_private_root_and_returns_held_tombstone_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let root = root_in(&temp);
+        let root_path = root.path().to_path_buf();
+        root.open_append(Path::new("operations/pending.json"))
+            .unwrap()
+            .append_bounded(b"pending\n", 1024, 512)
+            .unwrap();
+        drop(root);
+
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let isolation = inspector
+            .isolate_root_to_sibling(OsStr::new(".state-removing"))
+            .unwrap();
+        let tombstone = base.join(".state-removing");
+
+        assert_eq!(isolation.original_path(), root_path);
+        assert_eq!(isolation.tombstone_path(), tombstone);
+        assert!(!root_path.exists(), "the original state root was moved");
+        assert_eq!(
+            fs::read(tombstone.join("operations/pending.json")).unwrap(),
+            b"pending\n"
+        );
+        isolation
+            .state_root()
+            .replace_file(Path::new("operations/complete.json"), b"complete\n")
+            .unwrap();
+        assert_eq!(
+            fs::read(tombstone.join("operations/complete.json")).unwrap(),
+            b"complete\n"
+        );
+        assert!(isolation.state_root().path_matches_held_root().unwrap());
+        assert!(isolation.inspector().path_matches_held_root().unwrap());
+        assert!(
+            !inspector.path_matches_held_root().unwrap(),
+            "the original inspector cannot authorize the moved namespace"
+        );
+    }
+
+    #[test]
+    fn root_isolation_refuses_a_replaced_root_and_leaves_the_new_root_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let root = root_in(&temp);
+        let root_path = root.path().to_path_buf();
+        drop(root);
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+
+        let displaced = base.join("displaced-state");
+        fs::rename(&root_path, &displaced).unwrap();
+        let replacement = StateRoot::open_or_create(&root_path).unwrap();
+        replacement
+            .open_append(Path::new("new-state"))
+            .unwrap()
+            .append_bounded(b"keep\n", 1024, 512)
+            .unwrap();
+        drop(replacement);
+
+        let error = inspector
+            .isolate_root_to_sibling(OsStr::new(".state-removing"))
+            .unwrap_err();
+        assert!(matches!(error, StateError::UnsafePath { .. }));
+        assert_eq!(fs::read(root_path.join("new-state")).unwrap(), b"keep\n");
+        assert!(
+            displaced.exists(),
+            "the original held root was not renamed again"
+        );
+        assert!(!base.join(".state-removing").exists());
+    }
+
+    #[test]
+    fn root_isolation_never_reaches_a_new_root_created_after_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let root = root_in(&temp);
+        let root_path = root.path().to_path_buf();
+        root.open_append(Path::new("old-state"))
+            .unwrap()
+            .append_bounded(b"old\n", 1024, 512)
+            .unwrap();
+        drop(root);
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let isolation = inspector
+            .isolate_root_to_sibling(OsStr::new(".state-removing"))
+            .unwrap();
+
+        let replacement = StateRoot::open_or_create(&root_path).unwrap();
+        replacement
+            .open_append(Path::new("new-state"))
+            .unwrap()
+            .append_bounded(b"new\n", 1024, 512)
+            .unwrap();
+        drop(replacement);
+
+        assert_eq!(
+            fs::read(base.join(".state-removing/old-state")).unwrap(),
+            b"old\n"
+        );
+        assert_eq!(fs::read(root_path.join("new-state")).unwrap(), b"new\n");
+        assert!(isolation.inspector().path_matches_held_root().unwrap());
+    }
+
+    #[test]
+    fn root_isolation_never_replaces_an_existing_tombstone_or_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let root = root_in(&temp);
+        let root_path = root.path().to_path_buf();
+        drop(root);
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let tombstone = base.join(".state-removing");
+        let external = base.join("external");
+        fs::write(&tombstone, b"occupied\n").unwrap();
+        let occupied = inspector
+            .isolate_root_to_sibling(OsStr::new(".state-removing"))
+            .unwrap_err();
+        assert!(matches!(occupied, StateError::UnsafePath { .. }));
+        assert_eq!(fs::read(&tombstone).unwrap(), b"occupied\n");
+
+        fs::remove_file(&tombstone).unwrap();
+        fs::write(&external, b"outside\n").unwrap();
+        symlink(&external, &tombstone).unwrap();
+
+        let error = inspector
+            .isolate_root_to_sibling(OsStr::new(".state-removing"))
+            .unwrap_err();
+        assert!(matches!(error, StateError::UnsafePath { .. }));
+        assert!(root_path.exists(), "the source root remains in place");
+        assert!(tombstone.is_symlink(), "the existing target is untouched");
+        assert_eq!(fs::read(&external).unwrap(), b"outside\n");
+    }
+
+    #[test]
+    fn root_isolation_refuses_a_tombstone_created_at_the_rename_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let root = root_in(&temp);
+        let root_path = root.path().to_path_buf();
+        drop(root);
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let tombstone = base.join(".state-removing");
+        inject_isolate_root_before_rename(move |path| {
+            assert_eq!(path, tombstone);
+            fs::write(path, b"raced\n").unwrap();
+        });
+
+        let error = inspector
+            .isolate_root_to_sibling(OsStr::new(".state-removing"))
+            .unwrap_err();
+        assert!(matches!(error, StateError::UnsafePath { .. }));
+        assert!(root_path.exists(), "the source root remains in place");
+        assert_eq!(fs::read(base.join(".state-removing")).unwrap(), b"raced\n");
+    }
+
+    #[test]
+    fn root_isolation_refuses_a_non_private_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+        fs::create_dir(&root_path).unwrap();
+        set_mode(&root_path, 0o755);
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+
+        let error = inspector
+            .isolate_root_to_sibling(OsStr::new(".state-removing"))
+            .unwrap_err();
+        assert!(matches!(error, StateError::UnsafePath { .. }));
+        assert!(root_path.exists());
+    }
+
+    #[test]
+    fn root_isolation_reports_durability_uncertainty_after_a_visible_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let root = root_in(&temp);
+        let root_path = root.path().to_path_buf();
+        drop(root);
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let tombstone = base.join(".state-removing");
+        inject_next_directory_sync_failure();
+
+        let error = inspector
+            .isolate_root_to_sibling(OsStr::new(".state-removing"))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StateError::RemovalDurabilityUnknown { path, .. } if path == tombstone
+        ));
+        assert!(
+            !root_path.exists(),
+            "the rename was visible before sync failed"
+        );
+        assert!(
+            tombstone.exists(),
+            "the caller can inspect the named tombstone"
+        );
+    }
+
+    #[test]
+    fn empty_root_removal_removes_only_the_held_empty_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let root_path = base.join("state");
+        let root = StateRoot::open_or_create(&root_path).unwrap();
+
+        root.remove_if_empty().unwrap();
+
+        assert!(!root_path.exists());
+        assert!(base.exists(), "empty-root removal never reaches its parent");
+    }
+
+    #[test]
+    fn empty_root_removal_refuses_a_replacement_or_nonempty_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let root_path = base.join("state");
+        let held = StateRoot::open_or_create(&root_path).unwrap();
+        let displaced = base.join("displaced");
+        fs::rename(&root_path, &displaced).unwrap();
+        fs::create_dir(&root_path).unwrap();
+
+        assert!(held.remove_if_empty().is_err());
+        assert!(root_path.is_dir(), "the replacement root stays untouched");
+        assert!(
+            displaced.is_dir(),
+            "the held root stays available for recovery"
+        );
+
+        let nonempty = StateRoot::open_existing(&root_path).unwrap().unwrap();
+        nonempty
+            .open_append(Path::new("keep"))
+            .unwrap()
+            .append_bounded(b"keep\n", 1024, 512)
+            .unwrap();
+        assert!(nonempty.remove_if_empty().is_err());
+        assert_eq!(fs::read(root_path.join("keep")).unwrap(), b"keep\n");
+    }
+
+    #[test]
+    fn isolated_empty_root_can_be_finalized_without_reopening_its_source_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let root = root_in(&temp);
+        let root_path = root.path().to_path_buf();
+        drop(root);
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let isolation = inspector
+            .isolate_root_to_sibling(OsStr::new(".state-removing"))
+            .unwrap();
+        let tombstone = base.join(".state-removing");
+
+        isolation.remove_if_empty().unwrap();
+
+        assert!(!root_path.exists());
+        assert!(!tombstone.exists());
+    }
+
+    #[test]
+    fn descriptor_bound_inspector_cannot_follow_a_replaced_root_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let held = root_in(&temp);
+        let root_path = held.path().to_path_buf();
+        let inspector = held.inspector().unwrap();
+        let displaced = base.join("displaced");
+        fs::rename(&root_path, &displaced).unwrap();
+        fs::create_dir(&root_path).unwrap();
+
+        assert!(!inspector.path_matches_held_root().unwrap());
+        assert!(held.inspector().is_err());
+        assert!(displaced.is_dir());
+        assert!(root_path.is_dir());
+    }
+
+    #[test]
     fn bound_removal_rejects_symbolic_and_multiply_linked_files() {
         let temp = tempfile::tempdir().unwrap();
         let base = base(&temp);
@@ -3797,6 +4896,46 @@ mod tests {
         fs::write(&path, b"changed size").unwrap();
         assert!(removal.remove().is_err());
         assert_eq!(fs::read(&path).unwrap(), b"changed size");
+    }
+
+    #[test]
+    fn bound_regular_removal_with_evidence_refuses_a_same_size_rewrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let root_path = base(&temp).join("state");
+        let path = root_path.join("entry");
+        fs::create_dir(&root_path).unwrap();
+        fs::write(&path, b"before").unwrap();
+        let inspector = StateInspector::open_existing(&root_path)
+            .unwrap()
+            .expect("existing state root");
+        let snapshot = inspector.inspect_root(InspectionLimits::default()).unwrap();
+        let evidence = RegularFileEvidence::from_metadata(&fs::metadata(&path).unwrap());
+        let removal = inspector
+            .bind_regular_file_for_removal_with_evidence(&snapshot.entries[0], &evidence)
+            .unwrap();
+        assert!(removal.try_lock().unwrap());
+
+        fs::write(&path, b"after!").unwrap();
+        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: 1,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: 2,
+                tv_nsec: 0,
+            },
+        ];
+        // SAFETY: this test supplies a valid path and the two timestamps
+        // required by utimensat, using a fixed time rather than a sleep.
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, name.as_ptr(), times.as_ptr(), 0) },
+            0
+        );
+
+        assert!(removal.remove().is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"after!");
     }
 
     #[test]
@@ -4027,6 +5166,12 @@ mod tests {
         };
         let mask =
             u32::from_str_radix(&std::env::var(CHILD_UMASK).expect("child umask"), 8).unwrap();
+        let managed_parent = root
+            .parent()
+            .expect("state root has a parent")
+            .join("consumer/skills/cyclops");
+        fs::create_dir_all(&managed_parent).unwrap();
+        set_mode(&managed_parent, DIRECTORY_MODE);
         // SAFETY: this dedicated child owns the process-wide umask until exit.
         unsafe { libc::umask(mask as libc::mode_t) };
         let state = StateRoot::open_or_create(&root).unwrap();
@@ -4038,6 +5183,17 @@ mod tests {
         assert_eq!(
             state
                 .create_file_once(Path::new("identity/workspace-id"), b"stable\n")
+                .unwrap(),
+            CreateFileOutcome::Created
+        );
+        let managed = StateInspector::open_existing(&managed_parent)
+            .unwrap()
+            .expect("private managed parent")
+            .into_managed_asset_root()
+            .expect("managed parent is accepted");
+        assert_eq!(
+            managed
+                .create_file_once(Path::new("SKILL.md"), b"managed\n")
                 .unwrap(),
             CreateFileOutcome::Created
         );
@@ -4066,6 +5222,12 @@ mod tests {
             assert_eq!(mode(&root.join("config/settings.json")), FILE_MODE);
             assert_eq!(mode(&root.join("identity")), DIRECTORY_MODE);
             assert_eq!(mode(&root.join("identity/workspace-id")), FILE_MODE);
+            let managed_parent = root
+                .parent()
+                .expect("state root has a parent")
+                .join("consumer/skills/cyclops");
+            assert_eq!(mode(&managed_parent), DIRECTORY_MODE);
+            assert_eq!(mode(&managed_parent.join("SKILL.md")), FILE_MODE);
             assert_eq!(
                 fs::read(root.join("config/settings.json")).unwrap(),
                 b"atomic\n"
@@ -4073,6 +5235,10 @@ mod tests {
             assert_eq!(
                 fs::read(root.join("identity/workspace-id")).unwrap(),
                 b"stable\n"
+            );
+            assert_eq!(
+                fs::read(managed_parent.join("SKILL.md")).unwrap(),
+                b"managed\n"
             );
         }
     }
@@ -4523,6 +5689,149 @@ mod tests {
         assert_eq!(
             external_directory.metadata().unwrap().permissions().mode() & 0o777,
             0o750
+        );
+    }
+
+    #[test]
+    fn managed_asset_publisher_creates_one_direct_leaf_only_below_a_private_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = base(&temp);
+        let directory = base.join("consumer/skills/cyclops");
+        fs::create_dir_all(&directory).unwrap();
+        set_mode(&directory, DIRECTORY_MODE);
+        let external = base.join("outside.md");
+        fs::write(&external, b"released seed\n").unwrap();
+        let linked = directory.join("linked.md");
+        symlink(&external, &linked).unwrap();
+        let dangling_target = base.join("missing/outside.md");
+        let dangling = directory.join("dangling.md");
+        symlink(&dangling_target, &dangling).unwrap();
+        let skill = directory.join("SKILL.md");
+        fs::hard_link(&external, &skill).unwrap();
+        let owned = directory.join("owned.md");
+        fs::write(&owned, b"existing managed copy\n").unwrap();
+        let external_before = snapshot(&external);
+        let external_links = fs::metadata(&external).unwrap().nlink();
+        let root = StateInspector::open_existing(&directory)
+            .unwrap()
+            .expect("private final parent")
+            .into_managed_asset_root()
+            .expect("private parent is publishable");
+
+        assert_eq!(
+            root.create_file_once(Path::new("linked.md"), b"shipped\n")
+                .unwrap(),
+            CreateFileOutcome::AlreadyExists
+        );
+        assert_eq!(
+            root.create_file_once(Path::new("dangling.md"), b"shipped\n")
+                .unwrap(),
+            CreateFileOutcome::AlreadyExists
+        );
+        assert_eq!(
+            root.create_file_once(Path::new("SKILL.md"), b"shipped\n")
+                .unwrap(),
+            CreateFileOutcome::AlreadyExists
+        );
+        assert_eq!(
+            root.create_file_once(Path::new("owned.md"), b"shipped\n")
+                .unwrap(),
+            CreateFileOutcome::AlreadyExists
+        );
+        assert_eq!(
+            root.create_file_once(Path::new("fresh.md"), b"shipped\n")
+                .unwrap(),
+            CreateFileOutcome::Created
+        );
+        assert_eq!(fs::read(directory.join("fresh.md")).unwrap(), b"shipped\n");
+        assert_eq!(mode(&directory.join("fresh.md")), FILE_MODE);
+        assert!(root
+            .create_file_once(Path::new("nested/new.md"), b"shipped\n")
+            .is_err());
+        assert!(
+            !directory.join("nested").exists(),
+            "managed publication created a consumer-tree directory"
+        );
+
+        let outside_directory = base.join("outside-directory");
+        fs::create_dir(&outside_directory).unwrap();
+        let moved_parent = base.join("held-parent");
+        fs::rename(&directory, &moved_parent).unwrap();
+        symlink(&outside_directory, &directory).unwrap();
+        assert!(root
+            .create_file_once(Path::new("new.md"), b"shipped\n")
+            .is_err());
+
+        assert!(fs::symlink_metadata(&directory)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(snapshot(&external), external_before);
+        assert_eq!(fs::metadata(&external).unwrap().nlink(), external_links);
+        assert!(fs::symlink_metadata(moved_parent.join("linked.md"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(fs::symlink_metadata(moved_parent.join("dangling.md"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read(moved_parent.join("owned.md")).unwrap(),
+            b"existing managed copy\n"
+        );
+        assert_eq!(
+            fs::read(moved_parent.join("fresh.md")).unwrap(),
+            b"shipped\n"
+        );
+        assert!(!dangling_target.exists());
+        assert!(!outside_directory.join("new.md").exists());
+        assert!(!moved_parent.join("new.md").exists());
+    }
+
+    #[test]
+    fn managed_asset_publisher_refuses_a_nonprivate_parent_without_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = base(&temp).join("consumer/skills/cyclops");
+        fs::create_dir_all(&parent).unwrap();
+        set_mode(&parent, 0o755);
+
+        let result = StateInspector::open_existing(&parent)
+            .unwrap()
+            .expect("consumer parent")
+            .into_managed_asset_root();
+
+        assert!(matches!(result, Err(StateError::UnsafePath { .. })));
+        assert!(
+            fs::read_dir(&parent).unwrap().next().is_none(),
+            "a nonprivate parent gained a managed asset"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_asset_publisher_refuses_a_parent_with_an_extended_acl_without_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = base(&temp).join("consumer/skills/cyclops");
+        fs::create_dir_all(&parent).unwrap();
+        set_mode(&parent, DIRECTORY_MODE);
+        let status = Command::new("/bin/chmod")
+            .args(["+a", "everyone allow list,add_file,search"])
+            .arg(&parent)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(!acl_entries(&parent).is_empty());
+
+        let result = StateInspector::open_existing(&parent)
+            .unwrap()
+            .expect("consumer parent")
+            .into_managed_asset_root();
+
+        assert!(matches!(result, Err(StateError::UnsafePath { .. })));
+        assert!(
+            fs::read_dir(&parent).unwrap().next().is_none(),
+            "an ACL-bearing parent gained a managed asset"
         );
     }
 

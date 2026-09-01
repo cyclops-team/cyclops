@@ -422,58 +422,92 @@ async fn send_wait_turn_ended_round_trip() {
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
 
-    // Fixture turn: once the payload lands in the pane, run one
-    // working-then-idle title cycle, as an agent CLI would.
-    let socket = rig.tmux.socket().to_string();
-    let pane_for_driver = pane.clone();
-    let driver = std::thread::spawn(move || {
-        let tmux = |args: &[&str]| {
-            let _ = std::process::Command::new("tmux")
-                .args(["-u", "-L", &socket, "-f", "/dev/null"])
-                .args(args)
-                .status();
-        };
-        let capture = || {
-            std::process::Command::new("tmux")
-                .args(["-u", "-L", &socket, "-f", "/dev/null"])
-                .args(["capture-pane", "-p", "-t", &pane_for_driver])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                .unwrap_or_default()
-        };
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !capture().contains("[cyclops") && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        std::thread::sleep(Duration::from_millis(200));
-        tmux(&[
-            "select-pane",
-            "-t",
-            &pane_for_driver,
-            "-T",
-            "WORKING the turn",
-        ]);
-        // Outlive the 1Hz subscription tick (F23) so the working phase is
-        // observable before the turn "ends".
-        std::thread::sleep(Duration::from_millis(2000));
-        tmux(&[
-            "select-pane",
-            "-t",
-            &pane_for_driver,
-            "-T",
-            "READY turn ended",
-        ]);
+    // Drive the turn from delivery boundaries rather than guessing when the
+    // payload will appear. `post_submit` proves the key crossed the terminal
+    // boundary; `post_receipt` proves receipt observation has finished and
+    // the composed pane wait has not started. The complete working-to-idle
+    // edge happens while that second boundary is held. A receiver opened only
+    // by the wait would miss both facts; the pre-Enter handoff must retain
+    // them.
+    let (submitted_tx, mut submitted_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (post_receipt_tx, mut post_receipt_rx) = tokio::sync::mpsc::unbounded_channel();
+    let submitted_release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let post_receipt_release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let submitted_pause = std::sync::Arc::clone(&submitted_release);
+    let post_receipt_pause = std::sync::Arc::clone(&post_receipt_release);
+    rig.daemon.set_inject_pause(move |phase| {
+        let submitted_tx = submitted_tx.clone();
+        let post_receipt_tx = post_receipt_tx.clone();
+        let submitted_pause = std::sync::Arc::clone(&submitted_pause);
+        let post_receipt_pause = std::sync::Arc::clone(&post_receipt_pause);
+        Box::pin(async move {
+            let (entered, release) = match phase {
+                "post_submit" => (submitted_tx, submitted_pause),
+                "post_receipt" => (post_receipt_tx, post_receipt_pause),
+                _ => return,
+            };
+            let _ = entered.send(());
+            release
+                .acquire_owned()
+                .await
+                .expect("delivery-boundary release")
+                .forget();
+        })
     });
 
-    let (result, _) = rig
-        .send(json!({
-            "to": ["worker"],
-            "subject": "run this",
-            "body": "a\nb",
-            "wait": {"until": "turn_ended", "timeout_ms": 10000},
-        }))
-        .await;
-    driver.join().expect("driver thread");
+    let params: cyclops_proto::MsgSendParams = serde_json::from_value(json!({
+        "to": ["worker"],
+        "subject": "run this",
+        "body": "a\nb",
+        "wait": {"until": "turn_ended", "timeout_ms": 10000},
+    }))
+    .expect("send params");
+    let daemon = &rig.daemon;
+    let tmux = &rig.tmux;
+    let events = &mut rig.ev;
+    let ctl = &mut rig.ctl;
+    let (result, ()) = tokio::join!(daemon.deliver_payload("admin", params), async {
+        tokio::time::timeout(Duration::from_secs(5), submitted_rx.recv())
+            .await
+            .expect("send crossed the submit boundary")
+            .expect("submit boundary signal exists");
+        submitted_release.add_permits(1);
+
+        tokio::time::timeout(Duration::from_secs(8), post_receipt_rx.recv())
+            .await
+            .expect("send reached the post-receipt boundary")
+            .expect("post-receipt boundary signal exists");
+        tmux.run_ok(&["select-pane", "-t", &pane, "-T", "WORKING the turn"]);
+        events
+            .wait_event(Duration::from_secs(5), |event| {
+                event["event"] == "state"
+                    && event["data"]["pane_id"] == pane.as_str()
+                    && event["data"]["state"] == "working"
+                    && event["data"]["working_confirmed"] == true
+            })
+            .await;
+        tmux.run_ok(&["select-pane", "-t", &pane, "-T", "READY turn ended"]);
+        events
+            .wait_event(Duration::from_secs(5), |event| {
+                event["event"] == "state"
+                    && event["data"]["pane_id"] == pane.as_str()
+                    && event["data"]["state"] == "idle"
+            })
+            .await;
+        // This is an explicit state boundary, not a delay: the independent
+        // wait answers only after the daemon has made the final Idle state
+        // observable. The composed wait begins after this point.
+        let idle = ctl
+            .request(
+                "agent.wait",
+                json!({"target": "worker", "until": "idle", "timeout_ms": 5000}),
+            )
+            .await;
+        assert!(idle["error"].is_null(), "{idle}");
+        assert_eq!(idle["result"]["state"], "idle", "{idle}");
+        post_receipt_release.add_permits(1);
+    });
+    let result = result.expect("send-and-wait answers");
 
     let msg_id = result["msg_id"].as_str().expect("msg id").to_string();
     assert_eq!(
@@ -491,6 +525,183 @@ async fn send_wait_turn_ended_round_trip() {
         rig.final_state(&msg_id, "worker").as_deref(),
         Some("delivered_unverified")
     );
+    rig.assert_ledger_legal(&[]);
+    rig.shutdown().await;
+}
+
+/// A receiver retained across receipt settlement is historical evidence, not
+/// the pane's current state. This drives one completed post-submit turn and
+/// then starts a newer one before the composed wait begins. The old Idle must
+/// not satisfy `turn_ended` while the newer turn is still blocked.
+#[tokio::test(flavor = "multi_thread")]
+async fn send_wait_turn_ended_does_not_replay_historical_idle() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    // Manual lifecycle keys redraw durable screen evidence. Unlike rapid
+    // title changes, they cannot be coalesced by tmux's title subscription
+    // tick, so every state edge below is an explicit daemon event.
+    let mut rig = Rig::new(
+        "sendwait-history",
+        WAIT_MANIFEST,
+        &manual_lifecycle_composer_pane(),
+        "",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+
+    let (submitted_tx, mut submitted_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (post_receipt_tx, mut post_receipt_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (pre_wait_tx, mut pre_wait_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (baseline_tx, mut baseline_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (pane_wake_tx, mut pane_wake_rx) = tokio::sync::mpsc::unbounded_channel();
+    let submitted_release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let post_receipt_release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let pre_wait_release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let baseline_release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let pane_wake_release = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let submitted_pause = std::sync::Arc::clone(&submitted_release);
+    let post_receipt_pause = std::sync::Arc::clone(&post_receipt_release);
+    let pre_wait_pause = std::sync::Arc::clone(&pre_wait_release);
+    let baseline_pause = std::sync::Arc::clone(&baseline_release);
+    let pane_wake_pause = std::sync::Arc::clone(&pane_wake_release);
+    rig.daemon.set_inject_pause(move |phase| {
+        let submitted_tx = submitted_tx.clone();
+        let post_receipt_tx = post_receipt_tx.clone();
+        let pre_wait_tx = pre_wait_tx.clone();
+        let baseline_tx = baseline_tx.clone();
+        let pane_wake_tx = pane_wake_tx.clone();
+        let submitted_pause = std::sync::Arc::clone(&submitted_pause);
+        let post_receipt_pause = std::sync::Arc::clone(&post_receipt_pause);
+        let pre_wait_pause = std::sync::Arc::clone(&pre_wait_pause);
+        let baseline_pause = std::sync::Arc::clone(&baseline_pause);
+        let pane_wake_pause = std::sync::Arc::clone(&pane_wake_pause);
+        Box::pin(async move {
+            let (entered, release) = match phase {
+                "post_submit" => (submitted_tx, submitted_pause),
+                "post_receipt" => (post_receipt_tx, post_receipt_pause),
+                "pre_wait" => (pre_wait_tx, pre_wait_pause),
+                "post_wait_baseline" => (baseline_tx, baseline_pause),
+                "wait_pane_wake" => (pane_wake_tx, pane_wake_pause),
+                _ => return,
+            };
+            let _ = entered.send(());
+            release
+                .acquire_owned()
+                .await
+                .expect("delivery-boundary release")
+                .forget();
+        })
+    });
+
+    let params: cyclops_proto::MsgSendParams = serde_json::from_value(json!({
+        "to": ["worker"],
+        "subject": "do two turns",
+        "body": "a\nb",
+        "wait": {"until": "turn_ended", "timeout_ms": 10000},
+    }))
+    .expect("send params");
+    let daemon = &rig.daemon;
+    let tmux = &rig.tmux;
+    let events = &mut rig.ev;
+    let mut delivery = Box::pin(daemon.deliver_payload("admin", params));
+
+    let submitted = tokio::select! {
+        entered = tokio::time::timeout(Duration::from_secs(5), submitted_rx.recv()) => {
+            entered.expect("send crossed the submit boundary")
+        }
+        result = &mut delivery => panic!("send resolved before submit boundary: {result:?}"),
+    };
+    submitted.expect("submit boundary signal exists");
+    submitted_release.add_permits(1);
+
+    let post_receipt = tokio::select! {
+        entered = tokio::time::timeout(Duration::from_secs(8), post_receipt_rx.recv()) => {
+            entered.expect("send reached the post-receipt boundary")
+        }
+        result = &mut delivery => panic!("send resolved before receipt boundary: {result:?}"),
+    };
+    post_receipt.expect("post-receipt boundary signal exists");
+
+    // The retained receiver sees this first turn in full.
+    tmux.run_ok(&["send-keys", "-t", &pane, "C-t"]);
+    events
+        .wait_event_named(Duration::from_secs(5), "first Working state", |event| {
+            event["event"] == "state"
+                && event["data"]["pane_id"] == pane.as_str()
+                && event["data"]["state"] == "working"
+                && event["data"]["working_confirmed"] == true
+        })
+        .await;
+    tmux.run_ok(&["send-keys", "-t", &pane, "C-y"]);
+    events
+        .wait_event_named(Duration::from_secs(5), "first Idle state", |event| {
+            event["event"] == "state"
+                && event["data"]["pane_id"] == pane.as_str()
+                && event["data"]["state"] == "idle"
+                && event["data"]["prior"] == "working"
+        })
+        .await;
+
+    // A later Working state is current when the composed wait begins.
+    tmux.run_ok(&["send-keys", "-t", &pane, "C-t"]);
+    events
+        .wait_event_named(Duration::from_secs(5), "newer Working state", |event| {
+            event["event"] == "state"
+                && event["data"]["pane_id"] == pane.as_str()
+                && event["data"]["state"] == "working"
+                && event["data"]["prior"] == "idle"
+                && event["data"]["working_confirmed"] == true
+        })
+        .await;
+    post_receipt_release.add_permits(1);
+
+    let pre_wait = tokio::select! {
+        entered = tokio::time::timeout(Duration::from_secs(5), pre_wait_rx.recv()) => {
+            entered.expect("send reached the pre-wait boundary")
+        }
+        result = &mut delivery => panic!("send resolved before pane wait: {result:?}"),
+    };
+    pre_wait.expect("pre-wait boundary signal exists");
+    pre_wait_release.add_permits(1);
+
+    let baseline = tokio::select! {
+        entered = tokio::time::timeout(Duration::from_secs(5), baseline_rx.recv()) => {
+            entered.expect("composed wait reached its fresh baseline")
+        }
+        result = &mut delivery => panic!("historical Idle ended the newer turn at baseline: {result:?}"),
+    };
+    baseline.expect("baseline signal exists");
+    baseline_release.add_permits(1);
+
+    // Ctrl-L redraws the current Working frame. The wait can reach this
+    // pane-event boundary only if it did not replay the first turn's Idle.
+    tmux.run_ok(&["send-keys", "-t", &pane, "C-l"]);
+    let pane_wake = tokio::select! {
+        entered = tokio::time::timeout(Duration::from_secs(5), pane_wake_rx.recv()) => {
+            entered.expect("composed wait reached a live pane wake")
+        }
+        result = &mut delivery => panic!("historical Idle ended the newer turn: {result:?}"),
+    };
+    pane_wake.expect("live pane wake signal exists");
+
+    tmux.run_ok(&["send-keys", "-t", &pane, "C-y"]);
+    events
+        .wait_event_named(Duration::from_secs(5), "newer final Idle state", |event| {
+            event["event"] == "state"
+                && event["data"]["pane_id"] == pane.as_str()
+                && event["data"]["state"] == "idle"
+                && event["data"]["prior"] == "working"
+        })
+        .await;
+    pane_wake_release.add_permits(1);
+    let result = delivery
+        .await
+        .expect("send-and-wait answers after the newer turn ends");
+    assert_eq!(result["wait"][0]["outcome"], "reached", "{result}");
+    assert_eq!(result["wait"][0]["state"], "idle", "{result}");
     rig.assert_ledger_legal(&[]);
     rig.shutdown().await;
 }

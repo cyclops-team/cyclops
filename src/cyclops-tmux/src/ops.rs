@@ -46,6 +46,18 @@ pub enum PaneDirection {
     Down,
 }
 
+/// What tmux confirmed while attempting to close one session.
+///
+/// A fallback switch and the later close are separate commands. The switch
+/// can land even when the close fails, so callers need both facts: the exact
+/// session now selected for this client, when one was confirmed, and the
+/// result of the destructive command.
+#[derive(Debug)]
+pub struct CloseSessionAttempt {
+    pub confirmed_current_session_id: Option<String>,
+    pub close_result: Result<(), TmuxError>,
+}
+
 impl PaneDirection {
     fn flag(self) -> &'static str {
         match self {
@@ -81,6 +93,26 @@ impl ControlClient {
             .map(|_| ())
     }
 
+    /// Focus the live neighbour of one exact source pane.
+    ///
+    /// Unlike [`Self::select_pane_toward`], this never borrows tmux's ambient
+    /// current pane. An input gesture can be queued behind another effect, so
+    /// the pane that was current when the gesture was routed must travel with
+    /// it or the direction can silently apply to a different pane.
+    pub async fn select_pane_toward_from(
+        &self,
+        pane_id: &str,
+        direction: PaneDirection,
+    ) -> Result<(), TmuxError> {
+        self.command(&format!(
+            "select-pane {} -t {}",
+            direction.flag(),
+            quote_arg(pane_id)
+        ))
+        .await
+        .map(|_| ())
+    }
+
     /// Focus one pane by id.
     ///
     /// A pane on a window that is not current stays invisible until that
@@ -91,6 +123,34 @@ impl ControlClient {
         self.command(&format!("select-pane -t {}", quote_arg(pane_id)))
             .await
             .map(|_| ())
+    }
+
+    /// Focus an exact pane in another window of this client's session.
+    ///
+    /// The sequence is adapter-owned because selecting a pane in a hidden
+    /// window does not make that window visible. Callers provide the route;
+    /// they do not need to know the host transition needed to realize it.
+    pub async fn focus_window_pane(&self, window_id: &str, pane_id: &str) -> Result<(), TmuxError> {
+        self.select_window(window_id).await?;
+        self.select_pane(pane_id).await
+    }
+
+    /// Focus an exact pane in another session.
+    ///
+    /// The stable tmux session id is the first target, then the window and pane
+    /// ids complete the route. A failure at any step is returned so the caller
+    /// can reconcile the authoritative state instead of pretending the whole
+    /// route landed. This route is defined in terms of the stable id; callers
+    /// must not substitute a mutable session name.
+    pub async fn focus_session_window_pane(
+        &self,
+        session_id: &str,
+        window_id: &str,
+        pane_id: &str,
+    ) -> Result<(), TmuxError> {
+        self.command(&format!("switch-client -t {}", quote_arg(session_id)))
+            .await?;
+        self.focus_window_pane(window_id, pane_id).await
     }
 
     /// Split `pane_id` and leave tmux focused on the new pane.
@@ -108,13 +168,39 @@ impl ControlClient {
         pane_id: &str,
         direction: SplitDirection,
     ) -> Result<(), TmuxError> {
-        let path = self.display(pane_id, "#{pane_current_path}").await?;
+        self.split_window_target(pane_id, direction).await
+    }
+
+    /// Split a pane only while it still belongs to one exact session/window
+    /// route.
+    ///
+    /// Pane ids remain stable when tmux moves a pane. A bare `%pane` target
+    /// would therefore split it in its new workspace even though the operator
+    /// acted on the old layout. The compound id target makes tmux refuse that
+    /// stale route both when reading cwd and when performing the mutation.
+    pub async fn split_window_at(
+        &self,
+        session_id: &str,
+        window_id: &str,
+        pane_id: &str,
+        direction: SplitDirection,
+    ) -> Result<(), TmuxError> {
+        let target = format!("{session_id}:{window_id}.{pane_id}");
+        self.split_window_target(&target, direction).await
+    }
+
+    async fn split_window_target(
+        &self,
+        target: &str,
+        direction: SplitDirection,
+    ) -> Result<(), TmuxError> {
+        let path = self.display(target, "#{pane_current_path}").await?;
         let path = path.trim();
         let mut cmd = format!("split-window {}", direction.flag());
         if !path.is_empty() {
             cmd.push_str(&format!(" -c {}", quote_arg(path)));
         }
-        cmd.push_str(&format!(" -t {}", quote_arg(pane_id)));
+        cmd.push_str(&format!(" -t {}", quote_arg(target)));
         self.command(&cmd).await.map(|_| ())
     }
 
@@ -239,11 +325,12 @@ impl ControlClient {
         .map(|_| ())
     }
 
-    /// Rename one session.
+    /// Rename one session by exact name or stable `$session` id.
     ///
     /// The target is `=name`: without the `=`, tmux accepts a prefix match,
     /// so a rename aimed at a session that has just closed silently lands on
-    /// a neighbour whose name merely starts the same way.
+    /// a neighbour whose name merely starts the same way. A stable id remains
+    /// exact across rename and name reuse.
     pub async fn rename_session(&self, session: &str, name: &str) -> Result<(), TmuxError> {
         self.command(&format!(
             "rename-session -t {} {}",
@@ -340,6 +427,38 @@ impl ControlClient {
         .map(|_| ())
     }
 
+    /// Read one exact pane's current directory.
+    ///
+    /// tmux expands an absent `-t %pane` target to an empty successful reply
+    /// rather than `%error`. Including the target's own id lets callers tell
+    /// that absence apart from a real pane whose path is temporarily blank.
+    pub async fn pane_current_path(&self, pane_id: &str) -> Result<Option<String>, TmuxError> {
+        let reply = self
+            .command(&format!(
+                "display-message -p -t {} {}",
+                quote_arg(pane_id),
+                quote_arg("#{pane_id}\t#{pane_current_path}")
+            ))
+            .await?;
+        parse_pane_current_path(&reply, pane_id)
+    }
+
+    /// Read the stable id of the session this control client currently
+    /// displays.
+    ///
+    /// A state read after an uncertain `switch-client` is the only honest way
+    /// for a caller to choose its reconciliation target: the switch may have
+    /// landed even when its acknowledgement did not.
+    pub async fn current_session_id(&self) -> Result<String, TmuxError> {
+        let reply = self
+            .command(&format!(
+                "display-message -p {}",
+                quote_arg("#{session_id}")
+            ))
+            .await?;
+        first_field(&reply, "display current session id")
+    }
+
     /// Create a detached session rooted in `cwd` and return its session id.
     ///
     /// The id comes back from `-P -F '#{session_id}'` because the name is
@@ -372,6 +491,47 @@ impl ControlClient {
         .await
         .map(|_| ())
     }
+
+    /// Close one stable session identity, selecting an exact fallback first
+    /// when the attached client currently belongs to the target.
+    ///
+    /// The sequence lives here so workspace callers do not need to know how the
+    /// product chooses where its control client lands before destruction. A
+    /// returned error is not a claim that nothing happened: fallback selection
+    /// may already have landed before the close failed, and a failed close
+    /// reply may itself be uncertain. The returned attempt preserves a
+    /// successful fallback selection even when the close reports an error;
+    /// callers must reconcile host state after every attempted operation.
+    pub async fn close_session_at(
+        &self,
+        target_session_id: &str,
+        fallback_session_id: Option<&str>,
+    ) -> CloseSessionAttempt {
+        let mut confirmed_current_session_id = None;
+        if let Some(fallback_session_id) = fallback_session_id {
+            if let Err(error) = self
+                .command(&format!(
+                    "switch-client -t {}",
+                    quote_arg(fallback_session_id)
+                ))
+                .await
+            {
+                return CloseSessionAttempt {
+                    confirmed_current_session_id,
+                    close_result: Err(error),
+                };
+            }
+            confirmed_current_session_id = Some(fallback_session_id.to_string());
+        }
+        let close_result = self
+            .command(&format!("kill-session -t {}", quote_arg(target_session_id)))
+            .await
+            .map(|_| ());
+        CloseSessionAttempt {
+            confirmed_current_session_id,
+            close_result,
+        }
+    }
 }
 
 /// The single value a `-P -F` reply carries.
@@ -386,6 +546,37 @@ fn first_field(reply: &[String], what: &str) -> Result<String, TmuxError> {
         .find(|line| !line.is_empty())
         .map(str::to_string)
         .ok_or_else(|| TmuxError::Protocol(format!("{what}: reply carried no id")))
+}
+
+fn parse_pane_current_path(
+    reply: &[String],
+    expected_pane_id: &str,
+) -> Result<Option<String>, TmuxError> {
+    let Some((row, continuation)) = reply.split_first() else {
+        return Ok(None);
+    };
+    if row.is_empty() {
+        return Ok(None);
+    }
+    let Some((pane_id, path)) = row.split_once('\t') else {
+        return Err(TmuxError::Protocol(
+            "tmux pane-directory reply omitted its identity".into(),
+        ));
+    };
+    if pane_id.is_empty() {
+        return Ok(None);
+    }
+    if pane_id != expected_pane_id {
+        return Err(TmuxError::Protocol(format!(
+            "tmux pane-directory reply named {pane_id:?}, expected {expected_pane_id:?}"
+        )));
+    }
+    let mut path = path.to_string();
+    for line in continuation {
+        path.push('\n');
+        path.push_str(line);
+    }
+    Ok(Some(path))
 }
 
 #[cfg(test)]
@@ -416,5 +607,27 @@ mod tests {
             Err(TmuxError::Protocol(msg)) => assert!(msg.contains("new-window")),
             other => panic!("expected a protocol error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pane_directory_reply_keeps_a_real_blank_path_distinct_from_an_absent_pane() {
+        assert_eq!(
+            parse_pane_current_path(&["%3\t".into()], "%3").unwrap(),
+            Some(String::new())
+        );
+        assert_eq!(parse_pane_current_path(&[], "%3").unwrap(), None);
+        assert_eq!(parse_pane_current_path(&["\t".into()], "%3").unwrap(), None);
+        assert_eq!(
+            parse_pane_current_path(&["%3\t/work".into(), "tree".into()], "%3").unwrap(),
+            Some("/work\ntree".into())
+        );
+    }
+
+    #[test]
+    fn pane_directory_reply_rejects_a_different_identity() {
+        assert!(matches!(
+            parse_pane_current_path(&["%4\t/work".into()], "%3"),
+            Err(TmuxError::Protocol(_))
+        ));
     }
 }

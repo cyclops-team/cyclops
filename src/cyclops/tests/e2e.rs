@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 const GEMINI_ENDPOINT: &str =
     "agent:00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000002/%9";
 const TEST_SUMMARY: &str = "Test message. Inspect the result.";
+const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Scratch home unique per test and process, under the relocatable
 /// scratch root. Kept short: Unix socket paths cap out around 104 bytes
@@ -30,8 +31,8 @@ fn scratch_home(tag: &str) -> PathBuf {
 
 fn hello(proto: u32) -> Value {
     json!({
-        "cyclops": "0.1.0",
-        "build": env!("CYCLOPS_BUILD_REF"),
+        "cyclops": PACKAGE_VERSION,
+        "build": cyclops_proto::BUILD_REF,
         "proto": proto,
         "boot_id": "b-e2e"
     })
@@ -224,8 +225,8 @@ fn run_cyclops_binary_io(
 
 fn canned_status() -> Value {
     json!({
-        "daemon_version": "0.1.0",
-        "daemon_build": env!("CYCLOPS_BUILD_REF"),
+        "daemon_version": PACKAGE_VERSION,
+        "daemon_build": cyclops_proto::BUILD_REF,
         "proto": 1,
         "boot_id": "b-e2e",
         "uptime_ms": 120_000,
@@ -780,8 +781,8 @@ fn daemon_restart_refuses_while_mid_flight() {
     let process = json!({"pid": pid, "birth": birth});
     let daemon_executable = daemon.display().to_string();
     let hello_line = json!({
-        "cyclops": "0.1.0",
-        "build": env!("CYCLOPS_BUILD_REF"),
+        "cyclops": PACKAGE_VERSION,
+        "build": cyclops_proto::BUILD_REF,
         "daemon_process": process.clone(),
         "daemon_executable": daemon_executable.clone(),
         "proto": 1,
@@ -845,12 +846,13 @@ fn proto_mismatch_warns_and_continues() {
 fn build_mismatch_is_reported_by_health_and_machine_readable_status() {
     let home = scratch_home("bm");
     let mut canned = canned_status();
+    canned["daemon_version"] = json!("0.0.9");
     canned["daemon_build"] = json!("shadowed-build");
     let expected = canned.clone();
     serve_conns(
         &home,
         json!({
-            "cyclops": "0.1.0",
+            "cyclops": "0.0.9",
             "build": "shadowed-build",
             "proto": 1,
             "boot_id": "b-shadowed"
@@ -870,8 +872,8 @@ fn build_mismatch_is_reported_by_health_and_machine_readable_status() {
     );
 
     let note = format!(
-        "note: cyclopsd is build shadowed-build, this cyclops is build {}. Continuing; run cyclops daemon restart to load the installed daemon build.",
-        env!("CYCLOPS_BUILD_REF")
+        "version/build mismatch: cyclops {}, cyclopsd 0.0.9 (shadowed-build). Continuing; run cyclops daemon restart. If they still differ, update or reinstall the older side.",
+        cyclops_proto::VERSION_WITH_BUILD
     );
     let ping = run_cyclops(&home, &["ping", "--json"]);
     assert!(ping.status.success());
@@ -883,6 +885,36 @@ fn build_mismatch_is_reported_by_health_and_machine_readable_status() {
     assert_eq!(status, expected);
     assert_eq!(status["daemon_build"], "shadowed-build");
     assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), note);
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn semantic_version_drift_warns_even_when_the_source_build_matches() {
+    let home = scratch_home("vm");
+    serve_once(
+        &home,
+        json!({
+            "cyclops": "0.0.9",
+            "build": cyclops_proto::BUILD_REF,
+            "proto": 1,
+            "boot_id": "b-version-drift"
+        }),
+        move |req| {
+            assert_eq!(req["method"], "ping");
+            (
+                vec![json!({"id": req["id"], "result": {"pong": true, "ts": 1}}).to_string()],
+                false,
+            )
+        },
+    );
+
+    let output = run_cyclops(&home, &["ping", "--json"]);
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(cyclops_client::CLIENT_VERSION), "{stderr}");
+    assert!(stderr.contains("0.0.9"), "{stderr}");
+    assert!(stderr.contains(cyclops_proto::BUILD_REF), "{stderr}");
+    assert!(stderr.contains("cyclops daemon restart"), "{stderr}");
     let _ = fs::remove_dir_all(&home);
 }
 
@@ -954,6 +986,7 @@ fn watch_json_streams_events_then_reports_the_close() {
 }
 
 #[test]
+#[cfg(feature = "full-ui")]
 fn watch_rejects_every_unknown_display_alias_before_it_waits() {
     let home = scratch_home("wuf");
     serve_once(&home, hello(1), move |req| {
@@ -986,6 +1019,7 @@ fn watch_rejects_every_unknown_display_alias_before_it_waits() {
 }
 
 #[test]
+#[cfg(feature = "full-ui")]
 fn deprecated_ui_rejects_the_same_unknown_display_alias() {
     let home = scratch_home("uuf");
     serve_once(&home, hello(1), move |req| {
@@ -1021,6 +1055,68 @@ fn watch_json_refuses_tui_only_display_filters_as_json() {
     assert_eq!(value["code"], "unsupported_watch_filter");
     assert!(value["message"].as_str().unwrap().contains("--from"));
     assert!(value["message"].as_str().unwrap().contains("--json"));
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_list_empty_state_invites_a_bounded_wait() {
+    let home = scratch_home("inbox-empty");
+    serve_once(&home, hello(1), move |req| {
+        assert_eq!(req["method"], "inbox.list");
+        (
+            vec![json!({"id": req["id"], "result": {"entries": []}}).to_string()],
+            false,
+        )
+    });
+
+    let out = run_cyclops(&home, &["inbox", "list", "--plain"]);
+
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "No pending messages. Wait for one: cyclops inbox next --timeout 30s\n"
+    );
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_list_zero_limit_does_not_claim_the_inbox_is_empty() {
+    let home = scratch_home("inbox-zero");
+    serve_once(&home, hello(1), move |req| {
+        assert_eq!(req["method"], "inbox.list");
+        assert_eq!(req["params"]["limit"], 0);
+        (
+            vec![json!({"id": req["id"], "result": {"entries": []}}).to_string()],
+            false,
+        )
+    });
+
+    let out = run_cyclops(&home, &["inbox", "list", "--limit", "0", "--plain"]);
+
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty());
+    assert!(out.stdout.is_empty());
+    let _ = fs::remove_dir_all(&home);
+}
+
+#[test]
+fn inbox_list_empty_json_stays_the_raw_daemon_result() {
+    let home = scratch_home("inbox-json-empty");
+    serve_once(&home, hello(1), move |req| {
+        assert_eq!(req["method"], "inbox.list");
+        assert_eq!(req["params"]["limit"], 0);
+        (
+            vec![json!({"id": req["id"], "result": {"entries": []}}).to_string()],
+            false,
+        )
+    });
+
+    let out = run_cyclops(&home, &["inbox", "list", "--limit", "0", "--json"]);
+
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "{\"entries\":[]}\n");
     let _ = fs::remove_dir_all(&home);
 }
 
@@ -1540,7 +1636,7 @@ fn inbox_next_json_reports_one_structured_claim_failure() {
 }
 
 #[test]
-fn inbox_next_names_an_uncertain_claim_instead_of_an_empty_timeout() {
+fn inbox_next_names_unknown_after_the_claim_connection_closes() {
     let home = scratch_home("inc");
     let mut step = 0_u8;
     serve_once(&home, hello(1), move |req| {
@@ -1567,23 +1663,25 @@ fn inbox_next_names_an_uncertain_claim_instead_of_an_empty_timeout() {
             3 => {
                 assert_eq!(req["method"], "inbox.claim");
                 assert_eq!(req["params"]["message_id"], "m-uncertain");
-                (Vec::new(), false)
+                // Close only after reading the claim. This is explicit
+                // unknown-after-send evidence, not a guessed response delay.
+                (Vec::new(), true)
             }
             _ => panic!("unexpected request {req}"),
         }
     });
 
-    let out = run_cyclops(&home, &["inbox", "next", "--timeout", "50ms", "--json"]);
+    let out = run_cyclops(&home, &["inbox", "next", "--timeout", "1s", "--json"]);
 
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stderr.is_empty());
     let value: Value = serde_json::from_slice(&out.stdout).expect("JSON uncertain answer");
     assert_eq!(value["code"], "claim_outcome_unknown");
     assert_eq!(value["data"]["message_id"], "m-uncertain");
-    assert!(value["message"]
-        .as_str()
-        .unwrap()
-        .contains("may already be claimed"));
+    assert_eq!(
+        value["message"],
+        "cyclops sent the claim for m-uncertain, but no usable answer arrived. The message may already be claimed. Inspect it with cyclops thread m-uncertain or cyclops inbox list before retrying."
+    );
     let _ = fs::remove_dir_all(&home);
 }
 

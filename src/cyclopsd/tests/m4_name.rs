@@ -489,6 +489,71 @@ async fn a_state_change_rewrites_the_border() {
     rig.shutdown().await;
 }
 
+/// One pane observation owns its chrome projection through the last tmux
+/// write. A concurrent refresh must report honest incompleteness rather than
+/// overtake a stalled older repaint and leave mixed or stale border options.
+#[tokio::test(flavor = "multi_thread")]
+async fn overlapping_state_observation_waits_for_prior_chrome_repaint() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new("m4chrome-order", CHROME_MANIFEST, "cat", "").await;
+    rig.wait_attached(1).await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "implementer").await;
+    wait_border(&rig, &pane, "○ idle");
+
+    let repaint = rig.daemon.pause_next_chrome_repaint_for_test();
+    rig.tmux
+        .run_ok(&["select-pane", "-t", &pane, "-T", "CYC-BUSY"]);
+    tokio::time::timeout(Duration::from_secs(8), repaint.wait_until_entered())
+        .await
+        .expect("working observation did not reach the chrome boundary");
+
+    // Queue a newer idle edge, then ask a separate socket task to observe the
+    // same pane while the prior repaint is still held. The named status budget
+    // must expire on the retained pane gate; without that gate the newer
+    // observation overtakes this repaint and answers from interleaved chrome.
+    rig.tmux
+        .run_ok(&["select-pane", "-t", &pane, "-T", "CYC-IDLE"]);
+    let blocked = rig.ctl.request("status", json!({})).await;
+    let blocked_pane = blocked["result"]["sessions"][0]["panes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["pane_id"] == pane)
+        .unwrap();
+    assert_eq!(
+        blocked_pane["write_block"], "status_refresh_incomplete",
+        "a concurrent observation overtook the retained repaint: {blocked}"
+    );
+
+    repaint.release();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let status = rig.ctl.request("status", json!({})).await;
+        let current = status["result"]["sessions"][0]["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["pane_id"] == pane)
+            .unwrap();
+        if current["state"] == "idle" && current["write_block"] != "status_refresh_incomplete" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "newest idle observation never completed: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let idle = wait_border(&rig, &pane, "○ idle");
+    assert!(idle.contains("implementer"), "{idle:?}");
+
+    rig.shutdown().await;
+}
+
 /// A restart must not unname the team. The registry is a file, and the
 /// pane it points at has to still be the same pane.
 #[tokio::test(flavor = "multi_thread")]
@@ -695,8 +760,8 @@ async fn killing_a_watched_session_releases_its_labels() {
     rig.label(&aux_pane, "human").await;
     rig.tmux.run_ok(&["kill-session", "-t", "aux"]);
 
-    // Test-side bounded wait: the daemon notices on a reconnect attempt,
-    // and reconnects start at 200ms.
+    // Test-side bounded wait: the watcher reports the session disconnect and
+    // the daemon makes one existence check before it releases this label.
     let main_pane = rig.pane_ids().await[0].clone();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

@@ -13,8 +13,8 @@
 
 use cyclops_proto::{AgentState, Delivery, DeliveryState, Kind, LedgerLine, OpenDelivery};
 use cyclops_ui::{
-    build, App, EndpointFilter, Entry, EntryKind, Eye, Filter, Intake, PaneSnapshot, StatusSeed,
-    Theme, View,
+    build, App, EndpointFilter, Entry, EntryKind, Eye, Filter, PaneSnapshot, StatusSeed,
+    StreamInput, StreamProjectionState, StreamUpdate, Theme, View,
 };
 
 const BASE: u64 = 43_000_000;
@@ -96,28 +96,59 @@ fn ledger_with_a_buried_park(dir: &std::path::Path) {
     }
 }
 
+fn projected_tail(dir: &std::path::Path, limit: usize) -> (Vec<Entry>, Option<u64>) {
+    let home = dir.parent().expect("ledger has state root");
+    let state_root = cyclops_state::StateRoot::open_existing(home)
+        .expect("state root opens")
+        .expect("state root exists");
+    let descendant =
+        std::path::Path::new(dir.file_name().expect("ledger dir name")).join("main.ndjson");
+    let mut lines = cyclops_ledger::read_after(&state_root, &descendant, 0).expect("ledger reads");
+    let excess = lines.len().saturating_sub(limit);
+    lines.drain(..excess);
+    let max_seq = lines.last().map(|line| line.seq);
+    let report = cyclops_ui::project_backfill(cyclops_proto::StreamBackfillResult {
+        lines,
+        max_seq,
+        gap: None,
+    });
+    (report.entries, report.max_seq)
+}
+
 /// Everything a UI run holds after startup, for one `--backfill` value:
 /// the replayed tail, the daemon's answer reconciled over it, then any
 /// live entries that queued behind the two.
 fn started(dir: &std::path::Path, backfill: usize, seed: StatusSeed) -> App {
     let mut app = App::new(Theme::none(), View::Admin, Filter::default());
-    let mut intake = Intake::new();
-    // The seed arrives before the backfill; Intake orders it between the
+    let mut projection = StreamProjectionState::new();
+    // The seed arrives before the backfill; the projection orders it between the
     // replayed tail and the live backlog.
-    let watched = seed.watched.clone();
-    assert!(intake.status(Box::new(seed)).is_none());
-    let (entries, max_seq) = cyclops_ui::read_backfill(dir, backfill, Some(&watched));
-    let landed = intake.backfill(entries, max_seq);
-    for e in landed.replayed {
-        app.replay(e);
-    }
-    for e in app.seed_status(*landed.seed.expect("the seed came back")) {
-        app.replay(e);
-    }
-    for e in landed.live {
-        app.live(e);
-    }
+    assert!(projection
+        .apply(StreamInput::Status(Box::new(seed)))
+        .is_empty());
+    let (entries, max_seq) = projected_tail(dir, backfill);
+    apply_stream_updates(
+        &mut app,
+        projection.apply(StreamInput::Backfill { entries, max_seq }),
+    );
     app
+}
+
+fn apply_stream_updates(app: &mut App, updates: Vec<StreamUpdate>) {
+    for update in updates {
+        match update {
+            StreamUpdate::Replay(entry) => app.replay(entry),
+            StreamUpdate::Status(seed) => {
+                for entry in app.seed_status(*seed) {
+                    app.replay(entry);
+                }
+            }
+            StreamUpdate::Live(entry) => {
+                app.live(entry);
+            }
+            StreamUpdate::Notice(_) => {}
+        }
+    }
 }
 
 /// The daemon's answer for this ledger: the panes it currently sees, and
@@ -159,15 +190,13 @@ fn backfill_decides_what_is_displayed_never_what_is_counted() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = ledger_dir(&tmp);
     ledger_with_a_buried_park(&dir);
-    let watched = ["main".to_string()];
-
     // The tail genuinely misses both. This is the shape of the bug: the
     // stream alone can only answer for what it happens to be holding.
-    let (tail, _) = cyclops_ui::read_backfill(&dir, 200, Some(&watched));
+    let (tail, _) = projected_tail(&dir, 200);
     assert_eq!(tail.len(), 200);
     assert!(!tail.iter().any(is_the_park), "the fixture buried nothing");
     assert!(!tail.iter().any(is_the_ghost), "the fixture buried nothing");
-    let (wide, _) = cyclops_ui::read_backfill(&dir, 400, Some(&watched));
+    let (wide, _) = projected_tail(&dir, 400);
     assert!(wide.iter().any(is_the_park), "the wide tail lost the park");
     assert!(wide.iter().any(is_the_ghost), "the wide tail lost the pane");
 

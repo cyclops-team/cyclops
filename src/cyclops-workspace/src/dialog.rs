@@ -31,10 +31,10 @@ pub enum Dialog {
     RenameTab { window_id: String, buffer: String },
     /// Confirm closing a whole tab (kills every pane in it).
     ConfirmCloseTab { window_id: String },
-    /// Rename one workspace (tmux session).
-    RenameWorkspace { session: String, buffer: String },
-    /// Confirm closing a workspace that may host agents.
-    ConfirmCloseWorkspace { session: String },
+    /// Rename one stable workspace identity (tmux session).
+    RenameWorkspace { session_id: String, buffer: String },
+    /// Confirm closing one stable workspace identity.
+    ConfirmCloseWorkspace { session_id: String },
     /// Address a message from inside the workspace: `@reviewer ship it`.
     ///
     /// The recipient is part of the text rather than a separate field so

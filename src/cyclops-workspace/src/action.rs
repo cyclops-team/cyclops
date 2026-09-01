@@ -13,7 +13,7 @@
 //! context needed to name a stable target" to `Option<Action>`.
 //!
 //! Every variant that names a pane, tab, or workspace carries the stable
-//! tmux identity (`%pane`, `@window`, session name/id) it was resolved
+//! tmux identity (`%pane`, `@window`, or `$session`) it was resolved
 //! against at routing time, never a list position. A list position (a menu
 //! row, a keybinding's digit, a sidebar row's on-screen order) is exactly
 //! the kind of thing that goes stale between the keystroke and the moment
@@ -84,14 +84,16 @@
 //! themselves.
 
 use crossterm::event::MouseButton;
-use cyclops_tmux::{PaneDirection, SplitDirection};
+use cyclops_tmux::PaneDirection;
 
 use crate::bindings::BindingAction;
 use crate::dialog::{Dialog, ForceSubmitRow, SettingsSection, ViewRow};
 use crate::drag::DragTarget;
+use crate::focus::{Direction, Intent as FocusIntent};
 use crate::input::mouse::{HitTarget, MenuState};
 use crate::layout::SplitDir;
 use crate::model::{TabModel, WorkspaceRow};
+use crate::split::{Intent as SplitIntent, Placement as SplitPlacement};
 
 /// One target-bearing workspace action. Every device resolves to this
 /// vocabulary; only [`Action`] values reach execution (added by a later
@@ -99,23 +101,14 @@ use crate::model::{TabModel, WorkspaceRow};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     // -- Pane --
-    /// Split `pane_id`; `direction` matches tmux's `-h`/`-v` split flags.
-    Split {
-        pane_id: String,
-        direction: SplitDirection,
-    },
-    /// Focus a specific, already-known pane.
-    FocusPane {
-        pane_id: String,
-    },
-    /// Move focus to whichever pane tmux considers the current pane's
-    /// neighbour in `direction`. Unlike [`Action::FocusPane`] this carries
-    /// no target: tmux resolves the neighbour from live layout at execution
-    /// time, the same way `select-pane -L/-R/-U/-D` always has.
-    FocusDirection(PaneDirection),
+    /// Add a pane beside one stable source without exposing tmux flags.
+    Split(SplitIntent),
+    /// Move focus without exposing keys, hit targets, or tmux command flags
+    /// to the policy that settles it.
+    Focus(FocusIntent),
     /// Swap the focused pane with whichever pane tmux considers its
     /// neighbour in `direction`. Carries no target for the same reason as
-    /// [`Action::FocusDirection`].
+    /// directional focus intent.
     SwapPaneDirection(PaneDirection),
     /// Exchange the positions of two specific panes: the drop half of a
     /// pane drag. tmux swaps the contents; each pane keeps its id and takes
@@ -255,22 +248,18 @@ pub enum Action {
         session: String,
     },
     RequestRenameWorkspace {
-        session: String,
+        session_id: String,
     },
-    RenameWorkspace {
-        session: String,
-        name: String,
-    },
+    RenameWorkspace(crate::workspace_rename::Intent),
     /// Open the close-workspace confirmation. Unlike pane/tab closing, this
     /// UI confirms every workspace close unconditionally, so keyboard and
     /// menu routing resolve here rather than to [`Action::CloseWorkspace`]
     /// directly.
     RequestCloseWorkspace {
-        session: String,
+        session_id: String,
     },
-    CloseWorkspace {
-        session: String,
-    },
+    /// Close the stable workspace identity the operator confirmed.
+    CloseWorkspace(crate::workspace_close::Intent),
     /// Reorder one sidebar workspace row. `session_id` is the stable tmux
     /// session id, not the (renameable) session name, so a reorder started
     /// before a folder-following rename lands on the right row regardless.
@@ -402,6 +391,19 @@ pub struct RouteContext<'a> {
     pub active_workspace: usize,
 }
 
+fn pane_focus(pane_id: impl Into<String>) -> Action {
+    Action::Focus(FocusIntent::Pane {
+        pane_id: pane_id.into(),
+    })
+}
+
+fn adjacent_focus(from_pane_id: &str, direction: Direction) -> Action {
+    Action::Focus(FocusIntent::Adjacent {
+        from_pane_id: from_pane_id.to_string(),
+        direction,
+    })
+}
+
 /// Route one resolved keyboard action. Used directly for keyboard input,
 /// and by [`route_menu_item`] for the app menu, whose items are themselves
 /// `BindingAction`s.
@@ -420,10 +422,10 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
                 })
         }
         BindingAction::NewTab => Some(Action::NewTab { name: None }),
-        BindingAction::FocusLeft => Some(Action::FocusDirection(PaneDirection::Left)),
-        BindingAction::FocusRight => Some(Action::FocusDirection(PaneDirection::Right)),
-        BindingAction::FocusUp => Some(Action::FocusDirection(PaneDirection::Up)),
-        BindingAction::FocusDown => Some(Action::FocusDirection(PaneDirection::Down)),
+        BindingAction::FocusLeft => Some(adjacent_focus(ctx.active_pane, Direction::Left)),
+        BindingAction::FocusRight => Some(adjacent_focus(ctx.active_pane, Direction::Right)),
+        BindingAction::FocusUp => Some(adjacent_focus(ctx.active_pane, Direction::Up)),
+        BindingAction::FocusDown => Some(adjacent_focus(ctx.active_pane, Direction::Down)),
         // A keyboard swap acts on the focused pane, so it carries no
         // target, exactly like the Shift upgrade of the focus chords.
         // No target to resolve: the recipient is typed into the composer,
@@ -436,14 +438,14 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
         BindingAction::SwapPaneRight => Some(Action::SwapPaneDirection(PaneDirection::Right)),
         BindingAction::SwapPaneUp => Some(Action::SwapPaneDirection(PaneDirection::Up)),
         BindingAction::SwapPaneDown => Some(Action::SwapPaneDirection(PaneDirection::Down)),
-        BindingAction::SplitRight => Some(Action::Split {
-            pane_id: ctx.active_pane.to_string(),
-            direction: SplitDirection::Horizontal,
-        }),
-        BindingAction::SplitDown => Some(Action::Split {
-            pane_id: ctx.active_pane.to_string(),
-            direction: SplitDirection::Vertical,
-        }),
+        BindingAction::SplitRight => Some(Action::Split(SplitIntent {
+            source_pane_id: ctx.active_pane.to_string(),
+            placement: SplitPlacement::Right,
+        })),
+        BindingAction::SplitDown => Some(Action::Split(SplitIntent {
+            source_pane_id: ctx.active_pane.to_string(),
+            placement: SplitPlacement::Down,
+        })),
         BindingAction::ClosePane => Some(Action::ClosePane {
             pane_id: ctx.active_pane.to_string(),
         }),
@@ -462,7 +464,8 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
         }
         BindingAction::CloseTab => {
             let window_id = ctx.tabs.get(ctx.active_tab)?.window_id.clone();
-            Some(resolve_close_tab(&window_id, ctx.tabs, ctx.session))
+            let workspace = active_workspace(ctx)?;
+            Some(resolve_close_tab(&window_id, ctx.tabs, workspace))
         }
         BindingAction::NextWorkspace => {
             resolve_adjacent_workspace(ctx.workspaces, ctx.active_workspace, 1)
@@ -473,12 +476,11 @@ pub fn route_binding(action: BindingAction, ctx: &RouteContext) -> Option<Action
                 .map(|session| Action::SelectWorkspace { session })
         }
         BindingAction::NewWorkspace => Some(Action::NewWorkspace),
-        BindingAction::RenameWorkspace => Some(Action::RequestRenameWorkspace {
-            session: ctx.session.to_string(),
-        }),
-        BindingAction::CloseWorkspace => Some(Action::RequestCloseWorkspace {
-            session: ctx.session.to_string(),
-        }),
+        BindingAction::RenameWorkspace => active_workspace(ctx).map(request_rename_workspace),
+        BindingAction::CloseWorkspace => {
+            let workspace = active_workspace(ctx)?;
+            Some(request_close_workspace(workspace))
+        }
         BindingAction::ToggleSidebar => Some(Action::ToggleSidebar),
         BindingAction::ToggleMessages => Some(Action::ToggleMessages),
         BindingAction::ToggleTabBar => Some(Action::ToggleTabBar),
@@ -508,10 +510,10 @@ pub fn route_binding_shifted(action: BindingAction, ctx: &RouteContext) -> Optio
 }
 
 /// Route one menu item, given the menu state that opened it. `ContextMenu`,
-/// `TabMenu`, and `WorkspaceMenu` carry the pane/window/session the menu was
-/// opened on — the item resolves against THAT target, never whichever one
-/// happens to be active, so a right-click on a background tab still renames
-/// the tab that was clicked. `AppMenu` items are plain `BindingAction`s, so
+/// `TabMenu`, and `WorkspaceMenu` carry the pane/window/session identity the
+/// menu was opened on. The item resolves against THAT target, never whichever
+/// one happens to be active, so a right-click on a background tab still
+/// renames the tab that was clicked. `AppMenu` items are plain `BindingAction`s, so
 /// they resolve through [`route_binding`] exactly like the matching key
 /// would, except the `NewTab` item: every menu (unlike the keyboard) opens
 /// the naming dialog rather than creating a tab immediately — see the
@@ -528,15 +530,17 @@ pub fn route_menu_item(
             })
         }
         (MenuState::ContextMenu { pane_id, .. }, BindingAction::SplitRight) => {
-            Some(Action::Split {
-                pane_id: pane_id.clone(),
-                direction: SplitDirection::Horizontal,
-            })
+            Some(Action::Split(SplitIntent {
+                source_pane_id: pane_id.clone(),
+                placement: SplitPlacement::Right,
+            }))
         }
-        (MenuState::ContextMenu { pane_id, .. }, BindingAction::SplitDown) => Some(Action::Split {
-            pane_id: pane_id.clone(),
-            direction: SplitDirection::Vertical,
-        }),
+        (MenuState::ContextMenu { pane_id, .. }, BindingAction::SplitDown) => {
+            Some(Action::Split(SplitIntent {
+                source_pane_id: pane_id.clone(),
+                placement: SplitPlacement::Down,
+            }))
+        }
         (MenuState::ContextMenu { pane_id, .. }, BindingAction::ZoomPane) => {
             Some(Action::ZoomPane {
                 pane_id: pane_id.clone(),
@@ -580,25 +584,22 @@ pub fn route_menu_item(
             .then(|| Action::RequestRenameTab {
                 window_id: window_id.clone(),
             }),
-        (MenuState::TabMenu { window_id, .. }, BindingAction::CloseTab) => ctx
-            .tabs
-            .iter()
-            .any(|tab| &tab.window_id == window_id)
-            .then(|| resolve_close_tab(window_id, ctx.tabs, ctx.session)),
-        (MenuState::WorkspaceMenu { session, .. }, BindingAction::RenameWorkspace) => ctx
+        (MenuState::TabMenu { window_id, .. }, BindingAction::CloseTab) => {
+            if !ctx.tabs.iter().any(|tab| &tab.window_id == window_id) {
+                return None;
+            }
+            active_workspace(ctx).map(|workspace| resolve_close_tab(window_id, ctx.tabs, workspace))
+        }
+        (MenuState::WorkspaceMenu { session_id, .. }, BindingAction::RenameWorkspace) => ctx
             .workspaces
             .iter()
-            .any(|workspace| &workspace.name == session)
-            .then(|| Action::RequestRenameWorkspace {
-                session: session.clone(),
-            }),
-        (MenuState::WorkspaceMenu { session, .. }, BindingAction::CloseWorkspace) => ctx
+            .find(|workspace| &workspace.session_id == session_id)
+            .map(request_rename_workspace),
+        (MenuState::WorkspaceMenu { session_id, .. }, BindingAction::CloseWorkspace) => ctx
             .workspaces
             .iter()
-            .any(|workspace| &workspace.name == session)
-            .then(|| Action::RequestCloseWorkspace {
-                session: session.clone(),
-            }),
+            .find(|workspace| &workspace.session_id == session_id)
+            .map(request_close_workspace),
         // Every menu's "New tab" opens the naming dialog; only the keyboard
         // binding creates one immediately (checked above this arm so it
         // still wins for `AppMenu`, matching current precedence).
@@ -654,15 +655,17 @@ pub fn route_dialog_confirm(dialog: &Dialog) -> Option<Action> {
                     body: c.body,
                 })
         }
-        Dialog::RenameWorkspace { session, buffer } => {
-            non_empty(buffer).map(|name| Action::RenameWorkspace {
-                session: session.clone(),
+        Dialog::RenameWorkspace { session_id, buffer } => non_empty(buffer).map(|name| {
+            Action::RenameWorkspace(crate::workspace_rename::Intent {
+                session_id: session_id.clone(),
                 name,
             })
-        }
-        Dialog::ConfirmCloseWorkspace { session } => Some(Action::CloseWorkspace {
-            session: session.clone(),
         }),
+        Dialog::ConfirmCloseWorkspace { session_id, .. } => {
+            Some(Action::CloseWorkspace(crate::workspace_close::Intent {
+                session_id: session_id.clone(),
+            }))
+        }
         // Enter applies the row the arrows are on, in the section that is
         // showing. An empty theme listing has nothing to apply, so Enter
         // dismisses like the keybinds card.
@@ -741,17 +744,21 @@ pub fn route_mouse_click(target: &HitTarget, button: MouseButton) -> Option<Acti
         )
         // Left-down on the grip starts a swap drag instead; only the
         // right-click (which never drags) focuses immediately.
-        | (HitTarget::PaneGrip { pane_id }, MouseButton::Right) => Some(Action::FocusPane {
-            pane_id: pane_id.clone(),
-        }),
-        (HitTarget::PaneSplitRight { pane_id }, MouseButton::Left) => Some(Action::Split {
-            pane_id: pane_id.clone(),
-            direction: SplitDirection::Horizontal,
-        }),
-        (HitTarget::PaneSplitDown { pane_id }, MouseButton::Left) => Some(Action::Split {
-            pane_id: pane_id.clone(),
-            direction: SplitDirection::Vertical,
-        }),
+        | (HitTarget::PaneGrip { pane_id }, MouseButton::Right) => {
+            Some(pane_focus(pane_id.clone()))
+        }
+        (HitTarget::PaneSplitRight { pane_id }, MouseButton::Left) => {
+            Some(Action::Split(SplitIntent {
+                source_pane_id: pane_id.clone(),
+                placement: SplitPlacement::Right,
+            }))
+        }
+        (HitTarget::PaneSplitDown { pane_id }, MouseButton::Left) => {
+            Some(Action::Split(SplitIntent {
+                source_pane_id: pane_id.clone(),
+                placement: SplitPlacement::Down,
+            }))
+        }
         (HitTarget::NewTabButton, MouseButton::Left) => Some(Action::RequestNewTab),
         // The same action Ctrl+B @ routes to. A control that opened a
         // different composer from the chord would be a second code path
@@ -771,15 +778,15 @@ pub fn route_mouse_click(target: &HitTarget, button: MouseButton) -> Option<Acti
         (HitTarget::MessagesAction(action), MouseButton::Left) => {
             Some(Action::MessagesVerb(*action))
         }
-        (HitTarget::AttentionIndicator { pane_id }, MouseButton::Left) => Some(Action::FocusPane {
-            pane_id: pane_id.clone(),
-        }),
+        (HitTarget::AttentionIndicator { pane_id }, MouseButton::Left) => {
+            Some(pane_focus(pane_id.clone()))
+        }
         // Left-down on a sidebar agent starts a reorder drag instead; only
         // the right-click (which never drags) focuses immediately, matching
         // `handle_mouse` today.
-        (HitTarget::SidebarAgent { pane_id, .. }, MouseButton::Right) => Some(Action::FocusPane {
-            pane_id: pane_id.clone(),
-        }),
+        (HitTarget::SidebarAgent { pane_id, .. }, MouseButton::Right) => {
+            Some(pane_focus(pane_id.clone()))
+        }
         _ => None,
     }
 }
@@ -814,27 +821,21 @@ pub fn route_mouse_scroll(
 /// value the drag already carries (never a re-derived index).
 pub fn route_drag_click(target: &DragTarget) -> Option<Action> {
     match target {
-        DragTarget::Pane { pane_id } => Some(Action::FocusPane {
-            pane_id: pane_id.clone(),
-        }),
+        DragTarget::Pane { pane_id } => Some(pane_focus(pane_id.clone())),
         DragTarget::Tab { window_id } => Some(Action::SelectTab {
             window_id: window_id.clone(),
         }),
         DragTarget::Workspace { session, .. } => Some(Action::SelectWorkspace {
             session: session.clone(),
         }),
-        DragTarget::Agent { pane_id, .. } => Some(Action::FocusPane {
-            pane_id: pane_id.clone(),
-        }),
+        DragTarget::Agent { pane_id, .. } => Some(pane_focus(pane_id.clone())),
         // A seam grabbed through a pane's own top border focuses that pane
         // when the press never became a drag: the title strip painted there
         // is a focus control, and pressing it must still do what pressing
         // it always did. A seam grabbed in the bare gutter carries no pane
         // and stays a no-op, as does a title bar: neither has anything to
         // select.
-        DragTarget::Divider { focus_on_click, .. } => focus_on_click
-            .clone()
-            .map(|pane_id| Action::FocusPane { pane_id }),
+        DragTarget::Divider { focus_on_click, .. } => focus_on_click.clone().map(pane_focus),
         DragTarget::Sidebar
         | DragTarget::Messages
         | DragTarget::SidebarSplit
@@ -981,11 +982,27 @@ fn resolve_adjacent_workspace(
 /// Closing a session's only tab closes the workspace instead. This only
 /// reads the current tab count, so — unlike the has-agent confirmation
 /// check for either close — routing can make this decision itself.
-fn resolve_close_tab(window_id: &str, tabs: &[TabModel], session: &str) -> Action {
+fn active_workspace<'a>(ctx: &RouteContext<'a>) -> Option<&'a WorkspaceRow> {
+    ctx.workspaces
+        .get(ctx.active_workspace)
+        .filter(|workspace| workspace.name == ctx.session)
+}
+
+fn request_close_workspace(workspace: &WorkspaceRow) -> Action {
+    Action::RequestCloseWorkspace {
+        session_id: workspace.session_id.clone(),
+    }
+}
+
+fn request_rename_workspace(workspace: &WorkspaceRow) -> Action {
+    Action::RequestRenameWorkspace {
+        session_id: workspace.session_id.clone(),
+    }
+}
+
+fn resolve_close_tab(window_id: &str, tabs: &[TabModel], workspace: &WorkspaceRow) -> Action {
     if tabs.len() == 1 && tabs[0].window_id == window_id {
-        Action::RequestCloseWorkspace {
-            session: session.to_string(),
-        }
+        request_close_workspace(workspace)
     } else {
         Action::CloseTab {
             window_id: window_id.to_string(),
@@ -1190,10 +1207,10 @@ mod tests {
             &c,
         );
 
-        let expected = Some(Action::Split {
-            pane_id: "%3".into(),
-            direction: SplitDirection::Horizontal,
-        });
+        let expected = Some(Action::Split(SplitIntent {
+            source_pane_id: "%3".into(),
+            placement: SplitPlacement::Right,
+        }));
         assert_eq!(from_keyboard, expected);
         assert_eq!(from_mouse, expected);
         assert_eq!(from_menu, expected);
@@ -1253,10 +1270,10 @@ mod tests {
             &c,
         );
 
-        let expected = Some(Action::Split {
-            pane_id: "%3".into(),
-            direction: SplitDirection::Vertical,
-        });
+        let expected = Some(Action::Split(SplitIntent {
+            source_pane_id: "%3".into(),
+            placement: SplitPlacement::Down,
+        }));
         assert_eq!(from_keyboard, expected);
         assert_eq!(from_mouse, expected);
         assert_eq!(from_menu, expected);
@@ -1372,12 +1389,32 @@ mod tests {
             MouseButton::Right,
         );
 
-        let expected = Some(Action::FocusPane {
-            pane_id: "%5".into(),
-        });
+        let expected = Some(pane_focus("%5"));
         assert_eq!(from_pane_body, expected);
         assert_eq!(from_attention, expected);
         assert_eq!(from_agent_right_click, expected);
+    }
+
+    #[test]
+    fn directional_focus_keys_capture_the_pane_that_was_current_when_routed() {
+        let tabs = [tab("@1")];
+        let workspaces = [workspace("$1", "main")];
+        let c = ctx(&tabs, 0, "%7", "main", &workspaces, 0);
+
+        for (binding, direction) in [
+            (BindingAction::FocusLeft, Direction::Left),
+            (BindingAction::FocusRight, Direction::Right),
+            (BindingAction::FocusUp, Direction::Up),
+            (BindingAction::FocusDown, Direction::Down),
+        ] {
+            assert_eq!(
+                route_binding(binding, &c),
+                Some(Action::Focus(FocusIntent::Adjacent {
+                    from_pane_id: "%7".into(),
+                    direction,
+                }))
+            );
+        }
     }
 
     #[test]
@@ -1462,7 +1499,7 @@ mod tests {
         assert_eq!(
             route_binding(BindingAction::CloseTab, &c),
             Some(Action::RequestCloseWorkspace {
-                session: "solo".into()
+                session_id: "$1".into(),
             })
         );
     }
@@ -1485,19 +1522,55 @@ mod tests {
         let tabs = [tab("@1")];
         let workspaces = [workspace("$1", "main")];
         let c = ctx(&tabs, 0, "%0", "main", &workspaces, 0);
+        let expected = Some(Action::RequestCloseWorkspace {
+            session_id: "$1".into(),
+        });
+        assert_eq!(route_binding(BindingAction::CloseWorkspace, &c), expected);
         assert_eq!(
-            route_binding(BindingAction::CloseWorkspace, &c),
-            Some(Action::RequestCloseWorkspace {
-                session: "main".into()
-            })
+            route_menu_item(
+                &MenuState::WorkspaceMenu {
+                    session_id: "$1".into(),
+                    at: (0, 0),
+                },
+                BindingAction::CloseWorkspace,
+                &c,
+            ),
+            expected,
+            "keyboard and sidebar confirmation must carry the same stable id"
         );
         assert_eq!(
             route_dialog_confirm(&Dialog::ConfirmCloseWorkspace {
-                session: "main".into()
+                session_id: "$1".into(),
             }),
-            Some(Action::CloseWorkspace {
-                session: "main".into()
-            })
+            Some(Action::CloseWorkspace(crate::workspace_close::Intent {
+                session_id: "$1".into(),
+            }))
+        );
+    }
+
+    #[test]
+    fn workspace_menu_keeps_the_clicked_identity_across_rename_and_name_reuse() {
+        let tabs = [tab("@1")];
+        let workspaces = [workspace("$1", "renamed"), workspace("$2", "original")];
+        let c = ctx(&tabs, 0, "%0", "renamed", &workspaces, 0);
+        let menu = MenuState::WorkspaceMenu {
+            session_id: "$1".into(),
+            at: (0, 0),
+        };
+
+        assert_eq!(
+            route_menu_item(&menu, BindingAction::CloseWorkspace, &c),
+            Some(Action::RequestCloseWorkspace {
+                session_id: "$1".into(),
+            }),
+            "the session that reused the old menu label must not become the close target"
+        );
+        assert_eq!(
+            route_menu_item(&menu, BindingAction::RenameWorkspace, &c),
+            Some(Action::RequestRenameWorkspace {
+                session_id: "$1".into(),
+            }),
+            "rename must keep the clicked identity after its old name is reused"
         );
     }
 
@@ -1556,7 +1629,7 @@ mod tests {
         );
         assert_eq!(
             route_dialog_confirm(&Dialog::RenameWorkspace {
-                session: "main".into(),
+                session_id: "$1".into(),
                 buffer: "".into(),
             }),
             None
@@ -1574,6 +1647,16 @@ mod tests {
                 window_id: "@1".into(),
                 name: "review".into(),
             })
+        );
+        assert_eq!(
+            route_dialog_confirm(&Dialog::RenameWorkspace {
+                session_id: "$1".into(),
+                buffer: "  review  ".into(),
+            }),
+            Some(Action::RenameWorkspace(crate::workspace_rename::Intent {
+                session_id: "$1".into(),
+                name: "review".into(),
+            }))
         );
     }
 
@@ -1944,9 +2027,7 @@ mod tests {
         let grip = HitTarget::PaneGrip {
             pane_id: "%5".into(),
         };
-        let expected = Some(Action::FocusPane {
-            pane_id: "%5".into(),
-        });
+        let expected = Some(pane_focus("%5"));
         assert_eq!(route_mouse_click(&frame, MouseButton::Left), expected);
         assert_eq!(route_mouse_click(&frame, MouseButton::Right), expected);
         assert_eq!(route_mouse_click(&grip, MouseButton::Right), expected);
@@ -2050,9 +2131,7 @@ mod tests {
             route_drag_click(&DragTarget::Pane {
                 pane_id: "%1".into()
             }),
-            Some(Action::FocusPane {
-                pane_id: "%1".into()
-            })
+            Some(pane_focus("%1"))
         );
         assert_eq!(
             route_drag_click(&DragTarget::Tab {
@@ -2077,9 +2156,7 @@ mod tests {
                 pane_id: "%1".into(),
                 order_key: "pane:%1".into(),
             }),
-            Some(Action::FocusPane {
-                pane_id: "%1".into()
-            })
+            Some(pane_focus("%1"))
         );
         // A seam grabbed in the bare gutter: nothing was pressed, so a
         // release that never moved has nothing to focus.
@@ -2100,9 +2177,7 @@ mod tests {
                 dir: SplitDir::Vertical,
                 focus_on_click: Some("%2".into()),
             }),
-            Some(Action::FocusPane {
-                pane_id: "%2".into()
-            })
+            Some(pane_focus("%2"))
         );
         assert_eq!(route_drag_click(&DragTarget::Sidebar), None);
         assert_eq!(route_drag_click(&DragTarget::Dialog), None);

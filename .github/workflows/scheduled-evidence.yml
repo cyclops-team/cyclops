@@ -1,0 +1,116 @@
+name: scheduled evidence
+
+on:
+  push:
+    branches: [beta/messaging-rework]
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: Evidence lane to run
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - matrix
+          - tmux-head
+          - performance
+          - reliability
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scheduled-evidence-${{ github.ref }}-${{ inputs.lane || 'all' }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  full-matrix:
+    name: scheduled full matrix (${{ matrix.os }})
+    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'matrix' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.100
+      - name: Install tmux
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then sudo apt-get update && sudo apt-get install -y tmux; else brew install tmux; fi
+      - name: Full clean-checkout validation
+        run: ./scripts/check.sh
+
+  tmux-head:
+    name: scheduled tmux HEAD
+    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'tmux-head' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.100
+      - name: Build tmux from master
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libevent-dev ncurses-dev build-essential bison pkg-config autoconf automake
+          git clone --depth 1 https://github.com/tmux/tmux.git /tmp/tmux-head
+          cd /tmp/tmux-head && sh autogen.sh && ./configure && make -j
+          sudo make install
+          tmux -V
+      - name: Full correctness evidence against tmux HEAD
+        run: ./scripts/check.sh --fast
+
+  performance:
+    name: scheduled performance history
+    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'performance' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Build real binaries used by workspace performance contracts
+        run: cargo build -p cyclops -p cyclopsd --bins
+      - name: Run stable workloads with environment metadata
+        run: python3 scripts/ci-performance.py artifacts/performance.json
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() }}
+        with:
+          name: performance-${{ github.sha }}-${{ github.run_attempt }}
+          path: artifacts/performance.json
+          if-no-files-found: error
+          retention-days: 90
+
+  reliability:
+    name: scheduled race and long-history evidence
+    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' || inputs.lane == 'all' || inputs.lane == 'reliability' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: Repeated race, forced-cleanup, soak, and long-history evidence
+        env:
+          CYCLOPS_CI_REPEAT: 10
+        run: ./scripts/ci-reliability.sh

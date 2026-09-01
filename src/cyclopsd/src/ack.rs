@@ -646,22 +646,26 @@ pub(crate) async fn handle_report(
         }
     }
     if let Some(start) = &start_confirmed_by_end {
-        crate::composer_recovery::bind_post_recovery_turn(
+        crate::apply_recovered_turn_evidence(
             inner,
-            origin.session_idx,
-            &pane_id,
-            start.turn.clone(),
-            start.edge_ms,
+            fusion::PaneRecoveredTurnEvidence {
+                session_idx: origin.session_idx,
+                pane_id: pane_id.clone(),
+                turn: start.turn.clone(),
+                since_ms: start.edge_ms,
+            },
         );
     }
     if is_turn_start && lifecycle_confirmed {
         if let Some(turnkey::TurnCorrelation::Exact(turn)) = &correlation {
-            crate::composer_recovery::bind_post_recovery_turn(
+            crate::apply_recovered_turn_evidence(
                 inner,
-                origin.session_idx,
-                &pane_id,
-                turn.clone(),
-                edge_ms,
+                fusion::PaneRecoveredTurnEvidence {
+                    session_idx: origin.session_idx,
+                    pane_id: pane_id.clone(),
+                    turn: turn.clone(),
+                    since_ms: edge_ms,
+                },
             );
         }
     }
@@ -674,16 +678,18 @@ pub(crate) async fn handle_report(
             if let Some(field) = &m.hooks.ack_payload_field {
                 if let Some(text) = params.payload.get(field).and_then(Value::as_str) {
                     if m.hooks.ack_evidence == AckEvidence::Receipt {
-                        if let Some(service) = inner.mailbox.as_ref() {
-                            matched |= service.confirm_attention_consumption_hook(
-                                session_idx,
-                                &pane_id,
-                                origin.recipient_key,
-                                origin.pane_root,
-                                origin.agent,
-                                &m.agent.id,
-                                text,
-                                edge_ms,
+                        if let Some(messaging) = inner.workspace_messaging() {
+                            matched |= messaging.attention_consumption_observed(
+                                crate::messaging::MessagingAttentionConsumptionObservation::new(
+                                    session_idx,
+                                    &pane_id,
+                                    origin.recipient_key,
+                                    origin.pane_root,
+                                    origin.agent,
+                                    &m.agent.id,
+                                    text,
+                                    edge_ms,
+                                ),
                             );
                         }
                     }
@@ -771,7 +777,7 @@ pub(crate) async fn handle_report(
     let live = watcher.is_some();
     if let Some(w) = watcher {
         let route_evidence = inner.advance_route_evidence(session_idx, &pane_id);
-        fusion::recompute_pane_for_route_evidence(
+        crate::observe_pane_for_route_evidence(
             inner,
             session_idx,
             &w,
@@ -781,7 +787,13 @@ pub(crate) async fn handle_report(
             &route_evidence,
         )
         .await;
-        crate::messaging::schedule_route_evidence(inner, session_idx, &pane_id, &route_evidence);
+        if let Some(messaging) = inner.workspace_messaging() {
+            messaging.route_evidence_observed(crate::messaging::MessagingRouteEvidence::new(
+                session_idx,
+                &pane_id,
+                route_evidence,
+            ));
+        }
     }
     if is_turn_end && lifecycle_confirmed {
         if let (Some(turn), Some(manifest)) = (exact_turn.as_ref(), origin.manifest.as_deref()) {

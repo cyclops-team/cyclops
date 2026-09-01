@@ -655,7 +655,7 @@ mod tests {
         std::fs::create_dir_all(&home).expect("scratch");
         std::fs::write(
             home.join("config.toml"),
-            "[workspace]\nfuture_key = 42\n[workspace.bindings]\nnext_tab = 'Alt+n'\n[theme]\nname = 'sage'\n",
+            "[workspace]\nfuture_key = 42\nterminal_default_fg = '#3a2b26'\nterminal_default_bg = '#000000'\n[workspace.bindings]\nnext_tab = 'Alt+n'\n[theme]\nname = 'sage'\n",
         )
         .expect("write");
 
@@ -685,6 +685,8 @@ mod tests {
         let table = saved.parse::<toml::Table>().expect("valid TOML");
         let workspace = table["workspace"].as_table().expect("workspace table");
         assert_eq!(workspace["future_key"].as_integer(), Some(42));
+        assert_eq!(workspace["terminal_default_fg"].as_str(), Some("#3a2b26"));
+        assert_eq!(workspace["terminal_default_bg"].as_str(), Some("#000000"));
         assert_eq!(
             workspace["bindings"]
                 .as_table()

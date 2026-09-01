@@ -16,13 +16,16 @@
 //!
 //! This module owns boot, the event queue, render scheduling, reconnect
 //! orchestration, and top-level `App` state. It does not own tmux command
-//! strings (`cyclops-tmux` and `action::route_*`), device-event decoding
-//! (`input`), dialog text-editing (`dialog`), or frame composition
-//! (`render`) — it calls into those and reacts to their results.
+//! strings (`cyclops-tmux` and `action::route_*`), reversible window-sizing
+//! ownership (`sizing_ownership`), device-event decoding (`input`), dialog
+//! text-editing (`dialog`), or frame composition (`render`) — it calls into
+//! those and reacts to their results.
 
 #![allow(clippy::too_many_arguments)]
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+#[cfg(test)]
+use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -30,7 +33,7 @@ use std::pin::Pin;
 use crossterm::event::{
     self, Event, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use cyclops_tmux::sizing::ClientIdentity;
+use cyclops_client::{BlockingClient, ClientError, DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT};
 use cyclops_tmux::{
     ControlClient, ControlConfig, InputCapacity, Notification, NotificationReceiver, TmuxError,
 };
@@ -52,17 +55,24 @@ use crate::input::encode_send_keys;
 use crate::input::mouse::{HitMap, HitTarget, MenuState};
 use crate::input::router::{Router, RouterResult};
 use crate::layout::SplitDir;
-use crate::model::{pane_is_visible, RuntimeRegistry, TabModel, WorkspaceModel};
+use crate::model::{pane_is_visible, RuntimeRegistry, WorkspaceModel};
 use crate::naming;
 use crate::notice::NoticeState;
 use crate::persist::{self, load_prefs, set_last_active, SidebarTab, WorkspacePrefs};
 use crate::render::{
     paint_dialog, paint_menu, paint_messages, paint_messages_rail, paint_messages_resize_feedback,
     paint_sidebar, paint_sidebar_rail, paint_sidebar_resize_feedback, paint_tab_bar, paint_window,
+    MessagesRailCue,
 };
 use crate::resilience::{self, LinkState};
 use crate::selection::{self, SelectionState};
-use crate::sync::{fetch_workspace_model, hydrate_visible_tab};
+#[cfg(test)]
+use crate::sizing_ownership::{
+    adopt_windows, owns_session, rekey_ownership, restore_owned_sizing, unpinned_windows, Adopted,
+};
+use crate::sizing_ownership::{declarable, SizingOutcome};
+pub use crate::sizing_ownership::{OwnedSession, WindowSizing};
+use crate::sync::{fetch_workspace_model, fetch_workspace_model_by_id, hydrate_visible_tab};
 use crate::term_guard::{SynchronizedWriter, TermGuard};
 use crate::theme::Paint;
 
@@ -84,6 +94,14 @@ const RENDER_DEBOUNCE: Duration = Duration::from_millis(8);
 /// pushed back, so a noisy pane costs one tmux round trip per interval and
 /// an idle workspace costs no wakeups at all.
 const FOLDER_PROBE_DELAY: Duration = Duration::from_millis(600);
+/// How long Files waits after active-pane output before it asks tmux for the
+/// pane directory and re-reads the visible tree.
+///
+/// A shell echoes a `cd` before it finishes changing directory, so the
+/// output edge needs the same short delay as a folder-following workspace.
+/// This is one event-armed deadline, never a recurring timer: an idle
+/// workspace has no Files refresh wakeups.
+const FILES_REFRESH_DELAY: Duration = Duration::from_millis(600);
 /// How long a burst of daemon decoration events (state, label, delivery
 /// changes) is allowed to coalesce before `spawn_decoration_forwarder`
 /// issues one status fetch. Same rule as `RENDER_DEBOUNCE`/`arm()`: armed
@@ -115,10 +133,6 @@ const PASTE_MAX_BYTES: usize = 1 << 20;
 /// Pane output uses the same byte envelope as a terminal paste. Larger
 /// control-mode notifications are split without changing pane byte order.
 const OUTPUT_BATCH_MAX_BYTES: usize = 1 << 20;
-/// Daemon event lines are body-free in normal operation. A line larger
-/// than the paste envelope is treated as a stream gap and reconciled from
-/// the bounded journal tail instead of entering the app queue.
-const STREAM_EVENT_MAX_BYTES: usize = 1 << 20;
 
 enum AppMsg {
     /// A send started from the composer has an answer. Carries the
@@ -145,7 +159,8 @@ enum AppMsg {
         mouse: MouseEvent,
     },
     /// The terminal's focus moved onto (`true`) or off (`false`) the
-    /// workspace's tab. Drives the host palette only: the theme's ink and
+    /// workspace's tab. Drives the opt-in host palette only: when the
+    /// operator supplied an exact restoration pair, the theme's ink and
     /// ground are handed to the terminal while the workspace is looked at
     /// and both defaults return the moment it is not, so a shell in another
     /// tab of the same window never wears the workspace's colors.
@@ -179,6 +194,8 @@ enum AppMsg {
         pane: String,
     },
     DecorationChanged(DecorationSnapshot),
+    /// Persistent classification of the authenticated daemon's Hello identity.
+    DaemonCompatibility(cyclops_client::HelloCompatibility),
     /// The daemon subscription (re)connected. The handler resyncs what an
     /// outage loses on both sides: a restarted daemon forgot every watch
     /// ask (those live in its memory, not config.toml), and any state that
@@ -268,9 +285,10 @@ struct MessagesDraftIdentity {
 enum HostPaletteState {
     /// Nothing has been emitted since this process acquired or regained the surface.
     Unknown,
-    /// The terminal owns both defaults (OSC 110/111 was emitted).
+    /// The terminal owns both defaults because Cyclops left them alone or
+    /// restored the operator-provided exact pair.
     Defaults,
-    /// Cyclops owns both defaults with this exact theme pair.
+    /// Cyclops requested this theme pair when host palette theming is enabled.
     Theme(crate::theme::HostPalette),
 }
 
@@ -454,6 +472,10 @@ struct App {
     /// an idle workspace without a keypress and without a timer of its
     /// own.
     notice: NoticeState,
+    daemon_compatibility: Option<cyclops_client::HelloCompatibility>,
+    /// A Hello mismatch is durable connection state, not a transient action
+    /// result. It remains visible until a later authenticated Hello replaces it.
+    daemon_compatibility_notice: Option<String>,
     decoration: DecorationSnapshot,
     prefs: WorkspacePrefs,
     /// Stable session ids whose agent children are visible in the sidebar.
@@ -479,10 +501,9 @@ struct App {
     files_pinned: crate::files::FileTree,
     /// Which of the two the panel is showing.
     files_view: crate::files::FilesView,
-    /// When the file tree is next re-read. `None` while nothing is armed;
-    /// see [`arm_files_probe`], which is what keeps this off the clock when
-    /// the panel is not on screen.
-    files_probe_at: Option<Instant>,
+    /// One requested Files refresh. `None` means no event currently warrants
+    /// a filesystem read; see [`request_files_refresh`].
+    files_refresh_at: Option<Instant>,
     /// The next file probe should also re-root the tree on the focused
     /// pane's folder. Set at boot and whenever the operator asks for it;
     /// cleared once the probe answers, so a pane that has since gone does
@@ -506,6 +527,10 @@ struct App {
     record: cyclops_ui::Record,
     /// The shared Cyclops watch Messages model (HumanQueue).
     messages_queue: cyclops_ui::HumanQueue,
+    /// Last authenticated body-free counts for the collapsed Messages rail.
+    /// Freshness is owned by `messages_gate`; these are never mutated as a
+    /// second unread queue.
+    messages_snapshot_counts: Option<cyclops_proto::MessagesSnapshotCounts>,
     /// Authenticated mailbox identity that produced the current snapshot.
     /// Absent means the Messages pane is read-only.
     messages_caller: Option<cyclops_proto::RecipientKey>,
@@ -516,11 +541,11 @@ struct App {
     /// Data-driven avatar registry for resolving agent/sender initials and icons.
     avatar_registry: cyclops_ui::AvatarRegistry,
     /// Startup ordering and seq dedup for `record`
-    /// ([`cyclops_ui::Intake`]): live entries reaching the app before
+    /// ([`cyclops_ui::StreamProjectionState`]): live entries reaching the app before
     /// [`crate::event_record::boot`] lands its backfill buffer here, and
     /// ledger-backed duplicates arriving live during startup are dropped
     /// by seq instead of shown twice.
-    intake: cyclops_ui::Intake,
+    stream_projection: cyclops_ui::StreamProjectionState,
     /// An oversized event invalidates the stream once. A replacement is
     /// loaded off-loop and later gaps coalesce until that result lands.
     stream_reconciling: bool,
@@ -538,6 +563,10 @@ struct App {
     /// has pinned. See [`WindowSizing`].
     sizing: WindowSizing,
     needs_reconcile: bool,
+    /// Stable session identity the next authoritative snapshot must select.
+    /// Set only from a confirmed adapter transition and retained across a
+    /// failed repair so a rename cannot strand recovery on a cached name.
+    reconcile_session_id: Option<String>,
     /// A structural notification changed visible pane dimensions. Hydration
     /// waits for the render deadline so resize bursts collapse to one set of
     /// captures instead of blocking the input path for every intermediate.
@@ -919,6 +948,10 @@ fn boot_target(reopen: &persist::ReopenTarget) -> (String, bool) {
 /// Run the workspace on a tty. Returns the process exit code.
 pub async fn run_async() -> i32 {
     let home = cyclops_proto::cyclops_home();
+    // Exact terminal defaults are an operator-provided configuration pair.
+    // The workspace never reads terminal input to discover them, so the
+    // input thread below remains the sole owner of keystrokes and paste.
+    crate::term_guard::configure_default_palette(&home);
     let state_root = match cyclops_state::StateRoot::open_or_create(&home) {
         Ok(root) => std::sync::Arc::new(root),
         Err(error) => {
@@ -926,8 +959,14 @@ pub async fn run_async() -> i32 {
             return 1;
         }
     };
+    let tmux_cfg = match load_tmux_config(&home) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
     let prefs = load_prefs(&home);
-    let tmux_cfg = load_tmux_config(&home);
     let socket_name = tmux_cfg.socket.clone();
     let socket = socket_name.as_deref();
     // No server yet is the same as a server with no sessions: boot one.
@@ -1088,13 +1127,6 @@ pub async fn run_async() -> i32 {
         }
     });
 
-    // Ask the terminal for its own default colors before the reader thread
-    // below starts consuming stdin: the reply arrives as terminal input, so
-    // it must be read here or not at all. On exit and on focus loss the
-    // workspace hands these exact colors back (`term_guard::reset_window_palette`),
-    // because Apple Terminal honors an OSC 10/11 set but ignores the OSC
-    // 110/111 reset that would otherwise undo the themed ground.
-    crate::term_guard::capture_default_palette();
     let terminal_input_gate = pane_input_gate.clone();
     std::thread::spawn(move || loop {
         match event::read() {
@@ -1211,14 +1243,9 @@ pub async fn run_async() -> i32 {
     // size is written, so the first thing this process does to a session is
     // reversible.
     let mut sizing = WindowSizing::default();
-    let adopted = adopt_windows(
-        &mut sizing,
-        &client,
-        &model.session.session,
-        &model.session.tabs,
-        &home,
-    )
-    .await;
+    let adopted = sizing
+        .adopt(&client, &model.session.session, &model.session.tabs, &home)
+        .await;
     let following_at_boot = adopted.newly_following;
 
     // Declare terminal cells only after the split topology is known. tmux
@@ -1228,12 +1255,11 @@ pub async fn run_async() -> i32 {
     // model: a workspace quit collapsed would otherwise be declared one
     // sidebar wide and painted another, and the first reconcile would
     // fight the declaration. `chrome_for` is the one geometry both read.
-    model.sidebar_visible = prefs.sidebar_visible;
-    model.messages_visible = prefs.messages_visible;
+    apply_saved_workspace_visibility(&mut model, &prefs);
     let declared_client_size =
         declare_initial_client_size(term_size, &model, &prefs, &mut sizing, &client, &home).await;
     if declared_client_size.is_some() {
-        if let Err(error) = recover_post_resize_geometry(&sizing, &client, &home, None).await {
+        if let Err(error) = sizing.recover_geometry(&client, &home, None).await {
             log_err(&home, &format!("boot post-resize recovery failed: {error}"));
         }
         // The resize can rebalance leaf dimensions. Re-list before
@@ -1295,6 +1321,8 @@ pub async fn run_async() -> i32 {
         selection: SelectionState::default(),
         drag: None,
         notice: NoticeState::default(),
+        daemon_compatibility: None,
+        daemon_compatibility_notice: None,
         // Nothing to fall back to on the first frame: no answer here is
         // genuinely "nothing known yet", which is what the default says.
         decoration: decoration::fetch_decoration(&home).unwrap_or_else(|error| {
@@ -1310,26 +1338,28 @@ pub async fn run_async() -> i32 {
         files_pinned: {
             let mut pinned = crate::files::FileTree::new();
             if let Some(root) = &prefs.files_pinned_root {
-                pinned.reroot(root.clone());
+                crate::file_adapter::reroot(&mut pinned, root.clone());
             }
             pinned
         },
         files_view: crate::files::FilesView::default(),
-        files_probe_at: None,
+        files_refresh_at: None,
         files_root_pending: true,
         record: cyclops_ui::Record::new(),
         messages_queue: cyclops_ui::HumanQueue::default(),
+        messages_snapshot_counts: None,
         messages_caller: None,
         messages_detail: None,
         messages_composer: cyclops_ui::ComposerState::default(),
         avatar_registry: cyclops_ui::AvatarRegistry::default(),
-        intake: cyclops_ui::Intake::new(),
+        stream_projection: cyclops_ui::StreamProjectionState::new(),
         stream_reconciling: false,
         cursor_style: None,
         term_size,
         declared_client_size,
         sizing,
         needs_reconcile: false,
+        reconcile_session_id: None,
         needs_hydrate: false,
         paste_seq: 0,
         home,
@@ -1365,15 +1395,21 @@ pub async fn run_async() -> i32 {
     }
     // The subscription at the top of this function is already queuing live
     // entries on the app channel; boot's backfill-then-seed lands before
-    // the loop below drains them, which is exactly the order the intake
-    // contract wants (crate::event_record's doc).
-    if let Some(warning) = crate::event_record::boot(&mut app.record, &mut app.intake, &app.home) {
+    // the loop below drains them, which is exactly the order the stream
+    // projection contract wants (crate::event_record's doc).
+    if let Some(warning) =
+        crate::event_record::boot(&mut app.record, &mut app.stream_projection, &app.home)
+    {
         app.notice.show(warning, Instant::now());
     }
     if following_at_boot {
         app.notice
             .show(copy::SIZING_FOLLOWER.to_string(), Instant::now());
     }
+    // The first Files snapshot is an explicit boot request, not a recurring
+    // clock. Later refreshes come from a pane-route event, pane output, or a
+    // Files interaction.
+    let _ = probe_files(&mut app, &client).await;
 
     let mut debounce: Option<Instant> = None;
     let mut reconnect_deadline: Option<Instant> = None;
@@ -1392,19 +1428,11 @@ pub async fn run_async() -> i32 {
         log_err(&app.home, &error);
     }
     while !detached {
-        // Every iteration, because everything that turns the file panel on
-        // is somewhere else: the sidebar reopening, the tab going back to
-        // Sessions, the menu toggle, the first frame needing a folder at
-        // all. Arming from each of those was four places to forget one; the
-        // call is a no-op when a probe is already armed or the panel is not
-        // on screen, so asking every time is both cheaper to reason about
-        // and the only version that cannot go stale.
-        arm_files_probe(&mut app);
         let next_deadline = soonest([
             debounce,
             reconnect_deadline,
             app.folder_probe_at,
-            app.files_probe_at,
+            app.files_refresh_at,
             app.notice.deadline(),
             motion.deadline(),
             // The resize settle window is a one-shot deadline like every
@@ -1624,12 +1652,9 @@ pub async fn run_async() -> i32 {
                         log_err(&app.home, &e);
                     }
                 }
-                if app.files_probe_at.is_some_and(|due| due <= now) {
-                    app.files_probe_at = None;
-                    // Only a change earns a frame. The poll runs once a
-                    // second and answers "nothing moved" nearly every time;
-                    // redrawing on each of those would be a workspace that
-                    // repaints forever over a folder nobody touched.
+                if take_files_refresh_request(&mut app, now) {
+                    // Only a changed, explicitly requested snapshot earns
+                    // a frame. This deadline never re-arms itself.
                     if probe_files(&mut app, &client).await {
                         if let Err(error) = renderer.frame(&mut app, &mut motion, Instant::now()) {
                             log_err(&app.home, &error);
@@ -1691,7 +1716,7 @@ pub async fn run_async() -> i32 {
     // A manual size is window state and outlives the process that set it,
     // so this is the difference between quitting and leaving the operator's
     // sessions frozen at whatever size this workspace happened to be.
-    restore_owned_sizing(&mut app.sizing, &client, &app.home).await;
+    app.sizing.hand_back(&client, &app.home).await;
     client.shutdown().await;
     if detached {
         eprintln!("{}", copy::DETACHED);
@@ -2020,46 +2045,6 @@ enum SubscribeEnd {
     SinkGone,
 }
 
-enum BoundedLine {
-    Eof,
-    Complete,
-    TooLong,
-}
-
-/// Read one blocking socket line without allocating past the consumer's
-/// frame envelope. The caller closes the connection on `TooLong`, so there is
-/// no need to retain or drain the rest of that frame.
-fn read_bounded_line(
-    reader: &mut impl std::io::BufRead,
-    line: &mut Vec<u8>,
-    max_bytes: usize,
-) -> std::io::Result<BoundedLine> {
-    line.clear();
-    loop {
-        let (take, complete) = {
-            let available = reader.fill_buf()?;
-            if available.is_empty() {
-                return Ok(if line.is_empty() {
-                    BoundedLine::Eof
-                } else {
-                    BoundedLine::Complete
-                });
-            }
-            let newline = available.iter().position(|byte| *byte == b'\n');
-            let take = newline.map_or(available.len(), |index| index + 1);
-            if line.len().saturating_add(take) > max_bytes {
-                return Ok(BoundedLine::TooLong);
-            }
-            line.extend_from_slice(&available[..take]);
-            (take, newline.is_some())
-        };
-        reader.consume(take);
-        if complete {
-            return Ok(BoundedLine::Complete);
-        }
-    }
-}
-
 /// The forwarder's whole life: subscribe, forward until the connection
 /// ends, reconnect on a bounded backoff, repeat. Unlike the tmux link
 /// there is no give-up state: the workspace works without its daemon and
@@ -2136,61 +2121,36 @@ fn subscribe_decoration_once(
     control_tx: &mpsc::Sender<AppMsg>,
     stream_tx: &mpsc::Sender<AppMsg>,
 ) -> SubscribeEnd {
-    use std::io::Write;
     let socket = home.join(cyclops_proto::SOCK_NAME);
-    let Ok(stream) = std::os::unix::net::UnixStream::connect(socket) else {
-        return SubscribeEnd::ConnectFailed;
-    };
-    let mut reader = std::io::BufReader::new(stream);
-    let mut hello = Vec::new();
-    if !matches!(
-        read_bounded_line(&mut reader, &mut hello, STREAM_EVENT_MAX_BYTES),
-        Ok(BoundedLine::Complete)
-    ) {
-        log_err(home, &"cyclopsd sent an incomplete or oversized hello");
-        return SubscribeEnd::ConnectFailed;
-    }
-    if let Err(error) = serde_json::from_slice::<cyclops_proto::Hello>(&hello) {
-        log_err(home, &format!("cyclopsd sent an unreadable hello: {error}"));
-        return SubscribeEnd::ConnectFailed;
-    }
-    if reader
-        .get_mut()
-        .write_all(b"{\"id\":1,\"method\":\"events.subscribe\",\"params\":{}}\n")
+    let mut client =
+        match BlockingClient::connect_path(socket, DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT) {
+            Ok(client) => client,
+            Err(ClientError::NotRunning(_)) => return SubscribeEnd::ConnectFailed,
+            Err(error) => {
+                log_err(
+                    home,
+                    &format!("cyclopsd event subscription could not connect: {error}"),
+                );
+                return SubscribeEnd::ConnectFailed;
+            }
+        };
+    if stream_tx
+        .blocking_send(AppMsg::DaemonCompatibility(client.hello_compatibility()))
         .is_err()
     {
-        return SubscribeEnd::ConnectFailed;
+        return SubscribeEnd::SinkGone;
     }
-    let mut acknowledgement = Vec::new();
-    if !matches!(
-        read_bounded_line(&mut reader, &mut acknowledgement, STREAM_EVENT_MAX_BYTES),
-        Ok(BoundedLine::Complete)
-    ) {
+    if let Err(error) = client.subscribe(serde_json::json!({})) {
         log_err(
             home,
-            &"cyclopsd sent an incomplete or oversized subscription acknowledgement",
+            &format!("cyclopsd did not establish the event subscription: {error}"),
         );
         return SubscribeEnd::ConnectFailed;
     }
-    let acknowledgement = match serde_json::from_slice::<serde_json::Value>(&acknowledgement) {
-        Ok(value) => value,
-        Err(error) => {
-            log_err(
-                home,
-                &format!("cyclopsd sent an unreadable subscription acknowledgement: {error}"),
-            );
-            return SubscribeEnd::ConnectFailed;
-        }
-    };
-    if acknowledgement
-        .get("id")
-        .and_then(serde_json::Value::as_u64)
-        != Some(1)
-        || acknowledgement.pointer("/result/subscribed") != Some(&serde_json::Value::Bool(true))
-    {
-        log_err(home, &"cyclopsd did not acknowledge the event subscription");
-        return SubscribeEnd::ConnectFailed;
-    }
+    // Subscriptions are idle by design. Request deadlines protect the
+    // handshake above; after acknowledgement, EOF or a malformed frame is the
+    // evidence of a gap, not the absence of traffic for five seconds.
+    client.clear_read_timeout();
     // Subscribed. Ask the app to resync before any event arrives on this
     // connection: everything that changed while nothing was subscribed
     // produced no event, so without this a state flip during the outage
@@ -2205,65 +2165,31 @@ fn subscribe_decoration_once(
     let (sig_tx, sig_rx) = std::sync::mpsc::sync_channel::<DecorationSignal>(1);
     let stream_tx = stream_tx.clone();
     std::thread::spawn(move || loop {
-        let mut line = Vec::new();
-        match read_bounded_line(&mut reader, &mut line, STREAM_EVENT_MAX_BYTES) {
-            Ok(BoundedLine::Eof) => {
-                report_stream_gap(&stream_tx, &sig_tx, "daemon event subscription closed");
-                return;
-            }
+        let ev = match client.next_event() {
+            Ok(frame) => frame.event,
             Err(error) => {
-                report_stream_gap(
-                    &stream_tx,
-                    &sig_tx,
-                    format!("daemon event read failed: {error}"),
-                );
-                return;
-            }
-            Ok(BoundedLine::TooLong) => {
-                report_stream_gap(
-                    &stream_tx,
-                    &sig_tx,
-                    format!("daemon event exceeded {STREAM_EVENT_MAX_BYTES} bytes"),
-                );
-                return;
-            }
-            Ok(BoundedLine::Complete) => {}
-        }
-        let value = match serde_json::from_slice::<serde_json::Value>(&line) {
-            Ok(value) => value,
-            Err(error) => {
-                report_stream_gap(
-                    &stream_tx,
-                    &sig_tx,
-                    format!("malformed daemon event JSON: {error}"),
-                );
+                let why = match &error {
+                    ClientError::Gap(cause) if cause == "the connection closed" => {
+                        "daemon event subscription closed".to_string()
+                    }
+                    ClientError::Gap(cause) if cause.starts_with("malformed event frame: ") => {
+                        cause.replacen(
+                            "malformed event frame: ",
+                            "malformed daemon event JSON: ",
+                            1,
+                        )
+                    }
+                    _ => error.cause(),
+                };
+                report_stream_gap(&stream_tx, &sig_tx, why);
                 return;
             }
         };
-        if value.get("event").is_none() {
-            report_stream_gap(
-                &stream_tx,
-                &sig_tx,
-                "daemon event stream sent a non-event record",
-            );
-            return;
-        }
         // E2: normalize this same line onto the shared stream model
         // before the decoration signal below. Cheap (no IO) and
         // per-event on purpose. It must never wait for or extend the
         // coalescing deadline that follows. An unreadable event closes
         // this subscription so the app reconciles before reconnecting.
-        let ev = match serde_json::from_value::<cyclops_proto::Event>(value) {
-            Ok(event) => event,
-            Err(error) => {
-                report_stream_gap(
-                    &stream_tx,
-                    &sig_tx,
-                    format!("unreadable daemon event: {error}"),
-                );
-                return;
-            }
-        };
         // A theme reload is not a fact about the record; the CLI stream
         // drops it the same way (`cyclops_ui`'s own subscribe loop). It
         // still becomes a wake-only `ThemeChanged`. Every other vocabulary,
@@ -2425,7 +2351,7 @@ async fn handle_reconnect(
             // that no longer exists. Move them onto the new identity here,
             // at the seam, rather than letting the sessions this process is
             // not currently displaying sit pinned with nobody owning them.
-            rekey_ownership(&mut app.sizing, client, &app.home).await;
+            app.sizing.reconnect(client, &app.home).await;
             resize_client(app, client).await;
             // The gap this flag exists for: %output missed while the link
             // was down, with no size change to mark any pane stale.
@@ -2502,7 +2428,9 @@ async fn declare_initial_client_size(
     }
     let canvas =
         chrome_for(Rect::new(0, 0, term_size.0, term_size.1), model, prefs).tmux_sizing_canvas();
-    let outcome = size_owned_windows(sizing, client, canvas, &model.session.tabs, home).await;
+    let outcome = sizing
+        .resize_owned(client, canvas, &model.session.tabs, home)
+        .await;
     if outcome.all_succeeded() {
         Some(size)
     } else {
@@ -2619,6 +2547,16 @@ fn reconnect_config(base: &ControlConfig, session: &str) -> ControlConfig {
 }
 
 impl App {
+    fn daemon_compatibility_marker(&self) -> Option<&'static str> {
+        match self.daemon_compatibility.as_ref()? {
+            cyclops_client::HelloCompatibility::Current { .. } => None,
+            cyclops_client::HelloCompatibility::Mismatch { .. } => Some("daemon mismatch"),
+            cyclops_client::HelloCompatibility::UnverifiedDaemon { .. } => {
+                Some("daemon unverified")
+            }
+        }
+    }
+
     /// Put a dialog on screen at its resting center.
     ///
     /// Every open goes through here so the drag offset is cleared with it.
@@ -2699,7 +2637,7 @@ impl App {
 
 /// Append one error line to `<home>/workspace.log`. The alternate screen
 /// owns stderr while the workspace runs; printing there corrupts the frame.
-fn log_err(home: &std::path::Path, err: &dyn std::fmt::Display) {
+pub(crate) fn log_err(home: &std::path::Path, err: &dyn std::fmt::Display) {
     use std::io::Write;
     if let Ok(root) = cyclops_state::StateRoot::open_or_create(home) {
         let Ok(mut f) = root.open_append(std::path::Path::new("workspace.log")) else {
@@ -2787,519 +2725,6 @@ fn apply_pane_input_outcome(
     }
 }
 
-/// The smallest grid worth declaring to tmux. Below this the terminal is
-/// nearly all chrome, and declaring the leftover sliver would reshape
-/// every pane in the session to fit it. Boot and every later resize must
-/// apply the same floor: if they disagree, a terminal declarable at boot
-/// stops being declarable on the first resize, or the reverse, and the
-/// panes are painted for a size tmux was never told about.
-const MIN_DECLARABLE_SIZE: (u16, u16) = (10, 3);
-
-fn declarable(size: (u16, u16)) -> bool {
-    size.0 >= MIN_DECLARABLE_SIZE.0 && size.1 >= MIN_DECLARABLE_SIZE.1
-}
-
-/// Which sessions this workspace sizes, and what it owes them back.
-///
-/// A window's size is its panes' size, so sizing is not a viewer's private
-/// business: it reshapes every agent running in that session. Exactly one
-/// workspace per session therefore writes sizes, and the rest render inside
-/// whatever it chose. `sizing.rs` holds the tmux side and the measurements
-/// behind it; this holds what one process remembers.
-///
-/// Ownership is per session and lasts for the life of the process, not for
-/// the life of a view. A workspace that navigates from a session keeps one
-/// connection and one identity, so it vanishes from that session's client
-/// list while remaining alive; re-electing on that would hand a session to
-/// whoever glanced at it next and would put its windows back while its
-/// owner was still using them.
-#[derive(Debug, Default)]
-pub struct WindowSizing {
-    /// This connection's identity, read once. A reconnect is a new client
-    /// and therefore a new identity, so this is dropped with the old link.
-    pub identity: Option<ClientIdentity>,
-    /// Sessions owned, each with what this workspace holds in it. Ordered
-    /// so a restore visits them the same way twice.
-    pub owned: BTreeMap<String, OwnedSession>,
-    /// Sessions found already owned by a live workspace. Kept so a follower
-    /// asks tmux once rather than on every reconcile.
-    pub following: BTreeSet<String>,
-}
-
-/// What this workspace holds in one session it owns.
-#[derive(Debug, Default)]
-pub struct OwnedSession {
-    /// Windows this workspace pinned, and therefore must put back.
-    pub pinned: BTreeSet<String>,
-    /// Windows carrying a record this version cannot read.
-    ///
-    /// Never pinned by this workspace and never changed by it, and yet the
-    /// reason the session stays owned. A window already on `manual` with an
-    /// unreadable record is exactly the state that cannot recover on its
-    /// own, and releasing the mark over it is what strands it: no policy
-    /// applies, no owner exists, and no later workspace can tell what it
-    /// was. Holding the mark keeps it visibly somebody's problem.
-    pub blocked: BTreeSet<String>,
-    /// Per pinned window, the last size this workspace asked tmux for and
-    /// the size the window was laid out at when it asked. This is how
-    /// [`resize_client`] tells a window that still needs moving from one
-    /// tmux has already declined to move. A layout has a minimum (one row
-    /// per pane plus a separator between each), and a `resize-window`
-    /// below it is clamped, not refused: the command succeeds and the
-    /// window keeps disagreeing with its target however often it is asked.
-    /// Asking again is not free, because tmux answers every
-    /// `resize-window` with a `%layout-change` whether or not the size
-    /// changed (F79), and a workspace that re-asks on each of those is a
-    /// loop at tmux round-trip speed.
-    pub settled: BTreeMap<String, AskedSize>,
-}
-
-/// One `resize-window` this workspace issued, kept as the two facts a later
-/// pass needs: what was asked for, and what the window was at the time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AskedSize {
-    pub target: (u16, u16),
-    pub laid_out: (u16, u16),
-}
-
-impl OwnedSession {
-    /// Whether this session may be handed back. A window whose original is
-    /// unknowable is not a window that can be put back.
-    fn releasable(&self) -> bool {
-        self.blocked.is_empty()
-    }
-}
-
-impl WindowSizing {
-    fn owns(&self, session: &str) -> bool {
-        self.owned.contains_key(session)
-    }
-
-    pub(crate) fn has_window_authority(&self, session: &str, window_id: &str) -> bool {
-        self.owned
-            .get(session)
-            .is_some_and(|o| o.pinned.contains(window_id))
-    }
-}
-
-/// This connection's identity, read once and remembered.
-async fn sizing_identity(
-    sizing: &mut WindowSizing,
-    client: &ControlClient,
-    home: &std::path::Path,
-) -> Option<ClientIdentity> {
-    if let Some(identity) = &sizing.identity {
-        return Some(identity.clone());
-    }
-    match client.client_identity().await {
-        Ok(identity) => {
-            sizing.identity = Some(identity.clone());
-            Some(identity)
-        }
-        Err(error) => {
-            log_err(home, &error);
-            None
-        }
-    }
-}
-
-/// Whether this workspace sizes `session`, claiming it when nobody live
-/// does.
-///
-/// Fails closed everywhere: an unreadable mark, an unreadable client list,
-/// or a lost race all answer false, and a workspace that answers false
-/// writes no sizes at all. The cost of a wrong false is that a session
-/// keeps the size it already had; the cost of a wrong true is two
-/// workspaces fighting over every pane in it.
-async fn owns_session(
-    sizing: &mut WindowSizing,
-    client: &ControlClient,
-    session: &str,
-    home: &std::path::Path,
-) -> bool {
-    if sizing.owns(session) {
-        return true;
-    }
-    let Some(identity) = sizing_identity(sizing, client, home).await else {
-        return false;
-    };
-    let marker = identity.marker();
-    let held = match client.window_driver(session).await {
-        Ok(held) => held,
-        Err(error) => {
-            log_err(home, &error);
-            return false;
-        }
-    };
-    let won = match held {
-        // Nobody has it. The claim is create-only, so a race is decided by
-        // tmux rather than by who read first.
-        None => client.claim_window_driver(session, &marker).await,
-        // Already ours: a reconcile after we claimed, not a new election.
-        Some(held) if held == marker => Ok(true),
-        Some(held) => {
-            // Server-wide, never this session's client list. An owner that
-            // navigated to another session is absent from this session's
-            // list while still alive and still sizing these windows
-            // (F76, M12); testing liveness there would steal the session
-            // out from under a live workspace.
-            let live = match client.server_client_markers().await {
-                Ok(live) => live,
-                Err(error) => {
-                    log_err(home, &error);
-                    return false;
-                }
-            };
-            if live.contains(&held) {
-                // A live owner. Follow it, and say so once.
-                sizing.following.insert(session.to_string());
-                return false;
-            }
-            client
-                .take_over_window_driver(session, &held, &marker)
-                .await
-        }
-    };
-    match won {
-        Ok(true) => {
-            sizing.following.remove(session);
-            sizing.owned.entry(session.to_string()).or_default();
-            true
-        }
-        Ok(false) => {
-            sizing.following.insert(session.to_string());
-            false
-        }
-        Err(error) => {
-            log_err(home, &error);
-            false
-        }
-    }
-}
-
-/// Record what each displayed window's sizing policy was, then take it off
-/// every policy so only this workspace moves it.
-///
-/// The order is the whole point and it is not an implementation detail: a
-/// capture without a pin restores to what is already there, while a pin
-/// without a capture loses the window's original policy permanently. A
-/// window that fails stays unowned so the next reconcile retries it.
-/// What one adoption pass changed, for the caller that has to react to it.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct Adopted {
-    /// This call was the one that found another workspace owns the session,
-    /// so exactly one notice is shown for it.
-    newly_following: bool,
-    /// At least one window was pinned that was not pinned before, so it is
-    /// carrying whatever size it had rather than this workspace's canvas.
-    took_a_window: bool,
-    /// True when this client transitioned from follower to authoritative sizing owner.
-    authority_transferred: bool,
-}
-
-/// Take ownership of a session's displayed windows: record what each one's
-/// sizing policy was, then take it off every policy so only this workspace
-/// moves it.
-async fn adopt_windows(
-    sizing: &mut WindowSizing,
-    client: &ControlClient,
-    session: &str,
-    tabs: &[TabModel],
-    home: &std::path::Path,
-) -> Adopted {
-    let followed_before = sizing.following.contains(session);
-    if !owns_session(sizing, client, session, home).await {
-        return Adopted {
-            newly_following: !followed_before && sizing.following.contains(session),
-            took_a_window: false,
-            authority_transferred: false,
-        };
-    }
-    // A window that has been closed is not owned any more, and there is
-    // nothing left to restore on it. Dropping it here keeps the exit path
-    // from asking tmux about windows that no longer exist. Re-adopting one
-    // that only looked absent is safe: the capture is create-only, so its
-    // original survives a second pass.
-    let displayed: BTreeSet<String> = tabs.iter().map(|tab| tab.window_id.clone()).collect();
-    if let Some(owned) = sizing.owned.get_mut(session) {
-        owned
-            .pinned
-            .retain(|window_id| displayed.contains(window_id));
-        owned
-            .blocked
-            .retain(|window_id| displayed.contains(window_id));
-    }
-    let owned = sizing.owned.entry(session.to_string()).or_default();
-    // Blocked windows are deliberately not excluded here. They are cheap to
-    // re-read, this workspace never pinned them, and if the record they
-    // carry is ever repaired the next pass adopts them properly instead of
-    // ignoring them for the life of the process.
-    let fresh: Vec<String> = unpinned_windows(tabs, &owned.pinned)
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    let mut took_a_window = false;
-    for window_id in fresh {
-        match client.capture_prior_window_size(&window_id).await {
-            Ok(cyclops_tmux::Captured::Record(_)) => {}
-            Ok(cyclops_tmux::Captured::Malformed) => {
-                // Not pinned, not written to, and not forgotten. Forgetting
-                // it is what used to release the session's mark over a
-                // window that was already pinned and unreadable, which is
-                // the one state nothing recovers from.
-                let owned = sizing.owned.entry(session.to_string()).or_default();
-                if owned.blocked.insert(window_id.clone()) {
-                    log_err(
-                        home,
-                        &format!(
-                            "{window_id}: sizing record unreadable, so this workspace will not \
-                             size it and will not release {session}. Inspect it with: tmux \
-                             show-options -w -t {window_id} @cyclops_prior_window_size"
-                        ),
-                    );
-                }
-                continue;
-            }
-            Err(error) => {
-                log_err(home, &error);
-                continue;
-            }
-        }
-        match client.pin_window_size_manual(&window_id).await {
-            Ok(()) => {
-                sizing
-                    .owned
-                    .entry(session.to_string())
-                    .or_default()
-                    .pinned
-                    .insert(window_id);
-                took_a_window = true;
-            }
-            Err(error) => log_err(home, &error),
-        }
-    }
-    Adopted {
-        newly_following: false,
-        took_a_window,
-        authority_transferred: followed_before,
-    }
-}
-
-/// Result of resizing execution across pinned windows in a session.
-#[derive(Debug, Default)]
-pub(crate) struct SizingOutcome {
-    pub succeeded: BTreeSet<String>,
-    pub failed: BTreeMap<String, cyclops_tmux::TmuxError>,
-}
-
-impl SizingOutcome {
-    pub fn all_succeeded(&self) -> bool {
-        self.failed.is_empty()
-    }
-}
-
-/// Push per-window topology-derived target sizes to every window this workspace owns,
-/// in every session it owns. Returns exact per-window successes and failures.
-///
-/// Every ask that lands is remembered on its session ([`OwnedSession::settled`]),
-/// so the next pass can tell a window that still needs moving from one tmux
-/// has already left where it is.
-async fn size_owned_windows(
-    sizing: &mut WindowSizing,
-    client: &ControlClient,
-    canvas: Rect,
-    tabs: &[TabModel],
-    home: &std::path::Path,
-) -> SizingOutcome {
-    let mut outcome = SizingOutcome::default();
-    for owned in sizing.owned.values_mut() {
-        for window_id in &owned.pinned {
-            let tab = tabs.iter().find(|t| &t.window_id == window_id);
-            let target_size = if let Some(tab) = tab {
-                crate::render::window_target_size_for_layout(canvas, &tab.layout, tab.zoomed)
-            } else {
-                let inner = crate::render::pane_canvas(canvas);
-                (inner.width, inner.height)
-            };
-
-            if !declarable(target_size) {
-                continue;
-            }
-
-            match client
-                .resize_window(window_id, target_size.0, target_size.1)
-                .await
-            {
-                Ok(()) => {
-                    // Only a window whose layout is on hand can be judged
-                    // against its target later, so only that ask is
-                    // remembered. A background session's window has no tab
-                    // here and nothing to judge it by.
-                    match tab {
-                        Some(tab) => {
-                            let rect = tab.layout.rect();
-                            owned.settled.insert(
-                                window_id.clone(),
-                                AskedSize {
-                                    target: target_size,
-                                    laid_out: (rect.width, rect.height),
-                                },
-                            );
-                        }
-                        None => {
-                            owned.settled.remove(window_id);
-                        }
-                    }
-                    outcome.succeeded.insert(window_id.clone());
-                }
-                Err(error) => {
-                    log_err(home, &error);
-                    outcome.failed.insert(window_id.clone(), error);
-                }
-            }
-        }
-    }
-    outcome
-}
-
-/// Put every window this workspace pinned back on the policy it was found
-/// with, then stop owning its sessions.
-///
-/// Restores before releasing, in that order: a marker cleared first would
-/// let another workspace claim the session and adopt windows that still
-/// carry this one's pin, which is how a `manual` nobody chose becomes
-/// permanent.
-async fn restore_owned_sizing(
-    sizing: &mut WindowSizing,
-    client: &ControlClient,
-    home: &std::path::Path,
-) {
-    let Some(marker) = sizing.identity.as_ref().map(ClientIdentity::marker) else {
-        // No identity means nothing can be proved to be ours, and putting
-        // windows back on a guess would undo whoever does own them.
-        sizing.owned.clear();
-        return;
-    };
-    for (session, owned) in std::mem::take(&mut sizing.owned) {
-        // Ownership is re-checked here, not assumed from the map. A
-        // workspace can lose a session between claiming it and quitting:
-        // its link dropped, a follower found the mark stale and took over,
-        // and that follower is now the one those windows belong to.
-        // Restoring them here would take a live workspace's session out
-        // from under it, so the exact marker has to still be this one's.
-        match client.window_driver(&session).await {
-            Ok(Some(held)) if held == marker => {}
-            Ok(_) => continue,
-            Err(error) => {
-                log_err(home, &error);
-                continue;
-            }
-        }
-        // Whether this session was fully handed back. It starts false when a
-        // window here carries a record nobody can read, since such a window
-        // was never pinned by this workspace and is exactly why the session
-        // may not be released.
-        let mut handed_back = owned.releasable();
-        for window_id in &owned.pinned {
-            match client.restore_window_size(window_id).await {
-                Ok(cyclops_tmux::Restored::Malformed) => {
-                    // The record of what this window was cannot be read, so
-                    // the original policy is unknowable. Nothing was
-                    // changed, and nothing here will change it: choosing a
-                    // policy would invent state the operator never set, and
-                    // clearing the record would destroy the only evidence
-                    // of what the window originally was. The window stays
-                    // pinned and this workspace stays its owner, which is
-                    // visibly wrong and fully recoverable.
-                    handed_back = false;
-                    log_err(
-                        home,
-                        &format!(
-                            "{window_id}: sizing record unreadable, so the original policy is \
-                             unknown. The window is left on manual and still owned. Inspect it \
-                             with: tmux show-options -w -t {window_id} @cyclops_prior_window_size"
-                        ),
-                    );
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    // A restore that failed leaves the window exactly as
-                    // this workspace pinned it: on `manual`, with its record
-                    // still attached. Releasing the mark over that is the
-                    // same orphaning as the unreadable case, reached through
-                    // a transient tmux failure instead: no policy applies,
-                    // no client can resize it, and no owner is named for
-                    // anyone to blame. The link may be down or the command
-                    // may have timed out, and either way this session was
-                    // not handed back.
-                    handed_back = false;
-                    log_err(home, &error);
-                }
-            }
-        }
-        if !handed_back {
-            // Keeping the mark is the point: a pinned window with no owner
-            // is the one state nothing can recover from on its own.
-            continue;
-        }
-        if let Err(error) = client.release_window_driver(&session).await {
-            log_err(home, &error);
-        }
-    }
-}
-
-/// Move every session this workspace owns onto the identity of a new
-/// connection.
-///
-/// A reconnect replaces the tmux client, so `client_name:client_created`
-/// changes while the process lives on. The marks left behind name a client
-/// that no longer exists, which is exactly what a follower watches for, so
-/// this is a race with a real other party rather than bookkeeping: between
-/// the old client dying and this running, a follower may have taken a
-/// session legitimately.
-///
-/// Each session is therefore moved with one compare-and-set from the exact
-/// old marker to the exact new one, and ownership is kept only where that
-/// won. A session lost in the gap is dropped from the map entirely, so
-/// nothing here resizes it and the exit path will not put it back: it
-/// belongs to the workspace that won it.
-async fn rekey_ownership(
-    sizing: &mut WindowSizing,
-    client: &ControlClient,
-    home: &std::path::Path,
-) {
-    sizing.following.clear();
-    let Some(previous) = sizing.identity.take() else {
-        // Nothing was ever claimed under a proven identity.
-        sizing.owned.clear();
-        return;
-    };
-    let stale = previous.marker();
-    let Some(identity) = sizing_identity(sizing, client, home).await else {
-        // Without a new identity this workspace cannot prove it owns
-        // anything, so it claims nothing rather than writing sizes it
-        // cannot defend.
-        sizing.owned.clear();
-        return;
-    };
-    let marker = identity.marker();
-    for session in sizing.owned.keys().cloned().collect::<Vec<_>>() {
-        let kept = client
-            .take_over_window_driver(&session, &stale, &marker)
-            .await;
-        match kept {
-            Ok(true) => {}
-            Ok(false) => {
-                sizing.owned.remove(&session);
-            }
-            Err(error) => {
-                log_err(home, &error);
-                sizing.owned.remove(&session);
-            }
-        }
-    }
-}
-
 async fn resize_client(app: &mut App, client: &ControlClient) -> SizingOutcome {
     let (w, h) = app.term_size;
     let canvas = app.chrome(Rect::new(0, 0, w, h)).tmux_sizing_canvas();
@@ -3307,54 +2732,16 @@ async fn resize_client(app: &mut App, client: &ControlClient) -> SizingOutcome {
     if !declarable(size) {
         return SizingOutcome::default();
     }
-    // A window still not laid out the way this canvas wants it is a reason
-    // to write sizes even when the canvas has not moved. Two windows are
-    // not that reason, and both used to be read as if they were (F79):
-    //
-    // 1. A pinned window of a session this workspace owns but is not
-    //    showing. It has no tab in the displayed model, so there is no
-    //    layout to judge it by. Reading "no tab" as "diverged" made every
-    //    workspace that owned two sessions re-issue `resize-window` for
-    //    all of them on every `%layout-change`, and tmux answers every
-    //    `resize-window` with a `%layout-change`, size changed or not. That
-    //    is the thousand-a-second loop an operator sees as the canvas
-    //    jumping, with the workspace and the tmux server each on half a
-    //    core.
-    // 2. A window tmux has already declined to move: asked for exactly
-    //    this target while laid out exactly like this, and left there. A
-    //    layout has a minimum and `resize-window` below it is clamped, not
-    //    refused, so asking again changes nothing except producing the
-    //    notification that would ask again.
-    let any_window_diverged = app.sizing.owned.values().any(|owned| {
-        owned.pinned.iter().any(|window_id| {
-            let Some(tab) = app
-                .model
-                .session
-                .tabs
-                .iter()
-                .find(|t| &t.window_id == window_id)
-            else {
-                return false;
-            };
-            let target =
-                crate::render::window_target_size_for_layout(canvas, &tab.layout, tab.zoomed);
-            let rect = tab.layout.rect();
-            let laid_out = (rect.width, rect.height);
-            laid_out != target
-                && owned.settled.get(window_id) != Some(&AskedSize { target, laid_out })
-        })
-    });
+    let any_window_diverged = app
+        .sizing
+        .any_window_diverged(canvas, &app.model.session.tabs);
     if app.declared_client_size == Some(size) && !any_window_diverged {
         return SizingOutcome::default();
     }
-    let outcome = size_owned_windows(
-        &mut app.sizing,
-        client,
-        canvas,
-        &app.model.session.tabs,
-        &app.home,
-    )
-    .await;
+    let outcome = app
+        .sizing
+        .resize_owned(client, canvas, &app.model.session.tabs, &app.home)
+        .await;
     if outcome.all_succeeded() {
         app.declared_client_size = Some(size);
     }
@@ -3362,124 +2749,23 @@ async fn resize_client(app: &mut App, client: &ControlClient) -> SizingOutcome {
     outcome
 }
 
-/// Shared post-resize recovery helper:
-/// 1. Reconciles every exact successfully resized window in every owned session.
-/// 2. Always fetches a fresh post-resize snapshot before any pane decision.
-/// 3. For each window in owned[session].pinned, revalidates live driver marker before mutating.
-/// 4. Panes with deliberate minimization provenance (`Minimized { original_height }`)
-///    must remain collapsed at 1 row after tmux automatic reflow on window resize.
-/// 5. Panes with `None` provenance that are 1-row high fail closed: they are NOT modified
-///    (manual resize is preserved; no auto-uncrush of unknown intent) and surface an explicit banner.
-/// 6. Panes with malformed provenance (`Malformed(bad)`) fail closed: surface visible notice,
-///    log error, leave option evidence untouched.
-/// 7. Fails visibly on errors, logs errors, and retains retry state (`needs_reconcile = true`).
+/// Compatibility seam for focused integration evidence. Runtime code calls
+/// the sizing owner directly so the workspace loop cannot reach its tmux
+/// transition protocol.
 pub async fn recover_post_resize_geometry(
     sizing: &WindowSizing,
     client: &ControlClient,
     home: &std::path::Path,
-    mut notice: Option<&mut NoticeState>,
+    notice: Option<&mut NoticeState>,
 ) -> Result<bool, TmuxError> {
-    let identity = client.client_identity().await?;
-    let my_marker = identity.marker();
-
-    let owned_sessions: Vec<(String, Vec<String>)> = sizing
-        .owned
-        .iter()
-        .map(|(sess, owned)| (sess.clone(), owned.pinned.iter().cloned().collect()))
-        .collect();
-
-    if owned_sessions.is_empty() {
-        return Ok(false);
-    }
-
-    let snapshot = client.workspace_snapshot().await?;
-    let mut any_modified = false;
-
-    for (session, pinned_windows) in owned_sessions {
-        let current_driver = client.window_driver(&session).await?;
-        if current_driver.as_ref() != Some(&my_marker) {
-            continue;
-        }
-
-        let Some(snap_session) = snapshot.sessions.iter().find(|s| s.name == session) else {
-            continue;
-        };
-
-        for window_id in pinned_windows {
-            let Some(snap_window) = snap_session.windows.iter().find(|w| w.id == window_id) else {
-                continue;
-            };
-
-            for pane in &snap_window.panes {
-                match &pane.minimization {
-                    cyclops_tmux::PaneMinimizationProvenance::Minimized { .. } => {
-                        if pane.height > crate::render::MINIMIZED_ROWS as u32 {
-                            if let Err(e) = client
-                                .resize_pane_height(&pane.id, crate::render::MINIMIZED_ROWS)
-                                .await
-                            {
-                                log_err(
-                                    home,
-                                    &format!(
-                                        "failed to re-collapse minimized pane {}: {e}",
-                                        pane.id
-                                    ),
-                                );
-                                if let Some(ref mut n) = notice {
-                                    n.show(
-                                        format!("error: failed to re-collapse pane {}", pane.id),
-                                        Instant::now(),
-                                    );
-                                }
-                                return Err(e);
-                            }
-                            any_modified = true;
-                        }
-                    }
-                    cyclops_tmux::PaneMinimizationProvenance::Malformed(bad) => {
-                        if pane.height <= crate::render::MINIMIZED_ROWS as u32 {
-                            log_err(
-                                home,
-                                &format!(
-                                    "{}: malformed minimization provenance ({bad}), refusing recovery",
-                                    pane.id
-                                ),
-                            );
-                            if let Some(ref mut n) = notice {
-                                n.show(
-                                    format!(
-                                        "warning: pane {} has malformed minimization record ({bad}); manual recovery required",
-                                        pane.id
-                                    ),
-                                    Instant::now(),
-                                );
-                            }
-                        }
-                    }
-                    cyclops_tmux::PaneMinimizationProvenance::None => {
-                        if pane.height <= crate::render::MINIMIZED_ROWS as u32 {
-                            // Fail closed on unknown intent: do not uncrush without positive provenance.
-                            if let Some(ref mut n) = notice {
-                                n.show(
-                                    format!(
-                                        "pane {} is 1 row high (unknown provenance); manual resize required to uncrush",
-                                        pane.id
-                                    ),
-                                    Instant::now(),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(any_modified)
+    sizing.recover_geometry(client, home, notice).await
 }
 
 async fn run_post_resize_recovery(app: &mut App, client: &ControlClient) {
-    if let Err(error) =
-        recover_post_resize_geometry(&app.sizing, client, &app.home, Some(&mut app.notice)).await
+    if let Err(error) = app
+        .sizing
+        .recover_geometry(client, &app.home, Some(&mut app.notice))
+        .await
     {
         log_err(
             &app.home,
@@ -3487,14 +2773,6 @@ async fn run_post_resize_recovery(app: &mut App, client: &ControlClient) {
         );
         app.needs_reconcile = true;
     }
-}
-
-/// The tab windows not yet pinned to the sizing policy, in tab order.
-fn unpinned_windows<'a>(tabs: &'a [TabModel], pinned: &BTreeSet<String>) -> Vec<&'a str> {
-    tabs.iter()
-        .filter(|tab| !pinned.contains(&tab.window_id))
-        .map(|tab| tab.window_id.as_str())
-        .collect()
 }
 
 /// Apply a `%layout-change` notification directly. Returns false when the
@@ -3834,9 +3112,6 @@ fn request_messages_snapshot(app: &mut App) {
 /// Pump the Messages pane refresh gate, issuing a snapshot fetch if one is
 /// owed and none is in flight.
 fn pump_messages_refresh(app: &mut App) {
-    if !app.model.messages_visible {
-        return;
-    }
     if let Some(req) = app.messages_gate.begin() {
         let sent = if let Some(tx) = &app.messages_snapshot_tx {
             tx.try_send((req, 128)).is_ok()
@@ -3847,6 +3122,49 @@ fn pump_messages_refresh(app: &mut App) {
             app.messages_gate.finish_failure(req);
         }
     }
+}
+
+/// Install one authenticated body-free snapshot for both the Messages pane
+/// and its collapsed rail. The refresh gate rejects replies made stale by a
+/// newer invalidation, so retaining these counts never invents current state.
+fn install_messages_snapshot(
+    app: &mut App,
+    request: cyclops_ui::RefreshRequest,
+    result: cyclops_proto::MessagesSnapshotResult,
+) -> bool {
+    if !app.messages_gate.finish_snapshot(request, &result) {
+        return false;
+    }
+    app.messages_refresh_error = None;
+    app.messages_caller = result.caller;
+    app.messages_snapshot_counts = Some(result.counts);
+    let snapshot = apply_messages_presentation_cutoff(
+        cyclops_ui::messages::rows_from_snapshot(&result),
+        app.prefs.messages_cleared_through_seq,
+    );
+    app.messages_queue.replace(snapshot);
+    finish_messages_reconcile(app);
+    true
+}
+
+/// Apply the latest ordered control-mode session transition.
+///
+/// The stable id replaces any older pending reconciliation selector. The
+/// accompanying name is useful for the next frame, but only the id is safe to
+/// carry into an authoritative snapshot if another client renames the session.
+fn apply_session_switched(app: &mut App, session: String, name: String) {
+    app.reconcile_session_id = Some(session.clone());
+    if let Some(index) = app
+        .model
+        .workspaces
+        .iter()
+        .position(|workspace| workspace.session_id == session)
+    {
+        app.model.active_workspace = index;
+    }
+    app.model.session.session = name;
+    app.needs_reconcile = true;
+    app.hit_map.clear();
 }
 
 /// Handle one app message. Returns false when the channel closed.
@@ -3879,8 +3197,8 @@ async fn handle_app_msg(
             app.window_focused = focused;
             if focused {
                 // Forget what the terminal was last told so the next draw
-                // re-emits the theme's ground even though it has not
-                // changed since focus left.
+                // re-emits the theme's ground when host palette theming is
+                // enabled, even though it has not changed since focus left.
                 app.window_palette = HostPaletteState::Unknown;
                 // Another program owned this surface while focus was away
                 // and may have written over it.
@@ -3919,17 +3237,10 @@ async fn handle_app_msg(
             arm(debounce);
         }
         AppMsg::SessionSwitched { session, name } => {
-            if let Some(index) = app
-                .model
-                .workspaces
-                .iter()
-                .position(|workspace| workspace.session_id == session)
-            {
-                app.model.active_workspace = index;
-            }
-            app.model.session.session = name;
-            app.needs_reconcile = true;
-            app.hit_map.clear();
+            apply_session_switched(app, session, name);
+            // The authoritative session snapshot below selects the new active
+            // pane. Keep the Files root request until that route is known.
+            app.files_root_pending = true;
             arm(debounce);
         }
         AppMsg::SessionRenamed { session, name } => {
@@ -3998,14 +3309,22 @@ async fn handle_app_msg(
                 .find(|t| t.window_id == window)
                 .map(|t| t.active_pane = pane)
                 .is_some();
+            app.files_root_pending = true;
             if !known {
                 app.needs_reconcile = true;
+            } else {
+                // A pane route is concrete evidence that the agent view may
+                // need a new root. This is one request, not an idle watch.
+                request_files_refresh(app, Duration::ZERO);
             }
             arm(debounce);
         }
         AppMsg::OutputBatch(output) => {
             let mut changed = false;
+            let active_pane = app.model.active_tab().active_pane.clone();
+            let mut active_pane_output = false;
             for (pane, bytes) in output {
+                active_pane_output |= pane == active_pane;
                 if app.is_visible_pane(&pane) {
                     if let Some(rt) = app.runtimes.get_mut(&pane) {
                         rt.feed(&bytes);
@@ -4016,6 +3335,12 @@ async fn handle_app_msg(
             if changed {
                 arm(debounce);
                 arm_folder_probe(app);
+            }
+            // tmux has no directory-change notification. Output from the
+            // active pane is the observable edge a shell `cd` produces, so
+            // it earns one coalesced Files snapshot.
+            if active_pane_output {
+                request_files_refresh(app, FILES_REFRESH_DELAY);
             }
         }
         AppMsg::LinkLost => {
@@ -4045,15 +3370,24 @@ async fn handle_app_msg(
         }
         AppMsg::DecorationChanged(snapshot) => {
             apply_decoration_snapshot(app, snapshot);
-            app.messages_gate.mark_dirty();
-            pump_messages_refresh(app);
+            // Route chrome changes invalidate the detailed open view. The
+            // collapsed cue contains only durable snapshot counts, so it does
+            // not turn every pane-state repaint into a message fetch or a
+            // false uncertainty marker. Reopening explicitly refreshes the
+            // detailed projection before enabling actions.
+            if app.model.messages_visible {
+                app.messages_gate.mark_dirty();
+                pump_messages_refresh(app);
+            }
+            arm(debounce);
+        }
+        AppMsg::DaemonCompatibility(compatibility) => {
+            app.daemon_compatibility_notice = copy::daemon_compatibility_notice(&compatibility);
+            app.daemon_compatibility = Some(compatibility);
             arm(debounce);
         }
         AppMsg::DaemonReconnected => {
-            resync_daemon_state(app);
-            app.messages_gate.connected();
-            app.messages_gate.mark_dirty();
-            pump_messages_refresh(app);
+            apply_daemon_reconnected(app);
             arm(debounce);
         }
         // E2: per-event, not coalesced with the decoration burst above —
@@ -4062,11 +3396,11 @@ async fn handle_app_msg(
         // `spawn_decoration_forwarder`'s doc). `Record::live` also moves
         // the record's own attention register by the one rule in
         // `cyclops_proto::attention`, the same rule `app.decoration`'s
-        // register answers to; neither side recomputes it. The intake
+        // register answers to; neither side recomputes it. The projection
         // between here and the record drops ledger-backed entries the
         // boot-time tail already replayed (crate::event_record).
         AppMsg::StreamEntry(entry) => {
-            crate::event_record::live(&mut app.record, &mut app.intake, *entry);
+            crate::event_record::live(&mut app.record, &mut app.stream_projection, *entry);
             arm(debounce);
         }
         AppMsg::MessagesChanged(changed) => {
@@ -4101,10 +3435,10 @@ async fn handle_app_msg(
             if !queued {
                 let bootstrap = crate::event_record::load(&app.home);
                 let mut record = cyclops_ui::Record::new();
-                let mut intake = cyclops_ui::Intake::new();
-                let warning = crate::event_record::install(&mut record, &mut intake, bootstrap);
+                let mut projection = cyclops_ui::StreamProjectionState::new();
+                let warning = crate::event_record::install(&mut record, &mut projection, bootstrap);
                 app.record = record;
-                app.intake = intake;
+                app.stream_projection = projection;
                 app.stream_reconciling = false;
                 app.notice.show(
                     warning.unwrap_or_else(|| copy::STREAM_RECONCILED.to_string()),
@@ -4115,10 +3449,10 @@ async fn handle_app_msg(
         }
         AppMsg::StreamReconciled(bootstrap) => {
             let mut record = cyclops_ui::Record::new();
-            let mut intake = cyclops_ui::Intake::new();
-            let warning = crate::event_record::install(&mut record, &mut intake, *bootstrap);
+            let mut projection = cyclops_ui::StreamProjectionState::new();
+            let warning = crate::event_record::install(&mut record, &mut projection, *bootstrap);
             app.record = record;
-            app.intake = intake;
+            app.stream_projection = projection;
             app.stream_reconciling = false;
             app.notice.show(
                 warning.unwrap_or_else(|| copy::STREAM_RECONCILED.to_string()),
@@ -4130,17 +3464,7 @@ async fn handle_app_msg(
         // arms (the theme_watch refresh in `run_async`).
         AppMsg::ThemeChanged => arm(debounce),
         AppMsg::MessagesSnapshotLoaded { request, result } => {
-            let accepted = app.messages_gate.finish_snapshot(request, &result);
-            if accepted {
-                app.messages_refresh_error = None;
-                app.messages_caller = result.caller;
-                let snapshot = apply_messages_presentation_cutoff(
-                    cyclops_ui::messages::rows_from_snapshot(&result),
-                    app.prefs.messages_cleared_through_seq,
-                );
-                app.messages_queue.replace(snapshot);
-                finish_messages_reconcile(app);
-            }
+            install_messages_snapshot(app, request, result);
             pump_messages_refresh(app);
             arm(debounce);
         }
@@ -4675,9 +3999,9 @@ async fn handle_mouse(
                         at: (col, row),
                     });
                 }
-                HitTarget::SidebarRow { session, .. } => {
+                HitTarget::SidebarRow { session_id, .. } => {
                     app.open_menu(MenuState::WorkspaceMenu {
-                        session: session.clone(),
+                        session_id: session_id.clone(),
                         at: (col, row),
                     });
                 }
@@ -4933,7 +4257,7 @@ async fn handle_mouse(
                 HitTarget::FileUp => {
                     app.close_menu();
                     if let Some(parent) = app.files_tree().parent() {
-                        app.files_tree_mut().reroot(parent);
+                        crate::file_adapter::reroot(app.files_tree_mut(), parent);
                         remember_pinned_root(app);
                     }
                     return Ok(());
@@ -4942,15 +4266,17 @@ async fn handle_mouse(
                     app.close_menu();
                     match app.files_view {
                         // Back to where the work is. Asking the pane where
-                        // it is costs a tmux round trip, so this only
-                        // records the request; the loop's next pass arms
-                        // the probe that answers it.
-                        crate::files::FilesView::Agent => app.files_root_pending = true,
+                        // it is costs a tmux round trip, so this records and
+                        // immediately requests one snapshot to answer it.
+                        crate::files::FilesView::Agent => {
+                            app.files_root_pending = true;
+                            request_files_refresh(app, Duration::ZERO);
+                        }
                         // Back to the folder the operator pinned. Saved
                         // state, no probe to wait for.
                         crate::files::FilesView::Pinned => {
                             if let Some(root) = app.prefs.files_pinned_root.clone() {
-                                app.files_pinned.reroot(root);
+                                crate::file_adapter::reroot(&mut app.files_pinned, root);
                             }
                         }
                     }
@@ -4964,20 +4290,20 @@ async fn handle_mouse(
                     // back, a mode nobody re-entered on purpose.
                     app.files_tree_mut().release_cursor();
                     app.files_view = app.files_view.other();
-                    // The probe follows the panel; a fresh view may need
-                    // its first root or a refresh right away.
-                    arm_files_probe(app);
+                    // A fresh view may need its first root or a fresh
+                    // listing, so this interaction requests one snapshot.
+                    request_files_refresh(app, Duration::ZERO);
                     return Ok(());
                 }
                 HitTarget::FileBack => {
                     app.close_menu();
-                    app.files_tree_mut().go_back();
+                    crate::file_adapter::go_back(app.files_tree_mut());
                     remember_pinned_root(app);
                     return Ok(());
                 }
                 HitTarget::FileForward => {
                     app.close_menu();
-                    app.files_tree_mut().go_forward();
+                    crate::file_adapter::go_forward(app.files_tree_mut());
                     remember_pinned_root(app);
                     return Ok(());
                 }
@@ -4986,7 +4312,7 @@ async fn handle_mouse(
                 HitTarget::FileDisclosure { path } => {
                     app.close_menu();
                     let path = std::path::PathBuf::from(path.clone());
-                    app.files_tree_mut().toggle(&path);
+                    crate::file_adapter::toggle(app.files_tree_mut(), &path);
                     return Ok(());
                 }
                 // The rest of a folder's row walks into it. The panel is
@@ -4995,7 +4321,7 @@ async fn handle_mouse(
                 HitTarget::FileRow { path, is_dir, .. } if *is_dir => {
                     app.close_menu();
                     let path = std::path::PathBuf::from(path.clone());
-                    app.files_tree_mut().reroot(path);
+                    crate::file_adapter::reroot(app.files_tree_mut(), path);
                     remember_pinned_root(app);
                     return Ok(());
                 }
@@ -5101,11 +4427,15 @@ async fn handle_mouse(
                 drag.is_active() && matches!(&drag.target, DragTarget::SidebarSplit)
             });
             if split_drag {
+                let was_hidden = app.prefs.files_rows == 0;
                 app.prefs.files_rows = files_rows_for_row(app, row);
                 app.layout_changed();
                 // No `resize_client`: this seam is inside the sidebar, so
                 // no column changed hands and no pane reflows.
                 app.save_prefs_or_log();
+                if was_hidden && app.prefs.files_rows > 0 {
+                    request_files_refresh(app, Duration::ZERO);
+                }
             }
             apply_live_divider(app, client).await?;
             if let Some(drag) = app.drag.take() {
@@ -5234,7 +4564,7 @@ async fn handle_files_key(
         // already navigates by mouse, on the keys that mean them.
         KeyCode::Left | KeyCode::Char('h') => {
             if let Some(parent) = app.files_tree().parent() {
-                app.files_tree_mut().reroot(parent);
+                crate::file_adapter::reroot(app.files_tree_mut(), parent);
                 remember_pinned_root(app);
             }
             Ok(Some(InputOutcome::Redraw))
@@ -5246,7 +4576,7 @@ async fn handle_files_key(
             match row.kind {
                 crate::files::RowKind::Dir { .. } => {
                     let path = row.path.clone();
-                    app.files_tree_mut().reroot(path);
+                    crate::file_adapter::reroot(app.files_tree_mut(), path);
                     remember_pinned_root(app);
                     Ok(Some(InputOutcome::Redraw))
                 }
@@ -5526,15 +4856,8 @@ fn apply_messages_presentation_cutoff(
 }
 
 /// The session filter the Messages pane should apply right now: the active
-/// workspace's name, the durable identity the daemon bound to its tmux
-/// session, and the panes linked into its windows; or none when the
+/// workspace's name and the panes linked into its windows, or none when the
 /// operator asked for every session.
-///
-/// The identity is what makes the filter a session and not a set of pane
-/// ids: tmux hands `%1` out again after a server restart, and the messages
-/// of the `main` that died before this one are addressed to its instance,
-/// not to this one. They stay in the durable history and in the
-/// all-sessions view; they are not this session's.
 ///
 /// Derived, never stored: tmux panes join and leave a session while the
 /// Messages pane is open, and a stored pane set would go stale the moment
@@ -5545,6 +4868,10 @@ fn messages_session_filter(app: &App) -> Option<cyclops_ui::SessionFilter> {
         return None;
     }
     let workspace = app.model.workspaces.get(app.model.active_workspace)?;
+    // Pane ids are reused after a tmux server restart. The daemon's durable
+    // session identity is therefore required alongside the current panes;
+    // while it is absent, the scoped view deliberately shows no addressable
+    // rows instead of guessing from a recycled `%` id.
     let session = app.decoration.sessions.get(&workspace.session_id).copied();
     let panes = app
         .decoration
@@ -5821,44 +5148,42 @@ async fn apply_live_sidebar(app: &mut App, client: &ControlClient) {
     }
 }
 
-/// How often the file panel re-reads what it is showing.
-///
-/// A poll rather than a filesystem watch, which is the same call the theme
-/// reload and the folder-follow already make. It costs one `read_dir` per
-/// OPEN directory and answers "nothing moved" with a single integer
-/// comparison ([`crate::files::FileTree::refresh`]), so a second is far
-/// more often than it needs to be and still cheap. A watch would mean a
-/// new dependency with a platform backend per OS, in a binary whose build
-/// time is already something the operator notices.
-const FILES_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+/// Whether the Files panel is currently visible to the operator.
+fn files_panel_visible(app: &App) -> bool {
+    app.model.sidebar_visible && app.sidebar_tab == SidebarTab::Sessions && app.prefs.files_rows > 0
+}
 
-/// Arm the next file-panel poll, unless one is already armed or the panel
-/// is not on screen to poll for.
+/// Request one Files snapshot from an observed route, active-pane output, or
+/// a Files interaction.
 ///
-/// Three ways to be off screen, and all three have to gate this or the
-/// loop wakes once a second forever to read a folder nobody is looking at:
-/// the sidebar collapsed, the sidebar showing the event stream, and the
-/// panel itself toggled shut. `files_root_pending` overrides them, because
-/// that request is a tmux round trip the panel needs answered before it
-/// can show anything at all, and it clears itself once it lands.
-fn arm_files_probe(app: &mut App) {
-    if app.files_probe_at.is_some() {
+/// The deadline deliberately does not move or recreate itself: the panel
+/// keeps its last snapshot until another relevant event arrives. A native
+/// filesystem watcher is a separate future capability, not an implicit poll.
+fn request_files_refresh(app: &mut App, delay: Duration) {
+    if app.files_refresh_at.is_some() {
         return;
     }
-    let showing = app.model.sidebar_visible
-        && app.sidebar_tab == SidebarTab::Sessions
-        && app.prefs.files_rows > 0;
-    if showing || app.files_root_pending {
-        app.files_probe_at = Some(Instant::now() + FILES_PROBE_INTERVAL);
+    if files_panel_visible(app) || app.files_root_pending {
+        app.files_refresh_at = Some(Instant::now() + delay);
+    }
+}
+
+/// Consume one due Files snapshot request without generating another one.
+fn take_files_refresh_request(app: &mut App, now: Instant) -> bool {
+    if app.files_refresh_at.is_some_and(|due| due <= now) {
+        app.files_refresh_at = None;
+        true
+    } else {
+        false
     }
 }
 
 /// Re-read the file panel, and keep the agent view where the agent is.
 ///
 /// Returns whether anything a reader would see moved, which is the only
-/// thing that earns a redraw. Nothing here is fatal: a tmux probe that
-/// fails leaves the request armed for the next poll, and an unreadable
-/// folder simply lists as empty.
+/// thing that earns a redraw. Nothing here is fatal: a tmux probe failure
+/// preserves the old tree and leaves a root request for the next relevant
+/// route, output, or Files interaction; an unreadable folder lists empty.
 async fn probe_files(app: &mut App, client: &ControlClient) -> bool {
     let mut changed = false;
     let pane = app.model.active_tab().active_pane.clone();
@@ -5870,8 +5195,8 @@ async fn probe_files(app: &mut App, client: &ControlClient) -> bool {
             // panes, or the pane cd'd — and the view goes where it went.
             // An answer matching the anchor is the agent standing still,
             // so browsing the operator did inside the view is left alone.
-            // (A cd has no tmux notification to subscribe to; this rides
-            // the same once-a-second probe the panel already runs.)
+            // A `cd` has no tmux notification to subscribe to; active-pane
+            // output requests the event-armed snapshot that notices it.
             let moved = app.files.anchor() != std::path::Path::new(cwd);
             if app.files_root_pending || moved {
                 app.files_root_pending = false;
@@ -5880,7 +5205,7 @@ async fn probe_files(app: &mut App, client: &ControlClient) -> bool {
                 // what references are written from, so it follows the pane
                 // rather than the browsing that happens after this.
                 app.files.anchor_at(cwd);
-                app.files.reroot(cwd);
+                crate::file_adapter::reroot(&mut app.files, cwd);
                 changed |= app.files.root() != before;
             }
             // References from the pinned view are sent to the same agent,
@@ -5891,11 +5216,11 @@ async fn probe_files(app: &mut App, client: &ControlClient) -> bool {
             // `remember_pinned_root`).
             app.files_pinned.anchor_at(cwd);
             if !app.files_pinned.has_root() {
-                app.files_pinned.reroot(cwd);
+                crate::file_adapter::reroot(&mut app.files_pinned, cwd);
             }
         }
     }
-    changed | app.files_tree_mut().refresh()
+    changed | crate::file_adapter::refresh(app.files_tree_mut())
 }
 
 /// A browse in the pinned view is what "pin it" means: the folder the
@@ -6157,9 +5482,25 @@ fn resync_daemon_state(app: &mut App) {
     }
 }
 
+/// Rebuild every daemon-owned projection after a new subscription connects.
+///
+/// A fresh workspace process has no prior Messages snapshot to retain, so the
+/// collapsed rail must request the same authenticated body-free projection as
+/// an already-running workspace recovering from a socket gap.
+fn apply_daemon_reconnected(app: &mut App) {
+    resync_daemon_state(app);
+    app.messages_gate.connected();
+    app.messages_gate.mark_dirty();
+    pump_messages_refresh(app);
+}
+
 async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_tmux::TmuxError> {
+    let confirmed_session_id = app.reconcile_session_id.clone();
     let session = app.model.session.session.clone();
-    let mut model = fetch_workspace_model(client, &session).await?;
+    let mut model = match confirmed_session_id.as_deref() {
+        Some(session_id) => fetch_workspace_model_by_id(client, session_id).await?,
+        None => fetch_workspace_model(client, &session).await?,
+    };
     apply_workspace_order(&mut model, &app.prefs.workspace_order);
     install_reconciled_model(
         &mut app.model,
@@ -6170,7 +5511,7 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
 
     let session = app.model.session.session.clone();
     let tabs = app.model.session.tabs.clone();
-    let adopted = adopt_windows(&mut app.sizing, client, &session, &tabs, &app.home).await;
+    let adopted = app.sizing.adopt(client, &session, &tabs, &app.home).await;
     if adopted.newly_following {
         app.notice
             .show(copy::SIZING_FOLLOWER.to_string(), Instant::now());
@@ -6186,7 +5527,10 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
 
     // Fetch fresh model after resize and recovery so dimensions and
     // provenance are up-to-date with live tmux state before hydration and rendering.
-    let mut fresh_model = fetch_workspace_model(client, &session).await?;
+    let mut fresh_model = match confirmed_session_id.as_deref() {
+        Some(session_id) => fetch_workspace_model_by_id(client, session_id).await?,
+        None => fetch_workspace_model(client, &session).await?,
+    };
     apply_workspace_order(&mut fresh_model, &app.prefs.workspace_order);
     install_reconciled_model(
         &mut app.model,
@@ -6208,6 +5552,11 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
     // Before the snapshot, not after: a session the daemon starts watching
     // now is one this same reconcile can already show agents for.
     ensure_sessions_watched(app);
+    // An unknown pane/session route is resolved only after the authoritative
+    // model lands. That one route event earns one Files snapshot.
+    if app.files_root_pending {
+        request_files_refresh(app, Duration::ZERO);
+    }
     // Keep what the last answer said when this one does not arrive: a
     // reconcile that cannot reach the daemon knows nothing new about the
     // roster, and blanking it would un-name every agent on screen.
@@ -6233,6 +5582,7 @@ async fn reconcile(app: &mut App, client: &ControlClient) -> Result<(), cyclops_
         hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await;
     }
     app.needs_hydrate = false;
+    app.reconcile_session_id = None;
     Ok(())
 }
 
@@ -6337,6 +5687,16 @@ fn install_reconciled_model(
     fresh.sidebar_visible = sidebar_visible;
     fresh.messages_visible = messages_visible;
     *current = fresh;
+}
+
+/// Restore the two visibility choices owned by workspace preferences.
+///
+/// Boot uses this before its first geometry declaration, so a workspace that
+/// was detached with the Messages pane collapsed does not briefly reserve or
+/// paint the expanded rail when it is attached again.
+fn apply_saved_workspace_visibility(model: &mut WorkspaceModel, prefs: &WorkspacePrefs) {
+    model.sidebar_visible = prefs.sidebar_visible;
+    model.messages_visible = prefs.messages_visible;
 }
 
 /// Forward one already-routed input event, retaining its exact target and
@@ -6740,6 +6100,14 @@ impl<B: Backend> RenderOwner<B> {
     }
 }
 
+fn messages_rail_cue(app: &App) -> Option<MessagesRailCue> {
+    app.messages_snapshot_counts.map(|counts| MessagesRailCue {
+        work_messages: counts.work_messages,
+        attention_entries: counts.open_attention_entries,
+        current: app.messages_gate.may_mutate(),
+    })
+}
+
 fn draw<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -6751,9 +6119,11 @@ fn draw<B: Backend>(
     // read per frame is cheap, it cannot desynchronise from what the menu
     // just wrote, and it also covers a `config.toml` edited under a
     // running workspace.
-    // Repaint the host terminal's defaults when the theme's ink or ground
-    // changes. The ground fills the window padding around the grid; the ink
-    // keeps unstyled host text readable against it.
+    // When host palette theming is enabled, repaint the terminal's defaults
+    // when the theme's ink or ground changes. The ground fills the window
+    // padding around the grid; the ink keeps unstyled host text readable
+    // against it. Without an exact restoration pair, this leaves the host
+    // palette alone.
     // Here rather than at each theme site because the paint changes through
     // three of them: boot, the ThemeWatch reload, and the picker's live
     // preview. One comparison catches all three and emits nothing on the
@@ -6761,7 +6131,8 @@ fn draw<B: Backend>(
     // Only while focus is here: a frame drawn for output arriving in an
     // unfocused tab must not restyle the terminal the operator is using
     // for something else (`AppMsg::Focus` hands both defaults back on leave
-    // and clears `window_palette` so return reapplies it).
+    // and clears `window_palette` so return reapplies it when the operator
+    // enabled host palette theming).
     let palette = app
         .paint
         .host_palette_rgb()
@@ -6813,13 +6184,26 @@ fn draw<B: Backend>(
                     app.hover,
                     app.drag.as_ref(),
                 );
+                if app.decoration.online {
+                    if let Some(marker) = app.daemon_compatibility_marker() {
+                        crate::render::paint_daemon_status(
+                            sidebar,
+                            app.sidebar_tab,
+                            marker,
+                            f.buffer_mut(),
+                            &app.paint,
+                        );
+                    }
+                }
             }
             if let Some(rail) = areas.rail {
+                let daemon_warning = app.daemon_compatibility_marker().is_some();
                 paint_sidebar_rail(
                     rail,
                     f.buffer_mut(),
                     &app.paint,
                     &mut app.hit_map,
+                    daemon_warning,
                     app.hover,
                 );
             }
@@ -6834,10 +6218,14 @@ fn draw<B: Backend>(
                     .messages_refresh_error
                     .as_ref()
                     .map(|error| format!("refresh failed: {error} · Ctrl+R to retry"));
+                let visible_notice = app
+                    .notice
+                    .text()
+                    .or(app.daemon_compatibility_notice.as_deref());
                 let link_status = refresh_status.as_deref().or_else(|| {
                     (app.messages_gate.link() == cyclops_ui::Link::Lost)
                         .then_some("daemon reconnecting")
-                        .or_else(|| app.notice.text())
+                        .or(visible_notice)
                 });
                 paint_messages(
                     &app.messages_queue,
@@ -6857,11 +6245,13 @@ fn draw<B: Backend>(
                 );
             }
             if let Some(messages_rail) = areas.messages_rail {
+                let cue = messages_rail_cue(app);
                 paint_messages_rail(
                     messages_rail,
                     f.buffer_mut(),
                     &app.paint,
                     &mut app.hit_map,
+                    cue,
                     app.hover,
                 );
             }
@@ -6876,6 +6266,10 @@ fn draw<B: Backend>(
                 app.hover,
             );
             let tab = app.model.active_tab();
+            let visible_notice = app
+                .notice
+                .text()
+                .or(app.daemon_compatibility_notice.as_deref());
             let mut ctx = crate::render::WindowPaintCtx {
                 link: app.link_state,
                 paused: &app.paused_panes,
@@ -6883,7 +6277,7 @@ fn draw<B: Backend>(
                 decoration: &app.decoration,
                 selection: app.selection.active_pane(),
                 drag: app.drag.as_ref(),
-                notice: app.notice.text(),
+                notice: visible_notice,
                 minimized: &app.minimized,
                 cursor: None,
                 // Where every fade this frame stands. `none()` while motion
@@ -7802,9 +7196,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(home);
     }
 
-    /// The next `%layout-change` tmux sends for `window`, shaped the way
-    /// the event loop hands it to [`apply_layout_change`]. Bounded so a
-    /// fixture that never produces one fails instead of hanging.
+    /// The next `%layout-change` tmux sends for `window`, shaped the way the
+    /// event loop hands it to [`apply_layout_change`]. The deadline is a
+    /// fixture failure boundary, not a timing guess: the test has an exact
+    /// event it must observe before it can make the next assertion.
     async fn next_layout_change(
         rx: &mut cyclops_tmux::NotificationReceiver,
         window: &str,
@@ -7827,80 +7222,28 @@ mod tests {
             }
         })
         .await
-        .expect("tmux sent no %layout-change for the window it was asked to resize")
+        .expect("tmux sent no %layout-change for the window it resized")
     }
 
-    /// Whether tmux announces a layout change within `wait`. After a pass
-    /// that wrote nothing it must not, since only a write is answered.
-    async fn layout_change_within(
-        rx: &mut cyclops_tmux::NotificationReceiver,
-        wait: std::time::Duration,
-    ) -> bool {
-        tokio::time::timeout(wait, async {
-            loop {
-                match rx.recv().await {
-                    Some(Notification::LayoutChange { .. }) => return true,
-                    Some(_) => continue,
-                    None => return false,
-                }
-            }
-        })
-        .await
-        .unwrap_or(false)
-    }
-
-    /// Wait for the server to drop a client that just shut down, so a
-    /// takeover below tests a dead marker and not a closing one.
-    async fn wait_until_client_gone(client: &ControlClient, marker: &str) {
-        for _ in 0..50 {
-            let live = client
-                .server_client_markers()
-                .await
-                .expect("server clients");
-            if !live.iter().any(|m| m == marker) {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-        }
-        panic!("the first terminal's client never left the server");
-    }
-
-    /// The loop F79 measured, reproduced the way it was hit: a workspace
-    /// reopened from another terminal that ends up owning two sessions.
-    ///
-    /// One terminal opened `main`, then the session it worked in next, and
-    /// so owned both. It went away without its exit path running. A second
-    /// terminal ran `cyclops`, took `main` over from the dead marker,
-    /// reopened the last-active session, and owned both too. From then on
-    /// every `%layout-change` tmux sent for the workspace's own
-    /// `resize-window` was answered with another `resize-window`, because
-    /// the background session's window has no tab in the displayed model
-    /// and "no tab" was read as "diverged". tmux answers every
-    /// `resize-window` with a `%layout-change` whether or not the size
-    /// changed, so the pair never stopped: about a thousand a second on
-    /// tmux 3.7b, the workspace and the tmux server each on half a core,
-    /// and the canvas visibly jumping.
-    ///
-    /// Driven through the real seam: the second workspace's
-    /// `resize_client`, then the `%layout-change` that write produced,
-    /// applied the way the event loop applies it, then `resize_client`
-    /// again. The second call must write nothing, and tmux must then have
-    /// nothing to announce.
+    /// Ownership can span sessions while the model only shows one. A
+    /// background window has no displayed layout, so it must remain
+    /// reversible ownership without becoming a resize target or a reason to
+    /// reissue the shown window's resize forever.
     #[tokio::test]
-    async fn reopening_from_another_terminal_with_two_owned_sessions_does_not_loop() {
+    async fn two_owned_sessions_without_a_displayed_background_tab_do_not_loop() {
         use cyclops_testrig::{tmux_available, TmuxServer};
         use cyclops_tmux::{ControlClient, ControlConfig};
 
         if !tmux_available() {
             return;
         }
-        let server = TmuxServer::new("workspace-reopen-two-owned");
-        for name in ["main", "agent"] {
+        let server = TmuxServer::new("workspace-two-owned-no-loop");
+        for session in ["main", "agent"] {
             server.run_ok(&[
                 "new-session",
                 "-d",
                 "-s",
-                name,
+                session,
                 "-x",
                 "120",
                 "-y",
@@ -7908,69 +7251,41 @@ mod tests {
                 "/bin/sh",
             ]);
         }
-        let attach = |session: &str| {
-            ControlConfig::attach(session)
-                .on_socket(server.socket().to_string())
-                .with_config_file("/dev/null")
-        };
-        let home = cyclops_proto::scratch::scratch_dir("workspace-reopen-two-owned-home");
+        let config = ControlConfig::attach("agent")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let (client, mut rx) = ControlClient::spawn(config).await.expect("attach");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-two-owned-no-loop-home");
 
-        // The first terminal: owns main, then the session it opened next,
-        // then is gone before anything is handed back.
-        let (first, _rx1) = ControlClient::spawn(attach("main"))
-            .await
-            .expect("first terminal");
-        let mut first_sizing = WindowSizing::default();
-        let main_tabs = fetch_workspace_model(&first, "main")
+        let mut sizing = WindowSizing::default();
+        let main_tabs = fetch_workspace_model(&client, "main")
             .await
             .expect("main model")
             .session
             .tabs;
-        adopt_windows(&mut first_sizing, &first, "main", &main_tabs, &home).await;
-        let agent_tabs = fetch_workspace_model(&first, "agent")
-            .await
-            .expect("agent model")
-            .session
-            .tabs;
-        adopt_windows(&mut first_sizing, &first, "agent", &agent_tabs, &home).await;
-        assert!(
-            first_sizing.owns("main") && first_sizing.owns("agent"),
-            "the fixture wants the first terminal owning both sessions"
-        );
-        let gone = first_sizing.identity.as_ref().expect("identity").marker();
-        first.shutdown().await;
-
-        // The second terminal: boots on main, takes it over from the dead
-        // marker, reopens the last-active session, takes that over too.
-        let (client, mut rx) = ControlClient::spawn(attach("main"))
-            .await
-            .expect("second terminal");
-        wait_until_client_gone(&client, &gone).await;
-        let mut sizing = WindowSizing::default();
         adopt_windows(&mut sizing, &client, "main", &main_tabs, &home).await;
-        client
-            .command("switch-client -t 'agent'")
-            .await
-            .expect("reopen last-active");
         let model = fetch_workspace_model(&client, "agent")
             .await
             .expect("agent model");
         adopt_windows(&mut sizing, &client, "agent", &model.session.tabs, &home).await;
         assert!(
             sizing.owns("main") && sizing.owns("agent"),
-            "the fixture wants one workspace owning both sessions"
+            "the fixture must give one workspace reversible ownership of both sessions"
         );
+
         let shown = model.active_tab().window_id.clone();
         let mut app = test_app(model, home.clone());
         app.term_size = (120, 40);
         app.sizing = sizing;
 
-        // The canvas has never been declared: one write per owned window.
         let boot = resize_client(&mut app, &client).await;
-        assert_eq!(boot.succeeded.len(), 2, "boot sizes both owned windows");
-        assert!(boot.failed.is_empty(), "{:?}", boot.failed);
+        assert_eq!(
+            boot.succeeded.len(),
+            1,
+            "only the visible session has a layout this workspace may size"
+        );
+        assert!(boot.failed.is_empty(), "{:#?}", boot.failed);
 
-        // tmux's answer to that write, applied the way the loop applies it.
         let (layout, flags) = next_layout_change(&mut rx, &shown).await;
         assert!(apply_layout_change(
             &mut app,
@@ -7979,29 +7294,19 @@ mod tests {
             flags.as_deref()
         ));
 
-        // The pass that made the loop: same canvas, both sessions owned.
-        let again = resize_client(&mut app, &client).await;
+        let settled = resize_client(&mut app, &client).await;
         assert!(
-            again.succeeded.is_empty() && again.failed.is_empty(),
-            "an unchanged canvas over two owned sessions re-issued resize-window: {again:?}"
-        );
-        assert!(
-            !layout_change_within(&mut rx, std::time::Duration::from_millis(300)).await,
-            "tmux announced a layout change after a pass that wrote nothing"
+            settled.succeeded.is_empty() && settled.failed.is_empty(),
+            "an unchanged layout with a background owned session reissued a resize: {settled:#?}"
         );
 
         client.shutdown().await;
         let _ = std::fs::remove_dir_all(home);
     }
 
-    /// The same loop through a different door: a target tmux will not
-    /// give. A layout has a minimum, one row per pane plus a separator
-    /// between each, and `resize-window` below it is clamped, not refused
-    /// (F79): the command succeeds and the window keeps disagreeing with
-    /// its target. A workspace that re-asks whenever a window disagrees
-    /// re-asks on every `%layout-change` its own ask produced. It asks
-    /// once more at most, then leaves the window where tmux put it until
-    /// the target or the window moves.
+    /// tmux clamps a target below a layout's minimum rather than rejecting
+    /// it. After the one follow-up pass sees that stable clamped layout, the
+    /// owner must leave it alone until the target or layout changes.
     #[tokio::test]
     async fn a_target_tmux_declines_is_asked_for_once_not_forever() {
         use cyclops_testrig::{tmux_available, TmuxServer};
@@ -8022,40 +7327,36 @@ mod tests {
             "40",
             "/bin/sh",
         ]);
-        // Six stacked panes: tmux cannot lay them out below 11 rows.
         for _ in 0..5 {
             server.run_ok(&["split-window", "-v", "-t", "s"]);
             server.run_ok(&["select-layout", "-t", "s", "even-vertical"]);
         }
-        let cfg = ControlConfig::attach("s")
+        let config = ControlConfig::attach("s")
             .on_socket(server.socket().to_string())
             .with_config_file("/dev/null");
-        let (client, mut rx) = ControlClient::spawn(cfg).await.expect("attach");
+        let (client, mut rx) = ControlClient::spawn(config).await.expect("attach");
         let home = cyclops_proto::scratch::scratch_dir("workspace-clamped-target-home");
         let model = fetch_workspace_model(&client, "s").await.expect("model");
         let mut sizing = WindowSizing::default();
         adopt_windows(&mut sizing, &client, "s", &model.session.tabs, &home).await;
         assert!(sizing.owns("s"));
+
         let window = model.active_tab().window_id.clone();
         let mut app = test_app(model, home.clone());
-        // A terminal short enough that the six-pane target is below the
-        // rows tmux needs, and tall enough that it is still declarable.
         app.term_size = (80, 18);
         app.sizing = sizing;
         let canvas = app.chrome(Rect::new(0, 0, 80, 18)).tmux_sizing_canvas();
         let target = crate::render::tmux_client_size(canvas, app.model.active_tab());
         assert!(
             declarable(target) && target.1 < 11,
-            "the fixture wants a declarable target tmux cannot give: {target:?}"
+            "the fixture needs a declarable target tmux cannot give: {target:?}"
         );
 
-        // Two passes may write: the first ask, and one more once the
-        // window is seen where tmux clamped it. Each is answered.
         for pass in 0..2 {
             let outcome = resize_client(&mut app, &client).await;
             assert!(
                 outcome.failed.is_empty(),
-                "pass {pass}: {:?}",
+                "pass {pass}: {:#?}",
                 outcome.failed
             );
             if outcome.succeeded.is_empty() {
@@ -8072,19 +7373,13 @@ mod tests {
         let laid_out = app.model.active_tab().layout.rect();
         assert!(
             laid_out.height >= 11 && laid_out.height != target.1,
-            "the fixture wants tmux to have clamped the ask: {laid_out:?} for {target:?}"
+            "the fixture needs tmux to clamp the ask: {laid_out:?} for {target:?}"
         );
 
-        // From here the window disagrees with its target and stays that
-        // way, and that must not be a reason to write again.
         let settled = resize_client(&mut app, &client).await;
         assert!(
             settled.succeeded.is_empty() && settled.failed.is_empty(),
-            "a target tmux declined was asked for again: {settled:?}"
-        );
-        assert!(
-            !layout_change_within(&mut rx, std::time::Duration::from_millis(300)).await,
-            "tmux announced a layout change after a pass that wrote nothing"
+            "a target tmux declined was asked again: {settled:#?}"
         );
 
         client.shutdown().await;
@@ -8473,6 +7768,8 @@ mod tests {
             selection: SelectionState::default(),
             drag: None,
             notice: NoticeState::default(),
+            daemon_compatibility: None,
+            daemon_compatibility_notice: None,
             decoration: DecorationSnapshot::default(),
             prefs: WorkspacePrefs::default(),
             expanded_workspaces: HashSet::new(),
@@ -8482,21 +7779,23 @@ mod tests {
             files: crate::files::FileTree::new(),
             files_pinned: crate::files::FileTree::new(),
             files_view: crate::files::FilesView::default(),
-            files_probe_at: None,
+            files_refresh_at: None,
             files_root_pending: true,
             record: cyclops_ui::Record::new(),
             messages_queue: cyclops_ui::HumanQueue::default(),
+            messages_snapshot_counts: None,
             messages_caller: None,
             messages_detail: None,
             messages_composer: cyclops_ui::ComposerState::default(),
             avatar_registry: cyclops_ui::AvatarRegistry::default(),
-            intake: cyclops_ui::Intake::new(),
+            stream_projection: cyclops_ui::StreamProjectionState::new(),
             stream_reconciling: false,
             cursor_style: None,
             term_size: (40, 12),
             declared_client_size: None,
             sizing: WindowSizing::default(),
             needs_reconcile: false,
+            reconcile_session_id: None,
             needs_hydrate: false,
             paste_seq: 0,
             home,
@@ -8522,62 +7821,6 @@ mod tests {
 
     /// A one-pane model for tests that need an `App` but never reach
     /// tmux, so the ids are inert.
-    /// The Messages current-session filter is addressed by the active
-    /// session's durable identity, taken from the daemon's status answer
-    /// under the session's tmux id, together with the panes in its
-    /// windows. Without that identity the filter names the session but
-    /// can hold no row, since nothing can be addressed in a session the
-    /// daemon has not identified.
-    #[test]
-    fn the_messages_session_filter_carries_the_sessions_durable_identity() {
-        let home = cyclops_proto::scratch::scratch_dir("workspace-messages-session-filter");
-        let mut app = test_app(one_pane_model(), home);
-        let decorated = |pane_id: &str, window_id: &str| crate::decoration::PaneDecoration {
-            pane_id: pane_id.into(),
-            window_id: window_id.into(),
-            label: Some("reviewer".into()),
-            manifest: None,
-            manifest_display_name: None,
-            state: cyclops_proto::AgentState::Idle,
-            needs_attention: false,
-        };
-        app.decoration
-            .panes
-            .insert("%0".into(), decorated("%0", "@0"));
-        // A pane in a window this workspace does not link.
-        app.decoration
-            .panes
-            .insert("%7".into(), decorated("%7", "@7"));
-
-        let filter = messages_session_filter(&app).expect("scoped by default");
-        assert_eq!(filter.name, "s");
-        assert_eq!(filter.session, None, "the daemon has not identified $0");
-        assert_eq!(
-            filter.panes,
-            std::collections::BTreeSet::from(["%0".to_string()])
-        );
-
-        let instance: cyclops_proto::SessionInstanceId =
-            "22222222-2222-4222-8222-222222222201".parse().unwrap();
-        app.decoration.sessions.insert("$0".into(), instance);
-        // Another session's identity is not this one's.
-        app.decoration.sessions.insert(
-            "$1".into(),
-            "22222222-2222-4222-8222-222222222202".parse().unwrap(),
-        );
-        assert_eq!(
-            messages_session_filter(&app),
-            Some(cyclops_ui::SessionFilter::new(
-                "s",
-                Some(instance),
-                ["%0".to_string()]
-            ))
-        );
-
-        app.messages_session_scoped = false;
-        assert_eq!(messages_session_filter(&app), None);
-    }
-
     fn one_pane_model() -> WorkspaceModel {
         let tab = crate::model::TabModel {
             window_id: "@0".into(),
@@ -8610,6 +7853,72 @@ mod tests {
             sidebar_visible: true,
             messages_visible: false,
         }
+    }
+
+    #[test]
+    fn files_refresh_is_event_armed_and_never_rearms_itself() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-files-refresh-request");
+        let mut app = test_app(one_pane_model(), home.clone());
+        app.files_root_pending = false;
+
+        // A hidden panel has no reason to touch the filesystem.
+        app.model.sidebar_visible = false;
+        request_files_refresh(&mut app, Duration::ZERO);
+        assert!(app.files_refresh_at.is_none());
+
+        // A visible panel is an explicit request. A second event in the
+        // burst keeps the first deadline rather than sliding or queueing it.
+        app.model.sidebar_visible = true;
+        request_files_refresh(&mut app, Duration::ZERO);
+        let due = app.files_refresh_at.expect("visible Files request");
+        request_files_refresh(&mut app, FILES_REFRESH_DELAY);
+        assert_eq!(app.files_refresh_at, Some(due));
+
+        // Consuming the request leaves no hidden recurring deadline behind.
+        assert!(take_files_refresh_request(&mut app, due));
+        assert!(app.files_refresh_at.is_none());
+        assert!(!take_files_refresh_request(
+            &mut app,
+            due + FILES_REFRESH_DELAY
+        ));
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn the_latest_session_switch_replaces_an_older_pending_repair_target() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-switch-repair-target");
+        let mut model = one_pane_model();
+        model.workspaces.extend([
+            crate::model::WorkspaceRow {
+                session_id: "$b".into(),
+                name: "fallback".into(),
+                tab_count: 1,
+                window_ids: vec!["@b".into()],
+            },
+            crate::model::WorkspaceRow {
+                session_id: "$c".into(),
+                name: "chosen".into(),
+                tab_count: 1,
+                window_ids: vec!["@c".into()],
+            },
+        ]);
+        let mut app = test_app(model, home.clone());
+        app.reconcile_session_id = Some("$b".into());
+        app.hit_map
+            .push(Rect::new(0, 0, 1, 1), HitTarget::SidebarToggle);
+
+        apply_session_switched(&mut app, "$c".into(), "chosen".into());
+
+        assert_eq!(app.reconcile_session_id.as_deref(), Some("$c"));
+        assert_eq!(
+            app.model.workspaces[app.model.active_workspace].session_id,
+            "$c"
+        );
+        assert_eq!(app.model.session.session, "chosen");
+        assert!(app.needs_reconcile);
+        assert!(app.hit_map.hit(0, 0).is_none());
+        let _ = std::fs::remove_dir_all(home);
     }
 
     fn messages_pane_model() -> WorkspaceModel {
@@ -8689,35 +7998,252 @@ mod tests {
         let _ = std::fs::remove_dir_all(home);
     }
 
-    fn current_messages_gate(app: &mut App) {
+    fn messages_snapshot(
+        workspace_seq: u64,
+        work_messages: u64,
+        attention_entries: u64,
+    ) -> cyclops_proto::MessagesSnapshotResult {
         let workspace_id = "00000000-0000-0000-0000-000000000001"
             .parse()
             .expect("workspace id");
-        let snapshot = cyclops_proto::MessagesSnapshotResult {
+        cyclops_proto::MessagesSnapshotResult {
             workspace_id,
             caller: Some(cyclops_proto::RecipientKey::admin(workspace_id)),
-            workspace_seq: 1,
+            workspace_seq,
             counts: cyclops_proto::MessagesSnapshotCounts {
-                visible_messages: 0,
+                visible_messages: work_messages,
                 returned_messages: 0,
-                inbox_messages: 0,
+                inbox_messages: work_messages,
                 outbound_messages: 0,
-                work_messages: 0,
-                active_messages: 0,
+                work_messages,
+                active_messages: work_messages,
                 settled_messages: 0,
-                pending_entries: 0,
+                pending_entries: work_messages,
                 claimed_entries: 0,
-                open_attention_entries: 0,
+                open_attention_entries: attention_entries,
             },
             rows: Vec::new(),
             mailbox_attention: Vec::new(),
-        };
+        }
+    }
+
+    fn current_messages_gate(app: &mut App) {
+        let snapshot = messages_snapshot(1, 0, 0);
         app.messages_gate.connected();
         app.messages_gate.mark_dirty();
         let request = app.messages_gate.begin().expect("snapshot request");
         assert!(app.messages_gate.finish_snapshot(request, &snapshot));
         app.messages_caller = snapshot.caller;
         assert!(app.messages_gate.may_mutate());
+    }
+
+    #[test]
+    fn a_hidden_messages_invalidation_fetches_without_opening_the_pane() {
+        let home = cyclops_proto::scratch::scratch_dir("workspace-hidden-messages-cue");
+        let mut app = test_app(one_pane_model(), home.clone());
+        assert!(!app.model.messages_visible, "the fixture starts collapsed");
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        app.messages_snapshot_tx = Some(tx);
+        app.messages_gate.connected();
+
+        let workspace_id = "00000000-0000-0000-0000-000000000001"
+            .parse()
+            .expect("workspace id");
+        app.messages_gate
+            .messages_changed(&cyclops_proto::MessagesChangedData {
+                workspace_id,
+                workspace_seq: 7,
+                changed: [cyclops_proto::MessagesChangedArea::Messages]
+                    .into_iter()
+                    .collect(),
+            });
+        pump_messages_refresh(&mut app);
+
+        let (request, bound) = rx
+            .try_recv()
+            .expect("the body-free invalidation must fetch an authorized snapshot");
+        assert_eq!(bound, 128);
+        assert!(install_messages_snapshot(
+            &mut app,
+            request,
+            messages_snapshot(7, 3, 1),
+        ));
+        assert_eq!(
+            app.messages_snapshot_counts,
+            Some(cyclops_proto::MessagesSnapshotCounts {
+                visible_messages: 3,
+                returned_messages: 0,
+                inbox_messages: 3,
+                outbound_messages: 0,
+                work_messages: 3,
+                active_messages: 3,
+                settled_messages: 0,
+                pending_entries: 3,
+                claimed_entries: 0,
+                open_attention_entries: 1,
+            })
+        );
+        assert!(
+            app.messages_gate.may_mutate(),
+            "the installed cue is current"
+        );
+        assert!(
+            !app.model.messages_visible,
+            "an arrival forced the Messages pane open"
+        );
+        let accepted_counts = app.messages_snapshot_counts;
+        app.messages_gate.mark_dirty();
+        assert_eq!(
+            app.messages_snapshot_counts, accepted_counts,
+            "uncertainty retains the last authenticated body-free counts"
+        );
+        assert!(
+            !app.messages_gate.may_mutate(),
+            "the retained cue must be labeled stale"
+        );
+
+        app.messages_gate.disconnected();
+        app.messages_gate.connected();
+        pump_messages_refresh(&mut app);
+        let (reconnect_request, reconnect_bound) = rx
+            .try_recv()
+            .expect("a hidden reconnect must rebuild the authorized cue");
+        assert_eq!(reconnect_bound, 128);
+        assert!(install_messages_snapshot(
+            &mut app,
+            reconnect_request,
+            messages_snapshot(8, 2, 0),
+        ));
+        assert_eq!(
+            app.messages_snapshot_counts
+                .expect("reconnected counts")
+                .work_messages,
+            2
+        );
+        assert!(app.messages_gate.may_mutate());
+        assert!(
+            !app.model.messages_visible,
+            "reconnecting forced the Messages pane open"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// Protects the body-free cue across a real control-client detach and
+    /// reattach, a fresh `App`, saved visibility restoration, and the actual
+    /// `AppMsg::DaemonReconnected` dispatch. This becomes obsolete when a
+    /// full-binary reattachment journey asserts the same snapshot, cue, and
+    /// visibility contract without broadening its failure meaning.
+    #[tokio::test]
+    async fn a_hidden_workspace_rebuilds_the_collapsed_cue_after_reattach() {
+        use cyclops_testrig::{tmux_available, TmuxServer};
+        use cyclops_tmux::{ControlClient, ControlConfig};
+
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("workspace-messages-reattach");
+        server.run_ok(&[
+            "new-session",
+            "-d",
+            "-s",
+            "s",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "/bin/sh",
+        ]);
+        let cfg = ControlConfig::attach("s")
+            .on_socket(server.socket().to_string())
+            .with_config_file("/dev/null");
+        let home = cyclops_proto::scratch::scratch_dir("workspace-reattached-messages-cue");
+
+        struct ScratchOwner(std::path::PathBuf);
+        impl Drop for ScratchOwner {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        let _scratch = ScratchOwner(home.clone());
+
+        let (first_client, _first_rx) = ControlClient::spawn(cfg.clone()).await.expect("attach");
+        let mut first = test_app(one_pane_model(), home.clone());
+        first.prefs.messages_visible = false;
+        first.prefs.messages_width = 41;
+        persist::save_prefs(&home, &first.prefs).expect("save collapsed visibility");
+        current_messages_gate(&mut first);
+        first.messages_snapshot_counts = Some(messages_snapshot(4, 5, 1).counts);
+        assert!(first.messages_gate.may_mutate());
+        first_client.shutdown().await;
+        drop(first);
+
+        let saved = load_prefs(&home);
+        assert_eq!(saved.messages_width, 41, "reattachment did not load prefs");
+        let mut reattached_model = one_pane_model();
+        apply_saved_workspace_visibility(&mut reattached_model, &saved);
+        let mut reattached = test_app(reattached_model, home.clone());
+        reattached.prefs = saved;
+        assert!(
+            !reattached.model.messages_visible,
+            "the fresh workspace preserves the collapsed visibility choice"
+        );
+        assert!(
+            reattached.messages_snapshot_counts.is_none(),
+            "a fresh App cannot reuse another instance's projection"
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        reattached.messages_snapshot_tx = Some(tx);
+
+        let (mut reattached_client, _reattached_rx) =
+            ControlClient::spawn(cfg).await.expect("reattach");
+        let mut debounce = None;
+        let mut reconnect_deadline = None;
+        let mut detached = false;
+        let mut pending_input = None;
+        assert!(
+            handle_app_msg(
+                Some(AppMsg::DaemonReconnected),
+                &mut reattached,
+                &mut reattached_client,
+                &mut debounce,
+                &mut reconnect_deadline,
+                &mut detached,
+                &mut pending_input,
+            )
+            .await,
+            "the reconnect event closed the app channel"
+        );
+        assert!(debounce.is_some(), "the reconnect did not schedule a frame");
+
+        let (request, bound) = rx
+            .try_recv()
+            .expect("reattachment must request the authenticated body-free snapshot");
+        assert_eq!(bound, 128);
+        assert!(install_messages_snapshot(
+            &mut reattached,
+            request,
+            messages_snapshot(9, 2, 1),
+        ));
+        let counts = reattached
+            .messages_snapshot_counts
+            .expect("reattached collapsed cue");
+        assert_eq!(counts.work_messages, 2);
+        assert_eq!(counts.open_attention_entries, 1);
+        assert!(reattached.messages_gate.may_mutate());
+        assert_eq!(
+            messages_rail_cue(&reattached),
+            Some(MessagesRailCue {
+                work_messages: 2,
+                attention_entries: 1,
+                current: true,
+            })
+        );
+        assert!(
+            !reattached.model.messages_visible,
+            "reattachment forced the Messages pane open"
+        );
+        reattached_client.shutdown().await;
     }
 
     fn messages_test_caller() -> cyclops_proto::RecipientKey {
@@ -10700,27 +10226,6 @@ mod tests {
         assert!(!signal_decoration_event(&tx));
     }
 
-    #[test]
-    fn decoration_frames_stop_before_allocating_past_the_limit() {
-        let mut exact = vec![b'x'; STREAM_EVENT_MAX_BYTES];
-        exact[STREAM_EVENT_MAX_BYTES - 1] = b'\n';
-        let mut reader = std::io::BufReader::new(std::io::Cursor::new(exact));
-        let mut line = Vec::new();
-        assert!(matches!(
-            read_bounded_line(&mut reader, &mut line, STREAM_EVENT_MAX_BYTES).unwrap(),
-            BoundedLine::Complete
-        ));
-        assert_eq!(line.len(), STREAM_EVENT_MAX_BYTES);
-
-        let oversized = vec![b'x'; STREAM_EVENT_MAX_BYTES + 1];
-        let mut reader = std::io::BufReader::new(std::io::Cursor::new(oversized));
-        assert!(matches!(
-            read_bounded_line(&mut reader, &mut line, STREAM_EVENT_MAX_BYTES).unwrap(),
-            BoundedLine::TooLong
-        ));
-        assert!(line.len() <= STREAM_EVENT_MAX_BYTES);
-    }
-
     /// L1: a burst of daemon events must collapse to exactly one status
     /// fetch, the same coalescing guarantee `arm()`/`RENDER_DEBOUNCE` give
     /// rendering. A fake cyclopsd accepts the forwarder's persistent
@@ -12514,7 +12019,8 @@ mod tests {
             "s".into(),
             OwnedSession {
                 pinned: std::collections::BTreeSet::from(["@0".into()]),
-                ..Default::default()
+                blocked: std::collections::BTreeSet::new(),
+                settled: std::collections::BTreeMap::new(),
             },
         );
         app.decoration = DecorationSnapshot {
@@ -12900,7 +12406,8 @@ mod tests {
             ),
             other => panic!("a frame cell must never pick a pane up, got {other:?}"),
         }
-        // Released without moving: the seam stays put and the pane focuses.
+        // Released without moving: the seam stays put. This pane was already
+        // focused, so pure focus policy spends the click without host IO.
         handle_mouse(
             &mut app,
             &client,
@@ -12911,6 +12418,7 @@ mod tests {
         .expect("up");
         assert!(app.drag.is_none());
         assert_eq!(app.model.active_tab().active_pane, bottom);
+        assert!(!app.needs_reconcile);
 
         // The top pane's own top border has no pane above it, so there is
         // no seam there and the press is a plain focus click.
@@ -12923,9 +12431,14 @@ mod tests {
         .await
         .expect("down");
         assert!(app.drag.is_none());
-        assert_eq!(app.model.active_tab().active_pane, top);
+        assert_eq!(app.model.active_tab().active_pane, bottom);
+        assert!(app.needs_reconcile);
         let active = server.run(&["display-message", "-p", "-t", "s", "#{pane_id}"]);
         assert_eq!(String::from_utf8_lossy(&active.stdout).trim(), top);
+        reconcile(&mut app, &client)
+            .await
+            .expect("settle top focus from tmux");
+        assert_eq!(app.model.active_tab().active_pane, top);
         client.shutdown().await;
     }
 

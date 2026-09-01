@@ -51,8 +51,12 @@ CYCD="$REPO/target/debug/cyclopsd"
 COMPOSER_PATH="$REPO/src/cyclopsd/tests/common/faketui.py"
 OUT="$ROOT/out"
 DAEMON_PID=""
+INST_DAEMON_PID=""
 CHECKS=0
 FAILS=0
+# The install and update transcripts carry the package version. Accept the
+# SemVer prerelease form Cargo exposes, not only a final X.Y.Z version.
+PACKAGE_VERSION_RE='[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?'
 
 # The installer section is opt-in because it runs the installer's dist
 # build, and everything else here reuses the debug binaries that are
@@ -135,15 +139,24 @@ cleanup() {
         tail -30 "$log" | sed 's/^/   /'
       fi
     done
-    # The nested rigs log their daemon to a file nobody prints. When the
-    # failure is "the daemon never came up", this is the only place that
-    # says what it said on the way down.
-    for nested in duo stock; do
-      if [ -s "$ROOT/$nested/daemon.log" ]; then
-        echo
-        echo "== $nested daemon.log (last 20):"
-        tail -20 "$ROOT/$nested/daemon.log" | sed 's/^/   /'
+    # Nested daemons write structured lifecycle events under their private
+    # homes; their launch redirection is still useful for an early process
+    # failure. Show both when a nested journey fails.
+    for nested in duo stock installed; do
+      if [ "$nested" = installed ]; then
+        structured_log="${INST_HOME:-}"
+        [ -n "$structured_log" ] && structured_log="$structured_log/cyclopsd.log"
+      else
+        structured_log="$ROOT/$nested/home/cyclopsd.log"
       fi
+      for log in "$structured_log" "$ROOT/$nested/daemon.log"; do
+        if [ -z "$log" ] || [ ! -s "$log" ]; then
+          continue
+        fi
+        echo
+        echo "== $log (last 20):"
+        tail -20 "$log" | sed 's/^/   /'
+      done
     done
     if [ -s "$ROOT/notification-state.json" ]; then
       echo
@@ -158,14 +171,14 @@ cleanup() {
   # The nested rigs run their own daemon and their own tmux server in their
   # own directories. All of them die here even when a check above exited
   # early.
-  for pid in "${DUO_PID:-}" "${STOCK_PID:-}"; do
+  for pid in "${DUO_PID:-}" "${STOCK_PID:-}" "${INST_DAEMON_PID:-}"; do
     if [ -n "$pid" ]; then
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
     fi
   done
   cyc_tmux_teardown default
-  for nested in duo stock; do
+  for nested in duo stock installed; do
     if [ -d "$ROOT/$nested/tmux" ]; then
       TMUX_TMPDIR="$ROOT/$nested/tmux" cyc_tmux_teardown default
     fi
@@ -298,6 +311,34 @@ check() {
   fi
 }
 
+check_same_file() {
+  local what="$1" before="$2" after="$3"
+  CHECKS=$((CHECKS + 1))
+  if cmp -s "$before" "$after"; then
+    printf '   ok    %s\n' "$what"
+  else
+    printf '   FAIL  %s\n         %s changed from %s\n' "$what" "$after" "$before"
+    FAILS=$((FAILS + 1))
+  fi
+}
+
+check_different_file() {
+  local what="$1" before="$2" after="$3" result
+  CHECKS=$((CHECKS + 1))
+  if cmp -s "$before" "$after"; then
+    printf '   FAIL  %s\n         %s did not change from %s\n' "$what" "$after" "$before"
+    FAILS=$((FAILS + 1))
+  else
+    result=$?
+    if [ "$result" -eq 1 ]; then
+      printf '   ok    %s\n' "$what"
+    else
+      printf '   FAIL  %s\n         could not compare %s with %s\n' "$what" "$after" "$before"
+      FAILS=$((FAILS + 1))
+    fi
+  fi
+}
+
 # Assert the last `run` printed NOTHING matching an extended regex. For the
 # lines a command must say once and then stop saying: a note repeated on
 # every run is noise, and the reader is looking for what changed.
@@ -354,24 +395,17 @@ check_exit() {
   fi
 }
 
-if [ "$INSTALLER_ONLY" -eq 0 ]; then
-echo "== rig home:   $CYCLOPS_HOME (removed on exit)"
-echo "== tmux:       private TMUX_TMPDIR=$TMUX_TMPDIR (removed on exit)"
-
-# A parity gate that ran yesterday's binaries would pass while the docs are
-# already wrong, which is the one failure this script exists to catch.
-echo "== building cyclops and cyclopsd"
-cargo build -q -p cyclops -p cyclopsd
-
 # The fixture has its own executable identity. Cyclops commands and the
 # composer run as its children, so the gate exercises peer ancestry instead
-# of granting authority from a mutable pane label.
+# of granting authority from a mutable pane label. The installer-only journey
+# uses the same fixture against the binaries that were actually installed.
 rustc --edition=2021 -Dwarnings "$REPO/tests/e2e/parity_agent.rs" -o "$ROOT/cycagent"
 
-# The stand-in's manifest. Written AFTER the first `cyclops start`, not
-# before: seeding the home with the shipped manifests is that command's job
-# now, and a rig that copied them in first is exactly how the first run
-# stayed broken through five milestones while this gate passed.
+# The stand-in's manifest is written only after each isolated home has seeded
+# the shipped set. Doorbell transport points at the reviewed skill bytes in
+# this rig, never at an agent installation in the operator's home.
+DEMO_SKILL="$ROOT/cyclops-skill.md"
+cp "$REPO/skills/cyclops/SKILL.md" "$DEMO_SKILL"
 DEMO_MANIFEST=$(cat <<'EOF'
 [agent]
 id = "demo"
@@ -454,13 +488,16 @@ composer_trailer_required_prefix = 2
 safe_states = ["idle"]
 EOF
 )
-
-# Doorbell transport requires exact installed skill evidence. The fixture
-# gets the reviewed skill bytes in its isolated root rather than borrowing
-# any agent installation from the operator's home.
-DEMO_SKILL="$ROOT/cyclops-skill.md"
-cp "$REPO/skills/cyclops/SKILL.md" "$DEMO_SKILL"
 DEMO_MANIFEST="${DEMO_MANIFEST/__CYCLOPS_MAILBOX_CAPABILITY__/$DEMO_SKILL}"
+
+if [ "$INSTALLER_ONLY" -eq 0 ]; then
+echo "== rig home:   $CYCLOPS_HOME (removed on exit)"
+echo "== tmux:       private TMUX_TMPDIR=$TMUX_TMPDIR (removed on exit)"
+
+# A parity gate that ran yesterday's binaries would pass while the docs are
+# already wrong, which is the one failure this script exists to catch.
+echo "== building cyclops and cyclopsd"
+cargo build -q -p cyclops -p cyclopsd
 
 echo
 echo "#### Rung 1: one pane, persistence, history"
@@ -866,10 +903,14 @@ echo "#### The first run docs/guides/QUICKSTART.md walks, from outside the repo"
 # status, teach a manifest, name, send, read the receipt.
 mkdir -p "$ROOT/duo/home" "$ROOT/duo/tmux" "$ROOT/duo/elsewhere"
 DUO_HOME="$ROOT/duo/home"
+DUO_TMUX_CONFIG="$ROOT/duo/tmux.conf"
 duo() { ( cd "$ROOT/duo/elsewhere" && CYCLOPS_HOME="$DUO_HOME" TMUX_TMPDIR="$ROOT/duo/tmux" "$@" ); }
-duo_tmx() { duo tmux -u "$@"; }
+duo_tmx() { duo tmux -u -f "$DUO_TMUX_CONFIG" "$@"; }
 duo_daemon_up() { duo "$CYC" --json status >/dev/null 2>&1; }
 duo_attached() { duo "$CYC" --json status | jq -e '.sessions[0].attached == true' >/dev/null; }
+duo_waiting_for_session() {
+  grep -Fq 'waiting for session; create it, then call session.watch' "$DUO_HOME/cyclopsd.log"
+}
 duo_roster_has() { duo "$CYC" --json list | jq -e --arg a "$1" '[.agents[].agent] | index($a)' >/dev/null; }
 duo_pane_has_text() { duo_tmx capture-pane -p -t "$1" | grep -Fq -- "$2"; }
 duo_pane_matches() { duo_tmx capture-pane -p -t "$1" | grep -Eq -- "$2"; }
@@ -935,10 +976,11 @@ stop_duo_daemon() {
   DUO_PID=""
 }
 
-# The order scripts/install.sh and the README hand out: set the home up,
-# start the daemon, then open the workspace. Started the other way round
-# the first `start` has no daemon to register a name with, and naming
-# takes a second run (rung 1 covers that path).
+# The external-supervisor path: set the home up, start the daemon, then
+# create its configured session with --no-daemon. This is distinct from the
+# ordinary one-command journey below. The fixture config holds an empty tmux
+# server open so a control attach made before the session exists is observable
+# rather than disappearing before this test can inspect it.
 printf '\n$ cd ~/scratch && cyclops start --setup-only\n'
 duo "$CYC" start --setup-only --plain > "$OUT" 2>&1
 cat "$OUT"
@@ -946,9 +988,17 @@ check "setup writes the config"           'wrote .*/config\.toml$'
 check "and installs the manifests"        '^  wrote 4 detection manifests to .*/manifests$'
 check_absent "and opens nothing"          'workspace ready'
 
+printf '%s\n' 'set-option -g exit-empty off' 'set-option -g exit-unattached off' \
+  > "$DUO_TMUX_CONFIG"
+printf '\ntmux_config = "%s"\n' "$DUO_TMUX_CONFIG" >> "$DUO_HOME/config.toml"
+
 # The daemon runs from the same empty directory. Nothing in the config
 # names a manifest directory, so it has to find the one setup just wrote.
 start_duo_daemon
+wait_for "the external daemon to wait for main" 50 duo_waiting_for_session
+find "$ROOT/duo/tmux" -type s -print > "$OUT"
+cat "$OUT"
+check_absent "waiting for main does not create a tmux server" '.'
 
 printf '\n$ cyclopsd &\n$ cyclops start --preset duo\n'
 duo "$CYC" start --preset duo --no-daemon --plain > "$OUT" 2>&1
@@ -1261,16 +1311,36 @@ if [ -n "${RUSTUP_TOOLCHAIN:-}" ]; then
   TOOLCHAIN_KEEP+=("RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN")
 fi
 
+run_installer_in() {
+  local home="$1" path="$2" out="$3" marker="$4"; shift 4
+  set +e
+  if [ -n "$marker" ]; then
+    env -i \
+      PATH="$path" \
+      HOME="$home" \
+      SHELL=/bin/zsh \
+      TERM=dumb \
+      NO_COLOR=1 \
+      "${TOOLCHAIN_KEEP[@]}" \
+      "CYCLOPS_TEST_COPY_FAILURE_MARKER=$marker" \
+      sh "$REPO/scripts/install.sh" "$@" > "$out" 2>&1
+  else
+    env -i \
+      PATH="$path" \
+      HOME="$home" \
+      SHELL=/bin/zsh \
+      TERM=dumb \
+      NO_COLOR=1 \
+      "${TOOLCHAIN_KEEP[@]}" \
+      sh "$REPO/scripts/install.sh" "$@" > "$out" 2>&1
+  fi
+  printf '%s' "$?" > "$ROOT/exit"
+  set -e
+}
+
 run_installer() {
   local path="$1"; shift
-  env -i \
-    PATH="$path" \
-    HOME="$INST" \
-    SHELL=/bin/zsh \
-    TERM=dumb \
-    NO_COLOR=1 \
-    "${TOOLCHAIN_KEEP[@]}" \
-    sh "$REPO/scripts/install.sh" "$@" > "$OUT" 2>&1 || true
+  run_installer_in "$INST" "$path" "$OUT" "" "$@"
 }
 
 printf '\n$ ./scripts/install.sh\n'
@@ -1281,7 +1351,7 @@ grep -v '^ *\(Compiling\|Finished\|Downloaded\|Blocking\|Updating\|Adding\)' "$O
 check "it says where each binary went"    "^  cyclops    $INST/.local/bin/cyclops$"
 check "and the daemon too"                "^  cyclopsd   $INST/.local/bin/cyclopsd$"
 check "and where the home is"             "^  home       $INST/.cyclops$"
-check "it reports the version it built"   '^✔ cyclops [0-9]+\.[0-9]+\.[0-9]+ \(([0-9a-f]+(\.dirty)?|unknown)\) is installed$'
+check "it reports the version it built"   "^✔ cyclops $PACKAGE_VERSION_RE \\(([0-9a-f]+(\\.dirty)?|unknown)\\) is installed$"
 check_absent "it gives no separate daemon step" 'cyclopsd &'
 check "step 2 opens the workspace"        '^  2  cyclops +open your workspace and start your agents$'
 check "it names the profile it edited"    "^  three lines added to $INST/.zshrc:$"
@@ -1292,6 +1362,7 @@ check "and where the backup went"         "^  the file as it was: $INST/.zshrc.c
 check_file "the binaries are executable"  "$INST/.local/bin/cyclops" '.'
 check_file "and the home has a config"    "$INST/.cyclops/config.toml" '^sessions = '
 check_file "and the shipped manifests"    "$INST/.cyclops/manifests/claude.toml" '^id = "claude"$'
+check_exit "a clean install exits 0" 0
 
 # The profile has exactly one block, not one per run, and the second run
 # says so instead of appending another.
@@ -1300,6 +1371,166 @@ run_installer "$PATH"
 grep -c '>>> cyclops >>>' "$INST/.zshrc" > "$ROOT/blocks"
 cat "$OUT" | grep 'already has the cyclops block' || true
 check_file "a second run adds no second block" "$ROOT/blocks" '^1$'
+check_exit "the idempotent install exits 0" 0
+
+# A failed macOS clone-optimized copy must not make a successful build
+# un-installable. This wrapper fails only the first private client candidate
+# copy; every other cp call delegates to the system implementation.
+COPY_FALLBACK_HOME="$ROOT/copy-fallback"
+COPY_FALLBACK_PREFIX="$COPY_FALLBACK_HOME/bin"
+COPY_FALLBACK_OUT="$ROOT/copy-fallback.out"
+COPY_FALLBACK_MARKER="$ROOT/copy-fallback.marker"
+mkdir -p "$COPY_FALLBACK_HOME"
+printf '\n$ ./scripts/install.sh --prefix ...    # private candidate copy fallback\n'
+run_installer_in "$COPY_FALLBACK_HOME" \
+  "$REPO/tests/e2e/fixtures/installer-copy-fails:$PATH" \
+  "$COPY_FALLBACK_OUT" \
+  "$COPY_FALLBACK_MARKER" \
+  --prefix "$COPY_FALLBACK_PREFIX" --no-path
+tail -12 "$COPY_FALLBACK_OUT"
+check_exit "the private candidate copy fallback installs successfully" 0
+check_file "the fallback simulation reaches the private candidate copy" \
+  "$COPY_FALLBACK_MARKER" '^intentional private candidate copy failure$'
+check_file "the fallback installs the client" "$COPY_FALLBACK_PREFIX/cyclops" '.'
+check_file "and the fallback installs the daemon" "$COPY_FALLBACK_PREFIX/cyclopsd" '.'
+check_same_file "the fallback keeps client bytes exact" \
+  "$REPO/target/dist/cyclops" "$COPY_FALLBACK_PREFIX/cyclops"
+check_same_file "and the fallback keeps daemon bytes exact" \
+  "$REPO/target/dist/cyclopsd" "$COPY_FALLBACK_PREFIX/cyclopsd"
+
+echo
+echo "#### An installed pair completes the first durable handoff"
+
+# The first-handoff journey uses only the pair the installer selected. It has
+# its own home, tmux server, daemon process, and fixture-agent controls. It runs
+# from an empty directory and borrows no Cyclops binaries or state from the
+# checkout; only the test fixture and reviewed seeded bytes come from here.
+INST_HOME="$INST/.cyclops"
+INST_CYC="$INST/.local/bin/cyclops"
+INST_CYCD="$INST/.local/bin/cyclopsd"
+mkdir -p "$ROOT/installed/tmux" "$ROOT/installed/elsewhere"
+printf '\n# operator note retained across update and rollback\n' >> "$INST_HOME/config.toml"
+printf '%s\n' "$DEMO_MANIFEST" > "$INST_HOME/manifests/demo.toml"
+
+installed() {
+  ( cd "$ROOT/installed/elsewhere" && env \
+      HOME="$INST" \
+      CYCLOPS_HOME="$INST_HOME" \
+      TMUX_TMPDIR="$ROOT/installed/tmux" \
+      PATH="$INST/.local/bin:$PATH" \
+      "$@" )
+}
+installed_tmx() { installed tmux -u "$@"; }
+installed_daemon_up() { installed "$INST_CYC" --json status >/dev/null 2>&1; }
+installed_attached() {
+  installed "$INST_CYC" --json status |
+    jq -e '.sessions[0].attached == true' >/dev/null
+}
+installed_pane_bound_to() {
+  installed "$INST_CYC" --json status | jq -e --arg p "$1" --arg m "$2" \
+    '[.sessions[].panes[] | select(.pane_id == $p and .manifest == $m)] | length > 0' \
+    >/dev/null
+}
+installed_agent_ready() { [ -f "$ROOT/installed/ready.$1" ]; }
+installed_command_done() { [ -f "$ROOT/installed/done.$1" ]; }
+
+installed_start_agent() {
+  local label="$1" pane="$2"
+  rm -f "$ROOT/installed/control.$label" "$ROOT/installed/ready.$label"
+  mkfifo "$ROOT/installed/control.$label"
+  installed_tmx respawn-pane -k -t "$pane" \
+    "'$ROOT/cycagent' '$ROOT/installed/control.$label' '$ROOT/installed/ready.$label'"
+  wait_for "the installed $label fixture agent" 100 installed_agent_ready "$label"
+}
+
+installed_agent_command() {
+  local label="$1" command="$3" line
+  rm -f "$ROOT/installed/result.$label" "$ROOT/installed/exit.$label" \
+    "$ROOT/installed/done.$label"
+  printf '\n$ (run by the installed %s agent) cyclops %s\n' "$label" "$command"
+  line="HOME=\"$INST\" CYCLOPS_HOME=\"$INST_HOME\" TMUX_TMPDIR=\"$ROOT/installed/tmux\" PATH=\"$INST/.local/bin:$PATH\" \"$INST_CYC\" $command > \"$ROOT/installed/result.$label\" 2>&1; code=\$?; printf '%s' \"\$code\" > \"$ROOT/installed/exit.$label\"; : > \"$ROOT/installed/done.$label\""
+  printf 'run\t%s\n' "$line" > "$ROOT/installed/control.$label"
+  wait_for "the installed $label agent command" 100 installed_command_done "$label"
+  cp "$ROOT/installed/result.$label" "$OUT"
+  cp "$ROOT/installed/exit.$label" "$ROOT/exit"
+  cat "$OUT"
+}
+
+start_installed_daemon() {
+  ( cd "$ROOT/installed/elsewhere" && exec env \
+      HOME="$INST" \
+      CYCLOPS_HOME="$INST_HOME" \
+      TMUX_TMPDIR="$ROOT/installed/tmux" \
+      PATH="$INST/.local/bin:$PATH" \
+      "$INST_CYCD" ) >>"$ROOT/installed/daemon.log" 2>&1 &
+  INST_DAEMON_PID=$!
+  wait_for "the installed daemon socket" 50 test -S "$INST_HOME/sock"
+  wait_for "the installed daemon to answer" 50 installed_daemon_up
+}
+
+stop_installed_daemon() {
+  [ -n "${INST_DAEMON_PID:-}" ] || return 0
+  kill "$INST_DAEMON_PID" 2>/dev/null || true
+  wait "$INST_DAEMON_PID" 2>/dev/null || true
+  INST_DAEMON_PID=""
+}
+
+start_installed_daemon
+installed "$INST_CYC" start --preset duo --no-daemon --plain > "$OUT" 2>&1
+cat "$OUT"
+check "the installed pair opens the workspace" '^✔ workspace ready · 2 agents$'
+wait_for "the installed daemon to attach" 60 installed_attached
+
+read -r I1 I2 <<<"$(installed_tmx list-panes -t main -F '#{pane_id}' | tr '\n' ' ')"
+installed_start_agent implementer "$I1"
+installed_start_agent reviewer "$I2"
+wait_for "the installed daemon to name implementer" 100 \
+  installed "$INST_CYC" name "$I1" implementer --plain
+wait_for "the installed daemon to name reviewer" 100 \
+  installed "$INST_CYC" name "$I2" reviewer --plain
+wait_for "the installed daemon to bind implementer" 100 installed_pane_bound_to "$I1" demo
+wait_for "the installed daemon to bind reviewer" 100 installed_pane_bound_to "$I2" demo
+
+installed_agent_command implementer "$I1" \
+  'send reviewer --subject "Installed handoff" --summary "Review the installed handoff. Reply when complete." --body "Installed pair reached durable messaging." --client-key parity-installed-handoff --plain'
+check "the installed send is durably accepted" '^accepted m-[[:xdigit:]]{32}$'
+check_exit "the installed send exits 0" 0
+INST_HANDOFF_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
+[ -n "$INST_HANDOFF_ID" ] || { echo "!! installed handoff id was not captured" >&2; exit 1; }
+
+installed_agent_command reviewer "$I2" "inbox claim $INST_HANDOFF_ID --plain"
+check "the installed reviewer claims the body" '^Installed pair reached durable messaging\.$'
+check_exit "the installed claim exits 0" 0
+
+installed_agent_command reviewer "$I2" \
+  "reply $INST_HANDOFF_ID --summary \"Confirm the installed handoff. Record the result.\" --body \"Installed handoff complete.\" --client-key parity-installed-reply --plain"
+check "the installed reply is durably accepted" '^accepted m-[[:xdigit:]]{32}$'
+check_exit "the installed reply exits 0" 0
+INST_REPLY_ID="$(awk '$1 == "accepted" { print $2; exit }' "$OUT")"
+[ -n "$INST_REPLY_ID" ] || { echo "!! installed reply id was not captured" >&2; exit 1; }
+
+installed_agent_command implementer "$I1" "inbox claim $INST_REPLY_ID --plain"
+check "the installed implementer claims the reply" '^Installed handoff complete\.$'
+check_exit "the installed reply claim exits 0" 0
+
+# Quiesce the exact test-owned daemon before preserving the user-owned files.
+# Update and rollback both prove replay while the original journal stays still.
+stop_installed_daemon
+find "$INST_HOME/workspaces" -name messages.ndjson -print > "$ROOT/installed/journals"
+INST_JOURNAL_COUNT="$(wc -l < "$ROOT/installed/journals" | tr -d ' ')"
+[ "$INST_JOURNAL_COUNT" -eq 1 ] || {
+  echo "!! installed journey expected one message journal, found $INST_JOURNAL_COUNT" >&2
+  exit 1
+}
+INST_JOURNAL="$(sed -n '1p' "$ROOT/installed/journals")"
+cp "$INST_HOME/config.toml" "$ROOT/installed/config.before"
+cp "$INST_JOURNAL" "$ROOT/installed/messages.before"
+cp -L "$INST_CYC" "$ROOT/installed/cyclops.before"
+cp -L "$INST_CYCD" "$ROOT/installed/cyclopsd.before"
+"$INST_CYC" --version | sed 's/^cyclops //' > "$ROOT/installed/client.before-version"
+"$INST_CYCD" --version | sed 's/^cyclopsd //' > "$ROOT/installed/daemon.before-version"
+check_same_file "the installed client and daemon start as one exact pair" \
+  "$ROOT/installed/client.before-version" "$ROOT/installed/daemon.before-version"
 
 echo
 echo "#### The update docs/guides/install.md documents"
@@ -1346,7 +1577,7 @@ run_update() {
     CYCLOPS_REF=parity-update \
     CARGO_TARGET_DIR="$REPO/target" \
     "${TOOLCHAIN_KEEP[@]}" \
-    "$INST/.local/bin/cyclops" update > "$OUT" 2>&1
+    "$INST/.local/bin/cyclops" update "$@" > "$OUT" 2>&1
   printf '%s' "$?" > "$ROOT/exit"
   set -e
 }
@@ -1355,13 +1586,24 @@ printf '\n$ cyclops update\n'
 run_update
 grep -v '^ *\(Compiling\|Finished\|Downloaded\|Blocking\|Updating\|Adding\)' "$OUT" | tail -24
 
-check "update names the running build"    '^cyclops [0-9]+\.[0-9]+\.[0-9]+ \(([0-9a-f]+(\.dirty)?|unknown)\)$'
+check "update names the running build"    "^cyclops $PACKAGE_VERSION_RE \\(([0-9a-f]+(\\.dirty)?|unknown)\\)$"
 check "and its source"                    "^  source $ROOT/remote at parity-update$"
-check "it reran the installer"            '^✔ cyclops [0-9]+\.[0-9]+\.[0-9]+ \([0-9a-f]+\) is installed$'
-check "and reports old build to new"      '^✔ updated · [0-9]+\.[0-9]+\.[0-9]+ \(([0-9a-f]+(\.dirty)?|unknown)\) → [0-9]+\.[0-9]+\.[0-9]+ \([0-9a-f]+\)$'
+check "it reran the installer"            "^✔ cyclops $PACKAGE_VERSION_RE \\([0-9a-f]+\\) is installed$"
+check "and reports old build to new"      "^✔ updated · $PACKAGE_VERSION_RE \\(([0-9a-f]+(\\.dirty)?|unknown)\\) → $PACKAGE_VERSION_RE \\([0-9a-f]+\\)$"
 check "and keeps a stopped daemon stopped" '^  no daemon was running; the selected pair remains stopped$'
 check_absent "it never stops the daemon itself" 'stopped cyclopsd'
 check_exit "an update exits 0" 0
+
+"$INST_CYC" --version | sed 's/^cyclops //' > "$ROOT/installed/client.updated-version"
+"$INST_CYCD" --version | sed 's/^cyclopsd //' > "$ROOT/installed/daemon.updated-version"
+check_same_file "the update selects one exact client and daemon build" \
+  "$ROOT/installed/client.updated-version" "$ROOT/installed/daemon.updated-version"
+check_different_file "the update selects a new build identity" \
+  "$ROOT/installed/client.before-version" "$ROOT/installed/client.updated-version"
+check_different_file "the selected client bytes changed" \
+  "$ROOT/installed/cyclops.before" "$INST_CYC"
+check_different_file "the selected daemon bytes changed" \
+  "$ROOT/installed/cyclopsd.before" "$INST_CYCD"
 
 # A second update against the same ref: the binary just installed IS the
 # mirror's commit, so the freshness check answers and nothing rebuilds.
@@ -1374,7 +1616,36 @@ check_exit "and exits 0 saying so" 0
 # What an update must never cost: the home the first install set up. The
 # installer's seed rule (files already there are never rewritten) is what
 # this rides on, and this is where it is proven from the update side.
-check_file "the config survived the update" "$INST/.cyclops/config.toml" '^sessions = '
+check_same_file "the operator-edited config survives the update byte for byte" \
+  "$ROOT/installed/config.before" "$INST_HOME/config.toml"
+check_same_file "the durable handoff survives the update byte for byte" \
+  "$ROOT/installed/messages.before" "$INST_JOURNAL"
+
+printf '\n$ cyclops update --rollback\n'
+run_update --rollback
+cat "$OUT"
+check "rollback reports completion" '^✔ rolled back$'
+check "rollback names the restored active pair" '^  active pairs/pair\.[0-9a-f]{32}$'
+check "rollback keeps the displaced pair as known-good" \
+  '^  known-good pairs/pair\.[0-9a-f]{32}$'
+check_exit "rollback exits 0" 0
+
+"$INST_CYC" --version | sed 's/^cyclops //' > "$ROOT/installed/client.rolled-version"
+"$INST_CYCD" --version | sed 's/^cyclopsd //' > "$ROOT/installed/daemon.rolled-version"
+check_same_file "rollback restores the original client identity" \
+  "$ROOT/installed/client.before-version" "$ROOT/installed/client.rolled-version"
+check_same_file "rollback restores the original daemon identity" \
+  "$ROOT/installed/daemon.before-version" "$ROOT/installed/daemon.rolled-version"
+check_same_file "the rolled-back client and daemon remain one exact pair" \
+  "$ROOT/installed/client.rolled-version" "$ROOT/installed/daemon.rolled-version"
+check_same_file "rollback restores the original client bytes" \
+  "$ROOT/installed/cyclops.before" "$INST_CYC"
+check_same_file "rollback restores the original daemon bytes" \
+  "$ROOT/installed/cyclopsd.before" "$INST_CYCD"
+check_same_file "rollback leaves the operator-edited config byte-identical" \
+  "$ROOT/installed/config.before" "$INST_HOME/config.toml"
+check_same_file "rollback leaves the durable handoff byte-identical" \
+  "$ROOT/installed/messages.before" "$INST_JOURNAL"
 
 # The update legs built the mirror's clone into the repo's own target dir
 # (the shared cache that keeps this job fast), which leaves the MIRROR's
@@ -1389,6 +1660,7 @@ printf '\n$ ./scripts/install.sh --uninstall\n'
 run_installer "$INST/.local/bin:$PATH" --uninstall
 cat "$OUT"
 check "uninstall keeps the record"        "your record and config are untouched at $INST/.cyclops"
+check_exit "uninstall exits 0" 0
 
 # The load-bearing one. A profile this touched has to come back byte for
 # byte, or the installer is something an operator cannot safely undo.

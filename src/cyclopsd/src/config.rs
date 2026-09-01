@@ -1,14 +1,18 @@
 //! Daemon configuration: `$CYCLOPS_HOME/config.toml`.
 //!
 //! Data-only parse (v1 keeper): the file is TOML values, never code.
-//! Unknown keys and wrong-typed values warn and are ignored so an old
-//! daemon keeps booting against a newer config file. A missing file is a
-//! valid empty config: the daemon watches nothing and status still answers.
+//! Unknown keys and wrong-typed daemon-owned values warn and are ignored so an
+//! old daemon keeps booting against a newer config file. The coordinator keys
+//! (`sessions`, `tmux_socket`, and `tmux_config`) use the shared strict safety
+//! boundary: an unsafe value must not silently select the ambient tmux server.
+//! A missing file is a valid empty config: the daemon watches nothing and
+//! status still answers.
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
+use cyclops_state::CoordinatorConfig;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -54,21 +58,10 @@ pub struct Config {
     /// Delay retained while the escape hatch is off, so toggling it back on
     /// restores the operator's chosen position.
     pub force_notification_submit_delay_ms: u64,
-    /// Theme name. The daemon never reads this field: `cyclops-theme`
-    /// re-reads the same key out of the same file (`select::config_theme`)
-    /// and that is what paints every surface, borders included. It is
-    /// recognized here so a config carrying it does not warn as an unknown
-    /// key, and for nothing else, exactly like `default_workspace`.
-    pub theme: Option<String>,
     /// Write `role • state` onto an adopted pane's tmux border. On by
     /// default: a named pane that does not say its name is the whole
     /// feature missing. Off leaves every tmux option untouched.
     pub chrome: bool,
-    /// Workspace `cyclops start` opens when it is given no name. The
-    /// daemon builds no workspaces and never reads this; like `theme`, it
-    /// is recognized here so a config carrying it does not warn as an
-    /// unknown key.
-    pub default_workspace: Option<String>,
 }
 
 impl Config {
@@ -88,73 +81,63 @@ impl Config {
             unclaimed_reminder_ms: None,
             force_notification_submit: false,
             force_notification_submit_delay_ms: 5_000,
-            theme: None,
             chrome: true,
-            default_workspace: None,
         }
     }
 
     /// Load `<home>/config.toml`. A missing file yields the defaults.
     /// Returns the config plus human-readable warnings for the caller to log.
     pub fn load(home: &Path) -> anyhow::Result<(Config, Vec<String>)> {
-        let path = home.join("config.toml");
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((Config::defaults(home), Vec::new()));
-            }
-            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-        };
-        Config::parse(&text, home).with_context(|| format!("parse {}", path.display()))
+        let path = home.join(cyclops_state::COORDINATOR_CONFIG_FILE);
+        let document = cyclops_state::load_coordinator_config(home)
+            .with_context(|| format!("read {}", path.display()))?;
+        Ok(Config::parse_table(
+            &document.table,
+            home,
+            document.coordinator,
+        ))
     }
 
-    /// Parse config text. Only TOML syntax errors fail; everything else
-    /// degrades to a warning.
+    /// Parse config text. Coordinator values are strict; other daemon values
+    /// may degrade to a warning for forward compatibility.
     pub fn parse(text: &str, home: &Path) -> anyhow::Result<(Config, Vec<String>)> {
-        let table: toml::Table = toml::from_str(text)?;
-        let mut cfg = Config::defaults(home);
+        let document = cyclops_state::parse_coordinator_document(
+            text,
+            &home.join(cyclops_state::COORDINATOR_CONFIG_FILE),
+        )?;
+        Ok(Config::parse_table(
+            &document.table,
+            home,
+            document.coordinator,
+        ))
+    }
+
+    fn parse_table(
+        table: &toml::Table,
+        home: &Path,
+        coordinator: CoordinatorConfig,
+    ) -> (Config, Vec<String>) {
+        let mut cfg = Config {
+            sessions: coordinator.sessions,
+            tmux_socket: coordinator.tmux_socket,
+            tmux_config: coordinator.tmux_config,
+            ..Config::defaults(home)
+        };
         let mut warnings = Vec::new();
         for (key, value) in table {
             match key.as_str() {
-                "sessions" => match value {
-                    toml::Value::Array(items) => {
-                        for item in items {
-                            match item {
-                                toml::Value::String(s) => cfg.sessions.push(s),
-                                other => warnings.push(format!(
-                                    "`sessions` entries must be strings; skipped a {}",
-                                    other.type_str()
-                                )),
-                            }
-                        }
-                    }
-                    other => warnings.push(format!(
-                        "`sessions` must be an array of strings, not a {}; watching nothing",
-                        other.type_str()
-                    )),
-                },
-                "tmux_socket" => match value {
-                    toml::Value::String(s) => cfg.tmux_socket = Some(s),
-                    other => warnings.push(format!(
-                        "`tmux_socket` must be a string, not a {}; using the default tmux server",
-                        other.type_str()
-                    )),
-                },
-                "tmux_config" => match value {
-                    toml::Value::String(s) => cfg.tmux_config = Some(PathBuf::from(s)),
-                    other => warnings.push(format!(
-                        "`tmux_config` must be a string path, not a {}; ignored",
-                        other.type_str()
-                    )),
-                },
-                "manifest_dir" => match value {
-                    toml::Value::String(s) => cfg.manifest_dir = Some(PathBuf::from(s)),
-                    other => warnings.push(format!(
+                // The shared coordinator parser accepted these before this
+                // daemon-owned parser begins. Reinterpreting them here would
+                // let another reader drift back to a different default.
+                "sessions" | "tmux_socket" | "tmux_config" => {}
+                "manifest_dir" => match value.as_str() {
+                    Some(s) => cfg.manifest_dir = Some(PathBuf::from(s)),
+                    None => warnings.push(format!(
                         "`manifest_dir` must be a string path, not a {}; using the default",
-                        other.type_str()
+                        value.type_str()
                     )),
                 },
-                "ack_timeout_ms" => match ms_value(&value) {
+                "ack_timeout_ms" => match ms_value(value) {
                     Some(v) => cfg.ack_timeout_ms = v,
                     None => warnings.push(format!(
                         "`ack_timeout_ms` must be a non-negative integer, not a {}; using {}",
@@ -162,7 +145,7 @@ impl Config {
                         cfg.ack_timeout_ms
                     )),
                 },
-                "delivery_retry_max" => match ms_value(&value) {
+                "delivery_retry_max" => match ms_value(value) {
                     Some(v) => cfg.delivery_retry_max = v.min(u32::MAX as u64) as u32,
                     None => warnings.push(format!(
                         "`delivery_retry_max` must be a non-negative integer, not a {}; using {}",
@@ -170,7 +153,7 @@ impl Config {
                         cfg.delivery_retry_max
                     )),
                 },
-                "receipt_block_ms" => match ms_value(&value) {
+                "receipt_block_ms" => match ms_value(value) {
                     Some(v) => cfg.receipt_block_ms = v,
                     None => warnings.push(format!(
                         "`receipt_block_ms` must be a non-negative integer, not a {}; using {}",
@@ -178,7 +161,7 @@ impl Config {
                         cfg.receipt_block_ms
                     )),
                 },
-                "gate_hold_notify_ms" => match ms_value(&value) {
+                "gate_hold_notify_ms" => match ms_value(value) {
                     Some(v) => cfg.gate_hold_notify_ms = v,
                     None => warnings.push(format!(
                         "`gate_hold_notify_ms` must be a non-negative integer, not a {}; using {}",
@@ -186,7 +169,7 @@ impl Config {
                         cfg.gate_hold_notify_ms
                     )),
                 },
-                "ambiguous_composer_settle_ms" => match ms_value(&value) {
+                "ambiguous_composer_settle_ms" => match ms_value(value) {
                     Some(v) => cfg.ambiguous_composer_settle_ms = v,
                     None => warnings.push(format!(
                         "`ambiguous_composer_settle_ms` must be a non-negative integer, not a {}; using {}",
@@ -194,7 +177,7 @@ impl Config {
                         cfg.ambiguous_composer_settle_ms
                     )),
                 },
-                "unclaimed_reminder_ms" => match ms_value(&value) {
+                "unclaimed_reminder_ms" => match ms_value(value) {
                     Some(0) => cfg.unclaimed_reminder_ms = None,
                     Some(v) => cfg.unclaimed_reminder_ms = Some(v),
                     None => warnings.push(format!(
@@ -209,7 +192,7 @@ impl Config {
                         "`force_notification_submit` must be \"on\" or \"off\", not {value}; leaving it off"
                     )),
                 },
-                "force_notification_submit_delay_ms" => match ms_value(&value) {
+                "force_notification_submit_delay_ms" => match ms_value(value) {
                     Some(v) if v <= 20_000 => cfg.force_notification_submit_delay_ms = v,
                     Some(_) => warnings.push(
                         "`force_notification_submit_delay_ms` must be between 0 and 20000; using 5000"
@@ -220,25 +203,12 @@ impl Config {
                         value.type_str()
                     )),
                 },
-                // Recognized, never used, and deliberately silent about a
-                // wrong type: cyclops-theme reads this same key out of
-                // this same file and warns about it there. Two crates
-                // parsing one key printed two warnings in two wordings for
-                // one mistake, and the daemon's was the one describing a
-                // fallback it does not have (nothing here reads the
-                // value).
-                "theme" => {
-                    if let toml::Value::String(s) = value {
-                        cfg.theme = Some(s);
-                    }
-                }
-                "default_workspace" => match value {
-                    toml::Value::String(s) => cfg.default_workspace = Some(s),
-                    other => warnings.push(format!(
-                        "`default_workspace` must be a string, not a {}; `cyclops start` will use the first watched session",
-                        other.type_str()
-                    )),
-                },
+                // One physical TOML file carries settings for several
+                // product owners. The daemon acknowledges these top-level
+                // keys so a shared file stays quiet, but must not interpret
+                // or validate them: cyclops-theme owns `theme`, and the
+                // workspace launcher owns `default_workspace`.
+                "theme" | "default_workspace" => {}
                 // Words, not a bool: the switch turns a visible thing on
                 // and off, and `chrome = "off"` is what a person writes.
                 "chrome" => match value.as_str() {
@@ -256,7 +226,7 @@ impl Config {
                 unknown => warnings.push(format!("unknown config key `{unknown}` ignored")),
             }
         }
-        Ok((cfg, warnings))
+        (cfg, warnings)
     }
 
     /// Resolve the manifest directory: explicit config value first, then
@@ -343,8 +313,6 @@ next_tab = "Alt+n"
         assert_eq!(cfg.sessions, vec!["main", "aux"]);
         assert_eq!(cfg.tmux_socket.as_deref(), Some("cyc-test"));
         assert_eq!(cfg.tmux_config.as_deref(), Some(Path::new("/dev/null")));
-        assert_eq!(cfg.default_workspace.as_deref(), Some("main"));
-        assert_eq!(cfg.theme.as_deref(), Some("dark"));
         assert_eq!(
             cfg.manifest_dir(),
             Some(PathBuf::from("/private/tmp/manifests"))
@@ -363,35 +331,36 @@ next_tab = "Alt+n"
     }
 
     #[test]
-    fn wrong_types_warn_and_fall_back() {
-        let (cfg, warnings) = Config::parse(
+    fn client_owned_keys_are_not_daemon_configuration() {
+        let (_, warnings) =
+            Config::parse("theme = 3\ndefault_workspace = 3\n", Path::new("/h")).unwrap();
+
+        assert!(
+            warnings.is_empty(),
+            "the daemon must leave client-owned keys to their owners: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn wrongly_typed_coordinator_values_refuse_instead_of_defaulting_tmux() {
+        assert!(Config::parse(
             "sessions = \"main\"\ntmux_socket = 7\ntheme = 3\n",
             Path::new("/h"),
         )
-        .unwrap();
-        assert!(cfg.sessions.is_empty());
-        assert!(cfg.tmux_socket.is_none());
-        // Two, not three: `theme` is silent here on purpose, see below.
-        assert!(cfg.theme.is_none());
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        .is_err());
     }
 
     /// One mistake, one warning.
     ///
-    /// The `theme` key is parsed twice on this machine: here, so a config
-    /// carrying it is not an unknown key, and in cyclops-theme, which is
-    /// the crate that resolves it and paints from it. Both used to
-    /// complain about a wrong type in different words, and the daemon's
-    /// version named a fallback it does not have, because nothing in the
-    /// daemon reads the value at all.
+    /// The daemon acknowledges `theme` only because it shares a file with
+    /// the theme engine. It never gives the key a daemon meaning.
     #[test]
     fn a_wrong_typed_theme_key_is_the_theme_engine_s_to_complain_about() {
         let home = cyclops_proto::scratch::scratch_dir("cfg-theme-key");
         std::fs::create_dir_all(&home).expect("create scratch home");
         std::fs::write(home.join("config.toml"), "theme = 3\n").expect("write config");
 
-        let (cfg, warnings) = Config::load(&home).expect("load config");
-        assert!(cfg.theme.is_none());
+        let (_, warnings) = Config::load(&home).expect("load config");
         assert!(
             !warnings.iter().any(|w| w.contains("theme")),
             "the daemon complained about a key it never reads: {warnings:?}"
@@ -444,6 +413,20 @@ next_tab = "Alt+n"
     #[test]
     fn syntax_error_is_an_error() {
         assert!(Config::parse("sessions = [", Path::new("/h")).is_err());
+    }
+
+    #[test]
+    fn descriptor_backed_load_refuses_malformed_coordinator_config() {
+        let home = cyclops_proto::scratch::scratch_dir("cfg-safe-coordinator-load");
+        let _ = std::fs::remove_dir_all(&home);
+        cyclops_state::StateRoot::open_or_create(&home)
+            .expect("create safe home")
+            .replace_file(Path::new("config.toml"), b"tmux_socket = [")
+            .expect("write malformed config");
+
+        assert!(Config::load(&home).is_err());
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

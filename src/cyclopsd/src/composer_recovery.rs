@@ -50,13 +50,6 @@ pub(crate) enum RecoveryAction {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LifecycleRetirement {
-    NotReady,
-    Durable(NotificationAttemptId),
-    Blocked(&'static str),
-}
-
 fn same_physical_pane(left: RecipientKey, right: RecipientKey) -> bool {
     left.workspace_id() == right.workspace_id()
         && left.pane_id().is_some()
@@ -95,7 +88,7 @@ impl RecoveryCoordinator {
         self.tracked_attempts.insert(attempt_id);
     }
 
-    fn writer_unknown(&self) -> bool {
+    pub(crate) fn writer_unknown(&self) -> bool {
         self.writer_unknown
     }
 
@@ -119,11 +112,11 @@ impl RecoveryCoordinator {
             .collect()
     }
 
-    fn contains(&self, attempt_id: NotificationAttemptId) -> bool {
+    pub(crate) fn contains(&self, attempt_id: NotificationAttemptId) -> bool {
         self.tracked_attempts.contains(&attempt_id)
     }
 
-    fn reserve_record(
+    pub(crate) fn reserve_record(
         &mut self,
         canonical: &[NotificationRecord],
         attempt_id: NotificationAttemptId,
@@ -237,7 +230,7 @@ impl RecoveryCoordinator {
         self.retiring.remove(&attempt_id);
     }
 
-    fn require_reopen(&mut self) {
+    pub(crate) fn require_reopen(&mut self) {
         self.writer_unknown = true;
         self.retiring.clear();
     }
@@ -346,79 +339,47 @@ pub(crate) fn clean_composer_for_binding(
     detection_manifest == Some(binding.manifest.as_str()) && clean_composer(det, in_mode)
 }
 
-/// Bind a turn start observed after a recovered barrier was restored.
+/// Name the recovered attempt which may consume one exact lifecycle start.
 ///
-/// `StagedDuringTurn` is excluded because the turn already running when the
-/// barrier was restored cannot prove it consumed the staged payload. Once it
-/// ends, the hold returns to `Staged` and the next exact start may bind.
-pub(crate) fn bind_post_recovery_turn(
-    inner: &std::sync::Arc<Inner>,
+/// This is physical cache evidence only. The composition root asks
+/// `WorkspaceMessaging` whether the attempt is still active before binding the
+/// turn. `StagedDuringTurn` is excluded because the turn already running when
+/// the barrier was restored cannot prove it consumed the staged payload.
+pub(crate) fn recovered_turn_candidate(
+    inner: &Inner,
     session_idx: usize,
     pane_id: &str,
-    turn: crate::turnkey::TurnKey,
-    since_ms: u64,
-) -> bool {
-    let attempt_id = {
-        let detections = inner.detections.lock().expect("detections lock");
-        let Some(entry) = detections.get(&crate::PaneKey::new(session_idx, pane_id)) else {
-            return false;
-        };
-        if !matches!(
-            entry.hold,
-            ComposerHold::Staged | ComposerHold::TurnStarted { .. }
-        ) {
-            return false;
-        }
-        let Some(owner) = entry.hold_owner.as_deref() else {
-            return false;
-        };
-        let Ok(attempt_id) = NotificationAttemptId::parse(owner) else {
-            return false;
-        };
-        attempt_id
-    };
-    if !inner
-        .composer_recovery
-        .lock()
-        .expect("composer recovery lock")
-        .contains(attempt_id)
-    {
-        return false;
+) -> Option<NotificationAttemptId> {
+    let detections = inner.detections.lock().expect("detections lock");
+    let entry = detections.get(&crate::PaneKey::new(session_idx, pane_id))?;
+    if !matches!(
+        entry.hold,
+        ComposerHold::Staged | ComposerHold::TurnStarted { .. }
+    ) {
+        return None;
     }
-    fusion::bind_turn(
-        inner,
-        session_idx,
-        pane_id,
-        &attempt_id.to_string(),
-        turn,
-        since_ms,
-    )
-    .is_some()
+    NotificationAttemptId::parse(entry.hold_owner.as_deref()?).ok()
 }
 
 /// Persist exact post-restart lifecycle evidence before fusion consumes it.
 ///
 /// The runtime candidate is copied under the established detection then
 /// turn-end lock order. Journal IO starts only after both locks are released.
-pub(crate) fn retire_exact_lifecycle(
+pub(crate) fn exact_lifecycle_candidate(
     inner: &Inner,
     session_idx: usize,
     pane_id: &str,
     live: Option<&NotificationBinding>,
     clean_composer: bool,
-) -> LifecycleRetirement {
+) -> Option<NotificationAttemptId> {
     if !clean_composer {
-        return LifecycleRetirement::NotReady;
+        return None;
     }
-    let Some(live) = live else {
-        return LifecycleRetirement::NotReady;
-    };
+    let live = live?;
     let candidate = {
         let pane = crate::PaneKey::new(session_idx, pane_id);
         let detections = inner.detections.lock().expect("detections lock");
-        let Some(entry) = detections.get(&pane) else {
-            return LifecycleRetirement::NotReady;
-        };
+        let entry = detections.get(&pane)?;
         let live_agent = crate::identity::ProcId {
             pid: live.agent.pid(),
             birth: live.agent.birth(),
@@ -427,13 +388,13 @@ pub(crate) fn retire_exact_lifecycle(
             || entry.manifest.as_deref() != Some(live.manifest.as_str())
             || !matches!(entry.hold, ComposerHold::TurnStarted { .. })
         {
-            return LifecycleRetirement::NotReady;
+            return None;
         }
         let (Some(owner), Some(turn)) = (entry.hold_owner.as_deref(), entry.turn.as_ref()) else {
-            return LifecycleRetirement::NotReady;
+            return None;
         };
         let Ok(attempt_id) = NotificationAttemptId::parse(owner) else {
-            return LifecycleRetirement::NotReady;
+            return None;
         };
         if !crate::turnkey::PaneEnds::holds(
             &inner.turn_ends.lock().expect("turn ends lock"),
@@ -442,227 +403,11 @@ pub(crate) fn retire_exact_lifecycle(
             live.manifest.as_str(),
             turn,
         ) {
-            return LifecycleRetirement::NotReady;
+            return None;
         }
         attempt_id
     };
-
-    let Some(service) = inner.mailbox.as_ref() else {
-        return LifecycleRetirement::Blocked("composer_recovery_store_unavailable");
-    };
-    let canonical = match service.active_notification_barriers() {
-        Ok(records) => records,
-        Err(_) => {
-            return LifecycleRetirement::Blocked("composer_recovery_store_unavailable");
-        }
-    };
-    if canonical.iter().any(|record| {
-        record.attempt_id == candidate && record.needs_claimed_ack_timeout_reconciliation()
-    }) {
-        // Exact attempt ACK-timeout recovery owns its own clear-or-clean settlement
-        // fact. A turn end cannot remove that barrier or hide its alarm.
-        return LifecycleRetirement::Blocked("claimed_notification_reconciliation_pending");
-    }
-    let record = match inner
-        .composer_recovery
-        .lock()
-        .expect("composer recovery lock")
-        .reserve_record(&canonical, candidate)
-    {
-        Ok(Some(record)) => record,
-        // Another durable cause already removed this barrier. Runtime
-        // settlement is now safe without appending a duplicate retirement.
-        Ok(None) => return LifecycleRetirement::Durable(candidate),
-        Err(reason) => return LifecycleRetirement::Blocked(reason),
-    };
-    let action = RecoveryAction::Retire {
-        record: Box::new(record),
-        cause: NotificationBarrierRetirementCause::LifecycleReconciled,
-        replacement: None,
-    };
-    match persist(inner, &action) {
-        Ok(attempt_id) => LifecycleRetirement::Durable(attempt_id),
-        Err(reason) => LifecycleRetirement::Blocked(reason),
-    }
-}
-
-/// Read active boot barriers for this physical pane from the canonical projection.
-///
-/// The exact durable recipient still scopes compaction. Recovery additionally
-/// follows the globally unique tmux pane id across a session move so the same
-/// physical composer cannot shed its barrier by changing routes.
-pub(crate) fn active_for_recipient(
-    inner: &Inner,
-    recipient: RecipientKey,
-) -> Result<Vec<NotificationRecord>, &'static str> {
-    let service = inner
-        .mailbox
-        .as_ref()
-        .ok_or("composer_recovery_store_unavailable")?;
-    let canonical = service
-        .active_notification_barriers()
-        .map_err(|_| "composer_recovery_store_unavailable")?;
-    let mut recovery = inner
-        .composer_recovery
-        .lock()
-        .expect("composer recovery lock");
-    let records = recovery.active_for_recipient(&canonical, recipient);
-    if recovery.writer_unknown() && !records.is_empty() {
-        Err("composer_recovery_reopen_required")
-    } else {
-        Ok(records)
-    }
-}
-
-/// Persist a decision after dropping the recovery coordinator lock.
-pub(crate) fn persist(
-    inner: &Inner,
-    action: &RecoveryAction,
-) -> Result<NotificationAttemptId, &'static str> {
-    let RecoveryAction::Retire {
-        record,
-        cause,
-        replacement,
-    } = action
-    else {
-        return Err("composer_recovery_not_a_retirement");
-    };
-    let attempt_id = record.attempt_id;
-    let Some(service) = inner.mailbox.as_ref() else {
-        inner
-            .composer_recovery
-            .lock()
-            .expect("composer recovery lock")
-            .retirement_failed(attempt_id);
-        return Err("composer_recovery_store_unavailable");
-    };
-    let result = service.retire_notification_barrier(record, *cause, replacement.clone());
-    let writer_unknown = result.as_ref().is_err_and(writer_requires_reopen);
-    let mut recovery = inner
-        .composer_recovery
-        .lock()
-        .expect("composer recovery lock");
-    if result.is_ok() {
-        recovery.retired(attempt_id);
-    } else {
-        recovery.retirement_failed(attempt_id);
-        if writer_unknown {
-            recovery.require_reopen();
-        }
-    }
-    result
-        .map(|()| attempt_id)
-        .map_err(|_| "composer_recovery_retirement_failed")
-}
-
-/// Retire every active barrier for one route before the route is forgotten.
-pub(crate) fn retire_gone_recipient(
-    inner: &Inner,
-    recipient: RecipientKey,
-) -> Result<(), &'static str> {
-    let service = inner
-        .mailbox
-        .as_ref()
-        .ok_or("composer_recovery_store_unavailable")?;
-    let records: Vec<_> = service
-        .active_notification_barriers()
-        .map_err(|_| "composer_recovery_store_unavailable")?
-        .into_iter()
-        .filter(|record| record.recipient == recipient)
-        .collect();
-    if records.is_empty() {
-        return Ok(());
-    }
-    if inner
-        .composer_recovery
-        .lock()
-        .expect("composer recovery lock")
-        .writer_unknown()
-    {
-        return Err("composer_recovery_reopen_required");
-    }
-    for record in records {
-        if let Err(error) = service.retire_notification_barrier(
-            &record,
-            NotificationBarrierRetirementCause::PaneGone,
-            None,
-        ) {
-            if writer_requires_reopen(&error) {
-                inner
-                    .composer_recovery
-                    .lock()
-                    .expect("composer recovery lock")
-                    .require_reopen();
-            }
-            return Err("composer_recovery_retirement_failed");
-        }
-        inner
-            .composer_recovery
-            .lock()
-            .expect("composer recovery lock")
-            .retired(record.attempt_id);
-    }
-    Ok(())
-}
-
-/// Retire every barrier owned by a process generation that was replaced.
-///
-/// The caller first validates the registry's exact old root while holding the
-/// route-publication transaction. A stale replacement edge therefore cannot
-/// reach this operation or retire barriers owned by a newer occupant. The
-/// retirement is persisted before the registry rebind because the physical
-/// replacement remains true even if that later registry write fails. The
-/// replacement binding is the positive process and manifest observation that
-/// makes the durable cause truthful.
-pub(crate) fn retire_replaced_recipient(
-    inner: &Inner,
-    recipient: RecipientKey,
-    replacement: Option<NotificationBinding>,
-) -> Result<(), &'static str> {
-    let service = inner
-        .mailbox
-        .as_ref()
-        .ok_or("composer_recovery_store_unavailable")?;
-    let records: Vec<_> = service
-        .active_notification_barriers()
-        .map_err(|_| "composer_recovery_store_unavailable")?
-        .into_iter()
-        .filter(|record| record.recipient == recipient)
-        .collect();
-    if records.is_empty() {
-        return Ok(());
-    }
-    let replacement = replacement.ok_or("composer_recovery_replacement_unproven")?;
-    if inner
-        .composer_recovery
-        .lock()
-        .expect("composer recovery lock")
-        .writer_unknown()
-    {
-        return Err("composer_recovery_reopen_required");
-    }
-    for record in records {
-        if let Err(error) = service.retire_notification_barrier(
-            &record,
-            NotificationBarrierRetirementCause::OccupantReplaced,
-            Some(replacement.clone()),
-        ) {
-            if writer_requires_reopen(&error) {
-                inner
-                    .composer_recovery
-                    .lock()
-                    .expect("composer recovery lock")
-                    .require_reopen();
-            }
-            return Err("composer_recovery_retirement_failed");
-        }
-        inner
-            .composer_recovery
-            .lock()
-            .expect("composer recovery lock")
-            .retired(record.attempt_id);
-    }
-    Ok(())
+    Some(candidate)
 }
 
 /// Prove physical pane loss against the whole tmux server.
@@ -719,7 +464,7 @@ pub(crate) fn pane_root_gone(adoption: &crate::registry::Adoption) -> Result<boo
     }
 }
 
-fn writer_requires_reopen(error: &mailbox::MailboxServiceError) -> bool {
+pub(crate) fn writer_requires_reopen(error: &mailbox::MailboxServiceError) -> bool {
     matches!(
         error,
         mailbox::MailboxServiceError::Store(mailbox::MessageStoreError::Ledger(

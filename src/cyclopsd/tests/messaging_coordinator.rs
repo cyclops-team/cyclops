@@ -2,14 +2,14 @@ mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{
     composer_pane, faketui_path, hold_script, manual_lifecycle_composer_pane,
-    swallowing_animated_composer_pane, tmux_available, wait_pane_state, Rig, CAT_MANIFEST,
-    HOOK_MANIFEST, LIVENESS_MANIFEST, MODAL_MANIFEST,
+    swallowing_animated_composer_pane, tmux_available, wait_pane_state, Rig, TestClient,
+    CAT_MANIFEST, HOOK_MANIFEST, LIVENESS_MANIFEST, MODAL_MANIFEST, QUOTA_MANIFEST,
 };
 use cyclops_proto::{
     Kind, LedgerLine, MessageId, MsgSendParams, NotificationAttemptId, NotificationState,
@@ -213,6 +213,95 @@ async fn send_summarized_workspace_message(
         )
         .await
         .unwrap()
+}
+
+// Obsolete if a mailbox quota reset no longer requires a fresh pane
+// observation followed by explicit operator requeue.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_positive_quota_observation_commits_before_cancelled_chrome_repaint() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let script = "sh -c 'echo \"Individual quota reached. Please upgrade your subscription.\"; read x; printf \"\\033[2J\\033[H\"; exec cat'";
+    let mut rig = Rig::new(
+        "workspace-quota-reset-observation",
+        QUOTA_MANIFEST,
+        script,
+        "",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "blocked_quota").await;
+
+    let sent = send_workspace_message(
+        &rig,
+        "quota-reset-observation",
+        "Held during quota",
+        "body stays durable",
+    )
+    .await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    let held_notice = rig
+        .ev
+        .wait_event(Duration::from_secs(8), |event| {
+            event["event"] == "admin-notify"
+                && event["data"]["level"] == "urgent"
+                && event["data"]["id"] == message_id.as_str()
+        })
+        .await;
+    assert!(held_notice["data"]["body"]
+        .as_str()
+        .is_some_and(|body| body.contains("will not resume automatically")));
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::QuotaHeld),
+        1
+    );
+    let attempts_before = notification_attempts(&rig, &message_id);
+
+    let repaint = rig.daemon.pause_next_chrome_repaint_for_test();
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
+    tokio::time::timeout(Duration::from_secs(8), repaint.wait_until_entered())
+        .await
+        .expect("quota reset did not reach the post-commit chrome boundary");
+    let reset_notice = rig
+        .ev
+        .wait_event(Duration::from_secs(8), |event| {
+            event["event"] == "admin-notify"
+                && event["data"]["level"] == "action_required"
+                && event["data"]["id"] == message_id.as_str()
+        })
+        .await;
+    assert_eq!(
+        reset_notice["data"]["subject"],
+        "quota reset observed for worker"
+    );
+    assert!(reset_notice["data"]["body"]
+        .as_str()
+        .is_some_and(|body| body.contains(&format!("cyclops requeue {message_id}"))));
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::QuotaResetObserved),
+        1
+    );
+    assert_eq!(notification_attempts(&rig, &message_id), attempts_before);
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::Writing),
+        0,
+        "positive reset observation must not write or requeue"
+    );
+    let screen = rig.tmux.capture(&pane);
+    assert!(!screen.contains(&compact_doorbell(&rig, &message_id)));
+    assert!(!screen.contains("body stays durable"));
+
+    // Leave the repaint stalled. Shutdown cancels the owning daemon task,
+    // proving presentation cancellation cannot consume the already-committed
+    // reset edge.
+    rig.daemon.shutdown().await;
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::QuotaResetObserved),
+        1
+    );
 }
 
 struct WaitingPair {
@@ -792,6 +881,329 @@ async fn force_submit_sends_one_enter_for_the_exact_verify_failed_attempt() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn force_submit_waits_for_the_exact_reservation_release_before_revalidating() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "workspace-force-submit-resolution-release",
+        CAT_MANIFEST,
+        &composer_pane(),
+        "delivery_retry_max = 0\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let (pre_tx, mut pre_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reservation_tx, mut reservation_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (force_waiting_tx, mut force_waiting_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pre_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let reservation_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let first_pre = Arc::new(AtomicBool::new(true));
+    let first_reservation = Arc::new(AtomicBool::new(true));
+    let first_force_wait = Arc::new(AtomicBool::new(true));
+    rig.daemon.set_inject_pause({
+        let pre_release = Arc::clone(&pre_release);
+        let reservation_release = Arc::clone(&reservation_release);
+        let first_pre = Arc::clone(&first_pre);
+        let first_reservation = Arc::clone(&first_reservation);
+        let first_force_wait = Arc::clone(&first_force_wait);
+        move |phase| {
+            let pre_tx = pre_tx.clone();
+            let reservation_tx = reservation_tx.clone();
+            let force_waiting_tx = force_waiting_tx.clone();
+            let pre_release = Arc::clone(&pre_release);
+            let reservation_release = Arc::clone(&reservation_release);
+            let pause_pre = phase == "pre_submit" && first_pre.swap(false, Ordering::SeqCst);
+            let pause_reservation = phase == "attention_after_reservation"
+                && first_reservation.swap(false, Ordering::SeqCst);
+            let report_force_wait = phase == "force_submit_waiting_for_resolution_release"
+                && first_force_wait.swap(false, Ordering::SeqCst);
+            Box::pin(async move {
+                if pause_pre {
+                    let _ = pre_tx.send(());
+                    pre_release.acquire_owned().await.unwrap().forget();
+                } else if pause_reservation {
+                    let _ = reservation_tx.send(());
+                    reservation_release.acquire_owned().await.unwrap().forget();
+                } else if report_force_wait {
+                    let _ = force_waiting_tx.send(());
+                }
+            })
+        }
+    });
+
+    let sent = send_workspace_message(
+        &rig,
+        "force-submit-resolution-release",
+        "Force submit waits for release",
+        "private body",
+    )
+    .await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    tokio::time::timeout(Duration::from_secs(5), pre_rx.recv())
+        .await
+        .expect("doorbell reached pre-submit")
+        .expect("pre-submit sender stayed open");
+    rig.tmux
+        .run_ok(&["send-keys", "-l", "-t", &pane, " trailing input"]);
+    rig.tmux.wait_screen("main", "trailing input");
+    pre_release.add_permits(1);
+
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::AttentionRequired).await;
+    tokio::time::timeout(Duration::from_secs(5), reservation_rx.recv())
+        .await
+        .expect("ordinary resolver acquired the exact reservation")
+        .expect("ordinary resolver sender stayed open");
+
+    let enabled = rig
+        .ctl
+        .request(
+            "notification.force_submit.set",
+            json!({"enabled": true, "delay_seconds": 0}),
+        )
+        .await;
+    assert_eq!(enabled["result"]["enabled"], true, "{enabled}");
+    tokio::time::timeout(Duration::from_secs(5), force_waiting_rx.recv())
+        .await
+        .expect("force-submit observed the conflicting reservation")
+        .expect("force-submit wait sender stayed open");
+    assert_eq!(
+        pane_history(&rig, &pane).matches("FAKETUI-WORKING").count(),
+        0,
+        "force-submit pressed Enter while another resolver still owned the attempt"
+    );
+
+    reservation_release.add_permits(1);
+    let intent = wait_for_workspace_fact(&rig, &message_id, "notification_resolution_intent").await;
+    assert_eq!(intent.data.as_ref().unwrap()["forced"], true);
+    wait_for_workspace_fact(&rig, &message_id, "notification_resolution_action_accepted").await;
+    rig.tmux.wait_screen("main", "FAKETUI-WORKING");
+
+    let lines = workspace_lines(&rig);
+    for fact_type in [
+        "notification_resolution_intent",
+        "notification_resolution_action_accepted",
+    ] {
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| {
+                    line.id == message_id
+                        && line
+                            .data
+                            .as_ref()
+                            .is_some_and(|data| data["type"] == fact_type)
+                })
+                .count(),
+            1,
+            "the exact release handoff appended {fact_type} more than once: {lines:#?}"
+        );
+    }
+    assert_eq!(
+        pane_history(&rig, &pane).matches("FAKETUI-WORKING").count(),
+        1,
+        "the release handoff pressed Enter more than once"
+    );
+
+    rig.daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn force_submit_waits_through_successive_reservations_until_one_forced_action_can_run() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "workspace-force-submit-successive-reservations",
+        CAT_MANIFEST,
+        &composer_pane(),
+        "delivery_retry_max = 0\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let (pre_tx, mut pre_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (a_reserved_tx, mut a_reserved_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (b_reserved_tx, mut b_reserved_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (force_waiting_tx, mut force_waiting_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (after_a_release_tx, mut after_a_release_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pre_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let a_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let b_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let force_after_a_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let first_pre = Arc::new(AtomicBool::new(true));
+    let reservation_count = Arc::new(AtomicUsize::new(0));
+    let first_after_a_release = Arc::new(AtomicBool::new(true));
+    rig.daemon.set_inject_pause({
+        let pre_release = Arc::clone(&pre_release);
+        let a_release = Arc::clone(&a_release);
+        let b_release = Arc::clone(&b_release);
+        let force_after_a_release = Arc::clone(&force_after_a_release);
+        let first_pre = Arc::clone(&first_pre);
+        let reservation_count = Arc::clone(&reservation_count);
+        let first_after_a_release = Arc::clone(&first_after_a_release);
+        move |phase| {
+            let pre_tx = pre_tx.clone();
+            let a_reserved_tx = a_reserved_tx.clone();
+            let b_reserved_tx = b_reserved_tx.clone();
+            let force_waiting_tx = force_waiting_tx.clone();
+            let after_a_release_tx = after_a_release_tx.clone();
+            let pre_release = Arc::clone(&pre_release);
+            let a_release = Arc::clone(&a_release);
+            let b_release = Arc::clone(&b_release);
+            let force_after_a_release = Arc::clone(&force_after_a_release);
+            let pause_pre = phase == "pre_submit" && first_pre.swap(false, Ordering::SeqCst);
+            let reservation = (phase == "attention_after_reservation")
+                .then(|| reservation_count.fetch_add(1, Ordering::SeqCst));
+            let pause_after_a_release = phase == "force_submit_after_resolution_release"
+                && first_after_a_release.swap(false, Ordering::SeqCst);
+            let force_waiting = phase == "force_submit_waiting_for_resolution_release";
+            Box::pin(async move {
+                if pause_pre {
+                    let _ = pre_tx.send(());
+                    pre_release.acquire_owned().await.unwrap().forget();
+                } else if let Some(0) = reservation {
+                    let _ = a_reserved_tx.send(());
+                    a_release.acquire_owned().await.unwrap().forget();
+                } else if let Some(1) = reservation {
+                    let _ = b_reserved_tx.send(());
+                    b_release.acquire_owned().await.unwrap().forget();
+                } else if force_waiting {
+                    let _ = force_waiting_tx.send(());
+                } else if pause_after_a_release {
+                    let _ = after_a_release_tx.send(());
+                    force_after_a_release
+                        .acquire_owned()
+                        .await
+                        .unwrap()
+                        .forget();
+                }
+            })
+        }
+    });
+
+    let sent = send_workspace_message(
+        &rig,
+        "force-submit-successive-reservations",
+        "Force submit survives successor reservations",
+        "private body",
+    )
+    .await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    tokio::time::timeout(Duration::from_secs(5), pre_rx.recv())
+        .await
+        .expect("doorbell reached pre-submit")
+        .expect("pre-submit sender stayed open");
+    rig.tmux
+        .run_ok(&["send-keys", "-l", "-t", &pane, " trailing input"]);
+    rig.tmux.wait_screen("main", "trailing input");
+    pre_release.add_permits(1);
+
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::AttentionRequired).await;
+    let attempt_id = current_notification_attempt(&workspace_lines(&rig), &message_id)
+        .expect("attention-required message has one current attempt");
+    tokio::time::timeout(Duration::from_secs(5), a_reserved_rx.recv())
+        .await
+        .expect("automatic resolver A reserved the attempt")
+        .expect("resolver A sender stayed open");
+
+    let enabled = rig
+        .ctl
+        .request(
+            "notification.force_submit.set",
+            json!({"enabled": true, "delay_seconds": 0}),
+        )
+        .await;
+    assert_eq!(enabled["result"]["enabled"], true, "{enabled}");
+    tokio::time::timeout(Duration::from_secs(5), force_waiting_rx.recv())
+        .await
+        .expect("force-submit waited for resolver A")
+        .expect("force-submit wait sender stayed open");
+
+    // Hold force-submit after A releases, then let explicit resolver B acquire
+    // the same exact reservation. This reproduces the successor race without
+    // guessing at task scheduling.
+    a_release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), after_a_release_rx.recv())
+        .await
+        .expect("force-submit received resolver A's release")
+        .expect("force-submit release sender stayed open");
+    let socket = rig.daemon.socket_path();
+    let requested_attempt = attempt_id.to_string();
+    let resolver_b = tokio::spawn(async move {
+        let mut client = TestClient::connect(&socket).await;
+        client
+            .request("attention.complete", json!({"id": requested_attempt}))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), b_reserved_rx.recv())
+        .await
+        .expect("explicit resolver B reserved after A")
+        .expect("resolver B sender stayed open");
+
+    force_after_a_release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(5), force_waiting_rx.recv())
+        .await
+        .expect("force-submit waited for resolver B instead of exiting")
+        .expect("force-submit second wait sender stayed open");
+    assert_eq!(
+        pane_history(&rig, &pane).matches("FAKETUI-WORKING").count(),
+        0,
+        "force-submit pressed Enter while either resolver still owned the attempt"
+    );
+
+    b_release.add_permits(1);
+    let b_result = tokio::time::timeout(Duration::from_secs(5), resolver_b)
+        .await
+        .expect("resolver B returned after its reservation released")
+        .expect("resolver B task joined");
+    assert_eq!(
+        b_result["error"]["code"], "attention_evidence_failed",
+        "resolver B must cancel before recording any terminal intent: {b_result}"
+    );
+
+    let intent = wait_for_workspace_fact(&rig, &message_id, "notification_resolution_intent").await;
+    assert_eq!(intent.data.as_ref().unwrap()["forced"], true);
+    wait_for_workspace_fact(&rig, &message_id, "notification_resolution_action_accepted").await;
+    rig.tmux.wait_screen("main", "FAKETUI-WORKING");
+
+    let lines = workspace_lines(&rig);
+    for fact_type in [
+        "notification_resolution_intent",
+        "notification_resolution_action_accepted",
+    ] {
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| {
+                    line.id == message_id
+                        && line
+                            .data
+                            .as_ref()
+                            .is_some_and(|data| data["type"] == fact_type)
+                })
+                .count(),
+            1,
+            "successive reservations appended {fact_type} more than once: {lines:#?}"
+        );
+    }
+    assert_eq!(
+        pane_history(&rig, &pane).matches("FAKETUI-WORKING").count(),
+        1,
+        "successive reservations allowed more than one forced Enter"
+    );
+
+    rig.daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn claiming_the_message_before_the_timer_cancels_force_submit() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
@@ -869,6 +1281,416 @@ async fn claiming_the_message_before_the_timer_cancels_force_submit() {
         pane_history(&rig, &pane).matches("FAKETUI-WORKING").count(),
         0,
         "claim cancellation still pressed Enter"
+    );
+
+    rig.daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claiming_after_forced_intent_withholds_the_submit_key() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "workspace-force-submit-claim-after-intent",
+        CAT_MANIFEST,
+        &composer_pane(),
+        "delivery_retry_max = 0\nforce_notification_submit = \"on\"\nforce_notification_submit_delay_ms = 0\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let (pre_tx, mut pre_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (intent_tx, mut intent_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pre_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let intent_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let first_pre = Arc::new(AtomicBool::new(true));
+    let first_intent = Arc::new(AtomicBool::new(true));
+    rig.daemon.set_inject_pause({
+        let pre_release = Arc::clone(&pre_release);
+        let intent_release = Arc::clone(&intent_release);
+        let first_pre = Arc::clone(&first_pre);
+        let first_intent = Arc::clone(&first_intent);
+        move |phase| {
+            let pre_tx = pre_tx.clone();
+            let intent_tx = intent_tx.clone();
+            let key_tx = key_tx.clone();
+            let pre_release = Arc::clone(&pre_release);
+            let intent_release = Arc::clone(&intent_release);
+            let pause_pre = phase == "pre_submit" && first_pre.swap(false, Ordering::SeqCst);
+            let pause_intent =
+                phase == "force_submit_after_intent" && first_intent.swap(false, Ordering::SeqCst);
+            let sent_key = phase == "force_submit_after_key_before_accepted";
+            Box::pin(async move {
+                if pause_pre {
+                    let _ = pre_tx.send(());
+                    pre_release.acquire_owned().await.unwrap().forget();
+                } else if pause_intent {
+                    let _ = intent_tx.send(());
+                    intent_release.acquire_owned().await.unwrap().forget();
+                } else if sent_key {
+                    let _ = key_tx.send(());
+                }
+            })
+        }
+    });
+
+    let sent = send_workspace_message(
+        &rig,
+        "force-submit-claim-after-intent",
+        "Claim after forced intent",
+        "private body",
+    )
+    .await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    tokio::time::timeout(Duration::from_secs(5), pre_rx.recv())
+        .await
+        .expect("doorbell reached pre-submit")
+        .expect("pre-submit sender stayed open");
+    rig.tmux
+        .run_ok(&["send-keys", "-l", "-t", &pane, " trailing input"]);
+    rig.tmux.wait_screen("main", "trailing input");
+    pre_release.add_permits(1);
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::AttentionRequired).await;
+
+    tokio::time::timeout(Duration::from_secs(5), intent_rx.recv())
+        .await
+        .expect("force-submit recorded durable intent")
+        .expect("intent sender stayed open");
+    rig.daemon
+        .claim_message_for_test("worker", &message_id)
+        .expect("recipient claims the exact message after forced intent");
+    intent_release.add_permits(1);
+
+    let withdrawn = wait_for_workspace_fact(
+        &rig,
+        &message_id,
+        "notification_resolution_intent_withdrawn",
+    );
+    tokio::pin!(withdrawn);
+    tokio::select! {
+        _ = key_rx.recv() => panic!(
+            "a claim after forced intent still reached the terminal submit key"
+        ),
+        _ = &mut withdrawn => {}
+    }
+
+    let lines = workspace_lines(&rig);
+    for fact_type in [
+        "notification_resolution_action_reserved",
+        "notification_resolution_action_accepted",
+    ] {
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| {
+                    line.id == message_id
+                        && line
+                            .data
+                            .as_ref()
+                            .is_some_and(|data| data["type"] == fact_type)
+                })
+                .count(),
+            0,
+            "claim cancellation must happen before {fact_type}: {lines:#?}"
+        );
+    }
+    assert_eq!(
+        pane_history(&rig, &pane).matches("FAKETUI-WORKING").count(),
+        0,
+        "claim cancellation still pressed Enter"
+    );
+
+    rig.daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn disabling_force_submit_before_the_forced_key_reservation_withholds_the_key() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "workspace-force-submit-disable-before-reservation",
+        CAT_MANIFEST,
+        &composer_pane(),
+        "delivery_retry_max = 0\nforce_notification_submit = \"on\"\nforce_notification_submit_delay_ms = 0\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let (pre_tx, mut pre_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (setting_tx, mut setting_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pre_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let setting_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let first_pre = Arc::new(AtomicBool::new(true));
+    let first_setting = Arc::new(AtomicBool::new(true));
+    rig.daemon.set_inject_pause({
+        let pre_release = Arc::clone(&pre_release);
+        let setting_release = Arc::clone(&setting_release);
+        let first_pre = Arc::clone(&first_pre);
+        let first_setting = Arc::clone(&first_setting);
+        move |phase| {
+            let pre_tx = pre_tx.clone();
+            let setting_tx = setting_tx.clone();
+            let key_tx = key_tx.clone();
+            let pre_release = Arc::clone(&pre_release);
+            let setting_release = Arc::clone(&setting_release);
+            let pause_pre = phase == "pre_submit" && first_pre.swap(false, Ordering::SeqCst);
+            let pause_setting = phase == "force_submit_after_setting_check_before_reservation"
+                && first_setting.swap(false, Ordering::SeqCst);
+            let sent_key = phase == "force_submit_after_key_before_accepted";
+            Box::pin(async move {
+                if pause_pre {
+                    let _ = pre_tx.send(());
+                    pre_release.acquire_owned().await.unwrap().forget();
+                } else if pause_setting {
+                    let _ = setting_tx.send(());
+                    setting_release.acquire_owned().await.unwrap().forget();
+                } else if sent_key {
+                    let _ = key_tx.send(());
+                }
+            })
+        }
+    });
+
+    let sent = send_workspace_message(
+        &rig,
+        "force-submit-disable-before-reservation",
+        "Disable before forced key reservation",
+        "private body",
+    )
+    .await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    tokio::time::timeout(Duration::from_secs(5), pre_rx.recv())
+        .await
+        .expect("doorbell reached pre-submit")
+        .expect("pre-submit sender stayed open");
+    rig.tmux
+        .run_ok(&["send-keys", "-l", "-t", &pane, " trailing input"]);
+    rig.tmux.wait_screen("main", "trailing input");
+    pre_release.add_permits(1);
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::AttentionRequired).await;
+
+    tokio::time::timeout(Duration::from_secs(5), setting_rx.recv())
+        .await
+        .expect("force-submit read the enabled setting before reservation")
+        .expect("setting-check sender stayed open");
+    let disabled = rig
+        .ctl
+        .request(
+            "notification.force_submit.set",
+            json!({"enabled": false, "delay_seconds": 0}),
+        )
+        .await;
+    assert_eq!(disabled["result"]["enabled"], false, "{disabled}");
+    setting_release.add_permits(1);
+
+    let withdrawn = wait_for_workspace_fact(
+        &rig,
+        &message_id,
+        "notification_resolution_intent_withdrawn",
+    );
+    tokio::pin!(withdrawn);
+    tokio::select! {
+        _ = key_rx.recv() => panic!(
+            "a successful force-submit disable still reached the terminal key"
+        ),
+        _ = &mut withdrawn => {}
+    }
+
+    let lines = workspace_lines(&rig);
+    for fact_type in [
+        "notification_resolution_action_reserved",
+        "notification_resolution_action_accepted",
+    ] {
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| {
+                    line.id == message_id
+                        && line
+                            .data
+                            .as_ref()
+                            .is_some_and(|data| data["type"] == fact_type)
+                })
+                .count(),
+            0,
+            "disable must withdraw before {fact_type}: {lines:#?}"
+        );
+    }
+    assert_eq!(
+        pane_history(&rig, &pane).matches("FAKETUI-WORKING").count(),
+        0,
+        "a successful disable still pressed Enter"
+    );
+
+    rig.daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn later_disable_or_claim_cannot_revoke_the_forced_key_reservation() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new(
+        "workspace-force-submit-events-after-reservation",
+        CAT_MANIFEST,
+        &composer_pane(),
+        "delivery_retry_max = 0\nforce_notification_submit = \"on\"\nforce_notification_submit_delay_ms = 0\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    wait_pane_state(&mut rig, "idle").await;
+
+    let (pre_tx, mut pre_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reservation_tx, mut reservation_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pre_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let reservation_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let first_pre = Arc::new(AtomicBool::new(true));
+    let first_reservation = Arc::new(AtomicBool::new(true));
+    rig.daemon.set_inject_pause({
+        let pre_release = Arc::clone(&pre_release);
+        let reservation_release = Arc::clone(&reservation_release);
+        let first_pre = Arc::clone(&first_pre);
+        let first_reservation = Arc::clone(&first_reservation);
+        move |phase| {
+            let pre_tx = pre_tx.clone();
+            let reservation_tx = reservation_tx.clone();
+            let pre_release = Arc::clone(&pre_release);
+            let reservation_release = Arc::clone(&reservation_release);
+            let pause_pre = phase == "pre_submit" && first_pre.swap(false, Ordering::SeqCst);
+            let pause_reservation = phase == "force_submit_after_terminal_key_reservation"
+                && first_reservation.swap(false, Ordering::SeqCst);
+            Box::pin(async move {
+                if pause_pre {
+                    let _ = pre_tx.send(());
+                    pre_release.acquire_owned().await.unwrap().forget();
+                } else if pause_reservation {
+                    let _ = reservation_tx.send(());
+                    reservation_release.acquire_owned().await.unwrap().forget();
+                }
+            })
+        }
+    });
+
+    let sent = send_workspace_message(
+        &rig,
+        "force-submit-events-after-reservation",
+        "Events after forced key reservation",
+        "private body",
+    )
+    .await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    tokio::time::timeout(Duration::from_secs(5), pre_rx.recv())
+        .await
+        .expect("doorbell reached pre-submit")
+        .expect("pre-submit sender stayed open");
+    rig.tmux
+        .run_ok(&["send-keys", "-l", "-t", &pane, " trailing input"]);
+    rig.tmux.wait_screen("main", "trailing input");
+    pre_release.add_permits(1);
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::AttentionRequired).await;
+
+    tokio::time::timeout(Duration::from_secs(5), reservation_rx.recv())
+        .await
+        .expect("forced key reservation is durable before terminal IO")
+        .expect("reservation sender stayed open");
+    // A completed settings request affects future timers. It cannot revoke
+    // this key because the durable reservation is already the commit point.
+    let disabled = rig
+        .ctl
+        .request(
+            "notification.force_submit.set",
+            json!({"enabled": false, "delay_seconds": 0}),
+        )
+        .await;
+    assert_eq!(disabled["result"]["enabled"], false, "{disabled}");
+    rig.daemon
+        .claim_message_for_test("worker", &message_id)
+        .expect("recipient claims after the forced key reservation");
+    let lines_after_claim = workspace_lines(&rig);
+    let reservation_seq = lines_after_claim
+        .iter()
+        .find(|line| {
+            line.id == message_id
+                && line
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| data["type"] == "notification_resolution_action_reserved")
+        })
+        .expect("one durable forced key reservation")
+        .seq;
+    let claim_seq = lines_after_claim
+        .iter()
+        .find(|line| {
+            line.id == message_id
+                && line
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| data["type"] == "message_claimed")
+        })
+        .expect("recipient claim fact")
+        .seq;
+    assert!(
+        reservation_seq < claim_seq,
+        "the regression must exercise a claim ordered after the reservation: {lines_after_claim:#?}"
+    );
+
+    reservation_release.add_permits(1);
+    wait_for_workspace_fact(&rig, &message_id, "notification_resolution_action_accepted").await;
+    rig.tmux.wait_screen("main", "FAKETUI-WORKING");
+
+    let lines = workspace_lines(&rig);
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| {
+                line.id == message_id
+                    && line.data.as_ref().is_some_and(|data| {
+                        data["type"] == "notification_resolution_action_reserved"
+                    })
+            })
+            .count(),
+        1,
+        "exactly one forced key may be reserved: {lines:#?}"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| {
+                line.id == message_id
+                    && line.data.as_ref().is_some_and(|data| {
+                        data["type"] == "notification_resolution_action_accepted"
+                    })
+            })
+            .count(),
+        1,
+        "the ordered reservation must still send exactly one key: {lines:#?}"
+    );
+    assert!(
+        lines.iter().all(|line| {
+            line.id != message_id
+                || line
+                    .data
+                    .as_ref()
+                    .is_none_or(|data| data["type"] != "notification_resolution_intent_withdrawn")
+        }),
+        "events after reservation must not revoke its forced key: {lines:#?}"
+    );
+    assert_eq!(
+        pane_history(&rig, &pane).matches("FAKETUI-WORKING").count(),
+        1,
+        "the reservation boundary must admit exactly one terminal Enter"
     );
 
     rig.daemon.shutdown().await;
@@ -1961,7 +2783,11 @@ async fn a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt() 
     rig.label(&pane, "worker").await;
     wait_pane_state(&mut rig, "idle").await;
 
-    let draft = "erase this draft";
+    // One visible character is the smallest draft that exercises the contract:
+    // human input holds the attempt, and Backspace clears that same attempt.
+    // A longer draft made the test enqueue many independent tmux commands before
+    // reaching this boundary, which tested runner scheduling rather than release.
+    let draft = "e";
     rig.tmux.run_ok(&["send-keys", "-l", "-t", &pane, draft]);
     rig.tmux.wait_screen("main", draft);
     wait_for_human_composer_evidence(&mut rig, &pane).await;
@@ -1975,11 +2801,15 @@ async fn a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt() 
     .await;
     let message_id = sent["msg_id"].as_str().unwrap().to_string();
     rig.ev
-        .wait_event(Duration::from_secs(8), |event| {
-            event["event"] == "gate"
-                && event["data"]["id"] == message_id.as_str()
-                && event["data"]["action"] == "hold"
-        })
+        .wait_event_named(
+            Duration::from_secs(8),
+            "initial composer gate hold",
+            |event| {
+                event["event"] == "gate"
+                    && event["data"]["id"] == message_id.as_str()
+                    && event["data"]["action"] == "hold"
+            },
+        )
         .await;
     let attempts_before = notification_attempts(&rig, &message_id);
     assert_eq!(attempts_before.len(), 1);
@@ -1988,82 +2818,41 @@ async fn a_visible_human_draft_cleared_by_backspace_releases_the_same_attempt() 
         .capture(&pane)
         .contains(&compact_doorbell(&rig, &message_id)));
 
-    for _ in 1..draft.chars().count() {
-        rig.tmux.run_ok(&["send-keys", "-t", &pane, "BSpace"]);
-    }
-    // `send-keys` acceptance does not prove the pane has consumed every key.
-    // Pin the visible one-character boundary before the final deletion so the
-    // release observation cannot race an input backlog on a busy CI runner.
-    rig.tmux.wait_screen("main", "❯ e");
-    wait_for_human_composer_evidence(&mut rig, &pane).await;
-    assert!(!rig
-        .tmux
-        .capture(&pane)
-        .contains(&compact_doorbell(&rig, &message_id)));
-
-    // Observe release and staging as two separate causal phases. A single
-    // deadline spanning both lets unrelated tmux rigs consume the whole
-    // budget before injection begins on a loaded runner.
-    let (prewrite_tx, mut prewrite_rx) = tokio::sync::mpsc::unbounded_channel();
-    let prewrite_release = Arc::new(tokio::sync::Semaphore::new(0));
-    let prewrite_release_seam = Arc::clone(&prewrite_release);
-    let (staged_tx, mut staged_rx) = tokio::sync::mpsc::unbounded_channel();
-    let staged_release = Arc::new(tokio::sync::Semaphore::new(0));
-    let staged_release_seam = Arc::clone(&staged_release);
-    rig.daemon.set_inject_pause(move |phase| {
-        let prewrite_tx = prewrite_tx.clone();
-        let prewrite_release = Arc::clone(&prewrite_release_seam);
-        let staged_tx = staged_tx.clone();
-        let staged_release = Arc::clone(&staged_release_seam);
-        Box::pin(async move {
-            if phase == "post_final_prewrite" {
-                let _ = prewrite_tx.send(());
-                prewrite_release
-                    .acquire_owned()
-                    .await
-                    .expect("pre-write release")
-                    .forget();
-            } else if phase == "pre_submit" {
-                let _ = staged_tx.send(());
-                staged_release
-                    .acquire_owned()
-                    .await
-                    .expect("staged doorbell release")
-                    .forget();
-            }
-        })
-    });
+    // Subscribe after the exact gate hold and immediately before Backspace.
+    // This is the causal barrier: the connection cannot contain a different
+    // gate decision from setup, but it is live before the release edge.
+    let mut release_events = TestClient::connect(&rig.daemon.socket_path()).await;
+    let subscribed = release_events.request("events.subscribe", json!({})).await;
+    assert_eq!(subscribed["result"]["subscribed"], true);
     rig.tmux.run_ok(&["send-keys", "-t", &pane, "BSpace"]);
-    tokio::time::timeout(Duration::from_secs(8), prewrite_rx.recv())
-        .await
-        .expect("final deletion released the human hold")
-        .expect("pre-write boundary sender stayed open");
-    prewrite_release.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(8), staged_rx.recv())
-        .await
-        .expect("released attempt reached the staged boundary")
-        .expect("staged boundary sender stayed open");
-    let released = rig.tmux.capture(&pane);
-    let expected = compact_doorbell(&rig, &message_id);
-    staged_release.add_permits(1);
-    rig.daemon.clear_inject_pause();
-    assert!(
-        released.contains(&expected),
-        "staged doorbell was not visible: {released}"
-    );
-    assert!(!released.contains(draft));
-    assert!(!released.contains("body stays in the mailbox"));
-    wait_for_notification_state(&mut rig, &message_id, NotificationState::Staged).await;
+    // `composer_clean` can precede the positive write-readiness edge while the
+    // screen is still settling. The readiness event is the exact contract that
+    // wakes or reopens the held attempt, so wait for it rather than polling a
+    // weaker projection or guessing how long settlement takes.
+    let readiness = release_events
+        .wait_event_named(
+            Duration::from_secs(8),
+            "positive readiness after Backspace",
+            |event| {
+                event["event"] == "readiness"
+                    && event["data"]["session_idx"] == 0
+                    && event["data"]["pane_id"] == pane.as_str()
+                    && event["data"]["write_ready"] == true
+                    && event["data"]["write_block"].is_null()
+            },
+        )
+        .await;
+    assert_eq!(readiness["seq"], serde_json::Value::Null, "{readiness}");
+    // This real-tmux adapter journey stops at the physical edge it owns.
+    // Deterministic tests below it protect the rest of the chain:
+    // `causal_route_evidence_survives_an_earlier_tokenless_readiness_observation`
+    // carries the source edge, `workspace_messaging_applies_a_readiness_route_observation`
+    // crosses the Module boundary, and
+    // `blocked_readiness_reopens_once_only_after_positive_exact_route_evidence`
+    // reopens this same durable attempt. Waiting here for another ephemeral
+    // gate event duplicated those contracts and made runner scheduling part of
+    // the proof.
     assert_eq!(notification_attempts(&rig, &message_id), attempts_before);
-    let gating_count = notification_state_count(&rig, &message_id, NotificationState::Gating);
-    assert!(
-        (1..=2).contains(&gating_count),
-        "the same attempt must gate once, with at most one release-evidence reopen: {gating_count}"
-    );
-    assert_eq!(
-        notification_state_count(&rig, &message_id, NotificationState::Writing),
-        1
-    );
     assert!(workspace_lines(&rig).iter().all(|line| {
         line.id != message_id
             || line
@@ -2481,8 +3270,12 @@ async fn replacement_recipient_bypasses_a_stale_prewrite_worker() {
         0
     );
 
-    rig.tmux.run_ok(&["kill-server"]);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    rig.tmux.simulate_server_loss();
+    rig.ev
+        .wait_event(Duration::from_secs(10), |event| {
+            event["event"] == "session" && event["data"]["attached"] == false
+        })
+        .await;
     rig.tmux.run_ok(&[
         "new-session",
         "-d",
@@ -2494,6 +3287,20 @@ async fn replacement_recipient_bypasses_a_stale_prewrite_worker() {
         "40",
         &composer_pane(),
     ]);
+    let availability = rig
+        .ctl
+        .request("session.watch", json!({"session": "main"}))
+        .await;
+    assert_eq!(
+        availability["result"]["added"],
+        json!(false),
+        "{availability}"
+    );
+    assert_eq!(
+        availability["result"]["watching"],
+        json!(true),
+        "{availability}"
+    );
     rig.wait_attached(1).await;
     let replacement_pane = rig.pane_ids().await[0].clone();
     assert_eq!(
@@ -3168,13 +3975,28 @@ async fn typed_composer_hold_is_a_durable_prewrite_block_until_a_real_turn() {
 
     // A ghost redraw alone cannot clear the durable block, even across a
     // transient process-table identity lapse during the shell transition.
+    // Subscribe at this causal boundary so the assertion cannot run against
+    // the prior idle-with-input cache while the redraw is still in flight.
+    let mut ghost_events = TestClient::connect(&rig.daemon.socket_path()).await;
+    let subscribed = ghost_events.request("events.subscribe", json!({})).await;
+    assert_eq!(subscribed["result"]["subscribed"], true);
     rig.daemon.fail_next_admitted_binding_observation();
     rig.tmux.run_ok(&["send-keys", "-t", &pane, "x", "Enter"]);
-    wait_pane_state(&mut rig, "idle").await;
+    ghost_events
+        .wait_event(Duration::from_secs(10), |event| {
+            event["event"] == "state"
+                && event["data"]["pane_id"] == pane.as_str()
+                && event["data"]["state"] == "idle"
+        })
+        .await;
     assert_eq!(
         notification_state_count(&rig, &third_id, NotificationState::Gating),
         1,
-        "a ghost redraw must not reopen the attempt"
+        "a ghost redraw must not reopen the attempt: {:#?}",
+        workspace_lines(&rig)
+            .into_iter()
+            .filter(|line| line.id == third_id)
+            .collect::<Vec<_>>()
     );
 
     // A genuine start and end is the only causal edge that retires the hold.
@@ -3497,12 +4319,12 @@ async fn an_indefinitely_ambiguous_idle_composer_settles_as_a_durable_pre_write_
     let blocked = notification_transition(&rig, &pair.first, NotificationState::BlockedPreWrite)
         .expect("settled ambiguity is durable");
     let fact = blocked.data.as_ref().expect("blocked transition has data");
-    assert_eq!(fact["pre_write_cause"], "composer_semantic_ambiguous");
+    assert_eq!(fact["pre_write_cause"], "write_readiness_changed");
     assert_eq!(fact["pre_write_observation"]["selected_manifest"], "fix");
     assert!(fact["pre_write_observation"]["binding"].is_object());
     assert_eq!(
         fact["pre_write_observation"]["write_block"],
-        "no_write_safe_composer_evidence"
+        "composer_semantic_ambiguous"
     );
     for state in [
         NotificationState::Writing,
@@ -3535,6 +4357,10 @@ async fn an_indefinitely_ambiguous_idle_composer_settles_as_a_durable_pre_write_
         .expect("blocked message remains visible");
     assert_eq!(
         first["recipients"][0]["notification"]["pre_write_cause"],
+        "write_readiness_changed"
+    );
+    assert_eq!(
+        first["recipients"][0]["notification"]["pre_write_block"],
         "composer_semantic_ambiguous"
     );
     assert_eq!(first["recipients"][0]["can_withdraw_notification"], true);

@@ -1,5 +1,7 @@
 # Build findings
 
+**Status:** Current measured evidence
+
 Probe results where reality contradicted the brief or the research, found
 while implementing v2. Same discipline as the validation campaign: every
 entry is MEASURED (observed live on this machine) or READ (source/doc
@@ -25,7 +27,7 @@ than a measurement.
 | F15 | Anything reading pane output accepts `%extended-output` as well as `%output` | binds |
 | F16 | Reply correlation accepts a terminator only when the `%begin` command number matches, so pane text cannot truncate a reply | binds |
 | F17 | Bracketed paste cannot be the gate; post-paste composer verification is | binds |
-| F18 | Code adjusting socket timeouts mid-connection on macOS tolerates EINVAL once the peer has closed | binds |
+| F18 | Code applying or adjusting socket timeouts on macOS tolerates EINVAL once the peer has closed | binds |
 | F19 | Typed text versus ghost text is an SGR distinction, so the delivery gate reads escaped captures | binds |
 | F20 | A dialog whose own text says Escape cancels never receives Escape; trust prompts hold for a human | binds |
 | F21 | Manifest binding falls back to argv basenames when the kernel comm name is a version string | binds |
@@ -76,6 +78,8 @@ than a measurement.
 | F67 | A one-line doorbell must fit the narrow lane because application wrapping is not exact composer evidence | binds |
 | F68 | Codex 0.149.1 colors the prompt glyph separately and may leave its status trailer unstyled under `NO_COLOR` | binds, partial evidence |
 | F75 | A repaint must not query cursor position while the workspace event reader owns stdin | binds |
+| F79 | A watched session with an unavailable tmux server waits for an explicit `session.watch` availability edge; its creator supplies it after creation | binds |
+| F80 | `has-session` proves a named absence only with tmux's exact missing-session reply; an unreachable socket is uncertainty | binds |
 
 ## F13. refresh-client -B subscriptions work in control mode on tmux 3.6a (MEASURED)
 
@@ -123,13 +127,17 @@ round-trip test proves byte-exact delivery (quotes, backslashes, tabs, UTF-8,
 embedded newlines) with mode 2004 on. Confirms amendment b's stance: the
 paste path cannot be gated on bracketing; composer verification is the gate.
 
-## F18. macOS setsockopt(SO_RCVTIMEO) fails with EINVAL once the peer closed (MEASURED)
+## F18. macOS socket timeout options fail with EINVAL once the peer closed (MEASURED)
 
-Reproduced in the CLI e2e tests: set_read_timeout(None) on a UnixStream
-whose peer already closed fails with EINVAL while buffered lines remain
-readable. The CLI swallows the error and lets the next read report the
-close. Anything adjusting socket timeouts mid-connection on macOS must
-tolerate this or it will hide readable data behind a misnamed error.
+Reproduced in the CLI e2e and Daemon Client tests: `set_read_timeout(None)`,
+`set_read_timeout(Some(_))`, and `set_write_timeout(Some(_))` on a UnixStream
+whose peer already closed can fail with EINVAL while buffered lines remain
+readable. During initial connection setup, the client swallows only that macOS
+closed-peer error and lets the next IO report the buffered line or close.
+Later event-stream timeout adjustments are explicitly best effort and ignore
+setter errors so buffered frames remain authoritative. Anything applying or
+adjusting socket timeouts mid-connection on macOS must tolerate this or it will
+hide readable data behind a misnamed error.
 
 ## F19. codex ghost text is SGR-dim; typed text is bare (MEASURED)
 
@@ -575,8 +583,8 @@ that does not exist yet. It clears itself: the retry three seconds later
 succeeded, in the same log. Logged at WARN with "cannot attach" in front,
 it reads as a dead end, and the operator stopped there rather than finding
 out. It now checks whether the session actually exists and says
-`INFO waiting for session; cyclops start creates it`, keeping the WARN for
-an attach that failed against a session that is there.
+`INFO waiting for session; create it, then call session.watch`, keeping the
+WARN for an attach that failed against a session that is there.
 
 ### The shape of the mistake
 
@@ -825,12 +833,13 @@ death notification per pane, so the F25 all-panes subscription that
 catches an individual pane dying observes nothing at all when the whole
 session goes. Anything keyed on per-pane death (the adoption registry
 was) silently survives session death. The daemon now releases a
-session's adoptions at the two edges that CAN answer: the attach-retry
-arm, where tmux positively reports the session missing, and boot, which
-re-verifies resurrected bindings for sessions outside the watched set
-with one has-session each. A tmux error keeps the label: could-not-ask
-never releases. src/cyclopsd/src/lib.rs, registry.rs; pinned by
-tests/m4_name.rs.
+session's adoptions at the two edges that CAN answer: the watcher-disconnect
+path, where tmux's exact missing-session reply positively reports absence,
+and boot, which re-verifies resurrected bindings for sessions outside the
+watched set with one has-session each. A confirmed missing configured slot
+then waits for an explicit post-creation `session.watch` edge rather than
+probing on a retry clock. A tmux error keeps the label: could-not-ask never
+releases. src/cyclopsd/src/lib.rs, registry.rs; pinned by tests/m4_name.rs.
 
 ## F48. `window-size latest` lets any regular client out-size a control client's declared canvas (MEASURED)
 
@@ -2036,6 +2045,22 @@ needs, clearing the host surface and resetting the diff baseline
 `get_cursor_position` calls rather than asserting a spelling, so any future
 invalidation may change how it clears and may not start reading to do it.
 
+### Decision: host-palette theming requires an exact restoration pair
+
+The workspace input thread is the sole terminal-input owner. A startup OSC
+10/11 query would return through that same input stream, so Cyclops does not
+read terminal replies to discover default colors. Instead the complete
+`[workspace]` `terminal_default_fg` and `terminal_default_bg` pair is an
+explicit opt-in: Cyclops applies the host palette while focused and restores
+that exact pair on focus loss and exit. When the pair is absent, partial, or
+invalid, it emits neither the host-palette set nor a reset request.
+
+This is an intentional safety boundary, not a claim that every terminal honors
+OSC reset. An unconfigured terminal keeps its own padding color, but it cannot
+retain Cyclops colors because Cyclops never changed them. Terminal-specific
+automatic theming needs a dedicated interactive probe before it can be
+represented as a measured cross-terminal guarantee.
+
 ## F76. A window's size is its panes' size, so no viewer may vote on it
 
 MEASURED 2026-08-26 on isolated tmux servers, tmux 3.6a and next-3.8
@@ -2209,42 +2234,95 @@ that hides undiscarded bytes behind the same settled clean chrome is outside
 the generic screen contract and must expose a non-clean manifest rule if it
 needs stronger treatment.
 
-## F79. tmux answers every `resize-window` with a `%layout-change`, and clamps rather than refuses
+## F79. An external daemon waits for a configured absent session with an unavailable tmux server (MEASURED)
 
-MEASURED 2026-08-30 on an isolated tmux 3.7b server (`tmux -L probe -f
-/dev/null`), one control-mode observer attached, every server torn down
-after.
+MEASURED 2026-08-31 with tmux 3.6a in the isolated external-supervisor leg of
+`tests/e2e/parity-check.sh`. The fixture starts `cyclopsd` first with `main`
+configured but absent. Its tmux config sets `exit-empty off` and
+`exit-unattached off`, so an accidental control client would leave an
+observable server socket. The probe waits for the daemon's `waiting for
+session` log, then confirms that its private tmux directory contains no
+socket.
 
-| # | Fact |
-|---|---|
-| M1 | With `window-size manual` and a window already at 106x55, three `resize-window -t @0 -x 106 -y 55` produced three `%layout-change @0 c37d,106x55,...` lines. The size did not change; the notification came anyway, once per command. |
-| M2 | `set-option -w -t @0 window-size manual` on a window already on `manual` produced no notification. |
-| M3 | Six panes stacked with `even-vertical` need 11 rows (one per pane, one separator between each). `resize-window -t @0 -x 100 -y 5` exited 0 with no message and left the window at 100x11 with six 1-row panes: a size below the layout's minimum is clamped, not refused. |
-| M4 | The same command issued again from control mode, with the window already at 100x11, answered `%begin`/`%end` (success) and another `%layout-change` at 100x11. |
+`cyclops start --preset duo --no-daemon` then creates `main` and sends the
+explicit `session.watch` availability edge. The same daemon attaches and
+names the new panes in that one start. This is not a claim that every
+externally created tmux session wakes a daemon automatically: the creation
+request is the edge, and the daemon still verifies tmux before attaching.
 
-M1 is what turns a harmless re-ask into a loop. A workspace that answers
-`%layout-change` for a window it sizes by checking whether that window is
-where it should be, and re-issuing `resize-window` when it is not, will get
-another `%layout-change` for that write. If the check can answer "not where
-it should be" forever, the pair runs at tmux round-trip speed. Observed on
-Admin's machine as about 1,000 `%layout-change` a second on each of two
-sessions, `cyclops` and the tmux server each at roughly half a core, the
-daemon socket answering EAGAIN under the reconcile load, and the workspace
-reporting `motion: off, this terminal writes frames slower than it draws
-them`. Two checks answered "not where it should be" forever:
+The constraint is therefore two-sided: before first attachment, and whenever
+tmux specifically reports that its configured server socket is unavailable,
+the daemon waits for the explicit creation edge without opening a control
+client or changing durable state. Once tmux positively reports a named
+session missing, a previously attached configured slot releases only its live
+route and waits on that same edge rather than retrying control attach on a
+timer. The focused
+regressions
+`configured_session_waits_for_creation_edges_on_first_start_and_recreation`
+and `an_availability_edge_before_task_start_rechecks_first_absence` pin the
+initial, recreation, and pre-task-edge cases without relying on wall-clock
+polling. `a_vanished_tmux_server_waits_for_an_availability_edge` pins the
+post-attachment missing-socket path: no control attach, no empty replacement
+server, and no identity or barrier cleanup before the explicit edge.
 
-- A pinned window of a session the workspace owns but is not showing. It
-  has no tab in the displayed model, and "no tab" was read as "diverged".
-  One workspace owning two sessions is enough, which is what a workspace
-  reopened from another terminal ends up with when it takes over `main`
-  and then reopens the last-active session.
-- A window whose target is below the layout minimum (M3). tmux leaves it
-  above the target and reports success, so a re-ask changes nothing except
-  producing the notification (M4) that re-asks.
+## F80. `has-session` proves a named absence only with tmux's exact missing-session reply (MEASURED)
 
-The workspace now judges divergence only for windows it can see, and
-remembers per window what it asked for and what the window was at the
-time, so a window tmux left where it was is asked once more at most. The
-regression tests are `reopening_from_another_terminal_with_two_owned_sessions_does_not_loop`
+MEASURED 2026-08-31 on tmux 3.6a. A reachable server with session `real`
+answers `has-session -t =rea` with `can't find session: =rea`; that is
+positive evidence that the exact target is gone. A configured socket with no
+server answers `error connecting to ... (No such file or directory)`, the
+same class of failure a renamed or otherwise unreachable socket can produce.
+It says nothing about whether an already observed session, its durable
+identity, or its delivery barriers survived.
+
+`cyclops_tmux::layout::session_missing` therefore accepts only the first
+reply as absence. The daemon recognizes the second as `ServerUnavailable`:
+before or after attachment it retains identity and barriers, then waits for
+`session.watch` rather than opening control mode or retrying on a timer.
+Other failures stay `Unknown`: before first attachment the task waits for an
+explicit availability edge, while after a live observation it uses the
+ordinary transient reconnect path. After a server disappears, a stale socket
+pathname may remain even though no listener exists, so the lifecycle test
+checks a passive connection as well as the no-connect-attempt counter. Probe:
+`cargo test -p cyclops-tmux --test layout_round_trip
+asking_about_a_session_that_is_not_there_is_not_an_error`,
+`unreachable_tmux_keeps_an_observed_session_identity`, and
+`a_vanished_tmux_server_waits_for_an_availability_edge`.
+
+## F81. A macOS candidate copy can fail after a successful Cargo build (MEASURED)
+
+MEASURED 2026-09-01 in the macOS release installer-and-user-journey job for
+candidate `6882baded55cff0fa82ef9020871ff31b21881ba`. Cargo finished the dist
+build, then BSD `cp` failed while staging `target/dist/cyclops` in a newly
+created private `/tmp/cyclops-pair.*` directory: `fcopyfile failed: Input/output
+error`. The matching Linux installer journey passed. A complete local macOS
+26.5.2 installer journey passed, so this records a platform runner failure
+mode, not a claim that every candidate copy fails.
+
+Probe: the installer parity journey puts a `cp` shim first in its isolated
+`PATH`. The shim fails only the first copy to the private client candidate and
+writes a marker that the test requires, while every other `cp` call delegates
+to the system implementation. Before the fallback, the installer stops before
+activation. With the fallback, it removes only that new private destination,
+performs a direct byte copy, compares the source and staged bytes, and then
+completes the normal pair validation and installation. The regression checks
+the installed client and daemon byte-for-byte against the built pair.
+
+## F82. tmux reports every `resize-window`, including a clamped one (MEASURED)
+
+MEASURED 2026-08-30 on an isolated tmux 3.7b server with one control-mode
+observer. Repeating `resize-window` at an unchanged size still produced one
+`%layout-change` per command. A six-pane vertical layout accepted a target
+below its eleven-row minimum, left the window at eleven rows, and reported
+success plus another layout-change.
+
+That makes two otherwise plausible checks unsafe: treating an owned window
+outside the displayed model as divergent, and repeatedly asking for a target
+tmux has already clamped. Either turns the workspace's own layout-change into
+the next resize request. The sizing owner now skips windows without a current
+tab and remembers the target and observed layout for each successful request;
+it may retry a changed layout once, but does not loop over an unchanged clamp.
+
+Probes: `two_owned_sessions_without_a_displayed_background_tab_do_not_loop`
 and `a_target_tmux_declines_is_asked_for_once_not_forever` in
-`src/cyclops-workspace/src/app.rs`.
+`src/cyclops-workspace/src/app.rs` exercise the real tmux notification seam.

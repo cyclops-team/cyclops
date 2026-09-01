@@ -20,6 +20,7 @@ fact to an NDJSON ledger. A generated knowledge base with diagrams lives at
 | `src/cyclops-manifest` | Detection-manifest schema and evaluation | Vendor CLI behavior is TOML data in `resources/manifests/`, never Rust |
 | `src/cyclops-ledger` | Append-only NDJSON writer/reader | Never rewritten; corrections are new lines |
 | `src/cyclops-theme` | Semantic color tokens | Renderers use tokens, never raw colors |
+| `src/cyclops-client` | Shared blocking and async daemon transport | Owns greeting, framing, correlation, timeout, and uncertainty; no presentation or domain policy |
 | `src/cyclopsd` | The daemon: fusion, delivery, socket, identity | Library + thin binary so tests boot it in-process |
 | `src/cyclops` | The CLI | Thin client; business rules stay in proto/daemon. User-facing sentences live in `src/cyclops/src/copy.rs` |
 | `src/cyclops-ui` | The stream TUI (`cyclops watch`) | Its `grid` module is the CLI/stream rendering vocabulary |
@@ -32,18 +33,26 @@ fact to an NDJSON ledger. A generated knowledge base with diagrams lives at
 
 ## The gates a change must pass
 
-Same five core gates, in order (full detail: [CONTRIBUTING.md](CONTRIBUTING.md)).
-`./scripts/check.sh` runs them all, cheapest first; `--fast` stops after
-the test suite. The Rust test gate uses nextest for executable tests and Cargo
-for doctests, which nextest does not run.
+The complete local gate is documented in [CONTRIBUTING.md](CONTRIBUTING.md).
+`./scripts/check.sh` runs it cheapest first; `--fast` stops after Rust
+correctness and documentation compilation. Performance executables run in the
+scheduled and release lanes, not as ordinary correctness tests.
+
+The paired build below is for
+`workspace_cli::start_starts_a_daemon_when_none_is_running`, which intentionally
+starts and asserts a real daemon. `workspace_boot_sizing`'s sizing assertion
+does not require a daemon and tolerates daemon-start failure.
 
 ```bash
-cargo fmt --all
+./tests/e2e/messaging-docs-parity.sh
+cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
-cargo test -p cyclopsd --all-targets --no-fail-fast
-cargo test --workspace --doc
+./scripts/check-headless.sh
 python3 scripts/check-doc-paths.py
+cargo build -p cyclops -p cyclopsd --bins
+cargo nextest run --workspace -E 'not (package(cyclopsd) | binary_id(=cyclops-ui::perf) | binary_id(=cyclops-ui::queue_perf) | binary_id(=cyclops-workspace::perf_contract))' --no-fail-fast
+cargo test -p cyclopsd --all-targets --no-fail-fast
+cargo doc --workspace --no-deps
 ./tests/e2e/parity-check.sh
 ```
 
@@ -52,8 +61,12 @@ python3 scripts/check-doc-paths.py
 - Touching either installer requires keeping `scripts/install.sh` and
   `website/static/install.sh` byte-for-byte identical, then running
   `./tests/e2e/parity-check.sh --with-installer`.
-- CI also reruns the whole suite with `CYCLOPS_TEST_TMP` relocated and has an advisory
-  job against tmux built from master.
+- CI runs focused root-selection, source-boundary, and tmux/daemon/socket
+  evidence with `CYCLOPS_TEST_TMP` relocated. Website, installer, tmux HEAD,
+  macOS, and other platform evidence run on pull requests only when their owned
+  inputs change. Full matrix, tmux HEAD, reliability, performance, and release
+  evidence have explicit workflows described in
+  [CI.md](docs/development/CI.md).
 
 ## Rules that are unusual for this repo
 
@@ -94,7 +107,9 @@ python3 scripts/check-doc-paths.py
 ## Fast navigation
 
 - How a message becomes a verified receipt: [docs/development/DELIVERY.md](docs/development/DELIVERY.md),
-  then `src/cyclopsd/src/delivery.rs` in call order
+  then `src/cyclopsd/src/messaging.rs` for current mailbox acceptance. Retained
+  direct delivery first crosses `src/cyclopsd/src/compatibility.rs`, then
+  `src/cyclopsd/src/delivery.rs` in call order
   (`msg_send` → `worker_loop` → `process` → `gate` → `attempt_delivery`).
 - What state a pane is in and why: `src/cyclopsd/src/fusion.rs`;
   per-sensor readings via `cyclops read <agent> --source detection`.

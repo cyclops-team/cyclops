@@ -4,6 +4,16 @@ Anything the UI does, a script can do. The CLI is a thin client over one
 Unix socket at `$CYCLOPS_HOME/sock`, and the wire is NDJSON: one JSON object
 per line, in both directions.
 
+Every official socket adapter accepts at most 1,048,576 bytes for the JSON
+object. The terminating newline is required and is not part of that count. An
+official client rejects an oversized request before writing any request bytes,
+so that outcome is known not sent. The daemon drops an oversized inbound frame
+before dispatch. It never emits an oversized hello, response, or event. When a
+response result is too large but its correlation id still fits in a bounded
+error, the daemon returns `frame_too_large` and states that the request outcome
+is unknown; otherwise it closes the connection. Clients recover uncertain
+outcomes from authoritative state instead of guessing or retrying blindly.
+
 Examples show current protocol shapes. Additive optional fields may be omitted
 when they are not relevant to the behavior being explained.
 Message ids are abbreviated for readability. Newly minted ids use `m-`
@@ -19,7 +29,7 @@ The daemon writes one hello line as soon as you connect, then one response
 line per request.
 
 ```
-{"cyclops":"0.1.0","proto":1,"boot_id":"b4ce18e9-c6d6-4473-af9b-a43b525106fe"}
+{"cyclops":"0.1.0-beta","build":"abc1234","proto":1,"boot_id":"b4ce18e9-c6d6-4473-af9b-a43b525106fe"}
 ```
 
 `boot_id` changes on every daemon restart, so a client can tell which
@@ -29,9 +39,18 @@ Sequences are ordered within their owning journal, not across session ledgers
 and the workspace message journal. Messaging snapshots and invalidations name
 their workspace journal position explicitly as `workspace_seq`.
 
-`proto` mismatching yours is a warning, never a disconnect: unknown fields
-are ignored in both directions, so a newer client and an older daemon keep
-working.
+`cyclops` is the Cargo workspace version compiled into the running daemon;
+`build` is its exact source build. Official clients compare both with their
+own identity. CLI, stream, and health output name both exact identities. The
+full workspace keeps a compact warning visible even when its sidebar is
+collapsed; `cyclops health` gives the exact pair when narrow chrome cannot.
+A mismatch does not disconnect: the additive protocol keeps a newer client and
+an older daemon working. A daemon old enough to omit `build` remains explicitly
+unverified.
+
+`proto` follows the same tolerant rule. A mismatch warns and continues because
+unknown fields are ignored in both directions. Package and source identity are
+runtime facts; they do not assign, move, or publish a public release tag.
 
 ```mermaid
 sequenceDiagram
@@ -73,6 +92,7 @@ Error codes are stable; messages are for humans. Common codes include:
 | `unknown_method` | no such method |
 | `unimplemented` | the method name is reserved but its milestone has not shipped |
 | `bad_request` | the params did not parse, or a value is not allowed |
+| `frame_too_large` | a response could not fit the official frame envelope; the request outcome is unknown until authoritative state is inspected |
 | `no_such_target` | no mailbox recipient or pane answers to that address |
 | `no_such_message` | the named message does not exist or is not visible to this caller |
 | `message_not_pending` | the named mailbox entry is no longer claimable, for example because it was superseded |
@@ -125,6 +145,7 @@ alphabet.
 | `agent.state.report` | A hook reporting a turn edge. Only from inside the pane |
 | `hooks.verify` | Hook liveness for a pane: tier and last-seen edges |
 | `hooks.selftest` | One no-op delivery that proves the ack hook fires |
+| `events.backfill` | Read one bounded, body-free stream-history projection |
 | `events.subscribe` | Switch this connection to push mode |
 | `admin.notify` | Raise something for the human |
 | `theme.reload` | Re-read the theme selection and repaint every named pane's border |
@@ -137,7 +158,7 @@ alphabet.
 
 ```
 -> {"id":2,"method":"status","params":{"open_deliveries":true}}
-<- {"id":2,"result":{"boot_id":"b4ce18e9-...","daemon_version":"0.1.0",
+<- {"id":2,"result":{"boot_id":"b4ce18e9-...","daemon_version":"0.1.0-beta",
     "daemon_build":"abc1234","daemon_executable":"/Users/me/.local/bin/cyclopsd",
     "daemon_process":{"pid":8123,"birth":981221},"pid":8123,
     "manifests":{"dir":"/private/tmp/cyclops-wire.l3llB0/home/manifests","ids":["demo"]},
@@ -790,7 +811,18 @@ no terminal key. Unsupported extraction, hidden content, an unprovable layout,
 or typed content never qualifies. Before a terminal-key action, the daemon
 appends a content-free `notification_resolution_intent` fact. A known refusal
 before the key appends `notification_resolution_intent_withdrawn` and may be
-retried. When the
+retried. Ordinary `attention.complete` and keyed `attention.discard` actions
+use accepted-key ordering: only a claim ordered after
+`notification_resolution_action_accepted` may count as consumption. The
+force-submit fallback instead adds one content-free
+`notification_resolution_action_reserved` fact after its final proofs and
+before terminal IO. That reservation is appended under the same workspace
+journal lock as `inbox.claim`: a claim ordered before it prevents terminal IO,
+while a later claim retrieves the message without revoking the one reserved
+key. That later claim may count as consumption only after the accepted-action
+fact. Reservation proves neither terminal acceptance nor composer consumption;
+a reserved but unaccepted action remains uncertain and cannot send a second key
+after recovery. When the
 terminal accepts the action key, the daemon appends a content-free
 `notification_resolution_action_accepted` fact. Acceptance is not composer
 consumption or settlement. A fresh Complete must then observe either an
@@ -825,11 +857,18 @@ Doorbell Format 3 or 4 attempt in `attention_required` with cause
 The timer rechecks that the mailbox entry is pending and that the recipient,
 pane process generation, agent generation, manifest, live pane, and tmux mode
 still match. It appends `notification_resolution_intent` with `forced: true`
-before sending the manifest submit key, then uses the ordinary action-accepted,
-consumption, and settlement facts. Durable intent admits at most one key across
-competing timers and restart. Claim, withdrawal, replacement, settlement, or a
-disabled setting refuses without terminal IO. The forced path bypasses only
-composer-content proof and may therefore submit human input.
+before its final route and payload proofs. It then appends
+`notification_resolution_action_reserved` only while that exact mailbox entry
+is still pending, before sending the manifest submit key, then uses the
+ordinary action-accepted, consumption, and settlement facts. The reservation,
+not intent alone, is the final claim-ordering boundary. A claim, withdrawal,
+replacement, or settlement ordered before reservation refuses without terminal
+IO. The persisted setting update and reservation share one gate, so a
+successful disable ordered before reservation also refuses. A claim ordered
+after reservation is still a normal authenticated retrieval, but it does not
+cancel the one reserved key; neither does a later setting change.
+The forced path bypasses only composer-content proof and may therefore submit
+human input.
 
 ### msg.history and msg.thread
 
@@ -960,15 +999,33 @@ a restart. It does not touch `config.toml`: a restart goes back to
 watching only the configured list, not whatever a client added here in the
 meantime.
 
-A runtime watch remains pending if the session has not appeared yet. After it
-has attached successfully, positive tmux evidence that the session was removed
-retires that runtime watch from `status`. Recreating the same display name then
-creates a fresh session identity and watcher while reusing the existing durable
-ledger. Configured sessions are different: they remain persistent and keep
-waiting for `cyclops start` to recreate them.
+A runtime watch remains pending if the session has not appeared yet. Its
+creator calls `session.watch` again after it creates or restores the tmux
+session; `cyclops start` does this automatically. After a runtime watch has
+attached, positive tmux evidence that its session was removed retires the watch
+from `status`. Recreating the same display name then creates a fresh session
+identity and watcher while reusing the durable ledger.
 
-Watching a session that is already watched is a no-op, not an error:
-`added` is false and nothing is opened twice.
+Configured sessions are different: they remain persistent while absent and
+wait for the post-creation request. A configured slot recovered from a durable
+rename identity is stricter: the request checks the recorded target; if
+control mode can connect, the daemon validates identity before publishing a
+route. It cannot authorize a different same-named session to replace the
+recorded identity.
+
+An unavailable tmux socket is not evidence that a session disappeared. Before
+its first attachment, and after a previously live server socket vanishes, a
+watched slot retains its durable state and waits for `session.watch`
+without opening control mode. Other tmux failures remain honest uncertainty:
+before its first attachment the task waits for an explicit `session.watch`
+edge, while after a live observation it uses the ordinary transient reconnect
+path.
+
+For an already watched session, `added` is false: the daemon opens no second
+ledger or watcher. If that task is detached and waiting after a confirmed
+absence or unavailable server socket, the same idempotent request is an
+availability edge for its existing task. The daemon checks tmux before
+attaching, so the edge is not proof that an absent session is live.
 
 ```
 -> {"id":17,"method":"session.watch","params":{"session":"extra"}}
@@ -977,8 +1034,8 @@ Watching a session that is already watched is a no-op, not an error:
 
 An absent, non-string, or empty/whitespace-only `session` is `bad_request`.
 A session name that does not exist yet on the tmux server is not an error
-either: the daemon watches for it exactly the way it waits for any
-configured session that has not been created yet.
+either: the daemon records a pending watch. Call `session.watch` again after
+creating that tmux session to supply its availability notification.
 
 ### agent.state.report
 
@@ -1050,6 +1107,26 @@ event. Pick `fyi` unless a person genuinely has to do something: an
 `action_required` ping that names nothing a client can later see resolved
 sits in the calm stream under a closed eye until the daemon restarts.
 
+### events.backfill
+
+One bounded connection-epoch projection for stream presentations. The daemon
+owns the retained session-journal source set and returns only body-free facts;
+clients do not discover or open journal paths.
+
+```
+-> {"id":1,"method":"events.backfill","params":{"limit":200}}
+<- {"id":1,"result":{"lines":[]}}
+```
+
+`limit` defaults to 200. The result is oldest first. `max_seq` is meaningful
+only when one journal supplied the projection and is omitted for several
+sources. If a retained source is unreadable or the official frame bound forces
+older rows out, `gap` reports `unreadable_sources` and `omitted_rows`. A normal
+bounded tail does not call its intentionally older rows a gap.
+
+This method is a snapshot, not subscription replay. Mailbox views recover
+durable progress with `messages.follow` instead.
+
 ### events.subscribe
 
 Sending it switches the connection to push mode. Responses to earlier
@@ -1066,6 +1143,11 @@ requests still arrive; unsolicited event lines now arrive too.
 event line has no `id` and never answers a request, so tell the two apart by
 the presence of `event`. `seq` is the ledger seq when the event corresponds
 to a ledger line.
+
+Subscriptions are ephemeral invalidation and observation streams. A legacy
+`cursor` field is accepted for wire compatibility but never promises replay;
+use `events.backfill`, a current snapshot, or `messages.follow` according to
+the projection being rebuilt.
 
 Use a second connection for the stream if you also want to make requests.
 `cyclops watch --json` is exactly this.

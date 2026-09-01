@@ -34,6 +34,8 @@ motion = true
 workspace_order = ["main"]
 agent_order = ["name:implementer", "name:reviewer"]
 folder_tracked = []
+terminal_default_fg = "#3a2b26" # opt in to themed terminal window padding
+terminal_default_bg = "#000000"
 ```
 
 ## Top-level keys
@@ -55,7 +57,13 @@ sidebar's visibility and width, how many rows its file panel gets
 states (`motion`), the persisted workspace and agent order, which
 workspaces follow their active pane's folder (`folder_tracked`), and
 where the pinned file browser points (`files_pinned_root`). Unknown keys
-are preserved when it writes preferences.
+are preserved when it writes preferences. `terminal_default_fg` and
+`terminal_default_bg` are an operator-owned optional pair: each must be a
+`#rrggbb` value. Supplying both opts in to themed terminal window padding:
+Cyclops applies the theme through OSC 10/11 while focused and restores that
+pair on workspace exit and focus loss. An absent, partial, or invalid pair
+leaves the host palette untouched. Cyclops does not read terminal input to
+discover a palette.
 
 ## Runtime files
 

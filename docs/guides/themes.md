@@ -217,12 +217,23 @@ unthemeable here: they print onto the terminal's own background, the
 CLI has no background emitter, and the full-screen stream inherits the
 terminal's ground the same way.
 
-While the workspace runs it paints the terminal's own default background
-(the few pixels of window padding around the grid) with the theme ground,
-and restores the terminal's original default when it exits or loses focus.
-It learns that original by asking the terminal at startup, so a terminal
-that honors setting the background but not resetting it — Apple Terminal —
-still gets its own color back instead of keeping the theme's.
+While the workspace runs it paints every terminal cell with the theme. The
+terminal's own window padding stays at its native color unless you configure
+an exact restoration pair. Cyclops never reads terminal input to discover
+those colors: the workspace input thread is their only owner. To theme the
+padding as well, configure both exact defaults yourself:
+
+```toml
+[workspace]
+terminal_default_fg = "#3a2b26"
+terminal_default_bg = "#000000"
+```
+
+With a complete valid pair Cyclops applies the theme through OSC 10/11 while
+focused and restores those colors through the same sequences on focus loss and
+exit. With either value missing or malformed it leaves the host palette
+untouched. The UI preserves these operator-owned keys when it saves its other
+workspace preferences.
 
 Naming a `stream.*` token in a theme file warns on stderr and is
 skipped, and so does a per-state token name from before the groups

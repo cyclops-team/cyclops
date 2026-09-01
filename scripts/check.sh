@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The five CI gates, one command, cheapest first.
+# The complete required CI gate, one command, cheapest first.
 #
 # `./scripts/check.sh` is the full pre-push pass; `./scripts/check.sh
 # --fast` stops after the compile-and-test gate for the inner loop. The
@@ -29,19 +29,27 @@ stage() {
     printf '   %ss\n' "$(( $(date +%s) - start ))"
 }
 
-# Both halves of the Rust gate run even when the first fails, so one pass
-# reports every failure; the stage fails if either did. Same as CI.
+# All parts of the Rust gate run even when an earlier part fails, so one pass
+# reports every failure; the stage fails if any did. Same as CI. Performance
+# executables belong to the retained scheduled and release evidence lanes.
 rust_tests() {
     status=0
-    cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast || status=$?
+    # workspace_cli's real-daemon start assertion needs its sibling binary.
+    # workspace_boot_sizing's sizing assertion does not require a daemon and
+    # tolerates daemon-start failure.
+    cargo build -p cyclops -p cyclopsd --bins || status=$?
+    cargo nextest run --workspace \
+        -E 'not (package(cyclopsd) | binary_id(=cyclops-ui::perf) | binary_id(=cyclops-ui::queue_perf) | binary_id(=cyclops-workspace::perf_contract))' \
+        --no-fail-fast || status=$?
     cargo test -p cyclopsd --all-targets --no-fail-fast || status=$?
-    cargo test --workspace --doc || status=$?
+    cargo doc --workspace --no-deps || status=$?
     return "$status"
 }
 
 stage "messaging docs" ./tests/e2e/messaging-docs-parity.sh
 stage "fmt" cargo fmt --all --check
 stage "clippy" cargo clippy --workspace --all-targets -- -D warnings
+stage "headless build" ./scripts/check-headless.sh
 stage "doc paths" python3 scripts/check-doc-paths.py
 stage "test" rust_tests
 

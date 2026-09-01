@@ -12,10 +12,12 @@ use cyclops_proto::{
 use cyclops_tmux::{PaneRow, SessionWatcher};
 
 use crate::mailbox::{
-    AttentionConsumptionSignal, AttentionResolutionStart, AttentionTarget, MailboxService,
-    MailboxServiceError,
+    AttentionConsumptionSignal, AttentionResolutionStart, AttentionTarget, MailboxServiceError,
 };
-use crate::{delivery, fusion, messaging, unix_ms, Inner};
+use crate::messaging::{
+    AttentionConsumptionRegistration, MessagingAttentionError, WorkspaceMessaging,
+};
+use crate::{delivery, fusion, unix_ms, Inner};
 
 // Bound terminal-action settlement while allowing slower terminal clients to
 // render the clean composer that proves the exact action took effect.
@@ -26,6 +28,8 @@ const POST_ACTION_EVENT_SCANS_PER_CHECKPOINT: usize = 8;
 pub(crate) enum AttentionActionError {
     #[error(transparent)]
     Store(#[from] MailboxServiceError),
+    #[error("this exact notification resolution is already in progress")]
+    ResolutionInProgress,
     #[error("the current terminal does not satisfy every attention evidence check")]
     Evidence(Box<AttentionShowResult>),
     #[error("this manifest has no measured whole-composer clear sequence")]
@@ -36,6 +40,14 @@ pub(crate) enum AttentionActionError {
     Uncertain,
     #[error("forced submit refused: {0}")]
     ForceRefused(&'static str),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AttentionResolveError {
+    #[error(transparent)]
+    Selection(#[from] MessagingAttentionError),
+    #[error(transparent)]
+    Action(#[from] AttentionActionError),
 }
 
 struct ActionRoute {
@@ -63,27 +75,37 @@ struct Assessment {
 
 pub(crate) async fn show(
     inner: &Arc<Inner>,
-    service: &MailboxService,
-    target: &AttentionTarget,
+    messaging: &WorkspaceMessaging,
+    caller: cyclops_proto::RecipientKey,
+    raw: &str,
     include_diff: bool,
-) -> AttentionShowResult {
-    assess(inner, service, target, include_diff).await.result
+) -> Result<AttentionShowResult, MessagingAttentionError> {
+    let target = messaging.attention_for_show(caller, raw)?;
+    Ok(assess(inner, messaging, &target, include_diff).await.result)
 }
 
 pub(crate) async fn resolve(
     inner: &Arc<Inner>,
-    service: &Arc<MailboxService>,
+    messaging: &WorkspaceMessaging,
+    caller: cyclops_proto::RecipientKey,
+    raw: &str,
+    resolution: NotificationResolution,
+) -> Result<AttentionResolveResult, AttentionResolveError> {
+    let target = messaging.attention_for_resolution(caller, raw)?;
+    let result = resolve_selected(inner, messaging, &target, resolution, false).await;
+    messaging.resume_exact_attention_reconciliation(target.record.attempt_id);
+    result.map_err(Into::into)
+}
+
+/// Execute one Module-selected automatic resolution through the same exact
+/// proof and settlement path as an explicit operator action.
+pub(crate) async fn resolve_automatic(
+    inner: &Arc<Inner>,
+    messaging: &WorkspaceMessaging,
     target: &AttentionTarget,
     resolution: NotificationResolution,
 ) -> Result<AttentionResolveResult, AttentionActionError> {
-    let result = resolve_selected(inner, service, target, resolution, false).await;
-    if service
-        .resume_exact_reconciliation(target.record.attempt_id)
-        .unwrap_or(false)
-    {
-        spawn_exact_owned_worker(inner, Arc::clone(service), target.record.attempt_id);
-    }
-    result
+    resolve_selected(inner, messaging, target, resolution, true).await
 }
 
 /// Press the manifest submit key once for an exact verify-failed notification
@@ -92,11 +114,12 @@ pub(crate) async fn resolve(
 /// This deliberately bypasses composer-content proof, and nothing else. The
 /// exact recipient, pane process generation, admitted agent generation,
 /// manifest, live pane, and tmux mode are checked before and after the durable
-/// intent. Intent is appended before the key, so a crash can lose the action
-/// but can never authorize a second key.
+/// intent. After the final proofs, one durable reservation shares the
+/// `inbox.claim` lock before the key. A crash can lose the action but can never
+/// authorize a second key.
 pub(crate) async fn force_complete(
     inner: &Arc<Inner>,
-    service: &Arc<MailboxService>,
+    messaging: &WorkspaceMessaging,
     target: &AttentionTarget,
 ) -> Result<AttentionResolveResult, AttentionActionError> {
     if !inner.force_submit.get().0 {
@@ -107,18 +130,25 @@ pub(crate) async fn force_complete(
             "attempt is not an exact verify-failed doorbell",
         ));
     }
-    if !service.force_submit_target_is_pending(target)? {
+    if !messaging.force_submit_target_is_pending(target)? {
         return Err(AttentionActionError::ForceRefused(
             "attempt was claimed, withdrawn, replaced, or settled",
         ));
     }
-    let start = service.begin_attention_resolution(target, NotificationResolution::Complete)?;
+    let start = match messaging.begin_attention_resolution(target, NotificationResolution::Complete)
+    {
+        Ok(start) => start,
+        Err(error) if error.notification_resolution_in_progress() => {
+            return Err(AttentionActionError::ResolutionInProgress);
+        }
+        Err(error) => return Err(AttentionActionError::Store(error)),
+    };
     match start {
         AttentionResolutionStart::Fresh => {}
         AttentionResolutionStart::AcceptedUnconsumed => {
             return reconcile_existing_intent(
                 inner,
-                service,
+                messaging,
                 target,
                 NotificationResolution::Complete,
                 true,
@@ -126,32 +156,35 @@ pub(crate) async fn force_complete(
             .await;
         }
         AttentionResolutionStart::ReconcileOnly | AttentionResolutionStart::IntentOnlyUncertain => {
-            service.cancel_attention_resolution(target.record.attempt_id)?;
+            messaging.cancel_attention_resolution(target.record.attempt_id)?;
             return Err(AttentionActionError::Uncertain);
         }
     }
 
-    if force_action_route(inner, service, target).is_none() {
-        service.cancel_attention_resolution(target.record.attempt_id)?;
+    if force_action_route(inner, messaging, target).is_none() {
+        messaging.cancel_attention_resolution(target.record.attempt_id)?;
         return Err(AttentionActionError::ForceRefused(
             "recipient process or pane mode changed",
         ));
     }
-    service.record_forced_attention_resolution_intent(target)?;
+    if let Err(error) = messaging.record_forced_attention_resolution_intent(target) {
+        return Err(AttentionActionError::Store(error));
+    }
     delivery::inject_pause(inner, "force_submit_after_intent").await;
 
     if !inner.force_submit.get().0 {
-        withdraw_pre_key(inner, service, target, NotificationResolution::Complete)?;
+        withdraw_pre_key(messaging, target, NotificationResolution::Complete)?;
         return Err(AttentionActionError::ForceRefused("setting was disabled"));
     }
-    let Some(route) = force_action_route(inner, service, target) else {
-        withdraw_pre_key(inner, service, target, NotificationResolution::Complete)?;
+    delivery::inject_pause(inner, "force_submit_after_setting_check_before_reservation").await;
+    let Some(route) = force_action_route(inner, messaging, target) else {
+        withdraw_pre_key(messaging, target, NotificationResolution::Complete)?;
         return Err(AttentionActionError::ForceRefused(
             "recipient process or pane mode changed",
         ));
     };
     let Some(keys) = action_keys(&route.manifest, NotificationResolution::Complete) else {
-        withdraw_pre_key(inner, service, target, NotificationResolution::Complete)?;
+        withdraw_pre_key(messaging, target, NotificationResolution::Complete)?;
         return Err(AttentionActionError::ForceRefused(
             "manifest has no submit key",
         ));
@@ -159,18 +192,41 @@ pub(crate) async fn force_complete(
 
     let mut evidence_events = inner.events.subscribe();
     let dispatch_started_ms = unix_ms();
-    let expected_payload = expected_notification(service, target)
-        .ok_or(AttentionActionError::ForceRefused("payload is obsolete"))?;
-    let registration = service.register_attention_consumption_candidate(
+    let Some(expected_payload) = messaging.expected_attention_notification(target) else {
+        withdraw_pre_key(messaging, target, NotificationResolution::Complete)?;
+        return Err(AttentionActionError::ForceRefused("payload is obsolete"));
+    };
+    let registration = match messaging.register_attention_consumption(
         target,
         route.session_idx,
         route.row.pane_id.clone(),
         expected_payload,
         dispatch_started_ms,
-    )?;
-    let registration = registration.map(|signal| {
-        ConsumptionRegistration::new(Arc::clone(service), target.record.attempt_id, signal)
-    });
+    ) {
+        Ok(registration) => registration,
+        Err(error) => {
+            withdraw_pre_key(messaging, target, NotificationResolution::Complete)?;
+            return Err(AttentionActionError::Store(error));
+        }
+    };
+
+    // The setting gate is held through this append, whose callback shares the
+    // workspace journal lock with inbox.claim. A saved disable ordered before
+    // this boundary withholds terminal IO; a claim ordered first does too.
+    let Some(reserved) = inner
+        .force_submit
+        .reserve_if_enabled(|| messaging.reserve_forced_attention_resolution_action(target))?
+    else {
+        withdraw_pre_key(messaging, target, NotificationResolution::Complete)?;
+        return Err(AttentionActionError::ForceRefused("setting was disabled"));
+    };
+    if !reserved {
+        withdraw_pre_key(messaging, target, NotificationResolution::Complete)?;
+        return Err(AttentionActionError::ForceRefused(
+            "attempt was claimed, withdrawn, replaced, or settled",
+        ));
+    }
+    delivery::inject_pause(inner, "force_submit_after_terminal_key_reservation").await;
 
     if route
         .watcher
@@ -179,15 +235,15 @@ pub(crate) async fn force_complete(
         .await
         .is_err()
     {
-        let _ = service.cancel_attention_resolution(target.record.attempt_id);
+        let _ = messaging.cancel_attention_resolution(target.record.attempt_id);
         return Err(AttentionActionError::Uncertain);
     }
     delivery::inject_pause(inner, "force_submit_after_key_before_accepted").await;
-    if service
+    if messaging
         .record_attention_resolution_action_accepted(target, NotificationResolution::Complete)
         .is_err()
     {
-        let _ = service.cancel_attention_resolution(target.record.attempt_id);
+        let _ = messaging.cancel_attention_resolution(target.record.attempt_id);
         return Err(AttentionActionError::Uncertain);
     }
 
@@ -197,23 +253,25 @@ pub(crate) async fn force_complete(
             .binding
             .clone()
             .expect("force-submit eligibility requires a binding"),
-        signal: registration.as_ref().map(ConsumptionRegistration::signal),
+        signal: registration
+            .as_ref()
+            .map(AttentionConsumptionRegistration::signal),
     };
     let Some(confirmed) = observe_post_action_clear(
         inner,
-        service,
+        messaging,
         target,
         &mut evidence_events,
         Some(&consumption),
     )
     .await
     else {
-        let _ = service.cancel_attention_resolution(target.record.attempt_id);
+        let _ = messaging.cancel_attention_resolution(target.record.attempt_id);
         return Err(AttentionActionError::Uncertain);
     };
     settle_resolution(
         inner,
-        service,
+        messaging,
         target,
         NotificationResolution::Complete,
         confirmed,
@@ -223,12 +281,13 @@ pub(crate) async fn force_complete(
 
 fn force_action_route(
     inner: &Arc<Inner>,
-    service: &MailboxService,
+    messaging: &WorkspaceMessaging,
     target: &AttentionTarget,
 ) -> Option<ActionRoute> {
     let binding = target.record.binding.as_ref()?;
-    let route =
-        crate::messaging::notification_route(inner, service, target.record.recipient).ok()??;
+    let route = messaging
+        .attention_terminal_route(target.record.recipient)
+        .ok()??;
     if route.row.dead || route.row.in_mode {
         return None;
     }
@@ -246,156 +305,66 @@ fn force_action_route(
     })
 }
 
-/// Reconcile exact Cyclops-owned composer content after relevant evidence moves.
-///
-/// The durable mailbox selects submit for pending work and clear for a claim
-/// ordered after the write. Every terminal action still passes through the
-/// same proof, intent, acceptance, and settlement path as an explicit action.
-pub(crate) fn schedule_exact_owned_reconciliation(
-    inner: &Arc<Inner>,
-    recipient: cyclops_proto::RecipientKey,
-) {
-    let Some(service) = inner.mailbox.as_ref().cloned() else {
-        return;
-    };
-    let Ok(candidates) = service.active_composer_notifications(recipient) else {
-        return;
-    };
-    if tokio::runtime::Handle::try_current().is_err() {
-        return;
-    }
-    for attempt_id in candidates
-        .into_iter()
-        .filter(|candidate| candidate.record.needs_exact_owned_reconciliation())
-        .map(|candidate| candidate.record.attempt_id)
-    {
-        if service
-            .request_exact_reconciliation(attempt_id)
-            .unwrap_or(false)
-        {
-            spawn_exact_owned_worker(inner, Arc::clone(&service), attempt_id);
-        }
-    }
-}
-
-fn spawn_exact_owned_worker(
-    inner: &Arc<Inner>,
-    service: Arc<MailboxService>,
-    attempt_id: cyclops_proto::NotificationAttemptId,
-) {
-    let task_inner = Arc::clone(inner);
-    inner.engine.spawn_descendant_task(async move {
-        while service
-            .take_exact_reconciliation_request(attempt_id)
-            .unwrap_or(false)
-        {
-            delivery::inject_pause(&task_inner, "automatic_attention_before_resolve").await;
-            let target = match service.attention_target(&attempt_id.to_string()) {
-                Ok(target) => target,
-                Err(_) => continue,
-            };
-            let resolution = match service.automatic_attention_resolution(&target) {
-                Ok(Some(resolution)) => resolution,
-                Ok(None) | Err(_) => continue,
-            };
-            match resolve_selected(&task_inner, &service, &target, resolution, true).await {
-                Ok(result) => tracing::info!(
-                    %attempt_id,
-                    resolution = ?result.resolution,
-                    "exact-owned composer notification reconciled"
-                ),
-                Err(AttentionActionError::Evidence(_)) => {}
-                Err(AttentionActionError::ForceRefused(_)) => {}
-                Err(AttentionActionError::Uncertain) => tracing::warn!(
-                    %attempt_id,
-                    "exact-owned composer reconciliation remains uncertain"
-                ),
-                Err(AttentionActionError::DiscardUnsupported) => tracing::warn!(
-                    %attempt_id,
-                    "exact-owned composer cannot be cleared by this manifest"
-                ),
-                Err(AttentionActionError::Store(error)) => {
-                    if error.notification_resolution_in_progress() {
-                        match service.park_exact_reconciliation_after_conflict(attempt_id) {
-                            Ok(true) => continue,
-                            Ok(false) | Err(_) => return,
-                        }
-                    }
-                    tracing::debug!(
-                        %attempt_id,
-                        %error,
-                        "exact-owned composer reconciliation did not start"
-                    );
-                }
-            }
-        }
-    });
-}
-
 async fn resolve_selected(
     inner: &Arc<Inner>,
-    service: &Arc<MailboxService>,
+    messaging: &WorkspaceMessaging,
     target: &AttentionTarget,
     mut resolution: NotificationResolution,
     automatic: bool,
 ) -> Result<AttentionResolveResult, AttentionActionError> {
-    let start = service.begin_attention_resolution(target, resolution)?;
+    let start = messaging.begin_attention_resolution(target, resolution)?;
     let attempt_id = target.record.attempt_id;
 
     match start {
-        AttentionResolutionStart::Fresh => {}
+        AttentionResolutionStart::Fresh => {
+            delivery::inject_pause(inner, "attention_after_reservation").await;
+        }
         AttentionResolutionStart::ReconcileOnly => {
-            return reconcile_existing_intent(inner, service, target, resolution, false).await;
+            return reconcile_existing_intent(inner, messaging, target, resolution, false).await;
         }
         AttentionResolutionStart::IntentOnlyUncertain => {
             if resolution == NotificationResolution::Discard {
-                return resolve_clear_composer_discard(inner, service, target).await;
+                return resolve_clear_composer_discard(inner, messaging, target).await;
             }
-            service.cancel_attention_resolution(attempt_id)?;
+            messaging.cancel_attention_resolution(attempt_id)?;
             return Err(AttentionActionError::Uncertain);
         }
         AttentionResolutionStart::AcceptedUnconsumed => {
-            return reconcile_existing_intent(inner, service, target, resolution, true).await;
+            return reconcile_existing_intent(inner, messaging, target, resolution, true).await;
         }
     }
 
-    let first = assess(inner, service, target, false).await;
+    let first = assess(inner, messaging, target, false).await;
     let Some(path_kind) = resolution_path(&first, resolution) else {
-        service.cancel_attention_resolution(attempt_id)?;
+        messaging.cancel_attention_resolution(attempt_id)?;
         return Err(AttentionActionError::Evidence(Box::new(first.result)));
     };
     if path_kind == ResolutionPathKind::ComposerAlreadyClear {
-        return resolve_clear_composer_discard(inner, service, target).await;
+        return resolve_clear_composer_discard(inner, messaging, target).await;
     }
     if matches!(first.path.as_ref(), Some(ResolutionPath::TerminalKey(route)) if resolution == NotificationResolution::Discard && route.manifest.injection.clear_keys.is_empty())
     {
-        service.cancel_attention_resolution(attempt_id)?;
+        messaging.cancel_attention_resolution(attempt_id)?;
         return Err(AttentionActionError::DiscardUnsupported);
     }
 
     // Rebuild before recording the resolution action.
-    let second = assess(inner, service, target, false).await;
+    let second = assess(inner, messaging, target, false).await;
     if resolution_path(&second, resolution) != Some(path_kind) {
-        service.cancel_attention_resolution(attempt_id)?;
+        messaging.cancel_attention_resolution(attempt_id)?;
         return Err(AttentionActionError::Evidence(Box::new(second.result)));
     }
     if matches!(second.path.as_ref(), Some(ResolutionPath::TerminalKey(route)) if action_keys(&route.manifest, resolution).is_none())
     {
-        service.cancel_attention_resolution(attempt_id)?;
+        messaging.cancel_attention_resolution(attempt_id)?;
         return Err(AttentionActionError::DiscardUnsupported);
     }
 
-    let intent = if automatic {
-        service.record_automatic_attention_resolution_intent(target)
-    } else {
-        service
-            .record_attention_resolution_intent(target, resolution)
-            .map(|_| resolution)
-    };
+    let intent = messaging.record_attention_resolution_intent(target, resolution, automatic);
     match intent {
         Ok(selected) => resolution = selected,
         Err(error) => {
-            service.cancel_attention_resolution(attempt_id)?;
+            messaging.cancel_attention_resolution(attempt_id)?;
             return Err(AttentionActionError::Store(error));
         }
     }
@@ -403,15 +372,15 @@ async fn resolve_selected(
 
     // The journal append takes time. Rebuild the proof before the terminal
     // key rather than trusting an earlier capture.
-    let final_assessment = assess(inner, service, target, false).await;
+    let final_assessment = assess(inner, messaging, target, false).await;
     if resolution == NotificationResolution::Discard
         && resolution_path(&final_assessment, resolution)
             == Some(ResolutionPathKind::ComposerAlreadyClear)
     {
-        return resolve_clear_composer_discard(inner, service, target).await;
+        return resolve_clear_composer_discard(inner, messaging, target).await;
     }
     if resolution_path(&final_assessment, resolution) != Some(path_kind) {
-        withdraw_pre_key(inner, service, target, resolution)?;
+        withdraw_pre_key(messaging, target, resolution)?;
         return Err(AttentionActionError::Evidence(Box::new(
             final_assessment.result,
         )));
@@ -419,32 +388,30 @@ async fn resolve_selected(
     let route = match final_assessment.path {
         Some(ResolutionPath::TerminalKey(route)) => {
             let Some(keys) = action_keys(&route.manifest, resolution) else {
-                withdraw_pre_key(inner, service, target, resolution)?;
+                withdraw_pre_key(messaging, target, resolution)?;
                 return Err(AttentionActionError::DiscardUnsupported);
             };
             let mut evidence_events = inner.events.subscribe();
             let dispatch_started_ms = unix_ms();
             let consumption_registration = if resolution == NotificationResolution::Complete {
-                let Some(expected_payload) = expected_notification(service, target) else {
-                    withdraw_pre_key(inner, service, target, resolution)?;
+                let Some(expected_payload) = messaging.expected_attention_notification(target)
+                else {
+                    withdraw_pre_key(messaging, target, resolution)?;
                     return Err(AttentionActionError::Uncertain);
                 };
-                let signal = match service.register_attention_consumption_candidate(
+                match messaging.register_attention_consumption(
                     target,
                     route.session_idx,
                     route.row.pane_id.clone(),
                     expected_payload,
                     dispatch_started_ms,
                 ) {
-                    Ok(signal) => signal,
+                    Ok(registration) => registration,
                     Err(error) => {
-                        withdraw_pre_key(inner, service, target, resolution)?;
+                        withdraw_pre_key(messaging, target, resolution)?;
                         return Err(AttentionActionError::Store(error));
                     }
-                };
-                signal.map(|signal| {
-                    ConsumptionRegistration::new(Arc::clone(service), attempt_id, signal)
-                })
+                }
             } else {
                 None
             };
@@ -455,21 +422,21 @@ async fn resolve_selected(
                 .await
                 .is_err()
             {
-                let _ = service.cancel_attention_resolution(attempt_id);
+                let _ = messaging.cancel_attention_resolution(attempt_id);
                 // The durable intent remains ambiguous. No automatic retry may
                 // press a second key sequence.
                 return Err(AttentionActionError::Uncertain);
             }
             delivery::inject_pause(inner, "attention_after_key_before_accepted").await;
             if let Err(error) =
-                service.record_attention_resolution_action_accepted(target, resolution)
+                messaging.record_attention_resolution_action_accepted(target, resolution)
             {
                 tracing::error!(
                     attempt_id = %attempt_id,
                     %error,
                     "terminal action was accepted but its durable boundary failed"
                 );
-                let _ = service.cancel_attention_resolution(attempt_id);
+                let _ = messaging.cancel_attention_resolution(attempt_id);
                 return Err(AttentionActionError::Uncertain);
             }
             delivery::inject_pause(inner, "attention_after_action_accepted").await;
@@ -482,19 +449,19 @@ async fn resolve_selected(
                         .expect("terminal action requires a durable binding"),
                     signal: consumption_registration
                         .as_ref()
-                        .map(ConsumptionRegistration::signal),
+                        .map(AttentionConsumptionRegistration::signal),
                 },
             );
             let Some(confirmed) = observe_post_action_clear(
                 inner,
-                service,
+                messaging,
                 target,
                 &mut evidence_events,
                 consumption.as_ref(),
             )
             .await
             else {
-                let _ = service.cancel_attention_resolution(attempt_id);
+                let _ = messaging.cancel_attention_resolution(attempt_id);
                 // The durable intent remains ambiguous. The exact barrier and
                 // open attention item stay recoverable, and no second key may
                 // be sent for this intent.
@@ -508,7 +475,7 @@ async fn resolve_selected(
         None => unreachable!("resolution path was checked above"),
     };
 
-    settle_resolution(inner, service, target, resolution, route).await
+    settle_resolution(inner, messaging, target, resolution, route).await
 }
 
 /// Settle Discard without a terminal key after two current exact-empty proofs.
@@ -519,34 +486,34 @@ async fn resolve_selected(
 /// path, but it still cannot send a key.
 async fn resolve_clear_composer_discard(
     inner: &Arc<Inner>,
-    service: &Arc<MailboxService>,
+    messaging: &WorkspaceMessaging,
     target: &AttentionTarget,
 ) -> Result<AttentionResolveResult, AttentionActionError> {
     let attempt_id = target.record.attempt_id;
-    let first = assess(inner, service, target, false).await;
+    let first = assess(inner, messaging, target, false).await;
     if resolution_path(&first, NotificationResolution::Discard)
         != Some(ResolutionPathKind::ComposerAlreadyClear)
     {
-        service.cancel_attention_resolution(attempt_id)?;
+        messaging.cancel_attention_resolution(attempt_id)?;
         return Err(AttentionActionError::Evidence(Box::new(first.result)));
     }
     delivery::inject_pause(inner, "attention_before_no_key_resolution").await;
-    let second = assess(inner, service, target, false).await;
+    let second = assess(inner, messaging, target, false).await;
     let Some(ResolutionPath::ComposerAlreadyClear(route)) = second.path else {
-        service.cancel_attention_resolution(attempt_id)?;
+        messaging.cancel_attention_resolution(attempt_id)?;
         return Err(AttentionActionError::Evidence(Box::new(second.result)));
     };
     if !second.result.checks.terminal_action_safe {
-        service.cancel_attention_resolution(attempt_id)?;
+        messaging.cancel_attention_resolution(attempt_id)?;
         return Err(AttentionActionError::Evidence(Box::new(second.result)));
     }
-    if let Err(error) = service.resolve_attention_without_terminal_action(target) {
+    if let Err(error) = messaging.commit_attention_without_terminal_action(target) {
         tracing::error!(
             attempt_id = %attempt_id,
             %error,
             "no-key Discard was proven but its atomic resolution fact failed"
         );
-        let _ = service.cancel_attention_resolution(attempt_id);
+        let _ = messaging.cancel_attention_resolution(attempt_id);
         return Err(AttentionActionError::Uncertain);
     }
     delivery::inject_pause(inner, "attention_after_no_key_resolution").await;
@@ -565,7 +532,7 @@ async fn resolve_clear_composer_discard(
 /// same resolution action; every other observation leaves the intent open.
 async fn reconcile_existing_intent(
     inner: &Arc<Inner>,
-    service: &Arc<MailboxService>,
+    messaging: &WorkspaceMessaging,
     target: &AttentionTarget,
     resolution: NotificationResolution,
     consumption_required: bool,
@@ -582,39 +549,39 @@ async fn reconcile_existing_intent(
     });
     let Some(route) = observe_post_action_clear(
         inner,
-        service,
+        messaging,
         target,
         &mut evidence_events,
         consumption.as_ref(),
     )
     .await
     else {
-        let _ = service.cancel_attention_resolution(attempt_id);
+        let _ = messaging.cancel_attention_resolution(attempt_id);
         return Err(AttentionActionError::Uncertain);
     };
-    settle_resolution(inner, service, target, resolution, route).await
+    settle_resolution(inner, messaging, target, resolution, route).await
 }
 
 async fn settle_resolution(
     inner: &Arc<Inner>,
-    service: &Arc<MailboxService>,
+    messaging: &WorkspaceMessaging,
     target: &AttentionTarget,
     resolution: NotificationResolution,
     route: ActionRoute,
 ) -> Result<AttentionResolveResult, AttentionActionError> {
     let attempt_id = target.record.attempt_id;
-    if let Err(error) = service.resolve_attention(target, resolution) {
+    if let Err(error) = messaging.commit_attention_resolution(target, resolution) {
         tracing::error!(
             attempt_id = %attempt_id,
             %error,
             "terminal action landed but its resolution fact failed"
         );
-        let _ = service.cancel_attention_resolution(attempt_id);
+        let _ = messaging.cancel_attention_resolution(attempt_id);
         return Err(AttentionActionError::Uncertain);
     }
     delivery::inject_pause(inner, "attention_after_resolution").await;
     resolve_staged_hold(inner, target, &route).await;
-    if let Err(error) = messaging::schedule_recipient(inner, service, target.record.recipient) {
+    if let Err(error) = messaging.notification_head_changed(target.record.recipient) {
         tracing::error!(
             recipient = %target.record.recipient,
             %error,
@@ -654,7 +621,7 @@ async fn resolve_staged_hold(inner: &Arc<Inner>, target: &AttentionTarget, route
 /// terminal key.
 async fn observe_post_action_clear(
     inner: &Arc<Inner>,
-    service: &MailboxService,
+    messaging: &WorkspaceMessaging,
     target: &AttentionTarget,
     evidence_events: &mut tokio::sync::broadcast::Receiver<Event>,
     consumption: Option<&ConsumptionRequirement>,
@@ -669,12 +636,12 @@ async fn observe_post_action_clear(
         if !consumption_observed {
             let observation = consumption
                 .and_then(|required| required.signal_observation())
-                .or_else(|| service.attention_claim_consumption(target).ok().flatten());
+                .or_else(|| messaging.attention_claim_consumption(target).ok().flatten());
             if let Some(observation) = observation {
                 if consumption.is_some_and(|required| {
-                    required.current_binding_matches(inner, service, target)
+                    required.current_binding_matches(inner, messaging, target)
                 }) {
-                    if let Err(error) = service
+                    if let Err(error) = messaging
                         .record_attention_resolution_consumption_observed(target, observation)
                     {
                         tracing::error!(
@@ -690,7 +657,7 @@ async fn observe_post_action_clear(
             }
         }
         if assess_now {
-            let assessment = assess(inner, service, target, false).await;
+            let assessment = assess(inner, messaging, target, false).await;
             if consumption_observed {
                 if let Some(ResolutionPath::ComposerAlreadyClear(route)) = assessment.path {
                     return Some(route);
@@ -776,13 +743,13 @@ impl ConsumptionRequirement {
     fn current_binding_matches(
         &self,
         inner: &Arc<Inner>,
-        service: &MailboxService,
+        messaging: &WorkspaceMessaging,
         target: &AttentionTarget,
     ) -> bool {
-        let Some(route) =
-            crate::messaging::notification_route(inner, service, target.record.recipient)
-                .ok()
-                .flatten()
+        let Some(route) = messaging
+            .attention_terminal_route(target.record.recipient)
+            .ok()
+            .flatten()
         else {
             return false;
         };
@@ -792,37 +759,6 @@ impl ConsumptionRequirement {
         }
         let current = fusion::admitted_binding(inner, route.session_idx, &row);
         binding_checks(current.as_ref(), &self.binding) == (true, true)
-    }
-}
-
-struct ConsumptionRegistration {
-    service: Arc<MailboxService>,
-    attempt_id: cyclops_proto::NotificationAttemptId,
-    signal: Arc<AttentionConsumptionSignal>,
-}
-
-impl ConsumptionRegistration {
-    fn new(
-        service: Arc<MailboxService>,
-        attempt_id: cyclops_proto::NotificationAttemptId,
-        signal: Arc<AttentionConsumptionSignal>,
-    ) -> Self {
-        Self {
-            service,
-            attempt_id,
-            signal,
-        }
-    }
-
-    fn signal(&self) -> Arc<AttentionConsumptionSignal> {
-        Arc::clone(&self.signal)
-    }
-}
-
-impl Drop for ConsumptionRegistration {
-    fn drop(&mut self) {
-        self.service
-            .unregister_attention_consumption_candidate(self.attempt_id);
     }
 }
 
@@ -843,38 +779,30 @@ fn resolution_path(
 }
 
 fn withdraw_pre_key(
-    inner: &Arc<Inner>,
-    service: &Arc<MailboxService>,
+    messaging: &WorkspaceMessaging,
     target: &AttentionTarget,
     resolution: NotificationResolution,
 ) -> Result<(), AttentionActionError> {
-    if let Err(error) = service.withdraw_attention_resolution_intent(target, resolution) {
+    if let Err(error) = messaging.withdraw_attention_resolution_intent(target, resolution) {
         tracing::error!(
             attempt_id = %target.record.attempt_id,
             %error,
             "pre-key refusal could not withdraw its durable action intent"
         );
-        let _ = service.cancel_attention_resolution(target.record.attempt_id);
+        let _ = messaging.cancel_attention_resolution(target.record.attempt_id);
         return Err(AttentionActionError::Uncertain);
     }
-    service.cancel_attention_resolution(target.record.attempt_id)?;
-    if let Err(error) = messaging::schedule_recipient(inner, service, target.record.recipient) {
-        tracing::error!(
-            recipient = %target.record.recipient,
-            %error,
-            "cannot schedule mailbox notification after attention intent withdrawal"
-        );
-    }
+    messaging.finish_attention_intent_withdrawal(target)?;
     Ok(())
 }
 
 async fn assess(
     inner: &Arc<Inner>,
-    service: &MailboxService,
+    messaging: &WorkspaceMessaging,
     target: &AttentionTarget,
     include_diff: bool,
 ) -> Assessment {
-    let expected = expected_notification(service, target);
+    let expected = messaging.expected_attention_notification(target);
     let mut checks = AttentionChecks {
         notification_exact: false,
         trailer_anchored: false,
@@ -895,7 +823,8 @@ async fn assess(
             action_path,
         );
     };
-    let Some(route) = crate::messaging::notification_route(inner, service, target.record.recipient)
+    let Some(route) = messaging
+        .attention_terminal_route(target.record.recipient)
         .ok()
         .flatten()
     else {
@@ -1094,11 +1023,7 @@ fn binding_checks(
     )
 }
 
-fn expected_notification(service: &MailboxService, target: &AttentionTarget) -> Option<String> {
-    let message = service.message_line(&target.record.message_id).ok()?;
-    expected_notification_from_message(target, &message)
-}
-
+#[cfg(test)]
 fn expected_notification_from_message(
     target: &AttentionTarget,
     message: &cyclops_proto::LedgerLine,

@@ -10,7 +10,8 @@
 //! - The record: one crash-safe NDJSON ledger per watched session, and
 //!   the read side over it (`history.rs`: `msg.history`, `msg.thread`).
 //! - Delivery (`delivery.rs`, docs/development/DELIVERY.md): the gate, the paste,
-//!   the ACK tiers, quota parking, `agent.wait`, restart-limbo closure.
+//!   the ACK tiers, quota parking, and `agent.wait`. Retained direct-delivery
+//!   entry points and restart replay cross `compatibility.rs` first.
 //! - Who is who: sender identity from socket peer credentials
 //!   (`identity.rs`) and the durable adoption roster
 //!   (`registry.rs`).
@@ -47,6 +48,7 @@
 mod ack;
 mod attention_resolution;
 mod chrome;
+mod compatibility;
 mod composer_recovery;
 pub mod config;
 mod deadlock;
@@ -58,6 +60,7 @@ pub mod identity;
 mod livesession;
 pub mod mailbox;
 mod messaging;
+mod messaging_runtime;
 mod notification_adapter;
 mod registry;
 mod selftest;
@@ -79,29 +82,32 @@ pub use delivery::render_payload;
 #[doc(hidden)]
 pub use delivery::{prove_composer_representation, ComposerRepresentationProof};
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cyclops_ledger::LedgerWriter;
 use cyclops_manifest::Manifest;
 use cyclops_proto::{
     AdminNotifyParams, AgentState, Detection, Event, Kind, LedgerLine, MessageId,
-    MessagesSnapshotResult, MsgSendParams, NotificationAttemptId, NotificationRouteEvidenceId,
-    NotificationWithdrawResult, ProcessInstanceId, RecipientKey, SessionIdentityBinding,
-    SessionInstanceId, StateReportParams, TmuxPaneId, TmuxSessionId, WireError, WorkspaceId,
+    MessagesSnapshotResult, MsgSendParams, NotificationAttemptId, NotificationManifestId,
+    NotificationRouteEvidenceId, NotificationWithdrawResult, ProcessInstanceId, RecipientKey,
+    SessionIdentityBinding, SessionInstanceId, StateReportParams, TmuxPaneId, TmuxSessionId,
+    WireError, WorkspaceId,
 };
-use cyclops_state::{RepairSummary, StateRoot};
+use cyclops_state::{RepairSummary, StateFile, StateRoot};
 use cyclops_tmux::{
     pane_session_id, ControlConfig, PaneEvent, PaneField, PaneRow, SessionWatcher, TmuxError,
     TmuxVersion,
 };
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, watch, Notify};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, warn};
 
 /// Recompute a pane this long after its last output activity settles.
@@ -119,9 +125,483 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 /// measured drops at ~2.5s of stall on the old 1024), while a truly wedged
 /// client still lags out and is dropped by the server.
 const EVENT_BUFFER: usize = 8192;
+const MISSING_LIFECYCLE_END_BODY: &str = concat!(
+    "A fresh screen shows the turn stopped and the composer clean, but no matching lifecycle ",
+    "end was recorded for the same process generation and turn. Terminal writes remain blocked; ",
+    "inspect the vendor hook configuration and lifecycle event payload."
+);
 
-/// Test seam: an async pause awaited inside the delivery injection path at
-/// a named phase ("pre_paste", "pre_submit"), installed via
+/// One `status` request refreshes every live pane under one bounded budget.
+/// The budget and concurrency cap are existing protocol behavior. They live
+/// with the runtime operation so a socket handler cannot independently own
+/// observation task lifetime or decide which panes to refresh.
+const STATUS_REFRESH_BUDGET: Duration = Duration::from_millis(250);
+const STATUS_REFRESH_CONCURRENCY: usize = 8;
+
+/// Application-level work performed by the pane observation runtime.
+///
+/// These counts deliberately do not describe operating-system scheduler
+/// wakeups, tmux internals, terminal-delivery captures, or client requests.
+/// They describe only watcher events and the state-observation work Cyclops
+/// starts in response.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ObservationWorkCounts {
+    /// Watcher [`PaneEvent`] values accepted by the daemon.
+    pub watcher_event_wakes: u64,
+    /// Pane observation transactions that acquired their per-route gate.
+    pub observation_recompute_starts: u64,
+    /// State-observation `capture-pane` commands issued through the tmux adapter.
+    pub screen_capture_requests: u64,
+}
+
+/// Commit all consequences of one pane observation before optional tmux chrome.
+///
+/// Fusion has already committed the cache. Runtime publications keep their
+/// observed order, followed by delivery ACKs and ordered messaging
+/// observations, before the first presentation await. A stalled or cancelled
+/// border write therefore cannot consume any immutable post-commit evidence.
+async fn apply_pane_observation(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    watcher: &SessionWatcher,
+    pane_id: &str,
+    observed: fusion::PaneObservation,
+) -> Detection {
+    let (
+        detection,
+        runtime_observations,
+        dispatch_acks,
+        messaging_observations,
+        repaint,
+        recompute_guard,
+    ) = observed.into_parts();
+    for observation in runtime_observations {
+        apply_pane_runtime_observation(inner, observation);
+    }
+    for evidence in dispatch_acks {
+        apply_dispatch_ack_evidence(inner, evidence);
+    }
+    for observation in messaging_observations {
+        apply_messaging_observation(inner, observation);
+    }
+    if repaint {
+        repaint_chrome(inner, session_idx, watcher, pane_id).await;
+    }
+    // The same pane cannot commit or paint a newer observation until this
+    // complete durable-then-presentation sequence has finished.
+    drop(recompute_guard);
+    detection
+}
+
+/// Composition-root handoff from immutable pane facts to durable records and
+/// live runtime events.
+pub(crate) fn apply_pane_runtime_observation(
+    inner: &Arc<Inner>,
+    observation: fusion::PaneRuntimeObservation,
+) {
+    match observation {
+        fusion::PaneRuntimeObservation::ReadinessChanged {
+            session_idx,
+            pane_id,
+            write_ready,
+            write_block,
+        } => inner.emit(
+            "readiness",
+            json!({
+                "pane_id": pane_id,
+                "session_idx": session_idx,
+                "write_ready": write_ready,
+                "write_block": write_block,
+            }),
+            None,
+        ),
+        fusion::PaneRuntimeObservation::MissingLifecycleEnd {
+            session_idx,
+            pane_id,
+        } => {
+            let target = inner
+                .label_for_route(session_idx, &pane_id)
+                .unwrap_or_else(|| pane_id.clone());
+            delivery::admin_notify(
+                inner,
+                cyclops_proto::NotifyLevel::ActionRequired,
+                &format!("{target}: matching lifecycle end missing"),
+                MISSING_LIFECYCLE_END_BODY,
+                None,
+                Some(session_idx),
+                delivery::About::pane(&pane_id),
+            );
+        }
+        fusion::PaneRuntimeObservation::StateChanged {
+            session_idx,
+            pane_id,
+            state,
+            disagreement,
+            decided_by,
+            prior,
+            cause,
+            source_agent,
+            source_manifest,
+            working_confirmed,
+        } => inner.emit_state(
+            session_idx,
+            &pane_id,
+            state,
+            disagreement,
+            &decided_by,
+            prior,
+            &cause,
+            (source_agent, &source_manifest),
+            working_confirmed,
+        ),
+    }
+}
+
+/// Composition-root handoff from immutable pane evidence to the retained
+/// delivery ACK mechanism.
+fn apply_dispatch_ack_evidence(inner: &Arc<Inner>, evidence: fusion::PaneDispatchAckEvidence) {
+    let (session_idx, pane_id, reporter, reporter_manifest, turn, accepted_ms) =
+        evidence.into_parts();
+    delivery::confirm_dispatch_ack(
+        inner,
+        session_idx,
+        &pane_id,
+        reporter,
+        &reporter_manifest,
+        &turn,
+        accepted_ms,
+    );
+}
+
+/// Composition-root handoff from immutable pane evidence to durable messaging.
+pub(crate) fn apply_messaging_observation(
+    inner: &Arc<Inner>,
+    observation: fusion::PaneMessagingObservation,
+) {
+    let Some(messaging) = inner.workspace_messaging() else {
+        return;
+    };
+    match messaging.apply_observation(observation) {
+        Ok(application) => {
+            for notice in application.notices {
+                delivery::admin_notify(
+                    inner,
+                    notice.level,
+                    &notice.subject,
+                    &notice.body,
+                    Some(notice.message_id.as_str()),
+                    Some(notice.session_idx),
+                    delivery::About::delivery(&notice.recipient_label),
+                );
+            }
+        }
+        Err(error) => {
+            error!(%error, "cannot apply pane observation to workspace messaging");
+        }
+    }
+}
+
+/// Publish one physical route observation to the durable messaging Module.
+fn apply_route_evidence_observation(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    pane_id: &str,
+    route_evidence: &NotificationRouteEvidenceId,
+) {
+    apply_messaging_observation(
+        inner,
+        fusion::PaneMessagingObservation::route_evidence(messaging::MessagingRouteEvidence::new(
+            session_idx,
+            pane_id,
+            route_evidence.clone(),
+        )),
+    );
+}
+
+/// Publish one physical pane-size edge without reading durable width state.
+fn apply_pane_size_observation(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    pane_id: &str,
+    route_evidence: &NotificationRouteEvidenceId,
+) {
+    let Some(recipient) = inner.recipient_key(session_idx, pane_id) else {
+        return;
+    };
+    let route =
+        messaging::MessagingRouteEvidence::new(session_idx, pane_id, route_evidence.clone());
+    apply_messaging_observation(
+        inner,
+        fusion::PaneMessagingObservation::pane_size_changed(
+            messaging::MessagingPaneSizeEvidence::new(recipient, route),
+        ),
+    );
+}
+
+/// Publish a route-directory or lifecycle availability change.
+fn apply_messaging_availability_change(inner: &Arc<Inner>) {
+    if let Some(messaging) = inner.workspace_messaging() {
+        messaging.availability_changed();
+    }
+}
+
+/// Composition adapter for the durable decisions needed during one pane
+/// observation. Fusion receives only this narrow boundary and immutable
+/// evidence; it cannot recover the mailbox service or recovery coordinator.
+struct DaemonPaneMessagingBoundary<'a> {
+    inner: &'a Arc<Inner>,
+    messaging: Option<Arc<messaging::WorkspaceMessaging>>,
+}
+
+impl<'a> DaemonPaneMessagingBoundary<'a> {
+    fn new(inner: &'a Arc<Inner>) -> Self {
+        Self {
+            inner,
+            messaging: inner.workspace_messaging(),
+        }
+    }
+}
+
+impl fusion::PaneMessagingBoundary for DaemonPaneMessagingBoundary<'_> {
+    fn composer_context(
+        &self,
+        recipient: Option<cyclops_proto::RecipientKey>,
+    ) -> fusion::PaneComposerMessagingContext {
+        let (recovery, projection) = match (self.messaging.as_ref(), recipient) {
+            (Some(messaging), Some(recipient)) => (
+                messaging.composer_recovery_probe(recipient),
+                messaging.composer_projection_probe(Some(recipient)),
+            ),
+            (Some(messaging), None) => (
+                messaging::MessagingComposerRecoveryProbe::none(),
+                messaging.composer_projection_probe(None),
+            ),
+            (None, Some(_)) => (
+                messaging::MessagingComposerRecoveryProbe::store_unavailable(),
+                messaging::MessagingComposerProjectionProbe::store_unavailable(),
+            ),
+            (None, None) => (
+                messaging::MessagingComposerRecoveryProbe::none(),
+                messaging::MessagingComposerProjectionProbe::none(),
+            ),
+        };
+        fusion::PaneComposerMessagingContext::new(recovery, projection)
+    }
+
+    fn recovered_turn_observed(&self, evidence: fusion::PaneRecoveredTurnEvidence) {
+        apply_recovered_turn_evidence(self.inner, evidence);
+    }
+
+    fn decide_composer_recovery(
+        &self,
+        recipient: Option<cyclops_proto::RecipientKey>,
+        probe: messaging::MessagingComposerRecoveryProbe,
+        evidence: messaging::MessagingComposerRecoveryObservation,
+        lifecycle_candidate: Option<cyclops_proto::NotificationAttemptId>,
+    ) -> Option<messaging::MessagingComposerRecoveryPlan> {
+        recipient?;
+        let Some(messaging) = self.messaging.as_ref() else {
+            return Some(messaging::MessagingComposerRecoveryPlan::store_unavailable());
+        };
+        let plan = messaging.reconcile_composer_recovery(probe, evidence);
+        Some(messaging.settle_composer_recovery_lifecycle(plan, lifecycle_candidate))
+    }
+
+    fn merge_composer_recovery(
+        &self,
+        plan: Option<messaging::MessagingComposerRecoveryPlan>,
+        base_hold: cyclops_proto::ComposerHold,
+        owner: Option<String>,
+        turn_running: bool,
+    ) -> messaging::MessagingComposerBarrierUpdate {
+        match (self.messaging.as_ref(), plan) {
+            (Some(messaging), Some(plan)) => {
+                messaging.merge_composer_recovery_barrier(plan, base_hold, owner, turn_running)
+            }
+            (None, Some(plan)) => plan.merge_without_module(base_hold, owner, turn_running),
+            (_, None) => messaging::MessagingComposerBarrierUpdate {
+                hold: base_hold,
+                owner,
+                clear_turn: false,
+                refusal: None,
+                recovered_hold: None,
+            },
+        }
+    }
+}
+
+/// Apply one exact lifecycle start to a barrier that messaging still owns.
+///
+/// Reading the cached physical owner is adapter work. Deciding whether that
+/// owner remains an active recovered attempt belongs to `WorkspaceMessaging`.
+pub(crate) fn apply_recovered_turn_evidence(
+    inner: &Arc<Inner>,
+    evidence: fusion::PaneRecoveredTurnEvidence,
+) -> bool {
+    let Some(attempt_id) =
+        composer_recovery::recovered_turn_candidate(inner, evidence.session_idx, &evidence.pane_id)
+    else {
+        return false;
+    };
+    if !inner
+        .workspace_messaging()
+        .is_some_and(|messaging| messaging.composer_recovery_contains(attempt_id))
+    {
+        return false;
+    }
+    fusion::bind_turn(
+        inner,
+        evidence.session_idx,
+        &evidence.pane_id,
+        &attempt_id.to_string(),
+        evidence.turn,
+        evidence.since_ms,
+    )
+    .is_some()
+}
+
+/// Observe one pane, apply its typed messaging consequence, and return the
+/// ordinary fused detection expected by existing callers.
+pub(crate) async fn observe_pane(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    watcher: &SessionWatcher,
+    pane_id: &str,
+    force_screen: bool,
+    cause: &str,
+) -> Option<Detection> {
+    let messaging = DaemonPaneMessagingBoundary::new(inner);
+    let observed = fusion::observe_pane(
+        inner,
+        fusion::PaneObservationTarget::new(session_idx, watcher, pane_id),
+        force_screen,
+        cause,
+        &messaging,
+    )
+    .await?;
+    Some(apply_pane_observation(inner, session_idx, watcher, pane_id, observed).await)
+}
+
+pub(crate) async fn observe_pane_for_route_evidence(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    watcher: &SessionWatcher,
+    pane_id: &str,
+    force_screen: bool,
+    cause: &str,
+    route_evidence: &NotificationRouteEvidenceId,
+) -> Option<Detection> {
+    let messaging = DaemonPaneMessagingBoundary::new(inner);
+    let observed = fusion::observe_pane_for_route_evidence(
+        inner,
+        fusion::PaneObservationTarget::new(session_idx, watcher, pane_id),
+        force_screen,
+        cause,
+        route_evidence,
+        &messaging,
+    )
+    .await?;
+    Some(apply_pane_observation(inner, session_idx, watcher, pane_id, observed).await)
+}
+
+pub(crate) async fn observe_pane_from_output(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    watcher: &SessionWatcher,
+    pane_id: &str,
+    evidence_ms: u64,
+    route_evidence: &NotificationRouteEvidenceId,
+) -> Option<Detection> {
+    let messaging = DaemonPaneMessagingBoundary::new(inner);
+    let observed = fusion::observe_pane_from_output(
+        inner,
+        fusion::PaneObservationTarget::new(session_idx, watcher, pane_id),
+        evidence_ms,
+        route_evidence,
+        &messaging,
+    )
+    .await?;
+    Some(apply_pane_observation(inner, session_idx, watcher, pane_id, observed).await)
+}
+
+type StatusRefreshFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
+type StatusRefreshJob = (PaneKey, StatusRefreshFuture);
+
+/// Refresh each live pane for one status request and return routes that did
+/// not finish inside the shared budget.
+///
+/// A refresh can append current runtime facts, so overdue work must finish in
+/// the daemon lifetime instead of being cancelled at the response boundary.
+/// The status projection treats every returned route as unknown until its
+/// next completed observation.
+pub(crate) async fn refresh_status_observations(inner: &Arc<Inner>) -> HashSet<PaneKey> {
+    let deadline = tokio::time::Instant::now() + STATUS_REFRESH_BUDGET;
+    let mut jobs = VecDeque::new();
+    for (session_idx, _) in inner.active_session_slots() {
+        let Some(watcher) = inner.watcher_of(session_idx) else {
+            continue;
+        };
+        for pane in watcher.snapshot() {
+            let pane_id = pane.pane_id;
+            let key = PaneKey::new(session_idx, &pane_id);
+            let inner = Arc::clone(inner);
+            let watcher = Arc::clone(&watcher);
+            jobs.push_back((
+                key,
+                Box::pin(async move {
+                    observe_pane(&inner, session_idx, &watcher, &pane_id, true, "status")
+                        .await
+                        .is_some()
+                }) as StatusRefreshFuture,
+            ));
+        }
+    }
+    run_status_refresh_jobs(&inner.engine, jobs, deadline, STATUS_REFRESH_CONCURRENCY).await
+}
+
+async fn run_status_refresh_jobs(
+    engine: &delivery::Engine,
+    mut pending: VecDeque<StatusRefreshJob>,
+    deadline: tokio::time::Instant,
+    concurrency: usize,
+) -> HashSet<PaneKey> {
+    let mut incomplete: HashSet<_> = pending.iter().map(|(pane, _)| pane.clone()).collect();
+    let mut running = JoinSet::new();
+    let concurrency = concurrency.max(1);
+
+    loop {
+        while running.len() < concurrency {
+            let Some((pane, refresh)) = pending.pop_front() else {
+                break;
+            };
+            running.spawn(engine.track_descendant(async move { (pane, refresh.await) }));
+        }
+        if running.is_empty() {
+            break;
+        }
+        match tokio::time::timeout_at(deadline, running.join_next()).await {
+            Ok(Some(Ok(Some((pane, true))))) => {
+                incomplete.remove(&pane);
+            }
+            Ok(Some(Ok(Some((_, false)))) | Some(Ok(None)) | Some(Err(_))) => {}
+            Ok(None) => break,
+            Err(_) => {
+                // Pane recomputation can publish state and journal facts. It
+                // is not cancellation-safe, so overdue work finishes in the
+                // background while this answer refuses its cached result.
+                // The daemon lifetime still owns it and cancels it before
+                // sealing the old boot's journals during shutdown.
+                running.detach_all();
+                break;
+            }
+        }
+    }
+    incomplete
+}
+
+/// Test seam: an async pause awaited at a named recovery or terminal-mutation
+/// phase ("pre_paste", "pre_submit"), installed via
 /// [`Daemon::set_inject_pause`]. Always None in production.
 pub(crate) type InjectPause = Arc<
     dyn Fn(&'static str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
@@ -165,6 +645,10 @@ pub(crate) struct Inner {
     pub(crate) force_submit: ForceSubmitRuntime,
     /// Validated descriptor anchoring every session-ledger open in this daemon.
     pub(crate) state_root: Arc<StateRoot>,
+    /// Held for the full lifetime of any runtime task that can write a
+    /// journal. Keeping it on `Inner` prevents an unclean outer `Daemon`
+    /// drop from opening a removal window while detached tasks still run.
+    durable_record_forget_lease: StdMutex<Option<StateFile>>,
     /// One boot-wide aggregate recorded on each session's boot fact.
     pub(crate) state_repair: RepairSummary,
     /// Durable identity of this state root. Loaded before any mailbox or
@@ -174,11 +658,15 @@ pub(crate) struct Inner {
     /// while this lock is held; the lock is never held across an await.
     pub(crate) session_identities: StdMutex<sessionstore::SessionIdentities>,
     pub(crate) mailbox: Option<Arc<mailbox::MailboxService>>,
+    /// The internal durable messaging Module. It is initialized on first use
+    /// at this composition root. The Module receives named post-commit
+    /// capabilities and cannot traverse daemon state itself.
+    pub(crate) workspace_messaging: OnceLock<Arc<messaging::WorkspaceMessaging>>,
     /// Boot-scoped reconciliation state for barriers derived from the
     /// canonical workspace projection.
-    pub(crate) composer_recovery: StdMutex<composer_recovery::RecoveryCoordinator>,
+    composer_recovery: Arc<StdMutex<composer_recovery::RecoveryCoordinator>>,
     /// Serializes route state, directory replacement, and authenticated reads.
-    pub(crate) mailbox_publication: StdMutex<()>,
+    pub(crate) mailbox_publication: Arc<StdMutex<()>>,
     /// Serializes unread badge derivations and tmux writes across concurrent sync requests.
     ///
     /// (1) Global scope is deliberate because badge writes are rare and short,
@@ -193,6 +681,7 @@ pub(crate) struct Inner {
     unread_projection_wake: Notify,
     unread_projection_stopping: AtomicBool,
     unread_projection_pause: StdMutex<Option<Arc<UnreadProjectionTestPause>>>,
+    chrome_repaint_pause: StdMutex<Option<Arc<ChromeRepaintTestPause>>>,
     #[cfg(test)]
     mailbox_publish_pause: StdMutex<Option<MailboxPublishPause>>,
     pub(crate) boot_id: String,
@@ -232,14 +721,10 @@ pub(crate) struct Inner {
     /// Pane-local causal route observation generation for notification
     /// reproof. Synthetic reconciliation reads this map without advancing it.
     pub(crate) route_evidence_generations: StdMutex<HashMap<PaneKey, u64>>,
-    /// One observation transaction per pane. Capture and cache commit stay in
-    /// order, so an older slow capture cannot overwrite a newer verdict or
-    /// mutate lifecycle candidates after the newer observation settled them.
-    pub(crate) pane_recomputes: StdMutex<HashMap<PaneKey, Arc<tokio::sync::Mutex<()>>>>,
-    /// One event-driven lifecycle settlement task per exact pane route.
-    /// Candidate replacements wake the existing task instead of spawning
-    /// another sleeper for the same pane.
-    pub(crate) lifecycle_rechecks: StdMutex<HashMap<PaneKey, fusion::LifecycleRecheckTask>>,
+    /// Owns each pane's ordered recompute gate and event-driven lifecycle
+    /// recheck task. Fusion keeps the concrete concurrency state private so
+    /// daemon callers cannot create a second observation timeline.
+    pane_observation_runtime: fusion::PaneObservationRuntime,
     /// Adoption registry: which pane wears which label, what manifest is
     /// pinned to it, and the tmux chrome it wore before cyclops arrived.
     /// Explicit adoption via pane.label (v1 keeper), durable across
@@ -313,9 +798,272 @@ pub(crate) struct Inner {
     pub(crate) extra_tasks: StdMutex<Vec<JoinHandle<()>>>,
 }
 
+/// Composition-root adapter for the post-commit capabilities requested by
+/// `WorkspaceMessaging`.
+///
+/// The durable operation Module sees only `WorkspaceMessagingEffects`. Keeping
+/// the daemon-root upgrade here prevents operation code from reaching through
+/// `Inner` for unrelated state while preserving a non-owning cycle boundary.
+struct DaemonWorkspaceMessagingEffects {
+    inner: Weak<Inner>,
+    events: broadcast::Sender<Event>,
+    receipt_block: Duration,
+}
+
+impl DaemonWorkspaceMessagingEffects {
+    fn new(inner: &Arc<Inner>) -> Self {
+        Self {
+            inner: Arc::downgrade(inner),
+            events: inner.events.clone(),
+            receipt_block: Duration::from_millis(inner.cfg.receipt_block_ms),
+        }
+    }
+
+    fn inner(&self) -> Result<Arc<Inner>, mailbox::MailboxServiceError> {
+        self.inner.upgrade().ok_or_else(|| {
+            mailbox::MailboxServiceError::NotificationSchedule(
+                "daemon messaging effects are unavailable".to_string(),
+            )
+        })
+    }
+}
+
+impl messaging::WorkspaceMessagingEffects for DaemonWorkspaceMessagingEffects {
+    fn subscribe_messages_changed(&self) -> broadcast::Receiver<Event> {
+        self.events.subscribe()
+    }
+
+    fn schedule_notification(
+        &self,
+        service: &Arc<mailbox::MailboxService>,
+        recipient: RecipientKey,
+    ) -> Result<messaging::RecipientScheduleOutcome, mailbox::MailboxServiceError> {
+        messaging_runtime::schedule_recipient(&self.inner()?, service, recipient)
+    }
+
+    fn invalidate_unread(&self, recipient: RecipientKey) {
+        if let Some(inner) = self.inner.upgrade() {
+            schedule_recipient_unread(&inner, recipient);
+        }
+    }
+
+    fn notification_route(
+        &self,
+        service: &mailbox::MailboxService,
+        recipient: RecipientKey,
+    ) -> Result<Option<messaging::NotificationRoute>, mailbox::MailboxServiceError> {
+        let Some(inner) = self.inner.upgrade() else {
+            return Ok(None);
+        };
+        messaging_runtime::notification_route(&inner, service, recipient)
+    }
+
+    fn notification_route_observation(
+        &self,
+        service: &mailbox::MailboxService,
+        recipient: RecipientKey,
+    ) -> Result<
+        Option<messaging::MessagingNotificationRouteObservation>,
+        mailbox::MailboxServiceError,
+    > {
+        let Some(inner) = self.inner.upgrade() else {
+            return Ok(None);
+        };
+        let Some(route) = messaging_runtime::notification_route(&inner, service, recipient)? else {
+            return Ok(None);
+        };
+        Ok(Some(messaging::MessagingNotificationRouteObservation {
+            agent_state: inner.cached_state(route.session_idx, &route.pane_id),
+            pane_id: route.pane_id,
+            recipient_label: route.label,
+            pane_pid: route.row.pane_pid,
+        }))
+    }
+
+    fn composer_runtime_facts(
+        &self,
+        recipient: RecipientKey,
+        attempt_id: NotificationAttemptId,
+        manifest: Option<&NotificationManifestId>,
+    ) -> messaging::MessagingComposerRuntimeFacts {
+        let Some(inner) = self.inner.upgrade() else {
+            return messaging::MessagingComposerRuntimeFacts::default();
+        };
+        messaging::MessagingComposerRuntimeFacts {
+            active_worker_owns: inner.engine.notification_worker_owns(recipient, attempt_id),
+            clear_supported: manifest
+                .and_then(|manifest| inner.manifests.get(manifest.as_str()))
+                .is_some_and(|manifest| !manifest.injection.clear_keys.is_empty()),
+        }
+    }
+
+    fn settle_notification_claim(&self, attempt_id: NotificationAttemptId) {
+        if let Some(inner) = self.inner.upgrade() {
+            delivery::settle_notification_claim(&inner, attempt_id);
+        }
+    }
+
+    fn observe_claimed_composer(
+        &self,
+        service: &Arc<mailbox::MailboxService>,
+        claimant: RecipientKey,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<(), mailbox::MailboxServiceError> {
+        messaging_runtime::schedule_claimed_composer_observation(
+            &self.inner()?,
+            service,
+            claimant,
+            attempt_id,
+        )
+    }
+
+    fn recover_claimed_notification(
+        &self,
+        service: &Arc<mailbox::MailboxService>,
+        claimant: RecipientKey,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<(), mailbox::MailboxServiceError> {
+        messaging_runtime::schedule_claimed_notification_recovery(
+            &self.inner()?,
+            service,
+            claimant,
+            attempt_id,
+        )
+    }
+
+    fn cancel_notification(&self, attempt_id: NotificationAttemptId) {
+        if let Some(inner) = self.inner.upgrade() {
+            inner.engine.cancel_notification(attempt_id);
+        }
+    }
+
+    fn spawn_exact_attention_worker(&self, attempt_id: NotificationAttemptId) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let Some(messaging) = inner.workspace_messaging() else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let task_inner = Arc::clone(&inner);
+        inner.engine.spawn_descendant_task(async move {
+            loop {
+                let (target, resolution) = match messaging.next_exact_attention_work(attempt_id) {
+                    messaging::ExactAttentionWork::Retire => return,
+                    messaging::ExactAttentionWork::Recheck => continue,
+                    messaging::ExactAttentionWork::Resolve { target, resolution } => {
+                        (target, resolution)
+                    }
+                };
+                delivery::inject_pause(&task_inner, "automatic_attention_before_resolve").await;
+                match attention_resolution::resolve_automatic(
+                    &task_inner,
+                    &messaging,
+                    &target,
+                    resolution,
+                )
+                .await
+                {
+                    Ok(result) => tracing::info!(
+                        %attempt_id,
+                        resolution = ?result.resolution,
+                        "exact-owned composer notification reconciled"
+                    ),
+                    Err(attention_resolution::AttentionActionError::Evidence(_)) => {}
+                    Err(attention_resolution::AttentionActionError::ForceRefused(_)) => {}
+                    Err(attention_resolution::AttentionActionError::Uncertain) => tracing::warn!(
+                        %attempt_id,
+                        "exact-owned composer reconciliation remains uncertain"
+                    ),
+                    Err(attention_resolution::AttentionActionError::DiscardUnsupported) => {
+                        tracing::warn!(
+                            %attempt_id,
+                            "exact-owned composer cannot be cleared by this manifest"
+                        )
+                    }
+                    Err(attention_resolution::AttentionActionError::ResolutionInProgress) => {
+                        if messaging.park_exact_attention_after_conflict(attempt_id) {
+                            continue;
+                        }
+                        return;
+                    }
+                    Err(attention_resolution::AttentionActionError::Store(error)) => {
+                        if error.notification_resolution_in_progress() {
+                            if messaging.park_exact_attention_after_conflict(attempt_id) {
+                                continue;
+                            }
+                            return;
+                        }
+                        tracing::debug!(
+                            %attempt_id,
+                            %error,
+                            "exact-owned composer reconciliation did not start"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    fn reconcile_route_evidence(&self, evidence: messaging::MessagingRouteEvidence) {
+        if let Some(inner) = self.inner.upgrade() {
+            messaging_runtime::schedule_route_evidence(
+                &inner,
+                evidence.session_idx,
+                &evidence.pane_id,
+                &evidence.evidence_id,
+            );
+        }
+    }
+
+    fn reconcile_current_route(&self, session_idx: usize, pane_id: String) {
+        if let Some(inner) = self.inner.upgrade() {
+            messaging_runtime::schedule_route_reconciliation(&inner, session_idx, &pane_id);
+        }
+    }
+
+    fn schedule_unclaimed_reminder(&self, record: cyclops_proto::NotificationRecord) {
+        if let Some(inner) = self.inner.upgrade() {
+            messaging_runtime::schedule_unclaimed_reminder(&inner, record);
+        }
+    }
+
+    fn schedule_force_submit(&self, record: cyclops_proto::NotificationRecord) {
+        if let Some(inner) = self.inner.upgrade() {
+            messaging_runtime::schedule_force_submit(&inner, record);
+        }
+    }
+
+    fn receipt_block(&self) -> Duration {
+        self.receipt_block
+    }
+}
+
+impl Inner {
+    pub(crate) fn workspace_messaging(
+        self: &Arc<Self>,
+    ) -> Option<Arc<messaging::WorkspaceMessaging>> {
+        let service = self.mailbox.clone()?;
+        Some(Arc::clone(self.workspace_messaging.get_or_init(|| {
+            Arc::new(messaging::WorkspaceMessaging::new_with_recovery(
+                service,
+                Arc::clone(&self.mailbox_publication),
+                Arc::new(DaemonWorkspaceMessagingEffects::new(self)),
+                Arc::clone(&self.composer_recovery),
+            ))
+        })))
+    }
+}
+
 pub(crate) struct ForceSubmitRuntime {
     enabled: AtomicBool,
     delay_ms: AtomicU64,
+    /// Orders a persisted setting change with the one durable forced-key
+    /// reservation. The only nested lock order is this gate, then the mailbox
+    /// store inside the reservation callback.
+    reservation_gate: StdMutex<()>,
 }
 
 impl ForceSubmitRuntime {
@@ -323,6 +1071,7 @@ impl ForceSubmitRuntime {
         Self {
             enabled: AtomicBool::new(enabled),
             delay_ms: AtomicU64::new(delay_ms.min(20_000)),
+            reservation_gate: StdMutex::new(()),
         }
     }
 
@@ -333,7 +1082,40 @@ impl ForceSubmitRuntime {
         )
     }
 
-    pub(crate) fn set(&self, enabled: bool, delay_ms: u64) {
+    /// Persist and publish a setting change before another forced action may
+    /// reserve its terminal key. The caller performs no async work here.
+    pub(crate) fn save_and_set(
+        &self,
+        enabled: bool,
+        delay_ms: u64,
+        save: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let _gate = self
+            .reservation_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        save()?;
+        self.set(enabled, delay_ms);
+        Ok(())
+    }
+
+    /// Reserve a forced key only while the setting remains enabled. The
+    /// callback is synchronous and owns the mailbox-side linearization.
+    pub(crate) fn reserve_if_enabled<E>(
+        &self,
+        reserve: impl FnOnce() -> Result<bool, E>,
+    ) -> Result<Option<bool>, E> {
+        let _gate = self
+            .reservation_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.enabled.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        reserve().map(Some)
+    }
+
+    fn set(&self, enabled: bool, delay_ms: u64) {
         self.delay_ms.store(delay_ms.min(20_000), Ordering::Release);
         self.enabled.store(enabled, Ordering::Release);
     }
@@ -343,6 +1125,18 @@ impl ForceSubmitRuntime {
 struct SessionRenamePause {
     entered: std::sync::mpsc::Sender<()>,
     release: Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+struct MissingSessionProbePause {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[cfg(test)]
+struct MissingSessionSettlementPause {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
 }
 
 pub(crate) struct SessionSlot {
@@ -371,6 +1165,12 @@ pub(crate) struct SessionSlot {
     /// collision. The atomic above is the state; this channel is only the
     /// edge that makes a blocked task observe it immediately.
     alias_changed: watch::Sender<Option<usize>>,
+    /// An explicit `session.watch` request says its caller has just made this
+    /// name available for observation. A waiting slot consumes this edge
+    /// instead of retrying a tmux query on a clock. The counter coalesces
+    /// repeated requests while preserving a request that arrives before the
+    /// task reaches its wait.
+    availability_changed: watch::Sender<u64>,
     /// Configured sessions survive absence and wait for `cyclops start` to
     /// create them. Runtime sessions come from a live workspace and retire
     /// after that exact tmux session is positively gone, so reopening a
@@ -380,6 +1180,29 @@ pub(crate) struct SessionSlot {
     observed_live: AtomicBool,
     retired: AtomicBool,
     retired_changed: watch::Sender<bool>,
+    /// One-shot test boundary at the exact point a task has confirmed a
+    /// missing session and is about to wait for `session.watch`. Production
+    /// never allocates or checks this hook.
+    #[cfg(test)]
+    missing_wait_entered: StdMutex<Option<Arc<Notify>>>,
+    #[cfg(test)]
+    missing_wait_active: AtomicBool,
+    /// Counts control-mode attach attempts at the exact call boundary. This
+    /// is test-only evidence that a missing server socket parks on the
+    /// availability edge instead of creating an empty tmux server.
+    #[cfg(test)]
+    control_connect_attempts: AtomicU64,
+    /// One-shot test boundary after tmux reports absence but before the task
+    /// decides whether an already-recorded availability edge requires one
+    /// recheck. It makes the startup-edge race deterministic in a unit test.
+    #[cfg(test)]
+    missing_probe_pause: StdMutex<Option<MissingSessionProbePause>>,
+    /// One-shot test boundary after a current missing probe returns but before
+    /// it takes the registration barrier to settle durable state. It proves a
+    /// followed rename cannot turn that old absence into cleanup of the new
+    /// canonical target.
+    #[cfg(test)]
+    missing_settlement_pause: StdMutex<Option<MissingSessionSettlementPause>>,
     #[cfg(test)]
     rename_pause: StdMutex<Option<SessionRenamePause>>,
     pub(crate) link: StdMutex<SessionLink>,
@@ -429,6 +1252,7 @@ impl SessionSlot {
 
     fn new_with_persistence(name: String, ledger: Arc<LedgerWriter>, persistent: bool) -> Self {
         let (alias_changed, _) = watch::channel(None);
+        let (availability_changed, _) = watch::channel(0);
         let (retired_changed, _) = watch::channel(false);
         SessionSlot {
             name: StdMutex::new(name),
@@ -436,10 +1260,21 @@ impl SessionSlot {
             boot_identity: StdMutex::new(None),
             alias_of: AtomicUsize::new(usize::MAX),
             alias_changed,
+            availability_changed,
             persistent: AtomicBool::new(persistent),
             observed_live: AtomicBool::new(false),
             retired: AtomicBool::new(false),
             retired_changed,
+            #[cfg(test)]
+            missing_wait_entered: StdMutex::new(None),
+            #[cfg(test)]
+            missing_wait_active: AtomicBool::new(false),
+            #[cfg(test)]
+            control_connect_attempts: AtomicU64::new(0),
+            #[cfg(test)]
+            missing_probe_pause: StdMutex::new(None),
+            #[cfg(test)]
+            missing_settlement_pause: StdMutex::new(None),
             #[cfg(test)]
             rename_pause: StdMutex::new(None),
             link: StdMutex::new(SessionLink::default()),
@@ -502,6 +1337,117 @@ impl SessionSlot {
         (idx != usize::MAX).then_some(idx)
     }
 
+    /// Subscribe before a task needs to wait, so an explicit watch request
+    /// received while it is checking tmux is retained as an observed edge.
+    fn availability_events(&self) -> watch::Receiver<u64> {
+        self.availability_changed.subscribe()
+    }
+
+    /// Wake an already-watched detached slot after a caller has created or
+    /// restored the requested tmux session. The caller is an event source,
+    /// not proof: the task still asks tmux once before it attaches.
+    fn session_may_be_available(&self) {
+        self.availability_changed
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    }
+
+    #[cfg(test)]
+    fn arm_missing_wait(&self) -> Arc<Notify> {
+        let entered = Arc::new(Notify::new());
+        *self
+            .missing_wait_entered
+            .lock()
+            .expect("missing wait hook lock") = Some(Arc::clone(&entered));
+        entered
+    }
+
+    #[cfg(test)]
+    fn mark_missing_wait_entered(&self) {
+        self.missing_wait_active.store(true, Ordering::Release);
+        if let Some(entered) = self
+            .missing_wait_entered
+            .lock()
+            .expect("missing wait hook lock")
+            .take()
+        {
+            entered.notify_one();
+        }
+    }
+
+    #[cfg(test)]
+    fn mark_missing_wait_exited(&self) {
+        self.missing_wait_active.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn missing_wait_is_active(&self) -> bool {
+        self.missing_wait_active.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn record_control_connect_attempt(&self) {
+        self.control_connect_attempts.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    fn control_connect_attempts(&self) -> u64 {
+        self.control_connect_attempts.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn arm_missing_probe_pause(&self) -> (Arc<Notify>, Arc<Notify>) {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        *self
+            .missing_probe_pause
+            .lock()
+            .expect("missing probe hook lock") = Some(MissingSessionProbePause {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        (entered, release)
+    }
+
+    #[cfg(test)]
+    async fn pause_after_missing_probe(&self) {
+        let pause = self
+            .missing_probe_pause
+            .lock()
+            .expect("missing probe hook lock")
+            .take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    fn arm_missing_settlement_pause(&self) -> (Arc<Notify>, Arc<Notify>) {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        *self
+            .missing_settlement_pause
+            .lock()
+            .expect("missing settlement pause lock") = Some(MissingSessionSettlementPause {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        (entered, release)
+    }
+
+    #[cfg(test)]
+    async fn pause_before_missing_settlement(&self) {
+        let pause = self
+            .missing_settlement_pause
+            .lock()
+            .expect("missing settlement pause lock")
+            .take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
     fn is_canonical(&self) -> bool {
         self.alias_of().is_none() && !self.retired.load(Ordering::Acquire)
     }
@@ -522,6 +1468,16 @@ impl SessionSlot {
         self.observed_live.store(true, Ordering::Release);
     }
 
+    /// Has this slot ever attached to a live tmux session?
+    ///
+    /// The distinction matters before the first attach. A configured daemon
+    /// may boot before `cyclops start` creates its session; probing that
+    /// absence with a control-mode attach can become the first tmux client
+    /// and briefly create an empty server of its own.
+    fn has_observed_live(&self) -> bool {
+        self.observed_live.load(Ordering::Acquire)
+    }
+
     fn retire_if_runtime(&self) -> bool {
         if self.persistent.load(Ordering::Acquire) || !self.observed_live.load(Ordering::Acquire) {
             return false;
@@ -536,7 +1492,7 @@ impl SessionSlot {
         retired
     }
 
-    fn journal_file_name(&self) -> Option<String> {
+    pub(crate) fn journal_file_name(&self) -> Option<String> {
         self.ledger
             .path()
             .file_name()
@@ -805,7 +1761,9 @@ impl Inner {
         &self,
         session_idx: usize,
         pane_id: &str,
-        det: &Detection,
+        state: AgentState,
+        disagreement: bool,
+        decided_by: &str,
         prior: Option<AgentState>,
         cause: &str,
         source: (Option<crate::identity::ProcId>, &str),
@@ -825,10 +1783,10 @@ impl Inner {
                     "session_idx": session_idx,
                     "target": target,
                     "recipient": recipient,
-                    "state": det.state,
+                    "state": state,
                     "prior": prior,
-                    "disagreement": det.disagreement,
-                    "decided_by": det.decided_by,
+                    "disagreement": disagreement,
+                    "decided_by": decided_by,
                     "cause": cause,
                     "working_confirmed": working_confirmed,
                 }),
@@ -848,10 +1806,10 @@ impl Inner {
                 "recipient": recipient,
                 "pane_id": pane_id,
                 "session_idx": session_idx,
-                "state": det.state,
+                "state": state,
                 "prior": prior,
-                "disagreement": det.disagreement,
-                "decided_by": det.decided_by,
+                "disagreement": disagreement,
+                "decided_by": decided_by,
                 "source_pid": source_agent.map(|a| a.pid),
                 "source_birth": source_agent.map(|a| a.birth),
                 "source_manifest": source_manifest,
@@ -1287,13 +2245,11 @@ fn mailbox_panes(
         .collect()
 }
 
-fn replace_mailbox_directory_unlocked(
+fn publish_mailbox_directory(
     inner: &Inner,
+    messaging: &messaging::WorkspaceMessaging,
     proposed: Option<&MailboxRouteOverride<'_>>,
 ) -> Result<(), String> {
-    let Some(service) = inner.mailbox.as_ref() else {
-        return Ok(());
-    };
     let panes = mailbox_panes(inner, proposed);
     #[cfg(test)]
     let pause = inner
@@ -1333,37 +2289,50 @@ fn replace_mailbox_directory_unlocked(
     }
     let directory = mailbox::MailboxDirectory::new(inner.workspace_id, agents)
         .map_err(|error| error.to_string())?;
-    service
+    messaging
         .replace_directory(directory)
         .map_err(|error| error.to_string())
 }
 
+/// Run one route-state transition against the same participant publication
+/// seen by authenticated messaging callers. A daemon without durable
+/// messaging still performs the physical transition.
+fn with_messaging_publication<T>(
+    inner: &Arc<Inner>,
+    operation: impl FnOnce(Option<&messaging::WorkspaceMessaging>) -> T,
+) -> T {
+    match inner.workspace_messaging() {
+        Some(messaging) => messaging.with_published(|messaging| operation(Some(messaging))),
+        None => operation(None),
+    }
+}
+
 fn publish_mailbox_transition(
-    inner: &Inner,
+    inner: &Arc<Inner>,
     proposed: &MailboxRouteOverride<'_>,
     commit: impl FnOnce(),
 ) -> Result<(), String> {
-    let _publication = inner
-        .mailbox_publication
-        .lock()
-        .expect("mailbox publication lock");
-    replace_mailbox_directory_unlocked(inner, Some(proposed))?;
-    commit();
-    Ok(())
+    with_messaging_publication(inner, |messaging| {
+        if let Some(messaging) = messaging {
+            publish_mailbox_directory(inner, messaging, Some(proposed))?;
+        }
+        commit();
+        Ok(())
+    })
 }
 
-fn refresh_mailbox_directory_unlocked(inner: &Inner) -> bool {
-    if let Err(error) = replace_mailbox_directory_unlocked(inner, None) {
+fn refresh_mailbox_directory_published(
+    inner: &Inner,
+    messaging: &messaging::WorkspaceMessaging,
+) -> bool {
+    if let Err(error) = publish_mailbox_directory(inner, messaging, None) {
         error!(error = %error, "cannot refresh mailbox directory");
-        let Some(service) = inner.mailbox.as_ref() else {
-            return false;
-        };
         let empty = mailbox::MailboxDirectory::new(
             inner.workspace_id,
             std::iter::empty::<mailbox::MailboxIdentity>(),
         )
         .expect("an empty directory is valid");
-        if let Err(clear_error) = service.replace_directory(empty) {
+        if let Err(clear_error) = messaging.replace_directory(empty) {
             error!(error = %clear_error, "cannot close stale mailbox directory");
         }
         return false;
@@ -1371,21 +2340,17 @@ fn refresh_mailbox_directory_unlocked(inner: &Inner) -> bool {
     true
 }
 
-fn refresh_mailbox_directory(inner: &Inner) -> bool {
-    let _publication = inner
-        .mailbox_publication
-        .lock()
-        .expect("mailbox publication lock");
-    refresh_mailbox_directory_unlocked(inner)
+fn refresh_mailbox_directory(inner: &Arc<Inner>) -> bool {
+    with_messaging_publication(inner, |messaging| {
+        messaging.is_none_or(|messaging| refresh_mailbox_directory_published(inner, messaging))
+    })
 }
 
-fn update_mailbox_route(inner: &Inner, update: impl FnOnce()) -> bool {
-    let _publication = inner
-        .mailbox_publication
-        .lock()
-        .expect("mailbox publication lock");
-    update();
-    let published = refresh_mailbox_directory_unlocked(inner);
+fn update_mailbox_route(inner: &Arc<Inner>, update: impl FnOnce()) -> bool {
+    let published = with_messaging_publication(inner, |messaging| {
+        update();
+        messaging.is_none_or(|messaging| refresh_mailbox_directory_published(inner, messaging))
+    });
     if published {
         inner.emit("messages.route_changed", json!({}), None);
     }
@@ -1394,7 +2359,7 @@ fn update_mailbox_route(inner: &Inner, update: impl FnOnce()) -> bool {
 
 fn refresh_mailbox_and_schedule(inner: &Arc<Inner>) {
     if refresh_mailbox_directory(inner) {
-        messaging::schedule_available(inner);
+        apply_messaging_availability_change(inner);
     }
 }
 
@@ -1474,6 +2439,28 @@ pub struct Daemon {
 pub struct UnreadProjectionTestPause {
     derived: Notify,
     release: Notify,
+}
+
+/// Test-only coordination at the post-observation presentation boundary.
+///
+/// It is always compiled because integration tests exercise the public daemon
+/// type as a dependency. Production never arms it.
+#[doc(hidden)]
+pub struct ChromeRepaintTestPause {
+    entered: Notify,
+    release: Notify,
+}
+
+impl ChromeRepaintTestPause {
+    #[doc(hidden)]
+    pub async fn wait_until_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    #[doc(hidden)]
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 impl UnreadProjectionTestPause {
@@ -1573,7 +2560,11 @@ impl Daemon {
         tasks.extend(std::mem::take(
             &mut *self.inner.extra_tasks.lock().expect("extra tasks lock"),
         ));
-        tasks.extend(fusion::take_lifecycle_recheck_tasks(&self.inner));
+        tasks.extend(
+            self.inner
+                .pane_observation_runtime
+                .take_tasks_for_shutdown(),
+        );
         for mut task in tasks {
             if tokio::time::timeout(SHUTDOWN_GRACE, &mut task)
                 .await
@@ -1624,6 +2615,12 @@ impl Daemon {
         {
             let _ = cleanup.remove();
         }
+        let _ = self
+            .inner
+            .durable_record_forget_lease
+            .lock()
+            .expect("durable record forget lease lock")
+            .take();
         info!("cyclopsd stopped");
     }
 
@@ -1645,6 +2642,26 @@ impl Daemon {
         server::status_result(&self.inner, open_deliveries)
     }
 
+    /// Reset application-level pane-observation work counters for a bounded
+    /// integration-test measurement window.
+    #[doc(hidden)]
+    pub fn reset_observation_work_counts_for_test(&self) {
+        self.inner.pane_observation_runtime.reset_work_counts();
+    }
+
+    /// Snapshot application-level pane-observation work since the last test
+    /// reset. This is not an operating-system wakeup or tmux-process metric.
+    #[doc(hidden)]
+    pub fn observation_work_counts_for_test(&self) -> ObservationWorkCounts {
+        self.inner.pane_observation_runtime.work_counts()
+    }
+
+    /// In-process body-free stream backfill, identical to the projection the
+    /// `events.backfill` socket method serves.
+    pub fn stream_backfill(&self, limit: u32) -> cyclops_proto::StreamBackfillResult {
+        history::stream_backfill(&self.inner, cyclops_proto::StreamBackfillParams { limit })
+    }
+
     /// In-process workspace message send with an already-resolved sender.
     /// The socket path resolves the sender from peer credentials first.
     pub async fn msg_send(&self, from: &str, params: MsgSendParams) -> Result<Value, WireError> {
@@ -1663,15 +2680,16 @@ impl Daemon {
                 data: None,
             });
         }
-        let service = self.inner.mailbox.as_ref().ok_or_else(|| WireError {
+        let messaging = self.inner.workspace_messaging().ok_or_else(|| WireError {
             code: "mailbox_unavailable".to_string(),
             message: "durable workspace identity is not connected".to_string(),
             data: None,
         })?;
-        let sender = service
+        let sender = messaging
             .identity_for_address(from)
             .map_err(server::mailbox_service_error)?;
-        let result = messaging::send(&self.inner, service, sender, params)
+        let result = messaging
+            .send(sender, params)
             .await
             .map_err(server::mailbox_service_error)?;
         serde_json::to_value(result).map_err(|error| WireError {
@@ -1724,6 +2742,27 @@ impl Daemon {
         pause
     }
 
+    /// Pause the next state-change chrome repaint after durable observation
+    /// consequences have committed but before tmux receives the border write.
+    #[doc(hidden)]
+    pub fn pause_next_chrome_repaint_for_test(&self) -> Arc<ChromeRepaintTestPause> {
+        let pause = Arc::new(ChromeRepaintTestPause {
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let replaced = self
+            .inner
+            .chrome_repaint_pause
+            .lock()
+            .expect("chrome repaint pause lock")
+            .replace(Arc::clone(&pause));
+        assert!(
+            replaced.is_none(),
+            "a chrome repaint pause is already armed"
+        );
+        pause
+    }
+
     /// Test seam for an exact mailbox claim while a delivery worker is paused.
     ///
     /// Sender authentication has separate socket and process-tree coverage.
@@ -1733,12 +2772,12 @@ impl Daemon {
         claimant: &str,
         message_id: &str,
     ) -> Result<(), WireError> {
-        let service = self.inner.mailbox.as_ref().ok_or_else(|| WireError {
+        let messaging = self.inner.workspace_messaging().ok_or_else(|| WireError {
             code: "mailbox_unavailable".to_string(),
             message: "durable workspace identity is not connected".to_string(),
             data: None,
         })?;
-        let claimant = service
+        let claimant = messaging
             .identity_for_address(claimant)
             .map_err(server::mailbox_service_error)?;
         let message_id = MessageId::new(message_id).map_err(|error| WireError {
@@ -1746,7 +2785,8 @@ impl Daemon {
             message: error.to_string(),
             data: None,
         })?;
-        messaging::claim(&self.inner, service, claimant.key, message_id)
+        messaging
+            .claim(claimant.key, message_id)
             .map_err(server::mailbox_service_error)?;
         Ok(())
     }
@@ -1756,7 +2796,9 @@ impl Daemon {
     /// terminal action for the exact attempt.
     #[doc(hidden)]
     pub fn schedule_force_submit_candidates_for_test(&self) {
-        messaging::schedule_force_submit_candidates(&self.inner);
+        if let Some(messaging) = self.inner.workspace_messaging() {
+            messaging.force_submit_enabled();
+        }
     }
 
     /// Test seam for a body-free mailbox snapshot with an already-resolved
@@ -1773,15 +2815,15 @@ impl Daemon {
         caller: &str,
         recent_settled: u32,
     ) -> Result<MessagesSnapshotResult, WireError> {
-        let service = self.inner.mailbox.as_ref().ok_or_else(|| WireError {
+        let messaging = self.inner.workspace_messaging().ok_or_else(|| WireError {
             code: "mailbox_unavailable".to_string(),
             message: "durable workspace identity is not connected".to_string(),
             data: None,
         })?;
-        let caller = service
+        let caller = messaging
             .identity_for_address(caller)
             .map_err(server::mailbox_service_error)?;
-        service
+        messaging
             .messages_snapshot(caller.key, recent_settled)
             .map_err(server::mailbox_service_error)
     }
@@ -1799,12 +2841,12 @@ impl Daemon {
         recipient: RecipientKey,
         attempt_id: NotificationAttemptId,
     ) -> Result<NotificationWithdrawResult, WireError> {
-        let service = self.inner.mailbox.as_ref().ok_or_else(|| WireError {
+        let messaging = self.inner.workspace_messaging().ok_or_else(|| WireError {
             code: "mailbox_unavailable".to_string(),
             message: "durable workspace identity is not connected".to_string(),
             data: None,
         })?;
-        let operator = service
+        let operator = messaging
             .identity_for_address(operator)
             .map_err(server::mailbox_service_error)?;
         if !operator.key.is_admin() {
@@ -1814,11 +2856,13 @@ impl Daemon {
                 data: None,
             });
         }
-        messaging::withdraw_notification(&self.inner, service, operator.key, recipient, attempt_id)
+        messaging
+            .withdraw_notification(operator.key, recipient, attempt_id)
             .map_err(server::mailbox_service_error)
     }
 
-    /// Legacy in-process delivery seam used by transport tests and embedders.
+    /// Compatibility-sensitive in-process delivery seam used by repository
+    /// tests and possible embedders. Public support status is unverified.
     ///
     /// This bypasses the durable mailbox contract. Its optional composed
     /// wait is an occupant-pinned pane-state heuristic, not proof that a
@@ -1828,7 +2872,7 @@ impl Daemon {
         from: &str,
         params: MsgSendParams,
     ) -> Result<Value, WireError> {
-        delivery::msg_send(&self.inner, from, params).await
+        compatibility::deliver_payload(&self.inner, from, params).await
     }
 
     /// In-process agent.state.report with a pre-trusted origin, mirroring
@@ -1947,8 +2991,8 @@ impl Daemon {
         Ok(json!({"notified": true, "seq": seq}))
     }
 
-    /// Test-only seam: pause a terminal mutation at a named phase so an
-    /// integration test can move the pane or stop the daemon at a precise
+    /// Test-only seam: pause a named recovery or terminal-mutation phase so
+    /// an integration test can move the pane or stop the daemon at a precise
     /// boundary. Not part of the public API surface.
     #[doc(hidden)]
     pub fn set_inject_pause<F>(&self, f: F)
@@ -2357,13 +3401,14 @@ fn conflicting_label_holder(
         .cloned()
 }
 
-/// Persist one adoption while the caller owns `mailbox_publication`.
+/// Persist one adoption during an atomic messaging publication.
 ///
 /// The earlier label check gives a fast refusal. This check is authoritative:
 /// two concurrent calls may both pass the earlier check, but only one may
 /// mutate the registry and publish the mailbox directory.
-fn commit_adoption_under_publication(
+fn commit_adoption_during_publication(
     inner: &Inner,
+    messaging: Option<&messaging::WorkspaceMessaging>,
     adoption: registry::Adoption,
     window: registry::WindowChrome,
 ) -> Result<(), WireError> {
@@ -2389,7 +3434,7 @@ fn commit_adoption_under_publication(
             data: None,
         });
     }
-    if !refresh_mailbox_directory_unlocked(inner) {
+    if messaging.is_some_and(|messaging| !refresh_mailbox_directory_published(inner, messaging)) {
         return Err(WireError {
             code: "internal".to_string(),
             message: "the name was recorded but its mailbox route could not be published"
@@ -2496,57 +3541,54 @@ async fn adopt_pane(
         },
         false => chrome::Snapshot::none(),
     };
-    let publication = inner
-        .mailbox_publication
-        .lock()
-        .expect("mailbox publication lock");
-    let Some((current_recipient, current_root, current_row)) =
-        adoption_route(inner, watcher, session_idx, pane_id)
-    else {
-        return Err(WireError {
-            code: "no_such_target".to_string(),
-            message: format!("target {target:?} changed during adoption"),
-            data: None,
-        });
-    };
-    if current_recipient != recipient
-        || current_root != pane_root
-        || current_row.window_id != row.window_id
-    {
-        return Err(WireError {
-            code: "no_such_target".to_string(),
-            message: format!("target {target:?} changed during adoption"),
-            data: None,
-        });
-    }
-    // 2. Write the registry.
-    let session = inner
-        .session(session_idx)
-        .expect("session_idx valid: caller resolved it")
-        .name();
-    let adoption = registry::Adoption {
-        session: session.clone(),
-        pane_id: pane_id.to_string(),
-        label: label.to_string(),
-        recipient: Some(recipient),
-        pane_root: Some(pane_root),
-        manifest: manifest.map(str::to_string),
-        pane_pid: row.pane_pid,
-        window_id: row.window_id.clone(),
-        border_format: known_format.unwrap_or(read.border_format),
-    };
-    let window = registry::WindowChrome {
-        session,
-        window_id: row.window_id.clone(),
-        border_status: known_status.unwrap_or(read.border_status),
-    };
-    commit_adoption_under_publication(inner, adoption, window)?;
-    drop(publication);
+    with_messaging_publication(inner, |messaging| {
+        let Some((current_recipient, current_root, current_row)) =
+            adoption_route(inner, watcher, session_idx, pane_id)
+        else {
+            return Err(WireError {
+                code: "no_such_target".to_string(),
+                message: format!("target {target:?} changed during adoption"),
+                data: None,
+            });
+        };
+        if current_recipient != recipient
+            || current_root != pane_root
+            || current_row.window_id != row.window_id
+        {
+            return Err(WireError {
+                code: "no_such_target".to_string(),
+                message: format!("target {target:?} changed during adoption"),
+                data: None,
+            });
+        }
+        // 2. Write the registry.
+        let session = inner
+            .session(session_idx)
+            .expect("session_idx valid: caller resolved it")
+            .name();
+        let adoption = registry::Adoption {
+            session: session.clone(),
+            pane_id: pane_id.to_string(),
+            label: label.to_string(),
+            recipient: Some(recipient),
+            pane_root: Some(pane_root),
+            manifest: manifest.map(str::to_string),
+            pane_pid: row.pane_pid,
+            window_id: row.window_id.clone(),
+            border_format: known_format.unwrap_or(read.border_format),
+        };
+        let window = registry::WindowChrome {
+            session,
+            window_id: row.window_id.clone(),
+            border_status: known_status.unwrap_or(read.border_status),
+        };
+        commit_adoption_during_publication(inner, messaging, adoption, window)
+    })?;
     // 3. Paint.
     paint_chrome(inner, session_idx, pane_id).await;
     // 4. Re-read.
     let route_evidence = inner.advance_route_evidence(session_idx, pane_id);
-    fusion::recompute_pane_for_route_evidence(
+    observe_pane_for_route_evidence(
         inner,
         session_idx,
         watcher,
@@ -2556,7 +3598,7 @@ async fn adopt_pane(
         &route_evidence,
     )
     .await;
-    messaging::schedule_route_evidence(inner, session_idx, pane_id, &route_evidence);
+    apply_route_evidence_observation(inner, session_idx, pane_id, &route_evidence);
     Ok(())
 }
 
@@ -2622,41 +3664,40 @@ async fn unadopt_pane(
     //    back, and the entry it could not drop still holds the ORIGINAL
     //    values, so the retry restores the same thing twice and nothing is
     //    poisoned.
-    let publication = inner
-        .mailbox_publication
-        .lock()
-        .expect("mailbox publication lock");
-    let cleared = inner
-        .registry
-        .lock()
-        .expect("registry lock")
-        .clear(recipient, pane_root)
-        .map_err(|e| WireError {
-            code: "internal".to_string(),
-            message: format!("cannot record the change: {e}"),
-            data: None,
-        })?;
-    if cleared.is_none() {
-        return Err(WireError {
-            code: "no_such_target".to_string(),
-            message: format!("target {pane_id:?} changed during clear"),
-            data: None,
-        });
-    }
-    if !refresh_mailbox_directory_unlocked(inner) {
-        return Err(WireError {
-            code: "internal".to_string(),
-            message: "the name was cleared but its mailbox route could not be republished"
-                .to_string(),
-            data: None,
-        });
-    }
-    drop(publication);
-    messaging::schedule_available(inner);
+    with_messaging_publication(inner, |messaging| {
+        let cleared = inner
+            .registry
+            .lock()
+            .expect("registry lock")
+            .clear(recipient, pane_root)
+            .map_err(|e| WireError {
+                code: "internal".to_string(),
+                message: format!("cannot record the change: {e}"),
+                data: None,
+            })?;
+        if cleared.is_none() {
+            return Err(WireError {
+                code: "no_such_target".to_string(),
+                message: format!("target {pane_id:?} changed during clear"),
+                data: None,
+            });
+        }
+        if messaging.is_some_and(|messaging| !refresh_mailbox_directory_published(inner, messaging))
+        {
+            return Err(WireError {
+                code: "internal".to_string(),
+                message: "the name was cleared but its mailbox route could not be republished"
+                    .to_string(),
+                data: None,
+            });
+        }
+        Ok(())
+    })?;
+    apply_messaging_availability_change(inner);
     // 5. Re-read.
     if let Some(w) = watcher {
         let route_evidence = inner.advance_route_evidence(session_idx, pane_id);
-        fusion::recompute_pane_for_route_evidence(
+        observe_pane_for_route_evidence(
             inner,
             session_idx,
             w,
@@ -2666,7 +3707,7 @@ async fn unadopt_pane(
             &route_evidence,
         )
         .await;
-        messaging::schedule_route_evidence(inner, session_idx, pane_id, &route_evidence);
+        apply_route_evidence_observation(inner, session_idx, pane_id, &route_evidence);
     }
     Ok(())
 }
@@ -2957,9 +3998,9 @@ pub(crate) async fn paint_chrome(inner: &Arc<Inner>, session_idx: usize, pane_id
 }
 
 /// Repaint the state half of an adopted pane's border. Called from the one
-/// place a fused state change is recorded
-/// (fusion::recompute_pane_with_evidence), so a border can never disagree
-/// with the row `cyclops list` prints.
+/// place a fused state change's durable consequences finish
+/// (`apply_pane_observation`), so a border can never disagree with the row
+/// `cyclops list` prints or outrun messaging truth.
 pub(crate) async fn repaint_chrome(
     inner: &Arc<Inner>,
     session_idx: usize,
@@ -2969,6 +4010,15 @@ pub(crate) async fn repaint_chrome(
     let Some(adoption) = inner.adoption_for_route(session_idx, pane_id) else {
         return;
     };
+    let pause = inner
+        .chrome_repaint_pause
+        .lock()
+        .expect("chrome repaint pause lock")
+        .take();
+    if let Some(pause) = pause {
+        pause.entered.notify_one();
+        pause.release.notified().await;
+    }
     let theme = inner.theme_now();
     let state = inner.cached_state(session_idx, pane_id);
     if let Err(e) = chrome::repaint(
@@ -3063,6 +4113,15 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     let boot_id = uuid::Uuid::new_v4().to_string();
     let started = Instant::now();
 
+    // Claim the writer/removal lease before probing tmux, binding the socket,
+    // or opening a journal. A confirmed forget holds it for its whole
+    // descriptor-bound removal transaction.
+    let state_root = Arc::new(
+        StateRoot::open_or_create(&cfg.home)
+            .map_err(|error| anyhow::anyhow!("open state root {}: {error}", cfg.home.display()))?,
+    );
+    let durable_record_forget_lease = hold_durable_record_forget_lease(&state_root)?;
+
     let tmux_version = match probe_tmux().await {
         Some(v) => {
             info!(
@@ -3084,11 +4143,6 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         }
     };
 
-    // Every session-ledger open is anchored to this validated state root.
-    let state_root = Arc::new(
-        StateRoot::open_or_create(&cfg.home)
-            .map_err(|error| anyhow::anyhow!("open state root {}: {error}", cfg.home.display()))?,
-    );
     let bound_socket = server::bind_socket(&state_root).await?;
     let repair = state_root
         .repair_descendant_permissions(Some(OsStr::new(cyclops_proto::SOCK_NAME)))
@@ -3181,7 +4235,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         }
         sessions.push(slot);
     }
-    let replay = history::session_journal_replay(&state_root, replay_roots);
+    let replay = compatibility::session_journal_replay(&state_root, replay_roots);
     // This is the first Engine use after construction, so every historical
     // id is reserved before any request can mint one. Files stay separate for
     // history; restart recovery receives one descendant-first stream per root.
@@ -3253,19 +4307,22 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         cfg,
         force_submit,
         state_root,
+        durable_record_forget_lease: StdMutex::new(Some(durable_record_forget_lease)),
         state_repair: repair,
         workspace_id,
         session_identities: StdMutex::new(session_identities),
         mailbox: Some(mailbox),
-        composer_recovery: StdMutex::new(composer_recovery::RecoveryCoordinator::new(
+        workspace_messaging: OnceLock::new(),
+        composer_recovery: Arc::new(StdMutex::new(composer_recovery::RecoveryCoordinator::new(
             recovered_barrier_ids,
-        )),
-        mailbox_publication: StdMutex::new(()),
+        ))),
+        mailbox_publication: Arc::new(StdMutex::new(())),
         unread_projection_gate: tokio::sync::Mutex::new(()),
         unread_projection_pending: StdMutex::new(HashSet::new()),
         unread_projection_wake: Notify::new(),
         unread_projection_stopping: AtomicBool::new(false),
         unread_projection_pause: StdMutex::new(None),
+        chrome_repaint_pause: StdMutex::new(None),
         #[cfg(test)]
         mailbox_publish_pause: StdMutex::new(None),
         boot_id,
@@ -3278,8 +4335,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         events,
         detections: StdMutex::new(HashMap::new()),
         route_evidence_generations: StdMutex::new(HashMap::new()),
-        pane_recomputes: StdMutex::new(HashMap::new()),
-        lifecycle_rechecks: StdMutex::new(HashMap::new()),
+        pane_observation_runtime: fusion::PaneObservationRuntime::new(),
         registry: StdMutex::new(adoptions),
         theme: StdMutex::new(theme),
         hook_readings: StdMutex::new(HashMap::new()),
@@ -3331,10 +4387,12 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     }
 
     // Any delivery the previous run left unresolved gets a named ending now.
-    delivery::close_limbo(&inner, &replayed);
+    compatibility::recover_direct_deliveries(&inner, &replayed);
     drop(replayed);
-    messaging::schedule_unclaimed_reminders(&inner);
-    messaging::schedule_force_submit_candidates(&inner);
+    if let Some(messaging) = inner.workspace_messaging() {
+        messaging.restore_unclaimed_reminders();
+        messaging.force_submit_enabled();
+    }
 
     let mut tasks = Vec::new();
     for idx in 0..inner.session_count() {
@@ -3355,7 +4413,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         boot_id = %inner.boot_id,
         sessions = inner.session_count(),
         manifests = inner.manifests.len(),
-        build = env!("CYCLOPS_BUILD_REF"),
+        build = cyclops_proto::BUILD_REF,
         "cyclopsd booted"
     );
     Ok(Daemon {
@@ -3367,22 +4425,38 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     })
 }
 
+/// Claim the journal writer/removal lease before the daemon opens any journal.
+///
+/// The lock is intentionally held until shutdown. A command that has already
+/// confirmed a record-removal preview obtains the same lease before it deletes
+/// anything, so a daemon cannot start in the gap after that command's initial
+/// liveness check.
+fn hold_durable_record_forget_lease(state_root: &StateRoot) -> anyhow::Result<StateFile> {
+    let lease = state_root
+        .open_append(Path::new(cyclops_proto::DURABLE_RECORD_FORGET_LEASE))
+        .map_err(|error| anyhow::anyhow!("open durable-record removal lease: {error}"))?;
+    match lease
+        .try_lock()
+        .map_err(|error| anyhow::anyhow!("lock durable-record removal lease: {error}"))?
+    {
+        true => Ok(lease),
+        false => anyhow::bail!(
+            "a confirmed durable-record removal is in progress; wait for it to finish before starting cyclopsd"
+        ),
+    }
+}
+
 /// Start watching a tmux session the daemon was not booted with.
 ///
-/// `sessions` in `config.toml` is what the daemon watches AT BOOT; this is
-/// how a session created afterwards (the terminal workspace UI creates
-/// tmux sessions at runtime) joins that set. It does not rewrite
-/// `config.toml`: a restart watches the configured list again, not
-/// whatever a client added here in between.
+/// This does not rewrite `config.toml`: after a restart, the daemon watches
+/// only the configured list.
 ///
-/// Idempotent: watching an already-watched session neither opens a second
-/// ledger nor spawns a second task, it just hands back the existing index
-/// with `added: false`. Otherwise the ledger is opened exactly the way
-/// `boot` opens one (same [`LedgerWriter::open`] with the boot id, same
-/// id-preload so message ids stay unique across the whole daemon, not just
-/// within one session), and a failure to open it is a [`WireError`] rather
-/// than a silent no-watch: a daemon that cannot record must not watch,
-/// same rule `boot` follows when it fails the whole boot.
+/// Repeating a request for an existing slot returns it with `added: false`.
+/// When that slot is waiting after confirmed absence or an unavailable server,
+/// the request is also its availability edge: its existing task rechecks tmux
+/// without creating another owner or claiming that the session is live. A new
+/// slot opens durable ledger state and starts its watcher; if that setup fails,
+/// no slot is added.
 pub(crate) async fn watch_session(
     inner: &Arc<Inner>,
     name: &str,
@@ -3399,6 +4473,15 @@ pub(crate) async fn watch_session(
         });
     }
     if let Some(idx) = inner.session_index(name) {
+        // `cyclops start` creates the session before asking the daemon to
+        // watch it. For an already-watched slot this remains idempotent, but
+        // it is also the availability edge that releases an absence or
+        // unavailable-server wait. The task rechecks tmux before attaching,
+        // so a manual request for an absent name cannot manufacture a live
+        // route.
+        if let Some(slot) = inner.session(idx) {
+            slot.session_may_be_available();
+        }
         return Ok((idx, false));
     }
     // The watcher applies its own rename before the matching PaneEvent
@@ -3539,34 +4622,64 @@ pub(crate) fn no_manifests_warning(dir: Option<&Path>) -> String {
     )
 }
 
-/// Does this session not exist on the server the daemon is configured for?
+/// What one authoritative `has-session` probe establishes.
 ///
-/// Answers false on any tmux trouble, because the point is to soften one
-/// specific log line and a probe that cannot tell should not be the reason
-/// a real failure goes unreported. Runs off the reactor: it shells out to
-/// tmux, which blocks.
-async fn session_missing(inner: &Arc<Inner>, session: &str) -> bool {
-    tmux_session_missing(&inner.cfg, session).await
+/// `ServerUnavailable` and `Unknown` are deliberately distinct from a named
+/// missing-session reply. The former must not open control mode because tmux
+/// can create an empty server at a missing socket. Before first attachment,
+/// `Unknown` also waits for an explicit availability edge; after a live
+/// observation it keeps ordinary transient reconnect handling. Neither is
+/// evidence that an already attached session, its identity, or its delivery
+/// barriers disappeared.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TmuxSessionPresence {
+    Present,
+    Missing,
+    /// The configured server socket is absent. Opening control mode against
+    /// it could create an empty tmux server, so retain state and wait for an
+    /// explicit availability edge instead.
+    ServerUnavailable,
+    Unknown,
 }
 
-/// The same question asked of the config alone, so `boot` can ask it
-/// before `Inner` exists. True only when tmux positively says the session
-/// is not there; an error keeps the answer at false, because "could not
-/// ask" must never release anybody's label.
-async fn tmux_session_missing(cfg: &Config, session: &str) -> bool {
+/// Ask tmux once whether a session is present. Runs off the reactor because
+/// the adapter's one-shot command blocks. Only the adapter's exact
+/// missing-session reply is `Missing`; a measured missing-socket reply is
+/// `ServerUnavailable`; every other transport or command failure is honest
+/// uncertainty.
+async fn tmux_session_presence(cfg: &Config, session: &str) -> TmuxSessionPresence {
     let server = cyclops_tmux::layout::Server {
         socket: cfg.tmux_socket.clone(),
         config_file: cfg.tmux_config.clone(),
     };
     let session = session.to_string();
-    tokio::task::spawn_blocking(move || {
-        matches!(
-            cyclops_tmux::layout::session_exists(&server, &session),
-            Ok(false)
-        )
+    match tokio::task::spawn_blocking(move || {
+        cyclops_tmux::layout::session_missing(&server, &session)
     })
     .await
-    .unwrap_or(false)
+    {
+        Ok(Ok(true)) => TmuxSessionPresence::Missing,
+        Ok(Ok(false)) => TmuxSessionPresence::Present,
+        Ok(Err(error)) => {
+            if cyclops_tmux::layout::session_server_unavailable(&error) {
+                TmuxSessionPresence::ServerUnavailable
+            } else {
+                debug!(error = %error, "cannot establish tmux session presence");
+                TmuxSessionPresence::Unknown
+            }
+        }
+        Err(error) => {
+            debug!(error = %error, "tmux session-presence task failed");
+            TmuxSessionPresence::Unknown
+        }
+    }
+}
+
+/// The boot-only question before a [`SessionSlot`] exists. Unknown stays
+/// false: restart recovery may release an adoption only after positive
+/// missing-session evidence.
+async fn tmux_session_missing(cfg: &Config, session: &str) -> bool {
+    tmux_session_presence(cfg, session).await == TmuxSessionPresence::Missing
 }
 
 /// Release only adoptions whose physical pane loss was proven.
@@ -3602,17 +4715,424 @@ async fn reconnect_delay(stop: &mut watch::Receiver<bool>, delay: Duration) -> b
     }
 }
 
+/// Wait for the caller that created or restored a missing session.
+///
+/// A configured session is allowed to be absent while an external supervisor
+/// starts `cyclopsd` before `cyclops start`. That absence is a state, not a
+/// clock-driven retry condition: the task asks tmux once, then waits for the
+/// idempotent `session.watch` request `cyclops start` sends after creation.
+///
+/// The availability receiver is created before the probe, so a request that
+/// races with that one probe is retained. An alias must also wake the task:
+/// it means another live slot became the canonical owner and this task must
+/// exit without opening a duplicate watcher.
+async fn wait_for_session_availability(
+    stop: &mut watch::Receiver<bool>,
+    aliases: &mut watch::Receiver<Option<usize>>,
+    availability: &mut watch::Receiver<u64>,
+) -> bool {
+    if *stop.borrow() || aliases.borrow().is_some() {
+        return true;
+    }
+    tokio::select! {
+        changed = stop.changed() => changed.is_err() || *stop.borrow(),
+        changed = aliases.changed() => {
+            let _ = changed;
+            true
+        }
+        changed = availability.changed() => changed.is_err(),
+    }
+}
+
+/// Availability edges associated with one session task.
+///
+/// A `session.watch` while the slot is live is only idempotent registration,
+/// not a future creation edge. Before a later absence probe, old notices are
+/// consumed; an edge that races that probe remains unread and wakes the
+/// resulting wait. The startup epoch is separate because `watch::subscribe`
+/// otherwise marks an edge accepted before this task first runs as seen.
+struct SessionAvailability {
+    receiver: watch::Receiver<u64>,
+    retain_initial_availability: bool,
+    initial_availability_edge: bool,
+}
+
+impl SessionAvailability {
+    fn for_slot(slot: &SessionSlot) -> Self {
+        let mut receiver = slot.availability_events();
+        let initial_availability_edge = *receiver.borrow_and_update() != 0;
+        SessionAvailability {
+            receiver,
+            retain_initial_availability: true,
+            initial_availability_edge,
+        }
+    }
+
+    /// Discard a live-session notice before every probe except the first.
+    /// That first probe must retain an early creation edge until it decides
+    /// whether the configured session is absent.
+    fn prepare_probe(&mut self) {
+        if !std::mem::replace(&mut self.retain_initial_availability, false) {
+            let _ = self.receiver.borrow_and_update();
+        }
+    }
+
+    /// A present target or a stale renamed target consumes any old
+    /// availability notice: it cannot later wake an unrelated disappearance.
+    fn discard_after_nonmissing_probe(&mut self) {
+        self.initial_availability_edge = false;
+        let _ = self.receiver.borrow_and_update();
+    }
+
+    /// An early startup edge or a request that raced the probe earns one
+    /// immediate recheck. It never starts a timer-driven retry.
+    fn availability_edge_needs_recheck(&mut self) -> bool {
+        let recheck = std::mem::take(&mut self.initial_availability_edge)
+            || self.receiver.has_changed().unwrap_or(false);
+        if recheck {
+            let _ = self.receiver.borrow_and_update();
+        }
+        recheck
+    }
+}
+
+/// Ask tmux once about the target this slot still owns.
+///
+/// A normal slot follows its display-name rename, while an identity-bound
+/// recovery slot keeps its stable tmux-id target. A rename can race the
+/// blocking tmux question, so `None` means the normal target changed and the
+/// caller must rebuild its connection attempt rather than act on a stale
+/// absence result.
+struct SessionTargetPresence {
+    target: String,
+    presence: TmuxSessionPresence,
+}
+
+async fn session_presence_at_current_target(
+    inner: &Arc<Inner>,
+    slot: &SessionSlot,
+    availability: &mut SessionAvailability,
+) -> Option<SessionTargetPresence> {
+    let target = slot.connect_target();
+    // The first receiver snapshot may carry a `session.watch` which the RPC
+    // accepted before this spawned task got CPU time. It is a real creation
+    // edge, so retain it through this one probe. Later probes discard notices
+    // that arrived while the session was live.
+    availability.prepare_probe();
+    let presence = tmux_session_presence(&inner.cfg, &target).await;
+    #[cfg(test)]
+    if presence == TmuxSessionPresence::Missing {
+        slot.pause_after_missing_probe().await;
+    }
+    (slot.connect_target() == target).then_some(SessionTargetPresence { target, presence })
+}
+
+enum MissingSessionSettlement {
+    Settled,
+    TargetChanged,
+    Stop,
+}
+
+/// Clear durable live-session state only after tmux has positively confirmed
+/// that a session which was once observed is gone. A configured slot then
+/// waits for its creation edge; a runtime slot retires so the next watch of
+/// the same display name receives a fresh identity.
+fn settle_missing_session(
+    inner: &Arc<Inner>,
+    idx: usize,
+    slot: &Arc<SessionSlot>,
+    probed_target: &str,
+) -> MissingSessionSettlement {
+    // A concurrent followed rename can make this slot an alias while the
+    // one-shot tmux probe is in flight. Share the registration barrier with
+    // that rename so an alias never clears the canonical slot's route or
+    // releases its retained recovery facts.
+    let _registration = inner
+        .session_registration
+        .lock()
+        .expect("session registration lock");
+    if !slot.is_canonical() {
+        return MissingSessionSettlement::Stop;
+    }
+    // The target equality after the tmux query is only a snapshot. Recheck
+    // under the same barrier that publishes followed renames before deleting
+    // any state. Otherwise an old-name `Missing` result could clear the live
+    // canonical slot that a rename just moved to a different target.
+    if slot.connect_target() != probed_target {
+        return MissingSessionSettlement::TargetChanged;
+    }
+    // Read the human-facing name only once that target is protected. Registry
+    // cleanup must follow the same name as the canonical slot, not the name
+    // that happened to be current when the probe began.
+    let name = slot.name();
+    if !slot.has_observed_live() {
+        return MissingSessionSettlement::Settled;
+    }
+
+    // A missing session does not prove its panes died. tmux can move a pane
+    // into another session while preserving its id, root process and
+    // composer. Release only roots whose loss is independently proven.
+    let stale = !inner
+        .registry
+        .lock()
+        .expect("registry lock")
+        .in_session(&name)
+        .is_empty();
+    if stale {
+        let adoptions = inner
+            .registry
+            .lock()
+            .expect("registry lock")
+            .in_session(&name);
+        let mut gone = Vec::new();
+        for adoption in &adoptions {
+            match crate::composer_recovery::pane_root_gone(adoption) {
+                Ok(false) => {}
+                Ok(true) => {
+                    inner
+                        .hook_liveness
+                        .close(&PaneKey::new(idx, &adoption.pane_id));
+                    if let Some(recipient) = adoption.recipient {
+                        match inner
+                            .workspace_messaging()
+                            .ok_or("composer_recovery_store_unavailable")
+                            .and_then(|messaging| {
+                                messaging.retire_gone_composer_recipient(recipient)
+                            }) {
+                            Ok(()) => gone.push(recipient),
+                            Err(reason) => {
+                                warn!(session = %name, %reason, "cannot retire composer barrier for missing session");
+                            }
+                        }
+                    }
+                }
+                Err(reason) => {
+                    warn!(session = %name, pane = %adoption.pane_id, %reason, "cannot prove physical pane loss for missing session");
+                }
+            }
+        }
+        if !gone.is_empty() {
+            let mut reg = inner.registry.lock().expect("registry lock");
+            release_gone_recipients(&mut reg, gone);
+        }
+    }
+
+    update_mailbox_route(inner, || {
+        slot.last_panes.lock().expect("last panes lock").clear();
+        let mut link = slot.link.lock().expect("session link lock");
+        link.identity = None;
+        link.mailbox_panes.clear();
+    });
+    apply_messaging_availability_change(inner);
+    if slot.retire_if_runtime() {
+        info!(
+            session = %name,
+            session_idx = idx,
+            "retired runtime watcher after tmux session disappeared"
+        );
+        return MissingSessionSettlement::Stop;
+    }
+    MissingSessionSettlement::Settled
+}
+
+/// Record a confirmed disappearance when necessary, then park until the
+/// creator reports that it has made the session available again.
+async fn park_for_session_creation(
+    inner: &Arc<Inner>,
+    idx: usize,
+    slot: &Arc<SessionSlot>,
+    probed_target: &str,
+    stop: &mut watch::Receiver<bool>,
+    aliases: &mut watch::Receiver<Option<usize>>,
+    availability: &mut watch::Receiver<u64>,
+) -> SessionLifecycleDecision {
+    match settle_missing_session(inner, idx, slot, probed_target) {
+        MissingSessionSettlement::TargetChanged => return SessionLifecycleDecision::TargetChanged,
+        MissingSessionSettlement::Stop => return SessionLifecycleDecision::Stop,
+        MissingSessionSettlement::Settled => {}
+    }
+    let name = slot.name();
+    info!(session = %name, "waiting for session; create it, then call session.watch");
+    #[cfg(test)]
+    slot.mark_missing_wait_entered();
+    let stopped = wait_for_session_availability(stop, aliases, availability).await;
+    #[cfg(test)]
+    slot.mark_missing_wait_exited();
+    if stopped {
+        SessionLifecycleDecision::Stop
+    } else {
+        SessionLifecycleDecision::Recheck
+    }
+}
+
+/// Wait for an explicit availability edge without clearing durable state.
+///
+/// A configured daemon may begin before tmux exists, and an already-live
+/// server can later lose its configured socket. In both cases a control-mode
+/// attach would be destructive speculation: it can make a new empty tmux
+/// server. The creator's idempotent `session.watch` request is the real
+/// lifecycle edge, so wait for it while retaining any last-known identity,
+/// route, and delivery barriers.
+async fn wait_for_session_availability_without_settlement(
+    _slot: &Arc<SessionSlot>,
+    name: &str,
+    stop: &mut watch::Receiver<bool>,
+    aliases: &mut watch::Receiver<Option<usize>>,
+    availability: &mut watch::Receiver<u64>,
+) -> bool {
+    info!(session = %name, "waiting for session; create it, then call session.watch");
+    #[cfg(test)]
+    _slot.mark_missing_wait_entered();
+    let stop = wait_for_session_availability(stop, aliases, availability).await;
+    #[cfg(test)]
+    _slot.mark_missing_wait_exited();
+    stop
+}
+
+/// The one lifecycle decision a session task makes after an initial probe,
+/// control failure, or watcher disconnect.
+#[derive(Debug, Eq, PartialEq)]
+enum SessionLifecycleDecision {
+    /// The current target still exists; normal reconnect backoff is allowed.
+    Present,
+    /// Tmux could not establish whether a previously live target survived.
+    /// Preserve its durable state and use the ordinary transient reconnect
+    /// path rather than treating uncertainty as removal.
+    Unknown,
+    /// The caller created or restored the missing target and woke the task.
+    Recheck,
+    /// A followed rename changed a normal slot's target during the probe.
+    TargetChanged,
+    /// Shutdown, alias retirement, or runtime retirement ended this task.
+    Stop,
+}
+
+/// Make one presence decision for a real lifecycle edge. The result is never
+/// cached across iterations: a newly available target is rechecked before a
+/// control client attaches, and a rename invalidates a stale name probe.
+async fn session_lifecycle_decision(
+    inner: &Arc<Inner>,
+    idx: usize,
+    slot: &Arc<SessionSlot>,
+    stop: &mut watch::Receiver<bool>,
+    aliases: &mut watch::Receiver<Option<usize>>,
+    availability: &mut SessionAvailability,
+) -> SessionLifecycleDecision {
+    match session_presence_at_current_target(inner, slot, availability).await {
+        None => {
+            availability.discard_after_nonmissing_probe();
+            SessionLifecycleDecision::TargetChanged
+        }
+        Some(SessionTargetPresence {
+            presence: TmuxSessionPresence::Present,
+            ..
+        }) => {
+            availability.discard_after_nonmissing_probe();
+            SessionLifecycleDecision::Present
+        }
+        Some(SessionTargetPresence {
+            presence: TmuxSessionPresence::ServerUnavailable,
+            ..
+        }) => {
+            if availability.availability_edge_needs_recheck() {
+                return SessionLifecycleDecision::Recheck;
+            }
+            let name = slot.name();
+            if wait_for_session_availability_without_settlement(
+                slot,
+                &name,
+                stop,
+                aliases,
+                &mut availability.receiver,
+            )
+            .await
+            {
+                SessionLifecycleDecision::Stop
+            } else {
+                SessionLifecycleDecision::Recheck
+            }
+        }
+        Some(SessionTargetPresence {
+            presence: TmuxSessionPresence::Unknown,
+            ..
+        }) if !slot.has_observed_live() => {
+            // An absent server and an unreachable socket look the same to
+            // one-shot tmux. Before first attachment, preserving the
+            // no-first-client guarantee matters more than retrying a control
+            // attach; there is no live identity or barrier to clear here.
+            if availability.availability_edge_needs_recheck() {
+                return SessionLifecycleDecision::Recheck;
+            }
+            let name = slot.name();
+            if wait_for_session_availability_without_settlement(
+                slot,
+                &name,
+                stop,
+                aliases,
+                &mut availability.receiver,
+            )
+            .await
+            {
+                SessionLifecycleDecision::Stop
+            } else {
+                SessionLifecycleDecision::Recheck
+            }
+        }
+        Some(SessionTargetPresence {
+            presence: TmuxSessionPresence::Unknown,
+            ..
+        }) => {
+            availability.discard_after_nonmissing_probe();
+            SessionLifecycleDecision::Unknown
+        }
+        Some(SessionTargetPresence {
+            target,
+            presence: TmuxSessionPresence::Missing,
+        }) => {
+            // `watch::Receiver::subscribe` starts at the sender's current
+            // value. Preserve that startup epoch explicitly, then use the
+            // receiver's unread state for a request that raced this tmux
+            // probe. Either edge earns exactly one recheck; neither becomes
+            // a timer-driven retry.
+            if availability.availability_edge_needs_recheck() {
+                return SessionLifecycleDecision::Recheck;
+            }
+            #[cfg(test)]
+            slot.pause_before_missing_settlement().await;
+            park_for_session_creation(
+                inner,
+                idx,
+                slot,
+                &target,
+                stop,
+                aliases,
+                &mut availability.receiver,
+            )
+            .await
+        }
+    }
+}
+
 /// Own one configured session for the daemon's lifetime: attach, pump
-/// events, reattach with backoff when the connection dies or the session
-/// does not exist yet.
+/// events, and reconnect with backoff only after a failure against a session
+/// tmux still says exists or an unclassified transient failure. A confirmed
+/// missing session, or a measured unavailable tmux server, instead waits for
+/// the next explicit `session.watch` creation edge.
 async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<bool>) {
     // One snapshot of the Arc for the task's whole life: idx is append-only
     // stable, so this never needs to re-consult the sessions lock.
     let slot = inner
         .session(idx)
         .expect("session_idx valid: append-only, never removed");
+    // Subscribe before the initial tmux probe. `watch::subscribe` considers
+    // its current value seen, so preserve a nonzero sender epoch separately:
+    // an explicit `session.watch` can arrive after slot registration but
+    // before this spawned task first runs. The first confirmed absence uses
+    // that edge for one recheck instead of silently parking forever.
+    let mut availability = SessionAvailability::for_slot(&slot);
+    let mut aliases = slot.alias_changed.subscribe();
     let mut backoff = RECONNECT_MIN;
-    let mut announced_missing = false;
+    let mut need_availability_probe = true;
     loop {
         if *stop.borrow() {
             return;
@@ -3642,6 +5162,37 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
         if let Some(f) = &inner.cfg.tmux_config {
             ccfg = ccfg.with_config_file(f.clone());
         }
+
+        // `cyclopsd` is allowed to start under an external supervisor before
+        // `cyclops start` builds the configured session. Do not use a
+        // control-mode attach merely to learn that the first session is not
+        // there yet: tmux can make that attach the server's first client,
+        // then tear the empty server down while `start` is creating it.
+        // Ask once for each startup or `session.watch` creation edge; never
+        // turn a confirmed absence into an interval poll.
+        if need_availability_probe {
+            match session_lifecycle_decision(
+                &inner,
+                idx,
+                &slot,
+                &mut stop,
+                &mut aliases,
+                &mut availability,
+            )
+            .await
+            {
+                SessionLifecycleDecision::Present | SessionLifecycleDecision::Unknown => {
+                    need_availability_probe = false
+                }
+                SessionLifecycleDecision::Recheck | SessionLifecycleDecision::TargetChanged => {
+                    continue;
+                }
+                SessionLifecycleDecision::Stop => return,
+            }
+        }
+
+        #[cfg(test)]
+        slot.record_control_connect_attempt();
         match SessionWatcher::connect(ccfg).await {
             Ok(watcher) => {
                 let watcher = Arc::new(watcher);
@@ -3654,6 +5205,25 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                     Err(error) => {
                         warn!(session = %name, error = %error, "cannot establish durable session identity");
                         watcher.shutdown().await;
+                        match session_lifecycle_decision(
+                            &inner,
+                            idx,
+                            &slot,
+                            &mut stop,
+                            &mut aliases,
+                            &mut availability,
+                        )
+                        .await
+                        {
+                            SessionLifecycleDecision::Present
+                            | SessionLifecycleDecision::Unknown => {}
+                            SessionLifecycleDecision::Recheck
+                            | SessionLifecycleDecision::TargetChanged => {
+                                need_availability_probe = true;
+                                continue;
+                            }
+                            SessionLifecycleDecision::Stop => return,
+                        }
                         if reconnect_delay(&mut stop, backoff).await {
                             return;
                         }
@@ -3671,6 +5241,24 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                         "identity-bound rename target resolved to a different live session"
                     );
                     watcher.shutdown().await;
+                    match session_lifecycle_decision(
+                        &inner,
+                        idx,
+                        &slot,
+                        &mut stop,
+                        &mut aliases,
+                        &mut availability,
+                    )
+                    .await
+                    {
+                        SessionLifecycleDecision::Present | SessionLifecycleDecision::Unknown => {}
+                        SessionLifecycleDecision::Recheck
+                        | SessionLifecycleDecision::TargetChanged => {
+                            need_availability_probe = true;
+                            continue;
+                        }
+                        SessionLifecycleDecision::Stop => return,
+                    }
                     if reconnect_delay(&mut stop, backoff).await {
                         return;
                     }
@@ -3686,13 +5274,30 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                     if slot.alias_of().is_some() {
                         return;
                     }
+                    match session_lifecycle_decision(
+                        &inner,
+                        idx,
+                        &slot,
+                        &mut stop,
+                        &mut aliases,
+                        &mut availability,
+                    )
+                    .await
+                    {
+                        SessionLifecycleDecision::Present | SessionLifecycleDecision::Unknown => {}
+                        SessionLifecycleDecision::Recheck
+                        | SessionLifecycleDecision::TargetChanged => {
+                            need_availability_probe = true;
+                            continue;
+                        }
+                        SessionLifecycleDecision::Stop => return,
+                    }
                     if reconnect_delay(&mut stop, backoff).await {
                         return;
                     }
                     backoff = (backoff * 2).min(RECONNECT_MAX);
                     continue;
                 }
-                announced_missing = false;
                 backoff = RECONNECT_MIN;
                 // Keep the root generations captured while each pane was
                 // authoritative. A detached numeric PID must never be
@@ -3705,7 +5310,7 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                     drop(link);
                     *slot.last_panes.lock().expect("last panes lock") = panes;
                 });
-                messaging::schedule_available(&inner);
+                apply_messaging_availability_change(&inner);
                 session_lifecycle(&inner, idx, false);
                 // Detached panes have no live sensors, so their runtime
                 // verdict goes: serving a stale one would let a reader
@@ -3743,6 +5348,27 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                 if *stop.borrow() {
                     return;
                 }
+                // A watcher disconnect is the lifecycle event that lets us
+                // ask tmux once whether the session itself disappeared. If
+                // it did, do not turn that fact into a reconnect timer: wait
+                // for the creation edge from `cyclops start` instead.
+                match session_lifecycle_decision(
+                    &inner,
+                    idx,
+                    &slot,
+                    &mut stop,
+                    &mut aliases,
+                    &mut availability,
+                )
+                .await
+                {
+                    SessionLifecycleDecision::Present | SessionLifecycleDecision::Unknown => {}
+                    SessionLifecycleDecision::Recheck | SessionLifecycleDecision::TargetChanged => {
+                        need_availability_probe = true;
+                        continue;
+                    }
+                    SessionLifecycleDecision::Stop => return,
+                }
                 // Re-read: a rename during this attach already moved the
                 // slot on, and the reattach log line should say the name
                 // that is about to be dialed, not the one this attempt
@@ -3750,90 +5376,28 @@ async fn session_task(inner: Arc<Inner>, idx: usize, mut stop: watch::Receiver<b
                 warn!(session = %slot.name(), "tmux connection lost; reattaching");
             }
             Err(e) => {
-                if announced_missing {
-                    debug!(session = %name, error = %e, "attach retry failed");
+                // This failed attach is a lifecycle event. Ask tmux once to
+                // distinguish a session that vanished between the preflight
+                // and control attach from an existing session with a
+                // transient connection failure. Only the latter backs off.
+                match session_lifecycle_decision(
+                    &inner,
+                    idx,
+                    &slot,
+                    &mut stop,
+                    &mut aliases,
+                    &mut availability,
+                )
+                .await
+                {
+                    SessionLifecycleDecision::Present | SessionLifecycleDecision::Unknown => {}
+                    SessionLifecycleDecision::Recheck | SessionLifecycleDecision::TargetChanged => {
+                        need_availability_probe = true;
+                        continue;
+                    }
+                    SessionLifecycleDecision::Stop => return,
                 }
-                // A missing session does not prove its panes died. tmux can
-                // move a pane into another session while preserving its id,
-                // root process and composer. Release only roots whose loss is
-                // independently proven.
-                let stale = !inner
-                    .registry
-                    .lock()
-                    .expect("registry lock")
-                    .in_session(&name)
-                    .is_empty();
-                if stale || !announced_missing {
-                    let missing = session_missing(&inner, &name).await;
-                    if stale && missing {
-                        let adoptions = inner
-                            .registry
-                            .lock()
-                            .expect("registry lock")
-                            .in_session(&name);
-                        let mut gone = Vec::new();
-                        for adoption in &adoptions {
-                            match crate::composer_recovery::pane_root_gone(adoption) {
-                                Ok(false) => {}
-                                Ok(true) => {
-                                    inner
-                                        .hook_liveness
-                                        .close(&PaneKey::new(idx, &adoption.pane_id));
-                                    if let Some(recipient) = adoption.recipient {
-                                        match crate::composer_recovery::retire_gone_recipient(
-                                            &inner, recipient,
-                                        ) {
-                                            Ok(()) => gone.push(recipient),
-                                            Err(reason) => {
-                                                warn!(session = %name, %reason, "cannot retire composer barrier for missing session");
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(reason) => {
-                                    warn!(session = %name, pane = %adoption.pane_id, %reason, "cannot prove physical pane loss for missing session");
-                                }
-                            }
-                        }
-                        if !gone.is_empty() {
-                            let mut reg = inner.registry.lock().expect("registry lock");
-                            release_gone_recipients(&mut reg, gone);
-                        }
-                    }
-                    if missing {
-                        update_mailbox_route(&inner, || {
-                            slot.last_panes.lock().expect("last panes lock").clear();
-                            let mut link = slot.link.lock().expect("session link lock");
-                            link.identity = None;
-                            link.mailbox_panes.clear();
-                        });
-                        messaging::schedule_available(&inner);
-                        if slot.retire_if_runtime() {
-                            info!(
-                                session = %name,
-                                session_idx = idx,
-                                "retired runtime watcher after tmux session disappeared"
-                            );
-                            return;
-                        }
-                    }
-                    if !announced_missing {
-                        // Two different situations reach this arm, and only
-                        // one of them is trouble. A session that does not
-                        // exist yet is the ordinary case for a daemon started
-                        // before `cyclops start`, and it clears itself the
-                        // moment the session appears. Logging that at WARN as
-                        // "cannot attach" reads like a dead end, and an
-                        // operator who stops there never finds out that the
-                        // retry two seconds later succeeded.
-                        if missing {
-                            info!(session = %name, "waiting for session; cyclops start creates it");
-                        } else {
-                            warn!(session = %name, error = %e, "cannot attach; retrying with backoff");
-                        }
-                        announced_missing = true;
-                    }
-                }
+                warn!(session = %name, error = %e, "cannot attach; retrying with backoff");
             }
         }
         if reconnect_delay(&mut stop, backoff).await {
@@ -4327,7 +5891,7 @@ async fn run_session(
     reconcile_adoptions(inner, idx, watcher, &kept).await;
     for row in watcher.snapshot() {
         let route_evidence = inner.advance_route_evidence(idx, &row.pane_id);
-        fusion::recompute_pane_for_route_evidence(
+        observe_pane_for_route_evidence(
             inner,
             idx,
             watcher,
@@ -4337,7 +5901,7 @@ async fn run_session(
             &route_evidence,
         )
         .await;
-        messaging::schedule_route_evidence(inner, idx, &row.pane_id, &route_evidence);
+        apply_route_evidence_observation(inner, idx, &row.pane_id, &route_evidence);
     }
     // Per-pane debounce kickers for output activity.
     let mut debounce: HashMap<String, watch::Sender<u64>> = HashMap::new();
@@ -4384,7 +5948,7 @@ async fn run_session(
                     }
                     for row in watcher.snapshot() {
                         let route_evidence = inner.advance_route_evidence(idx, &row.pane_id);
-                        fusion::recompute_pane_for_route_evidence(
+                        observe_pane_for_route_evidence(
                             inner,
                             idx,
                             watcher,
@@ -4393,7 +5957,7 @@ async fn run_session(
                             "lag_reconcile",
                             &route_evidence,
                         ).await;
-                        messaging::schedule_route_evidence(
+                        apply_route_evidence_observation(
                             inner,
                             idx,
                             &row.pane_id,
@@ -4463,7 +6027,10 @@ async fn reconcile_adoption_records(
             .find(|adoption| adoption.recipient == Some(recipient))
             .ok_or("composer_recovery_pane_root_unproven")?;
         if crate::composer_recovery::physical_pane_gone(watcher, adoption).await? {
-            crate::composer_recovery::retire_gone_recipient(inner, recipient)?;
+            inner
+                .workspace_messaging()
+                .ok_or("composer_recovery_store_unavailable")?
+                .retire_gone_composer_recipient(recipient)?;
         } else {
             transferred.insert(recipient);
         }
@@ -4492,7 +6059,7 @@ async fn reconcile_adoption_records(
 /// replacement route can become addressable. Only the label, manifest pin,
 /// and saved chrome move.
 fn rebind_same_session_adoptions(
-    inner: &Inner,
+    inner: &Arc<Inner>,
     session_idx: usize,
     session_instance_id: SessionInstanceId,
     observed: &[ObservedPane],
@@ -4521,57 +6088,51 @@ fn rebind_same_session_adoptions(
         return Ok(());
     }
 
-    let _publication = inner
-        .mailbox_publication
-        .lock()
-        .expect("mailbox publication lock");
-    let slot = inner
-        .session(session_idx)
-        .ok_or("adoption_rebind_session_missing")?;
-    for (recipient, old_root, new_root, row) in replacements {
-        let replacement_binding = fusion::admitted_binding(inner, session_idx, &row)
-            .as_ref()
-            .and_then(|binding| crate::composer_recovery::observed_binding(recipient, binding));
-        let mut registry = inner.registry.lock().expect("registry lock");
-        let Some(current_root) = registry
-            .for_recipient(recipient)
-            .and_then(|adoption| adoption.pane_root)
-        else {
-            return Err("adoption_rebind_route_changed");
-        };
-        if current_root != old_root && current_root != new_root {
-            return Err("adoption_rebind_route_changed");
-        }
-        if inner.mailbox.is_some() {
-            crate::composer_recovery::retire_replaced_recipient(
-                inner,
-                recipient,
-                replacement_binding,
-            )?;
-        }
-        if current_root == old_root {
-            match registry.rebind_process(recipient, old_root, new_root) {
-                Ok(true) => {}
-                Ok(false) => return Err("adoption_rebind_route_changed"),
-                Err(error) => {
-                    error!(recipient = %recipient, error = %error, "cannot persist adoption process replacement");
-                    return Err("adoption_rebind_write_failed");
+    with_messaging_publication(inner, |messaging| {
+        let slot = inner
+            .session(session_idx)
+            .ok_or("adoption_rebind_session_missing")?;
+        for (recipient, old_root, new_root, row) in replacements {
+            let replacement_binding = fusion::admitted_binding(inner, session_idx, &row)
+                .as_ref()
+                .and_then(|binding| crate::composer_recovery::observed_binding(recipient, binding));
+            let mut registry = inner.registry.lock().expect("registry lock");
+            let Some(current_root) = registry
+                .for_recipient(recipient)
+                .and_then(|adoption| adoption.pane_root)
+            else {
+                return Err("adoption_rebind_route_changed");
+            };
+            if current_root != old_root && current_root != new_root {
+                return Err("adoption_rebind_route_changed");
+            }
+            if let Some(messaging) = messaging {
+                messaging.retire_replaced_composer_recipient(recipient, replacement_binding)?;
+            }
+            if current_root == old_root {
+                match registry.rebind_process(recipient, old_root, new_root) {
+                    Ok(true) => {}
+                    Ok(false) => return Err("adoption_rebind_route_changed"),
+                    Err(error) => {
+                        error!(recipient = %recipient, error = %error, "cannot persist adoption process replacement");
+                        return Err("adoption_rebind_write_failed");
+                    }
                 }
             }
+            drop(registry);
+            let pane_id = recipient
+                .pane_id()
+                .ok_or("adoption_rebind_recipient_invalid")?;
+            retire_pane_process_trust(inner, session_idx, &pane_id.to_string());
         }
-        drop(registry);
-        let pane_id = recipient
-            .pane_id()
-            .ok_or("adoption_rebind_recipient_invalid")?;
-        retire_pane_process_trust(inner, session_idx, &pane_id.to_string());
-    }
-    {
-        let mut last = slot.last_panes.lock().expect("last panes lock");
-        for pane in observed {
-            last.insert(pane.row.pane_id.clone(), pane.clone());
+        {
+            let mut last = slot.last_panes.lock().expect("last panes lock");
+            for pane in observed {
+                last.insert(pane.row.pane_id.clone(), pane.clone());
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Remove current facts authenticated by the process generation that exited.
@@ -4736,10 +6297,26 @@ fn replace_pane_process(
     pane_id: &str,
     row: &PaneRow,
 ) -> Result<bool, &'static str> {
-    let _publication = inner
-        .mailbox_publication
-        .lock()
-        .expect("mailbox publication lock");
+    with_messaging_publication(inner, |messaging| {
+        replace_pane_process_during_publication(
+            inner,
+            messaging,
+            session_idx,
+            watcher,
+            pane_id,
+            row,
+        )
+    })
+}
+
+fn replace_pane_process_during_publication(
+    inner: &Arc<Inner>,
+    messaging: Option<&messaging::WorkspaceMessaging>,
+    session_idx: usize,
+    watcher: &Arc<SessionWatcher>,
+    pane_id: &str,
+    row: &PaneRow,
+) -> Result<bool, &'static str> {
     let authoritative = watcher
         .pane(pane_id)
         .map(ObservedPane::capture)
@@ -4816,12 +6393,8 @@ fn replace_pane_process(
         match adopted_root {
             None => {}
             Some(current) if current == new_root || previous_root == Some(current) => {
-                if inner.mailbox.is_some() {
-                    crate::composer_recovery::retire_replaced_recipient(
-                        inner,
-                        recipient,
-                        replacement_binding,
-                    )?;
+                if let Some(messaging) = messaging {
+                    messaging.retire_replaced_composer_recipient(recipient, replacement_binding)?;
                 }
                 if current != new_root {
                     match registry.rebind_process(recipient, current, new_root) {
@@ -4844,7 +6417,7 @@ fn replace_pane_process(
         let mut link = slot.link.lock().expect("session link lock");
         link.mailbox_panes.insert(pane_id.to_string(), replacement);
     }
-    if !refresh_mailbox_directory_unlocked(inner) {
+    if messaging.is_some_and(|messaging| !refresh_mailbox_directory_published(inner, messaging)) {
         return Err("pane_process_directory_publish_failed");
     }
     inner.emit("messages.route_changed", json!({}), None);
@@ -4859,6 +6432,7 @@ async fn handle_pane_event(
     debounce: &mut HashMap<String, watch::Sender<u64>>,
     ev: PaneEvent,
 ) -> bool {
+    inner.pane_observation_runtime.note_watcher_event_wake();
     match ev {
         PaneEvent::PaneAdded(row) => {
             inner
@@ -4875,7 +6449,7 @@ async fn handle_pane_event(
                     .insert(row.pane_id.clone(), ObservedPane::capture(row.clone()));
             });
             let route_evidence = inner.advance_route_evidence(session_idx, &row.pane_id);
-            fusion::recompute_pane_for_route_evidence(
+            observe_pane_for_route_evidence(
                 inner,
                 session_idx,
                 watcher,
@@ -4885,7 +6459,7 @@ async fn handle_pane_event(
                 &route_evidence,
             )
             .await;
-            messaging::schedule_route_evidence(inner, session_idx, &row.pane_id, &route_evidence);
+            apply_route_evidence_observation(inner, session_idx, &row.pane_id, &route_evidence);
             false
         }
         PaneEvent::PaneRemoved(id) => {
@@ -4932,8 +6506,10 @@ async fn handle_pane_event(
                     .chain(expected.and_then(|adoption| adoption.recipient))
                     .collect();
                 for recipient in gone_recipients {
-                    if let Err(reason) =
-                        crate::composer_recovery::retire_gone_recipient(inner, recipient)
+                    if let Err(reason) = inner
+                        .workspace_messaging()
+                        .ok_or("composer_recovery_store_unavailable")
+                        .and_then(|messaging| messaging.retire_gone_composer_recipient(recipient))
                     {
                         warn!(pane = %id, %reason, "cannot retire composer barrier before pane cleanup");
                         return true;
@@ -5014,7 +6590,7 @@ async fn handle_pane_event(
                     .retain(|(cached, _), _| cached != &pane);
                 inner.hook_liveness.close(&pane);
             }
-            messaging::schedule_available(inner);
+            apply_messaging_availability_change(inner);
             // The source session's last transition for this pane. The pane
             // may still exist under another session after a route transfer.
             // A client counting what needs a human takes its roster from
@@ -5079,7 +6655,7 @@ async fn handle_pane_event(
                 inner.route_evidence_id(session_idx, &id)
             };
             if route_changed {
-                fusion::recompute_pane_for_route_evidence(
+                observe_pane_for_route_evidence(
                     inner,
                     session_idx,
                     watcher,
@@ -5089,10 +6665,10 @@ async fn handle_pane_event(
                     &route_evidence,
                 )
                 .await;
-                messaging::schedule_route_evidence(inner, session_idx, &id, &route_evidence);
+                apply_route_evidence_observation(inner, session_idx, &id, &route_evidence);
             }
             if size_changed {
-                messaging::schedule_pane_size_changed(inner, session_idx, &id, &route_evidence);
+                apply_pane_size_observation(inner, session_idx, &id, &route_evidence);
             }
             // A move does not touch agent state, but it does move half the
             // chrome: the pane carries its own options and the window's
@@ -5147,7 +6723,7 @@ async fn handle_pane_event(
             }
             for pane_id in outcome.changed_panes {
                 let route_evidence = inner.advance_route_evidence(session_idx, &pane_id);
-                fusion::recompute_pane_for_route_evidence(
+                observe_pane_for_route_evidence(
                     inner,
                     session_idx,
                     watcher,
@@ -5157,7 +6733,7 @@ async fn handle_pane_event(
                     &route_evidence,
                 )
                 .await;
-                messaging::schedule_route_evidence(inner, session_idx, &pane_id, &route_evidence);
+                apply_route_evidence_observation(inner, session_idx, &pane_id, &route_evidence);
             }
             false
         }
@@ -5225,7 +6801,7 @@ async fn debounce_task(
             return;
         };
         let route_evidence = inner.advance_route_evidence(session_idx, &pane_id);
-        fusion::recompute_pane_from_output(
+        observe_pane_from_output(
             &inner,
             session_idx,
             &watcher,
@@ -5234,7 +6810,7 @@ async fn debounce_task(
             &route_evidence,
         )
         .await;
-        messaging::schedule_route_evidence(&inner, session_idx, &pane_id, &route_evidence);
+        apply_route_evidence_observation(&inner, session_idx, &pane_id, &route_evidence);
         if rx.changed().await.is_err() {
             return;
         }
@@ -5270,6 +6846,150 @@ pub(crate) fn unix_ms() -> u64 {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn daemon_boot_refuses_while_confirmed_record_removal_holds_the_journal_lease() {
+        let home = cyclops_proto::scratch::scratch_dir(&format!(
+            "cyc-data-forget-lease-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state_root = StateRoot::open_or_create(&home).unwrap();
+        let removal_lease = state_root
+            .open_append(Path::new(cyclops_proto::DURABLE_RECORD_FORGET_LEASE))
+            .unwrap();
+        assert!(removal_lease.try_lock().unwrap());
+
+        let error = match boot(Config::defaults(&home)).await {
+            Ok(daemon) => {
+                daemon.shutdown().await;
+                panic!("daemon booted while durable-record removal held the lease")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("confirmed durable-record removal is in progress"),
+            "{error:#}"
+        );
+        assert!(!home.join(cyclops_proto::SOCK_NAME).exists());
+
+        drop(removal_lease);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn unclean_drop_keeps_the_journal_lease_while_a_runtime_writer_is_in_flight() {
+        let home = cyclops_proto::scratch::scratch_dir(&format!(
+            "cyc-data-forget-unclean-drop-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let daemon = boot(Config::defaults(&home))
+            .await
+            .expect("boot daemon for unclean-drop lease test");
+        let (writer_started, writer_started_rx) = tokio::sync::oneshot::channel();
+        let (release_writer, release_writer_rx) = tokio::sync::oneshot::channel();
+        let writer_inner = Arc::clone(&daemon.inner);
+        let writer = tokio::spawn(async move {
+            let mut record = writer_inner
+                .state_root
+                .open_append(Path::new("ledger/unclean-drop.ndjson"))
+                .expect("open in-flight journal");
+            record
+                .append_bounded(b"{\"event\":\"in-flight\"}\n", 1024, 512)
+                .expect("append in-flight journal record");
+            writer_started
+                .send(())
+                .expect("test observes in-flight journal writer");
+            release_writer_rx
+                .await
+                .expect("test releases in-flight journal writer");
+        });
+        writer_started_rx
+            .await
+            .expect("in-flight journal writer starts");
+
+        // Quiesce every daemon-owned task without calling `shutdown`: the
+        // paused writer is the one remaining runtime owner when `Daemon` is
+        // dropped below.
+        daemon
+            .inner
+            .unread_projection_stopping
+            .store(true, Ordering::Release);
+        daemon.inner.unread_projection_wake.notify_one();
+        let _ = daemon.stop.send(true);
+        let tasks = std::mem::take(&mut *daemon.tasks.lock().expect("tasks lock"));
+        for task in tasks {
+            task.await.expect("daemon task stops");
+        }
+        let unread_projection_task = daemon
+            .unread_projection_task
+            .lock()
+            .expect("unread projection task lock")
+            .take();
+        if let Some(task) = unread_projection_task {
+            task.await.expect("unread projection task stops");
+        }
+
+        drop(daemon);
+        let state_root = StateRoot::open_existing(&home)
+            .expect("open state root after outer daemon drop")
+            .expect("state root remains present");
+        let contender = state_root
+            .open_append(Path::new(cyclops_proto::DURABLE_RECORD_FORGET_LEASE))
+            .expect("open removal contender lease");
+        let blocked_while_writer_lives = !contender.try_lock().expect("try contender lease");
+        if !blocked_while_writer_lives {
+            contender.unlock().expect("unlock wrongly acquired lease");
+        }
+
+        release_writer
+            .send(())
+            .expect("release in-flight journal writer");
+        writer.await.expect("in-flight journal writer exits");
+        let acquired_after_writer_exit = contender.try_lock().expect("try released lease");
+        if acquired_after_writer_exit {
+            contender.unlock().expect("unlock released lease");
+        }
+
+        let _ = std::fs::remove_dir_all(home);
+        assert!(
+            blocked_while_writer_lives,
+            "an outer Daemon drop released the journal lease while an in-flight writer still held the runtime"
+        );
+        assert!(
+            acquired_after_writer_exit,
+            "the journal lease remained held after the final runtime writer exited"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_shutdown_releases_the_journal_lease_after_runtime_tasks_stop() {
+        let home = cyclops_proto::scratch::scratch_dir(&format!(
+            "cyc-data-forget-clean-shutdown-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let daemon = boot(Config::defaults(&home))
+            .await
+            .expect("boot daemon for clean shutdown lease test");
+        daemon.shutdown().await;
+
+        let state_root = StateRoot::open_existing(&home)
+            .expect("open state root after clean shutdown")
+            .expect("state root remains present");
+        let contender = state_root
+            .open_append(Path::new(cyclops_proto::DURABLE_RECORD_FORGET_LEASE))
+            .expect("open removal contender lease");
+        assert!(
+            contender.try_lock().expect("try released lease"),
+            "clean shutdown must release the journal lease after its runtime tasks stop"
+        );
+        contender.unlock().expect("unlock released lease");
+
+        drop(contender);
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
     #[test]
     fn output_debounce_retains_the_newest_causal_timestamp() {
         let (tx, mut rx) = watch::channel(10);
@@ -5300,6 +7020,127 @@ mod tests {
         tokio::time::advance(OUTPUT_SETTLE).await;
 
         assert_eq!(settled.await.unwrap(), Some(40));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn status_refresh_has_one_budget_and_bounded_concurrency() {
+        let engine = delivery::Engine::new();
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut jobs = VecDeque::new();
+        for index in 0..(STATUS_REFRESH_CONCURRENCY + 3) {
+            let started = Arc::clone(&started);
+            jobs.push_back((
+                PaneKey::new(0, &format!("%{index}")),
+                Box::pin(async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                    true
+                }) as StatusRefreshFuture,
+            ));
+        }
+        let budget = Duration::from_millis(25);
+        let before = tokio::time::Instant::now();
+
+        let incomplete =
+            run_status_refresh_jobs(&engine, jobs, before + budget, STATUS_REFRESH_CONCURRENCY)
+                .await;
+
+        assert_eq!(tokio::time::Instant::now() - before, budget);
+        assert_eq!(started.load(Ordering::SeqCst), STATUS_REFRESH_CONCURRENCY);
+        assert_eq!(incomplete.len(), STATUS_REFRESH_CONCURRENCY + 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overdue_status_refresh_finishes_after_the_response_budget() {
+        let engine = delivery::Engine::new();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let completed_by_job = Arc::clone(&completed);
+        let pane = PaneKey::new(0, "%1");
+        let jobs = VecDeque::from([(
+            pane.clone(),
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                completed_by_job.fetch_add(1, Ordering::SeqCst);
+                true
+            }) as StatusRefreshFuture,
+        )]);
+        let before = tokio::time::Instant::now();
+
+        let incomplete =
+            run_status_refresh_jobs(&engine, jobs, before + Duration::from_millis(25), 1).await;
+
+        assert_eq!(incomplete, HashSet::from([pane]));
+        assert_eq!(
+            tokio::time::Instant::now() - before,
+            Duration::from_millis(25)
+        );
+        assert_eq!(completed.load(Ordering::SeqCst), 0);
+        tokio::time::advance(Duration::from_millis(25)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn runtime_observation_adapter_maps_body_free_facts_in_call_order() {
+        let inner = bare_inner("cyc-runtime-observation-publication");
+        let home = inner.cfg.home.clone();
+        let mut events = inner.events.subscribe();
+        for observation in [
+            fusion::PaneRuntimeObservation::MissingLifecycleEnd {
+                session_idx: 0,
+                pane_id: "%1".into(),
+            },
+            fusion::PaneRuntimeObservation::ReadinessChanged {
+                session_idx: 0,
+                pane_id: "%1".into(),
+                write_ready: true,
+                write_block: None,
+            },
+            fusion::PaneRuntimeObservation::StateChanged {
+                session_idx: 0,
+                pane_id: "%1".into(),
+                state: AgentState::Idle,
+                disagreement: false,
+                decided_by: "composer_empty".into(),
+                prior: Some(AgentState::Working),
+                cause: "output_settled".into(),
+                source_agent: Some(identity::ProcId { pid: 71, birth: 3 }),
+                source_manifest: "codex".into(),
+                working_confirmed: false,
+            },
+        ] {
+            apply_pane_runtime_observation(&inner, observation);
+        }
+
+        let diagnostic = events.try_recv().expect("missing-end diagnostic");
+        assert_eq!(diagnostic.event, "admin-notify");
+        assert_eq!(diagnostic.data["pane_id"], "%1");
+        assert_eq!(diagnostic.data["level"], "action_required");
+        assert_eq!(
+            diagnostic.data["subject"],
+            "%1: matching lifecycle end missing"
+        );
+        assert_eq!(diagnostic.data["body"], MISSING_LIFECYCLE_END_BODY);
+        let rendered = diagnostic.data.to_string();
+        assert!(!rendered.contains("turn-1"));
+        assert!(!rendered.contains("session"));
+
+        let readiness = events.try_recv().expect("readiness event");
+        assert_eq!(readiness.event, "readiness");
+        assert_eq!(readiness.data["write_ready"], true);
+        assert!(readiness.data["write_block"].is_null());
+
+        let state = events.try_recv().expect("state event");
+        assert_eq!(state.event, "state");
+        assert_eq!(state.data["state"], "idle");
+        assert_eq!(state.data["prior"], "working");
+        assert_eq!(state.data["source_pid"], 71);
+        assert_eq!(state.data["source_birth"], 3);
+        assert_eq!(state.data["source_manifest"], "codex");
+        assert!(events.try_recv().is_err(), "unexpected extra publication");
+
+        drop(inner);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
@@ -5397,17 +7238,22 @@ mod tests {
             cfg: Config::defaults(&home),
             force_submit: ForceSubmitRuntime::new(false, 5_000),
             state_root,
+            durable_record_forget_lease: StdMutex::new(None),
             state_repair: RepairSummary::default(),
             workspace_id,
             session_identities: StdMutex::new(session_identities),
             mailbox: None,
-            composer_recovery: StdMutex::new(composer_recovery::RecoveryCoordinator::default()),
-            mailbox_publication: StdMutex::new(()),
+            workspace_messaging: OnceLock::new(),
+            composer_recovery: Arc::new(StdMutex::new(
+                composer_recovery::RecoveryCoordinator::default(),
+            )),
+            mailbox_publication: Arc::new(StdMutex::new(())),
             unread_projection_gate: tokio::sync::Mutex::new(()),
             unread_projection_pending: StdMutex::new(HashSet::new()),
             unread_projection_wake: Notify::new(),
             unread_projection_stopping: AtomicBool::new(false),
             unread_projection_pause: StdMutex::new(None),
+            chrome_repaint_pause: StdMutex::new(None),
             mailbox_publish_pause: StdMutex::new(None),
             boot_id: "b-test".into(),
             started: Instant::now(),
@@ -5419,8 +7265,7 @@ mod tests {
             events: broadcast::channel(16).0,
             detections: StdMutex::new(HashMap::new()),
             route_evidence_generations: StdMutex::new(HashMap::new()),
-            pane_recomputes: StdMutex::new(HashMap::new()),
-            lifecycle_rechecks: StdMutex::new(HashMap::new()),
+            pane_observation_runtime: fusion::PaneObservationRuntime::new(),
             registry: StdMutex::new(registry),
             theme: StdMutex::new(cyclops_theme::ThemeWatch::new(&home)),
             hook_readings: StdMutex::new(HashMap::new()),
@@ -5541,7 +7386,13 @@ mod tests {
         slot
     }
 
-    fn set_test_label(inner: &Inner, session: &str, pane: TmuxPaneId, pane_pid: i32, label: &str) {
+    fn set_test_label(
+        inner: &Arc<Inner>,
+        session: &str,
+        pane: TmuxPaneId,
+        pane_pid: i32,
+        label: &str,
+    ) {
         let session_instance_id = inner
             .session_index(session)
             .and_then(|idx| inner.session(idx))
@@ -5957,22 +7808,24 @@ mod tests {
             border_status: None,
         };
 
-        let _publication = inner.mailbox_publication.lock().unwrap();
-        commit_adoption_under_publication(
-            &inner,
-            adoption("a", pane_a, recipient_a),
-            window("a", pane_a),
-        )
-        .unwrap();
-        let refused = commit_adoption_under_publication(
-            &inner,
-            adoption("b", pane_b, recipient_b),
-            window("b", pane_b),
-        )
-        .unwrap_err();
+        let refused = with_messaging_publication(&inner, |messaging| {
+            commit_adoption_during_publication(
+                &inner,
+                messaging,
+                adoption("a", pane_a, recipient_a),
+                window("a", pane_a),
+            )
+            .unwrap();
+            commit_adoption_during_publication(
+                &inner,
+                messaging,
+                adoption("b", pane_b, recipient_b),
+                window("b", pane_b),
+            )
+            .unwrap_err()
+        });
         assert_eq!(refused.code, "bad_request");
         assert!(refused.message.contains("already taken"));
-        drop(_publication);
 
         let adoptions = inner.registry.lock().unwrap().exact_adoptions();
         assert_eq!(adoptions.len(), 1);
@@ -6375,6 +8228,74 @@ process_names = ["never"]
     }
 
     #[test]
+    fn stream_backfill_is_body_free_bounded_and_daemon_owned() {
+        let inner = bare_inner("cyc-stream-backfill");
+        let ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/main.ndjson"),
+            &inner.boot_id,
+        )
+        .unwrap();
+        let slot = Arc::new(SessionSlot::new("main".into(), Arc::new(ledger)));
+        let mut oversized = daemon_line(
+            Kind::System,
+            "e-large".into(),
+            json!({
+                "event": "legacy_large_fact",
+                "padding": "x".repeat(cyclops_proto::FrameContract::MAX_JSON_BYTES),
+            }),
+        );
+        oversized.ts = 1;
+        slot.ledger.append(oversized).unwrap();
+        let mut legacy = daemon_line(
+            Kind::System,
+            "e-legacy".into(),
+            json!({
+                "event": "legacy_fact",
+                "body": "private legacy body",
+                "nested": {"body": "private nested body", "kept": true},
+            }),
+        );
+        legacy.ts = 2;
+        slot.ledger.append(legacy).unwrap();
+        let mut message = daemon_line(Kind::Msg, "m-kept".into(), Value::Null);
+        message.ts = 3;
+        message.from = "admin".into();
+        message.to = vec!["reviewer".into()];
+        message.subject = Some("inspect the durable seam".into());
+        message.body = Some("private body".into());
+        message.data = Some(json!({"internal_route": "%9"}));
+        slot.ledger.append(message).unwrap();
+        inner.sessions.lock().unwrap().push(slot);
+
+        let result =
+            history::stream_backfill(&inner, cyclops_proto::StreamBackfillParams { limit: 10 });
+        assert_eq!(result.lines.len(), 2);
+        assert_eq!(result.lines[0].id, "e-legacy");
+        assert_eq!(
+            result.lines[0].data.as_ref().unwrap()["nested"]["kept"],
+            true
+        );
+        assert_eq!(result.lines[1].id, "m-kept");
+        assert_eq!(result.lines[1].body, None);
+        assert_eq!(result.lines[1].data, None);
+        assert_eq!(result.max_seq, Some(3));
+        assert_eq!(
+            result.gap,
+            Some(cyclops_proto::StreamBackfillGap {
+                unreadable_sources: 0,
+                omitted_rows: 1,
+            })
+        );
+        let encoded = serde_json::to_vec(&result).unwrap();
+        assert!(encoded.len() < cyclops_proto::FrameContract::MAX_JSON_BYTES);
+        assert!(
+            !String::from_utf8(encoded).unwrap().contains("private"),
+            "a nested historical body crossed the presentation boundary"
+        );
+    }
+
+    #[test]
     fn composite_cursor_survives_rename_and_rejects_a_reused_name() {
         let inner = bare_inner("cyc-history-cursor-rename");
         let old_ledger = LedgerWriter::open(
@@ -6463,8 +8384,726 @@ process_names = ["never"]
         .expect("session identity was not published")
     }
 
+    async fn wait_for_session_lifecycle(
+        events: &mut broadcast::Receiver<Event>,
+        name: &str,
+        attached: bool,
+    ) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = events
+                    .recv()
+                    .await
+                    .expect("session event stream stays open");
+                if event.event == "session"
+                    && event.data["name"] == name
+                    && event.data["attached"] == attached
+                {
+                    return;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("session {name:?} did not report attached={attached}"));
+    }
+
+    /// A configured daemon can start before the workspace exists, and a
+    /// workspace can disappear after it attached. Both absence paths must
+    /// park on an explicit `session.watch` creation edge instead of probing
+    /// tmux on a timer. The test pauses at that exact parked state before it
+    /// creates each session, so neither attach can be a lucky preflight race.
+    #[tokio::test]
+    async fn configured_session_waits_for_creation_edges_on_first_start_and_recreation() {
+        if !cyclops_testrig::tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let server = cyclops_testrig::TmuxServer::new("session-creation-edges");
+        // Keep this isolated tmux server alive while `main` is absent. The
+        // watcher must not be able to mistake server shutdown for a main
+        // session lifecycle event.
+        server.run_ok(&["new-session", "-d", "-s", "anchor", "/bin/sh"]);
+
+        let mut inner = bare_inner("cyc-session-creation-edges");
+        let home = inner.cfg.home.clone();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        {
+            let mutable = Arc::get_mut(&mut inner).expect("bare inner is unique");
+            mutable.cfg.tmux_socket = Some(server.socket().to_string());
+            mutable.cfg.tmux_config = Some(PathBuf::from("/dev/null"));
+            mutable.shutdown_request = stop_tx.clone();
+            mutable.stop = stop_rx;
+        }
+        let ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/main.ndjson"),
+            &inner.boot_id,
+        )
+        .expect("configured ledger opens");
+        let slot = Arc::new(SessionSlot::new("main".into(), Arc::new(ledger)));
+        let idx = {
+            let mut sessions = inner.sessions.lock().expect("sessions lock");
+            sessions.push(Arc::clone(&slot));
+            sessions.len() - 1
+        };
+        let mut events = inner.events.subscribe();
+
+        let first_wait = slot.arm_missing_wait();
+        let task = tokio::spawn(session_task(Arc::clone(&inner), idx, inner.stop.clone()));
+        tokio::time::timeout(Duration::from_secs(10), first_wait.notified())
+            .await
+            .expect("configured startup reaches the missing-session wait");
+        assert!(
+            !slot.link.lock().expect("session link lock").attached,
+            "an absent configured session never opens a live route"
+        );
+
+        server.run_ok(&["new-session", "-d", "-s", "main", "/bin/sh"]);
+        assert!(
+            slot.missing_wait_is_active(),
+            "creating a configured session alone leaves the task at its explicit availability wait"
+        );
+        let (watched_idx, added) = watch_session(&inner, "main")
+            .await
+            .expect("configured session accepts an idempotent creation watch");
+        assert_eq!(watched_idx, idx);
+        assert!(!added, "the configured slot keeps its ledger and task");
+        wait_for_session_lifecycle(&mut events, "main", true).await;
+        let first = slot
+            .link
+            .lock()
+            .expect("session link lock")
+            .identity
+            .clone()
+            .expect("first attachment publishes an identity");
+
+        let recreation_wait = slot.arm_missing_wait();
+        server.run_ok(&["kill-session", "-t", "=main"]);
+        wait_for_session_lifecycle(&mut events, "main", false).await;
+        tokio::time::timeout(Duration::from_secs(10), recreation_wait.notified())
+            .await
+            .expect("post-attachment removal reaches the creation wait");
+        assert!(
+            !slot.link.lock().expect("session link lock").attached,
+            "a removed session releases its live route before it is recreated"
+        );
+
+        server.run_ok(&["new-session", "-d", "-s", "main", "/bin/sh"]);
+        let (watched_idx, added) = watch_session(&inner, "main")
+            .await
+            .expect("recreated configured session accepts its creation watch");
+        assert_eq!(watched_idx, idx);
+        assert!(
+            !added,
+            "recreation reuses the configured slot, not a second watcher"
+        );
+        wait_for_session_lifecycle(&mut events, "main", true).await;
+        let second = slot
+            .link
+            .lock()
+            .expect("session link lock")
+            .identity
+            .clone()
+            .expect("recreated session publishes an identity");
+        assert_ne!(
+            first.session_instance_id(),
+            second.session_instance_id(),
+            "a recreated tmux session receives a fresh durable identity"
+        );
+
+        stop_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("configured session task stops")
+            .expect("configured session task does not panic");
+        let extra_tasks = std::mem::take(&mut *inner.extra_tasks.lock().expect("extra tasks lock"));
+        for task in extra_tasks {
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("session descendant task stops")
+                .expect("session descendant task does not panic");
+        }
+        drop(slot);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// An idempotent `session.watch` can be accepted after the configured
+    /// slot exists but before the spawned session task receives CPU time.
+    /// That creation edge must earn one recheck. Otherwise a daemon can
+    /// observe absence just before creation and wait forever for a second
+    /// identical request that its client already made.
+    #[tokio::test]
+    async fn an_availability_edge_before_task_start_rechecks_first_absence() {
+        if !cyclops_testrig::tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let server = cyclops_testrig::TmuxServer::new("session-startup-availability-edge");
+        server.run_ok(&["new-session", "-d", "-s", "anchor", "/bin/sh"]);
+
+        let mut inner = bare_inner("cyc-session-startup-availability-edge");
+        let home = inner.cfg.home.clone();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        {
+            let mutable = Arc::get_mut(&mut inner).expect("bare inner is unique");
+            mutable.cfg.tmux_socket = Some(server.socket().to_string());
+            mutable.cfg.tmux_config = Some(PathBuf::from("/dev/null"));
+            mutable.shutdown_request = stop_tx.clone();
+            mutable.stop = stop_rx;
+        }
+        let ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/main.ndjson"),
+            &inner.boot_id,
+        )
+        .expect("configured ledger opens");
+        let slot = Arc::new(SessionSlot::new("main".into(), Arc::new(ledger)));
+        let idx = {
+            let mut sessions = inner.sessions.lock().expect("sessions lock");
+            sessions.push(Arc::clone(&slot));
+            sessions.len() - 1
+        };
+        let mut events = inner.events.subscribe();
+
+        // This is the existing configured-slot path in the RPC: it does not
+        // add a ledger or task, but it records a real availability edge.
+        let (watched_idx, added) = watch_session(&inner, "main")
+            .await
+            .expect("configured session accepts the early creation edge");
+        assert_eq!(watched_idx, idx);
+        assert!(!added, "the configured slot already owns this session");
+
+        let (probe_entered, probe_release) = slot.arm_missing_probe_pause();
+        let task = tokio::spawn(session_task(Arc::clone(&inner), idx, inner.stop.clone()));
+        tokio::time::timeout(Duration::from_secs(10), probe_entered.notified())
+            .await
+            .expect("first tmux absence probe completes before creation");
+        server.run_ok(&["new-session", "-d", "-s", "main", "/bin/sh"]);
+        probe_release.notify_one();
+
+        wait_for_session_lifecycle(&mut events, "main", true).await;
+        assert!(
+            slot.link.lock().expect("session link lock").attached,
+            "the preserved startup edge triggers the one recheck that sees creation"
+        );
+
+        stop_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("configured session task stops")
+            .expect("configured session task does not panic");
+        let extra_tasks = std::mem::take(&mut *inner.extra_tasks.lock().expect("extra tasks lock"));
+        for task in extra_tasks {
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("session descendant task stops")
+                .expect("session descendant task does not panic");
+        }
+        drop(slot);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A followed rename can land after tmux confirms the old target is
+    /// missing but before lifecycle cleanup takes the registration barrier.
+    /// That old reply must restart the decision against the renamed target;
+    /// it cannot erase the canonical slot's route or identity and park it.
+    #[tokio::test]
+    async fn a_rename_after_a_missing_probe_preserves_the_live_slot() {
+        if !cyclops_testrig::tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let server = cyclops_testrig::TmuxServer::new("missing-probe-rename-settlement");
+        server.run_ok(&["new-session", "-d", "-s", "old", "/bin/sh"]);
+        server.run_ok(&["rename-session", "-t", "=old", "new"]);
+
+        let mut inner = bare_inner("cyc-missing-probe-rename-settlement");
+        let home = inner.cfg.home.clone();
+        {
+            let mutable = Arc::get_mut(&mut inner).expect("bare inner is unique");
+            mutable.cfg.tmux_socket = Some(server.socket().to_string());
+            mutable.cfg.tmux_config = Some(PathBuf::from("/dev/null"));
+        }
+        let ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/old.ndjson"),
+            &inner.boot_id,
+        )
+        .expect("configured ledger opens");
+        let slot = Arc::new(SessionSlot::new("old".into(), Arc::new(ledger)));
+        let binding = persist_test_binding(&inner, test_live_key(inner.workspace_id, 41, 7, "$1"));
+        let pane_pid = std::process::id() as i32;
+        let pane = ObservedPane::capture(test_pane("%0", pane_pid));
+        {
+            let mut link = slot.link.lock().expect("session link lock");
+            link.identity = Some(binding.clone());
+            link.mailbox_panes
+                .insert(pane.row.pane_id.clone(), pane.clone());
+        }
+        slot.last_panes
+            .lock()
+            .expect("last panes lock")
+            .insert(pane.row.pane_id.clone(), pane.clone());
+        slot.mark_observed_live();
+        let idx = {
+            let mut sessions = inner.sessions.lock().expect("sessions lock");
+            sessions.push(Arc::clone(&slot));
+            sessions.len() - 1
+        };
+
+        let (settlement_entered, settlement_release) = slot.arm_missing_settlement_pause();
+        let decision_inner = Arc::clone(&inner);
+        let decision_slot = Arc::clone(&slot);
+        let decision = tokio::spawn(async move {
+            let (_stop_tx, mut stop) = watch::channel(false);
+            let mut aliases = decision_slot.alias_changed.subscribe();
+            let mut availability = SessionAvailability::for_slot(&decision_slot);
+            session_lifecycle_decision(
+                &decision_inner,
+                idx,
+                &decision_slot,
+                &mut stop,
+                &mut aliases,
+                &mut availability,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), settlement_entered.notified())
+            .await
+            .expect("current old-target absence reaches the settlement seam");
+
+        assert!(
+            rename_session_slot(&inner, idx, "new".into()),
+            "the followed rename updates the canonical slot"
+        );
+        settlement_release.notify_one();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), decision)
+                .await
+                .expect("lifecycle decision resolves")
+                .expect("lifecycle decision does not panic"),
+            SessionLifecycleDecision::TargetChanged,
+            "the old missing result is discarded instead of settling the renamed slot"
+        );
+        assert_eq!(slot.name(), "new");
+        {
+            let link = slot.link.lock().expect("session link lock");
+            assert_eq!(
+                link.identity.as_ref(),
+                Some(&binding),
+                "the old missing result cannot clear the renamed slot identity"
+            );
+            assert!(
+                link.mailbox_panes.contains_key(&pane.row.pane_id),
+                "the old missing result cannot clear the renamed live route"
+            );
+        }
+        assert!(
+            slot.last_panes
+                .lock()
+                .expect("last panes lock")
+                .contains_key(&pane.row.pane_id),
+            "the old missing result cannot clear retained pane evidence"
+        );
+        assert!(
+            !slot.missing_wait_is_active(),
+            "a changed target retries instead of parking on the old absence"
+        );
+
+        let (_stop_tx, mut stop) = watch::channel(false);
+        let mut aliases = slot.alias_changed.subscribe();
+        let mut availability = SessionAvailability::for_slot(&slot);
+        assert_eq!(
+            session_lifecycle_decision(
+                &inner,
+                idx,
+                &slot,
+                &mut stop,
+                &mut aliases,
+                &mut availability,
+            )
+            .await,
+            SessionLifecycleDecision::Present,
+            "the retry asks tmux about the current renamed target"
+        );
+
+        let mut events = inner.events.subscribe();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(session_task(Arc::clone(&inner), idx, stop_rx));
+        wait_for_session_lifecycle(&mut events, "new", true).await;
+        assert!(
+            slot.link.lock().expect("session link lock").attached,
+            "the session task attaches the renamed live target without another session.watch"
+        );
+        stop_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("renamed session task stops")
+            .expect("renamed session task does not panic");
+        let extra_tasks = std::mem::take(&mut *inner.extra_tasks.lock().expect("extra tasks lock"));
+        for task in extra_tasks {
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("session descendant task stops")
+                .expect("session descendant task does not panic");
+        }
+
+        drop(slot);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A missing configured socket after a session was live is not proof that
+    /// the session or its durable identity was removed. The prior broad
+    /// `session_exists == false` mapping cleared this identity before a later
+    /// explicit availability edge could prove what survived.
+    #[tokio::test]
+    async fn unreachable_tmux_keeps_an_observed_session_identity() {
+        if !cyclops_testrig::tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let mut inner = bare_inner("cyc-unreachable-session-presence");
+        let home = inner.cfg.home.clone();
+        Arc::get_mut(&mut inner)
+            .expect("bare inner is unique")
+            .cfg
+            .tmux_socket = Some(format!(
+            "cyclops-unreachable-presence-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/main.ndjson"),
+            &inner.boot_id,
+        )
+        .expect("configured ledger opens");
+        let slot = Arc::new(SessionSlot::new("main".into(), Arc::new(ledger)));
+        let binding = persist_test_binding(&inner, test_live_key(inner.workspace_id, 41, 7, "$1"));
+        slot.mark_observed_live();
+        slot.link.lock().expect("session link lock").identity = Some(binding.clone());
+        let mut availability = SessionAvailability::for_slot(&slot);
+
+        assert_eq!(
+            session_presence_at_current_target(&inner, &slot, &mut availability)
+                .await
+                .map(|probe| probe.presence),
+            Some(TmuxSessionPresence::ServerUnavailable)
+        );
+        assert_eq!(
+            slot.link
+                .lock()
+                .expect("session link lock")
+                .identity
+                .as_ref(),
+            Some(&binding),
+            "an unreachable tmux socket cannot clear an observed identity"
+        );
+
+        drop(slot);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// Losing the configured tmux server after attachment must not let the
+    /// daemon create an empty replacement while it retries. It retains the
+    /// exact route and active delivery barrier until the creator rebuilds
+    /// tmux and sends the explicit availability edge.
+    #[tokio::test]
+    async fn a_vanished_tmux_server_waits_for_an_availability_edge() {
+        use cyclops_proto::{
+            NotificationBinding, NotificationManifestId, NotificationState, NotificationTransport,
+            DOORBELL_FORMAT_COMPACT_CLAIM,
+        };
+
+        if !cyclops_testrig::tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let server = cyclops_testrig::TmuxServer::new("vanished-server-availability");
+        server.run_ok(&["new-session", "-d", "-s", "main", "sleep 60"]);
+        let socket_path = server.socket_path().expect("live tmux socket path");
+
+        let mut inner = bare_inner("cyc-vanished-server-availability");
+        enable_mailbox(&mut inner);
+        let home = inner.cfg.home.clone();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        {
+            let mutable = Arc::get_mut(&mut inner).expect("bare inner is unique");
+            mutable.cfg.tmux_socket = Some(server.socket().to_string());
+            mutable.cfg.tmux_config = Some(PathBuf::from("/dev/null"));
+            mutable.shutdown_request = stop_tx.clone();
+            mutable.stop = stop_rx;
+        }
+        let ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/main.ndjson"),
+            &inner.boot_id,
+        )
+        .expect("configured ledger opens");
+        let slot = Arc::new(SessionSlot::new("main".into(), Arc::new(ledger)));
+        let idx = {
+            let mut sessions = inner.sessions.lock().expect("sessions lock");
+            sessions.push(Arc::clone(&slot));
+            sessions.len() - 1
+        };
+        let mut events = inner.events.subscribe();
+        let task = tokio::spawn(session_task(Arc::clone(&inner), idx, inner.stop.clone()));
+        wait_for_session_lifecycle(&mut events, "main", true).await;
+
+        let binding = slot
+            .link
+            .lock()
+            .expect("session link lock")
+            .identity
+            .clone()
+            .expect("attached session publishes identity");
+        let row = slot
+            .link
+            .lock()
+            .expect("session link lock")
+            .watcher
+            .as_ref()
+            .expect("attached watcher")
+            .snapshot()
+            .into_iter()
+            .next()
+            .expect("one watched pane");
+        let pane: TmuxPaneId = row.pane_id.parse().expect("pane id");
+        let process = identity::ProcId::of(row.pane_pid).expect("live pane process");
+        let process_instance =
+            ProcessInstanceId::new(process.pid, process.birth).expect("process instance");
+        set_test_label(&inner, "main", pane, process.pid, "worker");
+        let recipient =
+            RecipientKey::agent(inner.workspace_id, binding.session_instance_id(), pane);
+        let service = inner.mailbox.as_ref().expect("mailbox enabled");
+        let accepted = send_test_message(service, "worker".into()).expect("message accepted");
+        let queued = service
+            .prepare_oldest_notification(recipient)
+            .expect("notification preparation")
+            .expect("one notification");
+        let durable_binding = NotificationBinding {
+            recipient,
+            pane_root: Some(process_instance),
+            leader: Some(process_instance),
+            agent: process_instance,
+            manifest: NotificationManifestId::new("test").expect("manifest id"),
+        };
+        {
+            let store = service.store_handle();
+            let mut store = store.lock().expect("mailbox store lock");
+            store
+                .advance_notification(
+                    accepted.message_id.clone(),
+                    recipient,
+                    queued.attempt_id,
+                    NotificationState::Gating,
+                    None,
+                    None,
+                )
+                .expect("notification enters gating");
+            store
+                .advance_notification_with_transport(
+                    accepted.message_id,
+                    recipient,
+                    queued.attempt_id,
+                    NotificationState::Writing,
+                    durable_binding,
+                    NotificationTransport::Doorbell,
+                    Some(DOORBELL_FORMAT_COMPACT_CLAIM),
+                )
+                .expect("notification owns barrier");
+        }
+        assert_eq!(
+            service
+                .active_notification_barriers()
+                .expect("barriers readable")
+                .len(),
+            1,
+            "fixture creates an active delivery barrier"
+        );
+
+        let connect_attempts_before_loss = slot.control_connect_attempts();
+        let unavailable_wait = slot.arm_missing_wait();
+        server.simulate_server_loss();
+        wait_for_session_lifecycle(&mut events, "main", false).await;
+        tokio::time::timeout(Duration::from_secs(10), unavailable_wait.notified())
+            .await
+            .expect("vanished server reaches the explicit availability wait");
+        assert_eq!(
+            slot.control_connect_attempts(),
+            connect_attempts_before_loss,
+            "a vanished server cannot reach SessionWatcher::connect while parked"
+        );
+        // tmux may leave a stale socket pathname while the server is already
+        // gone. The counter above proves Cyclops did not attach; this
+        // passive connect proves no replacement server is listening there.
+        let no_server_listens =
+            !socket_path.exists() || std::os::unix::net::UnixStream::connect(&socket_path).is_err();
+        assert!(
+            no_server_listens,
+            "the parked daemon did not leave an empty tmux server listening at {}",
+            socket_path.display()
+        );
+        assert!(
+            slot.missing_wait_is_active(),
+            "the task is parked on an event, not a reconnect timer"
+        );
+        assert_eq!(
+            slot.link
+                .lock()
+                .expect("session link lock")
+                .identity
+                .as_ref(),
+            Some(&binding),
+            "an unavailable server cannot clear the last observed identity"
+        );
+        assert_eq!(
+            service
+                .active_notification_barriers()
+                .expect("barriers readable")
+                .len(),
+            1,
+            "an unavailable server cannot retire the active delivery barrier"
+        );
+
+        server.run_ok(&["new-session", "-d", "-s", "main", "sleep 60"]);
+        assert!(
+            slot.missing_wait_is_active(),
+            "recreating tmux alone does not wake the parked task"
+        );
+        let (watched_idx, added) = watch_session(&inner, "main")
+            .await
+            .expect("configured slot accepts the availability edge");
+        assert_eq!(watched_idx, idx);
+        assert!(!added, "the configured slot keeps its ledger and task");
+        wait_for_session_lifecycle(&mut events, "main", true).await;
+        assert_eq!(
+            slot.control_connect_attempts(),
+            connect_attempts_before_loss + 1,
+            "only the explicit availability edge permits the next control attach"
+        );
+
+        stop_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("session task stops")
+            .expect("session task does not panic");
+        let extra_tasks = std::mem::take(&mut *inner.extra_tasks.lock().expect("extra tasks lock"));
+        for task in extra_tasks {
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("session descendant task stops")
+                .expect("session descendant task does not panic");
+        }
+        drop(slot);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A followed rename changes a normal slot's reconnect target. If its
+    /// control client later disconnects while the renamed session remains
+    /// live, the daemon must reconnect to that live target without waiting
+    /// for a new `session.watch` creation edge.
+    #[tokio::test]
+    async fn a_renamed_live_session_reconnects_without_a_creation_watch() {
+        if !cyclops_testrig::tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let server = cyclops_testrig::TmuxServer::new("renamed-session-reconnect");
+        server.run_ok(&["new-session", "-d", "-s", "anchor", "/bin/sh"]);
+        server.run_ok(&["new-session", "-d", "-s", "main", "/bin/sh"]);
+        server.run_ok(&["set-option", "-g", "exit-empty", "off"]);
+        server.run_ok(&["set-option", "-g", "exit-unattached", "off"]);
+
+        let mut inner = bare_inner("cyc-renamed-session-reconnect");
+        let home = inner.cfg.home.clone();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        {
+            let mutable = Arc::get_mut(&mut inner).expect("bare inner is unique");
+            mutable.cfg.tmux_socket = Some(server.socket().to_string());
+            mutable.cfg.tmux_config = Some(PathBuf::from("/dev/null"));
+            mutable.shutdown_request = stop_tx.clone();
+            mutable.stop = stop_rx;
+        }
+        let ledger = LedgerWriter::open(
+            &inner.state_root,
+            Path::new("ledger/main.ndjson"),
+            &inner.boot_id,
+        )
+        .expect("configured ledger opens");
+        let slot = Arc::new(SessionSlot::new("main".into(), Arc::new(ledger)));
+        let idx = {
+            let mut sessions = inner.sessions.lock().expect("sessions lock");
+            sessions.push(Arc::clone(&slot));
+            sessions.len() - 1
+        };
+        let mut events = inner.events.subscribe();
+        let task = tokio::spawn(session_task(Arc::clone(&inner), idx, inner.stop.clone()));
+        wait_for_session_lifecycle(&mut events, "main", true).await;
+        let original = slot
+            .link
+            .lock()
+            .expect("session link lock")
+            .identity
+            .clone()
+            .expect("attach lifecycle event publishes the session identity");
+
+        server.run_ok(&["rename-session", "-t", "=main", "hidden"]);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while slot.name() != "hidden" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("followed rename reaches the slot before control disconnect");
+
+        // This closes the watcher's tmux client, not the renamed session.
+        // The two lifecycle events below prove the daemon reconnects to
+        // `hidden` on its own; no `session.watch` request is sent here.
+        server.run_ok(&["detach-client", "-s", "hidden"]);
+        wait_for_session_lifecycle(&mut events, "hidden", false).await;
+        wait_for_session_lifecycle(&mut events, "hidden", true).await;
+        assert!(
+            slot.link.lock().expect("session link lock").attached,
+            "the still-live renamed session reattaches without a creation edge"
+        );
+        assert_eq!(slot.name(), "hidden");
+        assert_eq!(
+            slot.link
+                .lock()
+                .expect("session link lock")
+                .identity
+                .as_ref()
+                .expect("reattached session has an identity")
+                .session_instance_id(),
+            original.session_instance_id(),
+            "a control reconnect preserves the renamed session's identity"
+        );
+
+        stop_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("configured session task stops")
+            .expect("configured session task does not panic");
+        let extra_tasks = std::mem::take(&mut *inner.extra_tasks.lock().expect("extra tasks lock"));
+        for task in extra_tasks {
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("session descendant task stops")
+                .expect("session descendant task does not panic");
+        }
+        drop(slot);
+        drop(inner);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
     fn assert_current_mailbox_route(
-        inner: &Inner,
+        inner: &Arc<Inner>,
         slot: &SessionSlot,
         binding: &SessionIdentityBinding,
     ) {
@@ -7271,9 +9910,17 @@ process_names = ["never"]
             first.session_instance_id()
         );
 
-        drop(tmux);
-        let tmux = cyclops_testrig::TmuxServer::new("durable-session-wiring");
+        let restart_wait = slot.arm_missing_wait();
+        let tmux = tmux.restart();
+        tokio::time::timeout(Duration::from_secs(10), restart_wait.notified())
+            .await
+            .expect("server replacement reaches the configured-session wait");
         tmux.run_ok(&["new-session", "-d", "-s", "after"]);
+        let (watched_idx, added) = watch_session(&daemon.inner, "after")
+            .await
+            .expect("recreated configured session accepts the creation edge");
+        assert_eq!(watched_idx, 0);
+        assert!(!added, "the followed configured slot remains the owner");
         let second = wait_for_session_binding(&slot, Some(first.session_instance_id())).await;
         let second_pane: TmuxPaneId = slot
             .link
@@ -7301,8 +9948,17 @@ process_names = ["never"]
         );
 
         tmux.run_ok(&["new-session", "-d", "-s", "anchor"]);
+        let recreation_wait = slot.arm_missing_wait();
         tmux.run_ok(&["kill-session", "-t", "=after"]);
+        tokio::time::timeout(Duration::from_secs(10), recreation_wait.notified())
+            .await
+            .expect("session removal reaches the configured-session wait");
         tmux.run_ok(&["new-session", "-d", "-s", "after"]);
+        let (watched_idx, added) = watch_session(&daemon.inner, "after")
+            .await
+            .expect("post-attachment recreation accepts the creation edge");
+        assert_eq!(watched_idx, 0);
+        assert!(!added, "the configured watcher is not duplicated");
         let third = wait_for_session_binding(&slot, Some(second.session_instance_id())).await;
         let third_pane: TmuxPaneId = slot
             .link

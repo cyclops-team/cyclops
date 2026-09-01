@@ -33,6 +33,13 @@ async fn watching_a_session_after_boot_makes_status_see_it() {
         "an empty boot set watches nothing"
     );
 
+    // Keep the isolated tmux server reachable after the runtime session goes
+    // away. The removal assertion below needs tmux's named-missing reply;
+    // if `extra` were its last session, a missing socket would be honest
+    // uncertainty and must retain the runtime slot instead of retiring it.
+    rig.tmux
+        .run_ok(&["new-session", "-d", "-s", "anchor", "cat"]);
+
     // A session the workspace UI created at runtime, on the same tmux
     // server the daemon is configured for.
     rig.tmux.run_ok(&[
@@ -143,6 +150,94 @@ async fn watching_a_session_after_boot_makes_status_see_it() {
     );
     let absent = rig.ctl.request("session.watch", json!({})).await;
     assert_eq!(absent["error"]["code"], json!("bad_request"), "{absent}");
+
+    rig.shutdown().await;
+}
+
+/// Losing the whole tmux server is not proof that a runtime session was
+/// removed. Keep its durable slot readable until the creator rebuilds tmux
+/// and sends the same explicit availability edge that created the watch.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unavailable_runtime_watch_waits_for_an_explicit_availability_edge() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new_multi("runtime-watch-unavailable", CAT_MANIFEST, &[], "").await;
+    rig.tmux.run_ok(&[
+        "new-session",
+        "-d",
+        "-s",
+        "extra",
+        "-x",
+        "160",
+        "-y",
+        "40",
+        "cat",
+    ]);
+    let first_watch = rig
+        .ctl
+        .request("session.watch", json!({"session": "extra"}))
+        .await;
+    assert_eq!(first_watch["result"]["added"], json!(true), "{first_watch}");
+    rig.wait_attached_session(0, 1).await;
+    let before_loss = rig.ctl.request("status", json!({})).await;
+    let before_identity = before_loss["result"]["sessions"][0]["identity"].clone();
+
+    rig.tmux.simulate_server_loss();
+    rig.ev
+        .wait_event(Duration::from_secs(10), |event| {
+            event["event"] == "session"
+                && event["data"]["name"] == "extra"
+                && event["data"]["attached"] == false
+        })
+        .await;
+    let detached = rig.ctl.request("status", json!({})).await;
+    assert_eq!(
+        detached["result"]["sessions"].as_array().map(Vec::len),
+        Some(1),
+        "an unavailable tmux server does not retire the runtime slot: {detached}"
+    );
+    assert_eq!(detached["result"]["sessions"][0]["name"], json!("extra"));
+    assert_eq!(detached["result"]["sessions"][0]["attached"], json!(false));
+    assert_eq!(
+        detached["result"]["sessions"][0]["identity"], before_identity,
+        "uncertainty keeps the runtime slot's last observed identity"
+    );
+
+    rig.tmux.run_ok(&[
+        "new-session",
+        "-d",
+        "-s",
+        "extra",
+        "-x",
+        "160",
+        "-y",
+        "40",
+        "cat",
+    ]);
+    let still_detached = rig.ctl.request("status", json!({})).await;
+    assert_eq!(
+        still_detached["result"]["sessions"][0]["attached"],
+        json!(false),
+        "recreating tmux alone is not an availability edge"
+    );
+
+    let availability = rig
+        .ctl
+        .request("session.watch", json!({"session": "extra"}))
+        .await;
+    assert_eq!(
+        availability["result"]["added"],
+        json!(false),
+        "{availability}"
+    );
+    assert_eq!(
+        availability["result"]["watching"],
+        json!(true),
+        "{availability}"
+    );
+    rig.wait_attached_session(0, 1).await;
 
     rig.shutdown().await;
 }

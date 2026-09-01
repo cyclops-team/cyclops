@@ -41,32 +41,35 @@ mod client;
 mod consumer;
 mod copy;
 mod daemon;
+mod data;
+mod data_forget;
 mod hash;
 mod health;
 mod hook;
 mod hookset;
+mod managed_assets;
 mod manifests;
 mod render;
 mod setup;
 mod sizing;
 mod skillseed;
 mod soundseed;
+mod state_remove;
 mod style;
 mod theme;
 mod themeseed;
 mod update;
 mod workspace;
 
-use std::io::Write;
-use std::io::{BufRead, IsTerminal};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 
-use client::{Client, ClientError};
+use client::{Certainty, Client, ClientError};
 use cyclops_proto::{
-    delivery_needs_human, DeliveryReceipt, DeliveryState, Event, HistoryParams, HistoryResult,
+    delivery_needs_human, DeliveryReceipt, DeliveryState, HistoryParams, HistoryResult,
     MessageNotificationState, MsgSendParams, MsgSendResult, PaneReadParams, PaneReadResult,
     PaneReadSource, PaneStatus, StatusResult, SubscribeParams, ThreadResult, WaitUntil,
     PROTOCOL_VERSION,
@@ -90,24 +93,31 @@ const WAIT_TIMEOUT_DEFAULT: &str = "60s";
 /// budget, so the transport never times out before the daemon answers.
 const WAIT_READ_SLACK: Duration = Duration::from_secs(10);
 
-/// Exact source build stamped by this crate's existing build script.
-const BUILD_REF: &str = env!("CYCLOPS_BUILD_REF");
+/// Exact source build stamped once for the whole workspace.
+const BUILD_REF: &str = cyclops_proto::BUILD_REF;
 
 /// Version plus the commit that built it (build.rs), so "which build am
 /// I on" is one command instead of an afternoon.
-const VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    " (",
-    env!("CYCLOPS_BUILD_REF"),
-    ")"
-);
+const VERSION: &str = cyclops_proto::VERSION_WITH_BUILD;
 
 #[derive(Parser)]
 #[command(
     name = "cyclops",
     version = VERSION,
     about = "One eye on every agent",
-    after_help = "With no command, opens the full-screen workspace (and starts the daemon if needed)."
+    subcommand_help_heading = "Everyday commands"
+)]
+#[cfg_attr(
+    feature = "full-ui",
+    command(
+        after_help = "Run cyclops with no command to open the full-screen workspace (and start the daemon if needed).\nRun cyclops commands to see workspace, operations, and diagnostic commands."
+    )
+)]
+#[cfg_attr(
+    not(feature = "full-ui"),
+    command(
+        after_help = "This build includes command-line and JSON operation. The full-screen workspace is not included.\nInteractive watch is not included in this build.\nRun cyclops commands to see workspace, operations, and diagnostic commands."
+    )
 )]
 struct Cli {
     /// Request structured JSON where the command supports it. `watch` emits
@@ -125,16 +135,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Open the default workspace: restore it, or build it from a preset.
+    /// Build or adopt the default tmux session from a preset or saved layout.
     /// Safe to run twice; a session that is already there is left alone.
+    #[command(hide = true)]
     Start(StartArgs),
-    /// Inspect manifests, hook wiring, and agent skill installation.
-    /// Reads setup state without changing it.
+    /// Inspect setup state or preview safe seeded-file decisions without changing it.
+    #[command(hide = true)]
     Setup {
         #[command(subcommand)]
         cmd: SetupCmd,
     },
-    /// Save and restore the shape of a session: panes, sizes, names.
+    /// Save or restore a saved layout: panes, sizes, and names.
+    #[command(hide = true)]
     Workspace {
         #[command(subcommand)]
         cmd: WorkspaceCmd,
@@ -144,15 +156,36 @@ enum Cmd {
     /// A workspace sizes the windows it owns and restores them when it
     /// quits. Use this when one was killed hard and no workspace is coming
     /// back to tidy up, or when you are finished with Cyclops on a session.
+    #[command(hide = true)]
     Sizing {
         #[command(subcommand)]
         cmd: SizingCmd,
     },
-    /// What cyclops is watching and the state of every agent.
+    /// See who Cyclops is watching, what each agent is doing, and what needs you.
+    #[command(display_order = 4)]
     Status,
-    /// Inspect the installation, daemon, setup, and state without changing them.
+    /// Check installation and runtime problems without changing anything.
+    #[command(display_order = 5)]
     Health,
+    /// Inventory retained durable records first, or export them without changing source files.
+    #[command(hide = true)]
+    Data {
+        #[command(subcommand)]
+        cmd: DataCmd,
+    },
+    /// Preview removal of the complete current Cyclops state home, then require its exact confirmation.
+    #[command(hide = true)]
+    Remove {
+        /// Confirm that the complete state home shown by the current preview may be removed.
+        #[arg(long, required = true)]
+        all: bool,
+        /// Exact token emitted by a matching preview while the daemon stayed
+        /// stopped. Without this, Cyclops only previews.
+        #[arg(long, value_name = "TOKEN")]
+        confirm: Option<String>,
+    },
     /// Inventory or remove bounded rebuildable assets. Dry-run is the default.
+    #[command(hide = true)]
     Cleanup {
         /// List one or both asset classes.
         #[arg(value_enum, required = true)]
@@ -162,13 +195,17 @@ enum Cmd {
         apply: bool,
     },
     /// Name a pane so cyclops can address it. `--clear` gives it back.
+    #[command(hide = true)]
     Name(NameArgs),
     /// Every named agent: what it is called, how it is doing, what it is on.
     /// Inside tmux it scopes to your session; `--all` is every session.
+    #[command(hide = true)]
     List(ListArgs),
     /// Round-trip check against the daemon.
+    #[command(hide = true)]
     Ping,
     /// Read a pane: visible screen, recent output, or the detection view.
+    #[command(hide = true)]
     Read {
         /// Agent label or pane id, e.g. reviewer or %4.
         target: String,
@@ -183,8 +220,15 @@ enum Cmd {
         #[arg(long)]
         raw: bool,
     },
-    /// Live stream of daemon events and the admin TUI. `--json` prints one
-    /// event per line; without it, opens the stream TUI (formerly `ui`).
+    #[cfg_attr(
+        feature = "full-ui",
+        doc = " Live stream of daemon events and the admin TUI. `--json` prints one event per line; without it, opens the stream TUI (formerly `ui`)."
+    )]
+    #[cfg_attr(
+        not(feature = "full-ui"),
+        doc = " Live stream of daemon events as NDJSON with `--json`. Interactive watch is not included in this build."
+    )]
+    #[command(hide = true)]
     Watch {
         /// Only these event kinds (prefix match), comma separated. JSON mode
         /// only; ignored when opening the TUI.
@@ -194,30 +238,41 @@ enum Cmd {
         ui: UiArgs,
     },
     /// Store a durable message in one or more recipient inboxes.
+    #[command(display_order = 1)]
     Send(SendArgs),
-    /// List or claim messages in the authenticated caller's inbox.
+    /// Check, wait for, or claim messages in your inbox.
+    #[command(display_order = 2)]
     Inbox(InboxArgs),
     /// Body-free inbox, outbound, and delivery state in one workspace snapshot.
+    #[command(hide = true)]
     Messages(MessagesArgs),
     /// Reply to a visible message using its sender and thread.
+    #[command(display_order = 3)]
     Reply(ReplyArgs),
     /// Requeue a message by identifier.
+    #[command(hide = true)]
     Requeue(RequeueArgs),
     /// Manage exact notification attempts.
+    #[command(hide = true)]
     Notification(NotificationArgs),
     /// Preview or clear delivery alarms.
+    #[command(hide = true)]
     Alarm(AlarmArgs),
     /// Inspect or resolve an exact staged notification attempt.
+    #[command(hide = true)]
     Attention(AttentionArgs),
     /// Messages from the record, newest last. Filter by agent or direction.
+    #[command(hide = true)]
     History(HistoryArgs),
     /// One message with its replies and delivery record, oldest first.
+    #[command(hide = true)]
     Thread {
         /// Message id, e.g. m-3f9c2a.
         id: String,
     },
     /// Wait for an agent to reach a state. Exit 0 when reached, 2 on
     /// timeout, 3 when the pane died or changed occupant mid-wait.
+    #[command(hide = true)]
     Wait {
         /// Agent label or pane id, e.g. reviewer or %4.
         target: String,
@@ -231,9 +286,18 @@ enum Cmd {
         #[arg(long, default_value = WAIT_TIMEOUT_DEFAULT)]
         timeout: String,
     },
-    /// Deprecated alias for `cyclops watch`. Use `cyclops watch` instead.
+    #[cfg_attr(
+        feature = "full-ui",
+        doc = " Deprecated alias for `cyclops watch`. Use `cyclops watch` instead."
+    )]
+    #[cfg_attr(
+        not(feature = "full-ui"),
+        doc = " Deprecated interactive alias. This build supports `cyclops watch --json` instead."
+    )]
+    #[command(hide = true)]
     Ui(UiArgs),
     /// Relay a vendor hook event to cyclops. Silent, always exits 0.
+    #[command(hide = true)]
     Hook {
         /// Event name, e.g. Stop. An argument because agy payloads carry
         /// no event-name field; the payload arrives on stdin.
@@ -244,21 +308,24 @@ enum Cmd {
         agent: Option<String>,
     },
     /// Prepare vendor hook configs and prove they fire.
+    #[command(hide = true)]
     Hooks {
         #[command(subcommand)]
         cmd: HooksCmd,
     },
     /// Switch themes, or list them with a preview of each.
+    #[command(hide = true)]
     Theme {
         /// Theme to switch to, e.g. light. Omit to list what is there.
         name: Option<String>,
     },
     /// Update Cyclops itself: fetch the source, rebuild, and replace the
-    /// installed binaries. Durable records and operator-edited setup files
-    /// are preserved. Untouched shipped themes, manifests, skills, and
-    /// Cyclops hook entries may be upgraded. Set CYCLOPS_NO_VENDOR_HOOKS=1
-    /// to skip vendor hook and skill wiring. A running daemon is safely
-    /// restarted; a stopped daemon stays stopped. An open workspace is untouched.
+    /// installed binaries. Durable records and existing manifests and skills
+    /// are preserved. Known unedited shipped themes and verified Cyclops-owned
+    /// hook entries may be refreshed. Set CYCLOPS_NO_VENDOR_HOOKS=1 to skip
+    /// vendor hook and skill wiring. A running daemon is safely restarted; a
+    /// stopped daemon stays stopped. An open workspace is untouched.
+    #[command(hide = true)]
     Update {
         /// Reactivate a replay-proven retained pair. State is not rolled back.
         #[arg(long)]
@@ -276,10 +343,14 @@ enum Cmd {
     },
     /// The daemon: stop it, ask after it, read its log. `cyclops start`
     /// starts one for you, so there is no `daemon start`.
+    #[command(hide = true)]
     Daemon {
         #[command(subcommand)]
         cmd: DaemonCmd,
     },
+    /// Show workspace, operations, and diagnostic commands.
+    #[command(display_order = 6)]
+    Commands,
 }
 
 #[derive(Subcommand)]
@@ -288,9 +359,31 @@ enum SizingCmd {
     /// clear the ownership mark. Safe to run twice, and a window cyclops
     /// never sized is left exactly as it is.
     Release {
-        /// Session to release. Defaults to the one this shell is in.
+        /// Session to release. Defaults to this shell's session only on the default tmux server.
         #[arg(long)]
         session: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DataCmd {
+    /// List workspace and session journal files and their retained size.
+    Inventory,
+    /// Copy raw durable journals into one new private directory.
+    Export {
+        /// A new directory to create for this export. Cyclops refuses an existing path.
+        #[arg(long, value_name = "DIR")]
+        to: std::path::PathBuf,
+    },
+    /// Preview removal of every retained journal, then require its exact confirmation token.
+    Forget {
+        /// Confirm that the whole current durable-record inventory may be removed.
+        #[arg(long, required = true)]
+        all: bool,
+        /// Exact token emitted by a matching preview while the daemon stayed
+        /// stopped. Without this, Cyclops only previews.
+        #[arg(long, value_name = "TOKEN")]
+        confirm: Option<String>,
     },
 }
 
@@ -316,6 +409,8 @@ enum DaemonCmd {
 enum SetupCmd {
     /// Report setup and whether messaging uses a doorbell or direct fallback.
     Check,
+    /// Preview manifests and final skill leaves below accepted private parents without writing files.
+    Plan,
 }
 
 #[derive(clap::Args)]
@@ -803,12 +898,20 @@ fn style_for(cli: &Cli) -> Style {
 fn run(cli: &Cli) -> i32 {
     match &cli.cmd {
         None => {
-            if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
-                seed_home_for_workspace();
-                ensure_daemon_for_workspace();
-                cyclops_workspace::run()
-            } else {
-                cyclops_workspace::print_help_and_exit()
+            #[cfg(feature = "full-ui")]
+            {
+                if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+                    seed_home_for_workspace();
+                    ensure_daemon_for_workspace();
+                    cyclops_workspace::run()
+                } else {
+                    cyclops_workspace::print_help_and_exit()
+                }
+            }
+            #[cfg(not(feature = "full-ui"))]
+            {
+                eprintln!("{}", copy::WORKSPACE_NOT_INCLUDED);
+                EXIT_USAGE
             }
         }
         Some(cmd) => run_cmd(cli, cmd),
@@ -822,12 +925,14 @@ fn run(cli: &Cli) -> i32 {
 /// never there. Without manifests, every pane reads unknown and nothing can
 /// be delivered, which is indistinguishable from a broken install to a
 /// first-time visitor who ran bare `cyclops` after a binary-only copy.
-/// Operator-edited files stay unchanged. Known unedited shipped files may
-/// advance, and a current home costs no writes on open.
+/// Existing manifests stay unchanged, including known old shipped seeds;
+/// setup reports those as outdated for manual review. A current manifest home
+/// costs no writes on open. Themes and sounds retain their own update policy.
 ///
 /// A problem is a note, not an exit: a home without themes still renders in
 /// built-in colors, and a home without manifests still opens (the sidebar
 /// shows unknown) rather than refusing the front door.
+#[cfg(feature = "full-ui")]
 fn seed_home_for_workspace() {
     let home = cyclops_proto::cyclops_home();
     for why in themeseed::seed(&home).problems {
@@ -843,9 +948,10 @@ fn seed_home_for_workspace() {
         eprintln!("{}", manifests::partly_installed(&seeded));
     }
     // The vendor homes too, when the installer's consent is on file: an
-    // agent CLI installed after cyclops gets its skill and hook config on
-    // this boot instead of never. Quiet unless something was written, so
-    // the front door stays silent on every ordinary open.
+    // agent CLI installed after Cyclops gets its hook config and, when it
+    // already owns a private skill parent, its final skill file on this boot.
+    // Quiet unless something was written, so the front door stays silent on
+    // every ordinary open.
     for note in workspace::finish_deferred_wiring(&home) {
         eprintln!("{note}");
     }
@@ -859,15 +965,18 @@ fn seed_home_for_workspace() {
 ///
 /// Unlike `start`, this runs before the session exists, because the
 /// workspace creates or attaches its own session after this returns. The
-/// cost is the daemon's attach retry rather than an immediate attach; it
-/// converges within seconds, and the workspace asks it to watch whatever
-/// session it lands on (`session.watch`) regardless of what was configured.
+/// workspace then sends `session.watch` after creation or adoption only when
+/// the daemon reports `NotYet`; it leaves `Elsewhere` alone so it does not
+/// turn the existing configuration hint into a runtime watch. That explicit
+/// availability edge lets the daemon attach without treating a confirmed
+/// missing session as a retry loop, regardless of what was configured at boot.
 ///
 /// A failure is a note, not an exit. The workspace is still usable without
 /// a daemon, and its sidebar says `cyclopsd offline` for as long as none
 /// answers, so the state is never silently wrong. Boot failures write their
 /// own reason to the daemon log; this only has to carry the ones that never
 /// got as far as a running daemon.
+#[cfg(feature = "full-ui")]
 fn ensure_daemon_for_workspace() {
     let home = cyclops_proto::cyclops_home();
     if let Err(why) = daemon::ensure_running(&home) {
@@ -875,8 +984,23 @@ fn ensure_daemon_for_workspace() {
     }
 }
 
+fn command_catalog() -> String {
+    let commands = Cmd::augment_subcommands(clap::Command::new("cyclops"));
+    copy::command_catalog(|name| {
+        commands
+            .find_subcommand(name)
+            .and_then(clap::Command::get_about)
+            .unwrap_or_else(|| panic!("command catalog names an undocumented command: {name}"))
+            .to_string()
+    })
+}
+
 fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
     match cmd {
+        Cmd::Commands => {
+            println!("{}", command_catalog());
+            0
+        }
         // Hook never prints and owns its transport handling: a hook that
         // fails loudly breaks the vendor CLI that invoked it. No Style is
         // built on this path, so a broken theme file cannot put a warning
@@ -897,28 +1021,48 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
         Cmd::Setup {
             cmd: SetupCmd::Check,
         } => setup::run_check(cli.json, &style_for(cli)),
+        Cmd::Setup {
+            cmd: SetupCmd::Plan,
+        } => setup::run_plan(cli.json, &style_for(cli)),
         // Health must not load a theme through an unchecked state path.
         Cmd::Sizing {
             cmd: SizingCmd::Release { session },
-        } => match session
-            .clone()
-            .or_else(|| cyclops_tmux::current_session(None))
-        {
-            Some(session) => sizing::run_release(
-                &cyclops_proto::cyclops_home(),
-                &session,
-                cli.json,
-                &style_for(cli),
-            ),
-            None => {
-                eprintln!(
-                    "{}",
-                    style_for(cli).bold("not inside tmux: name the session with --session <name>")
-                );
-                2
-            }
-        },
+        } => {
+            let home = cyclops_proto::cyclops_home();
+            let settings = match workspace::Settings::read(&home) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    if cli.json {
+                        println!(
+                            "{}",
+                            json!({"ok": false, "session": session.as_deref(), "error": error})
+                        );
+                    } else {
+                        eprintln!("{}", style_for(cli).bold(&error));
+                    }
+                    return 1;
+                }
+            };
+            let session = match sizing::resolve_session(session.clone(), &settings.server) {
+                Ok(session) => session,
+                Err(error) => {
+                    eprintln!("{}", style_for(cli).bold(&error));
+                    return EXIT_USAGE;
+                }
+            };
+            sizing::run_release(&settings.server, &session, cli.json, &style_for(cli))
+        }
         Cmd::Health => health::run(cli.json),
+        Cmd::Data {
+            cmd: DataCmd::Inventory,
+        } => data::run_inventory(cli.json),
+        Cmd::Data {
+            cmd: DataCmd::Export { to },
+        } => data::run_export(cli.json, to),
+        Cmd::Data {
+            cmd: DataCmd::Forget { all: _, confirm },
+        } => data_forget::run(cli.json, confirm.as_deref()),
+        Cmd::Remove { all: _, confirm } => state_remove::run(cli.json, confirm.as_deref()),
         // Cleanup has no arbitrary path input and does not need the daemon.
         Cmd::Cleanup { assets, apply } => cleanup::run(cli.json, assets, *apply),
         Cmd::Start(args) => workspace::run_start(
@@ -1017,7 +1161,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 Ok(client) => client,
                 Err(error) => return inbox_next_client_failed(cli, &error),
             };
-            report_hello_mismatch(client.hello());
+            report_hello_mismatch(&client);
             cmd_inbox_next(&mut client, cli, timeout, from.as_deref())
         }
         // Install renders and instructs without a daemon; verify and
@@ -1106,11 +1250,14 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 | Cmd::Start(_)
                 | Cmd::Setup { .. }
                 | Cmd::Health
+                | Cmd::Data { .. }
+                | Cmd::Remove { .. }
                 | Cmd::Cleanup { .. }
                 | Cmd::Theme { .. }
                 | Cmd::Update { .. }
                 | Cmd::Workspace { .. }
-                | Cmd::Sizing { .. } => {
+                | Cmd::Sizing { .. }
+                | Cmd::Commands => {
                     unreachable!("handled above")
                 }
             }
@@ -1139,13 +1286,23 @@ fn cmd_watch(cli: &Cli, style: &Style, kinds: &[String], ui: &UiArgs) -> i32 {
         };
         return cmd_watch_json(&mut c, cli, style, kinds);
     }
-    let filters = match preflight_watch_filters(ui) {
-        Ok(filters) => filters,
-        Err(code) => return code,
-    };
-    run_stream_ui(cli, ui, filters)
+    #[cfg(feature = "full-ui")]
+    {
+        let filters = match preflight_watch_filters(ui) {
+            Ok(filters) => filters,
+            Err(code) => return code,
+        };
+        run_stream_ui(cli, ui, filters)
+    }
+    #[cfg(not(feature = "full-ui"))]
+    {
+        let _ = ui;
+        eprintln!("{}", copy::WATCH_NOT_INCLUDED);
+        EXIT_USAGE
+    }
 }
 
+#[cfg(feature = "full-ui")]
 fn preflight_watch_filters(ui: &UiArgs) -> Result<cyclops_ui::Filter, i32> {
     if ui.with.is_none() && ui.from.is_none() && ui.to.is_none() {
         return Ok(cyclops_ui::Filter::default());
@@ -1156,6 +1313,7 @@ fn preflight_watch_filters(ui: &UiArgs) -> Result<cyclops_ui::Filter, i32> {
 
 /// Resolve display conveniences once to immutable endpoint identities.
 /// A later rename changes only presentation and cannot strand the watch.
+#[cfg(feature = "full-ui")]
 fn resolve_watch_filters(c: &mut Client, ui: &UiArgs) -> Result<cyclops_ui::Filter, i32> {
     let value = c
         .request(
@@ -1207,6 +1365,7 @@ fn resolve_watch_filters(c: &mut Client, ui: &UiArgs) -> Result<cyclops_ui::Filt
 }
 
 /// cyclops ui: deprecated alias for `cyclops watch`.
+#[cfg(feature = "full-ui")]
 fn cmd_ui(cli: &Cli, args: &UiArgs) -> i32 {
     if cli.json {
         eprintln!("{}", copy::UI_NO_JSON);
@@ -1220,7 +1379,23 @@ fn cmd_ui(cli: &Cli, args: &UiArgs) -> i32 {
     run_stream_ui(cli, args, filters)
 }
 
+#[cfg(not(feature = "full-ui"))]
+fn cmd_ui(_cli: &Cli, _args: &UiArgs) -> i32 {
+    eprintln!("{}", copy::WATCH_NOT_INCLUDED);
+    EXIT_USAGE
+}
+
+#[cfg(feature = "full-ui")]
 fn run_stream_ui(cli: &Cli, args: &UiArgs, filters: cyclops_ui::Filter) -> i32 {
+    let home = cyclops_proto::cyclops_home();
+    let focus = match workspace::focus_adapter(&home) {
+        Ok(focus) => focus,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
+
     cyclops_ui::run(cyclops_ui::UiOptions {
         plain: cli.plain,
         firehose: args.firehose,
@@ -1228,6 +1403,7 @@ fn run_stream_ui(cli: &Cli, args: &UiArgs, filters: cyclops_ui::Filter) -> i32 {
         from: filters.from,
         to: filters.to,
         backfill: args.backfill,
+        focus: Some(focus),
     })
 }
 
@@ -1236,11 +1412,12 @@ fn run_stream_ui(cli: &Cli, args: &UiArgs, filters: cyclops_ui::Filter) -> i32 {
 /// Both mismatches warn and continue. The protocol is tolerant by design,
 /// while the build identifier detects an old or shadowed daemon without
 /// pretending that it cannot answer requests.
-fn report_hello_mismatch(hello: &cyclops_proto::Hello) {
+fn report_hello_mismatch(client: &Client) {
+    let hello = client.hello();
     if hello.proto != PROTOCOL_VERSION {
         eprintln!("{}", copy::proto_mismatch(hello.proto, PROTOCOL_VERSION));
     }
-    if let Some(note) = copy::build_mismatch(hello.build.as_deref(), BUILD_REF) {
+    if let Some(note) = copy::hello_compatibility_notice(&client.hello_compatibility()) {
         eprintln!("{note}");
     }
 }
@@ -1249,7 +1426,7 @@ fn report_hello_mismatch(hello: &cyclops_proto::Hello) {
 fn connect() -> Result<Client, i32> {
     match Client::connect() {
         Ok(c) => {
-            report_hello_mismatch(c.hello());
+            report_hello_mismatch(&c);
             Ok(c)
         }
         Err(e) => {
@@ -1354,7 +1531,7 @@ fn cmd_daemon(cli: &Cli, style: &Style, cmd: &DaemonCmd) -> i32 {
                     return 0;
                 }
             };
-            report_hello_mismatch(client.hello());
+            report_hello_mismatch(&client);
             let status: StatusResult = match ask(
                 &mut client,
                 "status",
@@ -1844,6 +2021,10 @@ fn cmd_inbox(c: &mut Client, cli: &Cli, style: &Style, args: &InboxArgs) -> i32 
                 Ok(None) => return 0,
                 Err(code) => return code,
             };
+            if result.entries.is_empty() && *limit != Some(0) {
+                println!("{}", copy::EMPTY_INBOX);
+                return 0;
+            }
             for entry in result.entries {
                 let subject = entry.subject.as_deref().unwrap_or("(no subject)");
                 println!(
@@ -1931,7 +2112,7 @@ fn cmd_inbox_next(c: &mut Client, cli: &Cli, timeout: &str, from: Option<&str>) 
         cursor: None,
     })
     .expect("events.subscribe params serialize");
-    if let Err(error) = c.request("events.subscribe", subscribe) {
+    if let Err(error) = c.subscribe(subscribe) {
         return match error {
             ClientError::ReadTimeout(_) => inbox_next_timed_out(cli, budget),
             error => inbox_next_client_failed(cli, &error),
@@ -1972,7 +2153,7 @@ fn cmd_inbox_next(c: &mut Client, cli: &Cli, timeout: &str, from: Option<&str>) 
             .expect("inbox.claim params serialize");
             let raw = match c.request("inbox.claim", params) {
                 Ok(value) => value,
-                Err(ClientError::ReadTimeout(_)) => {
+                Err(error) if error.certainty() == Certainty::OutcomeUnknown => {
                     return inbox_claim_outcome_unknown(cli, &message_id);
                 }
                 Err(ClientError::Server { code, .. }) if code == "message_not_pending" => {
@@ -2009,12 +2190,9 @@ fn cmd_inbox_next(c: &mut Client, cli: &Cli, timeout: &str, from: Option<&str>) 
         if let Err(code) = inbox_next_set_remaining(c, cli, budget, deadline) {
             return code;
         }
-        match c.next_line() {
-            Ok(line) => {
-                let Ok(event) = serde_json::from_str::<Event>(&line) else {
-                    continue;
-                };
-                if event.event != "messages.changed" {
+        match c.next_event() {
+            Ok(frame) => {
+                if frame.event.event != "messages.changed" {
                     continue;
                 }
             }
@@ -2097,10 +2275,20 @@ fn inbox_next_client_failed(cli: &Cli, error: &ClientError) -> i32 {
             1,
         );
     }
-    let (code, message, data) = match error {
-        ClientError::NotRunning => ("not_running", copy::client_error(error, None), Value::Null),
+    let (code, message, data) = inbox_next_client_error(error);
+    inbox_next_failed(cli, code, message, data, 1)
+}
+
+fn inbox_next_client_error(error: &ClientError) -> (&str, String, Value) {
+    match error {
+        ClientError::NotRunning(_) => ("not_running", copy::client_error(error, None), Value::Null),
         ClientError::ConnectTimeout(waited) => (
             "connect_timeout",
+            copy::client_error(error, None),
+            json!({"waited_ms": waited.as_millis() as u64}),
+        ),
+        ClientError::HelloTimeout(waited) => (
+            "read_timeout",
             copy::client_error(error, None),
             json!({"waited_ms": waited.as_millis() as u64}),
         ),
@@ -2109,19 +2297,38 @@ fn inbox_next_client_failed(cli: &Cli, error: &ClientError) -> i32 {
             copy::client_error(error, None),
             json!({"waited_ms": waited.as_millis() as u64}),
         ),
+        ClientError::RequestFrameTooLarge => (
+            cyclops_proto::FrameContract::TOO_LARGE_CODE,
+            copy::client_error(error, None),
+            json!({"known_not_sent": true}),
+        ),
+        ClientError::DaemonFrameTooLarge => (
+            cyclops_proto::FrameContract::TOO_LARGE_CODE,
+            copy::client_error(error, None),
+            json!({"known_not_sent": false}),
+        ),
+        ClientError::OversizedResponse(message) => (
+            cyclops_proto::FrameContract::TOO_LARGE_CODE,
+            message.clone(),
+            Value::Null,
+        ),
+        ClientError::InvalidHello(_) => (
+            "connection_lost",
+            copy::client_error(error, None),
+            Value::Null,
+        ),
         ClientError::Server {
             code,
             message,
             data,
             ..
         } => (code.as_str(), message.clone(), data.clone()),
-        ClientError::Broken(_) => (
+        ClientError::NotSent(_) | ClientError::Unknown(_) | ClientError::Gap(_) => (
             "connection_lost",
             copy::client_error(error, None),
             Value::Null,
         ),
-    };
-    inbox_next_failed(cli, code, message, data, 1)
+    }
 }
 
 enum InboxListOneError {
@@ -3208,12 +3415,26 @@ fn cmd_thread(c: &mut Client, cli: &Cli, style: &Style, id: &str) -> i32 {
 /// the ledger records what was sent, not a cleaned-up version.
 fn read_body_file(path: &str) -> Result<String, String> {
     if path == "-" {
-        let mut s = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut s).map_err(|e| e.to_string())?;
-        Ok(s)
+        read_bounded_body(std::io::stdin())
     } else {
-        std::fs::read_to_string(path).map_err(|e| e.to_string())
+        let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+        read_bounded_body(file)
     }
+}
+
+fn read_bounded_body(reader: impl std::io::Read) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    reader
+        .take((cyclops_proto::FrameContract::MAX_JSON_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > cyclops_proto::FrameContract::MAX_JSON_BYTES {
+        return Err(format!(
+            "{}; nothing was sent",
+            copy::frame_too_large("message body")
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| "message body is not UTF-8".to_string())
 }
 
 struct MessageAcceptance {
@@ -3287,7 +3508,7 @@ fn cmd_watch_json(c: &mut Client, cli: &Cli, style: &Style, kinds: &[String]) ->
         cursor: None,
     })
     .expect("events.subscribe params serialize");
-    if let Err(e) = c.request("events.subscribe", params) {
+    if let Err(e) = c.subscribe(params) {
         eprintln!("{}", copy::client_error(&e, None));
         return 1;
     }
@@ -3298,26 +3519,20 @@ fn cmd_watch_json(c: &mut Client, cli: &Cli, style: &Style, kinds: &[String]) ->
     // partial line behind.
     let mut stdout = std::io::stdout();
     loop {
-        let line = match c.next_line() {
-            Ok(l) => l,
+        let frame = match c.next_event() {
+            Ok(frame) => frame,
             Err(e) => {
                 eprintln!("{}", copy::client_error(&e, None));
                 return 1;
             }
         };
-        let Ok(v) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if v.get("event").is_none() {
-            continue;
-        }
         if cli.json {
-            let _ = writeln!(stdout, "{line}");
-        } else if let Ok(ev) = serde_json::from_value::<Event>(v) {
+            let _ = writeln!(stdout, "{}", frame.raw_text());
+        } else {
             let _ = writeln!(
                 stdout,
                 "{}",
-                render::render_event_line(&ev, style, render::now_ms())
+                render::render_event_line(&frame.event, style, render::now_ms())
             );
         }
         let _ = stdout.flush();
@@ -3327,6 +3542,232 @@ fn cmd_watch_json(c: &mut Client, cli: &Cli, style: &Style, kinds: &[String]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "full-ui")]
+    fn tmux_text(server: &cyclops_testrig::TmuxServer, args: &[&str]) -> String {
+        let output = server.run(args);
+        assert!(
+            output.status.success(),
+            "tmux {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[cfg(feature = "full-ui")]
+    fn two_window_server(server: &cyclops_testrig::TmuxServer, session: &str) -> (String, String) {
+        server.run_ok(&["new-session", "-d", "-s", session, "/bin/sh"]);
+        server.run_ok(&["new-window", "-d", "-t", session, "/bin/sh"]);
+        let panes: Vec<String> = tmux_text(server, &["list-panes", "-a", "-F", "#{pane_id}"])
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(panes.len(), 2, "expected two panes on isolated server");
+        (panes[0].clone(), panes[1].clone())
+    }
+
+    #[cfg(feature = "full-ui")]
+    fn active_pane(server: &cyclops_testrig::TmuxServer, session: &str) -> String {
+        tmux_text(
+            server,
+            &["display-message", "-p", "-t", session, "#{pane_id}"],
+        )
+    }
+
+    #[cfg(feature = "full-ui")]
+    fn focus_child(home: &std::path::Path, target: &str) -> std::process::Command {
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("test executable"));
+        child
+            .args([
+                "--ignored",
+                "--exact",
+                "tests::stream_focus_adapter_child",
+                "--nocapture",
+            ])
+            .env("CYCLOPS_STREAM_FOCUS_CHILD_HOME", home)
+            .env("CYCLOPS_STREAM_FOCUS_CHILD_TARGET", target);
+        child
+    }
+
+    #[test]
+    #[cfg(feature = "full-ui")]
+    #[ignore = "invoked by the parent focus test with isolated tmux context"]
+    fn stream_focus_adapter_child() {
+        let Some(home) = std::env::var_os("CYCLOPS_STREAM_FOCUS_CHILD_HOME") else {
+            return;
+        };
+        let target = std::env::var("CYCLOPS_STREAM_FOCUS_CHILD_TARGET")
+            .expect("parent supplied focus target");
+        workspace::focus_adapter(std::path::Path::new(&home))
+            .expect("valid coordinator config")
+            .focus(&target)
+            .expect("focus through configured launcher adapter");
+    }
+
+    #[test]
+    #[cfg(feature = "full-ui")]
+    fn stream_focus_refuses_bad_coordinator_config_before_constructing_a_tmux_adapter() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-focus-malformed-config");
+        let _ = std::fs::remove_dir_all(&home);
+        cyclops_state::StateRoot::open_or_create(&home)
+            .expect("create safe home")
+            .replace_file(std::path::Path::new("config.toml"), b"tmux_socket = [")
+            .expect("write malformed config");
+
+        assert!(workspace::focus_adapter(&home).is_err());
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    #[cfg(feature = "full-ui")]
+    fn stream_focus_uses_the_configured_server_and_leaves_the_ambient_server_alone() {
+        if !cyclops_testrig::tmux_available() {
+            return;
+        }
+        // cyclops-ui separately proves that the selected displayed row emits
+        // its exact pane id. This test starts at the launcher boundary and
+        // proves where that semantic request is performed.
+        let configured = cyclops_testrig::TmuxServer::new("watch-focus-configured");
+        let ambient = cyclops_testrig::TmuxServer::new("watch-focus-ambient");
+        let (configured_first, configured_target) = two_window_server(&configured, "shown");
+        let (ambient_first, ambient_target) = two_window_server(&ambient, "ambient");
+        assert_eq!(
+            configured_target, ambient_target,
+            "the control server must carry the same pane id"
+        );
+        assert_eq!(active_pane(&configured, "shown"), configured_first);
+        assert_eq!(active_pane(&ambient, "ambient"), ambient_first);
+
+        let home = tempfile::Builder::new()
+            .prefix("cyclops-watch-focus-")
+            .tempdir_in(cyclops_proto::scratch::scratch_root())
+            .expect("create owned scratch home");
+        let config_file = home.path().join("tmux.conf");
+        std::fs::write(&config_file, "set -g @cyclops-focus-test loaded\n")
+            .expect("write isolated tmux config");
+        std::fs::write(
+            home.path().join("config.toml"),
+            format!(
+                "tmux_socket = {:?}\ntmux_config = {:?}\n",
+                configured.socket(),
+                config_file
+            ),
+        )
+        .expect("write launcher config");
+
+        let ambient_path = ambient.socket_path().expect("ambient server socket path");
+        let ambient_pid = tmux_text(&ambient, &["display-message", "-p", "#{pid}"]);
+        let output = focus_child(home.path(), &configured_target)
+            .env(
+                "TMUX",
+                format!("{},{ambient_pid},0", ambient_path.display()),
+            )
+            .output()
+            .expect("run isolated focus child");
+        assert!(
+            output.status.success(),
+            "focus child failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert_eq!(
+            (
+                active_pane(&configured, "shown"),
+                active_pane(&ambient, "ambient")
+            ),
+            (configured_target, ambient_first),
+            "focus must move only the configured server's target pane"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "full-ui")]
+    fn stream_focus_forwards_the_configured_socket_and_config_to_tmux() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::Builder::new()
+            .prefix("cyclops-watch-focus-command-")
+            .tempdir_in(cyclops_proto::scratch::scratch_root())
+            .expect("create owned scratch root");
+        let home = root.path().join("home");
+        let bin = root.path().join("bin");
+        std::fs::create_dir_all(&home).expect("create isolated home");
+        std::fs::create_dir(&bin).expect("create isolated executable directory");
+
+        let config_file = root.path().join("focus config.conf");
+        std::fs::write(&config_file, "set -g @cyclops-focus-test loaded\n")
+            .expect("write isolated tmux config");
+        std::fs::write(
+            home.join("config.toml"),
+            format!(
+                "tmux_socket = \"focus-configured\"\ntmux_config = {:?}\n",
+                config_file
+            ),
+        )
+        .expect("write launcher config");
+
+        let calls = root.path().join("tmux.calls");
+        let fake_tmux = bin.join("tmux");
+        std::fs::write(
+            &fake_tmux,
+            "#!/bin/sh\nprintf 'call' >> \"$CYCLOPS_FOCUS_ARGS\"\nfor arg in \"$@\"; do printf '\\t%s' \"$arg\" >> \"$CYCLOPS_FOCUS_ARGS\"; done\nprintf '\\n' >> \"$CYCLOPS_FOCUS_ARGS\"\n",
+        )
+        .expect("write tmux argument recorder");
+        std::fs::set_permissions(&fake_tmux, std::fs::Permissions::from_mode(0o700))
+            .expect("make tmux argument recorder executable");
+
+        let output = focus_child(&home, "%7")
+            .env("PATH", &bin)
+            .env("CYCLOPS_FOCUS_ARGS", &calls)
+            .output()
+            .expect("run focus command-boundary child");
+        assert!(
+            output.status.success(),
+            "focus child failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let config = config_file.display();
+        assert_eq!(
+            std::fs::read_to_string(&calls).expect("read recorded tmux arguments"),
+            format!(
+                "call\t-u\t-L\tfocus-configured\t-f\t{config}\tselect-window\t-t\t%7\n\
+                 call\t-u\t-L\tfocus-configured\t-f\t{config}\tselect-pane\t-t\t%7\n"
+            )
+        );
+    }
+
+    #[test]
+    fn inbox_next_oversized_response_keeps_the_existing_json_shape() {
+        // Obsolete when inbox-next's documented machine error schema gains a
+        // typed uncertainty field for oversized daemon responses.
+        let message = "daemon response was too large; request outcome is unknown";
+        let error = ClientError::OversizedResponse(message.into());
+        let (code, rendered, data) = inbox_next_client_error(&error);
+        assert_eq!(code, cyclops_proto::FrameContract::TOO_LARGE_CODE);
+        assert_eq!(rendered, message);
+        assert_eq!(data, Value::Null);
+    }
+
+    #[test]
+    fn body_inputs_are_bounded_before_request_serialization() {
+        let exact = vec![b'x'; cyclops_proto::FrameContract::MAX_JSON_BYTES];
+        assert_eq!(
+            read_bounded_body(std::io::Cursor::new(exact))
+                .expect("the body boundary is readable")
+                .len(),
+            cyclops_proto::FrameContract::MAX_JSON_BYTES
+        );
+
+        let oversized = vec![b'x'; cyclops_proto::FrameContract::MAX_JSON_BYTES + 1];
+        let error = read_bounded_body(std::io::Cursor::new(oversized))
+            .expect_err("an oversized body must stop before request serialization");
+        assert!(error.contains("nothing was sent"), "{error}");
+    }
 
     #[test]
     fn durations_parse_human_forms() {
@@ -3368,6 +3809,137 @@ mod tests {
     }
 
     #[test]
+    fn durable_record_commands_do_not_require_a_daemon_command_family() {
+        let inventory = Cli::try_parse_from(["cyclops", "data", "inventory"])
+            .expect("parse durable record inventory");
+        assert!(matches!(
+            inventory.cmd,
+            Some(Cmd::Data {
+                cmd: DataCmd::Inventory
+            })
+        ));
+
+        let export =
+            Cli::try_parse_from(["cyclops", "data", "export", "--to", "new-record-export"])
+                .expect("parse durable record export");
+        assert!(matches!(
+            export.cmd,
+            Some(Cmd::Data {
+                cmd: DataCmd::Export { to }
+            }) if to == std::path::Path::new("new-record-export")
+        ));
+
+        let forget = Cli::try_parse_from(["cyclops", "data", "forget", "--all"])
+            .expect("parse previewed durable record removal");
+        assert!(matches!(
+            forget.cmd,
+            Some(Cmd::Data {
+                cmd: DataCmd::Forget {
+                    all: true,
+                    confirm: None,
+                }
+            })
+        ));
+        assert!(Cli::try_parse_from(["cyclops", "data", "forget"]).is_err());
+    }
+
+    #[test]
+    fn top_level_help_leads_with_the_everyday_front_door() {
+        let error = match Cli::try_parse_from(["cyclops", "--help"]) {
+            Ok(_) => panic!("top-level help returned a command instead of help"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = error.to_string();
+
+        assert!(help.contains("Everyday commands:"), "{help}");
+        for command in ["send", "inbox", "reply", "status", "health", "commands"] {
+            assert!(
+                help.lines()
+                    .any(|line| line.trim_start().starts_with(command)),
+                "missing {command:?} in {help}"
+            );
+        }
+        for command in ["workspace", "notification", "daemon", "hook"] {
+            assert!(
+                !help
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(command)),
+                "advanced command {command:?} leaked into {help}"
+            );
+        }
+        assert!(help.contains("cyclops commands"), "{help}");
+    }
+
+    #[test]
+    fn advanced_command_spelling_keeps_its_own_help() {
+        let error = match Cli::try_parse_from(["cyclops", "help", "history"]) {
+            Ok(_) => panic!("subcommand help returned a command instead of help"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = error.to_string();
+        assert!(help.contains("Usage: cyclops history"), "{help}");
+        assert!(help.contains("Messages from the record"), "{help}");
+    }
+
+    #[test]
+    fn command_catalog_contains_every_supported_spelling() {
+        use std::collections::BTreeSet;
+
+        let command = Cmd::augment_subcommands(clap::Command::new("cyclops"));
+        let supported: BTreeSet<_> = command
+            .get_subcommands()
+            .map(|subcommand| subcommand.get_name())
+            .filter(|name| *name != "commands")
+            .collect();
+        let catalog = command_catalog();
+        let catalog_entries: Vec<_> = catalog
+            .lines()
+            .filter_map(|line| line.strip_prefix("  "))
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+        let catalog: BTreeSet<_> = catalog_entries.iter().copied().collect();
+        assert_eq!(
+            catalog_entries.len(),
+            catalog.len(),
+            "command catalog contains a duplicate spelling"
+        );
+        assert_eq!(catalog, supported);
+
+        let catalog = command_catalog();
+        assert!(
+            catalog.contains(
+                "send          Store a durable message in one or more recipient inboxes."
+            ),
+            "{catalog}"
+        );
+        assert!(
+            catalog
+                .contains("reply         Reply to a visible message using its sender and thread."),
+            "{catalog}"
+        );
+        assert!(
+            catalog.contains("start         Build or adopt the default tmux session"),
+            "{catalog}"
+        );
+        assert!(
+            catalog.contains("workspace     Save or restore a saved layout"),
+            "{catalog}"
+        );
+
+        let visible: BTreeSet<_> = command
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+            .map(|subcommand| subcommand.get_name())
+            .collect();
+        assert_eq!(
+            visible,
+            BTreeSet::from(["commands", "health", "inbox", "reply", "send", "status"])
+        );
+    }
+
+    #[test]
     fn cleanup_is_dry_run_by_default_and_names_only_closed_asset_classes() {
         let parsed = Cli::try_parse_from([
             "cyclops",
@@ -3385,7 +3957,7 @@ mod tests {
                 apply: false,
             }) if assets == [cleanup::AssetClass::BuildCache, cleanup::AssetClass::UpdateScratch]
         ));
-        assert!(Cli::try_parse_from(["cyclops", "cleanup", "/tmp"]).is_err());
+        assert!(Cli::try_parse_from(["cyclops", "cleanup", "/tmp"]).is_err()); // scratch-path-lint: rejected CLI input, not an owned path.
         assert!(Cli::try_parse_from(["cyclops", "cleanup"]).is_err());
     }
 

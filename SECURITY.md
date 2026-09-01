@@ -1,6 +1,6 @@
 # Security
 
-Cyclops is pre-release software (`v0.1.0`). It has not had a security
+Cyclops is pre-release software (`v0.1.0-beta`). It has not had a security
 audit. Treat it accordingly: don't run it against panes or agents you don't
 trust, and expect rough edges.
 

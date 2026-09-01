@@ -31,6 +31,7 @@
 //! and it sits in the crate every other crate already depends on.
 
 pub mod attention;
+pub mod build_identity;
 pub mod identity;
 pub mod label;
 pub mod ledger;
@@ -41,6 +42,7 @@ pub mod state;
 pub mod wire;
 
 pub use attention::*;
+pub use build_identity::*;
 pub use identity::*;
 pub use ledger::*;
 pub use mailbox::*;
@@ -53,6 +55,11 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Default socket path relative to the cyclops home directory.
 pub const SOCK_NAME: &str = "sock";
+
+/// State lease shared by cyclopsd and the explicit durable-record forget
+/// operation. It prevents a live journal writer and confirmed removal from
+/// running at the same time.
+pub const DURABLE_RECORD_FORGET_LEASE: &str = "operations/data-forget.lock";
 
 /// Environment variable overriding the cyclops home (default `~/.cyclops`).
 /// Tests point this at a scratch directory so nothing touches the real home.

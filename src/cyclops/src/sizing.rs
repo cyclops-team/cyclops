@@ -15,24 +15,42 @@
 //! state the operator never set. A refusal changes nothing at all and says
 //! exactly what to do by hand.
 
-use std::path::Path;
-
 use crate::style::Style;
-use cyclops_tmux::{ReleaseOutcome, Restored};
+use cyclops_tmux::{layout::Server, ReleaseOutcome, Restored};
 
 /// Exit code for a refusal: nothing was read, nothing was written, and the
 /// operator has something to decide.
 const EXIT_REFUSED: i32 = 3;
+
+/// Resolve the session an operator asked to release.
+///
+/// An explicit server cannot safely inherit the shell's session name: that
+/// shell may be attached to a different tmux server. The caller must name the
+/// recovery target in that case.
+pub(crate) fn resolve_session(
+    requested: Option<String>,
+    server: &Server,
+) -> Result<String, String> {
+    if let Some(session) = requested {
+        return Ok(session);
+    }
+    if server.socket.is_some() {
+        return Err(
+            "Cyclops is configured for a named tmux server; pass --session <name> so recovery does not use this shell's different server"
+                .to_string(),
+        );
+    }
+    cyclops_tmux::current_session(None)
+        .ok_or_else(|| "not inside tmux: name the session with --session <name>".to_string())
+}
 
 /// Undo Cyclops sizing on `session`, printing what it did per window.
 ///
 /// The server comes from the same `tmux_socket` the rest of the client
 /// reads, so recovery lands on the server the daemon watches rather than on
 /// whichever one tmux would pick by default.
-pub fn run_release(home: &Path, session: &str, json: bool, style: &Style) -> i32 {
-    let settings = crate::workspace::Settings::read(home);
-    let socket = settings.server.socket.as_deref();
-    let outcome = match cyclops_tmux::release_session_sizing(session, socket) {
+pub fn run_release(server: &Server, session: &str, json: bool, style: &Style) -> i32 {
+    let outcome = match cyclops_tmux::release_session_sizing(session, server.socket.as_deref()) {
         Ok(outcome) => outcome,
         Err(error) => {
             if json {
@@ -156,4 +174,33 @@ fn refuse_live_owner(session: &str, marker: &str, json: bool, style: &Style) -> 
     eprintln!("  Nothing was changed. That workspace puts these windows back when it quits.");
     eprintln!("  Quit it, then run this again.");
     EXIT_REFUSED
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_server_requires_an_explicit_recovery_session() {
+        let server = Server {
+            socket: Some("cyclops-test".to_string()),
+            config_file: None,
+        };
+
+        let error = resolve_session(None, &server).expect_err("named servers need a named session");
+        assert!(error.contains("--session <name>"));
+    }
+
+    #[test]
+    fn an_explicit_session_is_valid_for_a_configured_server() {
+        let server = Server {
+            socket: Some("cyclops-test".to_string()),
+            config_file: None,
+        };
+
+        assert_eq!(
+            resolve_session(Some("recover-me".to_string()), &server),
+            Ok("recover-me".to_string())
+        );
+    }
 }

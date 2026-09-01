@@ -90,7 +90,7 @@ pub use error::TmuxError;
 pub use focus::focus_pane;
 pub use hydration::HydrationBundle;
 pub use notify::Notification;
-pub use ops::{PaneDirection, SplitDirection, PANE_MINIMIZED_OPTION_V1};
+pub use ops::{CloseSessionAttempt, PaneDirection, SplitDirection, PANE_MINIMIZED_OPTION_V1};
 pub use quote::quote_arg;
 pub use session::{
     active_pane, current_session, list_panes, list_sessions, list_window_memberships, list_windows,

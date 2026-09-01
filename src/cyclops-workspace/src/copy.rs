@@ -67,7 +67,124 @@ pub fn pane_input_uncertain(pane: &str, error: &dyn std::fmt::Display) -> String
     format!("input may have reached {pane}; it will not be replayed: {error}")
 }
 
+pub const FOCUS_CONTROL_RECONNECTING: &str =
+    "focus is unavailable while the tmux connection is recovering";
+pub const FOCUS_CONTROL_DISCONNECTED: &str =
+    "focus is unavailable because the tmux connection is no longer live";
+pub const FOCUS_STATE_REFRESHING: &str = "focus is unchanged while workspace state refreshes";
+
+pub fn focus_unconfirmed(pane: &str, error: &dyn std::fmt::Display) -> String {
+    format!("focus not confirmed for {pane}: {error}; refreshing workspace state")
+}
+
+pub const SPLIT_CONTROL_RECONNECTING: &str =
+    "split is unavailable while the tmux connection is recovering";
+pub const SPLIT_CONTROL_DISCONNECTED: &str =
+    "split is unavailable because the tmux connection is no longer live";
+pub const SPLIT_STATE_REFRESHING: &str = "split was not started while workspace state refreshes";
+pub const SPLIT_ROUTE_STALE: &str =
+    "split was not started because the source pane is no longer current; refreshing workspace state";
+
+pub fn split_unconfirmed(pane: &str, error: &dyn std::fmt::Display) -> String {
+    format!("split not confirmed for {pane}: {error}; refreshing workspace state")
+}
+
+pub const WORKSPACE_CLOSE_CONTROL_RECONNECTING: &str =
+    "workspace close is unavailable while the tmux connection is recovering";
+pub const WORKSPACE_CLOSE_CONTROL_DISCONNECTED: &str =
+    "workspace close is unavailable because the tmux connection is no longer live";
+pub const WORKSPACE_CLOSE_STATE_REFRESHING: &str =
+    "workspace close was not started while workspace state refreshes";
+pub const WORKSPACE_CLOSE_ROUTE_STALE: &str =
+    "workspace close was not started because that session is no longer in the current workspace state; refreshing workspace state";
+
+pub fn workspace_close_unconfirmed(name: &str, error: &dyn std::fmt::Display) -> String {
+    format!("close not confirmed for workspace {name}: {error}; refreshing workspace state")
+}
+
+pub const WORKSPACE_CREATE_CONTROL_RECONNECTING: &str =
+    "new session is unavailable while the tmux connection is recovering";
+pub const WORKSPACE_CREATE_CONTROL_DISCONNECTED: &str =
+    "new session is unavailable because the tmux connection is no longer live";
+pub const WORKSPACE_CREATE_STATE_REFRESHING: &str =
+    "new session was not started while workspace state refreshes";
+pub const WORKSPACE_CREATE_ROUTE_STALE: &str =
+    "new session was not started because the active pane is no longer current; refreshing workspace state";
+
+pub fn workspace_create_folder_unavailable(error: &dyn std::fmt::Display) -> String {
+    format!(
+        "new session was not started because Cyclops could not read the active pane's directory: {error}; refreshing workspace state"
+    )
+}
+
+pub fn workspace_create_default_folder_unavailable(error: &dyn std::fmt::Display) -> String {
+    format!(
+        "new session was not started because Cyclops could not determine a default folder: {error}; refreshing workspace state"
+    )
+}
+
+pub fn workspace_create_unconfirmed(name: &str, error: &dyn std::fmt::Display) -> String {
+    format!("creation not confirmed for session {name}: {error}; refreshing workspace state")
+}
+
+pub fn workspace_switch_rejected(name: &str, error: &dyn std::fmt::Display) -> String {
+    format!(
+        "session {name} was created, but tmux did not switch to it: {error}; refreshing workspace state"
+    )
+}
+
+pub fn workspace_switch_unconfirmed(
+    name: &str,
+    switch_error: &dyn std::fmt::Display,
+    probe_error: &dyn std::fmt::Display,
+) -> String {
+    format!(
+        "session {name} was created, but switching to it was not confirmed: {switch_error}; Cyclops could not read tmux's current session: {probe_error}; refreshing workspace state"
+    )
+}
+
+pub fn workspace_switch_settling(name: &str, error: &dyn std::fmt::Display) -> String {
+    format!(
+        "session {name} was created; the switch response was uncertain: {error}; tmux then reported its current session, so the workspace is refreshing"
+    )
+}
+
+pub const WORKSPACE_RENAME_CONTROL_RECONNECTING: &str =
+    "session rename is unavailable while the tmux connection is recovering";
+pub const WORKSPACE_RENAME_CONTROL_DISCONNECTED: &str =
+    "session rename is unavailable because the tmux connection is no longer live";
+pub const WORKSPACE_RENAME_STATE_REFRESHING: &str =
+    "session rename was not started while workspace state refreshes";
+pub const WORKSPACE_RENAME_ROUTE_STALE: &str =
+    "session rename was not started because that session is no longer in the current workspace state; refreshing workspace state";
+
+pub fn workspace_rename_unconfirmed(name: &str, error: &dyn std::fmt::Display) -> String {
+    format!("rename not confirmed for session {name}: {error}; refreshing workspace state")
+}
+
 pub const STREAM_RECONCILED: &str = "stream rebuilt from the durable tail";
+
+/// Workspace presentation for the shared Hello compatibility classification.
+/// This stays terse because it occupies the pane-canvas notice line.
+pub fn daemon_compatibility_notice(
+    compatibility: &cyclops_client::HelloCompatibility,
+) -> Option<String> {
+    use cyclops_client::HelloCompatibility;
+
+    match compatibility {
+        HelloCompatibility::Current { .. } => None,
+        HelloCompatibility::Mismatch { client, daemon } => Some(format!(
+            "version/build mismatch: cyclops {}, cyclopsd {} · continuing · run cyclops daemon restart",
+            client.description(),
+            daemon.description()
+        )),
+        HelloCompatibility::UnverifiedDaemon { client, daemon } => Some(format!(
+            "daemon identity unverified: cyclops {}, cyclopsd {} · continuing · run cyclops daemon restart",
+            client.description(),
+            daemon.description()
+        )),
+    }
+}
 
 // No space after the glyph: ☰ is ambiguous-width and most fonts already
 // draw it with a right shoulder, so a literal space read as a two-cell gap.
@@ -364,6 +481,13 @@ pub fn file_sent(reference: &str, pane: &str) -> String {
 pub const CONTROL_STREAM_GAP: &str =
     "the tmux event stream overflowed and the view was rebuilt; keys typed meanwhile were dropped, type them again";
 
+pub(crate) fn frame_too_large(subject: &str) -> String {
+    format!(
+        "{subject} exceeds the {}-byte JSON frame limit (newline excluded)",
+        cyclops_proto::FrameContract::MAX_JSON_BYTES
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,5 +514,19 @@ mod tests {
         // Column-accurate, not byte-accurate: a wide glyph is one thing
         // the operator selected, not three bytes.
         assert_eq!(copied("你好"), "copied 2 characters");
+    }
+
+    #[test]
+    fn daemon_mismatch_names_both_identities_and_the_recovery_command() {
+        let mismatch = cyclops_client::HelloCompatibility::between(
+            cyclops_client::RuntimeIdentity::new("0.1.0", Some("client-new")),
+            cyclops_client::RuntimeIdentity::new("0.0.9", Some("daemon-old")),
+        );
+        assert_eq!(
+            daemon_compatibility_notice(&mismatch).as_deref(),
+            Some(
+                "version/build mismatch: cyclops 0.1.0 (client-new), cyclopsd 0.0.9 (daemon-old) · continuing · run cyclops daemon restart"
+            )
+        );
     }
 }

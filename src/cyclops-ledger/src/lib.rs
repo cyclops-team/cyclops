@@ -9,8 +9,9 @@
 //! - `seq` is strictly monotonic per session file, across daemon restarts:
 //!   recovery scans the tail and continues numbering. `boot_id` says which
 //!   daemon run wrote a line.
-//! - A torn final write is recovered on the next open. Lenient replay seals
-//!   and skips it. Strict replay removes it and rejects every complete error.
+//! - A torn final write is recovered on the next open. Lenient replay seals it
+//!   and retains it when it validates, otherwise skips it. Strict replay
+//!   removes it and rejects every complete error.
 //! - Lines are never rewritten. Corrections are new lines.
 //! - Every open is relative to a validated [`cyclops_state::StateRoot`].
 //!
@@ -507,6 +508,37 @@ mod tests {
         let lines = writer.read_after(0).unwrap();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[1].subject.as_deref(), Some("three"));
+    }
+
+    #[test]
+    fn lenient_replay_seals_and_retains_a_valid_unterminated_tail() {
+        let scratch = Scratch::new("valid-torn-tail");
+        let descendant = Path::new("ledger/main.ndjson");
+        {
+            let writer = LedgerWriter::open(&scratch.root, descendant, "boot-1").unwrap();
+            writer.append(message("one")).unwrap();
+        }
+        {
+            let mut second = message("two");
+            second.seq = 2;
+            second.boot_id = "boot-1".into();
+            second.ts = 9;
+            let mut file = scratch.root.open_append(descendant).unwrap();
+            serde_json::to_writer(&mut file, &second).unwrap();
+            file.sync_data().unwrap();
+        }
+
+        let writer = LedgerWriter::open(&scratch.root, descendant, "boot-2").unwrap();
+        assert_eq!(writer.next_seq(), 3);
+        let lines = writer.read_after(0).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1].subject.as_deref(), Some("two"));
+        assert_eq!(
+            fs::read(scratch.root.path().join(descendant))
+                .unwrap()
+                .last(),
+            Some(&b'\n')
+        );
     }
 
     #[test]

@@ -112,3 +112,58 @@ fn a_panicking_test_tears_down_too() {
     );
     assert!(!path.exists(), "a panicking test left the socket {path:?}");
 }
+
+#[test]
+fn simulated_server_loss_reuses_the_owned_address_and_still_tears_down() {
+    if !tmux_available() {
+        eprintln!("skipping: no tmux binary on PATH");
+        return;
+    }
+    let (server, socket, path) = started("teardown-simulated-loss");
+
+    server.simulate_server_loss();
+    assert!(
+        !server_is_up(&socket),
+        "the simulated loss left the old server live"
+    );
+
+    server.run_ok(&["new-session", "-d", "-s", "replacement", "/bin/sh"]);
+    let replacement_path = server
+        .socket_path()
+        .expect("replacement reports the owned socket path");
+    assert_eq!(replacement_path, path);
+    drop(server);
+
+    assert!(!server_is_up(&socket), "replacement survived teardown");
+    assert!(
+        !replacement_path.exists(),
+        "replacement teardown left the socket file {replacement_path:?}"
+    );
+}
+
+#[test]
+fn an_explicit_restart_reuses_one_owned_address_and_still_tears_down() {
+    if !tmux_available() {
+        eprintln!("skipping: no tmux binary on PATH");
+        return;
+    }
+    let (srv, socket, old_path) = started("teardown-restart");
+
+    let replacement = srv.restart();
+    assert_eq!(replacement.socket(), socket);
+    assert!(!server_is_up(&socket), "restart left the old server live");
+    assert!(!old_path.exists(), "restart left the old socket file");
+
+    replacement.run_ok(&["new-session", "-d", "-s", "replacement", "/bin/sh"]);
+    let replacement_path = replacement
+        .socket_path()
+        .expect("replacement reports the same owned socket path");
+    assert_eq!(replacement_path, old_path);
+    drop(replacement);
+
+    assert!(!server_is_up(&socket), "replacement survived teardown");
+    assert!(
+        !replacement_path.exists(),
+        "replacement teardown left the socket file {replacement_path:?}"
+    );
+}

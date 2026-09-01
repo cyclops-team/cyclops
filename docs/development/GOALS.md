@@ -61,8 +61,11 @@ invisible, on a record that never lies.
 
 - Valuable at n=1. The ladder is law: one pane, name panes, any terminal
   agent, persist layouts, structured messages, pipe output. Roles optional;
-  nothing forced. 60 seconds from install to first delivered message, no docs.
-  `?` shows a cheatsheet.
+  nothing forced. Once installed, the guided first handoff reaches a delivered
+  message without requiring the docs. A clean-host 60-second
+  install-to-first-delivery goal is deferred until Cyclops ships a verified
+  matched prebuilt pair under explicit publication authority. `?` shows a
+  cheatsheet.
 
 ## Smoothness and performance
 
@@ -76,7 +79,9 @@ invisible, on a record that never lies.
 - Never clear a modal generically: per-CLI vocabulary with explicit declines,
   or park + alert.
 - blocked_quota never auto-retries.
-- Human live typing always wins.
+- Cyclops writes terminal notifications only after fresh positive composer and
+  occupant evidence. This minimizes concurrent-input risk; it cannot eliminate
+  the final observation-to-write interval without cooperative input ownership.
 - Secrets never enter the ledger.
 - Vendor quirks are data, not code.
 

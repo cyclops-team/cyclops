@@ -1,8 +1,10 @@
 //! Headless `cyclops ui` end to end: a canned daemon on a scratch socket
-//! feeds events through the real subscription, a fixture ledger feeds the
-//! backfill, and the plain follow mode (stdout is a pipe, so the TUI
+//! feeds events through the real subscription and serves the daemon-owned
+//! backfill projection. The plain follow mode (stdout is a pipe, so the TUI
 //! never engages) proves classification, ordering, dedupe, the hanging
 //! body line, and the eye word without a terminal anywhere.
+
+#![cfg(feature = "full-ui")]
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -12,6 +14,8 @@ use std::process::{Command, Output};
 use std::thread;
 
 use serde_json::{json, Value};
+
+const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Scratch home unique per test and process, under the relocatable
 /// scratch root. Kept short: Unix socket paths cap out around 104 bytes
@@ -43,8 +47,8 @@ where
                 w,
                 "{}",
                 json!({
-                    "cyclops": "0.1.0",
-                    "build": env!("CYCLOPS_BUILD_REF"),
+                    "cyclops": PACKAGE_VERSION,
+                    "build": cyclops_proto::BUILD_REF,
                     "proto": 1,
                     "boot_id": "b-ui"
                 })
@@ -108,37 +112,43 @@ fn empty_messages_snapshot(req: &Value) -> (Vec<String>, bool) {
     )
 }
 
-/// Two msg facts in the session ledger: one to admin (seq 1), one agent
-/// to agent (seq 2). Timestamps are fixed so the clock gutter is exact.
-///
-/// Seq 1 carries a two-line body so the backfill path pins plain mode's
-/// hanging body line: the first body line prints at the content column,
-/// the rest does not. Seq 2 carries none, so the bodyless message stays
-/// one line.
-fn write_ledger(home: &Path) {
-    let dir = home.join("ledger");
-    fs::create_dir_all(&dir).expect("create ledger dir");
-    let lines = [
-        json!({"seq": 1, "boot_id": "b-ui", "id": "m-a", "ts": 43_471_000u64, "kind": "msg",
-               "from": "codex", "to": ["admin"], "subject": "build done",
-               "body": "ci is green on main\nsecond line stays off"}),
-        json!({"seq": 2, "boot_id": "b-ui", "id": "m-b", "ts": 43_472_000u64, "kind": "msg",
-               "from": "codex", "to": ["reviewer"], "subject": "review this"}),
-    ];
-    let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
-    fs::write(dir.join("main.ndjson"), text).expect("write fixture ledger");
+/// Two body-free message facts served through `events.backfill`: one to admin
+/// (seq 1), one agent to agent (seq 2). Timestamps are fixed so the clock
+/// gutter is exact. The canned daemon deliberately owns these bytes; the UI
+/// test home contains no journal for presentation to discover.
+fn canned_backfill(req: &Value) -> (Vec<String>, bool) {
+    (
+        vec![json!({"id": req["id"], "result": {
+            "lines": [
+                {"seq": 1, "boot_id": "b-ui", "id": "m-a", "ts": 43_471_000u64,
+                 "kind": "msg", "from": "codex", "to": ["admin"], "subject": "build done"},
+                {"seq": 2, "boot_id": "b-ui", "id": "m-b", "ts": 43_472_000u64,
+                 "kind": "msg", "from": "codex", "to": ["reviewer"], "subject": "review this"}
+            ],
+            "max_seq": 2
+        }})
+        .to_string()],
+        true,
+    )
+}
+
+fn empty_backfill(req: &Value) -> (Vec<String>, bool) {
+    (
+        vec![json!({"id": req["id"], "result": {"lines": []}}).to_string()],
+        true,
+    )
 }
 
 /// The canned daemon: the subscribe connection acks and streams four
-/// events, then hangs up; the status connection answers one status.
-/// Event seqs sit above the ledger tail, so nothing dedupes away; one
-/// event repeats ledger seq 2 to prove the dedupe drops it.
+/// events, then hangs up; the status and backfill connections answer one
+/// bounded replacement. Event seqs sit above the retained tail, so nothing
+/// dedupes away; one event repeats seq 2 to prove the dedupe drops it.
 ///
 /// Seq 10 carries a body so the live event path pins the hanging body
 /// line too, not just the backfill path. Seq 11 carries an empty body,
 /// which is the same as none: no second line.
 fn serve_canned(home: &Path) {
-    serve_conns(home, 3, move |req| match req["method"].as_str() {
+    serve_conns(home, 4, move |req| match req["method"].as_str() {
         Some("events.subscribe") => (
             vec![
                 json!({"id": req["id"], "result": {"subscribed": true}}).to_string(),
@@ -166,7 +176,7 @@ fn serve_canned(home: &Path) {
         ),
         Some("status") => (
             vec![json!({"id": req["id"], "result": {
-                "daemon_version": "0.1.0", "proto": 1, "boot_id": "b-ui",
+                "daemon_version": PACKAGE_VERSION, "proto": 1, "boot_id": "b-ui",
                 "uptime_ms": 1000, "tmux_version": "3.6a",
                 "sessions": [{"name": "main", "attached": true, "panes": [{
                     "pane_id": "%1", "window_id": "@1", "window_name": "agents",
@@ -200,6 +210,7 @@ fn serve_canned(home: &Path) {
             .to_string()],
             true,
         ),
+        Some("events.backfill") => canned_backfill(&req),
         Some("messages.snapshot") => empty_messages_snapshot(&req),
         other => panic!("unexpected method {other:?}"),
     });
@@ -208,7 +219,6 @@ fn serve_canned(home: &Path) {
 #[test]
 fn ui_plain_admin_stream_is_calm_and_ends_honestly() {
     let home = scratch_home("adm");
-    write_ledger(&home);
     serve_canned(&home);
     let out = run_ui(&home, &["ui", "--plain"]);
     // The daemon hung up: the follow ends with the standard copy, exit 1.
@@ -236,7 +246,6 @@ fn ui_plain_admin_stream_is_calm_and_ends_honestly() {
 #[test]
 fn ui_plain_firehose_shows_everything_once() {
     let home = scratch_home("fh");
-    write_ledger(&home);
     serve_canned(&home);
     let out = run_ui(&home, &["ui", "--plain", "--firehose"]);
     assert_eq!(out.status.code(), Some(1));
@@ -279,7 +288,6 @@ fn ui_plain_firehose_shows_everything_once() {
 #[test]
 fn ui_plain_filter_narrows_the_firehose() {
     let home = scratch_home("flt");
-    write_ledger(&home);
     serve_canned(&home);
     let out = run_ui(&home, &["ui", "--plain", "--firehose", "--from", "codex"]);
     assert_eq!(out.status.code(), Some(1));
@@ -306,7 +314,8 @@ fn ui_daemon_down_reports_and_exits_one() {
     assert_eq!(
         String::from_utf8_lossy(&out.stderr).trim(),
         format!(
-            "cyclops ui is deprecated; use cyclops watch\nstartup status unavailable; state may be incomplete: No such file or directory (os error 2)\n{}",
+            "cyclops ui is deprecated; use cyclops watch\nstream snapshot unavailable; state may be incomplete: {}\n{}",
+            cyclops_proto::NOT_RUNNING,
             cyclops_proto::NOT_RUNNING
         )
     );
@@ -318,7 +327,7 @@ fn ui_daemon_down_reports_and_exits_one() {
 /// asked (`cyclops_proto::StatusParams`).
 fn answer(open_deliveries: bool) -> Value {
     let mut result = json!({
-        "daemon_version": "0.1.0", "proto": 1, "boot_id": "b-ui",
+        "daemon_version": PACKAGE_VERSION, "proto": 1, "boot_id": "b-ui",
         "uptime_ms": 120_000, "tmux_version": "3.6a",
         "sessions": [{"name": "main", "attached": true, "panes": [{
             "pane_id": "%1", "window_id": "@1", "window_name": "agents",
@@ -341,9 +350,9 @@ fn answer(open_deliveries: bool) -> Value {
 #[test]
 fn status_stays_live_while_the_stream_carries_durable_attention() {
     let home = scratch_home("two");
-    // Four connections: the status grid takes one, while the plain follow
-    // takes its subscription, status seed, and message snapshot.
-    serve_conns(&home, 4, move |req| match req["method"].as_str() {
+    // Five connections: the status grid takes one, while the plain follow
+    // takes its subscription, status seed, daemon backfill, and message snapshot.
+    serve_conns(&home, 5, move |req| match req["method"].as_str() {
         Some("status") => {
             let asked = req["params"]["open_deliveries"] == json!(true);
             (
@@ -355,6 +364,7 @@ fn status_stays_live_while_the_stream_carries_durable_attention() {
             vec![json!({"id": req["id"], "result": {"subscribed": true}}).to_string()],
             true,
         ),
+        Some("events.backfill") => empty_backfill(&req),
         Some("messages.snapshot") => empty_messages_snapshot(&req),
         other => panic!("unexpected method {other:?}"),
     });
@@ -387,9 +397,9 @@ fn status_stays_live_while_the_stream_carries_durable_attention() {
 /// A follow never ends saying a pane that closed needs a human.
 ///
 /// The daemon's answer says %1 is blocked; the pane then leaves the table.
-/// The snapshot that would drop the item is taken once, at startup, and
-/// nothing re-takes it (zero polling), so the pane-removed event is the
-/// only thing that can. Without it the eye stays open on a pane that no
+/// The connection-epoch snapshot reports the blocked pane before the queued
+/// `pane-removed` event lands. Zero polling means that event is the only thing
+/// that can close it; without the edge the eye stays open on a pane that no
 /// longer exists for as long as the follow runs.
 #[test]
 fn a_pane_that_closes_takes_its_attention_item_with_it() {
@@ -408,16 +418,19 @@ fn a_pane_that_closes_takes_its_attention_item_with_it() {
             vec![json!({"id": req["id"], "result": answer(false)}).to_string()],
             true,
         ),
+        Some("events.backfill") => empty_backfill(&req),
         Some("messages.snapshot") => empty_messages_snapshot(&req),
         other => panic!("unexpected method {other:?}"),
     });
     let stream = stdout_of(&run_ui(&home, &["ui", "--plain", "--firehose"]));
     // The event arrived and the firehose said so.
     assert!(stream.contains("%1 closed"), "{stream}");
-    // And nothing needs a human, so the eye never speaks at all.
-    assert!(
-        !stream.lines().any(|l| l.starts_with("eye ")),
-        "the eye reported a pane that is gone: {stream}"
+    // The snapshot's blocked fact may be visible first, but the event must
+    // close it. The final eye statement is the durable assertion.
+    assert_eq!(
+        stream.lines().rfind(|line| line.starts_with("eye ")),
+        Some("eye closed"),
+        "the eye still reported a pane that is gone: {stream}"
     );
     let _ = fs::remove_dir_all(&home);
 }

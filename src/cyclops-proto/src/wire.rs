@@ -12,6 +12,43 @@ use serde_json::Value;
 
 use crate::state::{AgentState, ComposerProof, ComposerState};
 
+/// The size outcome for one official daemon JSON object.
+///
+/// The newline is framing, not part of the JSON-object byte count. Socket
+/// adapters use this decision before accepting or emitting a frame; the proto
+/// crate owns no reader, writer, or allocation policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameSize {
+    InEnvelope,
+    TooLarge,
+}
+
+/// One size contract shared by every official daemon socket adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameContract;
+
+impl FrameContract {
+    /// Largest JSON object accepted on the official daemon wire.
+    pub const MAX_JSON_BYTES: usize = 1_048_576;
+    /// NDJSON delimiter. This byte is not included in `MAX_JSON_BYTES`.
+    pub const DELIMITER: u8 = b'\n';
+    /// Stable wire-error code for a frame outside the official envelope.
+    pub const TOO_LARGE_CODE: &'static str = "frame_too_large";
+
+    pub const fn classify_json_bytes(bytes: usize) -> FrameSize {
+        if bytes <= Self::MAX_JSON_BYTES {
+            FrameSize::InEnvelope
+        } else {
+            FrameSize::TooLarge
+        }
+    }
+
+    /// Complete on-wire bytes for the largest accepted object and delimiter.
+    pub const fn max_line_bytes() -> usize {
+        Self::MAX_JSON_BYTES + 1
+    }
+}
+
 /// First line the server writes on every connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
@@ -588,9 +625,66 @@ pub struct SubscribeParams {
     /// Event name prefixes to receive; empty means everything.
     #[serde(default)]
     pub kinds: Vec<String>,
-    /// Replay ledger-backed events after this seq before going live.
+    /// Retained compatibility input. Subscriptions are ephemeral and never
+    /// replay; durable recovery uses a snapshot or a domain follow cursor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<u64>,
+}
+
+fn default_stream_backfill_limit() -> u32 {
+    200
+}
+
+/// One bounded daemon-owned history projection for the event stream.
+///
+/// This is not an event-subscription cursor. It is a one-shot authorized
+/// snapshot of presentable compatibility facts; live progress still arrives
+/// through `events.subscribe`, while durable mailbox progress uses
+/// `messages.follow`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamBackfillParams {
+    #[serde(default = "default_stream_backfill_limit")]
+    pub limit: u32,
+}
+
+impl Default for StreamBackfillParams {
+    fn default() -> Self {
+        Self {
+            limit: default_stream_backfill_limit(),
+        }
+    }
+}
+
+/// Explicit loss facts for a bounded stream-history projection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamBackfillGap {
+    /// Retained journal sources that could not be read whole.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub unreadable_sources: u32,
+    /// Rows inside the requested tail omitted by an internal item or frame-size bound.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub omitted_rows: u64,
+}
+
+impl StreamBackfillGap {
+    pub fn is_empty(&self) -> bool {
+        self.unreadable_sources == 0 && self.omitted_rows == 0
+    }
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+/// Body-free session-history rows used to seed an event-stream presentation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamBackfillResult {
+    pub lines: Vec<crate::ledger::LedgerLine>,
+    /// Highest retained seq only when one journal source supplied the page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap: Option<StreamBackfillGap>,
 }
 
 /// `workspace_ui.get` params. Additive; older daemons omit the method.
@@ -1537,6 +1631,25 @@ pub enum NotifyLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn official_frame_boundary_excludes_the_newline() {
+        let max = FrameContract::MAX_JSON_BYTES;
+        assert_eq!(
+            FrameContract::classify_json_bytes(max - 1),
+            FrameSize::InEnvelope
+        );
+        assert_eq!(
+            FrameContract::classify_json_bytes(max),
+            FrameSize::InEnvelope
+        );
+        assert_eq!(
+            FrameContract::classify_json_bytes(max + 1),
+            FrameSize::TooLarge
+        );
+        assert_eq!(FrameContract::DELIMITER, b'\n');
+        assert_eq!(FrameContract::max_line_bytes(), max + 1);
+    }
 
     #[test]
     fn turn_ended_is_canonical_while_done_remains_read_compatible() {

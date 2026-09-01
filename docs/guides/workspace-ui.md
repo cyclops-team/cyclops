@@ -164,20 +164,22 @@ depends on color. Cyclops never writes the pane title to show any of
 this, the title remains a sensor. See [panes.md](panes.md) for naming and
 identity rules.
 
-Cyclops paints every cell your terminal gives it, and also asks the
-terminal to make its own default background the theme's chrome color
-(OSC 11). That is what fills the few pixels of window padding a terminal
-reserves outside the character grid, which no amount of cell painting can
-reach. It is handed back (OSC 111) on every exit path, panic included, so
-your shell gets its own background returned. A terminal that does not
-understand the sequence ignores it and shows its own padding color as
-before.
+Cyclops paints every cell your terminal gives it. The few pixels of window
+padding outside the character grid keep the terminal's own color by default:
+Cyclops does not change a host palette unless it can restore it exactly. To
+theme that padding, set both `terminal_default_fg` and
+`terminal_default_bg` under `[workspace]` as `#rrggbb` values. Cyclops then
+uses OSC 10/11 to apply the theme while focused and restores that explicit
+pair on every exit path, panic included, and on focus loss. A partial or
+malformed pair leaves the host palette untouched. Cyclops never reads terminal
+input to discover colors.
 
-The color also follows your focus. Switch to another tab or window of the
-same terminal and the background is handed back the moment focus leaves,
-so whatever you switched to wears the terminal's own color; come back and
-the theme's ground is reapplied. This rides terminal focus reporting, so
-a terminal without it simply keeps the color until exit, as before.
+When an exact pair enabled host-palette theming, the color also follows your
+focus. Switch to another tab or window of the same terminal and the configured
+defaults are handed back the moment focus leaves; come back and the theme's
+ground is reapplied. This rides terminal focus reporting, so a terminal
+without it simply keeps the color until exit. Without that pair, only the
+workspace grid is themed and there is no host palette to hand back.
 
 Pane content still maps one terminal cell to one tmux cell. The gutter is
 removed from the client size reported to tmux; it never scales or covers a
@@ -194,6 +196,25 @@ rail, and restores the exact grid that was visible before it opened. If that
 grid was already narrower than the terminal because another workspace owns
 the shared tmux geometry, closing Messages does not stretch it past the tmux
 source.
+
+The one-column rail remains stateful while the pane is closed. It reads only
+authenticated, body-free snapshot counts and never forces the pane open:
+
+- `✉` followed by `1` through `9` shows the current number of Work messages;
+- `✉` followed by `+` means ten or more Work messages;
+- `!` means at least one message notification needs attention; and
+- `?` means Cyclops has no authenticated snapshot yet or the retained snapshot
+  is stale after a connection gap or failed refresh.
+
+A body-free `messages.changed` edge refreshes this cue even while the pane is
+closed. Ordinary pane decoration changes do not create message reads. Opening
+Messages always refreshes its detailed projection before enabling actions, and
+the rail remains the same one-column click target in every cue state.
+
+This cue is specific to the full workspace. Adopted tmux panes keep their
+existing body-free message count in the pane border. A direct native tmux
+attach remains intentionally free of Cyclops chrome; use the inbox commands to
+inspect messaging there.
 
 The Messages pane uses the same card language as agent panes: a complete
 muted border at rest and a double accent border while it has keyboard focus.
@@ -271,8 +292,9 @@ file panel and hand the whole column back to the session tree. The
 the only way back, because a closed panel leaves no rule to grab.
 
 The panel is two browsers behind one header. The agent browser follows
-the focused agent: switch panes or let the agent `cd` and within a second
-the panel is looking at its working directory. The pinned browser stays
+the focused agent: a pane switch or output from the active pane requests
+one short settled snapshot of its working directory. That lets the panel
+catch a `cd` without polling the filesystem. The pinned browser stays
 wherever you last put it, such as a downloads folder or spec directory,
 and remembers that across launches (`files_pinned_root` in `config.toml`,
 written when you browse the pinned view). The chip at the header's right
@@ -309,11 +331,11 @@ still arrives as a path relative to the focused pane's own directory, so
 `@src/main.rs` means the same thing whether you clicked it from the
 project root or after walking into `src`.
 
-It re-reads once a second and repaints only when something you can see has
-moved: a file written into an open folder shows up on its own, one written
-into a closed one does not, because nothing on screen would change. A
-folder with more than 500 entries is listed short and says how many it
-left out.
+Files takes a fresh snapshot after a pane route, active-pane output, or a
+Files interaction, and repaints only when something you can see moved. It
+does not poll the filesystem: a change made without one of those edges
+appears after the next relevant interaction, route, or output. A folder
+with more than 500 entries is listed short and says how many it left out.
 
 Click a file and its path is typed into the focused pane as `@src/main.rs `,
 relative to the panel's root, with a trailing space so a second click does
@@ -395,11 +417,14 @@ switching sections never resizes it.
   0 to 20 second delay. Select `Delay` and use `←`/`→` to move the slider.
   This escape hatch applies only after Cyclops has pasted an exact notification
   and ordinary verification fails. It does not paste again. At expiry the
-  daemon rechecks the exact attempt and bound pane process, then presses Enter
-  once. A claim, withdrawal, replacement, or disabled setting cancels it. The
+  daemon rechecks the exact attempt and bound pane process, then reserves one
+  key with `inbox.claim` before pressing Enter once. A claim, withdrawal, or
+  replacement that wins before the reservation stops it, as does a successful
+  disable ordered before the reservation. A later claim still retrieves the
+  message, and a later setting change does not retract the reserved key. The
   warning is literal: because this bypasses composer-content proof, it may
-  submit human input that appeared after the notification was pasted. At 0
-  seconds the key is attempted immediately.
+  submit human input that appeared after the notification was
+  pasted. At 0 seconds the key is attempted immediately.
 
 `show_settings` is the binding name; `show_themes`, from when the card
 was only a theme picker, still works in an existing config.
@@ -468,6 +493,12 @@ the subject every listing shows; the body keeps everything. The dialog
 stays open across the send and reports the receipt where the hint was, then
 leaves `@name ` in the field so a second message to the same agent is one
 keystroke of setup.
+
+If the sender identity changes while the Messages composer sends, Cyclops says
+that nothing was accepted and keeps the draft. It holds message actions until
+it has a fresh authoritative snapshot. Reopen the workspace after updating
+Cyclops, review the unchanged draft, and send it again only after the snapshot
+is current. A retained draft is not a receipt.
 
 Right-click chooses the object under the pointer, even when it is not
 active:

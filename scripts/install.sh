@@ -370,12 +370,32 @@ done
 # Cargo may hard-link a top-level binary to its hashed build artifact. Copy
 # both binaries into one private directory so the validator executes and
 # stages the same unlinked candidate pair.
+#
+# F81 records a macOS fcopyfile failure after a successful Cargo build. The
+# private destination is newly created and not public yet, so a verified byte
+# copy is a safe fallback rather than a partial install.
+copy_private_candidate() {
+    if cp "$1" "$2" 2>/dev/null && cmp -s "$1" "$2"; then
+        return 0
+    fi
+    rm -f "$2" || return 1
+    if candidate_copy_error="$(dd if="$1" of="$2" bs=65536 2>&1)"; then
+        if cmp -s "$1" "$2"; then
+            return 0
+        fi
+        printf '%s\n' "private candidate copy did not preserve $1" >&2
+    else
+        printf '%s\n' "$candidate_copy_error" >&2
+    fi
+    return 1
+}
+
 PAIR_SOURCE="$(mktemp -d "${TMPDIR:-/tmp}/cyclops-pair.XXXXXX")" ||
     die "cannot create a private candidate directory"
 chmod 700 "$PAIR_SOURCE" || die "cannot secure the private candidate directory"
 for name in cyclops cyclopsd; do
-    cp "$TARGET/$name" "$PAIR_SOURCE/$name" ||
-        die "cannot copy $name into the private candidate directory"
+    copy_private_candidate "$TARGET/$name" "$PAIR_SOURCE/$name" ||
+        die "cannot stage $name in the private candidate directory"
     chmod 755 "$PAIR_SOURCE/$name" ||
         die "cannot make the private $name candidate executable"
 done

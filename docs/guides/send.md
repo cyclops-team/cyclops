@@ -113,11 +113,15 @@ The workspace Settings card has an optional `Force staged submit` escape hatch
 for a narrower failure: Cyclops already pasted the exact notification, but its
 normal verification could not confirm Enter. It is off by default. When enabled,
 the daemon waits the selected 0 to 20 seconds, rechecks the exact recipient,
-pane process generation, manifest, and tmux mode, then presses the manifest's
-submit key once without re-pasting the notification. A claim, withdrawal,
-replacement attempt, settled barrier, or disabled setting makes the timer a
-no-op. The durable resolution intent prevents duplicate timers or a restart
-from pressing a second key.
+pane process generation, manifest, and tmux mode, then reserves one key with
+`inbox.claim` before pressing the manifest's submit key without re-pasting the
+notification. A claim, withdrawal, replacement attempt, or settled barrier
+that wins before the reservation makes the timer a no-op. A later claim still
+retrieves the message and may count as consumption only after the key is
+accepted. A successful disable ordered before the reservation withholds the
+key; a later setting change does not retract one already reserved. The durable
+reservation prevents duplicate timers or a restart from
+pressing a second key.
 
 This setting intentionally bypasses composer-content proof. At 0 seconds it can
 submit human input that appeared after the notification was pasted. Use it only
@@ -157,9 +161,10 @@ To wait for one durable sender, copy its canonical `sender` key from
 $ cyclops inbox next --from 'agent:<workspace-id>/<session-instance-id>/%12' --timeout 30s
 ```
 
-If the claim request is sent but its answer misses the deadline, JSON reports
-`claim_outcome_unknown`. Inspect the named message before retrying because the
-claim may already be durable.
+If the claim request is sent but no usable answer arrives, JSON reports
+`claim_outcome_unknown`. This includes a deadline, connection loss, or an
+unreadable bounded answer. Inspect the named message before retrying because
+the claim may already be durable.
 
 Claim exactly the named message to fetch its immutable payload:
 
@@ -267,12 +272,21 @@ notification attempts.
 An ambiguous notification is never an invitation to resend blindly. Use its
 exact notification attempt id:
 
-Cyclops automatically handles a current exact-attempt `verify_failed` doorbell only
-when the complete durable binding and exact composer bytes still match. It
-submits once while the mailbox is pending. If the exact recipient claimed after
-the write, it clears that doorbell without submitting it. Durable intent blocks
-a second terminal key after an uncertain outcome. Human, trailing, changed, or
-unprovable content remains one visible attention item.
+On the ordinary automatic recovery path, Cyclops handles a current
+exact-attempt `verify_failed` doorbell only when the complete durable binding
+and exact composer bytes still match. It submits once while the mailbox is
+pending. If the exact recipient claimed after the write, it clears that
+doorbell without submitting it. Durable intent blocks a second terminal key
+after an uncertain outcome. Human, trailing, changed, or unprovable content
+remains one visible attention item.
+
+An administrator can separately enable the default-off force-submit control,
+stored as `force_notification_submit` and exposed through
+`notification.force_submit.set`; see [install.md](install.md) for the persisted
+configuration. It never pastes or replaces composer bytes, but it may send one
+submit key for one exact `verify_failed` attempt without composer-content proof
+and may therefore submit trailing human input. It is a deliberate liveness
+tradeoff, not an ordinary recovery path.
 
 ```bash
 cyclops attention show <attempt-id> --diff

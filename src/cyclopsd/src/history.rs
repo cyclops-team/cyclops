@@ -16,21 +16,19 @@
 //! machine, so no indexed reader was added to that crate; the additive
 //! index stays a measured-need option, not a speculative one.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
-use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use cyclops_proto::{
-    Delivery, HistoryParams, HistoryResult, Kind, LedgerLine, MessageMetadata, OpenDelivery,
-    RecipientKey, ThreadResult, WireError,
+    Delivery, FrameContract, HistoryParams, HistoryResult, Kind, LedgerLine, MessageMetadata,
+    OpenDelivery, RecipientKey, StreamBackfillGap, StreamBackfillParams, StreamBackfillResult,
+    ThreadResult, WireError,
 };
-use cyclops_state::StateRoot;
 use serde_json::Value;
-use tracing::{error, warn};
 
+use crate::compatibility;
 use crate::identity;
-use crate::mailbox::MailboxIdentity;
 use crate::server::sender_panes;
 use crate::Inner;
 
@@ -43,6 +41,116 @@ fn wire_err(code: &str, msg: impl Into<String>) -> WireError {
         code: code.to_string(),
         message: msg.into(),
         data: None,
+    }
+}
+
+const STREAM_BACKFILL_ITEM_CAP: usize = 4096;
+const STREAM_BACKFILL_FRAME_RESERVE: usize = 4096;
+
+/// A bounded, body-free projection of retained session history for stream
+/// presentation startup. Journal discovery and compatibility traversal stay
+/// in the daemon; clients receive authorized facts rather than file paths.
+pub(crate) fn stream_backfill(inner: &Inner, params: StreamBackfillParams) -> StreamBackfillResult {
+    let report = compatibility::CompatibilityHistoryAdapter::capture(inner).read();
+    let source_count = report.files.len();
+    let mut rows = report
+        .files
+        .into_iter()
+        .enumerate()
+        .flat_map(|(source, (_, lines))| {
+            lines
+                .into_iter()
+                .enumerate()
+                .filter(|(_, line)| stream_line_is_presentable(line))
+                .map(move |(ordinal, mut line)| {
+                    line.body = None;
+                    if matches!(line.kind, Kind::Msg | Kind::Fyi) {
+                        line.data = None;
+                    } else if let Some(data) = &mut line.data {
+                        redact_body_fields(data);
+                    }
+                    (line.ts, line.seq, source, ordinal, line)
+                })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        (left.0, left.1, left.2, left.3).cmp(&(right.0, right.1, right.2, right.3))
+    });
+
+    let requested = usize::try_from(params.limit).unwrap_or(usize::MAX);
+    let retained_limit = requested.min(STREAM_BACKFILL_ITEM_CAP);
+    let mut omitted_rows = if requested > STREAM_BACKFILL_ITEM_CAP {
+        rows.len().saturating_sub(retained_limit) as u64
+    } else {
+        0
+    };
+    let excess = rows.len().saturating_sub(retained_limit);
+    rows.drain(..excess);
+    let mut lines = rows
+        .into_iter()
+        .map(|(_, _, _, _, line)| line)
+        .collect::<Vec<_>>();
+
+    // Leave room for the response envelope and future additive fields. A
+    // single oversized historical fact is omitted with an explicit gap; it
+    // can never make the daemon return an ambiguous oversized-response error.
+    let payload_budget = FrameContract::MAX_JSON_BYTES - STREAM_BACKFILL_FRAME_RESERVE;
+    loop {
+        let gap = StreamBackfillGap {
+            unreadable_sources: u32::try_from(report.unreadable_sources).unwrap_or(u32::MAX),
+            omitted_rows,
+        };
+        let candidate = StreamBackfillResult {
+            max_seq: single_source_max_seq(source_count, &lines),
+            lines: lines.clone(),
+            gap: (!gap.is_empty()).then_some(gap),
+        };
+        if serde_json::to_vec(&candidate).is_ok_and(|encoded| encoded.len() <= payload_budget) {
+            return candidate;
+        }
+        if lines.is_empty() {
+            return candidate;
+        }
+        lines.remove(0);
+        omitted_rows = omitted_rows.saturating_add(1);
+    }
+}
+
+fn redact_body_fields(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            fields.remove("body");
+            for value in fields.values_mut() {
+                redact_body_fields(value);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_body_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn single_source_max_seq(source_count: usize, lines: &[LedgerLine]) -> Option<u64> {
+    if source_count == 1 {
+        lines.iter().map(|line| line.seq).max()
+    } else {
+        None
+    }
+}
+
+fn stream_line_is_presentable(line: &LedgerLine) -> bool {
+    match line.kind {
+        Kind::Msg | Kind::Fyi => true,
+        Kind::State | Kind::Gate => line.data.is_some(),
+        Kind::System => line
+            .data
+            .as_ref()
+            .and_then(|data| data.get("event"))
+            .and_then(Value::as_str)
+            .is_some(),
     }
 }
 
@@ -65,109 +173,18 @@ pub(crate) fn msg_history(
     cursor2: Option<String>,
     peer: Peer,
 ) -> Result<Value, WireError> {
-    if params.with.is_some() && (params.from.is_some() || params.to.is_some()) {
-        return Err(wire_err(
-            "bad_request",
-            "pick one filter shape: with, or from/to",
-        ));
-    }
-    let caller = history_caller(inner, peer)?;
-    let with = resolve_filter(inner, peer, params.with, caller.as_ref())?;
-    let from = resolve_filter(inner, peer, params.from, caller.as_ref())?;
-    let to = resolve_filter(inner, peer, params.to, caller.as_ref())?;
-    let limit = params.limit as usize;
-
-    let (files, names, workspace_file) = history_sources(inner);
-    let metadata = message_metadata(&files);
-    let matches = |line: &LedgerLine| {
-        let metadata = metadata.get(&line.id);
-        line_visible_to(metadata, caller.as_ref())
-            && line_matches_resolved(line, metadata, with.as_ref(), from.as_ref(), to.as_ref())
-    };
-
-    if let Some(c2) = cursor2 {
-        if params.cursor.is_some() {
-            return Err(wire_err(
-                "bad_request",
-                "pick one cursor: cursor, or cursor2",
-            ));
+    validate_history_params(&params)?;
+    let caller = crate::server::workspace_messaging_caller_if_available(inner, peer)?;
+    let compatibility = compatibility::CompatibilityHistoryAdapter::capture(inner).read();
+    let result = match caller {
+        Some((messaging, caller)) => messaging.history(caller, params, cursor2, compatibility)?,
+        None => {
+            let reader = compatibility_reader(inner, peer, &params)?;
+            let record = HistoryRecord::new(None, compatibility);
+            let mut result = query_history(&record, params, cursor2, reader.as_ref())?;
+            redact_compatibility_bodies(&mut result.lines);
+            result
         }
-        let consumed = decode_cursor2(&c2)?;
-        if !c2.is_empty() && !cursor_sources_match(&consumed, &names) {
-            return Err(wire_err(
-                "bad_request",
-                "cursor2 journal sources changed; restart the history walk",
-            ));
-        }
-        let (mut lines, next) =
-            page_composite(&files, &names, workspace_file, &matches, &consumed, limit);
-        crate::mailbox::redact_message_bodies(
-            inner.mailbox.as_deref(),
-            caller.as_ref().map(|identity| identity.key),
-            &mut lines,
-        );
-        let result = HistoryResult {
-            lines,
-            next_cursor: None,
-            next_cursor2: next.as_ref().map(encode_cursor2),
-        };
-        return Ok(serde_json::to_value(result).expect("history result serializes"));
-    }
-
-    if files.len() > 1 {
-        if params.cursor.is_some() {
-            return Err(wire_err(
-                "bad_request",
-                "cursor seqs are per-journal and would skip messages with several sources; \
-                 page with cursor2 (opaque, from next_cursor2; empty string starts from the \
-                 beginning)",
-            ));
-        }
-        // Tail across the merged record; the returned cursor2 marks
-        // everything read so far as consumed, so a resumed walk only sees
-        // newer messages (the single-session next_cursor contract).
-        let mut msgs = merge_files(&files, workspace_file);
-        msgs.retain(&matches);
-        let excess = msgs.len().saturating_sub(limit);
-        msgs.drain(..excess);
-        crate::mailbox::redact_message_bodies(
-            inner.mailbox.as_deref(),
-            caller.as_ref().map(|identity| identity.key),
-            &mut msgs,
-        );
-        let next_cursor2 = (!msgs.is_empty()).then(|| {
-            let mut consumed: BTreeMap<String, u64> = BTreeMap::new();
-            for (fi, file) in files.iter().enumerate() {
-                let max = file
-                    .iter()
-                    .filter(|l| matches!(l.kind, Kind::Msg | Kind::Fyi))
-                    .map(|l| l.seq)
-                    .max();
-                consumed.insert(names[fi].clone(), max.unwrap_or(0));
-            }
-            encode_cursor2(&consumed)
-        });
-        let result = HistoryResult {
-            lines: msgs,
-            next_cursor: None,
-            next_cursor2,
-        };
-        return Ok(serde_json::to_value(result).expect("history result serializes"));
-    }
-
-    // Single watched session: the shipped path, unchanged.
-    let mut msgs = merge_files(&files, workspace_file);
-    msgs.retain(&matches);
-    let (mut lines, next_cursor) = page(msgs, params.cursor, limit);
-    crate::mailbox::redact_message_bodies(
-        inner.mailbox.as_deref(),
-        caller.as_ref().map(|identity| identity.key),
-        &mut lines,
-    );
-    let result = HistoryResult {
-        lines,
-        next_cursor,
-        next_cursor2: None,
     };
     Ok(serde_json::to_value(result).expect("history result serializes"))
 }
@@ -179,30 +196,18 @@ pub(crate) fn msg_thread(inner: &Arc<Inner>, id: &str, peer: Peer) -> Result<Val
     if id.is_empty() {
         return Err(wire_err("bad_request", "msg.thread needs a message id"));
     }
-    let caller = history_caller(inner, peer)?;
-    let (files, _, workspace_file) = history_sources(inner);
-    let metadata = message_metadata(&files);
-    let visible_ids: HashSet<String> = merge_files(&files, workspace_file)
-        .into_iter()
-        .filter(|line| line_visible_to(metadata.get(&line.id), caller.as_ref()))
-        .map(|line| line.id)
-        .collect();
-    if !visible_ids.contains(id) {
-        return Err(no_such_message(id));
-    }
-    match thread_lines(&files, workspace_file, id) {
-        Some(mut lines) => {
-            lines.retain(|line| visible_ids.contains(&line.id));
-            crate::mailbox::redact_message_bodies(
-                inner.mailbox.as_deref(),
-                caller.as_ref().map(|identity| identity.key),
-                &mut lines,
-            );
-            let result = ThreadResult { lines };
-            Ok(serde_json::to_value(result).expect("thread result serializes"))
+    let caller = crate::server::workspace_messaging_caller_if_available(inner, peer)?;
+    let compatibility = compatibility::CompatibilityHistoryAdapter::capture(inner).read();
+    let result = match caller {
+        Some((messaging, caller)) => messaging.thread(caller, id, compatibility)?,
+        None => {
+            let record = HistoryRecord::new(None, compatibility);
+            let mut result = query_thread(&record, id, None)?;
+            redact_compatibility_bodies(&mut result.lines);
+            result
         }
-        None => Err(no_such_message(id)),
-    }
+    };
+    Ok(serde_json::to_value(result).expect("thread result serializes"))
 }
 
 fn no_such_message(id: &str) -> WireError {
@@ -222,27 +227,51 @@ struct ResolvedFilter {
     durable: Option<RecipientKey>,
 }
 
+/// The only caller facts the read model needs.
+///
+/// Workspace callers carry a durable key. Compatibility-only callers carry
+/// only their historical display label and therefore cannot gain current
+/// workspace authorization from a reused name.
+#[derive(Debug, Clone)]
+pub(crate) struct HistoryReader {
+    label: String,
+    durable: Option<RecipientKey>,
+}
+
+impl HistoryReader {
+    pub(crate) fn workspace(label: String, durable: RecipientKey) -> Self {
+        Self {
+            label,
+            durable: Some(durable),
+        }
+    }
+
+    fn compatibility(label: String) -> Self {
+        Self {
+            label,
+            durable: None,
+        }
+    }
+}
+
 /// Resolve "me" through the same durable identity boundary as sending.
 /// Plain labels remain presentation filters for compatibility records.
 fn resolve_filter(
-    inner: &Arc<Inner>,
-    peer: Peer,
     field: Option<String>,
-    caller: Option<&MailboxIdentity>,
+    caller: Option<&HistoryReader>,
 ) -> Result<Option<ResolvedFilter>, WireError> {
     match field {
         Some(value) if value == "me" => {
-            if let Some(caller) = caller {
-                Ok(Some(ResolvedFilter {
-                    display: caller.label.clone(),
-                    durable: Some(caller.key),
-                }))
-            } else {
-                Ok(Some(ResolvedFilter {
-                    display: caller_name(inner, peer)?,
-                    durable: None,
-                }))
-            }
+            let caller = caller.ok_or_else(|| {
+                wire_err(
+                    "denied",
+                    "can't tell who \"me\" is: caller identity unavailable",
+                )
+            })?;
+            Ok(Some(ResolvedFilter {
+                display: caller.label.clone(),
+                durable: caller.durable,
+            }))
         }
         Some(display) => Ok(Some(ResolvedFilter {
             display,
@@ -252,14 +281,18 @@ fn resolve_filter(
     }
 }
 
-/// Authenticate workspace readers once and use that identity for both
-/// visibility and any `me` filter. Legacy-only daemons retain their
-/// existing presentation-label behavior.
-fn history_caller(inner: &Arc<Inner>, peer: Peer) -> Result<Option<MailboxIdentity>, WireError> {
-    if inner.mailbox.is_none() {
-        return Ok(None);
-    }
-    crate::server::mailbox_caller(inner, peer).map(|(_, caller)| Some(caller))
+fn compatibility_reader(
+    inner: &Arc<Inner>,
+    peer: Peer,
+    params: &HistoryParams,
+) -> Result<Option<HistoryReader>, WireError> {
+    let uses_me = [&params.with, &params.from, &params.to]
+        .into_iter()
+        .flatten()
+        .any(|value| value == "me");
+    uses_me
+        .then(|| caller_name(inner, peer).map(HistoryReader::compatibility))
+        .transpose()
 }
 
 /// The caller as the ledger records it: pane label, pane id, or "admin".
@@ -310,54 +343,178 @@ fn caller_name(inner: &Arc<Inner>, peer: Peer) -> Result<String, WireError> {
 // Read model
 // ---------------------------------------------------------------------------
 
-/// Workspace messages first, followed by pre-upgrade session journals.
-/// Empty workspace journals are omitted so an untouched installation keeps
-/// the existing single-session cursor contract.
-fn history_sources(inner: &Inner) -> (Vec<Vec<LedgerLine>>, Vec<String>, Option<usize>) {
-    let mut files = Vec::new();
-    let mut names = Vec::new();
-    let mut workspace_file = None;
-    if let Some(service) = &inner.mailbox {
-        match service.journal_lines() {
-            Ok(lines) if !lines.is_empty() => {
-                workspace_file = Some(files.len());
-                names.push(format!("workspace:{}", service.workspace_id()));
-                files.push(lines);
-            }
-            Ok(_) => {}
-            Err(error) => {
-                warn!(error = %error, "workspace message history is unreadable");
-            }
+/// Immutable inputs to the history fold. WorkspaceMessaging constructs the
+/// optional current source; the named compatibility adapter constructs the
+/// retained session sources. Empty current journals stay omitted so the
+/// historical single-source cursor contract does not change.
+pub(crate) struct HistoryRecord {
+    files: Vec<Vec<LedgerLine>>,
+    names: Vec<String>,
+    workspace_file: Option<usize>,
+}
+
+impl HistoryRecord {
+    pub(crate) fn new(
+        workspace: Option<(String, Vec<LedgerLine>)>,
+        compatibility: compatibility::CompatibilityHistorySources,
+    ) -> Self {
+        let mut files = Vec::new();
+        let mut names = Vec::new();
+        let mut workspace_file = None;
+        if let Some((name, lines)) = workspace.filter(|(_, lines)| !lines.is_empty()) {
+            workspace_file = Some(files.len());
+            names.push(name);
+            files.push(lines);
+        }
+        for (name, lines) in compatibility.files {
+            names.push(name);
+            files.push(lines);
+        }
+        Self {
+            files,
+            names,
+            workspace_file,
         }
     }
-    let roots = inner
-        .session_slots()
-        .into_iter()
-        .enumerate()
-        .map(|(idx, slot)| {
-            (
-                idx,
-                slot.journal_file_name().unwrap_or_default(),
-                read_session(&slot),
-            )
-        })
-        .collect();
-    for (journal, lines) in session_journal_replay(&inner.state_root, roots).files {
-        names.push(legacy_journal_source_for_file(&journal));
-        files.push(lines);
+
+    pub(crate) fn has_workspace_source(&self) -> bool {
+        self.workspace_file.is_some()
     }
-    (files, names, workspace_file)
 }
 
-fn legacy_journal_source_for_file(file: &str) -> String {
-    format!("session-journal:{file}")
+fn validate_history_params(params: &HistoryParams) -> Result<(), WireError> {
+    if params.with.is_some() && (params.from.is_some() || params.to.is_some()) {
+        return Err(wire_err(
+            "bad_request",
+            "pick one filter shape: with, or from/to",
+        ));
+    }
+    Ok(())
 }
 
-pub(crate) struct SessionJournalReplay {
-    /// Globally unique files for id preload and the history read model.
-    pub(crate) files: Vec<(String, Vec<LedgerLine>)>,
-    /// One causally ordered stream per unambiguous configured root.
-    pub(crate) recovery: Vec<(usize, Vec<LedgerLine>)>,
+pub(crate) fn query_history(
+    record: &HistoryRecord,
+    params: HistoryParams,
+    cursor2: Option<String>,
+    caller: Option<&HistoryReader>,
+) -> Result<HistoryResult, WireError> {
+    validate_history_params(&params)?;
+    let with = resolve_filter(params.with, caller)?;
+    let from = resolve_filter(params.from, caller)?;
+    let to = resolve_filter(params.to, caller)?;
+    let limit = params.limit as usize;
+    let metadata = message_metadata(&record.files);
+    let matches = |line: &LedgerLine| {
+        let metadata = metadata.get(&line.id);
+        line_visible_to(metadata, caller)
+            && line_matches_resolved(line, metadata, with.as_ref(), from.as_ref(), to.as_ref())
+    };
+
+    if let Some(c2) = cursor2 {
+        if params.cursor.is_some() {
+            return Err(wire_err(
+                "bad_request",
+                "pick one cursor: cursor, or cursor2",
+            ));
+        }
+        let consumed = decode_cursor2(&c2)?;
+        if !c2.is_empty() && !cursor_sources_match(&consumed, &record.names) {
+            return Err(wire_err(
+                "bad_request",
+                "cursor2 journal sources changed; restart the history walk",
+            ));
+        }
+        let (lines, next) = page_composite(
+            &record.files,
+            &record.names,
+            record.workspace_file,
+            &matches,
+            &consumed,
+            limit,
+        );
+        return Ok(HistoryResult {
+            lines,
+            next_cursor: None,
+            next_cursor2: next.as_ref().map(encode_cursor2),
+        });
+    }
+
+    if record.files.len() > 1 {
+        if params.cursor.is_some() {
+            return Err(wire_err(
+                "bad_request",
+                "cursor seqs are per-journal and would skip messages with several sources; \
+                 page with cursor2 (opaque, from next_cursor2; empty string starts from the \
+                 beginning)",
+            ));
+        }
+        let mut lines = merge_files(&record.files, record.workspace_file);
+        lines.retain(&matches);
+        let excess = lines.len().saturating_sub(limit);
+        lines.drain(..excess);
+        let next_cursor2 = (!lines.is_empty()).then(|| {
+            let mut consumed: BTreeMap<String, u64> = BTreeMap::new();
+            for (file_index, file) in record.files.iter().enumerate() {
+                let max = file
+                    .iter()
+                    .filter(|line| matches!(line.kind, Kind::Msg | Kind::Fyi))
+                    .map(|line| line.seq)
+                    .max();
+                consumed.insert(record.names[file_index].clone(), max.unwrap_or(0));
+            }
+            encode_cursor2(&consumed)
+        });
+        return Ok(HistoryResult {
+            lines,
+            next_cursor: None,
+            next_cursor2,
+        });
+    }
+
+    let mut lines = merge_files(&record.files, record.workspace_file);
+    lines.retain(&matches);
+    let (lines, next_cursor) = page(lines, params.cursor, limit);
+    Ok(HistoryResult {
+        lines,
+        next_cursor,
+        next_cursor2: None,
+    })
+}
+
+pub(crate) fn query_thread(
+    record: &HistoryRecord,
+    id: &str,
+    caller: Option<&HistoryReader>,
+) -> Result<ThreadResult, WireError> {
+    if id.is_empty() {
+        return Err(wire_err("bad_request", "msg.thread needs a message id"));
+    }
+    let metadata = message_metadata(&record.files);
+    let visible_ids: HashSet<String> = merge_files(&record.files, record.workspace_file)
+        .into_iter()
+        .filter(|line| line_visible_to(metadata.get(&line.id), caller))
+        .map(|line| line.id)
+        .collect();
+    if !visible_ids.contains(id) {
+        return Err(no_such_message(id));
+    }
+    match thread_lines(&record.files, record.workspace_file, id) {
+        Some(mut lines) => {
+            lines.retain(|line| visible_ids.contains(&line.id));
+            Ok(ThreadResult { lines })
+        }
+        None => Err(no_such_message(id)),
+    }
+}
+
+fn redact_compatibility_bodies(lines: &mut [LedgerLine]) {
+    for line in lines {
+        line.body = None;
+    }
+}
+
+pub(crate) fn open_from_record(record: &HistoryRecord) -> Vec<OpenDelivery> {
+    open_from(&record.files, record.workspace_file)
 }
 
 /// Recover the display name last observed for a configured session.
@@ -415,196 +572,6 @@ pub(crate) fn latest_session_rename(
 
 fn valid_session_name(name: &str) -> bool {
     !name.trim().is_empty()
-}
-
-struct SessionJournalNode {
-    journal: String,
-    lines: Vec<LedgerLine>,
-    links: Vec<String>,
-    owners: BTreeSet<usize>,
-}
-
-/// Root session journals plus every rename-linked journal they reach.
-///
-/// History and boot recovery share this traversal so a linked compatibility
-/// chain cannot be visible to readers while remaining invisible to id preload
-/// or restart settlement. History sees each file once. Recovery sees each
-/// unambiguous family descendants-first and its configured root last, so a
-/// terminal fact appended to the root on an earlier boot follows the linked
-/// message that fact closes.
-pub(crate) fn session_journal_replay(
-    state_root: &StateRoot,
-    roots: Vec<(usize, String, Vec<LedgerLine>)>,
-) -> SessionJournalReplay {
-    let mut nodes = Vec::<SessionJournalNode>::new();
-    let mut by_journal = HashMap::<String, usize>::new();
-    let mut root_nodes = Vec::new();
-    let mut pending = VecDeque::<(usize, usize)>::new();
-    for (idx, journal, lines) in roots {
-        let node_idx = match by_journal.get(&journal).copied() {
-            Some(node_idx) => node_idx,
-            None => {
-                let node_idx = nodes.len();
-                by_journal.insert(journal.clone(), node_idx);
-                nodes.push(SessionJournalNode {
-                    links: linked_session_journals(&lines),
-                    journal,
-                    lines,
-                    owners: BTreeSet::new(),
-                });
-                node_idx
-            }
-        };
-        root_nodes.push((idx, node_idx));
-        if nodes[node_idx].owners.insert(idx) {
-            pending.push_back((node_idx, idx));
-        }
-    }
-
-    // The queue is one (journal, configured owner) pair. A cycle can revisit
-    // a file, but it cannot add the same owner twice, so traversal is bounded
-    // by files times configured roots.
-    while let Some((node_idx, owner)) = pending.pop_front() {
-        let links = nodes[node_idx].links.clone();
-        for linked in links {
-            let linked_idx = match by_journal.get(&linked).copied() {
-                Some(linked_idx) => linked_idx,
-                None => {
-                    let descendant = PathBuf::from("ledger").join(&linked);
-                    let lines = match cyclops_ledger::read_after(state_root, &descendant, 0) {
-                        Ok(lines) => lines,
-                        Err(read_error) => {
-                            warn!(journal = linked, error = %read_error, "linked session journal is unreadable");
-                            Vec::new()
-                        }
-                    };
-                    let linked_idx = nodes.len();
-                    by_journal.insert(linked.clone(), linked_idx);
-                    nodes.push(SessionJournalNode {
-                        links: linked_session_journals(&lines),
-                        journal: linked,
-                        lines,
-                        owners: BTreeSet::new(),
-                    });
-                    linked_idx
-                }
-            };
-            if nodes[linked_idx].owners.insert(owner) {
-                pending.push_back((linked_idx, owner));
-            }
-        }
-    }
-
-    for node in &nodes {
-        if node.owners.len() > 1 {
-            error!(
-                journal = node.journal,
-                owners = ?node.owners,
-                "linked session journal has more than one configured owner; restart recovery will leave it untouched"
-            );
-        }
-    }
-
-    fn collect_descendants_first(
-        node_idx: usize,
-        owner: usize,
-        nodes: &[SessionJournalNode],
-        by_journal: &HashMap<String, usize>,
-        visited: &mut HashSet<usize>,
-        order: &mut Vec<usize>,
-    ) {
-        if !visited.insert(node_idx)
-            || nodes[node_idx].owners.len() != 1
-            || !nodes[node_idx].owners.contains(&owner)
-        {
-            return;
-        }
-        for linked in &nodes[node_idx].links {
-            if let Some(linked_idx) = by_journal.get(linked).copied() {
-                collect_descendants_first(linked_idx, owner, nodes, by_journal, visited, order);
-            }
-        }
-        order.push(node_idx);
-    }
-
-    let mut recovery = Vec::new();
-    let mut history_order = Vec::new();
-    let mut history_seen = HashSet::new();
-    for (owner, root_idx) in root_nodes {
-        let mut visited = HashSet::new();
-        let mut family = Vec::new();
-        collect_descendants_first(
-            root_idx,
-            owner,
-            &nodes,
-            &by_journal,
-            &mut visited,
-            &mut family,
-        );
-        let lines = family
-            .iter()
-            .flat_map(|node_idx| nodes[*node_idx].lines.iter().cloned())
-            .collect();
-        for node_idx in family {
-            if history_seen.insert(node_idx) {
-                history_order.push(node_idx);
-            }
-        }
-        recovery.push((owner, lines));
-    }
-    // Ambiguously owned or otherwise unreachable nodes stay visible to
-    // history and id preload, but follow the unambiguous causal families.
-    for node_idx in 0..nodes.len() {
-        if history_seen.insert(node_idx) {
-            history_order.push(node_idx);
-        }
-    }
-    let mut nodes = nodes.into_iter().map(Some).collect::<Vec<_>>();
-    let files = history_order
-        .into_iter()
-        .map(|node_idx| {
-            let node = nodes[node_idx].take().expect("journal emitted once");
-            (node.journal, node.lines)
-        })
-        .collect();
-    SessionJournalReplay { files, recovery }
-}
-
-fn linked_session_journals(lines: &[LedgerLine]) -> Vec<String> {
-    lines
-        .iter()
-        .filter_map(|line| line.data.as_ref())
-        .filter(|data| data["event"] == "session_slot_aliased")
-        .filter_map(|data| data["canonical_journal"].as_str())
-        .filter_map(|file| {
-            if valid_session_journal_file(file) {
-                Some(file.to_owned())
-            } else {
-                warn!(journal = file, "invalid linked session journal was ignored");
-                None
-            }
-        })
-        .collect()
-}
-
-fn valid_session_journal_file(file: &str) -> bool {
-    let path = Path::new(file);
-    matches!(
-        path.components().collect::<Vec<_>>().as_slice(),
-        [Component::Normal(_)]
-    ) && path
-        .extension()
-        .is_some_and(|extension| extension == "ndjson")
-}
-
-fn read_session(slot: &crate::SessionSlot) -> Vec<LedgerLine> {
-    match slot.ledger.read_after(0) {
-        Ok(lines) => lines,
-        Err(e) => {
-            warn!(session = %slot.name(), error = %e, "history read failed; treating as empty");
-            Vec::new()
-        }
-    }
 }
 
 /// Fold one file's delivery-state lines into its msg/fyi lines. Returns the
@@ -766,25 +733,12 @@ pub(crate) fn merge_files(
 /// first. Same read model `msg.history` uses, so the answer does not
 /// depend on how much of the record a caller happens to be holding: a
 /// quota park from hours ago reads exactly like one from a second ago.
-pub(crate) fn open_deliveries(inner: &Inner) -> Vec<OpenDelivery> {
-    let (files, _, workspace_file) = history_sources(inner);
-    let mut open = open_from(&files, workspace_file);
-    if workspace_file.is_none() {
-        let Some(service) = &inner.mailbox else {
-            return open;
-        };
-        let workspace_ids = match service.workspace_message_ids() {
-            Ok(ids) => ids,
-            Err(error) => {
-                // The compatibility journals cannot safely answer which
-                // copy owns a message when workspace ownership is unreadable.
-                warn!(error = %error, "open delivery ownership is unreadable");
-                return Vec::new();
-            }
-        };
-        open.retain(|delivery| !workspace_ids.contains(&delivery.id));
+pub(crate) fn open_deliveries(inner: &Arc<Inner>) -> Vec<OpenDelivery> {
+    let compatibility = compatibility::CompatibilityHistoryAdapter::capture(inner).read();
+    match inner.workspace_messaging() {
+        Some(messaging) => messaging.retained_open_deliveries(compatibility),
+        None => open_from_record(&HistoryRecord::new(None, compatibility)),
     }
-    open
 }
 
 /// The fold half of [`open_deliveries`], split out so it tests on files.
@@ -882,17 +836,15 @@ fn message_metadata(files: &[Vec<LedgerLine>]) -> HashMap<String, MessageMetadat
 /// authoritative for workspace records. Pre-upgrade records have no stable
 /// participant identity, so agents cannot read them. Admin retains the
 /// compatibility view.
-fn line_visible_to(metadata: Option<&MessageMetadata>, caller: Option<&MailboxIdentity>) -> bool {
-    let Some(caller) = caller else {
+fn line_visible_to(metadata: Option<&MessageMetadata>, caller: Option<&HistoryReader>) -> bool {
+    let Some(caller) = caller.and_then(|caller| caller.durable) else {
         return true;
     };
-    if caller.key.is_admin() {
+    if caller.is_admin() {
         return true;
     }
     match metadata {
-        Some(metadata) => {
-            metadata.sender == caller.key || metadata.recipients.contains(&caller.key)
-        }
+        Some(metadata) => metadata.sender == caller || metadata.recipients.contains(&caller),
         None => false,
     }
 }
@@ -1199,13 +1151,81 @@ pub(crate) fn thread_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mailbox::{MailboxDirectory, MailboxSend, MailboxService, MessageStore};
+    use crate::mailbox::{
+        MailboxDirectory, MailboxIdentity, MailboxSend, MailboxService, MessageStore,
+    };
     use cyclops_proto::{
         Delivery, DeliveryState, LiveSessionKey, MessageId, MessagePresentation, OsBootId,
         ProcessInstanceId, RecipientPresentation, RequestContent, RequestDigest,
         SessionIdentityBinding, SessionInstanceId, TmuxPaneId, TmuxSessionId, VerifiedBy,
         WorkspaceId, CANONICAL_RECORD_VERSION,
     };
+
+    #[test]
+    fn socket_history_uses_the_messaging_module_and_named_compatibility_adapter() {
+        let source = include_str!("history.rs");
+        let production = source
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
+            .expect("primary history test module")
+            .0;
+        let entrypoints = production
+            .split_once("// Socket entry points")
+            .expect("history socket entry points")
+            .1
+            .split_once("// Identity (\"me\")")
+            .expect("history identity section")
+            .0;
+
+        for required in [
+            "CompatibilityHistoryAdapter",
+            "workspace_messaging_caller",
+            "messaging.history(",
+            "messaging.thread(",
+        ] {
+            assert!(
+                entrypoints.contains(required),
+                "history entry points bypassed the required seam: {required}"
+            );
+        }
+        for forbidden in [
+            "mailbox_caller",
+            "mailbox_publication",
+            "inner.mailbox",
+            "journal_lines(",
+            "redact_message_bodies",
+            "workspace_message_ids",
+        ] {
+            assert!(
+                !entrypoints.contains(forbidden),
+                "history entry points recovered messaging internals through {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_open_deliveries_use_the_messaging_module_for_current_ownership() {
+        let source = include_str!("history.rs");
+        let production = source
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
+            .expect("primary history test module")
+            .0;
+        let entrypoint = production
+            .split_once("pub(crate) fn open_deliveries(")
+            .expect("open-deliveries entry point")
+            .1
+            .split_once("pub(crate) fn open_from(")
+            .expect("open-deliveries fold")
+            .0;
+
+        assert!(entrypoint.contains("CompatibilityHistoryAdapter"));
+        assert!(entrypoint.contains("retained_open_deliveries"));
+        for forbidden in ["inner.mailbox", "workspace_message_ids"] {
+            assert!(
+                !entrypoint.contains(forbidden),
+                "open deliveries recovered current projection knowledge through {forbidden}"
+            );
+        }
+    }
     use std::path::Path;
     use std::str::FromStr;
 
@@ -1540,28 +1560,31 @@ mod tests {
             .unwrap(),
             supersedes: None,
         };
-        assert!(line_visible_to(Some(&metadata), Some(&alice)));
-        assert!(line_visible_to(Some(&metadata), Some(&bob)));
-        assert!(!line_visible_to(Some(&metadata), Some(&carol)));
+        let reader = |identity: &MailboxIdentity| {
+            HistoryReader::workspace(identity.label.clone(), identity.key)
+        };
+        assert!(line_visible_to(Some(&metadata), Some(&reader(&alice))));
+        assert!(line_visible_to(Some(&metadata), Some(&reader(&bob))));
+        assert!(!line_visible_to(Some(&metadata), Some(&reader(&carol))));
         assert!(line_visible_to(
             Some(&metadata),
-            Some(&MailboxIdentity {
+            Some(&reader(&MailboxIdentity {
                 key: RecipientKey::admin(workspace),
                 label: "admin".into(),
-            })
+            }))
         ));
 
         // Pre-upgrade labels cannot bind a live agent to an old participant.
         // Reusing Alice's label must not disclose the compatibility record.
-        assert!(!line_visible_to(None, Some(&carol)));
+        assert!(!line_visible_to(None, Some(&reader(&carol))));
         let outsider = workspace_identity("00000000-0000-0000-0000-000000000005", "%4", "outsider");
-        assert!(!line_visible_to(None, Some(&outsider)));
+        assert!(!line_visible_to(None, Some(&reader(&outsider))));
         assert!(line_visible_to(
             None,
-            Some(&MailboxIdentity {
+            Some(&reader(&MailboxIdentity {
                 key: RecipientKey::admin(workspace),
                 label: "admin".into(),
-            })
+            }))
         ));
     }
 

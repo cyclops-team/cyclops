@@ -17,136 +17,10 @@ use std::time::Duration;
 
 use cyclops_proto::{MessageId, NotificationAttemptId};
 use serde_json::{json, Value};
-use tokio::io::AsyncWriteExt;
-use tokio::net::UnixStream;
 
+use crate::action::{ActionOutcome, ActionRequest};
 use crate::detail::{Check, Loaded, ThreadEntry};
-use crate::wire::{encode_json, FrameReader};
-
-/// What a request is doing, which decides how its silence is read.
-///
-/// A read is not automatically harmless: an open that claims mutates a
-/// mailbox. Carrying this with the request is what lets an unanswered
-/// claiming open be recorded as unknown rather than as nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequestKind {
-    Read { claims: bool },
-    Act(crate::detail::Action),
-}
-
-/// One in-flight request, named so its answer cannot land anywhere else.
-///
-/// The nonce is minted per request and never reused, so a response that
-/// arrives after the reader closed one detail and opened another is
-/// dropped rather than applied to a detail that never asked for it. The
-/// target is carried too: two checks, because this one is about a body
-/// reaching the wrong reader.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestToken {
-    pub nonce: String,
-    /// The frozen row AND the exact attempt, together.
-    ///
-    /// Both, because they answer different questions. The row says which
-    /// detail may apply this answer and survives an alarm appearing or
-    /// clearing underneath it. The attempt says what the request was
-    /// actually about, and it is allowed to change: a requeue replaces
-    /// it, so an answer carrying the old one must not be applied to a
-    /// detail now looking at the new one.
-    pub frozen: crate::queue::FrozenTarget,
-    pub kind: RequestKind,
-}
-
-impl RequestToken {
-    pub fn new(frozen: crate::queue::FrozenTarget, kind: RequestKind) -> RequestToken {
-        RequestToken {
-            nonce: uuid::Uuid::new_v4().to_string(),
-            frozen,
-            kind,
-        }
-    }
-
-    /// The stable row this request belongs to.
-    pub fn row(&self) -> &crate::queue::QueueTarget {
-        &self.frozen.target
-    }
-
-    /// The exact attempt this request names, if any.
-    pub fn attempt(&self) -> Option<cyclops_proto::NotificationAttemptId> {
-        self.frozen.attempt
-    }
-
-    /// Did this request mutate anything, if it reached the daemon?
-    pub fn mutates(&self) -> bool {
-        match self.kind {
-            RequestKind::Read { claims } => claims,
-            RequestKind::Act(_) => true,
-        }
-    }
-
-    pub fn action(&self) -> Option<crate::detail::Action> {
-        match self.kind {
-            RequestKind::Act(action) => Some(action),
-            RequestKind::Read { .. } => None,
-        }
-    }
-}
-
-/// One thing to ask the daemon for an open detail.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ActionRequest {
-    /// Open a message. `claim` is true only for an inbound pending row:
-    /// a claim is what authorizes the body, and claiming something you
-    /// are only observing would take somebody else's mail.
-    OpenMessage {
-        message_id: MessageId,
-        claim: bool,
-    },
-    /// Open an alarm. Always by attempt id: a message id resolves only
-    /// when exactly one recipient is stuck, and a broadcast with two
-    /// answers ambiguous_attention.
-    OpenAttention {
-        attempt_id: NotificationAttemptId,
-    },
-    Reply {
-        message_id: MessageId,
-        body: String,
-        client_key: String,
-    },
-    WithdrawNotification {
-        attempt_id: NotificationAttemptId,
-        recipient: cyclops_proto::RecipientKey,
-    },
-    ClearAlarm {
-        attempt_id: NotificationAttemptId,
-    },
-    AttentionComplete {
-        attempt_id: NotificationAttemptId,
-    },
-    AttentionDiscard {
-        attempt_id: NotificationAttemptId,
-    },
-}
-
-/// What came back.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ActionOutcome {
-    /// A read succeeded and this is what the detail shows.
-    Opened(Box<Loaded>),
-    /// A mutation succeeded.
-    Done(String),
-    /// The daemon refused. Final: the operator should read it, not retry.
-    Refused { code: String, message: String },
-    /// The request never left this process. Nothing happened.
-    ///
-    /// A connect or hello failure is knowledge, not doubt: the daemon
-    /// never saw the request, so every action is still available.
-    NotSent(String),
-    /// The request was written and the outcome is unknown. It may have
-    /// landed, so a reply must be retried under the same key and the
-    /// terminal verbs must not be repeated as fresh actions. A later
-    /// matching terminal-accepted fact may permit no-key reconciliation.
-    Uncertain(String),
-}
+use cyclops_client::{AsyncClient, Certainty, ClientError};
 
 /// One request on one connection.
 ///
@@ -459,95 +333,57 @@ pub(crate) const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 /// request the daemon never saw. The phases are split so silence before
 /// the write is reported as the knowledge it is.
 async fn call(sock: &Path, method: &str, params: Value) -> Result<Value, Failure> {
-    let connected = match tokio::time::timeout(OPEN_TIMEOUT, open(sock)).await {
-        Ok(result) => result?,
-        Err(_) => {
-            return Err(Failure::NotSent(format!(
-                "no connection within {}s",
-                OPEN_TIMEOUT.as_secs()
-            )))
+    let mut client = AsyncClient::connect(sock, OPEN_TIMEOUT)
+        .await
+        .map_err(|error| failure_from_client(error, method))?;
+    client
+        .request(method, params, ANSWER_TIMEOUT)
+        .await
+        .map_err(|error| failure_from_client(error, method))
+}
+
+fn failure_from_client(error: ClientError, method: &str) -> Failure {
+    if let ClientError::Server { code, message, .. } = error {
+        return Failure::Refused { code, message };
+    }
+    let certainty = error.certainty();
+    let why = match error {
+        ClientError::ConnectTimeout(_) | ClientError::HelloTimeout(_) => {
+            format!("no connection within {}s", OPEN_TIMEOUT.as_secs())
         }
+        ClientError::ReadTimeout(_) => {
+            format!(
+                "{method} did not answer within {}s",
+                ANSWER_TIMEOUT.as_secs()
+            )
+        }
+        ClientError::NotRunning(cause) => format!("connect: {cause}"),
+        other => other.cause(),
     };
-    match tokio::time::timeout(ANSWER_TIMEOUT, ask(connected, method, params)).await {
-        Ok(result) => result,
-        Err(_) => Err(Failure::Uncertain(format!(
-            "{method} did not answer within {}s",
-            ANSWER_TIMEOUT.as_secs()
-        ))),
+    match certainty {
+        Certainty::KnownNotSent => Failure::NotSent(why),
+        Certainty::OutcomeUnknown | Certainty::StreamGap => Failure::Uncertain(why),
+        Certainty::Refused => unreachable!("daemon refusals were handled above"),
     }
-}
-
-/// Connect and read the hello. Nothing here writes a request, so every
-/// failure in this function is known-not-sent.
-type Connection = (
-    FrameReader<tokio::net::unix::OwnedReadHalf>,
-    tokio::net::unix::OwnedWriteHalf,
-);
-
-async fn open(sock: &Path) -> Result<Connection, Failure> {
-    let stream = UnixStream::connect(sock)
-        .await
-        .map_err(|e| Failure::NotSent(format!("connect: {e}")))?;
-    let (read, write) = stream.into_split();
-    let mut frames = FrameReader::new(read);
-    let frame = frames
-        .next_frame()
-        .await
-        .map_err(|e| Failure::NotSent(format!("hello: {e}")))?
-        .ok_or_else(|| Failure::NotSent("closed before the hello".into()))?;
-    match serde_json::from_slice::<cyclops_proto::Hello>(&frame) {
-        Ok(_) => Ok((frames, write)),
-        Err(_) => Err(Failure::NotSent("not a cyclops daemon".into())),
-    }
-}
-
-/// Write one request and read its answer.
-///
-/// The request is written by a single write_all of one line ending in a
-/// newline. That matters for how its failure is read: the daemon parses
-/// per line, so a write that errors has either delivered a whole line or
-/// an unterminated fragment the daemon cannot act on. Neither case is a
-/// half-executed request, which is why a write error is reported as
-/// not-sent. Everything after the write is uncertain.
-async fn ask(connection: Connection, method: &str, params: Value) -> Result<Value, Failure> {
-    let (mut frames, mut w) = connection;
-    let request = json!({ "id": 1, "method": method, "params": params });
-    let mut request =
-        encode_json(&request).map_err(|e| Failure::NotSent(format!("encode request: {e}")))?;
-    request.push(b'\n');
-    w.write_all(&request)
-        .await
-        .map_err(|e| Failure::NotSent(format!("send: {e}")))?;
-
-    let frame = frames
-        .next_frame()
-        .await
-        .map_err(|e| Failure::Uncertain(format!("read: {e}")))?
-        .ok_or_else(|| Failure::Uncertain("connection closed before an answer".into()))?;
-    let response: cyclops_proto::Response = serde_json::from_slice(&frame)
-        .map_err(|e| Failure::Uncertain(format!("malformed {method} answer: {e}")))?;
-    if response.id != 1 {
-        return Err(Failure::Uncertain(format!(
-            "{method} returned the wrong response id"
-        )));
-    }
-    if let Some(error) = response.error {
-        return Err(Failure::Refused {
-            code: error.code,
-            message: error.message,
-        });
-    }
-    response
-        .result
-        .ok_or_else(|| Failure::Uncertain(format!("{method} returned no result")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::str::FromStr;
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
+
+    #[test]
+    fn hello_timeout_keeps_the_existing_open_phase_sentence() {
+        // Obsolete when action presentation intentionally distinguishes a
+        // connected socket from a completed pre-write daemon handshake.
+        let failure = failure_from_client(ClientError::HelloTimeout(OPEN_TIMEOUT), "ping");
+        assert!(matches!(
+            failure,
+            Failure::NotSent(message) if message == "no connection within 3s"
+        ));
+    }
 
     /// A real greeting. The client rejects anything else, so a fixture
     /// that fakes one is testing a daemon that does not exist.
@@ -590,6 +426,50 @@ mod tests {
 
         let outcome = perform(&sock, request).await;
         (server.await.unwrap(), outcome)
+    }
+
+    #[tokio::test]
+    async fn a_bounded_oversized_response_error_remains_outcome_uncertain() {
+        let home = cyclops_proto::scratch::scratch_dir("ui-action-io-frame-too-large");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let sock = home.join(cyclops_proto::SOCK_NAME);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            write.write_all(hello_line().as_bytes()).await.unwrap();
+            let mut lines = BufReader::new(read).lines();
+            let asked: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            let answer = json!({
+                "id": asked["id"],
+                "error": {
+                    "code": cyclops_proto::FrameContract::TOO_LARGE_CODE,
+                    "message": "daemon response was too large; request outcome is unknown"
+                }
+            });
+            write
+                .write_all(format!("{answer}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+
+        let outcome = perform(
+            &sock,
+            ActionRequest::AttentionComplete {
+                attempt_id: NotificationAttemptId::parse(
+                    "att-00000000-0000-4000-8000-000000000019",
+                )
+                .unwrap(),
+            },
+        )
+        .await;
+        server.await.unwrap();
+        match outcome {
+            ActionOutcome::Uncertain(why) => assert!(why.contains("outcome is unknown"), "{why}"),
+            other => panic!("oversized daemon response was misclassified: {other:?}"),
+        }
     }
 
     #[tokio::test]

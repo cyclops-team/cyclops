@@ -6,6 +6,27 @@
 
 use cyclops_testrig::{tmux_available, TmuxServer};
 use cyclops_tmux::{ControlClient, ControlConfig};
+use std::path::{Path, PathBuf};
+
+struct ScratchHome(PathBuf);
+
+impl ScratchHome {
+    fn new(tag: &str) -> Self {
+        let path = cyclops_proto::scratch::scratch_dir(tag);
+        let _ = std::fs::remove_dir_all(&path);
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 struct Rig {
     server: TmuxServer,
@@ -534,11 +555,15 @@ async fn deliberate_minimized_pane_survives_ordinary_resizes_and_takeover_and_re
         following: std::collections::BTreeSet::new(),
     };
 
-    let temp_home = std::env::temp_dir();
-    let modified =
-        cyclops_workspace::app::recover_post_resize_geometry(&sizing, &client, &temp_home, None)
-            .await
-            .expect("recover");
+    let temp_home = ScratchHome::new("cyc-workspace-geometry-recovery");
+    let modified = cyclops_workspace::app::recover_post_resize_geometry(
+        &sizing,
+        &client,
+        temp_home.path(),
+        None,
+    )
+    .await
+    .expect("recover");
     assert!(modified, "recovery must re-collapse reflowed pane");
     assert_eq!(
         rig.pane_heights("geo6"),
@@ -552,10 +577,14 @@ async fn deliberate_minimized_pane_survives_ordinary_resizes_and_takeover_and_re
         .await
         .expect("resize window 2");
     rig.server.run_ok(&["resize-pane", "-t", "%1", "-y", "8"]);
-    let modified2 =
-        cyclops_workspace::app::recover_post_resize_geometry(&sizing, &client, &temp_home, None)
-            .await
-            .expect("recover 2");
+    let modified2 = cyclops_workspace::app::recover_post_resize_geometry(
+        &sizing,
+        &client,
+        temp_home.path(),
+        None,
+    )
+    .await
+    .expect("recover 2");
     assert!(modified2);
     assert_eq!(rig.pane_heights("geo6"), vec![45, 1]);
 
@@ -612,11 +641,15 @@ async fn byte_exact_malformed_provenance_rejects_trailing_tabs_and_spaces() {
         following: std::collections::BTreeSet::new(),
     };
 
-    let temp_home = std::env::temp_dir();
-    let modified =
-        cyclops_workspace::app::recover_post_resize_geometry(&sizing, &client, &temp_home, None)
-            .await
-            .expect("recover");
+    let temp_home = ScratchHome::new("cyc-workspace-geometry-malformed");
+    let modified = cyclops_workspace::app::recover_post_resize_geometry(
+        &sizing,
+        &client,
+        temp_home.path(),
+        None,
+    )
+    .await
+    .expect("recover");
     assert!(
         !modified,
         "malformed provenance must fail closed with 0 mutations"

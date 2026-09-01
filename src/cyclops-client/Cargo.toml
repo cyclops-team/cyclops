@@ -1,0 +1,14 @@
+[package]
+name = "cyclops-client"
+version.workspace = true
+edition.workspace = true
+description = "Shared bounded daemon transport for official Cyclops clients."
+
+[dependencies]
+cyclops-proto.workspace = true
+libc.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

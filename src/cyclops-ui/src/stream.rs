@@ -9,7 +9,8 @@
 //! second, and both should read this module rather than keep a private
 //! copy of any of the five things it owns:
 //!
-//! - initial backfill and live `events.subscribe` ordering ([`Intake`]);
+//! - connection-epoch backfill and live `events.subscribe` ordering
+//!   ([`crate::StreamProjectionState`]);
 //! - entry normalization and resolution rows ([`Entry::from_event`],
 //!   [`Entry::from_ledger`], [`Entry::cleared`] — the append-only second
 //!   line an alarm gets when it ends, `docs/development/INVARIANTS.md` rule 8);
@@ -25,7 +26,7 @@
 //! attention register (`cyclops_proto::attention`), and the uid counter,
 //! and its three verbs are the only way anything enters it — [`Record::
 //! replay`] for a line from history, [`Record::live`] for the daemon's
-//! push, [`Record::seed`] for the one-time startup reconciliation. A
+//! push, [`Record::seed`] for an authoritative epoch reconciliation. A
 //! renderer's own UI state (scrolling, selection, a sidebar, key
 //! bindings) stays out of it; `App` in app.rs holds one and delegates.
 
@@ -40,7 +41,14 @@ use serde_json::Value;
 
 use crate::grid;
 
-/// The one-shot startup reconciliation: which sessions the daemon watches,
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// One authoritative connection-epoch reconciliation: which sessions the daemon watches,
 /// where every pane stands right now, and every delivery it still counts
 /// as needing a human.
 ///
@@ -512,7 +520,7 @@ impl Entry {
         }
     }
 
-    /// The pane a focus jump should land on, when the entry names one.
+    /// The pane a focus request should select, when the entry names one.
     pub fn focus_target(&self) -> Option<&str> {
         match &self.kind {
             EntryKind::Msg { from, .. } => Some(from),
@@ -520,10 +528,10 @@ impl Entry {
             EntryKind::State {
                 pane_id, target, ..
             } => Some(pane_id.as_deref().unwrap_or(target)),
-            // A clearance jumps where its alarm row jumped: the pane it
+            // A clearance focuses where its alarm row focused: the pane it
             // was about, or the delivery's recipient. Except when the pane
             // is the thing that went away, which is the same reason
-            // PaneGone offers no jump: tmux has retired that id.
+            // PaneGone offers no focus target: tmux has retired that id.
             EntryKind::Cleared {
                 how: Clearance::PaneGone,
                 ..
@@ -532,7 +540,7 @@ impl Entry {
                 AttentionItem::Agent { pane_id, .. } => pane_id,
                 AttentionItem::Delivery { to, .. } => to,
             }),
-            // No jump for a pane that is gone; the notice would be the
+            // No focus request for a pane that is gone; the notice would be the
             // whole answer, so say nothing instead.
             _ => None,
         }
@@ -819,7 +827,7 @@ fn other_detail(d: &Value) -> Option<String> {
 /// produced (a socket subscription for `cyclops watch`, a different one
 /// for a workspace panel), and gets back the same three-group ordering
 /// either way.
-pub struct Intake {
+pub(crate) struct Intake {
     backfilled: bool,
     pending: Vec<Entry>,
     pending_status: Option<Box<StatusSeed>>,
@@ -892,7 +900,7 @@ impl Intake {
 /// order: `replayed` is history and moves nothing but the screen, `seed`
 /// is the daemon's snapshot and replaces the register, `live` are the
 /// transitions that happened while the two were loading.
-pub struct Backfilled {
+pub(crate) struct Backfilled {
     pub replayed: Vec<Entry>,
     pub seed: Option<Box<StatusSeed>>,
     pub live: Vec<Entry>,
@@ -905,7 +913,7 @@ pub struct Backfilled {
 /// Three verbs are the only way anything enters it, one per source, which
 /// is what lets [`Record::admits`] answer for a line without asking what
 /// produced it: [`Record::replay`] for history, [`Record::live`] for the
-/// daemon's push, [`Record::seed`] for the one-time startup reconciliation.
+/// daemon's push, [`Record::seed`] for an authoritative epoch reconciliation.
 /// What needs a human is NOT decided anywhere else: the register and the
 /// rule live in `cyclops_proto::attention`, and this only ever feeds it
 /// the daemon's snapshot and live events, never a replayed line
@@ -1209,7 +1217,7 @@ impl Record {
                     // the line is stamped when the reading was taken. It
                     // says where the pane stands now, which is what status
                     // is.
-                    ts: crate::data::now_ms(),
+                    ts: now_ms(),
                     seq: None,
                     id: None,
                     kind: EntryKind::State {
@@ -1232,7 +1240,7 @@ impl Record {
                         // The record's own transition time: this line can
                         // be hours older than the replayed tail above it,
                         // and saying so is the point of showing it at all.
-                        ts: record.map_or_else(crate::data::now_ms, |d| d.ts),
+                        ts: record.map_or_else(now_ms, |d| d.ts),
                         seq: None,
                         id: Some(id.clone()),
                         kind: EntryKind::Delivery {
@@ -1260,7 +1268,7 @@ impl Record {
         //    that under the row the reader is looking at.
         for (item, recipient, how) in self.alarms_the_answer_cleared() {
             out.push(Entry::cleared(
-                crate::data::now_ms(),
+                now_ms(),
                 None,
                 recipient,
                 Resolved { was: item, how },
@@ -2205,9 +2213,9 @@ mod tests {
         assert_eq!(r.entries().next().unwrap().uid, 11);
     }
 
-    /// The seam a future workspace panel's parity test reuses: one
+    /// The seam a workspace panel's parity test reuses: one
     /// backfill-plus-live transcript, fed through the exact ordering
-    /// [`Intake`] enforces, has to yield the four guarantees any renderer
+    /// [`crate::StreamProjectionState`] exposes, has to yield the four guarantees any renderer
     /// depends on: row order, stable identity across the update, the
     /// resolution row an ending alarm gets, and a calm-view decision that
     /// answers to the register's CURRENT state rather than to a stale scan.

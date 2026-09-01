@@ -378,10 +378,11 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "cyclops"
-version = "0.1.0"
+version = "0.1.0-beta"
 dependencies = [
  "anyhow",
  "clap",
+ "cyclops-client",
  "cyclops-manifest",
  "cyclops-proto",
  "cyclops-state",
@@ -399,8 +400,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cyclops-client"
+version = "0.1.0-beta"
+dependencies = [
+ "cyclops-proto",
+ "libc",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "cyclops-ledger"
-version = "0.1.0"
+version = "0.1.0-beta"
 dependencies = [
  "cyclops-proto",
  "cyclops-state",
@@ -412,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "cyclops-manifest"
-version = "0.1.0"
+version = "0.1.0-beta"
 dependencies = [
  "cyclops-proto",
  "libc",
@@ -426,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "cyclops-proto"
-version = "0.1.0"
+version = "0.1.0-beta"
 dependencies = [
  "serde",
  "serde_json",
@@ -437,20 +448,22 @@ dependencies = [
 
 [[package]]
 name = "cyclops-state"
-version = "0.1.0"
+version = "0.1.0-beta"
 dependencies = [
  "libc",
+ "serde",
  "tempfile",
  "thiserror 2.0.19",
+ "toml",
 ]
 
 [[package]]
 name = "cyclops-testrig"
-version = "0.1.0"
+version = "0.1.0-beta"
 
 [[package]]
 name = "cyclops-theme"
-version = "0.1.0"
+version = "0.1.0-beta"
 dependencies = [
  "cyclops-proto",
  "cyclops-state",
@@ -461,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "cyclops-tmux"
-version = "0.1.0"
+version = "0.1.0-beta"
 dependencies = [
  "cyclops-proto",
  "cyclops-state",
@@ -476,15 +489,14 @@ dependencies = [
 
 [[package]]
 name = "cyclops-ui"
-version = "0.1.0"
+version = "0.1.0-beta"
 dependencies = [
+ "cyclops-client",
  "cyclops-ledger",
  "cyclops-proto",
  "cyclops-state",
  "cyclops-theme",
- "cyclops-tmux",
  "libc",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -493,17 +505,17 @@ dependencies = [
 
 [[package]]
 name = "cyclops-workspace"
-version = "0.1.0"
+version = "0.1.0-beta"
 dependencies = [
  "alacritty_terminal",
  "crossterm",
+ "cyclops-client",
  "cyclops-proto",
  "cyclops-state",
  "cyclops-testrig",
  "cyclops-theme",
  "cyclops-tmux",
  "cyclops-ui",
- "libc",
  "ratatui",
  "serde_json",
  "thiserror 2.0.19",
@@ -515,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "cyclopsd"
-version = "0.1.0"
+version = "0.1.0-beta"
 dependencies = [
  "anyhow",
  "clap",

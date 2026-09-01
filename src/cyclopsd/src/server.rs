@@ -5,35 +5,31 @@
 //! own broadcast receiver, a lagged receiver is dropped with a warning,
 //! and writes carry a timeout so a wedged client costs one connection.
 
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::future::Future;
-use std::pin::Pin;
+use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::Context as _;
-#[cfg(test)]
-use cyclops_proto::TmuxPaneId;
 use cyclops_proto::{
-    AdminNotifyParams, AgentWaitParams, AlarmClearParams, AlarmClearResult, AlarmPreviewParams,
-    AlarmPreviewResult, AlarmSummary, AttentionResolveParams, AttentionShowParams,
-    ClaimDisposition, DaemonShutdownParams, DaemonShutdownResult, DeliveryState, Event, Hello,
-    InboxClaimParams, InboxClaimResult, InboxListParams, InboxListResult, InboxSummaryEntry,
-    MessagesFollowParams, MessagesSnapshotParams, MsgSendParams, NotificationAttemptId,
-    NotificationAttentionCause, NotificationRecord, NotificationResolution,
+    AdminNotifyParams, AgentWaitParams, AlarmClearParams, AlarmPreviewParams,
+    AttentionResolveParams, AttentionShowParams, DaemonShutdownParams, DaemonShutdownResult, Event,
+    FrameContract, FrameSize, Hello, InboxClaimParams, InboxListParams, MessagesFollowParams,
+    MessagesSnapshotParams, MsgSendParams, NotificationAttemptId, NotificationResolution,
     NotificationWithdrawParams, PaneReadParams, PaneReadResult, PaneReadSource, PingResult,
     ProcessInstanceId, QuiesceParams, RecipientKey, ReplyParams, Request, RequeueParams,
-    RequeueResult, Response, SessionStatus, StateReportParams, StatusMailboxRoute, StatusParams,
-    StatusResult, SubscribeParams, WireError, PROTOCOL_VERSION,
+    RequeueResult, Response, SessionStatus, StateReportParams, StatusParams, StatusResult,
+    StreamBackfillParams, SubscribeParams, WireError, PROTOCOL_VERSION,
 };
+#[cfg(test)]
+use cyclops_proto::{AlarmPreviewResult, NotificationAttentionCause, TmuxPaneId};
 use cyclops_state::{BoundSocketCleanup, StateRoot};
 use cyclops_tmux::SessionWatcher;
+use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, watch};
-use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::{ack, delivery, fusion, identity, unix_ms, Inner};
@@ -41,19 +37,17 @@ use crate::{ack, delivery, fusion, identity, unix_ms, Inner};
 /// Peer credentials captured once per connection, before the stream is
 /// split. None means the kernel could not report them; identity-gated
 /// methods fail closed on it.
-type Peer = Option<identity::PeerConn>;
+pub(crate) type Peer = Option<identity::PeerConn>;
 
 /// A write that does not finish inside this window means the client is
 /// wedged; the connection is dropped rather than buffered without bound.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
-const STATUS_REFRESH_BUDGET: Duration = Duration::from_millis(250);
-const STATUS_REFRESH_CONCURRENCY: usize = 8;
 const STATUS_BLOCKED_NOTIFICATION_LIMIT: usize = 32;
 const STATUS_REFRESH_INCOMPLETE: &str = "status_refresh_incomplete";
 
 /// The same source build identifier written on the daemon boot log line.
-const BUILD_REF: &str = env!("CYCLOPS_BUILD_REF");
+const BUILD_REF: &str = cyclops_proto::BUILD_REF;
 
 /// One kernel observation shared by every hello and status answer.
 fn daemon_process() -> Option<ProcessInstanceId> {
@@ -235,11 +229,14 @@ pub(crate) async fn handle_conn(inner: Arc<Inner>, stream: UnixStream) {
         proto: PROTOCOL_VERSION,
         boot_id: inner.boot_id.clone(),
     };
-    let hello_line = serde_json::to_string(&hello).expect("hello serializes");
-    if !write_line(&mut w, &hello_line).await {
+    let Ok(hello_frame) = encode_frame(&hello) else {
+        warn!("daemon hello exceeds the official frame contract");
+        return;
+    };
+    if !write_frame(&mut w, &hello_frame).await {
         return;
     }
-    let mut lines = BufReader::new(read_half).lines();
+    let mut reader = BufReader::new(read_half);
     let mut sub: Option<(broadcast::Receiver<Event>, Vec<String>)> = None;
     let mut stop = inner.stop.clone();
 
@@ -250,9 +247,9 @@ pub(crate) async fn handle_conn(inner: Arc<Inner>, stream: UnixStream) {
                 match &mut sub {
                     Some((rx, _)) => tokio::select! {
                         ev = rx.recv() => Pumped::Ev(ev),
-                        line = lines.next_line() => Pumped::Line(line),
+                        line = read_frame(&mut reader) => Pumped::Line(line),
                     },
-                    None => Pumped::Line(lines.next_line().await),
+                    None => Pumped::Line(read_frame(&mut reader).await),
                 }
             } => pumped,
         };
@@ -260,10 +257,18 @@ pub(crate) async fn handle_conn(inner: Arc<Inner>, stream: UnixStream) {
             Pumped::Ev(Ok(ev)) => {
                 let kinds = &sub.as_ref().expect("subscribed").1;
                 if kind_matches(kinds, &ev.event) {
-                    let Ok(line) = serde_json::to_string(&ev) else {
-                        continue;
+                    let frame = match encode_frame(&ev) {
+                        Ok(frame) => frame,
+                        Err(FrameEncodeError::TooLarge) => {
+                            warn!("event exceeds the official frame contract; dropping connection");
+                            return;
+                        }
+                        Err(FrameEncodeError::Serialize(error)) => {
+                            warn!(error = %error, "event serialization failed; dropping connection");
+                            return;
+                        }
                     };
-                    if !write_line(&mut w, &line).await {
+                    if !write_frame(&mut w, &frame).await {
                         return;
                     }
                 }
@@ -284,7 +289,11 @@ pub(crate) async fn handle_conn(inner: Arc<Inner>, stream: UnixStream) {
                 LineOutcome::Subscribed(kinds, rx) => sub = Some((rx, kinds)),
             },
             // EOF or read error: the client is gone.
-            Pumped::Line(_) => return,
+            Pumped::Line(Err(error)) => {
+                debug!(error = %error, "client frame rejected; dropping connection");
+                return;
+            }
+            Pumped::Line(Ok(None)) => return,
         }
     }
 }
@@ -304,8 +313,10 @@ async fn handle_line(
         Err(resp) => {
             // Malformed JSON answers with bad_request and a null id; the
             // connection stays open.
-            let text = serde_json::to_string(&resp).expect("response serializes");
-            return if write_line(w, &text).await {
+            let Some(frame) = response_frame(&resp) else {
+                return LineOutcome::Drop;
+            };
+            return if write_frame(w, &frame).await {
                 LineOutcome::Continue
             } else {
                 LineOutcome::Drop
@@ -322,16 +333,18 @@ async fn handle_line(
             .and_then(|result| result.get("stopping"))
             .and_then(Value::as_bool)
             == Some(true);
-    let text = serde_json::to_string(&resp).expect("response serializes");
+    let Some(frame) = response_frame(&resp) else {
+        return LineOutcome::Drop;
+    };
     if let Some(params) = subscribe {
         // Subscribe before writing the ack so no event can fall between.
         let rx = inner.events.subscribe();
-        if !write_line(w, &text).await {
+        if !write_frame(w, &frame).await {
             return LineOutcome::Drop;
         }
         return LineOutcome::Subscribed(params.kinds, rx);
     }
-    if write_line(w, &text).await {
+    if write_frame(w, &frame).await {
         if shutdown_after_write {
             inner.shutdown_request.send_replace(true);
             return LineOutcome::Drop;
@@ -420,7 +433,7 @@ pub(crate) async fn dispatch(
                     Err(r) => return (r, None),
                 },
             };
-            let incomplete = refresh_status_detections(inner).await;
+            let incomplete = crate::refresh_status_observations(inner).await;
             let result = status_result_with_refresh(inner, params.open_deliveries, &incomplete);
             (
                 Response::ok(id, serde_json::to_value(result).expect("status serializes")),
@@ -717,10 +730,28 @@ pub(crate) async fn dispatch(
                     }
                 }
             };
-            if params.cursor.is_some() {
-                debug!("subscribe cursor ignored: ledger replay lands with the stream client (M3)");
-            }
+            // `cursor` is accepted only as a compatibility input. This
+            // stream is deliberately ephemeral; authoritative recovery is a
+            // snapshot or a domain-specific follow page.
             (Response::ok(id, json!({"subscribed": true})), Some(params))
+        }
+        "events.backfill" => {
+            let params: StreamBackfillParams = if req.params.is_null() {
+                StreamBackfillParams::default()
+            } else {
+                match decode_params(&id, req.params, "events.backfill params") {
+                    Ok(params) => params,
+                    Err(response) => return (response, None),
+                }
+            };
+            let result = crate::history::stream_backfill(inner, params);
+            (
+                Response::ok(
+                    id,
+                    serde_json::to_value(result).expect("stream backfill serializes"),
+                ),
+                None,
+            )
         }
         "workspace_ui.get" => {
             let result = crate::workspace_ui::workspace_ui_get(&inner.workspace_ui);
@@ -751,7 +782,7 @@ pub(crate) async fn dispatch(
             (Response::ok(id, json!({"saved": true})), None)
         }
         "notification.force_submit.get" => {
-            if let Err(error) = require_mailbox_admin(inner, peer) {
+            if let Err(error) = require_workspace_messaging_admin(inner, peer) {
                 return (
                     Response {
                         id,
@@ -775,7 +806,7 @@ pub(crate) async fn dispatch(
             )
         }
         "notification.force_submit.set" => {
-            if let Err(error) = require_mailbox_admin(inner, peer) {
+            if let Err(error) = require_workspace_messaging_admin(inner, peer) {
                 return (
                     Response {
                         id,
@@ -801,11 +832,16 @@ pub(crate) async fn dispatch(
                 );
             }
             let delay_ms = u64::from(params.delay_seconds) * 1_000;
-            if let Err(error) = crate::config::save_force_notification_submit(
-                &inner.cfg.home,
-                params.enabled,
-                delay_ms,
-            ) {
+            if let Err(error) = inner
+                .force_submit
+                .save_and_set(params.enabled, delay_ms, || {
+                    crate::config::save_force_notification_submit(
+                        &inner.cfg.home,
+                        params.enabled,
+                        delay_ms,
+                    )
+                })
+            {
                 return (
                     Response::err(
                         id,
@@ -815,9 +851,10 @@ pub(crate) async fn dispatch(
                     None,
                 );
             }
-            inner.force_submit.set(params.enabled, delay_ms);
             if params.enabled {
-                crate::messaging::schedule_force_submit_candidates(inner);
+                if let Some(messaging) = inner.workspace_messaging() {
+                    messaging.force_submit_enabled();
+                }
             }
             let result = cyclops_proto::ForceSubmitSettings {
                 enabled: params.enabled,
@@ -902,7 +939,7 @@ async fn msg_send(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> R
             "send wait is not supported for mailbox notifications",
         );
     }
-    let (service, sender) = match mailbox_caller(inner, peer) {
+    let (messaging, sender) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
@@ -923,7 +960,7 @@ async fn msg_send(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> R
             "a reply cannot be an announcement or supersede another message",
         );
     }
-    match crate::messaging::send(inner, &service, sender, params).await {
+    match messaging.send(sender, params).await {
         Ok(result) => Response::ok(
             id,
             serde_json::to_value(result).expect("message acceptance serializes"),
@@ -937,20 +974,19 @@ async fn msg_reply(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> 
         Ok(params) => params,
         Err(response) => return response,
     };
-    let (service, sender) = match mailbox_caller(inner, peer) {
+    let (messaging, sender) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    match crate::messaging::reply(
-        inner,
-        &service,
-        sender,
-        params.message_id,
-        params.summary,
-        params.body,
-        params.client_key,
-    )
-    .await
+    match messaging
+        .reply(
+            sender,
+            params.message_id,
+            params.summary,
+            params.body,
+            params.client_key,
+        )
+        .await
     {
         Ok(result) => Response::ok(
             id,
@@ -965,28 +1001,15 @@ fn inbox_list(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Respo
         Ok(params) => params,
         Err(response) => return response,
     };
-    let (service, caller) = match mailbox_caller(inner, peer) {
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    match service.list(caller.key, params.sender, params.limit) {
-        Ok(entries) => {
-            let entries = entries
-                .into_iter()
-                .map(|item| InboxSummaryEntry {
-                    message_id: item.entry.message_id,
-                    sender: Some(item.sender),
-                    sender_label: item.sender_label,
-                    subject: item.subject,
-                    ts: item.entry.created_at,
-                    thread_root: item.thread_root,
-                })
-                .collect();
-            Response::ok(
-                id,
-                serde_json::to_value(InboxListResult { entries }).expect("inbox list serializes"),
-            )
-        }
+    match messaging.inbox_list(caller.key, params.sender, params.limit) {
+        Ok(result) => Response::ok(
+            id,
+            serde_json::to_value(result).expect("inbox list serializes"),
+        ),
         Err(error) => wire_error_response(id, mailbox_service_error(error)),
     }
 }
@@ -996,38 +1019,12 @@ fn inbox_claim(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Resp
         Ok(params) => params,
         Err(response) => return response,
     };
-    let (service, caller) = match mailbox_caller(inner, peer) {
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    // Only inbox.claim interprets the reserved locator. Every other message-id
-    // consumer keeps treating the same bytes as a literal historical id.
-    let outcome = match cyclops_proto::parse_notification_attempt_claim_locator(&params.message_id)
-    {
-        Some(attempt_id) => crate::messaging::claim_notification_locator(
-            inner,
-            &service,
-            caller.key,
-            params.message_id,
-            attempt_id,
-        ),
-        None => crate::messaging::claim(inner, &service, caller.key, params.message_id),
-    };
-    let result = match outcome {
-        Ok(crate::mailbox::ClaimOutcome::Claimed {
-            message,
-            skipped_oldest,
-            ..
-        }) => InboxClaimResult {
-            disposition: ClaimDisposition::Claimed,
-            message,
-            skipped_oldest,
-        },
-        Ok(crate::mailbox::ClaimOutcome::AlreadyClaimed { message, .. }) => InboxClaimResult {
-            disposition: ClaimDisposition::AlreadyClaimed,
-            message,
-            skipped_oldest: None,
-        },
+    let result = match messaging.claim(caller.key, params.message_id) {
+        Ok(result) => result,
         Err(error) => return wire_error_response(id, mailbox_service_error(error)),
     };
     Response::ok(
@@ -1049,11 +1046,11 @@ fn messages_snapshot(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -
             format!("recent_settled cannot exceed {MAX_RECENT_SETTLED_MESSAGES}"),
         );
     }
-    let (service, caller) = match mailbox_caller(inner, peer) {
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    match service.messages_snapshot(caller.key, params.recent_settled) {
+    match messaging.messages_snapshot(caller.key, params.recent_settled) {
         Ok(snapshot) => Response::ok(
             id,
             serde_json::to_value(snapshot).expect("messages snapshot serializes"),
@@ -1074,11 +1071,11 @@ fn messages_follow(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> 
             format!("limit must be between 1 and {MAX_FOLLOW_MESSAGES}"),
         );
     }
-    let (service, caller) = match mailbox_caller(inner, peer) {
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    match service.messages_follow(caller.key, params.after_seq, params.limit) {
+    match messaging.messages_follow(caller.key, params.after_seq, params.limit) {
         Ok(page) => Response::ok(
             id,
             serde_json::to_value(page).expect("messages follow page serializes"),
@@ -1092,14 +1089,14 @@ fn msg_requeue(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Resp
         Ok(params) => params,
         Err(response) => return response,
     };
-    if let Err(error) = require_mailbox_admin(inner, peer) {
-        return wire_error_response(id, error);
-    }
-    let service = match mailbox_service(inner) {
-        Ok(service) => service,
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
+        Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    let requeued = match crate::messaging::requeue(inner, &service, params.message_id.clone()) {
+    if !caller.key.is_admin() {
+        return wire_error_response(id, mailbox_admin_required());
+    }
+    let requeued = match messaging.requeue(params.message_id.clone()) {
         Ok(requeued) => requeued,
         Err(error) => return wire_error_response(id, mailbox_service_error(error)),
     };
@@ -1119,20 +1116,14 @@ fn notification_withdraw(inner: &Arc<Inner>, id: Value, params: Value, peer: Pee
             Ok(params) => params,
             Err(response) => return response,
         };
-    let (service, caller) = match mailbox_caller(inner, peer) {
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
     if !caller.key.is_admin() {
         return wire_error_response(id, mailbox_admin_required());
     }
-    match crate::messaging::withdraw_notification(
-        inner,
-        &service,
-        caller.key,
-        params.recipient,
-        params.attempt_id,
-    ) {
+    match messaging.withdraw_notification(caller.key, params.recipient, params.attempt_id) {
         Ok(result) => Response::ok(
             id,
             serde_json::to_value(result).expect("notification withdrawal result serializes"),
@@ -1146,40 +1137,16 @@ fn alarm_preview(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Re
         Ok(params) => params,
         Err(response) => return response,
     };
-    let (service, caller) = match mailbox_caller(inner, peer) {
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    if !caller.key.is_admin() {
-        return wire_error_response(id, mailbox_admin_required());
-    }
-    let cutoff_ms = unix_ms().saturating_sub(params.older_than_ms);
-    let records = match service.alarms_at_or_before(cutoff_ms) {
-        Ok(records) => records,
-        Err(error) => return wire_error_response(id, mailbox_service_error(error)),
-    };
-    // Identity, state and age only. No subject and no body: an operator
-    // deciding what to clear does not need the message contents.
-    let entries = records.iter().map(alarm_summary).collect();
-    Response::ok(
-        id,
-        serde_json::to_value(AlarmPreviewResult { entries, cutoff_ms })
-            .expect("alarm preview result serializes"),
-    )
-}
-
-fn alarm_summary(record: &NotificationRecord) -> AlarmSummary {
-    AlarmSummary {
-        id: record.attempt_id.to_string(),
-        message_id: record.message_id.to_string(),
-        recipient: record.recipient.to_string(),
-        state: DeliveryState::AttentionRequired,
-        // An attention record always carries a cause. If one ever reaches
-        // here without it, report an unknown outcome instead of inventing one.
-        cause: record
-            .cause
-            .unwrap_or(NotificationAttentionCause::TransportOutcomeUnknown),
-        ts: record.updated_at,
+    match messaging.alarm_preview(caller.key, params.older_than_ms, unix_ms()) {
+        Ok(result) => Response::ok(
+            id,
+            serde_json::to_value(result).expect("alarm preview result serializes"),
+        ),
+        Err(error) => wire_error_response(id, messaging_attention_error(error)),
     }
 }
 
@@ -1198,28 +1165,17 @@ fn alarm_clear(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Resp
             Err(_) => return Response::err(id, "bad_request", format!("invalid alarm id '{raw}'")),
         }
     }
-    let (service, caller) = match mailbox_caller(inner, peer) {
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    if !caller.key.is_admin() {
-        return wire_error_response(id, mailbox_admin_required());
+    match messaging.clear_alarms(caller.key, &attempts, params.cutoff_ms) {
+        Ok(result) => Response::ok(
+            id,
+            serde_json::to_value(result).expect("alarm clear result serializes"),
+        ),
+        Err(error) => wire_error_response(id, messaging_attention_error(error)),
     }
-    let summaries = match service.clear_alarms(caller.key, &attempts, params.cutoff_ms) {
-        Ok(summaries) => summaries,
-        Err(error) => return wire_error_response(id, mailbox_service_error(error)),
-    };
-    let result = AlarmClearResult {
-        cleared_ids: summaries
-            .iter()
-            .map(|record| record.attempt_id.to_string())
-            .collect(),
-        summaries: summaries.iter().map(alarm_summary).collect(),
-    };
-    Response::ok(
-        id,
-        serde_json::to_value(result).expect("alarm clear result serializes"),
-    )
 }
 
 async fn attention_show(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer) -> Response {
@@ -1227,40 +1183,33 @@ async fn attention_show(inner: &Arc<Inner>, id: Value, params: Value, peer: Peer
         Ok(params) => params,
         Err(response) => return response,
     };
-    let (service, caller) = match mailbox_caller(inner, peer) {
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    attention_show_for_caller(inner, id, params, &service, caller.key).await
+    attention_show_for_caller(inner, id, params, &messaging, caller.key).await
 }
 
 async fn attention_show_for_caller(
     inner: &Arc<Inner>,
     id: Value,
     params: AttentionShowParams,
-    service: &Arc<crate::mailbox::MailboxService>,
+    messaging: &crate::messaging::WorkspaceMessaging,
     caller: RecipientKey,
 ) -> Response {
-    // A non-admin caller learns nothing from a lookup failure: not whether
-    // the id exists, nor which candidates an ambiguous prefix names.
-    let target = match attention_target(service, &params.id) {
-        Ok(target) => target,
-        Err(_) if !caller.is_admin() => return wire_error_response(id, mailbox_admin_required()),
-        Err(error) => return wire_error_response(id, error),
-    };
-    if !attention_show_allowed(&caller, &target.record) {
-        return wire_error_response(id, mailbox_admin_required());
-    }
     // Diff mode returns the exact payload selected at the write boundary.
     // Direct compatibility attempts can therefore include message content,
     // which is why only the administrator and the attempt's own recipient,
     // who may already claim that body, can ask. Neither diff input is
     // logged or stored.
-    let result = crate::attention_resolution::show(inner, service, &target, params.diff).await;
-    Response::ok(
-        id,
-        serde_json::to_value(result).expect("attention show result serializes"),
-    )
+    match crate::attention_resolution::show(inner, messaging, caller, &params.id, params.diff).await
+    {
+        Ok(result) => Response::ok(
+            id,
+            serde_json::to_value(result).expect("attention show result serializes"),
+        ),
+        Err(error) => wire_error_response(id, messaging_attention_error(error)),
+    }
 }
 
 async fn attention_resolve(
@@ -1275,53 +1224,37 @@ async fn attention_resolve(
             Ok(params) => params,
             Err(response) => return response,
         };
-    let (service, caller) = match mailbox_caller(inner, peer) {
+    let (messaging, caller) = match workspace_messaging_caller(inner, peer) {
         Ok(caller) => caller,
         Err(error) => return wire_error_response(id, error),
     };
-    if !caller.key.is_admin() {
-        return wire_error_response(id, mailbox_admin_required());
-    }
-    let target = match attention_target(&service, &params.id) {
-        Ok(target) => target,
-        Err(error) => return wire_error_response(id, error),
-    };
-    match crate::attention_resolution::resolve(inner, &service, &target, resolution).await {
+    match crate::attention_resolution::resolve(
+        inner, &messaging, caller.key, &params.id, resolution,
+    )
+    .await
+    {
         Ok(result) => Response::ok(
             id,
             serde_json::to_value(result).expect("attention resolution result serializes"),
         ),
-        Err(error) => wire_error_response(id, attention_action_error(error)),
+        Err(error) => wire_error_response(id, attention_resolve_error(error)),
     }
 }
 
-fn attention_target(
-    service: &Arc<crate::mailbox::MailboxService>,
-    raw: &str,
-) -> Result<crate::mailbox::AttentionTarget, WireError> {
-    match service.attention_target(raw) {
-        Ok(target) => Ok(target),
-        Err(crate::mailbox::MailboxServiceError::Store(
-            crate::mailbox::MessageStoreError::Mailbox(error),
-        )) => {
-            if let crate::mailbox::MailboxError::AmbiguousAttentionTarget { candidates, .. } =
-                error.as_ref()
-            {
-                return Err(WireError {
-                    code: "ambiguous_attention".to_string(),
-                    message: error.to_string(),
-                    data: Some(json!({
-                        "candidates": candidates.iter().map(ToString::to_string).collect::<Vec<_>>()
-                    })),
-                });
-            }
-            Err(mailbox_service_error(
-                crate::mailbox::MailboxServiceError::Store(
-                    crate::mailbox::MessageStoreError::Mailbox(error),
-                ),
-            ))
-        }
-        Err(error) => Err(mailbox_service_error(error)),
+fn messaging_attention_error(error: crate::messaging::MessagingAttentionError) -> WireError {
+    match error {
+        crate::messaging::MessagingAttentionError::Denied => mailbox_admin_required(),
+        crate::messaging::MessagingAttentionError::Ambiguous {
+            message,
+            candidates,
+        } => WireError {
+            code: "ambiguous_attention".to_string(),
+            message,
+            data: Some(json!({
+                "candidates": candidates.iter().map(ToString::to_string).collect::<Vec<_>>()
+            })),
+        },
+        crate::messaging::MessagingAttentionError::Mailbox(error) => mailbox_service_error(error),
     }
 }
 
@@ -1330,6 +1263,11 @@ fn attention_action_error(error: crate::attention_resolution::AttentionActionErr
 
     match error {
         AttentionActionError::Store(error) => mailbox_service_error(error),
+        AttentionActionError::ResolutionInProgress => WireError {
+            code: "conflict".to_string(),
+            message: error.to_string(),
+            data: None,
+        },
         AttentionActionError::Evidence(result) => WireError {
             code: "attention_evidence_failed".to_string(),
             message: "the staged notification did not pass every safety check".to_string(),
@@ -1353,19 +1291,19 @@ fn attention_action_error(error: crate::attention_resolution::AttentionActionErr
     }
 }
 
-/// Who may read an attention attempt. `show` is read-only and the attempt's
-/// recipient is the one party that can say what its own composer holds, so
-/// it may look; every other non-admin identity is refused. `complete` and
-/// `discard` stay administrator-only and do not consult this.
-pub(crate) fn attention_show_allowed(
-    caller: &cyclops_proto::RecipientKey,
-    record: &cyclops_proto::NotificationRecord,
-) -> bool {
-    caller.is_admin() || *caller == record.recipient
+fn attention_resolve_error(error: crate::attention_resolution::AttentionResolveError) -> WireError {
+    match error {
+        crate::attention_resolution::AttentionResolveError::Selection(error) => {
+            messaging_attention_error(error)
+        }
+        crate::attention_resolution::AttentionResolveError::Action(error) => {
+            attention_action_error(error)
+        }
+    }
 }
 
-fn require_mailbox_admin(inner: &Arc<Inner>, peer: Peer) -> Result<(), WireError> {
-    let (_, identity) = mailbox_caller(inner, peer)?;
+fn require_workspace_messaging_admin(inner: &Arc<Inner>, peer: Peer) -> Result<(), WireError> {
+    let (_, identity) = workspace_messaging_caller(inner, peer)?;
     if identity.key.is_admin() {
         Ok(())
     } else {
@@ -1381,30 +1319,17 @@ fn mailbox_admin_required() -> WireError {
     }
 }
 
-fn mailbox_service(inner: &Arc<Inner>) -> Result<Arc<crate::mailbox::MailboxService>, WireError> {
-    inner.mailbox.clone().ok_or_else(|| WireError {
-        code: "mailbox_unavailable".to_string(),
-        message: "durable workspace identity is not connected".to_string(),
-        data: None,
-    })
-}
-
-pub(crate) fn mailbox_caller(
+fn resolve_mailbox_identity(
     inner: &Arc<Inner>,
-    peer: Peer,
-) -> Result<
-    (
-        Arc<crate::mailbox::MailboxService>,
-        crate::mailbox::MailboxIdentity,
-    ),
-    WireError,
-> {
-    let (uid, pid) = daemon_peer(peer)?;
-    let _publication = inner
-        .mailbox_publication
-        .lock()
-        .expect("mailbox publication lock");
-    let service = mailbox_service(inner)?;
+    (uid, pid): (u32, i32),
+    admin: crate::mailbox::MailboxIdentity,
+    identity_for_recipient: impl FnOnce(
+        RecipientKey,
+    ) -> Result<
+        Option<crate::mailbox::MailboxIdentity>,
+        crate::mailbox::MailboxServiceError,
+    >,
+) -> Result<crate::mailbox::MailboxIdentity, WireError> {
     let panes = report_panes(inner);
     let observed: Vec<_> = panes
         .iter()
@@ -1415,7 +1340,7 @@ pub(crate) fn mailbox_caller(
         crate::fusion::is_vendor_now(inner, process)
     });
     let caller = match origin {
-        identity::PeerOrigin::Admin => service.admin(),
+        identity::PeerOrigin::Admin => admin,
         identity::PeerOrigin::Pane {
             pane_id,
             pane_root,
@@ -1426,8 +1351,7 @@ pub(crate) fn mailbox_caller(
             // agent vendor. Labels are mutable display data and cannot grant
             // or revoke administrative authority.
             if !vendor_below {
-                let admin = service.admin();
-                return Ok((service, admin));
+                return Ok(admin);
             }
             let Some(route) = report_pane_at(&panes, &pane_id, pane_root) else {
                 // An unconfigured vendor cannot acquire administrative
@@ -1445,14 +1369,67 @@ pub(crate) fn mailbox_caller(
             {
                 return Err(mailbox_origin_denied());
             }
-            service
-                .identity_for_recipient(route.recipient_key)
+            identity_for_recipient(route.recipient_key)
                 .map_err(mailbox_service_error)?
                 .ok_or_else(mailbox_origin_denied)?
         }
         identity::PeerOrigin::Unprovable => return Err(mailbox_origin_denied()),
     };
-    Ok((service, caller))
+    Ok(caller)
+}
+
+fn workspace_messaging_caller(
+    inner: &Arc<Inner>,
+    peer: Peer,
+) -> Result<
+    (
+        Arc<crate::messaging::WorkspaceMessaging>,
+        crate::mailbox::MailboxIdentity,
+    ),
+    WireError,
+> {
+    let credentials = daemon_peer(peer)?;
+    let messaging = inner.workspace_messaging().ok_or_else(|| WireError {
+        code: "mailbox_unavailable".to_string(),
+        message: "durable workspace identity is not connected".to_string(),
+        data: None,
+    })?;
+    let caller = resolve_workspace_messaging_caller(inner, &messaging, credentials)?;
+    Ok((messaging, caller))
+}
+
+pub(crate) fn workspace_messaging_caller_if_available(
+    inner: &Arc<Inner>,
+    peer: Peer,
+) -> Result<
+    Option<(
+        Arc<crate::messaging::WorkspaceMessaging>,
+        crate::mailbox::MailboxIdentity,
+    )>,
+    WireError,
+> {
+    let Some(messaging) = inner.workspace_messaging() else {
+        return Ok(None);
+    };
+    let credentials = daemon_peer(peer)?;
+    let caller = resolve_workspace_messaging_caller(inner, &messaging, credentials)?;
+    Ok(Some((messaging, caller)))
+}
+
+fn resolve_workspace_messaging_caller(
+    inner: &Arc<Inner>,
+    messaging: &crate::messaging::WorkspaceMessaging,
+    credentials: (u32, i32),
+) -> Result<crate::mailbox::MailboxIdentity, WireError> {
+    let caller = messaging.with_published(|messaging| {
+        resolve_mailbox_identity(
+            inner,
+            credentials,
+            messaging.admin_identity(),
+            |recipient| messaging.identity_for_recipient(recipient),
+        )
+    })?;
+    Ok(caller)
 }
 
 fn mailbox_origin_denied() -> WireError {
@@ -1842,97 +1819,6 @@ fn verify_report_origin(
     })
 }
 
-type StatusRefreshFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
-type StatusRefreshJob = (crate::PaneKey, StatusRefreshFuture);
-
-/// Refresh live panes within one request-wide budget. Unfinished routes remain
-/// in the returned set and the status projection refuses their cached facts.
-async fn refresh_status_detections(inner: &Arc<Inner>) -> HashSet<crate::PaneKey> {
-    let deadline = tokio::time::Instant::now() + STATUS_REFRESH_BUDGET;
-    let mut jobs = VecDeque::new();
-    for (session_idx, _) in inner.active_session_slots() {
-        let Some(watcher) = inner.watcher_of(session_idx) else {
-            continue;
-        };
-        for pane in watcher.snapshot() {
-            let pane_id = pane.pane_id;
-            let key = crate::PaneKey::new(session_idx, &pane_id);
-            let inner = Arc::clone(inner);
-            let watcher = Arc::clone(&watcher);
-            jobs.push_back((
-                key,
-                Box::pin(async move {
-                    fusion::recompute_pane(&inner, session_idx, &watcher, &pane_id, true, "status")
-                        .await
-                        .is_some()
-                }) as StatusRefreshFuture,
-            ));
-        }
-    }
-    run_status_refresh_jobs(&inner.engine, jobs, deadline, STATUS_REFRESH_CONCURRENCY).await
-}
-
-async fn run_status_refresh_jobs(
-    engine: &delivery::Engine,
-    mut pending: VecDeque<StatusRefreshJob>,
-    deadline: tokio::time::Instant,
-    concurrency: usize,
-) -> HashSet<crate::PaneKey> {
-    let mut incomplete: HashSet<_> = pending.iter().map(|(pane, _)| pane.clone()).collect();
-    let mut running = JoinSet::new();
-    let concurrency = concurrency.max(1);
-
-    loop {
-        while running.len() < concurrency {
-            let Some((pane, refresh)) = pending.pop_front() else {
-                break;
-            };
-            running.spawn(engine.track_descendant(async move { (pane, refresh.await) }));
-        }
-        if running.is_empty() {
-            break;
-        }
-        match tokio::time::timeout_at(deadline, running.join_next()).await {
-            Ok(Some(Ok(Some((pane, true))))) => {
-                incomplete.remove(&pane);
-            }
-            Ok(Some(Ok(Some((_, false)))) | Some(Ok(None)) | Some(Err(_))) => {}
-            Ok(None) => break,
-            Err(_) => {
-                // Pane recomputation can publish state and journal facts. It
-                // is not cancellation-safe, so overdue work finishes in the
-                // background while this answer refuses its cached result.
-                // The daemon lifetime still owns it and cancels it before
-                // sealing the old boot's journals during shutdown.
-                running.detach_all();
-                break;
-            }
-        }
-    }
-    incomplete
-}
-
-type ComposerCandidateIndex = HashMap<
-    RecipientKey,
-    HashMap<NotificationAttemptId, crate::mailbox::ActiveComposerNotification>,
->;
-
-fn composer_candidate_index(inner: &Inner) -> Option<ComposerCandidateIndex> {
-    let candidates = inner
-        .mailbox
-        .as_ref()?
-        .active_composer_notifications_snapshot()
-        .ok()?;
-    let mut grouped = HashMap::new();
-    for candidate in candidates {
-        grouped
-            .entry(candidate.record.recipient)
-            .or_insert_with(HashMap::new)
-            .insert(candidate.record.attempt_id, candidate);
-    }
-    Some(grouped)
-}
-
 fn refuse_incomplete_status(pane: &mut cyclops_proto::PaneStatus) {
     pane.manifest = None;
     pane.manifest_display_name = None;
@@ -1944,7 +1830,7 @@ fn refuse_incomplete_status(pane: &mut cyclops_proto::PaneStatus) {
     pane.composer_proof = cyclops_proto::ComposerProof::Unprovable;
     pane.composer_reason = Some(STATUS_REFRESH_INCOMPLETE.to_string());
     if pane.notification_attempt.is_some() || pane.composer_candidates > 0 {
-        pane.next_action = Some(operator_next_action(
+        pane.next_action = Some(crate::messaging::operator_composer_next_action(
             pane.notification_state,
             pane.notification_attempt.is_some(),
         ));
@@ -1955,177 +1841,41 @@ fn refuse_incomplete_status(pane: &mut cyclops_proto::PaneStatus) {
     pane.hooks_verified = None;
 }
 
-fn operator_next_action(
-    notification: Option<cyclops_proto::NotificationState>,
-    has_exact_attempt: bool,
-) -> cyclops_proto::ComposerNextAction {
-    use cyclops_proto::{ComposerNextAction, NotificationState};
-
-    match notification {
-        Some(NotificationState::AttentionRequired) if has_exact_attempt => {
-            ComposerNextAction::InspectAttention
-        }
-        Some(
-            NotificationState::Writing
-            | NotificationState::Staged
-            | NotificationState::Submitting
-            | NotificationState::Submitted
-            | NotificationState::Notified
-            | NotificationState::WithdrawnAfterStaging,
-        ) if has_exact_attempt => ComposerNextAction::CheckHealth,
-        _ => ComposerNextAction::InspectMessages,
-    }
-}
-
-fn composer_next_action(
-    composer: cyclops_proto::ComposerState,
-    notification: cyclops_proto::NotificationState,
-    message: Option<cyclops_proto::ComposerMessageState>,
-    recovery_action: crate::mailbox::ExactOwnedRecoveryAction,
-    clear_supported: bool,
-    active_worker_owns: bool,
-) -> cyclops_proto::ComposerNextAction {
-    use cyclops_proto::{
-        ComposerMessageState, ComposerNextAction, ComposerState, NotificationState,
-    };
-
-    let exact_composer = matches!(
-        composer,
-        ComposerState::CyclopsNotificationStaged | ComposerState::CyclopsNotificationSubmitted
-    );
-    if exact_composer && notification == NotificationState::AttentionRequired {
-        return match recovery_action {
-            crate::mailbox::ExactOwnedRecoveryAction::Submit => ComposerNextAction::AutomaticSubmit,
-            crate::mailbox::ExactOwnedRecoveryAction::Clear if clear_supported => {
-                ComposerNextAction::AutomaticReconcile
-            }
-            crate::mailbox::ExactOwnedRecoveryAction::Reconcile => {
-                ComposerNextAction::AutomaticReconcile
-            }
-            crate::mailbox::ExactOwnedRecoveryAction::Ineligible
-            | crate::mailbox::ExactOwnedRecoveryAction::Clear
-            | crate::mailbox::ExactOwnedRecoveryAction::Inspect => {
-                ComposerNextAction::InspectAttention
-            }
-        };
-    }
-    if !exact_composer || !active_worker_owns {
-        return operator_next_action(Some(notification), true);
-    }
-    match (composer, notification, message) {
-        (
-            ComposerState::CyclopsNotificationStaged,
-            NotificationState::Staged,
-            Some(ComposerMessageState::Pending),
-        ) => ComposerNextAction::AutomaticSubmit,
-        (
-            ComposerState::CyclopsNotificationStaged,
-            NotificationState::Staged,
-            Some(ComposerMessageState::Claimed),
-        ) => ComposerNextAction::AutomaticReconcile,
-        (
-            ComposerState::CyclopsNotificationStaged | ComposerState::CyclopsNotificationSubmitted,
-            NotificationState::Submitting | NotificationState::Submitted,
-            _,
-        ) => ComposerNextAction::AutomaticReconcile,
-        _ => operator_next_action(Some(notification), true),
-    }
-}
-
 /// Assemble StatusResult from the session slots and the detection cache.
 ///
 /// `open_deliveries` adds the ledger-folded backlog of deliveries still
 /// waiting on a human. It is opt-in because it reads the session files,
 /// and only a client reconciling attention at startup needs it.
-pub(crate) fn status_result(inner: &Inner, open_deliveries: bool) -> StatusResult {
+pub(crate) fn status_result(inner: &Arc<Inner>, open_deliveries: bool) -> StatusResult {
     status_result_with_refresh(inner, open_deliveries, &HashSet::new())
 }
 
 fn status_result_with_refresh(
-    inner: &Inner,
+    inner: &Arc<Inner>,
     open_deliveries: bool,
     incomplete_refreshes: &HashSet<crate::PaneKey>,
 ) -> StatusResult {
     // The ledger fold happens before the state locks are taken: it reads
     // files, and the fusion engine wants those locks back promptly.
     // Two halves, kept apart: the legacy session-ledger fold, and the
-    // durable mailbox rows the projection serves (the same rows a
-    // messages.snapshot carries), including the pre-write blocks that
-    // blocked_notifications below also details; the renderer dedups that
-    // detailed row by attempt id so one attempt prints once.
-    let (open_deliveries, mailbox_attention) = if open_deliveries {
-        let open = crate::history::open_deliveries(inner);
-        let mailbox = inner
-            .mailbox
-            .as_ref()
-            .and_then(|service| service.mailbox_attention_rows().ok())
-            .unwrap_or_default();
-        (open, mailbox)
+    // durable WorkspaceMessaging status projection. The latter includes
+    // the pre-write blocks that blocked_notifications below also details;
+    // the renderer dedups that detailed row by attempt id so one attempt
+    // prints once.
+    let include_mailbox_attention = open_deliveries;
+    let open_deliveries = if include_mailbox_attention {
+        crate::history::open_deliveries(inner)
     } else {
-        (Vec::new(), Vec::new())
+        Vec::new()
     };
-    let admin_unread = inner
-        .mailbox
-        .as_ref()
-        .and_then(|service| service.pending_count(service.admin().key).ok())
-        .unwrap_or(0) as u64;
-    let mailbox_routes = inner
-        .mailbox
-        .as_ref()
-        .map(|service| {
-            let mut routes: Vec<StatusMailboxRoute> = service
-                .routes()
-                .ok()
-                .map(|routes| {
-                    routes
-                        .into_iter()
-                        .map(|identity| {
-                            let unread = service.pending_count(identity.key).ok().map(|c| c as u64);
-                            StatusMailboxRoute {
-                                recipient: identity.key,
-                                label: identity.label,
-                                unread,
-                            }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if let Ok(pending) = service.pending_recipients() {
-                for key in pending {
-                    if !routes.iter().any(|r| r.recipient == key) {
-                        let unread = service.pending_count(key).ok().map(|c| c as u64);
-                        if unread.unwrap_or(0) > 0 {
-                            let label = service
-                                .recipient_label(key)
-                                .ok()
-                                .flatten()
-                                .or_else(|| {
-                                    service
-                                        .identity_for_recipient(key)
-                                        .ok()
-                                        .flatten()
-                                        .map(|id| id.label)
-                                })
-                                .unwrap_or_else(|| key.to_string());
-                            routes.push(StatusMailboxRoute {
-                                recipient: key,
-                                label,
-                                unread,
-                            });
-                        }
-                    }
-                }
-            }
-            routes
-        })
-        .unwrap_or_default();
-    let blocked_notifications = inner
-        .mailbox
-        .as_ref()
-        .and_then(|service| {
-            service
-                .blocked_notification_snapshot(unix_ms(), STATUS_BLOCKED_NOTIFICATION_LIMIT)
-                .ok()
+    let messaging_status = inner
+        .workspace_messaging()
+        .map(|messaging| {
+            messaging.status_snapshot(
+                include_mailbox_attention,
+                unix_ms(),
+                STATUS_BLOCKED_NOTIFICATION_LIMIT,
+            )
         })
         .unwrap_or_default();
     let adoptions = inner
@@ -2133,12 +1883,13 @@ fn status_result_with_refresh(
         .lock()
         .expect("registry lock")
         .exact_adoptions();
-    let mut diagnostics = crate::deadlock::status_diagnostics(inner);
+    let mut diagnostics =
+        crate::deadlock::status_diagnostics(messaging_status.deadlock_candidates());
     diagnostics.extend(inner.engine.notification_worker_diagnostics());
-    let composer_candidates = composer_candidate_index(inner);
-    // Status joins durable notification state below. Clone the content-free
-    // fusion stamps first so no journal read runs under the detection lock.
-    let detections = inner.detections.lock().expect("detections lock").clone();
+    // Status joins durable notification state below. Snapshot typed,
+    // content-free fusion facts first so no journal read runs under the
+    // observation cache lock and this adapter never learns its representation.
+    let pane_observations = fusion::pane_status_observations(inner);
     let sessions = inner
         .active_session_slots()
         .into_iter()
@@ -2162,7 +1913,6 @@ fn status_result_with_refresh(
                     .map(|r| {
                         let pane = crate::PaneKey::new(session_idx, &r.pane_id);
                         let refresh_incomplete = incomplete_refreshes.contains(&pane);
-                        let entry = detections.get(&pane);
                         let recipient = instance_id.and_then(|instance_id| {
                             Some(RecipientKey::agent(
                                 inner.workspace_id,
@@ -2170,8 +1920,13 @@ fn status_result_with_refresh(
                                 r.pane_id.parse().ok()?,
                             ))
                         });
-                        let pane_root = identity::ProcId::of(r.pane_pid)
+                        let observed_root = identity::ProcId::of(r.pane_pid);
+                        let pane_root = observed_root
                             .and_then(|root| ProcessInstanceId::new(root.pid, root.birth).ok());
+                        let observation = pane_observations
+                            .get(&pane)
+                            .and_then(|observation| observation.for_pane_root(observed_root));
+                        let observation = observation.as_ref();
                         let adoption = recipient.and_then(|recipient| {
                             adoptions.iter().find(|adoption| {
                                 adoption.recipient == Some(recipient)
@@ -2180,155 +1935,58 @@ fn status_result_with_refresh(
                         });
                         let mut ps = r.to_status(
                             adoption.map(|adoption| adoption.label.clone()),
-                            entry.and_then(|e| e.manifest.clone()),
-                            entry
-                                .map(|e| e.detection.state)
+                            observation.and_then(|e| e.manifest.clone()),
+                            observation
+                                .map(|e| e.state)
                                 .unwrap_or(cyclops_proto::AgentState::Unknown),
                         );
                         // How long the pane has been in that state, from
                         // the change mark fusion keeps. The roster's
                         // elapsed column is this number and nothing else.
-                        ps.state_ms = entry.map(|e| e.since.elapsed().as_millis() as u64);
+                        ps.state_ms = observation.map(|e| e.state_ms);
                         // The second answer, carried from the same stamp
                         // the gate obeys. A pane with no cached detection
                         // has nothing behind it, so it stays refused.
-                        ps.write_ready = entry.is_some_and(|e| e.detection.write_ready);
-                        ps.write_block = entry.and_then(|e| e.detection.write_block.clone());
+                        ps.write_ready = observation.is_some_and(|e| e.write_ready);
+                        ps.write_block = observation.and_then(|e| e.write_block.clone());
                         // From the same cached verdict as the state itself,
                         // so the word and the reason for it can never come
                         // from two different moments.
-                        ps.unknown_reason =
-                            entry.and_then(|e| e.detection.unknown_reason.clone());
+                        ps.unknown_reason = observation.and_then(|e| e.unknown_reason.clone());
                         ps.working_confirmed = (ps.state == cyclops_proto::AgentState::Working)
-                            .then_some(entry.is_some_and(|e| e.working_confirmed));
-                        ps.unread = recipient.and_then(|recipient| {
-                            inner
-                                .mailbox
-                                .as_ref()
-                                .and_then(|m| m.pending_count(recipient).ok())
-                                .map(|c| c as u64)
+                            .then_some(observation.is_some_and(|e| e.working_confirmed));
+                        ps.unread =
+                            recipient.and_then(|recipient| messaging_status.unread_for(recipient));
+                        if let Some(observation) = observation {
+                            ps.composer = observation.composer.state;
+                            ps.composer_proof = observation.composer.proof;
+                            ps.notification_attempt = observation.composer.notification_attempt;
+                            ps.composer_reason = observation.composer.reason.clone();
+                            ps.composer_candidates = observation.composer.candidate_count;
+                        }
+                        let binding = recipient.and_then(|recipient| {
+                            observation?.composer.notification_evidence(recipient)
                         });
-                        if let Some(entry) = entry {
-                            ps.composer = entry.composer.state;
-                            ps.composer_proof = entry.composer.proof;
-                            ps.notification_attempt = entry.composer.notification_attempt;
-                            ps.composer_reason = entry.composer.reason.map(str::to_string);
-                            ps.composer_candidates = entry.composer.candidate_count;
-                        }
-                        if let Some(durable_candidates) = recipient.and_then(|recipient| {
-                            composer_candidates.as_ref()?.get(&recipient)
-                        }) {
-                            let durable_count = durable_candidates.len();
-                            ps.composer_candidates =
-                                u32::try_from(durable_count).unwrap_or(u32::MAX);
-                            ps.notification_attempt = if durable_count == 1 {
-                                durable_candidates.keys().next().copied()
-                            } else {
-                                None
-                            };
-                        }
-                        if let Some(attempt) = ps.notification_attempt {
-                            let candidate = recipient.and_then(|recipient| {
-                                composer_candidates.as_ref()?.get(&recipient)?.get(&attempt)
-                            });
-                            match candidate {
-                                Some(candidate) => {
-                                    ps.notification_state = Some(candidate.record.state);
-                                    ps.message_state = candidate
-                                        .entry_state
-                                        .as_ref()
-                                        .map(cyclops_proto::ComposerMessageState::from);
-                                    let cached_binding =
-                                        entry.and_then(|entry| entry.composer.binding.as_ref());
-                                    let durable_binding_complete = candidate
-                                        .record
-                                        .binding
-                                        .as_ref()
-                                        .is_some_and(|binding| {
-                                            binding.pane_root.is_some() && binding.leader.is_some()
-                                        });
-                                    let binding_unprovable = pane_root.is_none()
-                                        || cached_binding.is_none()
-                                        || !durable_binding_complete;
-                                    let binding_matches = recipient.is_some_and(|recipient| {
-                                        cached_binding.is_some_and(|binding| {
-                                            ProcessInstanceId::new(
-                                                binding.pane_root.pid,
-                                                binding.pane_root.birth,
-                                            )
-                                            .ok()
-                                            .is_some_and(|cached_root| {
-                                                pane_root == Some(cached_root)
-                                            }) && fusion::notification_binding_matches(
-                                                &candidate.record,
-                                                recipient,
-                                                binding,
-                                            )
-                                        })
-                                    });
-                                    if matches!(
-                                        ps.composer,
-                                        cyclops_proto::ComposerState::CyclopsNotificationStaged
-                                            | cyclops_proto::ComposerState::CyclopsNotificationSubmitted
-                                    ) && !binding_matches
-                                    {
-                                        ps.composer =
-                                            cyclops_proto::ComposerState::ComposerAmbiguous;
-                                        if binding_unprovable {
-                                            ps.composer_proof =
-                                                cyclops_proto::ComposerProof::Unprovable;
-                                            ps.composer_reason =
-                                                Some("binding_unprovable".to_string());
-                                        } else {
-                                            ps.composer_proof =
-                                                cyclops_proto::ComposerProof::Ambiguous;
-                                            ps.composer_reason =
-                                                Some("binding_mismatch".to_string());
-                                        }
-                                        ps.next_action = Some(operator_next_action(
-                                            ps.notification_state,
-                                            ps.notification_attempt.is_some(),
-                                        ));
-                                    } else {
-                                        let active_worker_owns =
-                                            inner.engine.notification_worker_owns(
-                                                candidate.record.recipient,
-                                                candidate.record.attempt_id,
-                                            );
-                                        let clear_supported = candidate
-                                            .record
-                                            .binding
-                                            .as_ref()
-                                            .and_then(|binding| {
-                                                inner.manifests.get(binding.manifest.as_str())
-                                            })
-                                            .is_some_and(|manifest| {
-                                                !manifest.injection.clear_keys.is_empty()
-                                            });
-                                        ps.next_action = Some(composer_next_action(
-                                            ps.composer,
-                                            candidate.record.state,
-                                            ps.message_state,
-                                            candidate.recovery_action,
-                                            clear_supported,
-                                            active_worker_owns,
-                                        ));
-                                    }
-                                }
-                                None => {
-                                    // A retired or unreadable durable barrier cannot inherit a
-                                    // prior exact status stamp. Status is evidence, not authority.
-                                    ps.composer = cyclops_proto::ComposerState::ComposerAmbiguous;
-                                    ps.composer_proof = cyclops_proto::ComposerProof::Unprovable;
-                                    ps.next_action = Some(operator_next_action(
-                                        ps.notification_state,
-                                        ps.notification_attempt.is_some(),
-                                    ));
-                                }
-                            }
-                        } else if ps.composer_candidates > 0 {
-                            ps.next_action = Some(cyclops_proto::ComposerNextAction::InspectMessages);
-                        }
+                        let composer_status = messaging_status.composer_status(
+                            recipient,
+                            crate::messaging::MessagingComposerObservation {
+                                composer: ps.composer,
+                                proof: ps.composer_proof,
+                                reason: ps.composer_reason,
+                                detected_attempt: ps.notification_attempt,
+                                detected_candidate_count: ps.composer_candidates,
+                                pane_root,
+                                binding,
+                            },
+                        );
+                        ps.composer = composer_status.composer;
+                        ps.composer_proof = composer_status.proof;
+                        ps.composer_reason = composer_status.reason;
+                        ps.composer_candidates = composer_status.candidate_count;
+                        ps.notification_attempt = composer_status.attempt;
+                        ps.notification_state = composer_status.notification_state;
+                        ps.message_state = composer_status.message_state;
+                        ps.next_action = composer_status.next_action;
                         // Hook liveness (amendment c): adopted panes whose
                         // manifest declares hooks carry the verified bit,
                         // scoped to the current occupant (edges from a
@@ -2348,14 +2006,14 @@ fn status_result_with_refresh(
                         // the detection lock across all of it. A pane that
                         // changes hands is republished by the recompute
                         // its own output triggers.
-                        let bound = entry.and_then(|e| e.manifest.as_deref());
+                        let bound = observation.and_then(|e| e.manifest.as_deref());
                         ps.hooks_verified = bound.and_then(|m| {
                             crate::selftest::hooks_verified_for(
                                 inner,
                                 &pane,
                                 adoption.is_some(),
                                 Some(m),
-                                entry.and_then(|e| e.agent),
+                                observation.and_then(|e| e.agent),
                             )
                         });
                         // The manifest's own display name, from the same
@@ -2387,12 +2045,12 @@ fn status_result_with_refresh(
         tmux_version: inner.tmux_version.clone(),
         workspace_id: Some(inner.workspace_id),
         sessions,
-        mailbox_routes,
-        admin_unread,
+        mailbox_routes: messaging_status.mailbox_routes,
+        admin_unread: messaging_status.admin_unread,
         open_deliveries,
         diagnostics,
-        blocked_notifications: blocked_notifications.rows,
-        blocked_notifications_total: blocked_notifications.total,
+        blocked_notifications: messaging_status.blocked_notifications,
+        blocked_notifications_total: messaging_status.blocked_notifications_total,
         // Always answered, empty set included: "I loaded none" is the fact
         // a client needs to explain an unknown pane, and it is exactly the
         // fact an omitted field would hide.
@@ -2402,7 +2060,7 @@ fn status_result_with_refresh(
         }),
         // The one process that can say this without guessing.
         pid: Some(std::process::id()),
-        mailbox_attention,
+        mailbox_attention: messaging_status.mailbox_attention,
     }
 }
 
@@ -2447,7 +2105,7 @@ async fn pane_read(inner: &Arc<Inner>, id: Value, params: Value) -> Response {
         PaneReadSource::Detection => {
             // Reconcile on doubt: an explicit detection read refreshes with
             // the full sensor set instead of trusting the cache.
-            let det = match fusion::recompute_pane(
+            let det = match crate::observe_pane(
                 inner,
                 session_idx,
                 &watcher,
@@ -2545,12 +2203,152 @@ fn known_panes(inner: &Inner) -> Vec<String> {
         .collect()
 }
 
-/// Write one line with the write timeout. False means drop the connection.
-async fn write_line(w: &mut OwnedWriteHalf, line: &str) -> bool {
-    let mut buf = String::with_capacity(line.len() + 1);
-    buf.push_str(line);
-    buf.push('\n');
-    match tokio::time::timeout(WRITE_TIMEOUT, w.write_all(buf.as_bytes())).await {
+struct BoundedJson {
+    bytes: Vec<u8>,
+    oversized: bool,
+}
+
+impl BoundedJson {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            oversized: false,
+        }
+    }
+}
+
+impl std::io::Write for BoundedJson {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if matches!(
+            FrameContract::classify_json_bytes(self.bytes.len().saturating_add(buf.len())),
+            FrameSize::TooLarge
+        ) {
+            self.oversized = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "official daemon frame is too large",
+            ));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+enum FrameEncodeError {
+    TooLarge,
+    Serialize(serde_json::Error),
+}
+
+fn frame_too_large(subject: &str) -> String {
+    format!(
+        "{subject} exceeds the {}-byte JSON frame limit (newline excluded)",
+        FrameContract::MAX_JSON_BYTES
+    )
+}
+
+fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, FrameEncodeError> {
+    let mut writer = BoundedJson::new();
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => Ok(writer.bytes),
+        Err(_) if writer.oversized => Err(FrameEncodeError::TooLarge),
+        Err(error) => Err(FrameEncodeError::Serialize(error)),
+    }
+}
+
+/// Preserve the request id when possible, but never emit a response outside
+/// the official envelope. A caller that receives this fallback knows the
+/// original outcome is uncertain and must inspect authoritative state.
+fn response_frame(response: &Response) -> Option<Vec<u8>> {
+    match encode_frame(response) {
+        Ok(frame) => Some(frame),
+        Err(FrameEncodeError::TooLarge) => {
+            let fallback = Response::err(
+                response.id.clone(),
+                FrameContract::TOO_LARGE_CODE,
+                format!(
+                    "{}; the request outcome is unknown, so inspect authoritative state before retrying",
+                    frame_too_large("daemon response")
+                ),
+            );
+            encode_frame(&fallback).ok()
+        }
+        Err(FrameEncodeError::Serialize(error)) => {
+            warn!(error = %error, "response serialization failed; dropping connection");
+            None
+        }
+    }
+}
+
+/// Read one newline-terminated frame without allocating beyond the shared
+/// JSON-object envelope. The delimiter is consumed but is not counted.
+async fn read_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if bytes.is_empty() {
+                Ok(None)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed during a daemon frame",
+                ))
+            };
+        }
+        if let Some(delimiter) = available
+            .iter()
+            .position(|byte| *byte == FrameContract::DELIMITER)
+        {
+            if matches!(
+                FrameContract::classify_json_bytes(bytes.len().saturating_add(delimiter)),
+                FrameSize::TooLarge
+            ) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    frame_too_large("client request"),
+                ));
+            }
+            bytes.extend_from_slice(&available[..delimiter]);
+            reader.consume(delimiter + 1);
+            return String::from_utf8(bytes).map(Some).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "client frame was not UTF-8",
+                )
+            });
+        }
+        if matches!(
+            FrameContract::classify_json_bytes(bytes.len().saturating_add(available.len())),
+            FrameSize::TooLarge
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                frame_too_large("client request"),
+            ));
+        }
+        bytes.extend_from_slice(available);
+        let consumed = available.len();
+        reader.consume(consumed);
+    }
+}
+
+/// Write one pre-encoded frame with the write timeout. False means drop the
+/// connection.
+async fn write_frame(w: &mut OwnedWriteHalf, frame: &[u8]) -> bool {
+    if matches!(
+        FrameContract::classify_json_bytes(frame.len()),
+        FrameSize::TooLarge
+    ) {
+        return false;
+    }
+    let mut bytes = Vec::with_capacity(frame.len() + 1);
+    bytes.extend_from_slice(frame);
+    bytes.push(FrameContract::DELIMITER);
+    match tokio::time::timeout(WRITE_TIMEOUT, w.write_all(&bytes)).await {
         Ok(Ok(())) => true,
         Ok(Err(e)) => {
             debug!(error = %e, "client write failed");
@@ -2564,6 +2362,11 @@ async fn write_line(w: &mut OwnedWriteHalf, line: &str) -> bool {
 }
 
 #[cfg(test)]
+async fn write_line(w: &mut OwnedWriteHalf, line: &str) -> bool {
+    write_frame(w, line.as_bytes()).await
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Config, DetEntry};
@@ -2573,68 +2376,161 @@ mod tests {
         TmuxSessionId, WorkspaceId,
     };
     use std::collections::{BTreeMap, HashMap};
+    use std::io::Cursor;
     use std::path::Path;
     use std::str::FromStr;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
     use std::time::{Duration, Instant};
 
-    #[tokio::test(start_paused = true)]
-    async fn status_refresh_has_one_budget_and_bounded_concurrency() {
-        let engine = delivery::Engine::new();
-        let started = Arc::new(AtomicUsize::new(0));
-        let mut jobs = VecDeque::new();
-        for index in 0..(STATUS_REFRESH_CONCURRENCY + 3) {
-            let started = Arc::clone(&started);
-            jobs.push_back((
-                crate::PaneKey::new(0, &format!("%{index}")),
-                Box::pin(async move {
-                    started.fetch_add(1, Ordering::SeqCst);
-                    std::future::pending::<()>().await;
-                    true
-                }) as StatusRefreshFuture,
-            ));
-        }
-        let budget = Duration::from_millis(25);
-        let before = tokio::time::Instant::now();
+    #[tokio::test]
+    async fn daemon_ingress_boundary_excludes_the_newline_and_requires_it() {
+        let mut exact = vec![b'x'; FrameContract::MAX_JSON_BYTES];
+        exact.push(FrameContract::DELIMITER);
+        let mut reader = BufReader::new(Cursor::new(exact));
+        assert_eq!(
+            read_frame(&mut reader).await.unwrap().unwrap().len(),
+            FrameContract::MAX_JSON_BYTES
+        );
 
-        let incomplete =
-            run_status_refresh_jobs(&engine, jobs, before + budget, STATUS_REFRESH_CONCURRENCY)
-                .await;
+        let mut oversized = vec![b'x'; FrameContract::MAX_JSON_BYTES + 1];
+        oversized.push(FrameContract::DELIMITER);
+        let mut reader = BufReader::new(Cursor::new(oversized));
+        assert_eq!(
+            read_frame(&mut reader).await.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
 
-        assert_eq!(tokio::time::Instant::now() - before, budget);
-        assert_eq!(started.load(Ordering::SeqCst), STATUS_REFRESH_CONCURRENCY);
-        assert_eq!(incomplete.len(), STATUS_REFRESH_CONCURRENCY + 3);
+        let mut reader = BufReader::new(Cursor::new(b"{}"));
+        assert_eq!(
+            read_frame(&mut reader).await.unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn overdue_status_refresh_finishes_after_the_response_budget() {
-        let engine = delivery::Engine::new();
-        let completed = Arc::new(AtomicUsize::new(0));
-        let completed_by_job = Arc::clone(&completed);
-        let pane = crate::PaneKey::new(0, "%1");
-        let jobs = VecDeque::from([(
-            pane.clone(),
-            Box::pin(async move {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                completed_by_job.fetch_add(1, Ordering::SeqCst);
-                true
-            }) as StatusRefreshFuture,
-        )]);
-        let before = tokio::time::Instant::now();
+    #[tokio::test]
+    async fn oversized_ingress_is_dropped_before_dispatch() {
+        let mut inner = bare_inner();
+        let (stop, stop_rx) = watch::channel(false);
+        Arc::get_mut(&mut inner).unwrap().stop = stop_rx;
+        let (server, client) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(handle_conn(inner, server));
+        let mut client = BufReader::new(client);
+        let mut hello = String::new();
+        client.read_line(&mut hello).await.unwrap();
+        assert!(!hello.is_empty());
 
-        let incomplete =
-            run_status_refresh_jobs(&engine, jobs, before + Duration::from_millis(25), 1).await;
+        let mut request = serde_json::to_vec(&json!({
+            "id": 1,
+            "method": "ping",
+            "params": {
+                "padding": "x".repeat(cyclops_proto::FrameContract::MAX_JSON_BYTES)
+            }
+        }))
+        .unwrap();
+        request.push(b'\n');
+        client.get_mut().write_all(&request).await.unwrap();
 
-        assert_eq!(incomplete, HashSet::from([pane]));
-        assert_eq!(
-            tokio::time::Instant::now() - before,
-            Duration::from_millis(25)
+        let mut response = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(1), client.read_line(&mut response))
+            .await
+            .expect("the daemon must close an oversized frame")
+            .unwrap();
+        assert_eq!(read, 0, "oversized request reached dispatch: {response}");
+        task.await.unwrap();
+        drop(stop);
+    }
+
+    #[tokio::test]
+    async fn oversized_subscription_event_drops_instead_of_emitting_a_partial_frame() {
+        let mut inner = bare_inner();
+        let (stop, stop_rx) = watch::channel(false);
+        Arc::get_mut(&mut inner).unwrap().stop = stop_rx;
+        let events = inner.events.clone();
+        let (server, client) = UnixStream::pair().unwrap();
+        let task = tokio::spawn(handle_conn(inner, server));
+        let mut client = BufReader::new(client);
+
+        let mut hello = String::new();
+        client.read_line(&mut hello).await.unwrap();
+        client
+            .get_mut()
+            .write_all(b"{\"id\":1,\"method\":\"events.subscribe\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        let mut acknowledgement = String::new();
+        client.read_line(&mut acknowledgement).await.unwrap();
+        assert!(acknowledgement.contains("subscribed"));
+
+        events
+            .send(Event {
+                event: "test.oversized".into(),
+                data: json!({"padding": "x".repeat(FrameContract::MAX_JSON_BYTES)}),
+                seq: None,
+            })
+            .unwrap();
+        let mut event = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(1), client.read_line(&mut event))
+            .await
+            .expect("the daemon must close after refusing oversized event egress")
+            .unwrap();
+        assert_eq!(read, 0, "daemon emitted event bytes: {event}");
+        task.await.unwrap();
+        drop(stop);
+    }
+
+    #[tokio::test]
+    async fn oversized_egress_is_never_written() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let (_, mut writer) = server.into_split();
+        let reader = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            client.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        });
+        let oversized = "x".repeat(cyclops_proto::FrameContract::MAX_JSON_BYTES + 1);
+
+        assert!(!write_line(&mut writer, &oversized).await);
+        drop(writer);
+        assert!(reader.await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn exact_egress_boundary_writes_the_delimiter_outside_the_json_count() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let (_, mut writer) = server.into_split();
+        let reader = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            client.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        });
+        let exact = "x".repeat(FrameContract::MAX_JSON_BYTES);
+
+        assert!(write_line(&mut writer, &exact).await);
+        drop(writer);
+        let bytes = reader.await.unwrap();
+        assert_eq!(bytes.len(), FrameContract::max_line_bytes());
+        assert_eq!(bytes.last(), Some(&FrameContract::DELIMITER));
+    }
+
+    #[test]
+    fn oversized_response_becomes_a_bounded_uncertainty_error() {
+        let response = Response::ok(
+            json!(7),
+            json!({"padding": "x".repeat(FrameContract::MAX_JSON_BYTES)}),
         );
-        assert_eq!(completed.load(Ordering::SeqCst), 0);
-        tokio::time::advance(Duration::from_millis(25)).await;
-        tokio::task::yield_now().await;
-        assert_eq!(completed.load(Ordering::SeqCst), 1);
+
+        let frame = response_frame(&response).expect("a bounded fallback must fit");
+        assert!(frame.len() <= FrameContract::MAX_JSON_BYTES);
+        let fallback: Response = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(fallback.id, json!(7));
+        let error = fallback.error.expect("the fallback is a wire error");
+        assert_eq!(error.code, FrameContract::TOO_LARGE_CODE);
+        assert!(error.message.contains("outcome is unknown"));
+        assert!(fallback.result.is_none());
     }
 
     #[test]
@@ -2939,19 +2835,22 @@ mod tests {
             cfg: Config::defaults(&home),
             force_submit: crate::ForceSubmitRuntime::new(false, 5_000),
             state_root,
+            durable_record_forget_lease: StdMutex::new(None),
             state_repair: cyclops_state::RepairSummary::default(),
             workspace_id,
             session_identities: StdMutex::new(session_identities),
             mailbox: None,
-            composer_recovery: StdMutex::new(
+            workspace_messaging: std::sync::OnceLock::new(),
+            composer_recovery: Arc::new(StdMutex::new(
                 crate::composer_recovery::RecoveryCoordinator::default(),
-            ),
-            mailbox_publication: StdMutex::new(()),
+            )),
+            mailbox_publication: Arc::new(StdMutex::new(())),
             unread_projection_gate: tokio::sync::Mutex::new(()),
             unread_projection_pending: StdMutex::new(HashSet::new()),
             unread_projection_wake: tokio::sync::Notify::new(),
             unread_projection_stopping: std::sync::atomic::AtomicBool::new(false),
             unread_projection_pause: StdMutex::new(None),
+            chrome_repaint_pause: StdMutex::new(None),
             mailbox_publish_pause: StdMutex::new(None),
             boot_id: "b-test".into(),
             started: Instant::now(),
@@ -2963,8 +2862,7 @@ mod tests {
             events: broadcast::channel(16).0,
             detections: StdMutex::new(HashMap::<crate::PaneKey, DetEntry>::new()),
             route_evidence_generations: StdMutex::new(HashMap::new()),
-            pane_recomputes: StdMutex::new(HashMap::new()),
-            lifecycle_rechecks: StdMutex::new(HashMap::new()),
+            pane_observation_runtime: crate::fusion::PaneObservationRuntime::new(),
             registry: StdMutex::new(registry),
             theme: StdMutex::new(cyclops_theme::ThemeWatch::new(&home)),
             hook_readings: StdMutex::new(HashMap::new()),
@@ -3759,46 +3657,6 @@ mod tests {
         std::fs::remove_dir_all(path).ok();
     }
 
-    /// The attempt's recipient may read its own attention record. The
-    /// administrator may read any, and every other identity is refused.
-    #[test]
-    fn attention_show_admits_admin_and_the_attempts_recipient_only() {
-        let workspace: cyclops_proto::WorkspaceId =
-            "00000000-0000-0000-0000-000000000001".parse().unwrap();
-        let session: cyclops_proto::SessionInstanceId =
-            "00000000-0000-0000-0000-000000000002".parse().unwrap();
-        let recipient =
-            cyclops_proto::RecipientKey::agent(workspace, session, "%1".parse().unwrap());
-        let stranger =
-            cyclops_proto::RecipientKey::agent(workspace, session, "%2".parse().unwrap());
-        let admin = cyclops_proto::RecipientKey::admin(workspace);
-        let record = cyclops_proto::NotificationRecord {
-            attempt_id: cyclops_proto::NotificationAttemptId::parse(
-                "att-00000000-0000-4000-8000-000000000001",
-            )
-            .unwrap(),
-            message_id: cyclops_proto::MessageId::new("m-1").unwrap(),
-            recipient,
-            state: cyclops_proto::NotificationState::AttentionRequired,
-            binding: None,
-            transport: cyclops_proto::NotificationTransport::Doorbell,
-            doorbell_format: Some(2),
-            cause: Some(cyclops_proto::NotificationAttentionCause::VerifyFailed),
-            verify_outcome: None,
-            pre_write_cause: None,
-            wake_block: None,
-            pre_write_observation: None,
-            pre_write_reopen_count: 0,
-            unclaimed_reminder_count: 0,
-            started_seq: 1,
-            updated_seq: 2,
-            updated_at: 3,
-        };
-        assert!(attention_show_allowed(&admin, &record));
-        assert!(attention_show_allowed(&recipient, &record));
-        assert!(!attention_show_allowed(&stranger, &record));
-    }
-
     #[tokio::test]
     async fn attention_show_endpoint_admits_the_exact_recipient_without_leaking_other_ids() {
         let (inner, path, attempt_id, _) = inner_with_alarm(
@@ -3812,20 +3670,22 @@ mod tests {
         let recipient =
             RecipientKey::agent(workspace, session, TmuxPaneId::from_str("%1").unwrap());
         let stranger = RecipientKey::agent(workspace, session, TmuxPaneId::from_str("%2").unwrap());
-        let service = inner.mailbox.as_ref().unwrap();
+        let messaging = inner.workspace_messaging().unwrap();
         let params = AttentionShowParams {
             id: attempt_id.to_string(),
             diff: true,
         };
 
         let shown =
-            attention_show_for_caller(&inner, json!(1), params.clone(), service, recipient).await;
+            attention_show_for_caller(&inner, json!(1), params.clone(), &messaging, recipient)
+                .await;
         assert!(shown.error.is_none(), "{:?}", shown.error);
         let shown: cyclops_proto::AttentionShowResult =
             serde_json::from_value(shown.result.unwrap()).unwrap();
         assert_eq!(shown.attempt_id, attempt_id);
 
-        let denied = attention_show_for_caller(&inner, json!(2), params, service, stranger).await;
+        let denied =
+            attention_show_for_caller(&inner, json!(2), params, &messaging, stranger).await;
         assert_eq!(denied.error.unwrap().code, "denied");
 
         let hidden = attention_show_for_caller(
@@ -3835,7 +3695,7 @@ mod tests {
                 id: "att-00000000-0000-4000-8000-000000000099".into(),
                 diff: true,
             },
-            service,
+            &messaging,
             stranger,
         )
         .await;
@@ -4179,156 +4039,6 @@ mod tests {
         std::fs::remove_dir_all(path).ok();
     }
 
-    #[test]
-    fn status_never_advertises_a_second_submit_after_submit_intent() {
-        use crate::mailbox::ExactOwnedRecoveryAction;
-        use cyclops_proto::{
-            ComposerMessageState, ComposerNextAction, ComposerState, NotificationState,
-        };
-
-        assert_eq!(
-            composer_next_action(
-                ComposerState::CyclopsNotificationStaged,
-                NotificationState::Staged,
-                Some(ComposerMessageState::Pending),
-                ExactOwnedRecoveryAction::Ineligible,
-                false,
-                true,
-            ),
-            ComposerNextAction::AutomaticSubmit
-        );
-        assert_eq!(
-            composer_next_action(
-                ComposerState::CyclopsNotificationStaged,
-                NotificationState::Staged,
-                Some(ComposerMessageState::Claimed),
-                ExactOwnedRecoveryAction::Ineligible,
-                false,
-                true,
-            ),
-            ComposerNextAction::AutomaticReconcile
-        );
-        assert_eq!(
-            composer_next_action(
-                ComposerState::CyclopsNotificationStaged,
-                NotificationState::AttentionRequired,
-                Some(ComposerMessageState::Pending),
-                ExactOwnedRecoveryAction::Submit,
-                false,
-                false,
-            ),
-            ComposerNextAction::AutomaticSubmit
-        );
-        assert_eq!(
-            composer_next_action(
-                ComposerState::CyclopsNotificationStaged,
-                NotificationState::AttentionRequired,
-                Some(ComposerMessageState::Pending),
-                ExactOwnedRecoveryAction::Inspect,
-                false,
-                false,
-            ),
-            ComposerNextAction::InspectAttention
-        );
-        assert_eq!(
-            composer_next_action(
-                ComposerState::CyclopsNotificationStaged,
-                NotificationState::AttentionRequired,
-                Some(ComposerMessageState::Claimed),
-                ExactOwnedRecoveryAction::Clear,
-                true,
-                false,
-            ),
-            ComposerNextAction::AutomaticReconcile
-        );
-        assert_eq!(
-            composer_next_action(
-                ComposerState::CyclopsNotificationStaged,
-                NotificationState::AttentionRequired,
-                Some(ComposerMessageState::Claimed),
-                ExactOwnedRecoveryAction::Clear,
-                false,
-                false,
-            ),
-            ComposerNextAction::InspectAttention
-        );
-        for message in [ComposerMessageState::Pending, ComposerMessageState::Claimed] {
-            assert_eq!(
-                composer_next_action(
-                    ComposerState::CyclopsNotificationStaged,
-                    NotificationState::Staged,
-                    Some(message),
-                    ExactOwnedRecoveryAction::Ineligible,
-                    false,
-                    false,
-                ),
-                ComposerNextAction::CheckHealth,
-                "{message:?}"
-            );
-        }
-        for state in [NotificationState::Submitting, NotificationState::Submitted] {
-            assert_eq!(
-                composer_next_action(
-                    ComposerState::CyclopsNotificationStaged,
-                    state,
-                    Some(ComposerMessageState::Pending),
-                    ExactOwnedRecoveryAction::Ineligible,
-                    false,
-                    true,
-                ),
-                ComposerNextAction::AutomaticReconcile,
-                "{state:?}"
-            );
-            assert_eq!(
-                composer_next_action(
-                    ComposerState::CyclopsNotificationStaged,
-                    state,
-                    Some(ComposerMessageState::Pending),
-                    ExactOwnedRecoveryAction::Ineligible,
-                    false,
-                    false,
-                ),
-                ComposerNextAction::CheckHealth,
-                "{state:?}"
-            );
-        }
-        for (state, expected) in [
-            (NotificationState::Notified, ComposerNextAction::CheckHealth),
-            (
-                NotificationState::AttentionRequired,
-                ComposerNextAction::InspectAttention,
-            ),
-            (
-                NotificationState::WithdrawnAfterStaging,
-                ComposerNextAction::CheckHealth,
-            ),
-        ] {
-            assert_eq!(
-                composer_next_action(
-                    ComposerState::CyclopsNotificationStaged,
-                    state,
-                    Some(ComposerMessageState::Claimed),
-                    ExactOwnedRecoveryAction::Ineligible,
-                    false,
-                    true,
-                ),
-                expected,
-                "{state:?}"
-            );
-        }
-        assert_eq!(
-            composer_next_action(
-                ComposerState::ComposerAmbiguous,
-                NotificationState::Staged,
-                Some(ComposerMessageState::Pending),
-                ExactOwnedRecoveryAction::Ineligible,
-                false,
-                true,
-            ),
-            ComposerNextAction::CheckHealth
-        );
-    }
-
     async fn call(tag: &str, method: &str, params: Value) -> Response {
         let (inner, path) = inner_with_mailbox(&format!("operator-{tag}"));
         let request = Request {
@@ -4396,28 +4106,31 @@ mod tests {
     }
 
     #[test]
-    fn mailbox_caller_waits_for_route_publication() {
-        let inner = bare_inner();
+    fn optional_workspace_messaging_caller_waits_for_route_publication() {
+        let (inner, path) = inner_with_mailbox("workspace-messaging-publication");
         let peer = own_peer();
-        let publication = inner.mailbox_publication.lock().unwrap();
+        let messaging = inner.workspace_messaging().unwrap();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
 
         std::thread::scope(|scope| {
-            let inner = Arc::clone(&inner);
-            let reader = scope.spawn(move || {
-                started_tx.send(()).unwrap();
-                let _ = mailbox_caller(&inner, peer);
-                done_tx.send(()).unwrap();
+            let reader = messaging.with_published(|_| {
+                let inner = Arc::clone(&inner);
+                let reader = scope.spawn(move || {
+                    started_tx.send(()).unwrap();
+                    let _ = workspace_messaging_caller_if_available(&inner, peer);
+                    done_tx.send(()).unwrap();
+                });
+                started_rx.recv().unwrap();
+                let overlapped = done_rx
+                    .recv_timeout(std::time::Duration::from_millis(100))
+                    .is_ok();
+                assert!(!overlapped, "mailbox caller observed a partial publication");
+                reader
             });
-            started_rx.recv().unwrap();
-            let overlapped = done_rx
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_ok();
-            drop(publication);
             reader.join().unwrap();
-            assert!(!overlapped, "mailbox caller observed a partial publication");
         });
+        std::fs::remove_dir_all(path).ok();
     }
 
     #[test]
@@ -4904,8 +4617,9 @@ mod tests {
 
         assert!(arm.contains("status_result(inner, false)"));
         for forbidden in [
-            "refresh_status_detections",
-            "recompute_pane",
+            "refresh_status_observations",
+            "observe_pane",
+            "apply_messaging_observation",
             "open_deliveries: true",
             "engine.wake",
             "events.send",
@@ -4913,6 +4627,159 @@ mod tests {
             assert!(
                 !arm.contains(forbidden),
                 "health snapshot entered mutating path {forbidden}"
+            );
+        }
+    }
+
+    /// Syntactic boundary tripwire, not a proof of refresh semantics. The
+    /// server may request one named runtime refresh, but session discovery,
+    /// pane iteration, task ownership, and observation application belong to
+    /// the daemon runtime operation.
+    #[test]
+    fn status_dispatch_delegates_runtime_observation_refresh() {
+        fn keeps_runtime_boundary(arm: &str) -> bool {
+            arm.contains("crate::refresh_status_observations(inner).await")
+                && [
+                    "active_session_slots(",
+                    "watcher_of(",
+                    "run_status_refresh_jobs(",
+                    "JoinSet",
+                    "observe_pane(",
+                ]
+                .iter()
+                .all(|forbidden| !arm.contains(forbidden))
+        }
+
+        let source = include_str!("server.rs");
+        let arm = source
+            .split_once("        \"status\" => {")
+            .expect("status dispatch arm")
+            .1
+            .split_once("        \"health.snapshot\" =>")
+            .expect("next dispatch arm")
+            .0;
+
+        assert!(keeps_runtime_boundary(arm));
+        assert!(
+            !keeps_runtime_boundary("let routes = inner.active_session_slots();"),
+            "the tripwire must reject a direct runtime traversal"
+        );
+    }
+
+    /// Syntactic architecture lint: these wire adapters may validate and
+    /// serialize protocol values, but durable reads and mutations, locator
+    /// interpretation, and post-commit work belong to WorkspaceMessaging.
+    #[test]
+    fn messaging_handlers_do_not_recover_mailbox_implementation_knowledge() {
+        let source = include_str!("server.rs");
+        for (name, next, authenticates) in [
+            ("inbox_list", "inbox_claim", true),
+            ("inbox_claim", "messages_snapshot", true),
+            ("messages_snapshot", "messages_follow", true),
+            ("messages_follow", "msg_requeue", true),
+            ("msg_requeue", "notification_withdraw", true),
+            ("notification_withdraw", "alarm_preview", true),
+            ("alarm_preview", "alarm_clear", true),
+            ("alarm_clear", "attention_show", true),
+            ("attention_show", "attention_show_for_caller", true),
+            ("attention_show_for_caller", "attention_resolve", false),
+            ("attention_resolve", "messaging_attention_error", true),
+        ] {
+            let marker = format!("fn {name}(");
+            let next_marker = format!("fn {next}(");
+            let handler = source
+                .split_once(&marker)
+                .unwrap_or_else(|| panic!("handler {name}"))
+                .1
+                .split_once(&next_marker)
+                .unwrap_or_else(|| panic!("handler after {name}"))
+                .0;
+            if authenticates {
+                assert!(
+                    handler.contains("workspace_messaging_caller"),
+                    "{name} bypasses WorkspaceMessaging"
+                );
+            }
+            for forbidden in [
+                "mailbox_caller",
+                "mailbox_publication",
+                "MailboxService",
+                "crate::mailbox::",
+                "parse_notification_attempt_claim_locator",
+                "schedule_recipient",
+                "service.alarms_at_or_before",
+                "service.clear_alarms",
+                "service.attention_target",
+                "alarm_summary",
+            ] {
+                assert!(
+                    !handler.contains(forbidden),
+                    "{name} recovered forbidden messaging knowledge: {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn force_submit_settings_authenticate_through_workspace_messaging() {
+        let source = include_str!("server.rs");
+        let settings = source
+            .split_once("        \"notification.force_submit.get\" => {")
+            .expect("force-submit get dispatch arm")
+            .1
+            .split_once("        method => {")
+            .expect("dispatch fallback after force-submit settings")
+            .0;
+        assert_eq!(
+            settings
+                .matches("require_workspace_messaging_admin(inner, peer)")
+                .count(),
+            2
+        );
+        for forbidden in ["require_mailbox_admin", "mailbox_caller", "inner.mailbox"] {
+            assert!(
+                !settings.contains(forbidden),
+                "force-submit settings recovered {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_composition_does_not_recover_mailbox_projection_knowledge() {
+        let source = include_str!("server.rs");
+        let status = source
+            .split_once("fn status_result_with_refresh(")
+            .expect("status composition")
+            .1
+            .split_once("fn pane_read(")
+            .expect("handler after status composition")
+            .0;
+        assert!(status.contains("messaging.status_snapshot("));
+        assert!(status.contains("messaging_status.composer_status("));
+        assert!(status.contains("fusion::pane_status_observations(inner)"));
+        for forbidden in [
+            "inner.mailbox",
+            "inner.detections",
+            "DetEntry",
+            ".detection.",
+            "ComposerProjection",
+            "ActiveComposerNotification",
+            "ExactOwnedRecoveryAction",
+            "active_composer_notifications_snapshot",
+            "composer_candidate_index",
+            "composer_next_action",
+            "notification_worker_owns",
+            ".pending_count(",
+            ".pending_recipients(",
+            ".recipient_label(",
+            ".identity_for_recipient(",
+            ".routes(",
+            ".mailbox_attention_rows(",
+            ".blocked_notification_snapshot(",
+        ] {
+            assert!(
+                !status.contains(forbidden),
+                "status composition recovered mailbox knowledge through {forbidden}"
             );
         }
     }
@@ -4932,6 +4799,40 @@ mod tests {
         .await;
         assert_eq!(resp.result.unwrap()["subscribed"], true);
         assert_eq!(sub.unwrap().kinds, vec!["state"]);
+    }
+
+    #[tokio::test]
+    async fn subscribe_cursor_is_compatibility_input_and_backfill_is_the_snapshot() {
+        let inner = bare_inner();
+        let (response, subscription) = dispatch(
+            &inner,
+            Request {
+                id: json!("subscribe"),
+                method: "events.subscribe".into(),
+                params: json!({"cursor": 99}),
+            },
+            own_peer(),
+        )
+        .await;
+        assert_eq!(response.result.unwrap()["subscribed"], true);
+        assert_eq!(subscription.expect("subscription begins").cursor, Some(99));
+
+        let (response, subscription) = dispatch(
+            &inner,
+            Request {
+                id: json!("backfill"),
+                method: "events.backfill".into(),
+                params: json!({"limit": 20}),
+            },
+            own_peer(),
+        )
+        .await;
+        assert!(subscription.is_none(), "a snapshot switched to push mode");
+        let result: cyclops_proto::StreamBackfillResult =
+            serde_json::from_value(response.result.unwrap()).unwrap();
+        assert!(result.lines.is_empty());
+        assert_eq!(result.max_seq, None);
+        assert_eq!(result.gap, None);
     }
 
     #[test]

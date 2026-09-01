@@ -234,10 +234,10 @@ struct Inventory {
     bytes: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct MountIdentity {
-    device: u64,
-    mount_id: u64,
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct MountIdentity {
+    pub(crate) device: u64,
+    pub(crate) mount_id: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1534,7 +1534,8 @@ where
             "asset changed at the inventory boundary".to_string(),
         ));
     }
-    require_same_mount(&root.directory, allowed_mount, &mut mount_probe)?;
+    require_same_mount(&root.directory, allowed_mount, &mut mount_probe)
+        .map_err(|error| (CandidateState::Unsafe, error))?;
     let mut entries = Vec::with_capacity(root.entries.len().min(ENTRY_LIMIT));
     let mut directories = BTreeMap::new();
     directories.insert(inspector.path().to_path_buf(), root.directory.clone());
@@ -1559,7 +1560,8 @@ where
             let snapshot = inspector
                 .inspect_bound_directory(&directory, InspectionLimits::new(1, 256).unwrap())
                 .map_err(|error| (CandidateState::Unsafe, error.to_string()))?;
-            require_same_mount(&snapshot.directory, allowed_mount, &mut mount_probe)?;
+            require_same_mount(&snapshot.directory, allowed_mount, &mut mount_probe)
+                .map_err(|error| (CandidateState::Unsafe, error))?;
             if snapshot.truncated || !snapshot.entries.is_empty() {
                 return Err((
                     CandidateState::Unsafe,
@@ -1576,7 +1578,8 @@ where
                 InspectionLimits::new(remaining_entries, remaining_names).unwrap(),
             )
             .map_err(|error| (CandidateState::Unsafe, error.to_string()))?;
-        require_same_mount(&snapshot.directory, allowed_mount, &mut mount_probe)?;
+        require_same_mount(&snapshot.directory, allowed_mount, &mut mount_probe)
+            .map_err(|error| (CandidateState::Unsafe, error))?;
         if snapshot.truncated || !same_exact(&snapshot.directory, &directory) {
             return Err((
                 CandidateState::Unsafe,
@@ -1642,12 +1645,14 @@ fn add_entries(
         }
         match entry.kind {
             InspectedKind::Directory if directory_safe_for_asset(&entry, class) => {
-                require_same_mount(&entry, allowed_mount, mount_probe)?;
+                require_same_mount(&entry, allowed_mount, mount_probe)
+                    .map_err(|error| (CandidateState::Unsafe, error))?;
                 directories.insert(entry.path.clone(), entry.clone());
                 queue.push_back((entry.clone(), depth));
             }
             InspectedKind::RegularFile if entry.safe_beneath_owner_only_parent() => {
-                require_same_mount(&entry, allowed_mount, mount_probe)?;
+                require_same_mount(&entry, allowed_mount, mount_probe)
+                    .map_err(|error| (CandidateState::Unsafe, error))?;
                 *bytes = bytes.checked_add(entry.size).ok_or_else(|| {
                     (
                         CandidateState::Unsafe,
@@ -1678,23 +1683,23 @@ fn directory_safe_for_asset(entry: &InspectedEntry, class: AssetClass) -> bool {
     }
 }
 
-fn require_same_mount(
+pub(crate) fn require_same_mount(
     entry: &InspectedEntry,
     allowed: MountIdentity,
     mount_probe: &mut impl FnMut(&InspectedEntry) -> Result<MountIdentity, String>,
-) -> Result<(), (CandidateState, String)> {
-    let current = mount_probe(entry).map_err(|error| (CandidateState::Unsafe, error))?;
+) -> Result<(), String> {
+    let current = mount_probe(entry)?;
     if current != allowed {
-        return Err((
-            CandidateState::Unsafe,
-            format!("asset crosses a mount boundary: {}", entry.path.display()),
+        return Err(format!(
+            "asset crosses a mount boundary: {}",
+            entry.path.display()
         ));
     }
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn mount_identity(entry: &InspectedEntry) -> Result<MountIdentity, String> {
+pub(crate) fn mount_identity(entry: &InspectedEntry) -> Result<MountIdentity, String> {
     Ok(MountIdentity {
         device: entry.device,
         mount_id: entry.device,
@@ -1702,7 +1707,7 @@ fn mount_identity(entry: &InspectedEntry) -> Result<MountIdentity, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn mount_identity(entry: &InspectedEntry) -> Result<MountIdentity, String> {
+pub(crate) fn mount_identity(entry: &InspectedEntry) -> Result<MountIdentity, String> {
     let path = std::ffi::CString::new(entry.path.as_os_str().as_bytes())
         .map_err(|_| format!("asset path contains a null byte: {}", entry.path.display()))?;
     // SAFETY: statx initializes the provided structure before a successful return.

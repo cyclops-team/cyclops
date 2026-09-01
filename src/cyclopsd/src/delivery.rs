@@ -10,7 +10,8 @@
 //! Four things live here that read like they belong elsewhere, and each
 //! one is here because it needs the same handle the pipeline holds:
 //! `admin_notify` (a ping usually points at a delivery), `close_limbo`
-//! (the restart sweep over chains this file left open), `agent_wait` and
+//! (the retained restart sweep, entered only through `compatibility.rs`),
+//! `agent_wait` and
 //! `wait_pinned` (send-and-wait pins on the pid the submit went to), and
 //! `About`, the item a ping names so a reader can stop showing it.
 //!
@@ -22,9 +23,10 @@
 //! Zero-polling shape: workers sleep on queue notifies and wake on watcher
 //! or fusion events. Every timer is a one-shot tied to one delivery: the
 //! paste verification re-reads, the tier-1 ACK window, the screen-evidence
-//! checkpoints, the decline-key spacing, the gate's single wedged-hold
-//! ping, and the two deadlines a caller asked for (`receipt_block_ms`,
-//! and `timeout_ms` on a wait). Nothing runs on an interval.
+//! checkpoints, the decline-key spacing, the idle-ambiguous-composer settle
+//! deadline, the gate's single wedged-hold ping, and the two deadlines a
+//! caller asked for (`receipt_block_ms`, and `timeout_ms` on a wait). Nothing
+//! runs on an interval.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -37,12 +39,12 @@ use cyclops_manifest::{
 };
 use cyclops_proto::{
     AgentState, ComposerSemantic, ComposerState, Delivery, DeliveryReceipt, DeliveryState,
-    Detection, Event, Kind, LedgerLine, MessageId, MsgSendParams, MsgSendResult,
-    NotificationAttemptId, NotificationAttentionCause, NotificationBinding, NotificationManifestId,
-    NotificationPreWriteCause, NotificationPreWriteObservation, NotificationRecord,
-    NotificationRouteEvidenceId, NotificationState, NotificationTransport,
-    NotificationVerifyFailureKind, NotificationVerifyOutcome, NotifyLevel, ProcessInstanceId,
-    QuiesceResult, RecipientKey, Sensor, StatusDiagnostic, VerifiedBy, WaitUntil, WireError,
+    Detection, Event, Kind, LedgerLine, MsgSendParams, MsgSendResult, NotificationAttemptId,
+    NotificationAttentionCause, NotificationBinding, NotificationManifestId,
+    NotificationPreWriteCause, NotificationPreWriteObservation, NotificationState,
+    NotificationTransport, NotificationVerifyFailureKind, NotificationVerifyOutcome, NotifyLevel,
+    ProcessInstanceId, QuiesceResult, RecipientKey, Sensor, StatusDiagnostic, VerifiedBy,
+    WaitUntil, WireError,
 };
 use cyclops_tmux::{ControlClient, PaneEvent, PaneRow, SessionWatcher, TmuxError};
 use serde_json::{json, Value};
@@ -51,10 +53,14 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, error, warn};
 
+use crate::messaging::{MessagingPreWriteBlock, MessagingPreWriteBlockOutcome};
 use crate::notification_adapter::{
     ClaimedNotificationBarrier, NotificationAdapterError, NotificationContext, SubmitReservation,
 };
 use crate::{daemon_line, fusion, unix_ms, Inner, PaneKey};
+
+#[cfg(test)]
+use cyclops_proto::{MessageId, NotificationRouteEvidenceId};
 
 /// Delivery gives up on evidence this long after submit (spec: neither ACK
 /// tier within 5s goes to retry_queued).
@@ -1060,6 +1066,11 @@ pub(crate) struct DeliveryHandle {
     /// The legacy composed wait uses this only to reject a working phase
     /// that predates the submit. It does not correlate a turn to a message.
     working_seen: AtomicBool,
+    /// A receiver opened before the submit key and handed to a composed wait.
+    /// It may contain older broadcasts, so the wait treats it only as a
+    /// source of an exact post-submit Working fact. Its state sequence never
+    /// becomes the wait's live state.
+    post_submit_turn_events: StdMutex<Option<broadcast::Receiver<Event>>>,
     /// pane_pid of the occupant this delivery was submitted to, recorded
     /// right before the submit key. Send-and-wait pins its wait on THIS
     /// occupant, not whoever lives in the pane when the wait starts; an
@@ -1143,6 +1154,21 @@ struct HandleState {
     barrier: Option<String>,
 }
 
+/// The pre-Enter event receiver travels with the exact delivery it observed.
+/// It is consumed only as a fact source by the composed `send --wait` path;
+/// the wait itself starts a fresh live receiver after its baseline.
+pub(crate) struct SubmittedTurnEvidence {
+    events: broadcast::Receiver<Event>,
+    handle: Arc<DeliveryHandle>,
+}
+
+/// Identity facts a wait must preserve from a preceding delivery.
+#[derive(Default)]
+pub(crate) struct WaitPin {
+    submitted_pid: Option<i32>,
+    turn_evidence: Option<SubmittedTurnEvidence>,
+}
+
 impl DeliveryHandle {
     /// This attempt's claim on a pane's composer barrier.
     ///
@@ -1180,6 +1206,24 @@ impl DeliveryHandle {
             .expect("submitted manifest lock")
             .as_deref()
             == Some(manifest_id)
+    }
+
+    fn replace_post_submit_turn_events(&self, events: broadcast::Receiver<Event>) {
+        *self
+            .post_submit_turn_events
+            .lock()
+            .expect("post-submit turn events lock") = Some(events);
+    }
+
+    fn take_post_submit_turn_evidence(self: &Arc<Self>) -> Option<SubmittedTurnEvidence> {
+        self.post_submit_turn_events
+            .lock()
+            .expect("post-submit turn events lock")
+            .take()
+            .map(|events| SubmittedTurnEvidence {
+                events,
+                handle: Arc::clone(self),
+            })
     }
 
     fn new(
@@ -1275,6 +1319,7 @@ impl DeliveryHandle {
             ack: Notify::new(),
             cancel: Notify::new(),
             working_seen: AtomicBool::new(false),
+            post_submit_turn_events: StdMutex::new(None),
             submitted_pid: AtomicI32::new(0),
             submitted_agent: StdMutex::new(None),
             submitted_at_ms: std::sync::atomic::AtomicU64::new(0),
@@ -1897,7 +1942,11 @@ pub(crate) async fn quiesce(inner: &Arc<Inner>, timeout_ms: Option<u64>) -> Quie
 /// that file, so a chain recorded in another session's file is never
 /// falsely closed here; a delivery that died before its first state line
 /// still closes through its hosted msg record.
-pub(crate) fn close_limbo(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine>)]) {
+pub(crate) fn close_limbo(
+    inner: &Arc<Inner>,
+    replayed: &[(usize, Vec<LedgerLine>)],
+    _boundary: &crate::compatibility::BoundaryToken,
+) {
     /// What `render_payload` needs to rebuild a requeued delivery's bytes,
     /// straight off the msg line.
     struct Envelope {
@@ -2311,6 +2360,7 @@ pub(crate) async fn msg_send(
     inner: &Arc<Inner>,
     from: &str,
     params: MsgSendParams,
+    _boundary: &crate::compatibility::BoundaryToken,
 ) -> Result<Value, WireError> {
     if inner.session_count() == 0 {
         return Err(wire_err("no_such_target", "no sessions are watched"));
@@ -2599,6 +2649,7 @@ pub(crate) async fn msg_send(
             // submit and wait start must read occupant_changed instead of
             // answering for the impostor.
             let submitted = handle.submitted_pid.load(Ordering::SeqCst);
+            let turn_evidence = handle.take_post_submit_turn_evidence();
             let end = wait_pinned(
                 inner,
                 handle.session_idx,
@@ -2606,7 +2657,10 @@ pub(crate) async fn msg_send(
                 spec.until,
                 remaining,
                 working_pre,
-                (submitted != 0).then_some(submitted),
+                WaitPin {
+                    submitted_pid: (submitted != 0).then_some(submitted),
+                    turn_evidence,
+                },
             )
             .await;
             waits.push(json!({
@@ -3141,18 +3195,21 @@ async fn notification_worker_loop(inner: Arc<Inner>, recipient: RecipientKey, wo
                             .claimed_notification_rerun_requested
                             .swap(false, Ordering::SeqCst)
                     {
-                        if let (Some(service), Some(notification)) =
-                            (&inner.mailbox, &handle.notification)
-                        {
-                            if let Err(error) = crate::messaging::schedule_recipient(
-                                &inner,
-                                service,
-                                notification.recipient(),
-                            ) {
+                        if let Some(notification) = &handle.notification {
+                            if let Some(messaging) = inner.workspace_messaging() {
+                                if let Err(error) =
+                                    messaging.notification_head_changed(notification.recipient())
+                                {
+                                    error!(
+                                        id = %handle.msg_id,
+                                        %error,
+                                        "cannot reschedule claimed notification after readiness edge"
+                                    );
+                                }
+                            } else {
                                 error!(
                                     id = %handle.msg_id,
-                                    %error,
-                                    "cannot reschedule claimed notification after readiness edge"
+                                    "cannot reschedule claimed notification without workspace messaging"
                                 );
                             }
                         }
@@ -3243,10 +3300,21 @@ fn recover_failed_job(
                 true
             }
             NotificationState::Queued | NotificationState::Gating => {
-                let Some(record) = persist_worker_failed_prewrite(notification, worker) else {
+                let Some(messaging) = inner.workspace_messaging() else {
+                    worker.set_fault("notification recovery has no workspace messaging Module");
                     return false;
                 };
-                notify_notification_prewrite_blocked(inner, handle, &record);
+                let block = match messaging.record_worker_failed_prewrite(notification) {
+                    Ok(MessagingPreWriteBlockOutcome::Recorded(block)) => Some(block),
+                    Ok(MessagingPreWriteBlockOutcome::Obsolete) => None,
+                    Err(error) => {
+                        worker.set_fault(format!("notification recovery failed: {error}"));
+                        return false;
+                    }
+                };
+                if let Some(block) = block {
+                    notify_notification_prewrite_blocked(inner, handle, &block);
+                }
                 worker.finish(handle);
                 inner.engine.retire_notification_run(handle);
                 true
@@ -3293,17 +3361,17 @@ fn recover_failed_job(
                         return false;
                     }
                     let recipient = notification.recipient();
-                    crate::schedule_recipient_unread(inner, recipient);
-                    if let Some(service) = &inner.mailbox {
-                        if let Err(error) = crate::messaging::schedule_recipient(
-                            inner,
-                            service,
-                            notification.recipient(),
-                        ) {
+                    if let Some(messaging) = inner.workspace_messaging() {
+                        if let Err(error) = messaging.direct_delivery_settled(recipient) {
                             worker
                                 .set_fault(format!("direct settlement scheduling failed: {error}"));
                             return false;
                         }
+                    } else {
+                        worker.set_fault(
+                            "direct settlement scheduling failed: workspace messaging unavailable",
+                        );
+                        return false;
                     }
                 }
                 let _ = advance(
@@ -3377,26 +3445,6 @@ fn recover_failed_job(
     }
 }
 
-/// Persist the terminal pre-write block before releasing FIFO ownership.
-///
-/// A failed read or append leaves the exact current handle in place. Advancing
-/// to the next queued message would bypass a durable attempt that still owns
-/// the recipient FIFO.
-fn persist_worker_failed_prewrite(
-    notification: &NotificationContext,
-    worker: &Worker,
-) -> Option<NotificationRecord> {
-    match notification.record_gating().and_then(|_| {
-        notification.record_pre_write_block(NotificationPreWriteCause::WorkerFailed, None)
-    }) {
-        Ok(record) => Some(record),
-        Err(error) => {
-            worker.set_fault(format!("notification recovery failed: {error}"));
-            None
-        }
-    }
-}
-
 /// Persist one known pre-write block without releasing FIFO ownership on an
 /// uncertain journal append.
 ///
@@ -3417,86 +3465,45 @@ async fn persist_notification_prewrite_block(
     // Test seam: an admitting edge can land between the gate's verdict and
     // this append. The reconcile below must catch it, never strand it.
     inject_pause(inner, "pre_prewrite_block").await;
-    if let Some(record) = record_notification_prewrite_block(
+    let Some(messaging) = inner.workspace_messaging() else {
+        worker.set_fault("notification pre-write block has no workspace messaging Module");
+        return;
+    };
+    let block = match messaging.record_notification_prewrite_block(
         notification,
-        worker,
-        &inner.mailbox_publication,
         cause,
         observation,
-        &route_evidence,
+        route_evidence,
+        handle.session_idx,
+        &handle.pane_id,
     ) {
-        notify_notification_prewrite_blocked(inner, handle, &record);
-        // A positive route edge can race just ahead of this append and see
-        // only Gating. Reconcile once after the durable block exists so that
-        // edge is not lost. The mailbox projection enforces the one-reopen
-        // limit and exact binding checks.
-        crate::messaging::schedule_route_reconciliation(inner, handle.session_idx, &handle.pane_id);
-        if let Some(watcher) = inner.watcher_of(handle.session_idx) {
-            let route_evidence = inner.route_evidence_id(handle.session_idx, &handle.pane_id);
-            fusion::recompute_pane_for_route_evidence(
-                inner,
-                handle.session_idx,
-                &watcher,
-                &handle.pane_id,
-                true,
-                "prewrite_block_reconcile",
-                &route_evidence,
-            )
-            .await;
-            crate::messaging::schedule_route_reconciliation(
-                inner,
-                handle.session_idx,
-                &handle.pane_id,
-            );
-        }
-    }
-}
-
-fn record_notification_prewrite_block(
-    notification: &NotificationContext,
-    worker: &Worker,
-    publication: &StdMutex<()>,
-    cause: NotificationPreWriteCause,
-    observation: Option<NotificationPreWriteObservation>,
-    route_evidence: &NotificationRouteEvidenceId,
-) -> Option<NotificationRecord> {
-    let observation =
-        if cause == NotificationPreWriteCause::WriteReadinessChanged && observation.is_none() {
-            // A readiness race can lack binding or width evidence, but it still
-            // needs the route generation under which the write was refused.
-            Some(NotificationPreWriteObservation {
-                write_block: None,
-                pane_root: None,
-                selected_manifest: None,
-                binding: None,
-                route_evidence: Some(route_evidence.clone()),
-                pane_width: None,
-                required_pane_width: None,
-            })
-        } else {
-            observation
-        };
-    let recorded = {
-        let _publication = publication.lock().expect("mailbox publication lock");
-        let wake_block = (cause == NotificationPreWriteCause::ComposerOwnershipUnproven)
-            .then_some(cyclops_proto::MessageWakeBlock::ComposerOwnershipUnproven);
-        notification.record_pre_write_block_with_wake_block(cause, observation, wake_block)
-    };
-    match recorded {
-        Ok(record) => Some(record),
-        Err(NotificationAdapterError::NoLongerCurrentBeforeWrite) => None,
-        Err(NotificationAdapterError::TerminalConflict(
-            NotificationState::Withdrawn
-            | NotificationState::WithdrawnByOperator
-            | NotificationState::Superseded,
-        )) => None,
+        Ok(MessagingPreWriteBlockOutcome::Recorded(block)) => block,
+        Ok(MessagingPreWriteBlockOutcome::Obsolete) => return,
         Err(error) => {
             error!(id = %notification.message_id(), %error, "notification pre-write block fact failed");
             worker.set_fault(format!(
                 "notification pre-write block storage failed: {error}"
             ));
-            None
+            return;
         }
+    };
+    notify_notification_prewrite_blocked(inner, handle, &block);
+    // A positive route edge can race just ahead of this append and see only
+    // Gating. Re-observe after the durable block exists so that edge is not
+    // lost. The Module enforces the one-reopen limit and exact binding checks.
+    if let Some(watcher) = inner.watcher_of(handle.session_idx) {
+        let route_evidence = inner.route_evidence_id(handle.session_idx, &handle.pane_id);
+        crate::observe_pane_for_route_evidence(
+            inner,
+            handle.session_idx,
+            &watcher,
+            &handle.pane_id,
+            true,
+            "prewrite_block_reconcile",
+            &route_evidence,
+        )
+        .await;
+        messaging.notification_prewrite_blocked(handle.session_idx, &handle.pane_id);
     }
 }
 
@@ -4247,7 +4254,7 @@ async fn attempt_delivery(
     // notice: same pane, same pid, same manifest, new draft. So the
     // readiness rule is asked again here, against a capture taken now,
     // immediately before the write that cannot be taken back.
-    match fusion::recompute_pane(
+    match crate::observe_pane(
         inner,
         handle.session_idx,
         &watcher,
@@ -4682,6 +4689,17 @@ async fn attempt_delivery(
     // phase before send-keys returns, so subscribing inside the receipt
     // waiter loses the only turn evidence that actually followed this key.
     let receipt_events = inner.events.subscribe();
+    // This receiver has one job: retain a matching working edge until a
+    // screen checkpoint has accounted for it. The main receipt receiver
+    // still owns session lifecycle and lag handling below. Keeping those
+    // responsibilities separate means a screen receipt cannot settle first
+    // and strand the `turn_ended` wait behind an already-observed turn.
+    let receipt_turn_events = inner.events.subscribe();
+    // Keep an independent receiver alive through receipt settlement and into
+    // `wait_pinned`. It can establish only an exact post-submit Working fact;
+    // the composed wait opens its own fresh stream for current and future
+    // state, so an older Idle cannot replay as a current answer.
+    handle.replace_post_submit_turn_events(inner.events.subscribe());
     let receipt_submit_at = Instant::now();
     let receipt_submit_at_ms = unix_ms();
     handle.submitted_pid.store(admitted_pid, Ordering::SeqCst);
@@ -4780,7 +4798,7 @@ async fn attempt_delivery(
             return AttemptOutcome::Done;
         }
     }
-    match await_ack(
+    let ack_outcome = await_ack(
         inner,
         handle,
         ReceiptWait {
@@ -4790,10 +4808,15 @@ async fn attempt_delivery(
             target,
             submit_at: receipt_submit_at,
             events: receipt_events,
+            turn_events: receipt_turn_events,
         },
     )
-    .await
-    {
+    .await;
+    // Test-only boundary after receipt observation has finished but before
+    // this worker publishes its delivery verdict. It proves the composed
+    // wait owns a receiver with no observation gap after an early receipt.
+    inject_pause(inner, "post_receipt").await;
+    match ack_outcome {
         AckOutcome::Resolved => AttemptOutcome::Done,
         AckOutcome::Screen => {
             // Stays registered: a late matching hook ACK upgrades it to
@@ -5219,17 +5242,16 @@ async fn reconcile_claimed_notification_barrier<I: Injector>(
         )
         .await;
     }
-    inner
-        .composer_recovery
-        .lock()
-        .expect("composer recovery lock")
-        .retired(record.attempt_id);
-    if let Some(service) = &inner.mailbox {
-        if let Err(error) =
-            crate::messaging::schedule_recipient(inner, service, notification.recipient())
-        {
+    if let Some(messaging) = inner.workspace_messaging() {
+        messaging.composer_barrier_retired(record.attempt_id);
+        if let Err(error) = messaging.notification_head_changed(notification.recipient()) {
             error!(id = %handle.msg_id, %error, "cannot advance notification FIFO after staged claim");
         }
+    } else {
+        error!(
+            id = %handle.msg_id,
+            "cannot advance notification FIFO after staged claim without workspace messaging"
+        );
     }
     AttemptOutcome::Done
 }
@@ -5622,12 +5644,8 @@ async fn fail_attempt(
                 };
                 match result {
                     Ok(record) => {
-                        if record.needs_exact_owned_reconciliation() {
-                            crate::attention_resolution::schedule_exact_owned_reconciliation(
-                                inner,
-                                record.recipient,
-                            );
-                            crate::messaging::schedule_force_submit(inner, record);
+                        if let Some(messaging) = inner.workspace_messaging() {
+                            messaging.notification_attention_recorded(record);
                         }
                     }
                     Err(NotificationAdapterError::TerminalConflict(_)) => return false,
@@ -5671,11 +5689,10 @@ async fn fail_attempt(
 fn notify_notification_prewrite_blocked(
     inner: &Arc<Inner>,
     handle: &DeliveryHandle,
-    record: &cyclops_proto::NotificationRecord,
+    block: &MessagingPreWriteBlock,
 ) {
-    let cause = record
-        .pre_write_cause
-        .and_then(|cause| serde_json::to_value(cause).ok())
+    let cause = serde_json::to_value(block.cause)
+        .ok()
         .and_then(|value| value.as_str().map(str::to_string))
         .unwrap_or_else(|| "unknown".to_string());
     admin_notify(
@@ -5684,7 +5701,7 @@ fn notify_notification_prewrite_blocked(
         &format!("notification to {} blocked before write", handle.to),
         &format!(
             "message {} attempt {}: {cause}; the mailbox remains claimable",
-            handle.msg_id, record.attempt_id
+            handle.msg_id, block.attempt_id
         ),
         Some(&handle.msg_id),
         Some(handle.session_idx),
@@ -5809,8 +5826,10 @@ async fn park_recipient(
         // already won, the edge's scan found no held attempt. Recheck the
         // exact route once after the hold exists so the attempt cannot be
         // stranded until another unrelated redraw.
-        if fusion::quota_reset_observed_now(inner, handle.session_idx, &handle.pane_id) {
-            observe_quota_reset(inner, handle.session_idx, &handle.pane_id);
+        if let Some(observation) =
+            fusion::quota_reset_observation_now(inner, handle.session_idx, &handle.pane_id)
+        {
+            crate::apply_messaging_observation(inner, observation);
         }
         return;
     }
@@ -5853,48 +5872,6 @@ async fn park_recipient(
         Some(handle.session_idx),
         About::delivery(&handle.to),
     );
-}
-
-/// Persist a positive quota-reset observation and expose only the explicit
-/// administrator verb. This never queues a worker or moves a delivery.
-pub(crate) fn observe_quota_reset(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) {
-    let Some(service) = inner.mailbox.as_ref() else {
-        return;
-    };
-    let Some(recipient) = inner.recipient_key(session_idx, pane_id) else {
-        return;
-    };
-    let observed = match service.observe_quota_reset(recipient) {
-        Ok(observed) => observed,
-        Err(error) => {
-            error!(%recipient, %error, "cannot record observed quota reset");
-            return;
-        }
-    };
-    if observed.is_empty() {
-        return;
-    }
-    let label = service
-        .identity_for_recipient(recipient)
-        .ok()
-        .flatten()
-        .map(|identity| identity.label)
-        .unwrap_or_else(|| pane_id.to_string());
-    for record in observed {
-        admin_notify(
-            inner,
-            NotifyLevel::ActionRequired,
-            &format!("quota reset observed for {label}"),
-            &quota_reset_notice(&record.message_id),
-            Some(record.message_id.as_str()),
-            Some(session_idx),
-            About::delivery(&label),
-        );
-    }
-}
-
-fn quota_reset_notice(message_id: &MessageId) -> String {
-    format!("message {message_id} remains held; run `cyclops requeue {message_id}`")
 }
 
 fn legacy_park_hint(handle: &DeliveryHandle, hint: Option<String>) -> Option<String> {
@@ -5966,15 +5943,20 @@ async fn gate(
     // the configured threshold pings the admin exactly once.
     let mut hold_since: Option<Instant> = None;
     let mut hold_notified = false;
+    // Subscribe once before the first evaluation and retain this receiver for
+    // the gate's whole lifetime. Replacing it between re-evaluations leaves a
+    // gap where a settled readiness edge can be published after an early pane
+    // wake but before the next receiver exists, stranding a now-clean pane.
+    let mut ev_rx = inner.events.subscribe();
     // When the idle-ambiguous composer hold began. Cleared whenever any
     // other verdict interrupts, so only unbroken ambiguity can outlive the
     // settle window and become the durable block.
     let mut ambiguous_since: Option<Instant> = None;
     let ambiguous_settle = Duration::from_millis(inner.cfg.ambiguous_composer_settle_ms);
     'gate: loop {
-        // Subscribe before evaluating so nothing published mid-evaluation
-        // is lost; evaluation itself is authoritative.
-        let mut ev_rx = inner.events.subscribe();
+        // The event receiver predates every evaluation, so events published
+        // mid-evaluation or between iterations remain buffered. Evaluation
+        // itself is still authoritative.
         let watcher = watcher_for_handle(inner, handle);
         let mut pane_rx = watcher.as_ref().map(|w| w.subscribe());
 
@@ -6076,7 +6058,7 @@ async fn gate(
                                 observation: Box::new(observation),
                             };
                         }
-                        let Some(det) = fusion::recompute_pane(
+                        let Some(det) = crate::observe_pane(
                             inner,
                             handle.session_idx,
                             w,
@@ -6313,11 +6295,17 @@ async fn gate(
                                                     ),
                                                 };
                                             };
+                                            // Keep the durable detail in the
+                                            // existing optional observation
+                                            // field. Adding a new persisted
+                                            // enum spelling would make an
+                                            // older journal reader reject a
+                                            // record it otherwise understands.
                                             observation.write_block =
-                                                Some("no_write_safe_composer_evidence".to_string());
+                                                Some("composer_semantic_ambiguous".to_string());
                                             return GateOutcome::BlockedPreWrite {
                                                 cause:
-                                                    NotificationPreWriteCause::ComposerSemanticAmbiguous,
+                                                    NotificationPreWriteCause::WriteReadinessChanged,
                                                 observation: Box::new(observation),
                                             };
                                         }
@@ -6845,23 +6833,26 @@ fn record_notification_notified(
             if handle.notification_transport() == Some(NotificationTransport::DirectPayload) {
                 notification.record_delivered_direct()?;
                 let recipient = notification.recipient();
-                crate::schedule_recipient_unread(inner, recipient);
-                if let Some(service) = &inner.mailbox {
-                    if let Err(error) = crate::messaging::schedule_recipient(
-                        inner,
-                        service,
-                        notification.recipient(),
-                    ) {
+                if let Some(messaging) = inner.workspace_messaging() {
+                    if let Err(error) = messaging.direct_delivery_settled(recipient) {
                         error!(
                             id = %handle.msg_id,
-                            recipient = %notification.recipient(),
+                            %recipient,
                             %error,
                             "direct delivery settled but the next mailbox item could not be scheduled"
                         );
                     }
+                } else {
+                    error!(
+                        id = %handle.msg_id,
+                        %recipient,
+                        "direct delivery settled without workspace messaging"
+                    );
                 }
             } else {
-                crate::messaging::schedule_unclaimed_reminder(inner, record);
+                if let Some(messaging) = inner.workspace_messaging() {
+                    messaging.notification_became_notified(record);
+                }
             }
             Ok(true)
         }
@@ -8034,6 +8025,7 @@ struct ReceiptWait<'a> {
     target: StagingTarget<'a>,
     submit_at: Instant,
     events: broadcast::Receiver<Event>,
+    turn_events: broadcast::Receiver<Event>,
 }
 
 fn receipt_is_resolved(handle: &DeliveryHandle) -> bool {
@@ -8084,13 +8076,22 @@ async fn receipt_checkpoint_pass(
     id_staged: bool,
     target: StagingTarget<'_>,
     working_seen: bool,
+    turn_events: &mut broadcast::Receiver<Event>,
     output_seen: bool,
     clock: &AckClock,
 ) -> ReceiptStep {
+    // `turn_events` subscribed before Enter. A screen checkpoint can become
+    // ready at the same instant as the state event, so account for every
+    // already-buffered matching edge before that checkpoint is allowed to
+    // settle the delivery. This is a fact recorder only; lifecycle handling
+    // remains on the main receipt event stream.
+    let working_seen = working_seen
+        || handle.working_seen.load(Ordering::SeqCst)
+        || record_buffered_working_evidence(turn_events, handle);
     let Some(watcher) = inner.watcher_of(handle.session_idx) else {
         return ReceiptStep::Freeze;
     };
-    let detection = fusion::recompute_pane(
+    let detection = crate::observe_pane(
         inner,
         handle.session_idx,
         &watcher,
@@ -8135,6 +8136,35 @@ async fn receipt_checkpoint_pass(
     }
 }
 
+/// Latch a matching working edge from the backlog present when this is called.
+/// The scan is bounded by that fixed backlog, not an arbitrary count. A
+/// receipt's main event stream handles later receipt lifecycle, while a
+/// composed wait has already opened a fresh stream for later fused state.
+///
+/// If the receiver has lagged, this records no fact. Missing a turn can only
+/// make `turn_ended` time out; inventing one would be a false success.
+fn record_buffered_working_evidence(
+    events: &mut broadcast::Receiver<Event>,
+    handle: &Arc<DeliveryHandle>,
+) -> bool {
+    let backlog = events.len();
+    for _ in 0..backlog {
+        match events.try_recv() {
+            Ok(event) => {
+                if submitted_working_state_event(&event, handle) {
+                    handle.working_seen.store(true, Ordering::SeqCst);
+                    return true;
+                }
+            }
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                return false;
+            }
+            Err(broadcast::error::TryRecvError::Lagged(_)) => return false,
+        }
+    }
+    false
+}
+
 async fn await_ack(
     inner: &Arc<Inner>,
     handle: &Arc<DeliveryHandle>,
@@ -8147,6 +8177,7 @@ async fn await_ack(
         target,
         submit_at,
         events: mut ev_rx,
+        turn_events: mut turn_ev_rx,
     } = wait;
     let tier1 = manifest.hooks.ack.is_some() && manifest.hooks.ack_payload_field.is_some();
     let mut pane_rx = inner.watcher_of(handle.session_idx).map(|w| w.subscribe());
@@ -8217,7 +8248,7 @@ async fn await_ack(
                 clock.advance_checkpoint();
                 match receipt_checkpoint_pass(
                     inner, handle, manifest, staged_window, id_staged, target,
-                    working_seen, output_seen, &clock,
+                    working_seen, &mut turn_ev_rx, output_seen, &clock,
                 ).await {
                     ReceiptStep::Resolved => return AckOutcome::Resolved,
                     ReceiptStep::Deliver => {
@@ -8268,7 +8299,7 @@ async fn await_ack(
                             // outage?
                             match receipt_checkpoint_pass(
                                 inner, handle, manifest, staged_window, id_staged, target,
-                                working_seen, output_seen, &clock,
+                                working_seen, &mut turn_ev_rx, output_seen, &clock,
                             ).await {
                                 ReceiptStep::Resolved => return AckOutcome::Resolved,
                                 ReceiptStep::Deliver => {
@@ -8311,7 +8342,7 @@ async fn await_ack(
                         clock.unfreeze(Instant::now());
                         match receipt_checkpoint_pass(
                             inner, handle, manifest, staged_window, id_staged, target,
-                            working_seen, output_seen, &clock,
+                            working_seen, &mut turn_ev_rx, output_seen, &clock,
                         ).await {
                             ReceiptStep::Resolved => return AckOutcome::Resolved,
                             ReceiptStep::Deliver => {
@@ -8341,26 +8372,28 @@ async fn await_ack(
     }
 }
 
-/// True when the event is a working fused-state change for this pane.
-fn track_state_event(
-    ev: &Result<Event, broadcast::error::RecvError>,
-    handle: &Arc<DeliveryHandle>,
-) -> bool {
-    let Ok(e) = ev else { return false };
-    if e.event != "state" || e.data["pane_id"] != handle.pane_id.as_str() {
+/// True when an event is an explicitly confirmed Working observation.
+fn confirmed_working_state_event(event: &Event) -> bool {
+    event.event == "state"
+        && event.data["state"] == "working"
+        && event.data["working_confirmed"] == true
+}
+
+/// True when an event proves a Working edge for this exact submitted delivery.
+///
+/// This does not associate a turn with a particular message. It only proves
+/// that the submitted process generation entered Working after the submit
+/// boundary, which is the conservative evidence `turn_ended` may carry from
+/// delivery into its separate pane wait.
+fn submitted_working_state_event(event: &Event, handle: &Arc<DeliveryHandle>) -> bool {
+    if !confirmed_working_state_event(event) || event.data["pane_id"] != handle.pane_id.as_str() {
         return false;
     }
-    if e.data["session_idx"].as_u64() != Some(handle.session_idx as u64) {
-        return false;
-    }
-    if e.data["state"] != "working" {
-        return false;
-    }
-    if e.data["working_confirmed"] != true {
+    if event.data["session_idx"].as_u64() != Some(handle.session_idx as u64) {
         return false;
     }
     let submitted_at_ms = handle.submitted_at_ms.load(Ordering::SeqCst);
-    if e.data["observed_at_ms"]
+    if event.data["observed_at_ms"]
         .as_u64()
         .is_none_or(|observed_at_ms| observed_at_ms < submitted_at_ms)
     {
@@ -8374,15 +8407,37 @@ fn track_state_event(
     // as long as the pane happened to look familiar again.
     // Both halves of the identity travel on the event, because a pid
     // alone is transferable and this is a trust comparison.
-    let Some(birth) = e.data["source_birth"].as_u64() else {
+    let Some(birth) = event.data["source_birth"].as_u64() else {
         return false;
     };
     let agent = crate::identity::ProcId {
-        pid: e.data["source_pid"].as_i64().unwrap_or_default() as i32,
+        pid: event.data["source_pid"].as_i64().unwrap_or_default() as i32,
         birth,
     };
-    let manifest = e.data["source_manifest"].as_str().unwrap_or_default();
+    let manifest = event.data["source_manifest"].as_str().unwrap_or_default();
     handle.submitted_binding_is(agent, manifest)
+}
+
+/// True when a wait may count an event as its Working phase. A standalone
+/// `agent.wait` follows the fused contract. A composed wait additionally
+/// retains the exact delivery identity it inherited across receipt settlement.
+fn wait_working_event_is_eligible(
+    event: &Event,
+    submitted_turn: Option<&Arc<DeliveryHandle>>,
+) -> bool {
+    match submitted_turn {
+        Some(handle) => submitted_working_state_event(event, handle),
+        None => confirmed_working_state_event(event),
+    }
+}
+
+/// Compatibility wrapper for receipt-path callers and focused tests.
+fn track_state_event(
+    ev: &Result<Event, broadcast::error::RecvError>,
+    handle: &Arc<DeliveryHandle>,
+) -> bool {
+    ev.as_ref()
+        .is_ok_and(|event| submitted_working_state_event(event, handle))
 }
 
 /// True when the event is a session lifecycle line: attach, detach, or
@@ -9545,7 +9600,7 @@ pub(crate) async fn wait_pinned(
     until: WaitUntil,
     timeout: Duration,
     working_pre: bool,
-    pinned: Option<i32>,
+    pin: WaitPin,
 ) -> WaitEnd {
     let started = Instant::now();
     let deadline = started + timeout;
@@ -9554,13 +9609,27 @@ pub(crate) async fn wait_pinned(
         state,
         waited_ms: started.elapsed().as_millis() as u64,
     };
-    // Subscribe before the baseline refresh so no state edge can fall
-    // between the fresh observation and the wait loop.
+    // Subscribe before the baseline refresh. A composed send also carries a
+    // fact-only receiver from before Enter; this fresh receiver owns the
+    // current and future state sequence, so stale state cannot replay after
+    // the baseline.
+    let WaitPin {
+        submitted_pid: pinned,
+        turn_evidence,
+    } = pin;
     let mut ev_rx = inner.events.subscribe();
+    let (submitted_turn_handle, handoff_working) = match turn_evidence {
+        Some(mut evidence) => {
+            let handoff_working =
+                record_buffered_working_evidence(&mut evidence.events, &evidence.handle);
+            (Some(evidence.handle), handoff_working)
+        }
+        None => (None, false),
+    };
     let watcher = inner.watcher_of(session_idx);
     let mut pane_rx = watcher.as_ref().map(|w| w.subscribe());
     if let Some(watcher) = watcher.as_ref() {
-        fusion::recompute_pane(
+        crate::observe_pane(
             inner,
             session_idx,
             watcher,
@@ -9611,8 +9680,14 @@ pub(crate) async fn wait_pinned(
             || fusion::foreground_pid_checked(pinned_pid) != Some(pinned_fg)
     };
     let mut working_seen = working_pre
-        || (state == AgentState::Working
+        || handoff_working
+        || (submitted_turn_handle.is_none()
+            && state == AgentState::Working
             && fusion::cached_working_confirmed(inner, session_idx, pane_id));
+    // Test-only boundary after the fresh baseline and fact-only handoff. It
+    // lets the regression prove that historical events cannot finish a newer
+    // current turn before the live pane stream wakes it.
+    inject_pause(inner, "post_wait_baseline").await;
     loop {
         if state == AgentState::Dead {
             return end(WaitOutcome::OccupantChanged, state);
@@ -9644,7 +9719,10 @@ pub(crate) async fn wait_pinned(
                     if let Ok(s) = serde_json::from_value::<AgentState>(e.data["state"].clone()) {
                         state = s;
                         if state == AgentState::Working
-                            && e.data["working_confirmed"] == true
+                            && wait_working_event_is_eligible(
+                                &e,
+                                submitted_turn_handle.as_ref(),
+                            )
                         {
                             working_seen = true;
                         }
@@ -9679,7 +9757,8 @@ pub(crate) async fn wait_pinned(
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     // Reconcile on doubt: re-read the cache and the pin.
                     state = inner.cached_state(session_idx, pane_id);
-                    if state == AgentState::Working
+                    if submitted_turn_handle.is_none()
+                        && state == AgentState::Working
                         && fusion::cached_working_confirmed(inner, session_idx, pane_id)
                     {
                         working_seen = true;
@@ -9707,6 +9786,10 @@ pub(crate) async fn wait_pinned(
                     if occupant_gone(inner, session_idx, pane_id, pinned_pid) {
                         return end(WaitOutcome::OccupantChanged, state);
                     }
+                    // Test-only proof that a composed wait reached a live
+                    // pane wake after its baseline. A stale historical Idle
+                    // would have returned before reaching this point.
+                    inject_pause(inner, "wait_pane_wake").await;
                 }
                 Ok(PaneEvent::Disconnected) | Err(broadcast::error::RecvError::Closed) => {
                     pane_rx = None;
@@ -9748,7 +9831,7 @@ pub(crate) async fn agent_wait(
         params.until,
         Duration::from_millis(timeout),
         false,
-        None,
+        WaitPin::default(),
     )
     .await;
     // `outcome` mirrors the send-and-wait entry shape: "reached" on
@@ -10815,15 +10898,6 @@ mod tests {
         inner.engine.begin_stopping();
         inner.engine.wait_for_descendant_tasks().await;
         assert!(inner.engine.take_legacy_worker_tasks().is_empty());
-    }
-
-    #[test]
-    fn quota_reset_notice_names_the_exact_message_wide_command() {
-        let message_id = MessageId::new("m-quota").unwrap();
-        assert_eq!(
-            quota_reset_notice(&message_id),
-            "message m-quota remains held; run `cyclops requeue m-quota`"
-        );
     }
 
     fn prepare_notification_receipt(context: &NotificationContext) {
@@ -12087,19 +12161,22 @@ composer_trailer_required_prefix = 1
             cfg: crate::Config::defaults(path),
             force_submit: crate::ForceSubmitRuntime::new(false, 5_000),
             state_root,
+            durable_record_forget_lease: StdMutex::new(None),
             state_repair: cyclops_state::RepairSummary::default(),
             workspace_id,
             session_identities: StdMutex::new(session_identities),
             mailbox: None,
-            composer_recovery: StdMutex::new(
+            workspace_messaging: std::sync::OnceLock::new(),
+            composer_recovery: Arc::new(StdMutex::new(
                 crate::composer_recovery::RecoveryCoordinator::default(),
-            ),
-            mailbox_publication: StdMutex::new(()),
+            )),
+            mailbox_publication: Arc::new(StdMutex::new(())),
             unread_projection_gate: tokio::sync::Mutex::new(()),
             unread_projection_pending: StdMutex::new(HashSet::new()),
             unread_projection_wake: tokio::sync::Notify::new(),
             unread_projection_stopping: std::sync::atomic::AtomicBool::new(false),
             unread_projection_pause: StdMutex::new(None),
+            chrome_repaint_pause: StdMutex::new(None),
             mailbox_publish_pause: StdMutex::new(None),
             boot_id: "b-unwritten-test".into(),
             started: std::time::Instant::now(),
@@ -12110,9 +12187,8 @@ composer_trailer_required_prefix = 1
             session_registration: StdMutex::new(()),
             events: broadcast::channel(16).0,
             detections: StdMutex::new(HashMap::new()),
-            pane_recomputes: StdMutex::new(HashMap::new()),
             route_evidence_generations: StdMutex::new(HashMap::new()),
-            lifecycle_rechecks: StdMutex::new(HashMap::new()),
+            pane_observation_runtime: crate::fusion::PaneObservationRuntime::new(),
             registry: StdMutex::new(registry),
             theme: StdMutex::new(cyclops_theme::ThemeWatch::new(path)),
             hook_readings: StdMutex::new(HashMap::new()),
@@ -12977,7 +13053,13 @@ composer_trailer_required_prefix = 1
             &handle
         ));
 
-        assert!(persist_worker_failed_prewrite(&context, &worker).is_none());
+        let error = context
+            .record_gating()
+            .and_then(|_| {
+                context.record_pre_write_block(NotificationPreWriteCause::WorkerFailed, None)
+            })
+            .expect_err("injected append failure reaches the Module boundary");
+        worker.set_fault(format!("notification recovery failed: {error}"));
         assert!(worker.is_faulted());
         assert!(Arc::ptr_eq(
             &worker.current().expect("failed attempt remains current"),
@@ -13025,18 +13107,26 @@ composer_trailer_required_prefix = 1
             &handle
         ));
 
-        let record = record_notification_prewrite_block(
-            &context,
-            &worker,
-            &StdMutex::new(()),
-            NotificationPreWriteCause::WriteReadinessChanged,
-            None,
-            &NotificationRouteEvidenceId {
-                boot_id: "boot".into(),
-                generation: 1,
-            },
-        );
-        assert!(record.is_none());
+        let error = context
+            .record_pre_write_block(
+                NotificationPreWriteCause::WriteReadinessChanged,
+                Some(NotificationPreWriteObservation {
+                    write_block: None,
+                    pane_root: None,
+                    selected_manifest: None,
+                    binding: None,
+                    route_evidence: Some(NotificationRouteEvidenceId {
+                        boot_id: "boot".into(),
+                        generation: 1,
+                    }),
+                    pane_width: None,
+                    required_pane_width: None,
+                }),
+            )
+            .expect_err("injected append failure reaches the Module boundary");
+        worker.set_fault(format!(
+            "notification pre-write block storage failed: {error}"
+        ));
         assert!(worker.is_faulted());
         assert!(Arc::ptr_eq(
             &worker.current().expect("failed attempt remains current"),
@@ -13120,21 +13210,25 @@ composer_trailer_required_prefix = 1
             queued.attempt_id,
         );
         context.record_gating().unwrap();
-        let worker = Worker::new();
         let route_evidence = |generation| NotificationRouteEvidenceId {
             boot_id: "boot".into(),
             generation,
         };
         let baseline = route_evidence(7);
-        let blocked = record_notification_prewrite_block(
-            &context,
-            &worker,
-            &StdMutex::new(()),
-            NotificationPreWriteCause::WriteReadinessChanged,
-            None,
-            &baseline,
-        )
-        .expect("readiness block");
+        let blocked = context
+            .record_pre_write_block(
+                NotificationPreWriteCause::WriteReadinessChanged,
+                Some(NotificationPreWriteObservation {
+                    write_block: None,
+                    pane_root: None,
+                    selected_manifest: None,
+                    binding: None,
+                    route_evidence: Some(baseline.clone()),
+                    pane_width: None,
+                    required_pane_width: None,
+                }),
+            )
+            .expect("readiness block");
         let stored = blocked
             .pre_write_observation
             .as_ref()
@@ -13220,15 +13314,20 @@ composer_trailer_required_prefix = 1
             recipient,
             queued.attempt_id,
         );
-        let blocked_again = record_notification_prewrite_block(
-            &reopened_context,
-            &worker,
-            &StdMutex::new(()),
-            NotificationPreWriteCause::WriteReadinessChanged,
-            None,
-            &route_evidence(8),
-        )
-        .expect("second readiness block");
+        let blocked_again = reopened_context
+            .record_pre_write_block(
+                NotificationPreWriteCause::WriteReadinessChanged,
+                Some(NotificationPreWriteObservation {
+                    write_block: None,
+                    pane_root: None,
+                    selected_manifest: None,
+                    binding: None,
+                    route_evidence: Some(route_evidence(8)),
+                    pane_width: None,
+                    required_pane_width: None,
+                }),
+            )
+            .expect("second readiness block");
         assert_eq!(blocked_again.pre_write_reopen_count, 1);
         let lines_before_repeat = service.journal_lines().unwrap().len();
         assert!(service
@@ -13256,18 +13355,22 @@ composer_trailer_required_prefix = 1
             &handle
         ));
 
-        let record = record_notification_prewrite_block(
-            &context,
-            &worker,
-            &StdMutex::new(()),
+        let record = context.record_pre_write_block(
             NotificationPreWriteCause::WriteReadinessChanged,
-            None,
-            &NotificationRouteEvidenceId {
-                boot_id: "boot".into(),
-                generation: 1,
-            },
+            Some(NotificationPreWriteObservation {
+                write_block: None,
+                pane_root: None,
+                selected_manifest: None,
+                binding: None,
+                route_evidence: Some(NotificationRouteEvidenceId {
+                    boot_id: "boot".into(),
+                    generation: 1,
+                }),
+                pane_width: None,
+                required_pane_width: None,
+            }),
         );
-        assert!(record.is_some());
+        assert!(record.is_ok());
         assert!(!worker.is_faulted());
         assert_eq!(
             notification_state(&store, recipient, context.message_id()).state,
@@ -14056,6 +14159,66 @@ line_regex_esc = ['^❯$']
             &event(3, 1_000, agent.birth, true),
             &handle
         ));
+
+        // The composed pane wait uses the same gate on its fresh live
+        // receiver. A confirmed Working edge from an earlier submit or a
+        // replacement process must not turn a later Idle into success.
+        assert!(!wait_working_event_is_eligible(
+            &event(3, 999, agent.birth, true).expect("event"),
+            Some(&handle)
+        ));
+        assert!(!wait_working_event_is_eligible(
+            &event(3, 1_000, agent.birth + 1, true).expect("event"),
+            Some(&handle)
+        ));
+        assert!(wait_working_event_is_eligible(
+            &event(3, 1_000, agent.birth, true).expect("event"),
+            Some(&handle)
+        ));
+
+        // Standalone waits do not inherit a delivery identity; their outer
+        // loop has already selected the requested pane and session.
+        assert!(wait_working_event_is_eligible(
+            &event(2, 999, agent.birth + 1, true).expect("event"),
+            None
+        ));
+    }
+
+    #[test]
+    fn buffered_working_evidence_survives_a_screen_checkpoint_race() {
+        // Model the receipt boundary precisely: Enter subscribed first, the
+        // watcher published a matching Working fact, and a screen checkpoint
+        // is ready before the normal receipt loop reads that fact. The
+        // checkpoint must not erase the turn evidence needed by `turn_ended`.
+        let handle = DeliveryHandle::new("m-buffered-working", "worker", "%1", 3, "payload".into());
+        let agent = crate::identity::ProcId {
+            pid: 4242,
+            birth: 818_221,
+        };
+        *handle.submitted_agent.lock().unwrap() = Some(agent);
+        *handle.submitted_manifest.lock().unwrap() = Some("fix".into());
+        handle.submitted_at_ms.store(1_000, Ordering::SeqCst);
+        let (events, mut turn_events) = broadcast::channel(4);
+        events
+            .send(Event {
+                event: "state".into(),
+                data: json!({
+                    "pane_id": "%1",
+                    "session_idx": 3,
+                    "state": "working",
+                    "source_pid": 4242,
+                    "source_birth": agent.birth,
+                    "source_manifest": "fix",
+                    "observed_at_ms": 1_000,
+                    "working_confirmed": true,
+                }),
+                seq: None,
+            })
+            .expect("working event has a receiver");
+
+        assert!(record_buffered_working_evidence(&mut turn_events, &handle));
+        assert!(handle.working_seen.load(Ordering::SeqCst));
+        assert!(!record_buffered_working_evidence(&mut turn_events, &handle));
     }
 
     #[test]

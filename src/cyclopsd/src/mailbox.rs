@@ -436,6 +436,20 @@ pub struct MailboxProjection {
     resolved_attempts: HashMap<NotificationAttemptId, NotificationResolution>,
     /// Terminal action intents recorded before a terminal write.
     resolution_intents: HashMap<NotificationAttemptId, NotificationResolution>,
+    /// Forced intents selected by the default-off submit fallback.
+    ///
+    /// This is retained only while the matching intent is open so a replayed
+    /// final key reservation can prove it belongs to that narrowly-scoped
+    /// fallback rather than to an ordinary operator action.
+    forced_resolution_intents: HashSet<NotificationAttemptId>,
+    /// Final forced terminal-key reservations ordered with mailbox claims.
+    resolution_action_reservations: HashMap<NotificationAttemptId, NotificationResolution>,
+    /// Workspace sequence of each forced terminal-key reservation.
+    ///
+    /// A recipient claim after this sequence can provide Complete consumption
+    /// evidence once terminal acceptance is also durable, even if the claim
+    /// arrived in the unavoidable interval before the actual terminal IO.
+    resolution_action_reservation_sequences: HashMap<NotificationAttemptId, u64>,
     /// Terminal action keys accepted by the terminal for an exact intent.
     resolution_actions_accepted: HashMap<NotificationAttemptId, NotificationResolution>,
     /// Workspace sequence of each terminal action-accepted boundary.
@@ -486,6 +500,11 @@ enum PreparedMutation {
         record: NotificationRecord,
     },
     NotificationResolutionIntent {
+        attempt_id: NotificationAttemptId,
+        resolution: NotificationResolution,
+        forced: bool,
+    },
+    NotificationResolutionActionReserved {
         attempt_id: NotificationAttemptId,
         resolution: NotificationResolution,
     },
@@ -868,6 +887,9 @@ impl MailboxProjection {
             clearance_batches: HashSet::new(),
             resolved_attempts: HashMap::new(),
             resolution_intents: HashMap::new(),
+            forced_resolution_intents: HashSet::new(),
+            resolution_action_reservations: HashMap::new(),
+            resolution_action_reservation_sequences: HashMap::new(),
             resolution_actions_accepted: HashMap::new(),
             resolution_action_sequences: HashMap::new(),
             claim_sequences: HashMap::new(),
@@ -1039,6 +1061,9 @@ impl MailboxProjection {
             }
             Some("notification_resolution_intent") => {
                 self.prepare_notification_resolution_intent(line)
+            }
+            Some("notification_resolution_action_reserved") => {
+                self.prepare_notification_resolution_action_reserved(line)
             }
             Some("notification_resolution_action_accepted") => {
                 self.prepare_notification_resolution_action_accepted(line)
@@ -1622,7 +1647,6 @@ impl MailboxProjection {
                 Some(
                     NotificationPreWriteCause::BindingUnprovable
                         | NotificationPreWriteCause::ComposerSemanticMissing
-                        | NotificationPreWriteCause::ComposerSemanticAmbiguous
                 )
             ) || width_observation.is_some()
                 && pre_write_cause == Some(NotificationPreWriteCause::WriteReadinessChanged))
@@ -2389,7 +2413,7 @@ impl MailboxProjection {
             message_id,
             recipient,
             resolution,
-            forced: _,
+            forced,
         } = fact
         else {
             return Err(MailboxError::InvalidNotificationFact(
@@ -2417,10 +2441,95 @@ impl MailboxProjection {
         if self.resolution_intents.contains_key(&attempt_id) {
             return Err(MailboxError::NotificationResolutionAmbiguous(attempt_id));
         }
+        if forced && resolution != NotificationResolution::Complete {
+            return Err(MailboxError::NotificationResolutionAmbiguous(attempt_id));
+        }
         Ok(PreparedMutation::NotificationResolutionIntent {
             attempt_id,
             resolution,
+            forced,
         })
+    }
+
+    fn prepare_notification_resolution_action_reserved(
+        &self,
+        line: &LedgerLine,
+    ) -> Result<PreparedMutation, MailboxError> {
+        let fact: NotificationFact = serde_json::from_value(
+            line.data
+                .clone()
+                .ok_or_else(|| MailboxError::InvalidNotificationFact("missing data".into()))?,
+        )
+        .map_err(|error| MailboxError::InvalidNotificationFact(error.to_string()))?;
+        let NotificationFact::NotificationResolutionActionReserved {
+            record_version,
+            attempt_id,
+            message_id,
+            recipient,
+            resolution,
+        } = fact
+        else {
+            return Err(MailboxError::InvalidNotificationFact(
+                "expected notification_resolution_action_reserved".into(),
+            ));
+        };
+
+        self.validate_notification_envelope(line, record_version, &message_id, recipient)?;
+        self.validate_forced_notification_resolution_action_reservation(
+            &message_id,
+            recipient,
+            attempt_id,
+            resolution,
+        )?;
+        Ok(PreparedMutation::NotificationResolutionActionReserved {
+            attempt_id,
+            resolution,
+        })
+    }
+
+    fn validate_forced_notification_resolution_action_reservation(
+        &self,
+        message_id: &MessageId,
+        recipient: RecipientKey,
+        attempt_id: NotificationAttemptId,
+        resolution: NotificationResolution,
+    ) -> Result<bool, MailboxError> {
+        let current = self
+            .notifications
+            .get(&(recipient, message_id.clone()))
+            .ok_or(MailboxError::NotificationAttemptUnknown(attempt_id))?;
+        if current.attempt_id != attempt_id {
+            return Err(MailboxError::NotificationAttemptMismatch {
+                expected: current.attempt_id,
+                found: attempt_id,
+            });
+        }
+        if !current.needs_exact_owned_reconciliation()
+            || self.notification(recipient, message_id) != Some(current)
+            || self.active_notification_barriers.get(&attempt_id) != Some(current)
+        {
+            return Err(MailboxError::NotificationClearRequiresAttention);
+        }
+        if !self.entry_is_pending(recipient, message_id) {
+            return Err(MailboxError::NotificationMessageNotPending {
+                message_id: message_id.clone(),
+                recipient,
+            });
+        }
+        if resolution != NotificationResolution::Complete
+            || self.resolved_attempts.contains_key(&attempt_id)
+            || self.resolution_actions_accepted.contains_key(&attempt_id)
+            || self.resolution_consumptions.contains_key(&attempt_id)
+            || self.resolution_intents.get(&attempt_id) != Some(&resolution)
+            || !self.forced_resolution_intents.contains(&attempt_id)
+        {
+            return Err(MailboxError::NotificationResolutionAmbiguous(attempt_id));
+        }
+        match self.resolution_action_reservations.get(&attempt_id) {
+            Some(recorded) if *recorded == resolution => Ok(true),
+            Some(_) => Err(MailboxError::NotificationResolutionAmbiguous(attempt_id)),
+            None => Ok(false),
+        }
     }
 
     fn prepare_notification_resolution_action_accepted(
@@ -2878,6 +2987,9 @@ impl MailboxProjection {
         }
         if self.resolution_intents.get(&attempt_id) != Some(&resolution)
             || self.resolved_attempts.contains_key(&attempt_id)
+            || self
+                .resolution_action_reservations
+                .contains_key(&attempt_id)
             || self.resolution_actions_accepted.contains_key(&attempt_id)
             || self.resolution_consumptions.contains_key(&attempt_id)
         {
@@ -3198,8 +3310,21 @@ impl MailboxProjection {
             PreparedMutation::NotificationResolutionIntent {
                 attempt_id,
                 resolution,
+                forced,
             } => {
                 self.resolution_intents.insert(attempt_id, resolution);
+                if forced {
+                    self.forced_resolution_intents.insert(attempt_id);
+                }
+            }
+            PreparedMutation::NotificationResolutionActionReserved {
+                attempt_id,
+                resolution,
+            } => {
+                self.resolution_action_reservations
+                    .insert(attempt_id, resolution);
+                self.resolution_action_reservation_sequences
+                    .insert(attempt_id, line.seq);
             }
             PreparedMutation::NotificationResolutionActionAccepted {
                 attempt_id,
@@ -3218,12 +3343,14 @@ impl MailboxProjection {
             }
             PreparedMutation::NotificationResolutionIntentWithdrawn { attempt_id } => {
                 self.resolution_intents.remove(&attempt_id);
+                self.forced_resolution_intents.remove(&attempt_id);
             }
             PreparedMutation::NotificationResolvedWithoutTerminalAction {
                 attempt_id,
                 resolution,
             } => {
                 self.resolved_attempts.insert(attempt_id, resolution);
+                self.forced_resolution_intents.remove(&attempt_id);
                 self.active_notification_barriers.remove(&attempt_id);
             }
             PreparedMutation::NotificationResolved {
@@ -3231,6 +3358,7 @@ impl MailboxProjection {
                 resolution,
             } => {
                 self.resolved_attempts.insert(attempt_id, resolution);
+                self.forced_resolution_intents.remove(&attempt_id);
                 self.active_notification_barriers.remove(&attempt_id);
             }
             PreparedMutation::NotificationClaimedStagedCleared {
@@ -3268,6 +3396,20 @@ impl MailboxProjection {
     pub fn entry_is_pending(&self, recipient: RecipientKey, message_id: &MessageId) -> bool {
         self.get_entry(recipient, message_id)
             .is_some_and(|entry| entry.state.is_pending())
+    }
+
+    /// Whether this exact force-submit timer target is still eligible under
+    /// the workspace journal lock.
+    fn force_submit_target_is_pending(&self, target: &AttentionTarget) -> bool {
+        let current = self.alarm_by_attempt(target.record.attempt_id);
+        current == Some(&target.record)
+            && current.is_some_and(NotificationRecord::needs_exact_owned_reconciliation)
+            && self.notification(target.record.recipient, &target.record.message_id) == current
+            && self
+                .active_notification_barriers
+                .get(&target.record.attempt_id)
+                == current
+            && self.entry_is_pending(target.record.recipient, &target.record.message_id)
     }
 
     /// Choose the terminal recovery for one exact active composer barrier.
@@ -3648,15 +3790,24 @@ impl MailboxProjection {
         &self,
         record: &NotificationRecord,
     ) -> Option<NotificationResolutionConsumptionObservation> {
+        // Ordinary actions linearize when their terminal key is accepted.
+        // Forced Complete uses its separately validated reservation instead:
+        // the reservation and inbox claim share the journal lock, while the
+        // terminal write necessarily occurs after that lock is released.
         let accepted_seq = self
             .resolution_action_sequences
             .get(&record.attempt_id)
             .copied()?;
+        let action_seq = self
+            .resolution_action_reservation_sequences
+            .get(&record.attempt_id)
+            .copied()
+            .unwrap_or(accepted_seq);
         let claim_seq = self
             .claim_sequences
             .get(&(record.recipient, record.message_id.clone()))
             .copied()?;
-        if claim_seq <= accepted_seq {
+        if claim_seq <= action_seq {
             return None;
         }
         let entry = self.get_entry(record.recipient, &record.message_id)?;
@@ -4559,6 +4710,10 @@ pub struct MailboxService {
     store: Arc<StdMutex<MessageStore>>,
     changes: Option<MessageChangePublisher>,
     resolving_attention: StdMutex<HashSet<NotificationAttemptId>>,
+    /// Private handoff for work that lost the exact in-memory resolution
+    /// reservation. This is not a durable message event: a resolver may give
+    /// up before appending anything.
+    attention_resolution_releases: broadcast::Sender<NotificationAttemptId>,
     exact_reconciliation: StdMutex<ExactReconciliationRequests>,
     attention_consumption_candidates:
         StdMutex<HashMap<NotificationAttemptId, AttentionConsumptionCandidate>>,
@@ -4703,12 +4858,17 @@ impl MailboxService {
         store: MessageStore,
         changes: Option<MessageChangePublisher>,
     ) -> Self {
+        // One release edge is enough to prompt one blocked force-submit task
+        // to revalidate. The stream is shared, so lag is not proof that this
+        // attempt was released.
+        let (attention_resolution_releases, _) = broadcast::channel(1);
         Self {
             workspace_id: directory.workspace_id(),
             directory: RwLock::new(directory),
             store: Arc::new(StdMutex::new(store)),
             changes,
             resolving_attention: StdMutex::new(HashSet::new()),
+            attention_resolution_releases,
             exact_reconciliation: StdMutex::new(ExactReconciliationRequests::default()),
             attention_consumption_candidates: StdMutex::new(HashMap::new()),
         }
@@ -5149,20 +5309,6 @@ impl MailboxService {
                     }
                 }
             }
-            // Ambiguity can clear without repairing anything: a later
-            // frame the manifest CAN prove reopens the wake. A manifest
-            // that truly cannot classify this vendor never produces that
-            // write-ready evidence and the block stays, exactly like the
-            // static ComposerSemanticMissing gap below.
-            Some(NotificationPreWriteCause::ComposerSemanticAmbiguous) => {
-                let later_route_evidence = current
-                    .pre_write_observation
-                    .as_ref()
-                    .and_then(|prior| prior.route_evidence.as_ref())
-                    .zip(observation.route_evidence.as_ref())
-                    .is_some_and(|(prior, current)| route_evidence_is_later(prior, current));
-                write_ready && later_route_evidence
-            }
             _ => false,
         };
         if current.state != NotificationState::BlockedPreWrite
@@ -5441,8 +5587,8 @@ impl MailboxService {
     }
 
     /// Exact verify-failed attempts eligible for the operator's opt-in timed
-    /// Enter escape hatch. Durable resolution intent is checked again when
-    /// the timer fires, so duplicate scheduler calls cannot send two keys.
+    /// Enter escape hatch. The final forced reservation, rather than this
+    /// candidate scan, prevents duplicate scheduler calls from sending two keys.
     pub(crate) fn force_submit_candidates(
         &self,
     ) -> Result<Vec<NotificationRecord>, MailboxServiceError> {
@@ -5464,25 +5610,14 @@ impl MailboxService {
         Ok(records)
     }
 
-    /// Revalidate the exact timer target at the action boundary. A claim,
-    /// withdrawal, replacement attempt, or settled barrier makes the timer a
-    /// no-op even if it was eligible when originally armed.
+    /// Revalidate the exact timer target before force preparation. The final
+    /// forced reservation, not this read, is the claim-ordering boundary.
     pub(crate) fn force_submit_target_is_pending(
         &self,
         target: &AttentionTarget,
     ) -> Result<bool, MailboxServiceError> {
         let store = self.store()?;
-        let projection = store.projection();
-        let current = projection.alarm_by_attempt(target.record.attempt_id);
-        Ok(current == Some(&target.record)
-            && current.is_some_and(NotificationRecord::needs_exact_owned_reconciliation)
-            && projection.notification(target.record.recipient, &target.record.message_id)
-                == current
-            && projection
-                .active_notification_barriers
-                .get(&target.record.attempt_id)
-                == current
-            && projection.entry_is_pending(target.record.recipient, &target.record.message_id))
+        Ok(store.projection().force_submit_target_is_pending(target))
     }
 
     /// Atomically classify or queue one due reminder under the store lock.
@@ -5987,10 +6122,7 @@ impl MailboxService {
                 ],
             );
         }
-        self.resolving_attention
-            .lock()
-            .map_err(|_| MailboxServiceError::Poisoned)?
-            .remove(&target.record.attempt_id);
+        self.release_attention_resolution(target.record.attempt_id)?;
         Ok(())
     }
 
@@ -6164,6 +6296,42 @@ impl MailboxService {
             ],
         );
         Ok(())
+    }
+
+    /// Atomically reserve one forced Complete key with mailbox claims.
+    ///
+    /// A claim ordered before this append makes the timer a no-op. Once the
+    /// reservation is durable, a later claim remains a normal retrieval but
+    /// cannot revoke the one key the fallback is about to send or count as
+    /// consumption until the action-accepted fact exists.
+    pub(crate) fn reserve_forced_attention_resolution_action(
+        &self,
+        target: &AttentionTarget,
+    ) -> Result<bool, MailboxServiceError> {
+        let mut store = self.store()?;
+        if !store.projection().force_submit_target_is_pending(target) {
+            return Ok(false);
+        }
+        let prior_seq = store.projection().last_sequence();
+        store.reserve_forced_notification_resolution_action(
+            target.record.message_id.clone(),
+            target.record.recipient,
+            target.record.attempt_id,
+        )?;
+        let seq = store
+            .projection()
+            .last_sequence()
+            .expect("forced key reservation advances the workspace sequence");
+        if Some(seq) != prior_seq {
+            self.publish_change(
+                seq,
+                &[
+                    MessagesChangedArea::Notifications,
+                    MessagesChangedArea::Attention,
+                ],
+            );
+        }
+        Ok(true)
     }
 
     /// Persist terminal acceptance for the exact durable resolution intent.
@@ -6341,7 +6509,10 @@ impl MailboxService {
             })
     }
 
-    /// Return a durable claim ordered strictly after this exact action.
+    /// Return a durable claim eligible to count as this action's consumption.
+    /// Ordinary actions need a claim after acceptance. Forced Complete instead
+    /// orders claims against its preceding reservation, but waits for acceptance
+    /// before treating an intervening claim as consumption evidence.
     pub(crate) fn attention_claim_consumption(
         &self,
         target: &AttentionTarget,
@@ -6376,10 +6547,7 @@ impl MailboxService {
                 ],
             );
         }
-        self.resolving_attention
-            .lock()
-            .map_err(|_| MailboxServiceError::Poisoned)?
-            .remove(&target.record.attempt_id);
+        self.release_attention_resolution(target.record.attempt_id)?;
         Ok(())
     }
 
@@ -6483,10 +6651,33 @@ impl MailboxService {
         &self,
         attempt_id: NotificationAttemptId,
     ) -> Result<(), MailboxServiceError> {
-        self.resolving_attention
+        self.release_attention_resolution(attempt_id)
+    }
+
+    /// Subscribe before attempting a force-submit reservation. A matching
+    /// release requires the caller to revalidate the exact attempt; it says
+    /// nothing about durable settlement.
+    pub(crate) fn subscribe_attention_resolution_releases(
+        &self,
+    ) -> broadcast::Receiver<NotificationAttemptId> {
+        self.attention_resolution_releases.subscribe()
+    }
+
+    /// End one boot-local resolution reservation and wake exact waiters after
+    /// the ownership change. A cancellation can leave the journal unchanged,
+    /// so this must not be represented as `messages.changed`.
+    fn release_attention_resolution(
+        &self,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<(), MailboxServiceError> {
+        let released = self
+            .resolving_attention
             .lock()
             .map_err(|_| MailboxServiceError::Poisoned)?
             .remove(&attempt_id);
+        if released {
+            let _ = self.attention_resolution_releases.send(attempt_id);
+        }
         Ok(())
     }
 
@@ -7648,6 +7839,39 @@ impl MessageStore {
         )
     }
 
+    /// Append the forced Complete key reservation after validating its claim
+    /// ordering boundary in this same store instance.
+    fn reserve_forced_notification_resolution_action(
+        &mut self,
+        message_id: MessageId,
+        recipient: RecipientKey,
+        attempt_id: NotificationAttemptId,
+    ) -> Result<NotificationRecord, MessageStoreError> {
+        let already_reserved = self
+            .projection
+            .validate_forced_notification_resolution_action_reservation(
+                &message_id,
+                recipient,
+                attempt_id,
+                NotificationResolution::Complete,
+            )?;
+        if already_reserved {
+            return Ok(self
+                .projection
+                .notification(recipient, &message_id)
+                .expect("validated forced reservation retains its notification")
+                .clone());
+        }
+        let fact = NotificationFact::NotificationResolutionActionReserved {
+            record_version: CANONICAL_RECORD_VERSION,
+            attempt_id,
+            message_id: message_id.clone(),
+            recipient,
+            resolution: NotificationResolution::Complete,
+        };
+        self.append_notification_fact_at(message_id, recipient, fact, now_ms())
+    }
+
     fn record_notification_resolution_intent_kind(
         &mut self,
         message_id: MessageId,
@@ -8190,6 +8414,59 @@ mod tests {
             client_key: client_key.map(str::to_string),
             supersedes: None,
         }
+    }
+
+    #[test]
+    fn historical_message_rows_larger_than_the_socket_frame_remain_readable_and_unchanged() {
+        let scratch = StoreScratch::new("oversized-historical-row");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, _admin, bob, carol) = test_context();
+        let directory = MailboxDirectory::new(
+            workspace,
+            [
+                MailboxIdentity {
+                    key: bob,
+                    label: "reviewer".into(),
+                },
+                MailboxIdentity {
+                    key: carol,
+                    label: "observer".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let store = MessageStore::open(&root, journal, workspace, "boot-old").unwrap();
+        let service = MailboxService::new(directory, store);
+        let body = "x".repeat(cyclops_proto::FrameContract::MAX_JSON_BYTES + 1);
+        let accepted = service
+            .send(
+                MailboxIdentity {
+                    key: bob,
+                    label: "reviewer".into(),
+                },
+                mailbox_send("observer", "Historical large row", &body),
+            )
+            .unwrap();
+        let message_id = accepted.message_id.clone();
+        drop(service);
+
+        let path = root.path().join(journal);
+        let before = fs::read(&path).unwrap();
+        assert!(before.len() > cyclops_proto::FrameContract::MAX_JSON_BYTES);
+
+        let reopened = MessageStore::open(&root, journal, workspace, "boot-current").unwrap();
+        let replayed = reopened
+            .projection()
+            .get_message(&message_id)
+            .expect("the historical oversized row remains readable");
+        assert_eq!(replayed.body.as_deref(), Some(body.as_str()));
+        drop(reopened);
+        assert_eq!(
+            fs::read(path).unwrap(),
+            before,
+            "replay rewrote the journal"
+        );
     }
 
     fn next_change(
@@ -10198,14 +10475,57 @@ mod tests {
             route_evidence: evidence(7),
             pane_width: None,
             required_pane_width: None,
-            write_block: Some("no_write_safe_composer_evidence".into()),
+            write_block: Some("composer_semantic_ambiguous".into()),
         };
         context
             .record_pre_write_block(
-                NotificationPreWriteCause::ComposerSemanticAmbiguous,
+                NotificationPreWriteCause::WriteReadinessChanged,
                 Some(blocked_observation.clone()),
             )
             .unwrap();
+
+        // The durable detail remains an additive observation beside the
+        // long-standing closed cause. Strict NDJSON replay must therefore
+        // rebuild it without asking a newer binary to understand a new enum
+        // spelling, and old JSON readers can ignore the optional detail.
+        let live_record = service
+            .store()
+            .unwrap()
+            .projection()
+            .notification(bob, &message.message_id)
+            .cloned()
+            .expect("live blocked record");
+        drop(context);
+        drop(service);
+        let directory = MailboxDirectory::new(
+            workspace,
+            [MailboxIdentity {
+                key: bob,
+                label: "reviewer".into(),
+            }],
+        )
+        .unwrap();
+        let replayed_store = MessageStore::open(&root, journal, workspace, "boot-replay").unwrap();
+        let service = MailboxService::new(directory, replayed_store);
+        let replayed = service
+            .store()
+            .unwrap()
+            .projection()
+            .notification(bob, &message.message_id)
+            .cloned()
+            .expect("strict replayed blocked record");
+        assert_eq!(replayed, live_record);
+        assert_eq!(
+            replayed.pre_write_cause,
+            Some(NotificationPreWriteCause::WriteReadinessChanged)
+        );
+        assert_eq!(
+            replayed
+                .pre_write_observation
+                .as_ref()
+                .and_then(|observation| observation.write_block.as_deref()),
+            Some("composer_semantic_ambiguous")
+        );
 
         // The same generation cannot reopen, however ready it claims to be:
         // this is the evidence the block was recorded against.
@@ -10249,7 +10569,7 @@ mod tests {
         );
         reopened_context
             .record_pre_write_block(
-                NotificationPreWriteCause::ComposerSemanticAmbiguous,
+                NotificationPreWriteCause::WriteReadinessChanged,
                 Some(later_observation.clone()),
             )
             .unwrap();
@@ -15651,6 +15971,72 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_attention_resolution_releases_exact_waiters_without_writing_the_journal() {
+        let scratch = StoreScratch::new("attention-resolution-release");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, admin, bob, _) = test_context();
+        let message_id = MessageId::new("m-resolution-release").unwrap();
+        let attempt_id = attempt(1);
+        let mut store = MessageStore::open(&root, journal, workspace, "boot").unwrap();
+        store
+            .accept_at(message_id.clone(), draft(admin, vec![bob], "Body", None), 1)
+            .unwrap();
+        alarm_because(
+            &mut store,
+            &message_id,
+            bob,
+            attempt_id,
+            2,
+            NotificationAttentionCause::VerifyFailed,
+        );
+        let target = AttentionTarget {
+            record: store
+                .projection()
+                .alarm_by_attempt(attempt_id)
+                .unwrap()
+                .clone(),
+        };
+        let before = store.projection().last_sequence();
+        let directory = MailboxDirectory::new(
+            workspace,
+            [MailboxIdentity {
+                key: bob,
+                label: "bob".into(),
+            }],
+        )
+        .unwrap();
+        let service = MailboxService::new(directory, store);
+        let mut releases = service.subscribe_attention_resolution_releases();
+
+        assert_eq!(
+            service
+                .begin_attention_resolution(&target, NotificationResolution::Complete)
+                .unwrap(),
+            AttentionResolutionStart::Fresh
+        );
+        assert!(matches!(
+            service.begin_attention_resolution(&target, NotificationResolution::Complete),
+            Err(error) if error.notification_resolution_in_progress()
+        ));
+
+        service.cancel_attention_resolution(attempt_id).unwrap();
+
+        assert_eq!(releases.try_recv().unwrap(), attempt_id);
+        assert_eq!(
+            service.store().unwrap().projection().last_sequence(),
+            before
+        );
+        assert_eq!(
+            service
+                .begin_attention_resolution(&target, NotificationResolution::Complete)
+                .unwrap(),
+            AttentionResolutionStart::Fresh,
+            "the exact waiter may retry only after the release edge"
+        );
+    }
+
+    #[test]
     fn unmatched_resolution_intent_replays_as_uncertain() {
         let scratch = StoreScratch::new("resolution-intent-restart");
         let root = scratch.root();
@@ -15758,6 +16144,207 @@ mod tests {
         assert!(!store.projection().attention_resolved(attempt(1)));
         assert!(store.projection().attention_resolution_pending(attempt(1)));
         assert_eq!(store.projection().active_notification_barriers().len(), 1);
+    }
+
+    #[test]
+    fn forced_action_reservation_replays_as_uncertain_until_acceptance() {
+        let scratch = StoreScratch::new("forced-action-reservation-replay");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, admin, bob, _) = test_context();
+        let message_id = MessageId::new("m-forced-action-reservation").unwrap();
+        let attempt_id = attempt(1);
+        {
+            let mut store = MessageStore::open(&root, journal, workspace, "boot-1").unwrap();
+            store
+                .accept_at(message_id.clone(), draft(admin, vec![bob], "Op", None), 1)
+                .unwrap();
+            exact_doorbell_alarm(&mut store, &message_id, bob, attempt_id, 2);
+            store
+                .record_forced_notification_resolution_intent(
+                    message_id.clone(),
+                    bob,
+                    attempt_id,
+                    NotificationResolution::Complete,
+                )
+                .unwrap();
+            store
+                .reserve_forced_notification_resolution_action(message_id.clone(), bob, attempt_id)
+                .unwrap();
+            assert_eq!(
+                store
+                    .projection()
+                    .resolution_action_reservations
+                    .get(&attempt_id),
+                Some(&NotificationResolution::Complete)
+            );
+            assert!(matches!(
+                store.withdraw_notification_resolution_intent(
+                    message_id.clone(),
+                    bob,
+                    attempt_id,
+                    NotificationResolution::Complete,
+                ),
+                Err(MessageStoreError::Mailbox(error))
+                    if matches!(error.as_ref(), MailboxError::NotificationResolutionAmbiguous(id) if *id == attempt_id)
+            ));
+            let reservation = store
+                .writer
+                .read_after(0)
+                .unwrap()
+                .into_iter()
+                .find(|line| {
+                    line.data.as_ref().is_some_and(|data| {
+                        data["type"] == "notification_resolution_action_reserved"
+                    })
+                })
+                .expect("durable forced reservation");
+            assert!(reservation.subject.is_none());
+            assert!(reservation.body.is_none());
+            assert!(reservation.reply_to.is_none());
+        }
+
+        let reopened = MessageStore::open(&root, journal, workspace, "boot-2").unwrap();
+        let target = AttentionTarget {
+            record: reopened
+                .projection()
+                .alarm_by_attempt(attempt_id)
+                .unwrap()
+                .clone(),
+        };
+        let directory = MailboxDirectory::new(
+            workspace,
+            [MailboxIdentity {
+                key: bob,
+                label: "bob".into(),
+            }],
+        )
+        .unwrap();
+        let service = MailboxService::new(directory, reopened);
+        assert_eq!(
+            service
+                .begin_attention_resolution(&target, NotificationResolution::Complete)
+                .unwrap(),
+            AttentionResolutionStart::IntentOnlyUncertain,
+            "a reserved but unaccepted key remains uncertain after restart"
+        );
+        service.cancel_attention_resolution(attempt_id).unwrap();
+
+        service
+            .claim(bob, message_id.clone())
+            .expect("post-reservation claim remains a normal retrieval");
+        assert_eq!(
+            service.attention_claim_consumption(&target).unwrap(),
+            None,
+            "a pre-acceptance claim is not consumption evidence by itself"
+        );
+        service
+            .record_attention_resolution_action_accepted(&target, NotificationResolution::Complete)
+            .unwrap();
+        assert!(matches!(
+            service.attention_claim_consumption(&target).unwrap(),
+            Some(NotificationResolutionConsumptionObservation {
+                evidence: NotificationResolutionConsumptionEvidence::AuthenticatedClaim,
+                ..
+            })
+        ));
+        {
+            let store = service.store().unwrap();
+            assert_eq!(
+                store
+                    .projection()
+                    .exact_owned_recovery_action(&target.record),
+                ExactOwnedRecoveryAction::Reconcile,
+                "the post-reservation claim can settle only after action acceptance"
+            );
+        }
+        drop(service);
+
+        let replayed = MessageStore::open(&root, journal, workspace, "boot-3").unwrap();
+        assert_eq!(
+            replayed
+                .projection()
+                .resolution_action_reservations
+                .get(&attempt_id),
+            Some(&NotificationResolution::Complete)
+        );
+        assert!(matches!(
+            replayed
+                .projection()
+                .exact_claim_after_attention_action(&target.record),
+            Some(NotificationResolutionConsumptionObservation {
+                evidence: NotificationResolutionConsumptionEvidence::AuthenticatedClaim,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn forced_action_reservation_refuses_a_claim_that_linearized_first() {
+        let (_scratch, store, message_id, bob) = operator_store("forced-reservation-prior-claim");
+        let workspace = store.projection().workspace_id();
+        let attempt_id = attempt(1);
+        let mut store = store;
+        exact_doorbell_alarm(&mut store, &message_id, bob, attempt_id, 2);
+        let target = AttentionTarget {
+            record: store
+                .projection()
+                .alarm_by_attempt(attempt_id)
+                .unwrap()
+                .clone(),
+        };
+        let directory = MailboxDirectory::new(
+            workspace,
+            [MailboxIdentity {
+                key: bob,
+                label: "bob".into(),
+            }],
+        )
+        .unwrap();
+        let service = MailboxService::new(directory, store);
+        service
+            .record_forced_attention_resolution_intent(&target)
+            .unwrap();
+        service.claim(bob, message_id.clone()).unwrap();
+        let before_reservation = service.store().unwrap().projection().last_sequence();
+        assert!(
+            !service
+                .reserve_forced_attention_resolution_action(&target)
+                .unwrap(),
+            "a claim ordered first withholds the forced key reservation"
+        );
+        assert_eq!(
+            service.store().unwrap().projection().last_sequence(),
+            before_reservation,
+            "the failed reservation writes no fact"
+        );
+    }
+
+    #[test]
+    fn ordinary_intent_cannot_create_a_forced_action_reservation() {
+        let (_scratch, mut store, message_id, bob) =
+            operator_store("ordinary-intent-forced-reservation");
+        let attempt_id = attempt(1);
+        exact_doorbell_alarm(&mut store, &message_id, bob, attempt_id, 2);
+        store
+            .record_notification_resolution_intent(
+                message_id.clone(),
+                bob,
+                attempt_id,
+                NotificationResolution::Complete,
+            )
+            .unwrap();
+        let before_reservation = store.projection().last_sequence();
+        assert!(matches!(
+            store.reserve_forced_notification_resolution_action(
+                message_id,
+                bob,
+                attempt_id,
+            ),
+            Err(MessageStoreError::Mailbox(error))
+                if matches!(error.as_ref(), MailboxError::NotificationResolutionAmbiguous(id) if *id == attempt_id)
+        ));
+        assert_eq!(store.projection().last_sequence(), before_reservation);
     }
 
     #[test]

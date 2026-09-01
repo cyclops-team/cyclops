@@ -262,14 +262,6 @@ pub enum NotificationPreWriteCause {
     /// The matched screen rule does not classify its composer ownership.
     /// No terminal write can be authorized until the manifest is repaired.
     ComposerSemanticMissing,
-    /// The screen rules kept classifying an idle pane's composer as
-    /// ambiguous for the whole settle window. One ambiguous frame may be a
-    /// redraw caught mid-paint; ambiguity that outlives the window is a
-    /// manifest that cannot prove this vendor's clean composer, and no pane
-    /// event announces "still ambiguous", so the wake settles durably
-    /// instead of waiting in memory forever. Later write-ready route
-    /// evidence reopens it once.
-    ComposerSemanticAmbiguous,
     /// The terminal grid cannot prove the complete application composer.
     /// No terminal write or submit key is authorized until an application
     /// source proves the exact composer bytes.
@@ -290,7 +282,6 @@ impl NotificationPreWriteCause {
             Self::PasteCommandUnwritten => "paste_command_unwritten",
             Self::BindingUnprovable => "binding_unprovable",
             Self::ComposerSemanticMissing => "composer_semantic_missing",
-            Self::ComposerSemanticAmbiguous => "composer_semantic_ambiguous",
             Self::ComposerOwnershipUnproven => "composer_ownership_unproven",
             Self::WorkerFailed => "worker_failed",
         }
@@ -307,7 +298,6 @@ impl NotificationPreWriteCause {
             Self::PasteCommandUnwritten => "paste command was not written",
             Self::BindingUnprovable => "binding unprovable",
             Self::ComposerSemanticMissing => "composer ownership rule missing",
-            Self::ComposerSemanticAmbiguous => "composer stays ambiguous on an idle pane",
             Self::ComposerOwnershipUnproven => "complete composer ownership unproven",
             Self::WorkerFailed => "worker failed",
         }
@@ -644,12 +634,16 @@ impl NotificationRecord {
             .saturating_add(self.unclaimed_reminder_count)
     }
 
-    /// Whether this exact failed wake may enter automatic composer recovery.
+    /// Whether this exact failed wake may enter ordinary automatic composer
+    /// recovery.
     ///
-    /// The terminal still has to prove the complete binding, exact rendered
-    /// doorbell, and action-safe composer before it may send a key. This
-    /// predicate only selects the durable attempt class that supports that
-    /// proof.
+    /// Ordinary recovery still has to prove the complete binding, exact
+    /// rendered doorbell, and action-safe composer before it may send a key.
+    /// The separately configured force-submit fallback uses this predicate as a
+    /// narrow candidate selector, but deliberately bypasses composer-content
+    /// proof after its own binding checks, durable intent, and forced key
+    /// reservation. This predicate only selects the durable attempt class that
+    /// supports either path.
     pub fn needs_exact_owned_reconciliation(&self) -> bool {
         self.state == NotificationState::AttentionRequired
             && self.cause == Some(NotificationAttentionCause::VerifyFailed)
@@ -798,6 +792,21 @@ pub enum NotificationFact {
         /// audit distinction; it does not weaken projection validation.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         forced: bool,
+    },
+    /// Durable final reservation of one forced Complete key.
+    ///
+    /// This remains a pre-key fact: it proves neither terminal acceptance nor
+    /// composer consumption. It is the claim-ordering boundary for the
+    /// default-off force-submit fallback, so an earlier authenticated claim
+    /// cancels the action while a later claim retrieves its message without
+    /// cancelling the already-reserved key. That later claim can count as
+    /// consumption only after an action-accepted fact exists.
+    NotificationResolutionActionReserved {
+        record_version: u32,
+        attempt_id: NotificationAttemptId,
+        message_id: MessageId,
+        recipient: RecipientKey,
+        resolution: NotificationResolution,
     },
     /// Durable proof that the terminal action key was accepted by the terminal.
     ///
@@ -1147,10 +1156,6 @@ mod tests {
                 NotificationPreWriteCause::ComposerSemanticMissing,
                 "composer_semantic_missing",
             ),
-            (
-                NotificationPreWriteCause::ComposerSemanticAmbiguous,
-                "composer_semantic_ambiguous",
-            ),
             (NotificationPreWriteCause::WorkerFailed, "worker_failed"),
         ];
 
@@ -1162,7 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn width_block_keeps_the_closed_prewrite_cause_rollback_decodable() {
+    fn pre_write_detail_keeps_the_closed_cause_rollback_decodable() {
         #[derive(Debug, Deserialize, PartialEq, Eq)]
         #[serde(rename_all = "snake_case")]
         enum LegacyPreWriteCause {
@@ -1183,7 +1188,8 @@ mod tests {
             "pre_write_observation": {
                 "selected_manifest": "codex",
                 "pane_width": 59,
-                "required_pane_width": 60
+                "required_pane_width": 60,
+                "write_block": "composer_semantic_ambiguous"
             }
         });
         let legacy: LegacyBlock = serde_json::from_value(current).unwrap();
@@ -1659,7 +1665,7 @@ mod tests {
                 }),
                 pane_width: Some(59),
                 required_pane_width: Some(60),
-                write_block: None,
+                write_block: Some("composer_semantic_ambiguous".into()),
             })),
         };
 
@@ -1669,7 +1675,8 @@ mod tests {
             serde_json::json!({
                 "route_evidence": {"boot_id": "boot-route", "generation": 9},
                 "pane_width": 59,
-                "required_pane_width": 60
+                "required_pane_width": 60,
+                "write_block": "composer_semantic_ambiguous"
             })
         );
         let decoded: NotificationFact = serde_json::from_value(encoded).unwrap();
@@ -1891,6 +1898,16 @@ mod tests {
                     forced: false,
                 },
                 "notification_resolution_intent",
+            ),
+            (
+                NotificationFact::NotificationResolutionActionReserved {
+                    record_version: 1,
+                    attempt_id,
+                    message_id: message_id.clone(),
+                    recipient,
+                    resolution: NotificationResolution::Complete,
+                },
+                "notification_resolution_action_reserved",
             ),
             (
                 NotificationFact::NotificationResolutionActionAccepted {

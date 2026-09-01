@@ -40,6 +40,17 @@ pub const SIDEBAR_EXPAND: &str = "▸";
 pub const MESSAGES_COLLAPSE: &str = "▸";
 pub const MESSAGES_EXPAND: &str = "◂";
 
+/// Body-free state for the collapsed Messages rail. The daemon snapshot owns
+/// the counts; the workspace only carries them to this pure renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessagesRailCue {
+    pub work_messages: u64,
+    pub attention_entries: u64,
+    /// False means these are the last authenticated counts from before a gap
+    /// or invalidation, not a current answer.
+    pub current: bool,
+}
+
 /// The one column at the panel's own outer edge that still answers as the
 /// resize handle. The handle itself moved: it used to be this hidden
 /// column, revealed as a dashed rule only once the pointer found it, one
@@ -82,6 +93,44 @@ pub fn sidebar_body_bottom(sidebar: Rect) -> u16 {
         footer_y.saturating_sub(1)
     } else {
         footer_y
+    }
+}
+
+/// Paint compact authenticated-daemon health in the Sessions tab's reserved
+/// status row. The exact identities remain available on the pane notice line;
+/// this marker is deliberately short enough to survive the narrowest sidebar.
+pub fn paint_daemon_status(
+    area: Rect,
+    tab: SidebarTab,
+    status: &str,
+    buf: &mut Buffer,
+    paint: &Paint,
+) {
+    if area.width == 0 || area.height <= 2 {
+        return;
+    }
+    let inner = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
+    let pad = 2.min(inner.width / 2);
+    let content = Rect::new(
+        inner.x + pad,
+        inner.y,
+        inner.width.saturating_sub(pad.saturating_mul(2)),
+        inner.height,
+    );
+    match tab.available() {
+        SidebarTab::Sessions => super::overlay_text_ellipsized(
+            buf,
+            content,
+            content.x,
+            content.y + 2,
+            status,
+            theme::chrome_notice(paint),
+        ),
+        // Stream rows start one cell in from the panel edge. Keep their
+        // text intact and use that otherwise-empty gutter for the marker.
+        SidebarTab::Stream => {
+            buf.set_string(inner.x, inner.y + 2, "!", theme::chrome_notice(paint));
+        }
     }
 }
 
@@ -420,6 +469,7 @@ pub fn paint_sidebar_rail(
     buf: &mut Buffer,
     paint: &Paint,
     hits: &mut HitMap,
+    daemon_warning: bool,
     hover: Option<(u16, u16)>,
 ) {
     if area.width == 0 || area.height == 0 {
@@ -439,6 +489,12 @@ pub fn paint_sidebar_rail(
         hits,
         hover,
     );
+    // A hidden sidebar is an intentional journey, not permission to hide an
+    // authenticated identity problem with it. The shape is redundant with
+    // warning color and occupies a row outside the centered toggle.
+    if daemon_warning {
+        buf.set_string(area.x, area.y, "!", theme::chrome_notice(paint));
+    }
 }
 
 /// Render the Messages pane on the right edge. Its left border remains the
@@ -601,6 +657,7 @@ pub fn paint_messages_rail(
     buf: &mut Buffer,
     paint: &Paint,
     hits: &mut HitMap,
+    cue: Option<MessagesRailCue>,
     hover: Option<(u16, u16)>,
 ) {
     if area.width == 0 || area.height == 0 {
@@ -617,6 +674,58 @@ pub fn paint_messages_rail(
         hits,
         hover,
     );
+
+    // Keep the reopen chevron at its established center cell. Body-free state
+    // stacks immediately above it: envelope, a saturated one-cell count,
+    // attention, then uncertainty. A narrow rail never changes pane geometry,
+    // and every state has a symbol so color is not the only encoding.
+    let arrow_y = area.y + area.height / 2;
+    let mut markers: Vec<(&str, Style)> = Vec::with_capacity(4);
+    match cue {
+        Some(cue) => {
+            if cue.work_messages > 0 {
+                markers.push(("✉", theme::chrome_notice(paint)));
+                markers.push((
+                    compact_count(cue.work_messages),
+                    theme::chrome_notice(paint),
+                ));
+            }
+            if cue.attention_entries > 0 {
+                markers.push(("!", chat_ink_style(paint, &cyclops_ui::ChatInk::Attention)));
+            }
+            if !cue.current {
+                markers.push(("?", theme::sidebar_label(paint)));
+            }
+        }
+        None => markers.push(("?", theme::sidebar_label(paint))),
+    }
+    let available = usize::from(arrow_y.saturating_sub(area.y));
+    let shown = markers.len().min(available);
+    let first = markers.len().saturating_sub(shown);
+    let start_y = arrow_y.saturating_sub(u16::try_from(shown).unwrap_or(u16::MAX));
+    for (offset, (glyph, style)) in markers[first..].iter().enumerate() {
+        let y = start_y.saturating_add(u16::try_from(offset).unwrap_or(u16::MAX));
+        if let Some(cell) = buf.cell_mut((area.x, y)) {
+            cell.set_symbol(glyph);
+            cell.set_style(*style);
+        }
+    }
+}
+
+fn compact_count(count: u64) -> &'static str {
+    match count {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3 => "3",
+        4 => "4",
+        5 => "5",
+        6 => "6",
+        7 => "7",
+        8 => "8",
+        9 => "9",
+        _ => "+",
+    }
 }
 
 /// Paint the hover / drag indicator on the Messages pane resize handle.
@@ -1442,7 +1551,7 @@ mod tests {
 
         fn tree(&self) -> crate::files::FileTree {
             let mut tree = crate::files::FileTree::new();
-            tree.reroot(&self.0);
+            crate::file_adapter::reroot(&mut tree, &self.0);
             tree
         }
     }
@@ -2265,6 +2374,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_daemon_mismatch_stays_visible_at_the_narrowest_sidebar_width() {
+        let paint = Paint::for_test();
+        let mut term = Terminal::new(TestBackend::new(
+            crate::render::SIDEBAR_MIN_WIDTH,
+            GRAB_TEST_HEIGHT,
+        ))
+        .unwrap();
+        term.draw(|frame| {
+            paint_daemon_status(
+                frame.area(),
+                SidebarTab::Sessions,
+                "daemon mismatch",
+                frame.buffer_mut(),
+                &paint,
+            );
+        })
+        .unwrap();
+
+        let frame = flatten(term.backend().buffer());
+        assert!(frame.contains("daemon"), "{frame}");
+    }
+
     /// The tree stops at the footer and does not scroll, so what it
     /// dropped has to be said somewhere: a workspace below the fold is
     /// otherwise indistinguishable from one that does not exist.
@@ -2940,6 +3072,29 @@ mod tests {
         assert!(!tree.contains(&word), "{tree:?}");
     }
 
+    #[test]
+    fn a_stream_tab_warning_keeps_the_first_event_row_intact() {
+        if !crate::persist::STREAM_TAB {
+            return;
+        }
+        let paint = Paint::for_test();
+        let record = one_row_record();
+        let word = cyclops_proto::AgentState::BlockedPermission.to_string();
+        let (mut stream_buf, _) = draw_sidebar(SidebarTab::Stream, &record, &paint);
+
+        paint_daemon_status(
+            SIDEBAR,
+            SidebarTab::Stream,
+            "daemon mismatch",
+            &mut stream_buf,
+            &paint,
+        );
+        let stream = sidebar_text(&stream_buf);
+        assert!(stream.contains("rev"), "{stream:?}");
+        assert!(stream.contains(&word), "{stream:?}");
+        assert_eq!(stream_buf[(SIDEBAR.x, SIDEBAR.y + 2)].symbol(), "!");
+    }
+
     /// Both chips answer the mouse where they paint, and the selected one
     /// is materially different from the other. Rule 11: the cue survives
     /// `NO_COLOR`, because the accent chip reverses when there is no color
@@ -3183,7 +3338,7 @@ mod tests {
         let rail = Rect::new(0, 0, 1, SIDEBAR.height);
         let mut term = Terminal::new(TestBackend::new(20, SIDEBAR.height)).unwrap();
         let mut hits = HitMap::default();
-        term.draw(|f| paint_sidebar_rail(rail, f.buffer_mut(), paint, &mut hits, hover))
+        term.draw(|f| paint_sidebar_rail(rail, f.buffer_mut(), paint, &mut hits, false, hover))
             .unwrap();
         (term.backend().buffer().clone(), hits)
     }
@@ -3219,6 +3374,27 @@ mod tests {
         for y in 0..SIDEBAR.height {
             assert_eq!(buf[(1, y)].symbol(), " ", "the rail painted past column 0");
         }
+    }
+
+    #[test]
+    fn a_collapsed_sidebar_keeps_a_daemon_warning_visible() {
+        let rail = Rect::new(0, 0, 1, SIDEBAR.height);
+        let mut term = Terminal::new(TestBackend::new(20, SIDEBAR.height)).unwrap();
+        let mut hits = HitMap::default();
+        term.draw(|frame| {
+            paint_sidebar_rail(
+                rail,
+                frame.buffer_mut(),
+                &Paint::for_test(),
+                &mut hits,
+                true,
+                None,
+            );
+        })
+        .unwrap();
+
+        assert_eq!(term.backend().buffer()[(0, 0)].symbol(), "!");
+        assert!(matches!(hits.hit(0, 0), Some(HitTarget::SidebarToggle)));
     }
 
     /// The open panel carries the same control on the middle of its own
@@ -3654,7 +3830,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         let mut hits = HitMap::default();
         let paint = Paint::for_test();
-        paint_messages_rail(area, &mut buf, &paint, &mut hits, None);
+        paint_messages_rail(area, &mut buf, &paint, &mut hits, None, None);
 
         for y in 0..area.height {
             assert!(
@@ -3672,6 +3848,59 @@ mod tests {
             MESSAGES_EXPAND,
             "collapsed, the chevron points left to open the Messages pane"
         );
+    }
+
+    #[test]
+    fn the_collapsed_messages_rail_projects_body_free_work_attention_and_freshness() {
+        let area = Rect::new(9, 0, 1, 12);
+        let paint = Paint::for_test();
+
+        let mut current = Buffer::empty(area);
+        paint_messages_rail(
+            area,
+            &mut current,
+            &paint,
+            &mut HitMap::default(),
+            Some(MessagesRailCue {
+                work_messages: 3,
+                attention_entries: 1,
+                current: true,
+            }),
+            None,
+        );
+        assert_eq!(current[(9, 3)].symbol(), "✉");
+        assert_eq!(current[(9, 4)].symbol(), "3");
+        assert_eq!(current[(9, 5)].symbol(), "!");
+        assert_eq!(current[(9, 6)].symbol(), MESSAGES_EXPAND);
+
+        let mut stale = Buffer::empty(area);
+        paint_messages_rail(
+            area,
+            &mut stale,
+            &paint,
+            &mut HitMap::default(),
+            Some(MessagesRailCue {
+                work_messages: 12,
+                attention_entries: 0,
+                current: false,
+            }),
+            None,
+        );
+        assert_eq!(stale[(9, 3)].symbol(), "✉");
+        assert_eq!(stale[(9, 4)].symbol(), "+");
+        assert_eq!(stale[(9, 5)].symbol(), "?");
+
+        let mut unknown = Buffer::empty(area);
+        paint_messages_rail(
+            area,
+            &mut unknown,
+            &paint,
+            &mut HitMap::default(),
+            None,
+            None,
+        );
+        assert_eq!(unknown[(9, 5)].symbol(), "?");
+        assert_eq!(unknown[(9, 6)].symbol(), MESSAGES_EXPAND);
     }
 
     #[test]

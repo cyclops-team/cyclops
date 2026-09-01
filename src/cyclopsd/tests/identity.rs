@@ -6,7 +6,7 @@
 //! pane's pane_pid.
 //!
 //! Never touches the user's tmux: every tmux call carries
-//! `-L cyc-id-<pid> -f /dev/null` through cyclops-testrig, which kills
+//! `-L cyc-id-<pid>-<sequence> -f /dev/null` through cyclops-testrig, which kills
 //! the server and unlinks its socket on drop.
 //! Skips cleanly when tmux is not on PATH. The retry loops are test-side
 //! waits for process spawns, outside the daemon's zero-polling contract.

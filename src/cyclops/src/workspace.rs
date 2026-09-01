@@ -143,12 +143,14 @@ fn check_name(name: &str) -> Result<(), String> {
 // Config
 // ---------------------------------------------------------------------------
 
-/// The config values these verbs need, read tolerantly.
+/// The config values these verbs need.
 ///
-/// The daemon owns config validation (`cyclopsd::Config`), and the CLI
-/// cannot depend on the daemon. Same arrangement as the theme key, which
-/// `cyclops-theme` reads out of the same file for the same reason: a
-/// client reads the keys it needs and stays quiet about the rest.
+/// This launcher owns `default_workspace`: it parses that key when a
+/// workspace command begins, supplies the fallback order below, and writes
+/// the first-run value. The shared file also carries coordinator settings
+/// needed to construct a workspace on the daemon's tmux server. Those three
+/// settings are accepted only by the shared safety boundary, before a CLI
+/// command can select tmux's ambient server.
 pub struct Settings {
     /// `sessions`, in order.
     pub sessions: Vec<String>,
@@ -162,40 +164,24 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn read(home: &Path) -> Settings {
-        let mut s = Settings {
-            sessions: Vec::new(),
+    pub fn read(home: &Path) -> Result<Settings, String> {
+        let document = cyclops_state::load_coordinator_config(home)
+            .map_err(|error| format!("read {}: {error}", config_path(home).display()))?;
+        let mut settings = Settings {
+            sessions: document.coordinator.sessions,
             default_workspace: None,
-            server: Server::default(),
-            exists: false,
+            server: Server {
+                socket: document.coordinator.tmux_socket,
+                config_file: document.coordinator.tmux_config,
+            },
+            exists: document.exists,
         };
-        let Ok(text) = std::fs::read_to_string(config_path(home)) else {
-            return s;
-        };
-        s.exists = true;
-        let Ok(table) = text.parse::<toml::Table>() else {
-            return s;
-        };
-        if let Some(list) = table.get("sessions").and_then(toml::Value::as_array) {
-            s.sessions = list
-                .iter()
-                .filter_map(toml::Value::as_str)
-                .map(str::to_string)
-                .collect();
-        }
-        s.default_workspace = table
+        settings.default_workspace = document
+            .table
             .get("default_workspace")
             .and_then(toml::Value::as_str)
             .map(str::to_string);
-        s.server.socket = table
-            .get("tmux_socket")
-            .and_then(toml::Value::as_str)
-            .map(str::to_string);
-        s.server.config_file = table
-            .get("tmux_config")
-            .and_then(toml::Value::as_str)
-            .map(PathBuf::from);
-        s
+        Ok(settings)
     }
 
     /// Which workspace a bare `cyclops start` means: the explicit ask, the
@@ -213,8 +199,22 @@ impl Settings {
     }
 }
 
+/// Bind a semantic pane-focus request to this launcher's configured server.
+#[cfg(feature = "full-ui")]
+pub fn focus_adapter(home: &Path) -> Result<cyclops_ui::FocusPane, String> {
+    let server = Settings::read(home)?.server;
+    Ok(cyclops_ui::FocusPane::new(move |target| {
+        cyclops_tmux::focus_pane(
+            server.socket.as_deref(),
+            server.config_file.as_deref(),
+            target,
+        )
+        .map_err(|error| error.to_string())
+    }))
+}
+
 pub fn config_path(home: &Path) -> PathBuf {
-    home.join("config.toml")
+    home.join(cyclops_state::COORDINATOR_CONFIG_FILE)
 }
 
 /// The size to build a detached session at: this terminal's, when there
@@ -271,10 +271,10 @@ enum Watch {
     /// Running, but this session is not one it was told to watch.
     Elsewhere,
     /// Told to watch it, not connected to it yet. A session created a
-    /// moment ago is normally here: the daemon retries its attach on a
-    /// backoff, and until that lands it can resolve none of the session's
-    /// panes, so naming one would fail per pane with nothing useful to
-    /// say.
+    /// moment ago remains here until `cyclops start` sends its idempotent
+    /// `session.watch` creation edge and the daemon attaches. Until then it
+    /// can resolve none of the session's panes, so naming one would fail per
+    /// pane with nothing useful to say.
     NotYet,
     /// Watching it. Carries pane id to name for the session.
     Watching(BTreeMap<String, String>),
@@ -297,6 +297,15 @@ impl Watch {
 /// without a daemon, minus the names.
 fn watch_of(client: &mut Client, session: &str) -> Watch {
     session_view(client, session).0
+}
+
+/// Tell a live daemon that a caller has just created or restored this tmux
+/// session. The request is idempotent for configured slots and opens a
+/// runtime slot only when the daemon did not know this name yet.
+fn notify_session_available(client: &mut Client, session: &str) -> bool {
+    client
+        .request("session.watch", json!({"session": session}))
+        .is_ok()
 }
 
 /// One status request, answering both questions callers ask of it: what
@@ -334,9 +343,9 @@ fn session_view(client: &mut Client, session: &str) -> (Watch, HashSet<String>) 
     (Watch::Watching(labels), panes)
 }
 
-/// How long `start` waits for cyclopsd to connect to a session it just
-/// built. The daemon's reattach backoff caps at five seconds (cyclopsd's
-/// RECONNECT_MAX), so this is that plus a margin.
+/// How long `start` waits for the daemon to consume its explicit creation
+/// notification and read the pane table. This is bounded client patience, not
+/// a daemon retry cadence for a missing session.
 const ATTACH_WAIT: Duration = Duration::from_secs(6);
 
 /// Wait for cyclopsd to reach a session and read its panes, or give up.
@@ -370,7 +379,7 @@ fn wait_for_attach(client: &mut Client, session: &str, built: &[String]) -> Watc
 fn daemon() -> Option<Client> {
     match Client::connect() {
         Ok(c) => Some(c),
-        Err(ClientError::NotRunning) => None,
+        Err(ClientError::NotRunning(_)) => None,
         // Anything else (a wedged accept queue, a broken hello) is also a
         // daemon we cannot ask. The verb says so in its own copy.
         Err(_) => None,
@@ -697,7 +706,13 @@ pub fn run_start(
     start_daemon: bool,
 ) -> i32 {
     let home = cyclops_proto::cyclops_home();
-    let settings = Settings::read(&home);
+    let settings = match Settings::read(&home) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
 
     // 1.
     let name = settings.workspace_name(asked);
@@ -809,10 +824,9 @@ pub fn run_start(
     // 4. Make sure there is a daemon, starting one if there is not.
     //
     //    Here, and not earlier, because the session now exists: a daemon
-    //    that boots with its session already there attaches at once
-    //    instead of retrying on a backoff, so the names below land in
-    //    this run. Starting it before building the session would work
-    //    too, and would spend up to five seconds waiting for the retry.
+    //    that boots with its session already there attaches at once, so
+    //    the names below land in this run. An external daemon that started
+    //    first is woken explicitly below after this creation succeeds.
     //
     //    A failure to start is a note, not an exit. The workspace is
     //    open and usable at this point; what is lost is naming, and the
@@ -842,15 +856,36 @@ pub fn run_start(
         None => Watch::Down,
         Some(c) => watch_of(c, &session),
     };
+    // A daemon started by an external supervisor can already hold this
+    // configured session in `NotYet`. `cyclops start` is the creator, so
+    // after it has built or restored the tmux session it sends the
+    // idempotent availability edge that releases the daemon's wait. Do not
+    // send this for `Elsewhere`: that state means the session is not
+    // configured, and turning it into a runtime watch would silently change
+    // the existing config-hint contract.
+    let mut notified_session = false;
+    if matches!(watch, Watch::NotYet) {
+        if let Some(c) = client.as_mut() {
+            if notify_session_available(c, &session) {
+                notified_session = true;
+                watch = watch_of(c, &session);
+            } else {
+                // We cannot honestly treat a failed creation notification as
+                // a watcher that will catch up on its own.
+                watch = Watch::Down;
+            }
+        }
+    }
     // A session built seconds ago is one cyclopsd has not connected to
     // yet, and until it does, no pane can be named. Waiting for it here is
     // what makes one `cyclops start` enough: without this the first run
     // builds the session, names nothing, and a second run is what puts the
     // names on.
     //
-    // Only when this run built the session, and only with a daemon there
-    // to wait for. Every other state is already its own answer.
-    if !existed && matches!(watch, Watch::NotYet | Watch::Watching(_)) {
+    // Only when this run built the session or successfully woke an existing
+    // daemon slot, and only with a daemon there to wait for. Every other
+    // state is already its own answer.
+    if (!existed || notified_session) && matches!(watch, Watch::NotYet | Watch::Watching(_)) {
         if let Some(c) = client.as_mut() {
             watch = wait_for_attach(c, &session, &pane_ids);
         }
@@ -1066,8 +1101,9 @@ fn prepare_home(
 
     // 3. Manifests, every run and not only the first. A home that predates
     //    the seed gets them without a reinstall, and a shipped set that
-    //    gains a file reaches an existing home on the next run. Operator
-    //    edits stay unchanged. Known unedited shipped files may advance.
+    //    gains a file reaches an existing home on the next run. Every
+    //    existing manifest stays unchanged; a known old shipped seed reports
+    //    outdated for manual review.
     let seeded = crate::manifests::seed(home);
     if seeded.none_installed() {
         // The one note that contradicts the ready line above it: with no
@@ -1100,7 +1136,13 @@ fn prepare_home(
 /// and because a machine without tmux should still finish installing.
 pub fn run_setup(json_out: bool, style: &Style, wire_hooks: bool) -> i32 {
     let home = cyclops_proto::cyclops_home();
-    let settings = Settings::read(&home);
+    let settings = match Settings::read(&home) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
     // The session the config will name. `start` with no arguments opens
     // this same one, so the config this writes is the config that run wants.
     let session = settings.workspace_name(None);
@@ -1170,6 +1212,7 @@ pub fn run_setup(json_out: bool, style: &Style, wire_hooks: bool) -> i32 {
                         "consumer": s.consumer,
                         "path": s.path.display().to_string(),
                         "outcome": crate::skillseed::json_word(&s.outcome),
+                        "detail": crate::skillseed::json_detail(&s.outcome),
                     })).collect::<Vec<_>>(),
             })
         );
@@ -1461,7 +1504,13 @@ fn keep_names(
 ///    names only when somebody could answer for them.
 pub fn run_save(json_out: bool, style: &Style, name: Option<&str>, session: Option<&str>) -> i32 {
     let home = cyclops_proto::cyclops_home();
-    let settings = Settings::read(&home);
+    let settings = match Settings::read(&home) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
     // The session to read is the default workspace's unless --session
     // says otherwise. The positional argument names the FILE, so
     // `cyclops workspace save review-setup` saves the session you are in
@@ -1594,7 +1643,13 @@ pub fn run_restore(
     launch: bool,
 ) -> i32 {
     let home = cyclops_proto::cyclops_home();
-    let settings = Settings::read(&home);
+    let settings = match Settings::read(&home) {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
     let name = settings.workspace_name(name);
     let session = session.map(str::to_string).unwrap_or_else(|| name.clone());
     for n in [&name, &session] {
@@ -2566,6 +2621,63 @@ mod tests {
         s.default_workspace = Some("configured".into());
         assert_eq!(s.workspace_name(None), "configured");
         assert_eq!(s.workspace_name(Some("asked")), "asked");
+    }
+
+    #[test]
+    fn the_workspace_launcher_falls_back_when_default_workspace_is_not_a_string() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-default-workspace-owner");
+        std::fs::create_dir_all(&home).expect("create scratch home");
+        std::fs::write(
+            config_path(&home),
+            "sessions = [\"watched\"]\ndefault_workspace = 3\n",
+        )
+        .expect("write config");
+
+        assert_eq!(
+            Settings::read(&home)
+                .expect("valid coordinator settings")
+                .workspace_name(None),
+            "watched"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn coordinator_settings_keep_a_valid_nondefault_tmux_server() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-settings-configured-server");
+        let _ = std::fs::remove_dir_all(&home);
+        StateRoot::open_or_create(&home)
+            .expect("create safe home")
+            .replace_file(
+                Path::new("config.toml"),
+                b"sessions = [\"main\"]\ntmux_socket = \"configured\"\ntmux_config = \"/dev/null\"\n",
+            )
+            .expect("write safe config");
+
+        let settings = Settings::read(&home).expect("valid settings");
+        assert_eq!(settings.sessions, ["main"]);
+        assert_eq!(settings.server.socket.as_deref(), Some("configured"));
+        assert_eq!(
+            settings.server.config_file.as_deref(),
+            Some(Path::new("/dev/null"))
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn malformed_coordinator_config_refuses_before_workspace_can_default_tmux() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-settings-malformed-config");
+        let _ = std::fs::remove_dir_all(&home);
+        StateRoot::open_or_create(&home)
+            .expect("create safe home")
+            .replace_file(Path::new("config.toml"), b"tmux_socket = [")
+            .expect("write malformed config");
+
+        assert!(Settings::read(&home).is_err());
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

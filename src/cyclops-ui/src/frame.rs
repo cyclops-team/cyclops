@@ -384,7 +384,7 @@ fn footer(app: &App) -> String {
     if let Some(notice) = app.notice_text() {
         return format!("  {notice}");
     }
-    theme.dim("? keys · tab view · a agents · c density · w/f/t filter · enter jump · q quit")
+    theme.dim("? keys · tab view · a agents · c density · w/f/t filter · enter focus · q quit")
 }
 
 fn cheatsheet(height: usize) -> Vec<String> {
@@ -394,14 +394,14 @@ fn cheatsheet(height: usize) -> Vec<String> {
         "  tab    admin stream / firehose / messages",
         "  a      agents panel · on wide terminals",
         "  w f t  filter with / from / to · enter applies · esc cancels",
-        "  enter  jump to the entry's pane",
+        "  enter  focus the entry's pane",
         "  ↑ ↓    scroll · unpins from the tail",
         "  end    back to the tail",
         "  c      density · comfortable / compact",
         "  ?      close this help",
         "  q      quit",
         "",
-        "  mouse  click an agent to jump to its pane · click an entry to",
+        "  mouse  click an agent to focus its pane · click an entry to",
         "         select it · wheel scrolls",
     ];
     let mut rows: Vec<String> = lines.iter().take(height).map(|l| l.to_string()).collect();
@@ -555,7 +555,7 @@ fn fits(list: &[&Entry], top: usize, sel: usize, sh: usize, comfortable: bool) -
 mod tests {
     use super::*;
     use crate::app::{App, View};
-    use crate::input::Key;
+    use crate::key::Key;
     use crate::stream::{EndpointFilter, Entry, EntryKind, Filter};
     use crate::theme::Theme;
     use cyclops_proto::{AgentState, DeliveryState};
@@ -640,7 +640,7 @@ mod tests {
             String::new(),
             String::new(),
             String::new(),
-            "? keys · tab view · a agents · c density · w/f/t filter · enter jump · q quit"
+            "? keys · tab view · a agents · c density · w/f/t filter · enter focus · q quit"
                 .to_string(),
         ];
         assert_eq!(got, expected);
@@ -686,7 +686,7 @@ mod tests {
             "  12:04:41  reviewer  ○ idle".to_string(),
             "  12:04:41  reviewer  ✔ cleared · was ⚠ blocked_permission".to_string(),
             String::new(),
-            "? keys · tab view · a agents · c density · w/f/t filter · enter jump · q quit"
+            "? keys · tab view · a agents · c density · w/f/t filter · enter focus · q quit"
                 .to_string(),
         ];
         assert_eq!(got, expected);

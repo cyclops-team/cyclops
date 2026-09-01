@@ -37,8 +37,12 @@ use crate::dialog::{
     Composed, Dialog, ForceSubmitPicker, SettingsSection, SoundPicker, SoundRow, ThemePicker,
     ViewSwitches,
 };
-use crate::naming;
+use crate::focus::{Decision as FocusDecision, Direction as FocusDirection, Effect as FocusEffect};
 use crate::persist::SidebarTab;
+use crate::split::{Decision as SplitDecision, Effect as SplitEffect, Placement as SplitPlacement};
+use crate::workspace_close::{Decision as CloseDecision, Effect as CloseEffect};
+use crate::workspace_create::Decision as CreateDecision;
+use crate::workspace_rename::{Decision as RenameDecision, Effect as RenameEffect};
 
 /// What the caller must do after one action executed. Every field defaults
 /// to false ("nothing beyond what already happened"); an arm sets exactly
@@ -72,15 +76,8 @@ pub(super) async fn execute(
     action: Action,
 ) -> Result<Outcome, TmuxError> {
     match action {
-        Action::Split { pane_id, direction } => {
-            client.split_window(&pane_id, direction).await?;
-            Ok(Outcome::reconcile())
-        }
-        Action::FocusPane { pane_id } => focus_pane(app, client, &pane_id).await,
-        Action::FocusDirection(direction) => {
-            client.select_pane_toward(direction).await?;
-            Ok(Outcome::reconcile())
-        }
+        Action::Split(intent) => execute_split(app, client, intent).await,
+        Action::Focus(intent) => execute_focus(app, client, intent).await,
         Action::SwapPaneDirection(direction) => {
             // At an edge with no neighbour tmux answers with an error,
             // which the caller logs like any other failed command.
@@ -306,21 +303,31 @@ pub(super) async fn execute(
             client.switch_to_session(&session).await?;
             Ok(Outcome::reconcile())
         }
-        Action::RequestRenameWorkspace { session } => {
+        Action::RequestRenameWorkspace { session_id } => {
+            let Some(workspace) = app
+                .model
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.session_id == session_id)
+            else {
+                app.notice.show(
+                    crate::copy::WORKSPACE_RENAME_ROUTE_STALE,
+                    tokio::time::Instant::now(),
+                );
+                return Ok(Outcome::reconcile());
+            };
             app.open_dialog(Dialog::RenameWorkspace {
-                buffer: session.clone(),
-                session,
+                session_id: workspace.session_id.clone(),
+                buffer: workspace.name.clone(),
             });
             Ok(Outcome::default())
         }
-        Action::RenameWorkspace { session, name } => {
-            rename_workspace(app, client, session, name).await
-        }
-        Action::RequestCloseWorkspace { session } => {
-            app.open_dialog(Dialog::ConfirmCloseWorkspace { session });
+        Action::RenameWorkspace(intent) => execute_rename_workspace(app, client, intent).await,
+        Action::RequestCloseWorkspace { session_id } => {
+            app.open_dialog(Dialog::ConfirmCloseWorkspace { session_id });
             Ok(Outcome::default())
         }
-        Action::CloseWorkspace { session } => close_workspace(app, client, session).await,
+        Action::CloseWorkspace(intent) => execute_close_workspace(app, client, intent).await,
         Action::ReorderWorkspace {
             session_id,
             insertion,
@@ -395,7 +402,8 @@ pub(super) async fn execute(
             // Stored as the row count, so "off" is zero rows and "on" is
             // whatever it was last. There is no separate visibility flag to
             // fall out of step with the size.
-            app.prefs.files_rows = if app.prefs.files_rows == 0 {
+            let showing = app.prefs.files_rows == 0;
+            app.prefs.files_rows = if showing {
                 crate::persist::WorkspacePrefs::default().files_rows
             } else {
                 0
@@ -406,6 +414,9 @@ pub(super) async fn execute(
             // repaint is requested here and not folded into the resize.
             app.layout_changed();
             sync_view_switches(app);
+            if showing {
+                super::request_files_refresh(app, std::time::Duration::ZERO);
+            }
             Ok(Outcome {
                 persist: true,
                 ..Outcome::default()
@@ -603,6 +614,7 @@ pub(super) async fn execute(
                 app.prefs.files_rows = crate::persist::WorkspacePrefs::default().files_rows;
             }
             app.files_tree_mut().take_cursor();
+            super::request_files_refresh(app, std::time::Duration::ZERO);
             if was_hidden {
                 // The panel took columns back from the canvas, so tmux has
                 // to be told before the next frame paints panes at the old
@@ -660,6 +672,7 @@ pub(super) async fn execute(
             app.model.sidebar_visible = true;
             if was_visible {
                 // Same columns, different body: tmux has nothing to be told.
+                super::request_files_refresh(app, std::time::Duration::ZERO);
                 return Ok(Outcome {
                     persist: true,
                     ..Outcome::default()
@@ -677,6 +690,7 @@ pub(super) async fn execute(
             let tab = tab.available();
             app.sidebar_tab = tab;
             app.prefs.sidebar_tab = tab;
+            super::request_files_refresh(app, std::time::Duration::ZERO);
             Ok(Outcome {
                 persist: true,
                 ..Outcome::default()
@@ -774,6 +788,7 @@ async fn commit_sidebar_visibility(app: &mut App, client: &ControlClient) -> Out
     app.prefs.sidebar_visible = app.model.sidebar_visible;
     app.layout_changed();
     super::resize_client(app, client).await;
+    super::request_files_refresh(app, std::time::Duration::ZERO);
     Outcome {
         persist: true,
         ..Outcome::default()
@@ -882,96 +897,163 @@ async fn scroll_pane(
     Ok(Outcome::default())
 }
 
-/// Focus a pane. Sidebar agent rows span every workspace, not just the
-/// active one, so this tries the active session first (cheap: no session
-/// switch) and only falls back to the cross-workspace path when the pane
-/// genuinely isn't on screen.
-async fn focus_pane(
+/// Decide and perform one focus intent. The decision is pure, the adapter owns
+/// every host transition, and only the next tmux event or snapshot may change
+/// the model. Even a failed multi-step route asks for reconciliation because a
+/// prefix of it may have landed.
+async fn execute_focus(
     app: &mut App,
     client: &ControlClient,
-    pane_id: &str,
+    intent: crate::focus::Intent,
 ) -> Result<Outcome, TmuxError> {
-    let target = app
-        .model
-        .session
-        .tabs
-        .iter()
-        .position(|tab| crate::layout::layout_contains_pane(&tab.layout, pane_id));
-    match target {
-        Some(index) => focus_pane_in_session(app, client, pane_id, index).await,
-        None => focus_pane_in_background_workspace(app, client, pane_id).await,
-    }
-}
-
-/// `pane_id` is on tab `index` of the active session. Select it, switching
-/// tabs first if needed, and hydrate synchronously on the input path the
-/// same way this has always worked. L1 made `hydrate_visible_tab` itself
-/// faster (every stale pane hydrates concurrently instead of serially)
-/// rather than moving it off this path: deferring it to the render deadline
-/// would be the background-effect system the recommendation says to add
-/// only after measurement shows this path is still slow, not speculatively.
-async fn focus_pane_in_session(
-    app: &mut App,
-    client: &ControlClient,
-    pane_id: &str,
-    index: usize,
-) -> Result<Outcome, TmuxError> {
-    // A click resolves against the frame it was aimed at, and a window can
-    // close between that frame and this handler. A stale index is a spent
-    // click, not a request.
-    if index >= app.model.session.tabs.len() {
-        return Ok(Outcome::default());
-    }
-    let prior_tab = app.model.session.active_tab;
-    let prior_pane = app.model.active_tab().active_pane.clone();
-    if index == prior_tab && prior_pane == pane_id {
-        // Already focused: nothing to tell tmux.
-        return Ok(Outcome::default());
-    }
-    if index != prior_tab {
-        client
-            .select_window(&app.model.session.tabs[index].window_id)
-            .await?;
-    }
-    client.select_pane(pane_id).await?;
-    app.model.session.active_tab = index;
-    let zoomed = app.model.session.tabs[index].zoomed;
-    app.model.session.tabs[index].active_pane = pane_id.to_string();
-    if index != prior_tab || (zoomed && prior_pane != pane_id) {
-        super::resize_client(app, client).await;
-        crate::sync::hydrate_visible_tab(client, app.model.active_tab(), &mut app.runtimes).await;
-        app.needs_hydrate = false;
-        app.persist_active();
-    }
-    Ok(Outcome::default())
-}
-
-/// `pane_id` is not on the active session — it's a sidebar agent row in a
-/// background workspace. Switch to that workspace and select the pane's
-/// window; reconciliation replaces the local model with tmux's own answer.
-async fn focus_pane_in_background_workspace(
-    app: &mut App,
-    client: &ControlClient,
-    pane_id: &str,
-) -> Result<Outcome, TmuxError> {
-    let Some(window_id) = app.decoration.pane(pane_id).map(|d| d.window_id.clone()) else {
-        // Decoration doesn't know this pane — a stale hit, or a reconcile
-        // that hasn't caught up yet. Ask for a fresh model rather than guess.
-        return Ok(Outcome::reconcile());
+    let decision = crate::focus::decide(
+        intent,
+        &app.model,
+        &app.decoration,
+        app.link_state,
+        !app.needs_reconcile,
+    );
+    let effect = match decision {
+        FocusDecision::NoOp => return Ok(Outcome::default()),
+        FocusDecision::Refresh => return Ok(Outcome::reconcile()),
+        FocusDecision::Refused(crate::focus::Refusal::Reconnecting) => {
+            app.notice.show(
+                crate::copy::FOCUS_CONTROL_RECONNECTING,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::default());
+        }
+        FocusDecision::Refused(crate::focus::Refusal::ServerGone) => {
+            app.notice.show(
+                crate::copy::FOCUS_CONTROL_DISCONNECTED,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::default());
+        }
+        FocusDecision::Refused(crate::focus::Refusal::Refreshing) => {
+            app.notice.show(
+                crate::copy::FOCUS_STATE_REFRESHING,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::reconcile());
+        }
+        FocusDecision::Run(effect) => effect,
     };
-    let Some(session) = app
-        .model
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.window_ids.iter().any(|id| id == &window_id))
-        .map(|workspace| workspace.name.clone())
-    else {
-        return Ok(Outcome::reconcile());
+
+    let pane_id = focus_effect_pane(&effect).to_string();
+    let result = match effect {
+        FocusEffect::Pane(route) => client.select_pane(&route.pane_id).await,
+        FocusEffect::WindowPane(route) => {
+            client
+                .focus_window_pane(&route.window_id, &route.pane_id)
+                .await
+        }
+        FocusEffect::SessionWindowPane(route) => {
+            client
+                .focus_session_window_pane(&route.session_id, &route.window_id, &route.pane_id)
+                .await
+        }
+        FocusEffect::Adjacent { from, direction } => {
+            client
+                .select_pane_toward_from(&from.pane_id, tmux_focus_direction(direction))
+                .await
+        }
     };
-    client.switch_to_session(&session).await?;
-    client.select_window(&window_id).await?;
-    client.select_pane(pane_id).await?;
+    if let Err(error) = result {
+        super::log_err(&app.home, &error);
+        app.notice.show(
+            crate::copy::focus_unconfirmed(&pane_id, &error),
+            tokio::time::Instant::now(),
+        );
+    }
     Ok(Outcome::reconcile())
+}
+
+fn focus_effect_pane(effect: &FocusEffect) -> &str {
+    match effect {
+        FocusEffect::Pane(route)
+        | FocusEffect::WindowPane(route)
+        | FocusEffect::SessionWindowPane(route) => &route.pane_id,
+        FocusEffect::Adjacent { from, .. } => &from.pane_id,
+    }
+}
+
+fn tmux_focus_direction(direction: FocusDirection) -> cyclops_tmux::PaneDirection {
+    match direction {
+        FocusDirection::Left => cyclops_tmux::PaneDirection::Left,
+        FocusDirection::Right => cyclops_tmux::PaneDirection::Right,
+        FocusDirection::Up => cyclops_tmux::PaneDirection::Up,
+        FocusDirection::Down => cyclops_tmux::PaneDirection::Down,
+    }
+}
+
+/// Decide and perform one split intent. The exact source route is rechecked by
+/// tmux immediately before mutation, and only authoritative host state may add
+/// the resulting pane to the model.
+async fn execute_split(
+    app: &mut App,
+    client: &ControlClient,
+    intent: crate::split::Intent,
+) -> Result<Outcome, TmuxError> {
+    let decision = crate::split::decide(intent, &app.model, app.link_state, !app.needs_reconcile);
+    let effect = match decision {
+        SplitDecision::Refresh => {
+            app.notice
+                .show(crate::copy::SPLIT_ROUTE_STALE, tokio::time::Instant::now());
+            return Ok(Outcome::reconcile());
+        }
+        SplitDecision::Refused(crate::split::Refusal::Reconnecting) => {
+            app.notice.show(
+                crate::copy::SPLIT_CONTROL_RECONNECTING,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::default());
+        }
+        SplitDecision::Refused(crate::split::Refusal::ServerGone) => {
+            app.notice.show(
+                crate::copy::SPLIT_CONTROL_DISCONNECTED,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::default());
+        }
+        SplitDecision::Refused(crate::split::Refusal::Refreshing) => {
+            app.notice.show(
+                crate::copy::SPLIT_STATE_REFRESHING,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::reconcile());
+        }
+        SplitDecision::Run(effect) => effect,
+    };
+
+    let pane_id = effect.route.pane_id.clone();
+    if let Err(error) = perform_split(client, effect).await {
+        super::log_err(&app.home, &error);
+        app.notice.show(
+            crate::copy::split_unconfirmed(&pane_id, &error),
+            tokio::time::Instant::now(),
+        );
+    }
+    Ok(Outcome::reconcile())
+}
+
+async fn perform_split(client: &ControlClient, effect: SplitEffect) -> Result<(), TmuxError> {
+    let route = effect.route;
+    client
+        .split_window_at(
+            &route.session_id,
+            &route.window_id,
+            &route.pane_id,
+            tmux_split_direction(effect.placement),
+        )
+        .await
+}
+
+fn tmux_split_direction(placement: SplitPlacement) -> cyclops_tmux::SplitDirection {
+    match placement {
+        SplitPlacement::Right => cyclops_tmux::SplitDirection::Horizontal,
+        SplitPlacement::Down => cyclops_tmux::SplitDirection::Vertical,
+    }
 }
 
 /// Close one pane: straight away when it hosts no agent, else via a confirm
@@ -1139,53 +1221,121 @@ async fn select_tab(
     Ok(Outcome::default())
 }
 
-/// Create a workspace named after the focused pane's directory and switch
-/// to it — no prompt, the folder is the name.
+/// Create a workspace from one lifecycle decision, then reconcile tmux's
+/// authoritative result. The model is never patched optimistically.
 async fn new_workspace(app: &mut App, client: &ControlClient) -> Result<Outcome, TmuxError> {
-    let pane = app.model.active_tab().active_pane.clone();
-    let cwd = client
-        .display(&pane, "#{pane_current_path}")
-        .await
-        .map(|p| p.trim().to_string())
-        .unwrap_or_default();
-    let folder = if cwd.is_empty() {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
-    } else {
-        PathBuf::from(cwd)
+    let probe =
+        match crate::workspace_create::decide(&app.model, app.link_state, !app.needs_reconcile) {
+            CreateDecision::Probe(probe) => probe,
+            CreateDecision::Refresh => {
+                app.notice.show(
+                    crate::copy::WORKSPACE_CREATE_ROUTE_STALE,
+                    tokio::time::Instant::now(),
+                );
+                return Ok(Outcome::reconcile());
+            }
+            CreateDecision::Refused(crate::workspace_create::Refusal::Reconnecting) => {
+                app.notice.show(
+                    crate::copy::WORKSPACE_CREATE_CONTROL_RECONNECTING,
+                    tokio::time::Instant::now(),
+                );
+                return Ok(Outcome::default());
+            }
+            CreateDecision::Refused(crate::workspace_create::Refusal::ServerGone) => {
+                app.notice.show(
+                    crate::copy::WORKSPACE_CREATE_CONTROL_DISCONNECTED,
+                    tokio::time::Instant::now(),
+                );
+                return Ok(Outcome::default());
+            }
+            CreateDecision::Refused(crate::workspace_create::Refusal::Refreshing) => {
+                app.notice.show(
+                    crate::copy::WORKSPACE_CREATE_STATE_REFRESHING,
+                    tokio::time::Instant::now(),
+                );
+                return Ok(Outcome::reconcile());
+            }
+        };
+
+    let observed_folder = match client.pane_current_path(&probe.pane_id).await {
+        Ok(Some(folder)) => folder,
+        Ok(None) => {
+            app.reconcile_session_id = None;
+            app.notice.show(
+                crate::copy::WORKSPACE_CREATE_ROUTE_STALE,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::reconcile());
+        }
+        Err(error) => {
+            super::log_err(&app.home, &error.to_string());
+            app.reconcile_session_id = None;
+            app.notice.show(
+                crate::copy::workspace_create_folder_unavailable(&error),
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::reconcile());
+        }
     };
-    let taken: Vec<String> = app
-        .model
-        .workspaces
-        .iter()
-        .map(|w| w.name.clone())
-        .collect();
-    let name = naming::unique_session_name(&naming::session_name_from_folder(&folder), &taken);
-    let session_id = client.new_session(&name, &folder).await?;
-    client.switch_to_session(&name).await?;
-    if !app.prefs.folder_tracked.contains(&session_id) {
-        app.prefs.folder_tracked.push(session_id);
+    let folder = if observed_folder.is_empty() {
+        match std::env::current_dir() {
+            Ok(folder) => folder,
+            Err(error) => {
+                super::log_err(&app.home, &error.to_string());
+                app.reconcile_session_id = None;
+                app.notice.show(
+                    crate::copy::workspace_create_default_folder_unavailable(&error),
+                    tokio::time::Instant::now(),
+                );
+                return Ok(Outcome::reconcile());
+            }
+        }
+    } else {
+        PathBuf::from(observed_folder)
+    };
+    let effect = crate::workspace_create::prepare(probe, folder);
+    let session_id = match client.new_session(&effect.name, &effect.folder).await {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            super::log_err(&app.home, &error.to_string());
+            app.reconcile_session_id = None;
+            app.notice.show(
+                crate::copy::workspace_create_unconfirmed(&effect.name, &error),
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::reconcile());
+        }
+    };
+
+    // The id proves creation even if the following switch fails or becomes
+    // uncertain. Persist that durable fact before attempting the transition.
+    crate::workspace_create::settle(&effect, &session_id, &mut app.prefs);
+    if let Err(error) = client.switch_to_session(&session_id).await {
+        super::log_err(&app.home, &error.to_string());
+        if !switch_result_is_uncertain(&error) {
+            app.reconcile_session_id = None;
+            app.notice.show(
+                crate::copy::workspace_switch_rejected(&effect.name, &error),
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome {
+                reconcile: true,
+                persist: true,
+                ..Outcome::default()
+            });
+        }
+        let current_session = client.current_session_id().await;
+        if let Err(probe_error) = &current_session {
+            super::log_err(&app.home, &probe_error.to_string());
+        }
+        return Ok(settle_uncertain_workspace_switch(
+            app,
+            &effect.name,
+            &error,
+            current_session,
+        ));
     }
-    // Land the new row directly under whichever workspace was active when
-    // the operator asked for it, instead of wherever tmux's own session
-    // ordering happens to put it (often above). Rewritten wholesale from
-    // the model's current names — the same move `reorder_workspace` makes
-    // for a drag — because sidebar order lives only in preferences, and
-    // the reconcile this Outcome triggers re-applies that order over
-    // whatever tmux just handed back.
-    let mut order: Vec<String> = app
-        .model
-        .workspaces
-        .iter()
-        .map(|w| w.name.clone())
-        .collect();
-    let insert_at = app
-        .model
-        .workspaces
-        .get(app.model.active_workspace)
-        .map(|_| app.model.active_workspace + 1)
-        .unwrap_or(order.len());
-    order.insert(insert_at, name);
-    app.prefs.workspace_order = order;
+    app.reconcile_session_id = Some(session_id);
     Ok(Outcome {
         reconcile: true,
         persist: true,
@@ -1193,35 +1343,117 @@ async fn new_workspace(app: &mut App, client: &ControlClient) -> Result<Outcome,
     })
 }
 
-/// Rename one workspace. An explicit rename means the human owns the name
-/// now, so a folder-following workspace stops following.
-async fn rename_workspace(
+/// `Command` is tmux's explicit `%error`, while `Io`, `Busy`, and `Protocol`
+/// stop before the command reaches tmux. Every other adapter error can leave
+/// the switch's effect unknown and must be reconciled from tmux's current
+/// state.
+fn switch_result_is_uncertain(error: &TmuxError) -> bool {
+    !matches!(
+        error,
+        TmuxError::Command(_) | TmuxError::Io(_) | TmuxError::Busy | TmuxError::Protocol(_)
+    )
+}
+
+/// Settle a switch whose command may have reached tmux. The caller supplies
+/// the one follow-up state read so this function can be tested without timing
+/// a control-mode server.
+fn settle_uncertain_workspace_switch(
+    app: &mut App,
+    name: &str,
+    switch_error: &TmuxError,
+    current_session: Result<String, TmuxError>,
+) -> Outcome {
+    match current_session {
+        Ok(current_session_id) => {
+            app.reconcile_session_id = Some(current_session_id);
+            app.notice.show(
+                crate::copy::workspace_switch_settling(name, switch_error),
+                tokio::time::Instant::now(),
+            );
+        }
+        Err(probe_error) => {
+            app.reconcile_session_id = None;
+            app.notice.show(
+                crate::copy::workspace_switch_unconfirmed(name, switch_error, &probe_error),
+                tokio::time::Instant::now(),
+            );
+        }
+    }
+    Outcome {
+        reconcile: true,
+        persist: true,
+        ..Outcome::default()
+    }
+}
+
+/// Decide and perform one confirmed workspace rename. The model remains a
+/// tmux snapshot; only reconciliation installs the renamed structure.
+async fn execute_rename_workspace(
     app: &mut App,
     client: &ControlClient,
-    session: String,
-    name: String,
+    intent: crate::workspace_rename::Intent,
 ) -> Result<Outcome, TmuxError> {
-    client.rename_session(&session, &name).await?;
-    let mut persist =
-        crate::persist::migrate_order_entry(&mut app.prefs.workspace_order, &session, &name);
-    if let Some(session_id) = app
-        .model
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.name == session)
-        .map(|workspace| workspace.session_id.clone())
-    {
-        let before = app.prefs.folder_tracked.len();
-        app.prefs.folder_tracked.retain(|id| id != &session_id);
-        persist |= app.prefs.folder_tracked.len() != before;
-    }
-    // The model addresses the active session BY NAME; skip this and the
-    // reconcile that follows queries the old name.
-    if app.model.session.session == session {
-        app.model.session.session = name;
-    }
+    // Confirmation is one consumed gesture. Refusal and uncertainty are
+    // visible on the notice line rather than hidden behind the same modal.
     app.dialog = None;
     app.hover = None;
+    let decision =
+        crate::workspace_rename::decide(intent, &app.model, app.link_state, !app.needs_reconcile);
+    let effect = match decision {
+        RenameDecision::Refresh => {
+            app.notice.show(
+                crate::copy::WORKSPACE_RENAME_ROUTE_STALE,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::reconcile());
+        }
+        RenameDecision::Refused(crate::workspace_rename::Refusal::Reconnecting) => {
+            app.notice.show(
+                crate::copy::WORKSPACE_RENAME_CONTROL_RECONNECTING,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::default());
+        }
+        RenameDecision::Refused(crate::workspace_rename::Refusal::ServerGone) => {
+            app.notice.show(
+                crate::copy::WORKSPACE_RENAME_CONTROL_DISCONNECTED,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::default());
+        }
+        RenameDecision::Refused(crate::workspace_rename::Refusal::Refreshing) => {
+            app.notice.show(
+                crate::copy::WORKSPACE_RENAME_STATE_REFRESHING,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::reconcile());
+        }
+        RenameDecision::Run(effect) => effect,
+    };
+
+    // Preserve the active identity through both snapshots even if this
+    // operation renames it, or a separate rename lands before reconciliation.
+    app.reconcile_session_id = Some(effect.reconcile_session_id.clone());
+    if let Err(error) = perform_workspace_rename(client, &effect).await {
+        super::log_err(&app.home, &error.to_string());
+        app.notice.show(
+            crate::copy::workspace_rename_unconfirmed(&effect.target.name, &error),
+            tokio::time::Instant::now(),
+        );
+        return Ok(Outcome::reconcile());
+    }
+
+    // An explicit rename means the human owns this identity's name now, so
+    // a folder-following workspace stops following. `workspace_order` is
+    // still keyed by mutable names: another session may have reused the
+    // cached name before this exact-id command landed. The ordered rename
+    // notification migrates the entry when it has a current identity/name
+    // mapping; this effect path must not guess and steal a survivor's entry.
+    let before = app.prefs.folder_tracked.len();
+    app.prefs
+        .folder_tracked
+        .retain(|id| id != &effect.target.session_id);
+    let persist = app.prefs.folder_tracked.len() != before;
     Ok(Outcome {
         reconcile: true,
         persist,
@@ -1229,47 +1461,104 @@ async fn rename_workspace(
     })
 }
 
-/// Close one workspace. Always reached through [`Action::RequestCloseWorkspace`]
-/// first, so the dialog is unconditionally the one being answered here.
-async fn close_workspace(
+async fn perform_workspace_rename(
+    client: &ControlClient,
+    effect: &RenameEffect,
+) -> Result<(), TmuxError> {
+    client
+        .rename_session(&effect.target.session_id, &effect.name)
+        .await
+}
+
+/// Decide and perform one confirmed workspace close. The adapter owns any
+/// fallback transition, and only a later host snapshot may remove the session
+/// from the application model.
+async fn execute_close_workspace(
     app: &mut App,
     client: &ControlClient,
-    session: String,
+    intent: crate::workspace_close::Intent,
 ) -> Result<Outcome, TmuxError> {
+    // Confirmation is one consumed gesture. Refusal and uncertainty are shown
+    // on the workspace notice line rather than hidden behind the same modal.
     app.dialog = None;
     app.hover = None;
-    let fallback = if session == app.model.session.session {
-        app.model
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.name != session)
-            .map(|workspace| workspace.name.clone())
-    } else {
-        None
+    let decision =
+        crate::workspace_close::decide(intent, &app.model, app.link_state, !app.needs_reconcile);
+    let effect = match decision {
+        CloseDecision::Refresh => {
+            app.notice.show(
+                crate::copy::WORKSPACE_CLOSE_ROUTE_STALE,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::reconcile());
+        }
+        CloseDecision::Refused(crate::workspace_close::Refusal::Reconnecting) => {
+            app.notice.show(
+                crate::copy::WORKSPACE_CLOSE_CONTROL_RECONNECTING,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::default());
+        }
+        CloseDecision::Refused(crate::workspace_close::Refusal::ServerGone) => {
+            app.notice.show(
+                crate::copy::WORKSPACE_CLOSE_CONTROL_DISCONNECTED,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::default());
+        }
+        CloseDecision::Refused(crate::workspace_close::Refusal::Refreshing) => {
+            app.notice.show(
+                crate::copy::WORKSPACE_CLOSE_STATE_REFRESHING,
+                tokio::time::Instant::now(),
+            );
+            return Ok(Outcome::reconcile());
+        }
+        CloseDecision::Run(effect) => effect,
     };
-    let closed_session_id = app
-        .model
-        .workspaces
-        .iter()
-        .find(|workspace| workspace.name == session)
-        .map(|workspace| workspace.session_id.clone());
-    if let Some(fallback) = &fallback {
-        client.switch_to_session(fallback).await?;
+
+    let attempt = perform_close_workspace(client, &effect).await;
+    if let Some(session_id) = attempt.confirmed_current_session_id.as_deref() {
+        // Preserve the adapter's stable fact all the way through the fresh
+        // snapshot. Converting it back to the model's cached name here would
+        // reintroduce a rename race before reconciliation begins.
+        app.reconcile_session_id = Some(session_id.to_string());
     }
-    client.kill_session(&session).await?;
-    let before_order = app.prefs.workspace_order.len();
-    app.prefs.workspace_order.retain(|name| name != &session);
-    let mut persist = app.prefs.workspace_order.len() != before_order;
-    if let Some(session_id) = closed_session_id {
-        let before_tracked = app.prefs.folder_tracked.len();
-        app.prefs.folder_tracked.retain(|id| id != &session_id);
-        persist |= app.prefs.folder_tracked.len() != before_tracked;
+    if let Err(error) = attempt.close_result {
+        super::log_err(&app.home, &error.to_string());
+        app.notice.show(
+            crate::copy::workspace_close_unconfirmed(&effect.target.name, &error),
+            tokio::time::Instant::now(),
+        );
+        return Ok(Outcome::reconcile());
     }
+
+    // `workspace_order` is still keyed by mutable names. The confirmed id may
+    // have been renamed while another session reused its old name, so deleting
+    // `target.name` here could erase the surviving session's preference. A
+    // missing name is harmless and ignored during reconciliation; only the
+    // identity-keyed tracking entry is safe to retire at this point.
+    let before_tracked = app.prefs.folder_tracked.len();
+    app.prefs
+        .folder_tracked
+        .retain(|id| id != &effect.target.session_id);
+    let persist = app.prefs.folder_tracked.len() != before_tracked;
     Ok(Outcome {
         reconcile: true,
         persist,
         ..Outcome::default()
     })
+}
+
+async fn perform_close_workspace(
+    client: &ControlClient,
+    effect: &CloseEffect,
+) -> cyclops_tmux::CloseSessionAttempt {
+    client
+        .close_session_at(
+            &effect.target.session_id,
+            effect.fallback_session_id.as_deref(),
+        )
+        .await
 }
 
 /// Reorder one sidebar workspace row. Purely local presentation order — tmux
@@ -1640,7 +1929,7 @@ mod tests {
     use std::collections::HashSet;
 
     use cyclops_testrig::{tmux_available, TmuxServer};
-    use cyclops_tmux::{ControlClient, ControlConfig, PaneDirection, SplitDirection};
+    use cyclops_tmux::{ControlClient, ControlConfig, PaneDirection};
 
     use super::*;
     use crate::bindings::default_bindings;
@@ -1706,7 +1995,7 @@ mod tests {
             files: crate::files::FileTree::new(),
             files_pinned: crate::files::FileTree::new(),
             files_view: crate::files::FilesView::default(),
-            files_probe_at: None,
+            files_refresh_at: None,
             files_root_pending: false,
             dialog: None,
             theme_restore: None,
@@ -1724,6 +2013,8 @@ mod tests {
             selection: SelectionState::default(),
             drag: None,
             notice: crate::notice::NoticeState::default(),
+            daemon_compatibility: None,
+            daemon_compatibility_notice: None,
             decoration: DecorationSnapshot::default(),
             prefs: WorkspacePrefs::default(),
             expanded_workspaces: HashSet::new(),
@@ -1732,17 +2023,19 @@ mod tests {
             sidebar_tab: SidebarTab::default(),
             record: cyclops_ui::Record::new(),
             messages_queue: cyclops_ui::HumanQueue::default(),
+            messages_snapshot_counts: None,
             messages_caller: None,
             messages_detail: None,
             messages_composer: cyclops_ui::ComposerState::default(),
             avatar_registry: cyclops_ui::AvatarRegistry::default(),
-            intake: cyclops_ui::Intake::new(),
+            stream_projection: cyclops_ui::StreamProjectionState::new(),
             stream_reconciling: false,
             cursor_style: None,
             term_size: (80, 24),
             declared_client_size: None,
             sizing: crate::app::WindowSizing::default(),
             needs_reconcile: false,
+            reconcile_session_id: None,
             needs_hydrate: false,
             paste_seq: 0,
             home,
@@ -2039,7 +2332,7 @@ mod tests {
     // -- An action that mutates structure reconciles. --
 
     #[tokio::test]
-    async fn split_calls_tmux_and_reconciles() {
+    async fn a_split_changes_tmux_and_waits_for_reconcile_to_change_the_model() {
         if !tmux_available() {
             return;
         }
@@ -2047,18 +2340,21 @@ mod tests {
         server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
         let pane = pane_ids(&server, "s")[0].clone();
         let client = rig_client(&server, "s").await;
-        let mut app = test_app(
-            one_tab_model("s", "@0", &pane, "$0"),
-            cyclops_proto::scratch::scratch_dir("exec-split-home"),
-        );
+        let model = crate::sync::fetch_workspace_model(&client, "s")
+            .await
+            .expect("initial authoritative model");
+        let home = cyclops_proto::scratch::scratch_dir("exec-split-home");
+        let mut app = test_app(model, home.clone());
+        let original_active = app.model.active_tab().active_pane.clone();
+        let original_slots = crate::layout::pane_ids_in_layout(&app.model.active_tab().layout);
 
         let outcome = execute(
             &mut app,
             &client,
-            Action::Split {
-                pane_id: pane.clone(),
-                direction: SplitDirection::Horizontal,
-            },
+            Action::Split(crate::split::Intent {
+                source_pane_id: pane.clone(),
+                placement: crate::split::Placement::Right,
+            }),
         )
         .await
         .expect("split executes");
@@ -2068,7 +2364,364 @@ mod tests {
             "a structural change must ask to reconcile"
         );
         assert_eq!(pane_ids(&server, "s").len(), 2, "tmux actually split");
+        assert_eq!(app.model.active_tab().active_pane, original_active);
+        assert_eq!(
+            crate::layout::pane_ids_in_layout(&app.model.active_tab().layout),
+            original_slots,
+            "only a tmux event or snapshot may settle the new pane locally"
+        );
+
+        let authoritative_active = active_pane_id(&server, "s");
+        let authoritative_panes = pane_ids(&server, "s");
+        crate::app::reconcile(&mut app, &client)
+            .await
+            .expect("authoritative split snapshot");
+        assert_eq!(app.model.active_tab().active_pane, authoritative_active);
+        let settled_panes = crate::layout::pane_ids_in_layout(&app.model.active_tab().layout);
+        assert_eq!(settled_panes.len(), authoritative_panes.len());
+        assert!(
+            authoritative_panes
+                .iter()
+                .all(|pane| settled_panes.contains(pane)),
+            "the reconciled model must contain every pane tmux reports"
+        );
         client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn a_second_split_waits_for_reconcile_instead_of_mutating_twice() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-split-reconcile-gate");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        let client = rig_client(&server, "s").await;
+        let model = crate::sync::fetch_workspace_model(&client, "s")
+            .await
+            .expect("initial authoritative model");
+        let pane = model.active_tab().active_pane.clone();
+        let home = scratch_home("exec-split-reconcile-gate-home");
+        let mut app = test_app(model, home.clone());
+        let intent = crate::split::Intent {
+            source_pane_id: pane,
+            placement: crate::split::Placement::Down,
+        };
+
+        let first = execute(&mut app, &client, Action::Split(intent.clone()))
+            .await
+            .expect("first split");
+        assert!(first.reconcile);
+        assert_eq!(pane_ids(&server, "s").len(), 2);
+        app.needs_reconcile = first.reconcile;
+
+        let second = execute(&mut app, &client, Action::Split(intent))
+            .await
+            .expect("stale second split is a settled refusal");
+        assert!(second.reconcile);
+        assert_eq!(
+            pane_ids(&server, "s").len(),
+            2,
+            "the second split ran before the first layout settled"
+        );
+        assert_eq!(app.notice.text(), Some(crate::copy::SPLIT_STATE_REFRESHING));
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn split_refusals_name_link_and_refresh_state_without_touching_tmux() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-split-refusals");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        let client = rig_client(&server, "s").await;
+        let model = crate::sync::fetch_workspace_model(&client, "s")
+            .await
+            .expect("initial authoritative model");
+        let pane = model.active_tab().active_pane.clone();
+        let home = scratch_home("exec-split-refusals-home");
+        let mut app = test_app(model, home.clone());
+        let intent = crate::split::Intent {
+            source_pane_id: pane,
+            placement: crate::split::Placement::Right,
+        };
+
+        client.shutdown().await;
+
+        app.link_state = LinkState::Reconnecting { attempt: 1 };
+        let reconnecting = execute(&mut app, &client, Action::Split(intent.clone()))
+            .await
+            .expect("reconnecting split is refused before IO");
+        assert!(!reconnecting.reconcile);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::SPLIT_CONTROL_RECONNECTING)
+        );
+
+        app.link_state = LinkState::ServerGone;
+        let disconnected = execute(&mut app, &client, Action::Split(intent.clone()))
+            .await
+            .expect("disconnected split is refused before IO");
+        assert!(!disconnected.reconcile);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::SPLIT_CONTROL_DISCONNECTED)
+        );
+
+        app.link_state = LinkState::Live;
+        app.needs_reconcile = true;
+        let refreshing = execute(&mut app, &client, Action::Split(intent))
+            .await
+            .expect("refreshing split is refused before IO");
+        assert!(refreshing.reconcile);
+        assert_eq!(app.notice.text(), Some(crate::copy::SPLIT_STATE_REFRESHING));
+        assert_eq!(
+            pane_ids(&server, "s").len(),
+            1,
+            "no refusal may reach the tmux adapter"
+        );
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn a_vanished_split_source_is_visible_and_never_changes_the_local_model() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-split-vanished-source");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        server.run_ok(&["split-window", "-h", "-t", "s"]);
+        let client = rig_client(&server, "s").await;
+        let model = crate::sync::fetch_workspace_model(&client, "s")
+            .await
+            .expect("initial authoritative model");
+        let pane = model.active_tab().active_pane.clone();
+        let original_slots = crate::layout::pane_ids_in_layout(&model.active_tab().layout);
+        let home = scratch_home("exec-split-vanished-source-home");
+        let mut app = test_app(model, home.clone());
+        server.run_ok(&["kill-pane", "-t", &pane]);
+
+        let outcome = execute(
+            &mut app,
+            &client,
+            Action::Split(crate::split::Intent {
+                source_pane_id: pane.clone(),
+                placement: crate::split::Placement::Right,
+            }),
+        )
+        .await
+        .expect("vanished source is an honest settled outcome");
+
+        assert!(outcome.reconcile);
+        assert_eq!(pane_ids(&server, "s").len(), 1);
+        assert_eq!(
+            crate::layout::pane_ids_in_layout(&app.model.active_tab().layout),
+            original_slots
+        );
+        let notice = app.notice.text().expect("split failure is visible");
+        assert!(notice.contains(&format!("split not confirmed for {pane}")));
+        assert!(notice.contains("refreshing workspace state"));
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn a_failed_focus_route_is_visible_and_never_mutates_the_model_optimistically() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-focus-failure");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        server.run_ok(&["split-window", "-h", "-t", "s"]);
+        let client = rig_client(&server, "s").await;
+        let model = crate::sync::fetch_workspace_model(&client, "s")
+            .await
+            .expect("initial authoritative model");
+        let original = model.active_tab().active_pane.clone();
+        let target = pane_ids(&server, "s")
+            .into_iter()
+            .find(|pane| pane != &original)
+            .expect("other pane");
+        let home = scratch_home("exec-focus-failure-home");
+        let mut app = test_app(model, home.clone());
+
+        server.run_ok(&["kill-pane", "-t", &target]);
+        let outcome = execute(
+            &mut app,
+            &client,
+            Action::Focus(crate::focus::Intent::Pane {
+                pane_id: target.clone(),
+            }),
+        )
+        .await
+        .expect("focus failure is an honest settled outcome");
+
+        assert!(
+            outcome.reconcile,
+            "a partial route may have changed host state"
+        );
+        assert_eq!(
+            app.model.active_tab().active_pane,
+            original,
+            "focus must wait for an authoritative event or snapshot"
+        );
+        let notice = app.notice.text().expect("focus failure is visible");
+        assert!(
+            notice.contains(&format!("focus not confirmed for {target}")),
+            "{notice}"
+        );
+        assert!(notice.contains("refreshing workspace state"), "{notice}");
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn a_second_focus_waits_for_reconcile_instead_of_using_the_stale_model() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-focus-reconcile-gate");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        server.run_ok(&["split-window", "-h", "-t", "s"]);
+        server.run_ok(&["split-window", "-h", "-t", "s"]);
+        let panes = pane_ids(&server, "s");
+        let (original, first_target, second_target) = (&panes[0], &panes[1], &panes[2]);
+        server.run_ok(&["select-pane", "-t", original]);
+        let client = rig_client(&server, "s").await;
+        let model = crate::sync::fetch_workspace_model(&client, "s")
+            .await
+            .expect("initial authoritative model");
+        let home = scratch_home("exec-focus-reconcile-gate-home");
+        let mut app = test_app(model, home.clone());
+
+        let first = execute(
+            &mut app,
+            &client,
+            Action::Focus(crate::focus::Intent::Pane {
+                pane_id: first_target.clone(),
+            }),
+        )
+        .await
+        .expect("first focus route");
+        assert!(first.reconcile);
+        assert_eq!(active_pane_id(&server, "s"), *first_target);
+        app.needs_reconcile = first.reconcile;
+
+        let second = execute(
+            &mut app,
+            &client,
+            Action::Focus(crate::focus::Intent::Pane {
+                pane_id: second_target.clone(),
+            }),
+        )
+        .await
+        .expect("stale second focus is a settled refusal");
+
+        assert!(second.reconcile);
+        assert_eq!(
+            active_pane_id(&server, "s"),
+            *first_target,
+            "the second effect ran before authoritative focus settled"
+        );
+        assert_eq!(
+            app.model.active_tab().active_pane,
+            *original,
+            "neither effect may settle the local model optimistically"
+        );
+        assert_eq!(app.notice.text(), Some(crate::copy::FOCUS_STATE_REFRESHING));
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn focus_waits_through_reconnect_then_settles_from_the_replacement_clients_snapshot() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-focus-reconnect");
+        server.run_ok(&["new-session", "-d", "-s", "s", "/bin/sh"]);
+        server.run_ok(&["split-window", "-h", "-t", "s"]);
+        let first = rig_client(&server, "s").await;
+        let model = crate::sync::fetch_workspace_model(&first, "s")
+            .await
+            .expect("initial authoritative model");
+        let original = model.active_tab().active_pane.clone();
+        let target = pane_ids(&server, "s")
+            .into_iter()
+            .find(|pane| pane != &original)
+            .expect("other pane");
+        let home = scratch_home("exec-focus-reconnect-home");
+        let mut app = test_app(model, home.clone());
+        let intent = crate::focus::Intent::Pane {
+            pane_id: target.clone(),
+        };
+
+        app.link_state = LinkState::Reconnecting { attempt: 1 };
+        let held = execute(&mut app, &first, Action::Focus(intent.clone()))
+            .await
+            .expect("reconnecting focus is refused without IO");
+        assert!(!held.reconcile);
+        assert_eq!(app.model.active_tab().active_pane, original);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::FOCUS_CONTROL_RECONNECTING)
+        );
+
+        app.link_state = LinkState::ServerGone;
+        let stopped = execute(&mut app, &first, Action::Focus(intent.clone()))
+            .await
+            .expect("disconnected focus is refused without IO");
+        assert!(!stopped.reconcile);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::FOCUS_CONTROL_DISCONNECTED)
+        );
+        first.shutdown().await;
+
+        let replacement = rig_client(&server, "s").await;
+        app.link_state = LinkState::Live;
+        let sent = execute(&mut app, &replacement, Action::Focus(intent))
+            .await
+            .expect("replacement client performs the exact route");
+        assert!(sent.reconcile);
+        assert_eq!(
+            app.model.active_tab().active_pane,
+            original,
+            "adapter success still does not settle local focus"
+        );
+
+        crate::app::reconcile(&mut app, &replacement)
+            .await
+            .expect("replacement snapshot");
+        assert_eq!(app.model.active_tab().active_pane, target);
+
+        replacement.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn focus_execution_uses_no_legacy_helpers_or_optimistic_assignment() {
+        let source = include_str!("exec.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        for forbidden in [
+            "async fn focus_pane(",
+            "async fn focus_pane_in_session(",
+            "async fn focus_pane_in_background_workspace(",
+            "active_pane = pane_id.to_string()",
+            "select_pane_toward(direction)",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "focus caller recovered deleted transition knowledge through {forbidden}"
+            );
+        }
     }
 
     // -- Pane swap: ids exchange slots while the layout shape stays put. --
@@ -2255,6 +2908,10 @@ mod tests {
             .expect("flip it back by chord");
         assert!(app.prefs.files_rows > 0);
         assert!(view(&app).files, "the card reads the pref, not its memory");
+        assert!(
+            app.files_refresh_at.is_some(),
+            "showing Files requests one fresh snapshot"
+        );
 
         let _ = std::fs::remove_dir_all(&home);
         client.shutdown().await;
@@ -2647,17 +3304,19 @@ mod tests {
         ]);
         let pane = pane_ids(&server, "host")[0].clone();
         let client = rig_client(&server, "host").await;
-        // "host" (the active tab's own session) sits first, with "alpha" and
-        // "beta" trailing behind it — but the active row is moved to
-        // "alpha", the middle of the three, so the splice target is neither
-        // the first nor the last row in the list.
+        // "host" is both the active tab's session and the middle sidebar row,
+        // so the snapshot stays coherent while proving that the splice target
+        // is neither the first nor the last row in the list.
         let mut model = one_tab_model("host", "@0", &pane, "$host");
-        model.workspaces.push(WorkspaceRow {
-            session_id: "$alpha".into(),
-            name: "alpha".into(),
-            tab_count: 1,
-            window_ids: Vec::new(),
-        });
+        model.workspaces.insert(
+            0,
+            WorkspaceRow {
+                session_id: "$alpha".into(),
+                name: "alpha".into(),
+                tab_count: 1,
+                window_ids: Vec::new(),
+            },
+        );
         model.workspaces.push(WorkspaceRow {
             session_id: "$beta".into(),
             name: "beta".into(),
@@ -2676,16 +3335,653 @@ mod tests {
         assert_eq!(
             app.prefs.workspace_order,
             vec![
-                "host".to_string(),
                 "alpha".to_string(),
+                "host".to_string(),
                 folder_name,
                 "beta".to_string(),
             ],
-            "the new row belongs directly after the active workspace (alpha), not at the front or back of the list"
+            "the new row belongs directly after the active workspace (host), not at the front or back of the list"
         );
 
         client.shutdown().await;
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[tokio::test]
+    async fn new_workspace_refuses_disconnected_and_refreshing_state_without_touching_tmux() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-new-workspace-refusals");
+        server.run_ok(&["new-session", "-d", "-s", "host", "/bin/sh"]);
+        let pane = pane_ids(&server, "host")[0].clone();
+        let client = rig_client(&server, "host").await;
+        let model = one_tab_model("host", "@0", &pane, "$host");
+        let mut app = test_app(model, scratch_home("exec-new-workspace-refusals-home"));
+
+        app.link_state = LinkState::Reconnecting { attempt: 1 };
+        let recovering = execute(&mut app, &client, Action::NewWorkspace)
+            .await
+            .expect("reconnecting refusal");
+        assert!(!recovering.reconcile);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::WORKSPACE_CREATE_CONTROL_RECONNECTING)
+        );
+
+        app.link_state = LinkState::ServerGone;
+        let disconnected = execute(&mut app, &client, Action::NewWorkspace)
+            .await
+            .expect("disconnected refusal");
+        assert!(!disconnected.reconcile);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::WORKSPACE_CREATE_CONTROL_DISCONNECTED)
+        );
+
+        app.link_state = LinkState::Live;
+        app.needs_reconcile = true;
+        let refreshing = execute(&mut app, &client, Action::NewWorkspace)
+            .await
+            .expect("refreshing refusal");
+        assert!(refreshing.reconcile);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::WORKSPACE_CREATE_STATE_REFRESHING)
+        );
+
+        assert_eq!(
+            String::from_utf8_lossy(
+                &server
+                    .run(&["list-sessions", "-F", "#{session_name}"])
+                    .stdout
+            )
+            .lines()
+            .collect::<Vec<_>>(),
+            vec!["host"],
+            "refusals must not create another session"
+        );
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn new_workspace_refuses_an_unreadable_focused_pane_without_falling_back() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-new-workspace-unreadable-pane");
+        server.run_ok(&["new-session", "-d", "-s", "host", "/bin/sh"]);
+        let client = rig_client(&server, "host").await;
+        let mut model = crate::sync::fetch_workspace_model(&client, "host")
+            .await
+            .expect("initial authoritative model");
+        // This is the model a just-vanished pane leaves behind: its exact id
+        // is still the focused route, but tmux cannot expand it anymore.
+        let vanished_pane = "%999999".to_string();
+        let active_tab = model.session.active_tab;
+        model.session.tabs[active_tab]
+            .active_pane
+            .clone_from(&vanished_pane);
+        assert_eq!(
+            client
+                .pane_current_path(&vanished_pane)
+                .await
+                .expect("target probe"),
+            None,
+            "tmux reports an absent pane as a blank successful expansion"
+        );
+        let home = scratch_home("exec-new-workspace-unreadable-pane-home");
+        let mut app = test_app(model, home.clone());
+
+        // The failed read must stop before `new-session`. A creation fallback
+        // here would use Cyclops' own cwd and create a session in the wrong
+        // project.
+        let outcome = execute(&mut app, &client, Action::NewWorkspace)
+            .await
+            .expect("unreadable folder probe settles visibly");
+
+        assert!(outcome.reconcile);
+        assert!(!outcome.persist, "no session identity was confirmed");
+        assert!(app.prefs.folder_tracked.is_empty());
+        assert!(app.prefs.workspace_order.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(
+                &server
+                    .run(&["list-sessions", "-F", "#{session_name}"])
+                    .stdout
+            )
+            .lines()
+            .collect::<Vec<_>>(),
+            vec!["host"],
+            "a failed folder probe must not create a session from the process cwd"
+        );
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::WORKSPACE_CREATE_ROUTE_STALE)
+        );
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn known_switch_failures_do_not_require_a_current_session_probe() {
+        assert!(!switch_result_is_uncertain(&TmuxError::Command(
+            "can't find session".into()
+        )));
+        assert!(!switch_result_is_uncertain(&TmuxError::Io(
+            std::io::Error::other("control command was not written")
+        )));
+        assert!(!switch_result_is_uncertain(&TmuxError::Busy));
+        assert!(!switch_result_is_uncertain(&TmuxError::Protocol(
+            "newline refused".into()
+        )));
+        assert!(switch_result_is_uncertain(&TmuxError::Timeout(
+            "switch-client -t '$2'".into()
+        )));
+    }
+
+    #[test]
+    fn timed_out_post_write_workspace_switch_reconciles_from_observed_tmux_state() {
+        // This is a local simulation of the adapter's post-write timeout
+        // result. It exercises recovery without adding a server-timing sleep:
+        // the only authoritative fact after that timeout is the follow-up
+        // current-session read.
+        let home = scratch_home("exec-new-workspace-timeout-recovery-home");
+        let mut app = test_app(one_tab_model("host", "@0", "%0", "$host"), home.clone());
+        let timeout = TmuxError::Timeout("switch-client -t '$created'".into());
+
+        let outcome = settle_uncertain_workspace_switch(
+            &mut app,
+            "created",
+            &timeout,
+            Ok("$actually-current".into()),
+        );
+
+        assert!(outcome.reconcile);
+        assert!(outcome.persist, "the created session identity was retained");
+        assert_eq!(
+            app.reconcile_session_id.as_deref(),
+            Some("$actually-current"),
+            "reconciliation follows tmux's observed current session, not a guessed switch target"
+        );
+        let notice = app.notice.text().expect("uncertainty is visible");
+        assert!(notice.contains("tmux reply timeout"));
+        assert!(notice.contains("tmux then reported its current session"));
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn workspace_rename_keeps_the_confirmed_identity_after_name_reuse() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-rename-workspace-identity");
+        server.run_ok(&["new-session", "-d", "-s", "target", "/bin/sh"]);
+        let client = rig_client(&server, "target").await;
+        let model = crate::sync::fetch_workspace_model(&client, "target")
+            .await
+            .expect("initial authoritative model");
+        let target_id = model
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == "target")
+            .expect("target row")
+            .session_id
+            .clone();
+        let home = scratch_home("exec-rename-workspace-identity-home");
+        let mut app = test_app(model, home.clone());
+        app.prefs.workspace_order = vec!["target".into()];
+        app.prefs.folder_tracked = vec![target_id.clone()];
+
+        let request = execute(
+            &mut app,
+            &client,
+            Action::RequestRenameWorkspace {
+                session_id: target_id.clone(),
+            },
+        )
+        .await
+        .expect("request opens a dialog");
+        assert!(!request.reconcile);
+        assert!(matches!(
+            &app.dialog,
+            Some(Dialog::RenameWorkspace { session_id, buffer })
+                if session_id == &target_id && buffer == "target"
+        ));
+
+        // The confirmed identity changes name while a new session takes its
+        // old name. A name-bearing dialog would now rename the new session.
+        server.run_ok(&["rename-session", "-t", &target_id, "moved"]);
+        server.run_ok(&["new-session", "-d", "-s", "target", "/bin/sh"]);
+
+        let outcome = execute(
+            &mut app,
+            &client,
+            Action::RenameWorkspace(crate::workspace_rename::Intent {
+                session_id: target_id.clone(),
+                name: "review".into(),
+            }),
+        )
+        .await
+        .expect("confirmed rename executes");
+
+        assert!(outcome.reconcile);
+        assert!(outcome.persist);
+        assert_eq!(
+            app.model.session.session, "target",
+            "only reconciliation may replace the cached workspace model"
+        );
+        assert_eq!(
+            app.reconcile_session_id.as_deref(),
+            Some(target_id.as_str())
+        );
+        assert_eq!(
+            app.prefs.workspace_order,
+            vec!["target".to_string()],
+            "the session that reused the old name keeps its name-keyed order entry"
+        );
+        assert!(app.prefs.folder_tracked.is_empty());
+        let sessions = server.run(&["list-sessions", "-F", "#{session_id}\t#{session_name}"]);
+        let sessions = String::from_utf8_lossy(&sessions.stdout);
+        assert!(sessions
+            .lines()
+            .any(|row| row == format!("{target_id}\treview")));
+        assert!(
+            sessions.lines().any(|row| row.ends_with("\ttarget")),
+            "the session that reused the old name must be untouched: {sessions}"
+        );
+
+        app.needs_reconcile = false;
+        crate::app::reconcile(&mut app, &client)
+            .await
+            .expect("authoritative rename settlement");
+        assert_eq!(app.model.session.session, "review");
+        assert_eq!(
+            app.model.workspaces[0].name, "target",
+            "the reused name still owns the retained name-keyed order entry"
+        );
+        assert_eq!(
+            app.model.workspaces[app.model.active_workspace].session_id,
+            target_id
+        );
+        assert_eq!(app.reconcile_session_id, None);
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_workspace_rename_is_visible_and_reconciles_the_active_identity() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-rename-workspace-failure");
+        server.run_ok(&["new-session", "-d", "-s", "host", "/bin/sh"]);
+        server.run_ok(&["new-session", "-d", "-s", "target", "/bin/sh"]);
+        let client = rig_client(&server, "host").await;
+        let model = crate::sync::fetch_workspace_model(&client, "host")
+            .await
+            .expect("initial authoritative model");
+        let host_id = model
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == "host")
+            .expect("host row")
+            .session_id
+            .clone();
+        let target_id = model
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == "target")
+            .expect("target row")
+            .session_id
+            .clone();
+        let home = scratch_home("exec-rename-workspace-failure-home");
+        let mut app = test_app(model, home.clone());
+        app.prefs.workspace_order = vec!["host".into(), "target".into()];
+        app.prefs.folder_tracked = vec![target_id.clone()];
+        app.dialog = Some(Dialog::RenameWorkspace {
+            session_id: target_id.clone(),
+            buffer: "review".into(),
+        });
+        server.run_ok(&["kill-session", "-t", &target_id]);
+
+        let outcome = execute(
+            &mut app,
+            &client,
+            Action::RenameWorkspace(crate::workspace_rename::Intent {
+                session_id: target_id.clone(),
+                name: "review".into(),
+            }),
+        )
+        .await
+        .expect("failed rename settles visibly");
+
+        assert!(outcome.reconcile);
+        assert!(!outcome.persist);
+        assert!(app.dialog.is_none());
+        assert_eq!(app.reconcile_session_id.as_deref(), Some(host_id.as_str()));
+        assert_eq!(
+            app.prefs.workspace_order,
+            vec!["host".to_string(), "target".to_string()]
+        );
+        assert_eq!(app.prefs.folder_tracked, vec![target_id.clone()]);
+        let notice = app.notice.text().expect("failure is visible");
+        assert!(notice.contains("rename not confirmed for session target"));
+        assert!(notice.contains("refreshing workspace state"));
+
+        app.needs_reconcile = false;
+        crate::app::reconcile(&mut app, &client)
+            .await
+            .expect("authoritative failure settlement");
+        assert_eq!(app.model.session.session, "host");
+        assert!(
+            !app.model
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.session_id == target_id),
+            "the authoritative snapshot removes the vanished target"
+        );
+        assert_eq!(app.reconcile_session_id, None);
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn confirmed_workspace_close_changes_tmux_but_waits_for_authoritative_model_settlement() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-close-workspace");
+        server.run_ok(&["new-session", "-d", "-s", "target", "/bin/sh"]);
+        server.run_ok(&["new-session", "-d", "-s", "fallback", "/bin/sh"]);
+        let client = rig_client(&server, "target").await;
+        let model = crate::sync::fetch_workspace_model(&client, "target")
+            .await
+            .expect("initial authoritative model");
+        let target_id = model
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == "target")
+            .expect("target row")
+            .session_id
+            .clone();
+        let fallback_id = model
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == "fallback")
+            .expect("fallback row")
+            .session_id
+            .clone();
+        let home = scratch_home("exec-close-workspace-home");
+        let mut app = test_app(model, home.clone());
+        app.prefs.workspace_order = vec!["target".into(), "fallback".into()];
+        app.prefs.folder_tracked = vec![target_id.clone(), fallback_id.clone()];
+        server.run_ok(&["rename-session", "-t", &fallback_id, "renamed-fallback"]);
+
+        let outcome = execute(
+            &mut app,
+            &client,
+            Action::CloseWorkspace(crate::workspace_close::Intent {
+                session_id: target_id.clone(),
+            }),
+        )
+        .await
+        .expect("confirmed close executes");
+
+        assert!(outcome.reconcile);
+        assert!(outcome.persist);
+        assert!(
+            app.model
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.session_id == target_id),
+            "only reconciliation may remove the closed workspace locally"
+        );
+        assert_eq!(
+            app.model.session.session, "target",
+            "no cached name is installed before the authoritative snapshot"
+        );
+        assert_eq!(
+            app.reconcile_session_id.as_deref(),
+            Some(fallback_id.as_str()),
+            "the confirmed fallback id must survive until reconciliation"
+        );
+        assert_eq!(
+            app.prefs.workspace_order,
+            vec!["target".to_string(), "fallback".to_string()],
+            "a name-keyed preference cannot be retired from an id-only confirmation"
+        );
+        assert_eq!(app.prefs.folder_tracked, vec![fallback_id.clone()]);
+        let sessions = server.run(&["list-sessions", "-F", "#{session_id}"]);
+        let sessions = String::from_utf8_lossy(&sessions.stdout);
+        assert!(!sessions.lines().any(|id| id == target_id));
+        assert!(sessions.lines().any(|id| id == fallback_id));
+        let attached = server.run(&["list-clients", "-F", "#{client_session}"]);
+        assert_eq!(
+            String::from_utf8_lossy(&attached.stdout).trim(),
+            "renamed-fallback"
+        );
+
+        app.needs_reconcile = false;
+        crate::app::reconcile(&mut app, &client)
+            .await
+            .expect("authoritative close settlement");
+        assert_eq!(app.model.session.session, "renamed-fallback");
+        assert_eq!(app.reconcile_session_id, None);
+        assert!(
+            !app.model
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.session_id == target_id),
+            "the authoritative snapshot removes the closed identity"
+        );
+        assert_eq!(
+            app.model.workspaces[app.model.active_workspace].session_id,
+            fallback_id
+        );
+
+        let second = execute(
+            &mut app,
+            &client,
+            Action::CloseWorkspace(crate::workspace_close::Intent {
+                session_id: target_id.clone(),
+            }),
+        )
+        .await
+        .expect("a stale second confirmation is refused");
+        assert!(second.reconcile);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::WORKSPACE_CLOSE_ROUTE_STALE)
+        );
+        let sessions = server.run(&["list-sessions", "-F", "#{session_id}"]);
+        assert!(
+            String::from_utf8_lossy(&sessions.stdout)
+                .lines()
+                .any(|id| id == fallback_id),
+            "the stale second action must not close the remaining workspace"
+        );
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn failed_workspace_close_is_visible_reconciled_and_keeps_preferences() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-close-workspace-failure");
+        server.run_ok(&["new-session", "-d", "-s", "target", "/bin/sh"]);
+        server.run_ok(&["new-session", "-d", "-s", "fallback", "/bin/sh"]);
+        // Keep the control connection on the surviving session while the
+        // application snapshot still represents target as active. This is
+        // the state after another client wins the close race, and lets the
+        // adapter confirm its fallback command before its target command
+        // reports the stale identity.
+        let client = rig_client(&server, "fallback").await;
+        let model = crate::sync::fetch_workspace_model(&client, "target")
+            .await
+            .expect("initial authoritative model");
+        let target_id = model
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == "target")
+            .expect("target row")
+            .session_id
+            .clone();
+        let fallback_id = model
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == "fallback")
+            .expect("fallback row")
+            .session_id
+            .clone();
+        let home = scratch_home("exec-close-workspace-failure-home");
+        let mut app = test_app(model, home.clone());
+        app.prefs.workspace_order = vec!["target".into(), "fallback".into()];
+        app.prefs.folder_tracked = vec![target_id.clone(), fallback_id.clone()];
+        app.dialog = Some(Dialog::ConfirmCloseWorkspace {
+            session_id: target_id.clone(),
+        });
+        // Simulate the target disappearing after confirmation. The adapter's
+        // fallback switch still lands, then its close command reports that
+        // the target is already gone.
+        server.run_ok(&["kill-session", "-t", &target_id]);
+
+        let outcome = execute(
+            &mut app,
+            &client,
+            Action::CloseWorkspace(crate::workspace_close::Intent {
+                session_id: target_id.clone(),
+            }),
+        )
+        .await
+        .expect("partial failure is a visible settled result");
+
+        assert!(outcome.reconcile, "host state may have changed");
+        assert!(!outcome.persist, "an unconfirmed close removes no prefs");
+        assert!(app.dialog.is_none(), "the confirmation was consumed");
+        assert_eq!(
+            app.prefs.workspace_order,
+            vec!["target".to_string(), "fallback".to_string()]
+        );
+        assert_eq!(
+            app.prefs.folder_tracked,
+            vec![target_id.clone(), fallback_id.clone()]
+        );
+        let notice = app.notice.text().expect("failure is visible");
+        assert!(notice.contains("close not confirmed for workspace target"));
+        assert!(notice.contains("refreshing workspace state"));
+        assert_eq!(
+            app.model.session.session, "target",
+            "partial failure leaves the cached presentation model untouched"
+        );
+        assert_eq!(
+            app.reconcile_session_id.as_deref(),
+            Some(fallback_id.as_str()),
+            "a landed switch still supplies the exact repair target"
+        );
+        let attached = server.run(&["list-clients", "-F", "#{client_session}"]);
+        assert_eq!(String::from_utf8_lossy(&attached.stdout).trim(), "fallback");
+        let sessions = server.run(&["list-sessions", "-F", "#{session_id}"]);
+        assert!(
+            !String::from_utf8_lossy(&sessions.stdout)
+                .lines()
+                .any(|id| id == target_id),
+            "the simulated race removes the target before the adapter close"
+        );
+        assert!(String::from_utf8_lossy(&sessions.stdout)
+            .lines()
+            .any(|id| id == fallback_id));
+
+        app.needs_reconcile = false;
+        crate::app::reconcile(&mut app, &client)
+            .await
+            .expect("authoritative partial-failure settlement");
+        assert_eq!(app.model.session.session, "fallback");
+        assert_eq!(app.reconcile_session_id, None);
+        assert_eq!(app.model.workspaces.len(), 1);
+        assert_eq!(app.model.workspaces[0].session_id, fallback_id);
+        assert_eq!(app.prefs.folder_tracked, vec![target_id, fallback_id]);
+
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn workspace_close_refuses_disconnected_and_refreshing_state_without_touching_tmux() {
+        if !tmux_available() {
+            return;
+        }
+        let server = TmuxServer::new("exec-close-workspace-refusals");
+        server.run_ok(&["new-session", "-d", "-s", "target", "/bin/sh"]);
+        server.run_ok(&["new-session", "-d", "-s", "fallback", "/bin/sh"]);
+        let client = rig_client(&server, "target").await;
+        let model = crate::sync::fetch_workspace_model(&client, "target")
+            .await
+            .expect("initial authoritative model");
+        let target_id = model
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name == "target")
+            .expect("target row")
+            .session_id
+            .clone();
+        let home = scratch_home("exec-close-workspace-refusals-home");
+        let mut app = test_app(model, home.clone());
+        let intent = crate::workspace_close::Intent {
+            session_id: target_id.clone(),
+        };
+        app.dialog = Some(Dialog::ConfirmCloseWorkspace {
+            session_id: target_id.clone(),
+        });
+
+        app.link_state = LinkState::Reconnecting { attempt: 1 };
+        let recovering = execute(&mut app, &client, Action::CloseWorkspace(intent.clone()))
+            .await
+            .expect("reconnecting refusal");
+        assert!(!recovering.reconcile);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::WORKSPACE_CLOSE_CONTROL_RECONNECTING)
+        );
+        assert!(app.dialog.is_none(), "the confirmation was consumed");
+
+        app.link_state = LinkState::ServerGone;
+        let disconnected = execute(&mut app, &client, Action::CloseWorkspace(intent.clone()))
+            .await
+            .expect("disconnected refusal");
+        assert!(!disconnected.reconcile);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::WORKSPACE_CLOSE_CONTROL_DISCONNECTED)
+        );
+
+        app.link_state = LinkState::Live;
+        app.needs_reconcile = true;
+        let refreshing = execute(&mut app, &client, Action::CloseWorkspace(intent))
+            .await
+            .expect("refreshing refusal");
+        assert!(refreshing.reconcile);
+        assert_eq!(
+            app.notice.text(),
+            Some(crate::copy::WORKSPACE_CLOSE_STATE_REFRESHING)
+        );
+
+        let sessions = server.run(&["list-sessions", "-F", "#{session_id}"]);
+        assert!(
+            String::from_utf8_lossy(&sessions.stdout)
+                .lines()
+                .any(|id| id == target_id),
+            "no refusal may reach the adapter"
+        );
+        client.shutdown().await;
+        let _ = std::fs::remove_dir_all(home);
     }
 
     // -- The sidebar: collapse, reopen, and which tab the stream chord

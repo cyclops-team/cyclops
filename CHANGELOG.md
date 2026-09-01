@@ -5,6 +5,10 @@ versions are unreleased until admin cuts a tag.
 
 ## [Unreleased]
 
+The selected prerelease identity for the audited Rust beta candidate is
+`0.1.0-beta` / `v0.1.0-beta`. The historical `v0.2.0-beta` tag remains attached
+to older source. No new tag or GitHub Release has been created.
+
 ### Fixed
 
 - A clean idle Cursor Agent composer could never prove itself write-safe:
@@ -21,25 +25,22 @@ versions are unreleased until admin cuts a tag.
   `cursor_clean_idle_composer_esc.txt` (cursor-agent 2026.08.25-3e8eec8).
 - A wake whose composer kept reading `ambiguous` on an idle pane waited
   in memory as "checking readiness" indefinitely, invisible to `cyclops
-  status` and to the reopen scheduler: the durable
-  `composer_semantic_missing` block only covered rules with NO composer
-  classification, not rules that answer "ambiguous" on every frame. The
-  gate now holds such a wake under its own named cause and, when the
-  ambiguity outlives a settle window (`ambiguous_composer_settle_ms`,
-  default 10s, with a timed wake so a silent pane still settles), records
-  a durable `composer_semantic_ambiguous` pre-write block — named,
-  operator-visible, withdrawable. Later route evidence whose verdict is
-  actually write-ready reopens the wake once; mid-turn ambiguity never
-  escalates, because working frames never reach the idle arm.
-- Detaching or quitting the workspace left the theme's ground on the
-  shell underneath on terminals that honor an OSC 11 background *set* but
-  ignore the OSC 110/111 *reset* — Apple Terminal is the common one, where
-  the only reset the workspace ever sent was the one that terminal drops.
-  The workspace now asks the terminal for its own default colors at
-  startup (OSC 10/11 query, fenced by a DA1 request) and hands exactly
-  those back on exit and on focus loss, which is a plain set every such
-  terminal obeys. Terminals that do not answer the query fall back to the
-  OSC 110/111 reset as before.
+  status` and to the reopen scheduler. The gate now gives continuous idle
+  ambiguity one configurable, one-shot grace
+  (`ambiguous_composer_settle_ms`, default 10 seconds), then records an
+  operator-visible, withdrawable pre-write block. The established
+  `write_readiness_changed` journal cause remains compatible with existing
+  readers; the optional observation carries the exact
+  `composer_semantic_ambiguous` reason. Later complete, write-ready route
+  evidence can reopen the same wake once. Mid-turn ambiguity never
+  escalates because working frames do not reach the idle arm.
+- Detaching or quitting the workspace could leave the theme's ground on the
+  shell underneath when a terminal accepted an OSC 11 background *set* but
+  ignored its reset. Host-palette theming now requires a complete, read-only
+  `[workspace]` `terminal_default_fg` and `terminal_default_bg` pair. Cyclops
+  applies the theme while focused and restores that exact pair through OSC
+  10/11 on exit and focus loss. Without a valid pair it leaves the host
+  palette untouched, and it never reads terminal input to discover colors.
 - The Messages pane's current-session view told sessions apart by pane id
   alone, so after a tmux server restart the new `main` showed the messages
   of the `main` that died before it: tmux hands `%0`, `%1`, … out again,
@@ -52,7 +53,7 @@ versions are unreleased until admin cuts a tag.
   from another terminal produces once it takes over `main` and reopens the
   last-active session, answered every `%layout-change` with another
   `resize-window` for every window it owned. tmux answers each of those
-  with a `%layout-change` whether or not the size changed (F79), so the
+  with a `%layout-change` whether or not the size changed (F82), so the
   canvas jumped continuously with the workspace and the tmux server each
   on half a core. The background session's window was being read as
   "not at its target" because it has no tab in the displayed model.

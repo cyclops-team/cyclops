@@ -645,7 +645,7 @@
             </details>
             <details class="sect">
               <summary><span class="sect-chev"></span><span class="sect-title mono">cyclops-ledger</span><span class="sect-trail">the append-only record</span></summary>
-              <div class="sect-body">The mechanics of the on-disk record: append with fsync, seal torn lines after a crash, keep sequence numbers monotonic across restarts. What a line means is cyclops-proto's business; this crate only owns how lines get on and off disk. Deliberately no index — a 10,000-line scan measures ~7ms.</div>
+              <div class="sect-body">The mechanics of the on-disk record: append with fsync, recover only a final unacknowledged torn tail after a crash, and keep sequence numbers monotonic across restarts. Lenient replay seals that tail and keeps it when valid; strict workspace replay discards only that tail. What a line means is cyclops-proto's business; this crate only owns how lines get on and off disk. Deliberately no index — a 10,000-line scan measures ~7ms.</div>
             </details>
             <details class="sect">
               <summary><span class="sect-chev"></span><span class="sect-title mono">cyclops-manifest</span><span class="sect-trail">a manifest declares what a vendor CLI looks like</span></summary>
@@ -697,15 +697,15 @@
       </details>
       <details class="sect">
         <summary><span class="sect-chev"></span><span class="sect-title mono">skills/</span><span class="sect-trail">teaching your agents to use Cyclops</span></summary>
-        <div class="sect-body">skills/cyclops/SKILL.md is one file that teaches a coding agent the send/wait/reply verbs and the safety rules. Nothing installs it automatically: copy it where your agent looks for instructions (for Claude Code, ~/.claude/skills/cyclops/SKILL.md) — or skip it, since every command explains itself with --help and every delivered message carries its own reply instructions.</div>
+        <div class="sect-body">skills/cyclops/SKILL.md is one file that teaches a coding agent the send/wait/reply verbs and the safety rules. During an install, Cyclops's consent-backed <code>--wire-hooks</code> setup may copy it into an existing supported private skill directory only when that exact file is absent. It never creates skill directories or overwrites a current, older, or operator-edited file. You can also copy it manually; every command explains itself with <code>--help</code>, and every delivered message carries its own reply instructions.</div>
       </details>
       <details class="sect">
-        <summary><span class="sect-chev"></span><span class="sect-title mono">docs/</span><span class="sect-trail">22 pages in 3 sections; start at development/HANDOFF.md</span></summary>
-        <div class="sect-body">Split by audience: docs/development/ (7 pages: HANDOFF, ARCHITECTURE, DELIVERY, INVARIANTS, GOALS, STYLE, V5), docs/guides/ (11 how-to pages: QUICKSTART, install, send, workspaces...), docs/reference/ (MANIFESTS, PROTOCOL, hooks, BENCHMARKS), plus docs/public/, the rendered public docs site. The developer front door is docs/development/HANDOFF.md. Unusual and important: docs are CI-enforced. Quoted terminal output must match what the binaries actually print (tests/e2e/parity-check.sh) and every quoted file path must exist (scripts/check-doc-paths.py). Treat doc edits like code edits.</div>
+        <summary><span class="sect-chev"></span><span class="sect-title mono">docs/</span><span class="sect-trail">guides, reference, and engineering contracts; start at development/HANDOFF.md</span></summary>
+        <div class="sect-body">Split by audience: docs/development/ holds current engineering contracts, approved charters, and acceptance records; docs/guides/ holds task-focused operating instructions; docs/reference/ holds protocol, manifests, hooks, and measured performance boundaries; docs/public/ powers the rendered public docs site. The developer front door is docs/development/HANDOFF.md. Unusual and important: docs are CI-enforced. Quoted terminal output must match what the binaries actually print (tests/e2e/parity-check.sh) and every quoted file path must exist (scripts/check-doc-paths.py). Treat doc edits like code edits.</div>
       </details>
       <details class="sect">
         <summary><span class="sect-chev"></span><span class="sect-title mono">demos/</span><span class="sect-trail">runnable proofs</span></summary>
-        <div class="sect-body">End-to-end scripts that run the real binaries on throwaway tmux servers and touch nothing of yours: m0-status through m5-theme (send, a two-agent conversation, the stream, naming, workspace save/destroy/restore, live theme switching), plus per-step launch/record scripts. The self-contained delivery demo is m1-send.sh. House rule: ship a demo with anything a user will do end to end — on this codebase demos have caught defects four times that reading the code did not.</div>
+        <div class="sect-body">End-to-end scripts that run the real binaries on throwaway tmux servers and touch nothing of yours: daemon status, durable mailbox acceptance without either UI, pane naming, workspace save/destroy/restore, and live theme switching. The maintained messaging journey is m1-send.sh; the complete agent-to-agent claim and reply journey is enforced by tests/e2e/parity-check.sh. House rule: ship a demo with anything a user will do end to end — on this codebase demos have caught defects four times that reading the code did not.</div>
       </details>
       <details class="sect">
         <summary><span class="sect-chev"></span><span class="sect-title mono">scripts/</span><span class="sect-trail">installer + doc gate</span></summary>
@@ -1165,7 +1165,7 @@
         <div class="card-head">Update your install</div>
         <div class="card-body vgap">
           <p class="small secondary">
-            Pre-release 0.1.0, no release channel yet — updating is one verb. It says which build you're
+            Pre-release v0.1.0-beta — updating is one verb. It says which build you're
             running, checks the source for a newer commit, reruns the installer from a fresh clone,
             refreshes any agent hooks it installed (they embed the binary's path), and prints the
             restart steps:

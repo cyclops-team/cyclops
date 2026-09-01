@@ -111,19 +111,23 @@ From a clone, use `./scripts/install.sh --uninstall`.
 ### With cargo instead
 
 ```bash
-cargo install --path src/cyclops
-cargo install --path src/cyclopsd
+cargo install --locked --path src/cyclops
+cargo install --locked --path src/cyclopsd
 ```
 
+Run both commands from the same checkout. `--locked` keeps Cargo from silently
+replacing that checkout's resolved dependency set while it builds either binary.
+
 Both go to `~/.cargo/bin`, and cargo warns when that is not on your PATH.
-`cargo install --root ~/.local --path src/cyclops` writes
+`cargo install --locked --root ~/.local --path src/cyclops` writes
 `~/.local/bin/cyclops` instead; the root is the prefix, not the directory,
 and cargo appends `bin`.
 
 Installing this way does no setup. Run `cyclops start --setup-only --wire-hooks`
 to write the config and manifests, merge Cyclops-owned hook entries, and seed
-the agent skill for installed supported consumers. Omit `--wire-hooks` when you
-want config and manifests only, then wire each agent explicitly.
+the agent skill for installed supported consumers when their private canonical
+skill parent already exists. Omit `--wire-hooks` when you want config and
+manifests only, then wire each agent explicitly.
 
 To build without installing, `cargo build --release` puts both in
 `target/release/`.
@@ -166,8 +170,9 @@ has run either one is set up.
 The installer passes one more flag, `--wire-hooks`, which extends setup
 into the agent CLIs installed on the machine. It safely merges Cyclops hooks
 into each installed vendor's default configuration, including
-`~/.claude/settings.json` for normal direct Claude launches, and it places the Cyclops skill at
-the canonical destination for each installed consumer:
+`~/.claude/settings.json` for normal direct Claude launches. It may add the
+final Cyclops skill file at the canonical destination for each installed
+consumer:
 
 - Claude Code: `~/.claude/skills/cyclops/SKILL.md`
 - Codex and Cursor: `~/.agents/skills/cyclops/SKILL.md`
@@ -178,16 +183,20 @@ Codex and Cursor share one copy. Codex is installed when `$CODEX_HOME`, or
 The shared destination alone does not trigger either consumer. Claude Code
 requires `~/.claude`, and Antigravity CLI requires
 `~/.gemini/antigravity-cli`. Setup creates no home for an absent
-consumer and never seeds duplicate skill locations. It keeps current
-and edited copies unchanged, and upgrades an unedited copy from a known
-Cyclops release. The entire wiring step is skipped when
+consumer and never seeds duplicate skill locations. Skill seeding never
+creates `.agents`, `skills`, or `cyclops` directories: it creates only a
+missing final `SKILL.md` below an existing private canonical parent. A missing
+or non-private parent is reported for manual review. It keeps current and
+edited copies unchanged. An existing skill that matches a known older Cyclops
+release is also preserved for manual review. The entire wiring step is skipped when
 `CYCLOPS_NO_VENDOR_HOOKS` is set.
 
 That consent outlives the run that gave it. `--wire-hooks` records it at
 `~/.cyclops/vendor-wiring-consented`, and every later `cyclops` or
 `cyclops start` finishes the wiring for an agent CLI that was not there
-yet. Install Cyclops before an agent CLI and its skill still lands on the
-first start after that CLI arrives, with a line saying what was placed.
+yet. Once that CLI has created its private canonical skill parent, the first
+later start can add the final skill file and says what was placed. Otherwise
+the plan and setup report manual review; Cyclops does not create the parent.
 A boot that finds nothing new writes nothing and says nothing.
 Delete the marker file to withdraw the consent; `CYCLOPS_NO_VENDOR_HOOKS`
 declines the step for one run without deleting anything.
@@ -209,7 +218,28 @@ transport from the same exact-skill check the daemon uses: `doorbell` or
 claim contract and therefore selects direct fallback. It exits 0 when setup is
 complete for the installed consumers and 1 when setup needs repair. Add
 `--json` for a stable machine-readable report. The check reads setup state
-only. Use `cyclops start --setup-only --wire-hooks` to install or repair it.
+only. The standard setup workflow installs or repairs it.
+
+Review the managed setup seed decisions:
+
+```
+$ cyclops setup plan
+```
+
+The plan is a read-only, body-free report. `--json` gives the same rows for a
+script. Each row names the exact manifest or installed-consumer skill target,
+its observed state, and the managed-asset decision: create a missing final
+file below an accepted private parent, keep the current seed, preserve an
+outdated released seed, preserve an operator edit, or leave an unreadable,
+unproven, or unsafe target for manual review. A shared
+`~/.agents/skills/cyclops/SKILL.md` alone does not make Codex or Cursor look
+installed, and the report never creates a vendor directory. During setup,
+Cyclops never creates the shared `.agents` root or any consumer skill-tree
+directory; a missing or unsafe parent remains manual review.
+
+This is intentionally not a generic setup dry run. It does not plan or change
+config, hook wiring, themes, sounds, binaries, updates, cleanup, or uninstall.
+This first slice has no apply capability yet.
 
 The long way, by hand. Create `~/.cyclops/config.toml`:
 
@@ -244,12 +274,10 @@ find, so a new one lands on your next start and says so:
   wrote 1 detection manifest to /Users/you/.cyclops/manifests
 ```
 
-A file you edited is never rewritten, so your measurements survive every
-run. A copy still byte-identical to a version Cyclops shipped is a seed
-nobody touched, and a newer shipped version replaces it on the next run,
-so an upgrade reaches an untouched home without a reinstall. Themes
-follow the same rule; the shipped sounds are written once and then left
-alone.
+A file already present is never rewritten, so your measurements survive every
+run. A known old Cyclops seed is reported as outdated and stays in place for
+manual review. Themes follow their own update rule; the shipped sounds are
+written once and then left alone.
 
 Four optional keys. The first two change how the daemon talks to tmux, so
 add them only when you mean to. `theme` changes what every surface prints,
@@ -318,12 +346,16 @@ restart or duplicate timer from writing more than one reminder.
 exact notification that crossed the paste boundary and then reached
 `verify_failed`. It never pastes a second notification. After
 `force_notification_submit_delay_ms`, the daemon revalidates the exact pending
-attempt, bound process generation, manifest, pane, and tmux mode, records a
-durable forced resolution intent, and presses the manifest submit key at most
-once. Claim, withdrawal, replacement, settlement, or switching the setting off
-makes the timer obsolete. This deliberately bypasses composer-content proof,
-so 0 milliseconds may submit human input that appeared after the paste. The
-workspace Settings card exposes the same choice as a 0 to 20 second slider.
+attempt, bound process generation, manifest, pane, and tmux mode, checks the
+setting one final time, records durable intent, and reserves one key under the
+same lock as `inbox.claim`. It then presses the manifest submit key at most
+once. Claim, withdrawal, replacement, or settlement that occurs before the
+reservation makes the timer obsolete. A successful disable ordered before the
+reservation also stops the timer; a later claim remains a normal retrieval,
+and a later setting change does not retract the reserved key. This deliberately
+bypasses composer-content proof, so 0 milliseconds may submit human input that
+appeared after the paste. The workspace Settings card exposes the same choice
+as a 0 to 20 second slider.
 
 Unknown keys warn and are ignored. The file is data; nothing in it executes.
 
@@ -457,6 +489,7 @@ cargo install cargo-nextest --locked --version 0.9.100
 ```
 
 ```bash
+cargo build -p cyclops -p cyclopsd --bins
 cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
 cargo test -p cyclopsd --all-targets --no-fail-fast
 cargo test --workspace --doc
@@ -478,7 +511,7 @@ tested repository installer.
 so one run reports every failing test.
 
 Tests need tmux on PATH; the ones that need it skip cleanly without it.
-Every test runs against its own tmux server (`-L cyc-<tag>-<pid>`), never
+Every test runs against its own tmux server (`-L cyc-<tag>-<pid>-<sequence>`), never
 yours.
 
 Throwaway test state goes under a short scratch root, because a Unix
@@ -488,6 +521,7 @@ elsewhere. Move it with `CYCLOPS_TEST_TMP`:
 
 ```bash
 mkdir -p /private/var/tmp/cyc-relocated
+cargo build -p cyclops -p cyclopsd --bins
 CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated cargo nextest run --workspace -E 'not package(cyclopsd)' --no-fail-fast
 CYCLOPS_TEST_TMP=/private/var/tmp/cyc-relocated cargo test -p cyclopsd --all-targets --no-fail-fast
 ```
@@ -509,6 +543,11 @@ private state snapshot whose content-free identity is stored in the selection
 record. `current replay unproven` is still expected during ordinary health
 inspection. Cyclops proves the current journals again immediately before an
 operator requests rollback.
+
+When health finds a distinct validated rollback candidate, it names the
+read-only next step `cyclops update --rollback`. Health does not run the
+command. The command revalidates current journals before changing the selector,
+so a candidate remains distinct from a rollback already proven safe.
 
 ```bash
 cyclops health
@@ -545,7 +584,7 @@ stops right there and exits 0:
 
 ```
 $ cyclops update
-cyclops 0.1.0 (1e16081)
+cyclops 0.1.0-beta (1e16081)
   source https://github.com/cyclops-team/cyclops.git at main
 ✔ already the latest main · nothing to update
 ```
@@ -555,9 +594,9 @@ pair. The candidate CLI and daemon must report one build, then the candidate
 daemon must replay a private copy of the current journals before either
 installed selector changes. A running daemon is authenticated, quiesced, and
 stopped before that copy is taken, then restarted on the old pair if replay
-fails. Durable records and operator-edited setup files in your home are
-preserved. Known unedited shipped themes, manifests, hook artifacts, and skills
-may advance with the installed release.
+fails. Durable records and existing setup files in your home are preserved.
+Known unedited shipped themes and hook artifacts may advance with the installed
+release; manifests and skills remain in place and can report outdated state.
 
 The selected-pair record stores a content-free replay attestation bound to the
 exact client and daemon hashes plus the private snapshot identity. Older
@@ -569,7 +608,7 @@ journal replay performed by rollback.
   activated matched pair 1e16081
   no daemon was running; the selected pair remains stopped
 
-✔ updated · 0.1.0 (0876ed7) → 0.1.0 (1e16081)
+✔ updated · 0.1.0-beta (0876ed7) → 0.1.0-beta (1e16081)
 
   an open workspace stays on the old build until you detach (ctrl+b d) and run cyclops again
 ```
@@ -579,6 +618,12 @@ the freshly installed one answering `--version` for itself. Each release is a
 directory containing the matched pair. The public commands pass through one
 `active` selector, so there is no moment where a new CLI names an old daemon.
 The previous matched pair remains as `known-good`.
+
+The number before the parentheses is the Cargo workspace version. The value in
+parentheses is the exact source build. Cyclops compares the complete pair
+identity during staging and checks the candidate daemon's greeting before
+activation. These internal facts do not choose a public beta tag; naming and
+publishing that tag remains a separate release gate.
 
 The pair-store lease admits one updater. A concurrent updater exits before it
 can stage, select, or repair files. If an updater process stops at a filesystem
@@ -594,6 +639,11 @@ Pair activation is the update commit point. If later home setup needs repair,
 the matched pair remains active and the installer prints the exact
 `cyclops start --setup-only --wire-hooks` repair command. It does not report a
 generic update failure that implies activation never happened.
+
+If a selector rename is visible but its directory sync cannot be confirmed,
+update names that state exactly. It does not start a daemon or delete the
+candidate until it has confirmed restoration of the prior selector; a later
+update repairs only validated residue.
 
 Before changing `active`, update asks the authenticated daemon to quiesce. It
 stops only when the daemon's PID, kernel start value, boot id, and socket answer
@@ -636,8 +686,8 @@ Reopening with `cyclops` (or any `cyclops start`) repairs prepared hook
 artifacts under `~/.cyclops/hooks/` when their receipts prove they are still
 unedited. A file you edited, or one with no receipt, is named and left alone.
 The installer and updater run setup with vendor-wiring consent: Cyclops-owned
-hook entries in installed agent configs and known unedited Cyclops skills may
-be refreshed, while unrelated vendor entries stay unchanged. Set
+hook entries in installed agent configs may be refreshed, while existing
+Cyclops skills and unrelated vendor entries stay unchanged. Set
 `CYCLOPS_NO_VENDOR_HOOKS=1` to skip that wiring for one run.
 
 `CYCLOPS_REPO` and `CYCLOPS_REF` pick the source, exactly as they do for
@@ -657,21 +707,56 @@ and refuses unknown, linked, or ownership-changing entries instead of deleting
 an unproven tree. Both public names are removed only from one prefix, selected
 by `--prefix` or by the `cyclops` command on `PATH`. It never resolves a
 `cyclopsd` from another prefix. If only `cyclopsd` can be found, uninstall
-refuses and asks for an explicit prefix:
+refuses and asks for an explicit prefix.
+
+For a state-preserving uninstall, run:
 
 ```bash
 curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
 ```
 
-If you also want to delete all Cyclops configuration and records, stop the
-daemon and copy out any history you want to keep before removing
-`~/.cyclops`. Canonical mailbox journals are under
-`~/.cyclops/workspaces/<workspace-id>/messages.ndjson`; session state and
-legacy direct-delivery records are under `~/.cyclops/ledger/`. Copy the whole
-Cyclops home if you need both. A complete uninstall must also remove only the
+Do not run that command first when you intend to remove the complete state
+home: it removes the `cyclops` command needed for the state-home journey below.
+
+If you want to remove the retained journals but keep the rest of Cyclops
+state, start with the previewed
+[`cyclops data forget --all`](data.md#forget-the-retained-journal-scope)
+journey. Stop the daemon before its preview and keep it stopped through the
+exact confirmation. It removes only the previewed workspace and session NDJSON
+journals, and deliberately leaves configuration and vendor wiring alone.
+Export first if you might need the history.
+
+If you also want to remove all configuration and records in the current
+Cyclops state home, stop the daemon and copy out any history you want to keep.
+Then make the body-free preview and run only its exact confirmation:
+
+```bash
+cyclops daemon stop
+cyclops data export --to <new-directory>
+cyclops remove --all
+cyclops remove --all --confirm <token-from-preview>
+```
+
+This command removes only the selected current state home. It leaves installed
+binaries, the installer-owned PATH block, vendor configuration, and skill
+files in agent-owned directories, including a Cyclops-seeded copy, alone. For
+the exact scope and interrupted-removal recovery boundary, follow the
+[`cyclops remove --all` guide](data.md#remove-the-complete-current-state-home).
+
+After that state-home command reports its result, run the managed uninstall:
+
+```bash
+curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
+```
+
+The remaining complete-uninstall work is separately owned. Remove only the
 Cyclops command hooks from installed vendor configuration. Check
 `~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.agents/hooks.json`, and
 `~/.cursor/hooks.json` where those files exist. Delete entries whose command
 invokes a `cyclops` binary followed by `hook <Event>`, while preserving every
 unrelated key, hook, and setting. Removing the binaries before these entries
 leaves the vendor CLI reporting hook exit code 127.
+
+Skill files in agent-owned directories, including a Cyclops-seeded copy, are
+not part of either `cyclops remove --all` or the managed installer uninstall.
+Remove one only after checking whether it is an operator customization.

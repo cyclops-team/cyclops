@@ -79,12 +79,13 @@ message, taken literally. Enter sends; `Alt+Enter` (`Shift+Enter` /
 ## The file panel
 
 Two browsers behind one header. The **agent browser** follows the focused
-agent's directory, within a second of a pane switch or `cd`; the **pinned
-browser** stays where you last left it, remembered across launches
-(`files_pinned_root`). The header's chip flips between them: `[pin]` while
-following the agent, `[agent]` while pinned. Click a file and its path is
-typed into the focused pane as `@src/main.rs `, relative to the panel's
-root: nothing is submitted. A file clicked in the pinned view still
+agent's directory: a pane switch or active-pane output requests one short,
+settled snapshot. That lets the panel catch a `cd` without polling the
+filesystem. The **pinned browser** stays where you last left it, remembered
+across launches (`files_pinned_root`). The header's chip flips between them:
+`[pin]` while following the agent, `[agent]` while pinned. Click a file and
+its path is typed into the focused pane as `@src/main.rs `, relative to the
+panel's root: nothing is submitted. A file clicked in the pinned view still
 resolves for the agent: relative under its folder, absolute outside it.
 
 ## Preferences
@@ -98,12 +99,18 @@ sidebar_visible = true
 sidebar_width = 28
 tab_bar_visible = true
 motion = true
+terminal_default_fg = "#3a2b26" # opt in to themed terminal window padding
+terminal_default_bg = "#000000"
 ```
 
 Motion fades pane borders, status ink, and dissolving notices instead of
 snapping, and turns itself off under `NO_COLOR` or without truecolor. See
 [Configuration](/reference/configuration) for the rest, including
-`files_pinned_root` and custom `[workspace.bindings]`.
+`files_pinned_root` and custom `[workspace.bindings]`. The optional terminal
+palette pair themes the window padding while the workspace is focused and
+restores the supplied colors through OSC 10/11. Both values are required;
+without them Cyclops leaves the host palette untouched and never queries
+terminal input for colors.
 
 ## Related
 

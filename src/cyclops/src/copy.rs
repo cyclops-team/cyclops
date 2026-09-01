@@ -1,6 +1,7 @@
 //! Human-facing copy. Errors follow GOALS.md: what happened, why, next
 //! step. Sentence case, plain verbs, no protocol jargon, no apologies.
 
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use crate::client::ClientError;
@@ -13,6 +14,12 @@ pub use cyclops_proto::NOT_RUNNING;
 
 /// `cyclops daemon status` with nothing to report on.
 pub const DAEMON_DOWN: &str = "○ cyclopsd is not running · start it with: cyclops start";
+
+#[cfg(not(feature = "full-ui"))]
+pub const WORKSPACE_NOT_INCLUDED: &str = "the full-screen workspace is not included in this build. Run cyclops --help for headless commands, or install a full Cyclops build.";
+
+#[cfg(not(feature = "full-ui"))]
+pub const WATCH_NOT_INCLUDED: &str = "interactive watch is not included in this build. Use cyclops watch --json for the headless event stream, or install a full Cyclops build.";
 
 /// Said when the running daemon is too old to answer the restart
 /// handshake. Retrying this verb can only fail the same way, so the copy
@@ -125,6 +132,75 @@ pub fn attention_action_uncertain(
 /// it. `cyclops status` is the way to find the pane id to hand it.
 pub const NO_AGENTS: &str =
     "No agents yet. Name a pane: cyclops name %1 reviewer  (cyclops status lists the panes)";
+
+/// The complete command map behind the everyday top-level help. The
+/// descriptions come from clap's command help, so discovery and detailed
+/// help cannot quietly describe the same spelling two different ways.
+pub const COMMAND_GROUPS: &[(&str, &[&str])] = &[
+    ("Everyday", &["send", "inbox", "reply", "status", "health"]),
+    (
+        "Workspace",
+        &["start", "workspace", "sizing", "name", "list", "watch"],
+    ),
+    (
+        "Operations",
+        &[
+            "setup", "hooks", "theme", "daemon", "update", "cleanup", "data", "remove",
+        ],
+    ),
+    (
+        "Diagnosis and compatibility",
+        &[
+            "ping",
+            "read",
+            "messages",
+            "requeue",
+            "notification",
+            "alarm",
+            "attention",
+            "history",
+            "thread",
+            "wait",
+            "ui",
+            "hook",
+        ],
+    ),
+];
+
+pub fn command_catalog(mut about: impl FnMut(&str) -> String) -> String {
+    let width = COMMAND_GROUPS
+        .iter()
+        .flat_map(|(_, commands)| commands.iter())
+        .map(|command| command.len())
+        .max()
+        .expect("command catalog is not empty");
+    let mut out = String::new();
+
+    for (group_index, (heading, commands)) in COMMAND_GROUPS.iter().enumerate() {
+        if group_index > 0 {
+            out.push('\n');
+        }
+        writeln!(out, "{heading}").expect("write command catalog heading");
+        for command in *commands {
+            let description = about(command);
+            let description = description.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut first_sentence = description
+                .split_once(". ")
+                .map(|(sentence, _)| format!("{sentence}."))
+                .unwrap_or(description);
+            if !first_sentence.ends_with(['.', '?', '!']) {
+                first_sentence.push('.');
+            }
+            writeln!(out, "  {command:width$}  {first_sentence}")
+                .expect("write command catalog entry");
+        }
+    }
+
+    out.push_str("\nRun cyclops <command> --help for details.");
+    out
+}
+
+pub const EMPTY_INBOX: &str = "No pending messages. Wait for one: cyclops inbox next --timeout 30s";
 
 /// The command that teaches cyclops what runs in a pane.
 ///
@@ -294,18 +370,25 @@ pub fn proto_mismatch(server: u32, client: u32) -> String {
     format!("note: cyclopsd speaks protocol {server}, this cyclops speaks {client}. Continuing; update the older side.")
 }
 
-/// A running daemon built from different source than this client.
-///
-/// Absence is a mismatch too: it identifies a daemon old enough to predate
-/// exact build reporting rather than silently treating it as current.
-pub fn build_mismatch(server: Option<&str>, client: &str) -> Option<String> {
-    match server {
-        Some(server) if server == client => None,
-        Some(server) => Some(format!(
-            "note: cyclopsd is build {server}, this cyclops is build {client}. Continuing; run cyclops daemon restart to load the installed daemon build."
+/// Persistent notice for a daemon that is not the same runtime identity as
+/// this CLI. Classification stays in `cyclops-client`; this module owns the
+/// command and recovery wording shown to a person.
+pub fn hello_compatibility_notice(
+    compatibility: &cyclops_client::HelloCompatibility,
+) -> Option<String> {
+    use cyclops_client::HelloCompatibility;
+
+    match compatibility {
+        HelloCompatibility::Current { .. } => None,
+        HelloCompatibility::Mismatch { client, daemon } => Some(format!(
+            "version/build mismatch: cyclops {}, cyclopsd {}. Continuing; run cyclops daemon restart. If they still differ, update or reinstall the older side.",
+            client.description(),
+            daemon.description()
         )),
-        None => Some(format!(
-            "note: cyclopsd did not report a build identifier, this cyclops is build {client}. Continuing; run cyclops daemon restart to load the installed daemon build."
+        HelloCompatibility::UnverifiedDaemon { client, daemon } => Some(format!(
+            "daemon identity unverified: cyclops {}, cyclopsd {}. Continuing; run cyclops daemon restart. If it remains unverified, update or reinstall the daemon.",
+            client.description(),
+            daemon.description()
         )),
     }
 }
@@ -323,7 +406,7 @@ pub fn inbox_next_timeout(d: Duration) -> String {
 
 pub fn inbox_claim_outcome_unknown(message_id: &str) -> String {
     format!(
-        "cyclops sent the claim for {message_id}, but the daemon did not answer before the deadline. The message may already be claimed. Inspect it with cyclops thread {message_id} or cyclops inbox list before retrying."
+        "cyclops sent the claim for {message_id}, but no usable answer arrived. The message may already be claimed. Inspect it with cyclops thread {message_id} or cyclops inbox list before retrying."
     )
 }
 
@@ -331,6 +414,7 @@ pub const INBOX_SENDER_FILTER_UNAVAILABLE: &str = "the daemon did not prove the 
 
 pub const WATCH_JSON_FILTER_UNSUPPORTED: &str = "--from, --to, and --with filter the interactive TUI and are not available with --json. Use --kinds for the event stream or cyclops inbox next --from <recipient-key> for bounded receive automation.";
 
+#[cfg(feature = "full-ui")]
 pub fn unknown_watch_filters(asked: &[&str]) -> String {
     let names = asked
         .iter()
@@ -371,9 +455,18 @@ pub fn wait_occupant_changed(target: &str) -> String {
 /// user typed, when the command had one.
 pub fn client_error(e: &ClientError, asked: Option<&str>) -> String {
     match e {
-        ClientError::NotRunning => NOT_RUNNING.into(),
+        ClientError::NotRunning(_) => NOT_RUNNING.into(),
         ClientError::ConnectTimeout(d) => connect_timeout(*d),
+        ClientError::HelloTimeout(d) => broken(&format!("no answer within {}", timeout_words(*d))),
         ClientError::ReadTimeout(d) => broken(&format!("no answer within {}", timeout_words(*d))),
+        ClientError::RequestFrameTooLarge => {
+            format!("{}. Nothing was sent.", frame_too_large("request"))
+        }
+        ClientError::DaemonFrameTooLarge => broken(&frame_too_large("daemon frame")),
+        // The daemon deliberately supplied this complete sentence because the
+        // real response would not fit. Preserve its honest uncertainty copy.
+        ClientError::OversizedResponse(message) => message.clone(),
+        ClientError::InvalidHello(_) => broken("the hello line didn't parse"),
         ClientError::Server {
             code,
             message,
@@ -392,8 +485,17 @@ pub fn client_error(e: &ClientError, asked: Option<&str>) -> String {
                 message.clone()
             }
         }
-        ClientError::Broken(cause) => broken(cause),
+        ClientError::NotSent(cause) | ClientError::Unknown(cause) | ClientError::Gap(cause) => {
+            broken(cause)
+        }
     }
+}
+
+pub fn frame_too_large(subject: &str) -> String {
+    format!(
+        "{subject} exceeds the {}-byte JSON frame limit (newline excluded)",
+        cyclops_proto::FrameContract::MAX_JSON_BYTES
+    )
 }
 
 /// Under a scoped roster's header: the watched sessions the caller is
@@ -409,11 +511,13 @@ pub fn also_watching(sessions: &[String]) -> String {
 
 /// `cyclops ui` refuses --json: the machine stream lives on `watch`, and
 /// pointing there beats emitting a shape nothing should rely on.
+#[cfg(feature = "full-ui")]
 pub const UI_NO_JSON: &str =
     "cyclops ui has no --json form. The machine stream is: cyclops watch --json";
 
 /// Said on stderr every `cyclops ui` run, so scripts keep working while
 /// their authors learn the verb that replaced it.
+#[cfg(feature = "full-ui")]
 pub const UI_DEPRECATED: &str = "cyclops ui is deprecated; use cyclops watch";
 
 /// `cyclops daemon log` with no log file. Not an error state: it means no
@@ -708,15 +812,16 @@ mod tests {
     }
 
     #[test]
-    fn build_mismatch_names_both_builds_and_treats_absence_as_old() {
-        assert_eq!(build_mismatch(Some("abc1234"), "abc1234"), None);
-        assert_eq!(
-            build_mismatch(Some("old5678"), "abc1234").as_deref(),
-            Some("note: cyclopsd is build old5678, this cyclops is build abc1234. Continuing; run cyclops daemon restart to load the installed daemon build.")
+    fn runtime_identity_notice_names_both_sides_and_an_existing_recovery_command() {
+        let compatibility = cyclops_client::HelloCompatibility::between(
+            cyclops_client::RuntimeIdentity::new("0.1.0", Some("client-new")),
+            cyclops_client::RuntimeIdentity::new("0.0.9", Some("daemon-old")),
         );
         assert_eq!(
-            build_mismatch(None, "abc1234").as_deref(),
-            Some("note: cyclopsd did not report a build identifier, this cyclops is build abc1234. Continuing; run cyclops daemon restart to load the installed daemon build.")
+            hello_compatibility_notice(&compatibility).as_deref(),
+            Some(
+                "version/build mismatch: cyclops 0.1.0 (client-new), cyclopsd 0.0.9 (daemon-old). Continuing; run cyclops daemon restart. If they still differ, update or reinstall the older side."
+            )
         );
     }
 
@@ -736,6 +841,26 @@ mod tests {
             data: serde_json::Value::Null,
         };
         assert_eq!(client_error(&bare, None), "cyclops refused: denied");
+    }
+
+    #[test]
+    fn oversized_response_preserves_the_daemons_uncertainty_sentence() {
+        // Obsolete when the daemon no longer substitutes a bounded uncertainty
+        // response for a result that exceeds the official frame contract.
+        let message = "daemon response was too large; request outcome is unknown";
+        let error = ClientError::OversizedResponse(message.into());
+        assert_eq!(client_error(&error, None), message);
+    }
+
+    #[test]
+    fn hello_timeout_keeps_the_existing_read_timeout_sentence() {
+        // Obsolete when CLI presentation intentionally distinguishes the
+        // Hello read from later bounded daemon reads.
+        let waited = Duration::from_secs(5);
+        assert_eq!(
+            client_error(&ClientError::HelloTimeout(waited), None),
+            client_error(&ClientError::ReadTimeout(waited), None)
+        );
     }
 
     #[test]

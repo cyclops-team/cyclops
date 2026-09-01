@@ -17,7 +17,6 @@ use cyclops_state::{InspectedEntry, InspectedKind, InspectionLimits, StateInspec
 use serde_json::{json, Value};
 
 use crate::client::{Client, ClientError};
-use crate::hookset::CliKind;
 use crate::style::Style;
 
 const PATH_ENTRY_LIMIT: usize = 128;
@@ -51,6 +50,7 @@ struct BinaryReport {
     selected_daemon: PathBuf,
     selected_daemon_resolved: Option<PathBuf>,
     selected_daemon_ready: bool,
+    selected_daemon_version: Option<String>,
     selected_daemon_build: Option<String>,
     selected_daemon_build_error: Option<String>,
     resolutions: Vec<BinaryResolution>,
@@ -72,6 +72,7 @@ struct DaemonReport {
     boot_id: Option<String>,
     process: Option<ProcessInstanceId>,
     uptime_ms: Option<u64>,
+    version_matches_client: Option<bool>,
     build_matches_client: Option<bool>,
     status: Option<StatusResult>,
     status_error: Option<String>,
@@ -230,6 +231,27 @@ struct RollbackReport {
     error: Option<String>,
 }
 
+/// A recovery command health may name without running it.
+///
+/// Health keeps the current-journal replay result unproven. This recommendation
+/// points at the command that performs that proof before changing selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RollbackRecommendedAction {
+    command: &'static str,
+    reason: &'static str,
+}
+
+impl RollbackReport {
+    fn recommended_action(&self) -> Option<RollbackRecommendedAction> {
+        (self.state == "candidate" && self.candidate_available == Some(true)).then_some(
+            RollbackRecommendedAction {
+                command: "cyclops update --rollback",
+                reason: "This command revalidates current journals before changing the selector.",
+            },
+        )
+    }
+}
+
 struct HealthReport {
     binaries: BinaryReport,
     daemon: DaemonReport,
@@ -241,40 +263,6 @@ struct HealthReport {
     operational: OperationalReport,
     issues: Vec<Issue>,
 }
-
-struct ConsumerSpec {
-    id: &'static str,
-    name: &'static str,
-    kind: CliKind,
-    required_receipt_tier: u8,
-}
-
-const CONSUMERS: &[ConsumerSpec] = &[
-    ConsumerSpec {
-        id: "claude",
-        name: "Claude Code",
-        kind: CliKind::Claude,
-        required_receipt_tier: 1,
-    },
-    ConsumerSpec {
-        id: "codex",
-        name: "Codex CLI",
-        kind: CliKind::Codex,
-        required_receipt_tier: 1,
-    },
-    ConsumerSpec {
-        id: "cursor",
-        name: "Cursor Agent CLI",
-        kind: CliKind::Cursor,
-        required_receipt_tier: 1,
-    },
-    ConsumerSpec {
-        id: "agy",
-        name: "Antigravity CLI",
-        kind: CliKind::Agy,
-        required_receipt_tier: 2,
-    },
-];
 
 pub fn run(json_out: bool) -> i32 {
     let report = collect();
@@ -339,30 +327,94 @@ fn collect() -> HealthReport {
         });
     }
     if binaries
-        .selected_daemon_build
+        .selected_daemon_version
         .as_deref()
-        .is_some_and(|build| build != crate::BUILD_REF)
+        .is_some_and(|version| version != cyclops_client::CLIENT_VERSION)
     {
         issues.push(Issue {
-            code: "selected_daemon_build_mismatch",
+            code: "selected_daemon_version_mismatch",
             message: format!(
-                "client build {} does not match selected adjacent daemon build {}",
-                crate::BUILD_REF,
-                binaries
-                    .selected_daemon_build
-                    .as_deref()
-                    .unwrap_or("unreported")
+                "client {} does not match selected adjacent daemon {}",
+                cyclops_client::RuntimeIdentity::current_client().description(),
+                cyclops_client::RuntimeIdentity::new(
+                    binaries
+                        .selected_daemon_version
+                        .as_deref()
+                        .unwrap_or("unreported"),
+                    binaries.selected_daemon_build.as_deref(),
+                )
+                .description()
             ),
             path: Some(binaries.selected_daemon.clone()),
         });
     }
-    if daemon.running && daemon.build.as_deref() != Some(crate::BUILD_REF) {
+    if binaries
+        .selected_daemon_build
+        .as_deref()
+        .is_some_and(|build| build != crate::BUILD_REF)
+    {
+        let client = cyclops_client::RuntimeIdentity::current_client();
+        let selected = cyclops_client::RuntimeIdentity::new(
+            binaries
+                .selected_daemon_version
+                .as_deref()
+                .unwrap_or("unreported"),
+            binaries.selected_daemon_build.as_deref(),
+        );
+        issues.push(Issue {
+            code: "selected_daemon_build_mismatch",
+            message: format!(
+                "client {} does not match selected adjacent daemon {}",
+                client.description(),
+                selected.description()
+            ),
+            path: Some(binaries.selected_daemon.clone()),
+        });
+    }
+    if daemon.version_matches_client == Some(false) {
+        let client = cyclops_client::RuntimeIdentity::current_client();
+        let running = cyclops_client::RuntimeIdentity::new(
+            daemon.version.as_deref().unwrap_or("unreported"),
+            daemon.build.as_deref(),
+        );
+        issues.push(Issue {
+            code: "client_daemon_version_mismatch",
+            message: format!(
+                "client {} does not match daemon {}",
+                client.description(),
+                running.description()
+            ),
+            path: None,
+        });
+    }
+    if daemon.build_matches_client == Some(false) {
+        let client = cyclops_client::RuntimeIdentity::current_client();
+        let running = cyclops_client::RuntimeIdentity::new(
+            daemon.version.as_deref().unwrap_or("unreported"),
+            daemon.build.as_deref(),
+        );
         issues.push(Issue {
             code: "client_daemon_build_mismatch",
             message: format!(
-                "client build {} does not match daemon build {}",
-                crate::BUILD_REF,
-                daemon.build.as_deref().unwrap_or("unreported")
+                "client {} does not match daemon {}",
+                client.description(),
+                running.description()
+            ),
+            path: None,
+        });
+    }
+    if daemon.running && daemon.build_matches_client.is_none() {
+        let client = cyclops_client::RuntimeIdentity::current_client();
+        let running = cyclops_client::RuntimeIdentity::new(
+            daemon.version.as_deref().unwrap_or("unreported"),
+            daemon.build.as_deref(),
+        );
+        issues.push(Issue {
+            code: "client_daemon_identity_unverified",
+            message: format!(
+                "client {} cannot verify daemon {}; the daemon did not report a build identity",
+                client.description(),
+                running.description()
             ),
             path: None,
         });
@@ -743,14 +795,15 @@ fn inspect_binaries_from(path: Option<&OsStr>, selected_client: PathBuf) -> Bina
         .iter()
         .any(|entry| entry.name == "cyclopsd" && entry.path == selected_daemon && entry.executable);
     let selected_daemon_resolved = std::fs::canonicalize(&selected_daemon).ok();
-    let (selected_daemon_build, selected_daemon_build_error) = if selected_daemon_ready {
-        match crate::update::candidate_build(&selected_daemon) {
-            Ok(build) => (Some(build), None),
-            Err(error) => (None, Some(error)),
-        }
-    } else {
-        (None, None)
-    };
+    let (selected_daemon_version, selected_daemon_build, selected_daemon_build_error) =
+        if selected_daemon_ready {
+            match crate::update::candidate_identity(&selected_daemon, "cyclopsd") {
+                Ok(identity) => (Some(identity.version), identity.build, None),
+                Err(error) => (None, None, Some(error)),
+            }
+        } else {
+            (None, None, None)
+        };
     let shadowed = distinct_clients.len() > 1 || distinct_daemons.len() > 1;
     BinaryReport {
         selected_client,
@@ -758,6 +811,7 @@ fn inspect_binaries_from(path: Option<&OsStr>, selected_client: PathBuf) -> Bina
         selected_daemon,
         selected_daemon_resolved,
         selected_daemon_ready,
+        selected_daemon_version,
         selected_daemon_build,
         selected_daemon_build_error,
         resolutions,
@@ -930,6 +984,7 @@ fn daemon_stopped() -> DaemonReport {
         boot_id: None,
         process: None,
         uptime_ms: None,
+        version_matches_client: None,
         build_matches_client: None,
         status: None,
         status_error: None,
@@ -971,7 +1026,7 @@ fn inspect_daemon(home: &Path, state: &StateReport) -> DaemonReport {
 
     let mut client = match Client::connect() {
         Ok(client) => client,
-        Err(ClientError::NotRunning) => return daemon_stale_socket(),
+        Err(ClientError::NotRunning(_)) => return daemon_stale_socket(),
         Err(error) => return daemon_unproven(crate::copy::client_error(&error, None)),
     };
     let hello = client.hello().clone();
@@ -997,6 +1052,9 @@ fn daemon_from_hello(
     status_error: Option<String>,
 ) -> DaemonReport {
     let mut transport_error = None;
+    let compatibility = cyclops_client::HelloCompatibility::from_hello(&hello);
+    let version_matches_client = compatibility.version_matches();
+    let build_matches_client = compatibility.build_matches();
     let executable = hello.daemon_executable.map(PathBuf::from);
     let executable = match executable {
         Some(path) if !path.is_absolute() => {
@@ -1024,7 +1082,8 @@ fn daemon_from_hello(
         authenticated_socket,
         stale_socket: false,
         version: Some(hello.cyclops),
-        build_matches_client: Some(hello.build.as_deref() == Some(crate::BUILD_REF)),
+        version_matches_client: Some(version_matches_client),
+        build_matches_client,
         build: hello.build,
         executable,
         boot_id: Some(hello.boot_id),
@@ -1612,10 +1671,11 @@ fn inspect_setup(cyclops_home: &Path) -> SetupReport {
         };
     };
     let state_inspector = StateInspector::open_existing(cyclops_home);
-    let mut consumers = Vec::with_capacity(CONSUMERS.len());
-    for spec in CONSUMERS {
-        let installed_root = crate::consumer::root(spec.kind, &user_home);
-        let (installed, install_state) = match StateInspector::open_existing(&installed_root) {
+    let mut consumers = Vec::with_capacity(crate::consumer::SHIPPED.len());
+    for spec in crate::consumer::SHIPPED {
+        let locations = spec.locations(&user_home);
+        let installed_root = &locations.install_root;
+        let (installed, install_state) = match StateInspector::open_existing(installed_root) {
             Ok(Some(_)) => (true, "present"),
             Ok(None) => (false, "absent"),
             Err(_) => (true, "unproven"),
@@ -1627,38 +1687,42 @@ fn inspect_setup(cyclops_home: &Path) -> SetupReport {
             Ok(None) => AssetRead::Missing,
             Err(_) => AssetRead::Unproven,
         };
-        let (manifest_state, ack_capable, mailbox_capability) = match manifest_file {
-            AssetRead::Missing => ("missing", None, None),
-            AssetRead::Unproven => ("unproven", None, None),
-            AssetRead::Truncated => ("truncated", None, None),
+        let (manifest_state, manifest_ready, ack_capable, mailbox_capability) = match manifest_file
+        {
+            AssetRead::Missing => ("missing", false, None, None),
+            AssetRead::Unproven => ("unproven", false, None, None),
+            AssetRead::Truncated => ("truncated", false, None, None),
             AssetRead::Bytes(bytes) => {
                 let shipped = crate::manifests::shipped_body(spec.id)
                     .expect("shipped consumer manifest")
                     .as_bytes();
-                let state = if bytes == shipped {
-                    "current"
-                } else if crate::manifests::unedited_seed(&bytes) {
-                    "outdated"
-                } else {
-                    "edited"
-                };
+                let state = crate::managed_assets::classify_seeded_bytes(
+                    &bytes,
+                    shipped,
+                    crate::manifests::unedited_seed,
+                );
                 let parsed = std::str::from_utf8(&bytes)
                     .ok()
                     .and_then(|body| cyclops_manifest::Manifest::parse(body, &manifest_path).ok());
                 match parsed {
                     Some(parsed) if parsed.agent.id == spec.id => {
                         let ack = parsed.hooks.ack.is_some();
-                        (state, Some(ack), parsed.messaging.mailbox_capability_file)
+                        (
+                            state.word(),
+                            state.ready(),
+                            Some(ack),
+                            parsed.messaging.mailbox_capability_file,
+                        )
                     }
-                    _ => ("invalid", None, None),
+                    _ => ("invalid", false, None, None),
                 }
             }
         };
-        let (hook_root, hook_relative, hook_path) = setup_hook_path(&user_home, spec.kind);
+        let hook_path = locations.hook.path();
         let hook_state = if !installed {
             "not_installed"
         } else {
-            match read_asset(&hook_root, &hook_relative) {
+            match read_asset(&locations.hook.root, &locations.hook.relative) {
                 AssetRead::Missing => "missing",
                 AssetRead::Unproven => "unproven",
                 AssetRead::Truncated => "truncated",
@@ -1668,10 +1732,9 @@ fn inspect_setup(cyclops_home: &Path) -> SetupReport {
             }
         };
         let hook_ready = !installed || hook_state == "current";
-        let (skill_root, skill_relative) = setup_skill_location(&user_home, spec.id);
-        let skill_path = skill_root.join(&skill_relative);
+        let skill_path = locations.skill.path();
         let (skill_state, skill_ready) = if installed {
-            inspect_skill(read_asset(&skill_root, &skill_relative))
+            inspect_skill(read_skill_asset(&locations.skill))
         } else {
             ("not_installed", true)
         };
@@ -1687,9 +1750,7 @@ fn inspect_setup(cyclops_home: &Path) -> SetupReport {
                     "direct_payload"
                 }
             });
-        let manifest_ready = matches!(manifest_state, "current" | "edited");
-        let receipt_ready =
-            !installed || spec.required_receipt_tier != 1 || ack_capable == Some(true);
+        let receipt_ready = !installed || spec.receipt.accepts(ack_capable);
         let complete = !installed
             || (install_state == "present"
                 && manifest_ready
@@ -1735,6 +1796,17 @@ fn read_asset(root: &Path, relative: &Path) -> AssetRead {
     }
 }
 
+/// Health uses the same private-parent boundary as setup. A skill below a
+/// missing or unsafe consumer parent cannot establish a healthy installation.
+fn read_skill_asset(location: &crate::consumer::AssetLocation) -> AssetRead {
+    match crate::skillseed::inspect(location) {
+        crate::skillseed::SkillInspection::Missing => AssetRead::Missing,
+        crate::skillseed::SkillInspection::Bytes(bytes) => AssetRead::Bytes(bytes),
+        crate::skillseed::SkillInspection::Unreadable
+        | crate::skillseed::SkillInspection::ManualReview => AssetRead::Unproven,
+    }
+}
+
 fn read_asset_from(inspector: &StateInspector, relative: &Path) -> AssetRead {
     match inspector.read_file(relative, FILE_BYTES_LIMIT) {
         Ok(Some(file)) if file.truncated => AssetRead::Truncated,
@@ -1745,46 +1817,19 @@ fn read_asset_from(inspector: &StateInspector, relative: &Path) -> AssetRead {
     }
 }
 
-fn setup_hook_path(home: &Path, kind: CliKind) -> (PathBuf, PathBuf, PathBuf) {
-    let (root, relative) = match kind {
-        CliKind::Claude => (home.join(".claude"), PathBuf::from("settings.json")),
-        CliKind::Codex => (
-            crate::consumer::root(kind, home),
-            PathBuf::from("hooks.json"),
-        ),
-        CliKind::Cursor => (home.join(".cursor"), PathBuf::from("hooks.json")),
-        CliKind::Agy => (home.join(".agents"), PathBuf::from("hooks.json")),
-    };
-    let path = root.join(&relative);
-    (root, relative, path)
-}
-
-fn setup_skill_location(home: &Path, id: &str) -> (PathBuf, PathBuf) {
-    match id {
-        "claude" => (
-            home.join(".claude"),
-            PathBuf::from("skills/cyclops/SKILL.md"),
-        ),
-        "codex" | "cursor" => (
-            home.join(".agents"),
-            PathBuf::from("skills/cyclops/SKILL.md"),
-        ),
-        "agy" => (
-            home.join(".gemini/antigravity-cli"),
-            PathBuf::from("skills/cyclops/SKILL.md"),
-        ),
-        _ => unreachable!("shipped consumer id"),
-    }
-}
-
 fn inspect_skill(asset: AssetRead) -> (&'static str, bool) {
     match asset {
         AssetRead::Missing => ("missing", false),
         AssetRead::Truncated => ("truncated", false),
         AssetRead::Unproven => ("unproven", false),
-        AssetRead::Bytes(body) if body == crate::skillseed::SHIPPED.as_bytes() => ("current", true),
-        AssetRead::Bytes(body) if crate::skillseed::unedited_seed(&body) => ("outdated", false),
-        AssetRead::Bytes(_) => ("edited", true),
+        AssetRead::Bytes(body) => {
+            let state = crate::managed_assets::classify_seeded_bytes(
+                &body,
+                crate::skillseed::SHIPPED.as_bytes(),
+                crate::skillseed::unedited_seed,
+            );
+            (state.word(), state.ready())
+        }
     }
 }
 
@@ -2011,12 +2056,14 @@ fn report_json(report: &HealthReport) -> Value {
         "healthy": report.issues.is_empty(),
         "client": {
             "version": crate::VERSION,
+            "package_version": cyclops_client::CLIENT_VERSION,
             "build": crate::BUILD_REF,
             "selected_executable": report.binaries.selected_client.display().to_string(),
             "selected_resolved": report.binaries.selected_resolved.as_ref().map(|path| path.display().to_string()),
             "selected_daemon": report.binaries.selected_daemon.display().to_string(),
             "selected_daemon_resolved": report.binaries.selected_daemon_resolved.as_ref().map(|path| path.display().to_string()),
             "selected_daemon_ready": report.binaries.selected_daemon_ready,
+            "selected_daemon_version": report.binaries.selected_daemon_version.as_deref(),
             "selected_daemon_build": report.binaries.selected_daemon_build.as_deref(),
             "selected_daemon_build_error": report.binaries.selected_daemon_build_error.as_deref(),
             "path": {
@@ -2041,6 +2088,7 @@ fn report_json(report: &HealthReport) -> Value {
             "authenticated_socket": report.daemon.authenticated_socket,
             "version": report.daemon.version.as_deref(),
             "build": report.daemon.build.as_deref(),
+            "client_version_matches": report.daemon.version_matches_client,
             "client_build_matches": report.daemon.build_matches_client,
             "boot_id": report.daemon.boot_id.as_deref(),
             "pid": report.daemon.process.map(ProcessInstanceId::pid),
@@ -2134,8 +2182,9 @@ fn render_plain(report: &HealthReport, style: &Style) -> String {
     };
     lines.push(style.bold(heading));
     lines.push(format!(
-        "  client   {} · build {}",
+        "  client   {} · version {} · build {}",
         report.binaries.selected_client.display(),
+        cyclops_client::CLIENT_VERSION,
         crate::BUILD_REF
     ));
     if let Some(resolved) = &report.binaries.selected_resolved {
@@ -2173,13 +2222,18 @@ fn render_plain(report: &HealthReport, style: &Style) -> String {
         lines.push("    PATH inventory truncated at its fixed limit".into());
     }
     lines.push(format!(
-        "    paired daemon {} · {} · build {}",
+        "    paired daemon {} · {} · version {} · build {}",
         report.binaries.selected_daemon.display(),
         if report.binaries.selected_daemon_ready {
             "executable"
         } else {
             "missing or not executable"
         },
+        report
+            .binaries
+            .selected_daemon_version
+            .as_deref()
+            .unwrap_or("unproven"),
         report
             .binaries
             .selected_daemon_build
@@ -2202,7 +2256,12 @@ fn render_plain(report: &HealthReport, style: &Style) -> String {
             report.daemon.boot_id.as_deref().unwrap_or("unreported")
         ));
         lines.push(format!(
-            "    client build match {}",
+            "    client version/build match {}/{}",
+            match report.daemon.version_matches_client {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "unproven",
+            },
             match report.daemon.build_matches_client {
                 Some(true) => "yes",
                 Some(false) => "no",
@@ -2464,7 +2523,7 @@ fn external_plain_state(report: &ExternalStateReport) -> &'static str {
 }
 
 fn rollback_json(report: &RollbackReport) -> Value {
-    json!({
+    let mut rollback = json!({
         "state": report.state,
         "prefix": report.prefix.as_ref().map(|path| path.display().to_string()),
         "selection": report.selection.as_ref().map(|path| path.display().to_string()),
@@ -2488,7 +2547,14 @@ fn rollback_json(report: &RollbackReport) -> Value {
         "rollback_safe": report.rollback_safe,
         "reason": report.reason.as_str(),
         "error": report.error.as_deref(),
-    })
+    });
+    if let Some(action) = report.recommended_action() {
+        rollback["recommended_action"] = json!({
+            "command": action.command,
+            "reason": action.reason,
+        });
+    }
+    rollback
 }
 
 fn render_rollback_plain(report: &RollbackReport) -> Vec<String> {
@@ -2545,6 +2611,10 @@ fn render_rollback_plain(report: &RollbackReport) -> Vec<String> {
     if let Some(error) = &report.error {
         lines.push(format!("    proof error {error}"));
     }
+    if let Some(action) = report.recommended_action() {
+        lines.push(format!("    next step {}", action.command));
+        lines.push(format!("    {}", action.reason));
+    }
     lines
 }
 
@@ -2569,6 +2639,7 @@ mod tests {
                 "/prefix/.cyclops-pairs/pairs/pair.a/cyclopsd",
             )),
             selected_daemon_ready: true,
+            selected_daemon_version: Some(cyclops_client::CLIENT_VERSION.into()),
             selected_daemon_build: Some(crate::BUILD_REF.into()),
             selected_daemon_build_error: None,
             resolutions: vec![BinaryResolution {
@@ -2897,9 +2968,16 @@ mod tests {
         assert_eq!(report.journal_replay, "unproven");
         assert_eq!(report.install_replay, "unproven");
         assert_eq!(report.rollback_safe, None);
+        assert_eq!(
+            report.recommended_action(),
+            Some(RollbackRecommendedAction {
+                command: "cyclops update --rollback",
+                reason: "This command revalidates current journals before changing the selector.",
+            })
+        );
         assert_eq!(report.active_build.as_deref(), Some("active-build"));
         assert_eq!(report.known_good_build.as_deref(), Some("known-build"));
-        let json = rollback_json(&report).to_string();
+        let json = rollback_json(&report);
         let plain = render_rollback_plain(&report).join("\n");
         for fact in [
             "candidate",
@@ -2909,8 +2987,53 @@ mod tests {
             "pair.a",
             "pair.b",
         ] {
-            assert!(json.contains(fact));
+            assert!(json.to_string().contains(fact));
             assert!(plain.contains(fact));
+        }
+        assert_eq!(
+            json["recommended_action"]["command"],
+            "cyclops update --rollback"
+        );
+        assert_eq!(
+            json["recommended_action"]["reason"],
+            "This command revalidates current journals before changing the selector."
+        );
+        assert!(plain.contains("next step cyclops update --rollback"));
+        assert!(plain.contains("revalidates current journals before changing the selector"));
+    }
+
+    #[test]
+    fn rollback_recommendation_requires_a_validated_distinct_candidate() {
+        let public = binaries_with_public_selector(true);
+        let reports = [
+            inspect_rollback_with(&binaries_with_public_selector(false), |_| {
+                panic!("a direct pair has no public rollback selector")
+            }),
+            inspect_rollback_with(&public, |_| Ok(None)),
+            inspect_rollback_with(&public, |_| Ok(Some(descriptor(true, false)))),
+            inspect_rollback_with(&public, |_| Ok(Some(descriptor(false, false)))),
+            inspect_rollback_with(&public, |_| {
+                Err(crate::update::InstalledPairInspectionError::Invalid(
+                    "selected pair changed".into(),
+                ))
+            }),
+        ];
+
+        for report in reports {
+            assert_eq!(
+                report.recommended_action(),
+                None,
+                "{} must not offer rollback",
+                report.state
+            );
+            assert!(rollback_json(&report).get("recommended_action").is_none());
+            assert!(
+                !render_rollback_plain(&report)
+                    .iter()
+                    .any(|line| line.contains("next step")),
+                "{} rendered a rollback action",
+                report.state
+            );
         }
     }
 

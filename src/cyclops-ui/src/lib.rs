@@ -12,7 +12,7 @@
 //! crates. The rendering itself is pure (frame.rs), so the backend is a
 //! thin seam.
 //!
-//! Zero polling: the subscription pushes, backfill reads once, the eye
+//! Zero polling: the subscription pushes, daemon backfill runs once, the eye
 //! arms a single one-shot timer per transition. No intervals anywhere.
 //!
 //! ## What it owns beyond the stream
@@ -23,7 +23,7 @@
 //! both were green.
 //!
 //! [`Record`] is the backend-neutral event-stream model: entry
-//! normalization, backfill/live ordering ([`Intake`]), resolution rows,
+//! normalization, backfill/live ordering ([`StreamProjectionState`]), resolution rows,
 //! the calm/firehose decision, and stable row identity: everything a
 //! renderer needs and nothing about how one paints. `cyclops watch`
 //! (app.rs, frame.rs, entry.rs, plain.rs) is its first renderer; a
@@ -37,61 +37,107 @@
 //!   accepts and asks it for the count.
 //! - Any color value. Every paint names a `cyclops-theme` token, and the
 //!   state-to-group mapping is that crate's too.
-//! - The daemon. It reads `events.subscribe`, one `status`, and whole
-//!   `messages.snapshot` answers after content-free change edges. Focus
-//!   jumps through `cyclops_tmux::focus_pane`, which is the only tmux call
-//!   anywhere near it.
+//! - The daemon. It reads `events.subscribe`, one `status`, one bounded
+//!   `events.backfill`, and whole
+//!   `messages.snapshot` answers after content-free change edges. Focus is a
+//!   target description handed to the launcher-provided terminal adapter.
 
+#[cfg(feature = "presentation")]
+mod action;
+#[cfg(feature = "watch")]
 pub mod action_io;
+#[cfg(feature = "presentation")]
 mod app;
+#[cfg(feature = "presentation")]
 pub mod avatar;
+#[cfg(feature = "presentation")]
 pub mod chat;
+#[cfg(feature = "watch")]
 mod data;
+#[cfg(feature = "presentation")]
 pub mod detail;
+#[cfg(feature = "presentation")]
 mod entry;
+#[cfg(feature = "presentation")]
 mod frame;
 pub mod grid;
+#[cfg(feature = "presentation")]
 mod health;
+#[cfg(feature = "watch")]
 mod input;
+#[cfg(feature = "presentation")]
+mod key;
+#[cfg(feature = "presentation")]
 pub mod messages;
+#[cfg(feature = "watch")]
 mod plain;
+#[cfg(feature = "presentation")]
+mod projection;
+#[cfg(feature = "presentation")]
 pub mod queue;
+#[cfg(feature = "presentation")]
 mod stream;
+#[cfg(feature = "watch")]
 mod term;
+mod terminal_size;
+#[cfg(feature = "presentation")]
 mod theme;
-mod wire;
 
-pub use action_io::{perform, ActionOutcome, ActionRequest, RequestKind, RequestToken};
+#[cfg(feature = "presentation")]
+pub use action::{ActionOutcome, ActionRequest, RequestKind, RequestToken};
+#[cfg(feature = "watch")]
+pub use action_io::perform;
+#[cfg(feature = "presentation")]
 pub use app::{App, Command, Density, RosterRow, RowTarget, View};
+#[cfg(feature = "presentation")]
 pub use avatar::{Avatar, AvatarRegistry};
+#[cfg(feature = "presentation")]
 pub use chat::{
     chat_action_line, chat_action_lines, chat_action_strip, chat_action_strips, chat_actions,
     render_chat, render_chat_lines, wrap_words, ChatAction, ChatActionSpan, ChatActionStrip,
     ChatInk, ChatLine, ChatLineKind, ChatRenderContext, ChatSpan, ComposerMode, ComposerState,
     TimelineItem,
 };
+#[cfg(feature = "presentation")]
 pub use cyclops_proto::{Attention, AttentionItem, Eye, PaneSnapshot};
-pub use data::{read_backfill, read_backfill_report, BackfillReport, UiMsg};
+#[cfg(feature = "watch")]
+pub use data::{FocusPane, UiMsg};
+#[cfg(feature = "presentation")]
 pub use detail::{Action, Back, Check, Detail, Draft, Loaded, Request, Stage, ThreadEntry};
+#[cfg(feature = "presentation")]
 pub use frame::{build, messages_help};
+#[cfg(feature = "presentation")]
 pub use health::BuildHealth;
-pub use input::Key;
+#[cfg(feature = "presentation")]
+pub use key::Key;
+#[cfg(feature = "presentation")]
 pub use messages::{
     rows_from_snapshot, FollowRequest, Link, MessageFollower, RefreshGate, RefreshRequest,
 };
+#[cfg(feature = "presentation")]
+pub use projection::{
+    project_backfill, BackfillReport, StreamInput, StreamProjection, StreamProjectionState,
+    StreamUpdate,
+};
+#[cfg(feature = "presentation")]
 pub use queue::{
     Counts, Direction, FrozenTarget, HumanQueue, MailboxWord, QueueRow, QueueTarget, Scope,
     SessionFilter, Snapshot, WakeWord,
 };
+#[cfg(feature = "presentation")]
 pub use stream::{
-    Backfilled, EndpointFilter, Entry, EntryKind, Filter, Intake, MessageEndpoints, PingDelivery,
-    Record, RosterSeed, StatusSeed,
+    EndpointFilter, Entry, EntryKind, Filter, MessageEndpoints, PingDelivery, Record, RosterSeed,
+    StatusSeed,
 };
+#[cfg(feature = "presentation")]
 pub use theme::Theme;
 
+#[cfg(feature = "watch")]
 use std::io::IsTerminal;
+#[cfg(feature = "watch")]
 use std::path::Path;
 
+#[cfg(feature = "watch")]
 use tokio::sync::mpsc;
 
 /// The terminal's size in cells, or the classic 80x24 when there is none
@@ -101,10 +147,11 @@ use tokio::sync::mpsc;
 /// frame with it, and `cyclops start` sizes a new tmux session with it.
 /// The ioctl is written once.
 pub fn terminal_size() -> (usize, usize) {
-    term::Term::size()
+    terminal_size::get()
 }
 
 /// How `cyclops ui` was asked to run.
+#[cfg(feature = "watch")]
 #[derive(Debug, Clone, Default)]
 pub struct UiOptions {
     /// Line-oriented follow mode; also forced by a non-tty.
@@ -116,8 +163,12 @@ pub struct UiOptions {
     pub to: Option<EndpointFilter>,
     /// Ledger tail length for backfill.
     pub backfill: usize,
+    /// Launcher-owned terminal focus effect. None keeps rows readable but
+    /// reports that focus is unavailable when the user asks for it.
+    pub focus: Option<FocusPane>,
 }
 
+#[cfg(feature = "watch")]
 impl UiOptions {
     pub fn filter(&self) -> Filter {
         Filter {
@@ -134,13 +185,15 @@ impl UiOptions {
 /// A color preference is deliberately not here. NO_COLOR reaches
 /// `Theme::detect` instead, which turns the paint off and leaves the whole
 /// UI standing: every state pairs a glyph with a word, so the eye, the
-/// firehose toggle, filters, scrolling, the cheatsheet and the jump all
+/// firehose toggle, filters, scrolling, the cheatsheet and pane focus all
 /// read fine uncolored. GOALS lists the two as separate obligations.
+#[cfg(feature = "watch")]
 fn wants_plain(opts: &UiOptions, tty: bool) -> bool {
     opts.plain || !tty
 }
 
 /// Run the UI to completion. Returns the process exit code.
+#[cfg(feature = "watch")]
 pub fn run(opts: UiOptions) -> i32 {
     let home = cyclops_proto::cyclops_home();
     let tty = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
@@ -163,28 +216,37 @@ pub fn run(opts: UiOptions) -> i32 {
 }
 
 /// How long the eye holds its intermediate frame: one tick, never a loop.
+#[cfg(feature = "watch")]
 const EYE_TICK_MS: u64 = 120;
 
 /// Largest number of queued messages folded into one frame. Keeps a flood
 /// fluid (one render per batch) without starving key handling. The workspace
 /// UI uses the same budget so one number defines interactive ingress.
+#[cfg(feature = "watch")]
 pub const INGRESS_BATCH: usize = 256;
+#[cfg(feature = "watch")]
 const BATCH: usize = INGRESS_BATCH;
 /// One complete render batch. Producers backpressure after this instead of
 /// growing memory while the terminal is slow.
+#[cfg(feature = "watch")]
 pub(crate) const EVENT_CAPACITY: usize = BATCH;
 /// One result from each snapshot producer can be outstanding: startup,
 /// queue refresh, and durable follow.
+#[cfg(feature = "watch")]
 pub(crate) const SNAPSHOT_CAPACITY: usize = 3;
 /// The action worker is serial, so a second result cannot exist before the
 /// first is consumed.
+#[cfg(feature = "watch")]
 pub(crate) const ACTION_CAPACITY: usize = 1;
 /// Keys have their own lane and one render batch of headroom. The blocking
 /// reader waits when it fills, preserving every key without letting data
 /// traffic delay it.
+#[cfg(feature = "watch")]
 const INPUT_CAPACITY: usize = BATCH;
+#[cfg(feature = "watch")]
 const MESSAGE_GAP_NOTICE: &str = "message sequence gap detected; rebuilding from a whole snapshot";
 
+#[cfg(feature = "watch")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lane {
     Input,
@@ -193,6 +255,7 @@ enum Lane {
     Event,
 }
 
+#[cfg(feature = "watch")]
 impl Lane {
     fn next(self) -> Self {
         match self {
@@ -204,12 +267,14 @@ impl Lane {
     }
 }
 
+#[cfg(feature = "watch")]
 enum IngressWake {
     Message(Lane, UiMsg),
     Resize,
     Closed,
 }
 
+#[cfg(feature = "watch")]
 async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
     let view = if opts.firehose {
         View::Firehose
@@ -226,7 +291,7 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
         snapshots: snapshot_tx,
         actions: action_tx,
     };
-    let io = data::spawn_io(&sinks, home, opts.backfill);
+    let io = data::spawn_io(&sinks, home, opts.backfill, opts.focus.clone());
     let (key_tx, mut key_rx) = mpsc::channel(INPUT_CAPACITY);
     input::spawn_reader(key_tx);
 
@@ -248,7 +313,7 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
         None
     };
 
-    let mut intake = Intake::new();
+    let mut stream_projection = StreamProjectionState::new();
     let mut message_follower = MessageFollower::default();
     let mut tick_armed = false;
     let mut key_open = true;
@@ -279,7 +344,7 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
             while let Some(msg) = queued.take() {
                 if handle(
                     &mut app,
-                    &mut intake,
+                    &mut stream_projection,
                     &mut message_follower,
                     &mut tick_armed,
                     &io.focus,
@@ -341,13 +406,13 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full((token, _))) => app.apply_action(
                     token,
-                    crate::action_io::ActionOutcome::NotSent(
+                    crate::action::ActionOutcome::NotSent(
                         "another detail action is still queued".into(),
                     ),
                 ),
                 Err(mpsc::error::TrySendError::Closed((token, _))) => app.apply_action(
                     token,
-                    crate::action_io::ActionOutcome::NotSent("action worker stopped".into()),
+                    crate::action::ActionOutcome::NotSent("action worker stopped".into()),
                 ),
             }
         }
@@ -381,9 +446,10 @@ async fn run_tui(opts: &UiOptions, home: &Path) -> i32 {
 }
 
 /// Apply one message to the app. True means quit.
+#[cfg(feature = "watch")]
 fn handle(
     app: &mut App,
-    intake: &mut Intake,
+    stream_projection: &mut StreamProjectionState,
     message_follower: &mut MessageFollower,
     tick_armed: &mut bool,
     focus: &tokio::sync::mpsc::Sender<String>,
@@ -401,40 +467,23 @@ fn handle(
                 match focus.try_send(pane) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
-                        app.notice = Some("jump already in progress".into());
+                        app.notice = Some("pane focus already in progress".into());
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
-                        app.notice = Some("can't jump: focus worker stopped".into());
+                        app.notice = Some("can't focus pane: focus worker stopped".into());
                     }
                 }
             }
             None => {}
         },
         UiMsg::Entry(e) => {
-            for e in intake.entry(*e) {
-                app.live(e);
-            }
+            apply_stream_updates(app, stream_projection.apply(StreamInput::Live(*e)))
         }
-        UiMsg::Backfill { entries, max_seq } => {
-            // The startup order, and it is the whole correctness story:
-            // the replayed tail is history, the seed is the daemon's
-            // answer about now, and the live entries that queued behind
-            // them are newer than both.
-            let landed = intake.backfill(entries, max_seq);
-            for e in landed.replayed {
-                app.replay(e);
-            }
-            if let Some(seed) = landed.seed {
-                seed_status(app, *seed);
-            }
-            for e in landed.live {
-                app.live(e);
-            }
-        }
-        UiMsg::Status(seed) => {
-            if let Some(seed) = intake.status(seed) {
-                seed_status(app, *seed);
-            }
+        UiMsg::StreamProjection(projection) => {
+            // The presentation projection owns the epoch reset, ordering, and
+            // duplicate cursor. App owns its own roster and render state.
+            app.clear_stream_projection();
+            apply_stream_updates(app, stream_projection.replace(*projection));
         }
         // The acknowledgement closes the startup race: only now may the
         // snapshot socket open, because later changes cannot be missed.
@@ -498,20 +547,40 @@ fn handle(
     false
 }
 
+/// Apply pure stream updates to this renderer's own state. The projection
+/// decides ordering and duplicate suppression; the application retains its
+/// roster, selection, and render-specific consequences of those facts.
+#[cfg(feature = "watch")]
+fn apply_stream_updates(app: &mut App, updates: Vec<StreamUpdate>) {
+    for update in updates {
+        match update {
+            StreamUpdate::Replay(entry) => app.replay(entry),
+            StreamUpdate::Status(seed) => seed_status(app, *seed),
+            StreamUpdate::Live(entry) => {
+                app.live(entry);
+            }
+            StreamUpdate::Notice(text) => app.notice = Some(text),
+        }
+    }
+}
+
 /// Apply the startup reconciliation and ingest the lines it wrote for
 /// items the replayed tail does not already carry.
+#[cfg(feature = "watch")]
 fn seed_status(app: &mut App, seed: stream::StatusSeed) {
     for e in app.seed_status(seed) {
         app.replay(e);
     }
 }
 
+#[cfg(feature = "watch")]
 fn draw(term: &mut term::Term, app: &mut App) {
-    let (w, h) = term::Term::size();
+    let (w, h) = terminal_size();
     let rows = frame::build(app, w, h);
     term.draw(&rows);
 }
 
+#[cfg(feature = "watch")]
 async fn recv_winch(sig: &mut Option<tokio::signal::unix::Signal>) -> bool {
     match sig {
         Some(s) => s.recv().await.is_some(),
@@ -521,6 +590,7 @@ async fn recv_winch(sig: &mut Option<tokio::signal::unix::Signal>) -> bool {
 
 /// Wait fairly across lanes. A closed stdin lane is disabled permanently,
 /// so EOF cannot become an eventless redraw loop that starves daemon work.
+#[cfg(feature = "watch")]
 async fn wait_next_ingress(
     key_open: &mut bool,
     key_rx: &mut mpsc::Receiver<Key>,
@@ -563,6 +633,7 @@ async fn wait_next_ingress(
 /// Drain ready work by rotating the first eligible lane after every item.
 /// Input starts each run first, while every continuously ready lane is served
 /// within four items.
+#[cfg(feature = "watch")]
 fn try_next_ready(
     start: &mut Lane,
     key_rx: &mut mpsc::Receiver<Key>,
@@ -586,7 +657,7 @@ fn try_next_ready(
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "watch"))]
 mod tests {
     use super::*;
 
@@ -683,7 +754,7 @@ mod tests {
     /// GOALS lists the plain screen-reader mode and honoring NO_COLOR as
     /// two separate obligations. Treating them as one cost a user who
     /// expressed a COLOR preference the eye, the firehose toggle, filters,
-    /// scrolling, the cheatsheet and the jump. Screen mode answers to
+    /// scrolling, the cheatsheet and pane focus. Screen mode answers to
     /// --plain and to having a terminal; nothing else.
     ///
     /// Run this with NO_COLOR set in the environment; the color half is
@@ -738,7 +809,7 @@ mod tests {
             watermark: 17,
             rows: Vec::new(),
         });
-        let mut intake = Intake::new();
+        let mut intake = StreamProjectionState::new();
         let mut message_follower = MessageFollower::default();
         let mut tick_armed = false;
         let (tx, _rx) = mpsc::channel(4);
@@ -776,7 +847,7 @@ mod tests {
     #[test]
     fn an_initial_connection_failure_is_visible_and_retryable() {
         let mut app = App::new(Theme::none(), View::Messages, Filter::default());
-        let mut intake = Intake::new();
+        let mut intake = StreamProjectionState::new();
         let mut message_follower = MessageFollower::default();
         let mut tick_armed = false;
         let (tx, _rx) = mpsc::channel(4);
@@ -801,11 +872,25 @@ mod tests {
     #[test]
     fn a_visible_stream_gap_requires_and_accepts_a_whole_snapshot_rebuild() {
         let mut app = App::new(Theme::none(), View::Messages, Filter::default());
+        app.live(Entry {
+            uid: 0,
+            ts: 1,
+            seq: None,
+            id: Some("stale-before-gap".into()),
+            kind: EntryKind::State {
+                target: "reviewer".into(),
+                recipient: None,
+                session_idx: 0,
+                pane_id: Some("%1".into()),
+                state: cyclops_proto::AgentState::BlockedPermission,
+            },
+        });
+        assert!(!app.is_empty());
         app.queue.replace(Snapshot {
             watermark: 17,
             rows: Vec::new(),
         });
-        let mut intake = Intake::new();
+        let mut intake = StreamProjectionState::new();
         let mut message_follower = MessageFollower::default();
         let mut tick_armed = false;
         let (focus, _focus_rx) = mpsc::channel(1);
@@ -824,6 +909,33 @@ mod tests {
             "stale state still allowed actions"
         );
         assert_eq!(app.handle_key(Key::Char('R')), Some(Command::Reconnect));
+
+        assert!(!handle(
+            &mut app,
+            &mut intake,
+            &mut message_follower,
+            &mut tick_armed,
+            &focus,
+            UiMsg::StreamProjection(Box::new(StreamProjection {
+                seed: Some(Box::new(StatusSeed::default())),
+                entries: Vec::new(),
+                max_seq: None,
+                warning: None,
+            })),
+        ));
+        assert!(
+            app.is_empty(),
+            "the stale stream projection survived reconnect"
+        );
+        assert!(
+            intake.is_backfilled(),
+            "the replacement projection did not land"
+        );
+        assert_eq!(
+            app.queue.watermark(),
+            17,
+            "stream recovery replaced the independent mailbox snapshot"
+        );
 
         assert!(!handle(
             &mut app,

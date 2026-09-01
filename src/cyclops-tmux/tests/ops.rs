@@ -9,7 +9,7 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::TestServer;
-use cyclops_tmux::{ControlClient, PaneDirection, SplitDirection, TmuxError};
+use cyclops_tmux::{ControlClient, ControlConfig, PaneDirection, SplitDirection, TmuxError};
 
 /// Pane ids of a target, in layout order.
 fn pane_ids(srv: &TestServer, target: &str) -> Vec<String> {
@@ -158,16 +158,112 @@ async fn select_pane_by_id_focuses_that_pane() {
 }
 
 #[tokio::test]
+async fn source_targeted_direction_does_not_borrow_the_ambient_current_pane() {
+    let Some(srv) = TestServer::new("ops-select-exact-source") else {
+        return;
+    };
+    srv.new_session("s");
+    srv.tmux_ok(&["split-window", "-h", "-t", "s"]);
+    srv.tmux_ok(&["split-window", "-h", "-t", "s"]);
+    let panes = pane_ids(&srv, "s");
+    let (left, middle, right) = (&panes[0], &panes[1], &panes[2]);
+    srv.tmux_ok(&["select-pane", "-t", right]);
+    let (client, _n) = ControlClient::spawn(srv.config("s")).await.expect("spawn");
+
+    client
+        .select_pane_toward_from(middle, PaneDirection::Left)
+        .await
+        .expect("select left of the captured source");
+
+    assert_eq!(field(&srv, "s", "#{pane_id}"), *left);
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn exact_focus_routes_stay_on_the_configured_server_and_config() {
+    let Some(ambient) = TestServer::new("ops-focus-route-ambient") else {
+        return;
+    };
+    let Some(configured) = TestServer::new("ops-focus-route-configured") else {
+        return;
+    };
+    ambient.new_session("same-name");
+    ambient.tmux_ok(&["split-window", "-h", "-t", "same-name"]);
+    let ambient_before = field(&ambient, "same-name", "#{pane_id}");
+
+    let root = scratch("cyclops-ops-focus-route-config");
+    let config_path = root.join("tmux.conf");
+    std::fs::write(&config_path, "set-option -g status-position top\n")
+        .expect("write configured tmux file");
+    let cfg = ControlConfig::new_session("same-name")
+        .on_socket(configured.sock().to_string())
+        .with_config_file(&config_path);
+    let (client, _n) = ControlClient::spawn(cfg)
+        .await
+        .expect("spawn configured client");
+    assert_eq!(
+        lines(&configured, &["show-options", "-gv", "status-position"]),
+        vec!["top"],
+        "the explicit config reached the same server as focus"
+    );
+
+    configured.tmux_ok(&["new-window", "-d", "-t", "same-name:", "-n", "second"]);
+    let second = lines(
+        &configured,
+        &["list-windows", "-t", "same-name", "-F", "#{window_id}"],
+    )[1]
+    .clone();
+    configured.tmux_ok(&["split-window", "-h", "-t", &second]);
+    let second_pane = pane_ids(&configured, &second)[0].clone();
+
+    client
+        .focus_window_pane(&second, &second_pane)
+        .await
+        .expect("focus exact window route");
+    assert_eq!(field(&configured, "same-name", "#{window_id}"), second);
+    assert_eq!(field(&configured, "same-name", "#{pane_id}"), second_pane);
+    assert_eq!(
+        field(&ambient, "same-name", "#{pane_id}"),
+        ambient_before,
+        "the same-shaped ambient server was untouched"
+    );
+
+    configured.new_session("background");
+    let background_id = field(&configured, "background", "#{session_id}");
+    let background_window = field(&configured, "background", "#{window_id}");
+    let background_pane = field(&configured, "background", "#{pane_id}");
+    configured.tmux_ok(&["rename-session", "-t", &background_id, "renamed-background"]);
+    configured.new_session("background");
+    client
+        .focus_session_window_pane(&background_id, &background_window, &background_pane)
+        .await
+        .expect("focus stable session route after name reuse");
+    assert_eq!(
+        lines(&configured, &["list-clients", "-F", "#{client_session}"]),
+        vec!["renamed-background"]
+    );
+    assert_eq!(
+        field(&configured, "renamed-background", "#{pane_id}"),
+        background_pane
+    );
+
+    client.shutdown().await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn horizontal_split_puts_the_new_pane_beside_the_source() {
     let Some(srv) = TestServer::new("ops-split-h") else {
         return;
     };
     srv.new_session("s");
     let source = pane_ids(&srv, "s")[0].clone();
+    let session_id = field(&srv, "s", "#{session_id}");
+    let window_id = field(&srv, &source, "#{window_id}");
     let (client, _n) = ControlClient::spawn(srv.config("s")).await.expect("spawn");
 
     client
-        .split_window(&source, SplitDirection::Horizontal)
+        .split_window_at(&session_id, &window_id, &source, SplitDirection::Horizontal)
         .await
         .expect("split");
 
@@ -197,10 +293,12 @@ async fn vertical_split_puts_the_new_pane_below_the_source() {
     };
     srv.new_session("s");
     let source = pane_ids(&srv, "s")[0].clone();
+    let session_id = field(&srv, "s", "#{session_id}");
+    let window_id = field(&srv, &source, "#{window_id}");
     let (client, _n) = ControlClient::spawn(srv.config("s")).await.expect("spawn");
 
     client
-        .split_window(&source, SplitDirection::Vertical)
+        .split_window_at(&session_id, &window_id, &source, SplitDirection::Vertical)
         .await
         .expect("split");
 
@@ -270,6 +368,8 @@ async fn split_opens_in_the_source_panes_directory_not_the_sessions() {
     // having landed yet, and reproduced zero mistargeted-pane failures
     // over 100 tries.
     let source = pane_ids(&srv, "s:1")[0].clone();
+    let session_id = field(&srv, "s", "#{session_id}");
+    let window_id = field(&srv, &source, "#{window_id}");
     let (client, _n) = ControlClient::spawn(srv.config("s")).await.expect("spawn");
     assert!(
         same_dir(&field(&srv, &source, "#{pane_current_path}"), &pane_dir),
@@ -277,7 +377,7 @@ async fn split_opens_in_the_source_panes_directory_not_the_sessions() {
     );
 
     client
-        .split_window(&source, SplitDirection::Horizontal)
+        .split_window_at(&session_id, &window_id, &source, SplitDirection::Horizontal)
         .await
         .expect("split");
 
@@ -293,6 +393,40 @@ async fn split_opens_in_the_source_panes_directory_not_the_sessions() {
     client.shutdown().await;
     let _ = std::fs::remove_dir_all(&session_dir);
     let _ = std::fs::remove_dir_all(&pane_dir);
+}
+
+#[tokio::test]
+async fn exact_split_route_refuses_a_source_moved_to_another_workspace() {
+    let Some(srv) = TestServer::new("ops-split-moved-source") else {
+        return;
+    };
+    srv.new_session("shown");
+    srv.tmux_ok(&["split-window", "-h", "-t", "shown"]);
+    srv.new_session("other");
+    let source = pane_ids(&srv, "shown")[0].clone();
+    let session_id = field(&srv, "shown", "#{session_id}");
+    let window_id = field(&srv, &source, "#{window_id}");
+    let (client, _n) = ControlClient::spawn(srv.config("shown"))
+        .await
+        .expect("spawn");
+
+    srv.tmux_ok(&["move-pane", "-s", &source, "-t", "other"]);
+    let before_shown = pane_ids(&srv, "shown");
+    let before_other = pane_ids(&srv, "other");
+    let error = client
+        .split_window_at(&session_id, &window_id, &source, SplitDirection::Horizontal)
+        .await
+        .expect_err("the old compound route must be stale");
+
+    assert!(matches!(error, TmuxError::Command(_)), "{error}");
+    assert_eq!(pane_ids(&srv, "shown"), before_shown);
+    assert_eq!(
+        pane_ids(&srv, "other"),
+        before_other,
+        "a stale route split the pane in its new workspace"
+    );
+
+    client.shutdown().await;
 }
 
 #[tokio::test]
@@ -476,6 +610,49 @@ async fn renaming_a_vanished_session_fails_instead_of_hitting_a_prefix_neighbour
     assert!(
         sessions.iter().any(|s| s == "project"),
         "`project` must not have been renamed: {sessions:?}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn rename_session_keeps_the_stable_id_after_name_reuse() {
+    let Some(srv) = TestServer::new("ops-rename-session-id") else {
+        return;
+    };
+    srv.new_session("host");
+    srv.new_session("original");
+    let target_id = lines(
+        &srv,
+        &[
+            "list-sessions",
+            "-f",
+            "#{==:#{session_name},original}",
+            "-F",
+            "#{session_id}",
+        ],
+    )[0]
+    .clone();
+    srv.tmux_ok(&["rename-session", "-t", &target_id, "moved"]);
+    srv.new_session("original");
+    let (client, _n) = ControlClient::spawn(srv.config("host"))
+        .await
+        .expect("spawn");
+
+    client
+        .rename_session(&target_id, "review")
+        .await
+        .expect("rename stable identity");
+
+    let rows = lines(
+        &srv,
+        &["list-sessions", "-F", "#{session_id}\t#{session_name}"],
+    );
+    assert!(rows
+        .iter()
+        .any(|row| row == &format!("{target_id}\treview")));
+    assert!(
+        rows.iter().any(|row| row.ends_with("\toriginal")),
+        "the session that reused the old name must be untouched: {rows:?}"
     );
     client.shutdown().await;
 }
@@ -730,6 +907,74 @@ async fn switch_to_session_moves_this_client() {
 }
 
 #[tokio::test]
+async fn switch_to_session_accepts_the_stable_session_id() {
+    let Some(srv) = TestServer::new("ops-switch-id") else {
+        return;
+    };
+    srv.new_session("alpha");
+    srv.new_session("beta");
+    let beta_id = field(&srv, "beta", "#{session_id}");
+    let (client, _n) = ControlClient::spawn(srv.config("alpha"))
+        .await
+        .expect("spawn");
+
+    assert_eq!(
+        client.current_session_id().await.expect("current alpha id"),
+        field(&srv, "alpha", "#{session_id}")
+    );
+
+    client
+        .switch_to_session(&beta_id)
+        .await
+        .expect("switch by stable id");
+
+    assert_eq!(
+        client.current_session_id().await.expect("current beta id"),
+        beta_id
+    );
+
+    let attached = lines(&srv, &["list-clients", "-F", "#{client_session}"]);
+    assert_eq!(attached, vec!["beta"], "the control client must move");
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn pane_current_path_reports_a_vanished_exact_pane_as_absent() {
+    let Some(srv) = TestServer::new("ops-pane-current-path") else {
+        return;
+    };
+    srv.new_session("host");
+    srv.tmux_ok(&["split-window", "-h", "-t", "host"]);
+    let panes = pane_ids(&srv, "host");
+    let live_pane = panes[0].clone();
+    let vanished_pane = panes[1].clone();
+    let (client, _n) = ControlClient::spawn(srv.config("host"))
+        .await
+        .expect("spawn");
+
+    srv.tmux_ok(&["kill-pane", "-t", &vanished_pane]);
+
+    assert!(
+        client
+            .pane_current_path(&live_pane)
+            .await
+            .expect("live pane read")
+            .is_some(),
+        "the still-live pane must not be treated as missing"
+    );
+    assert_eq!(
+        client
+            .pane_current_path(&vanished_pane)
+            .await
+            .expect("vanished pane read"),
+        None,
+        "tmux renders an absent exact pane as an empty successful expansion"
+    );
+
+    client.shutdown().await;
+}
+
+#[tokio::test]
 async fn new_session_returns_its_id_detached_in_the_requested_directory() {
     let Some(srv) = TestServer::new("ops-new-session") else {
         return;
@@ -781,6 +1026,112 @@ async fn kill_session_closes_exactly_that_session() {
     assert!(
         sessions.iter().any(|s| s == "project"),
         "the prefix neighbour must survive an exact-match kill: {sessions:?}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn close_session_uses_the_confirmed_id_after_rename_and_name_reuse() {
+    let Some(srv) = TestServer::new("ops-close-session-id-reuse") else {
+        return;
+    };
+    srv.new_session("host");
+    srv.new_session("target");
+    let target_id = field(&srv, "target", "#{session_id}");
+    let (client, _n) = ControlClient::spawn(srv.config("host"))
+        .await
+        .expect("spawn");
+
+    srv.tmux_ok(&["rename-session", "-t", &target_id, "renamed-target"]);
+    srv.new_session("target");
+    let reused_id = field(&srv, "target", "#{session_id}");
+
+    client
+        .close_session_at(&target_id, None)
+        .await
+        .close_result
+        .expect("close the confirmed identity");
+
+    let sessions = lines(
+        &srv,
+        &["list-sessions", "-F", "#{session_id} #{session_name}"],
+    );
+    assert!(
+        !sessions.iter().any(|row| row.starts_with(&target_id)),
+        "the renamed confirmed identity survived: {sessions:?}"
+    );
+    assert!(
+        sessions
+            .iter()
+            .any(|row| row == &format!("{reused_id} target")),
+        "the new session that reused the old name was closed: {sessions:?}"
+    );
+    let attached = lines(&srv, &["list-clients", "-F", "#{client_session}"]);
+    assert_eq!(
+        attached,
+        vec!["host"],
+        "closing a background session must not move the attached client"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn close_active_session_selects_the_exact_fallback_before_killing() {
+    let Some(srv) = TestServer::new("ops-close-session-fallback") else {
+        return;
+    };
+    srv.new_session("target");
+    srv.new_session("fallback");
+    let target_id = field(&srv, "target", "#{session_id}");
+    let fallback_id = field(&srv, "fallback", "#{session_id}");
+    let (client, _n) = ControlClient::spawn(srv.config("target"))
+        .await
+        .expect("spawn");
+
+    let attempt = client
+        .close_session_at(&target_id, Some(&fallback_id))
+        .await;
+    assert_eq!(
+        attempt.confirmed_current_session_id.as_deref(),
+        Some(fallback_id.as_str())
+    );
+    attempt.close_result.expect("switch and close");
+
+    let attached = lines(&srv, &["list-clients", "-F", "#{client_session}"]);
+    assert_eq!(attached, vec!["fallback"]);
+    let sessions = lines(&srv, &["list-sessions", "-F", "#{session_id}"]);
+    assert!(!sessions.contains(&target_id));
+    assert!(sessions.contains(&fallback_id));
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn missing_fallback_refuses_before_the_target_is_closed() {
+    let Some(srv) = TestServer::new("ops-close-session-missing-fallback") else {
+        return;
+    };
+    srv.new_session("target");
+    srv.new_session("fallback");
+    let target_id = field(&srv, "target", "#{session_id}");
+    let fallback_id = field(&srv, "fallback", "#{session_id}");
+    let (client, _n) = ControlClient::spawn(srv.config("target"))
+        .await
+        .expect("spawn");
+    srv.tmux_ok(&["kill-session", "-t", &fallback_id]);
+
+    let attempt = client
+        .close_session_at(&target_id, Some(&fallback_id))
+        .await;
+    assert_eq!(attempt.confirmed_current_session_id, None);
+    let error = attempt
+        .close_result
+        .expect_err("the exact fallback is gone");
+
+    assert!(matches!(error, TmuxError::Command(_)), "{error}");
+    let sessions = lines(&srv, &["list-sessions", "-F", "#{session_id}"]);
+    assert!(
+        sessions.contains(&target_id),
+        "target closed after fallback selection failed: {sessions:?}"
     );
     client.shutdown().await;
 }

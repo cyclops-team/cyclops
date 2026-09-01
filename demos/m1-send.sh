@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# M1 demo: the delivery pipeline end to end. cyclopsd watches an isolated
-# tmux session with two cat panes adopted as "implementer" and "reviewer"
-# via pane.label, then `cyclops send` pastes a message into a pane (visible
-# in the capture), a broadcast fans out to every labeled pane, and jq reads
-# the delivery record straight from the session ledger.
+# Current mailbox demo: durable messaging without either Cyclops UI. cyclopsd
+# watches an isolated tmux session with two cat panes adopted as
+# "implementer" and "reviewer". `cyclops send` durably accepts a private
+# message before its optional terminal wake, a broadcast fans out to every
+# labeled pane, and the body-free projection and workspace journal provide
+# independent evidence of the result.
 #
 # Never touches the default tmux server. Everything runs on a private server
 # (tmux -u -L cyc-m1-demo-$$ -f /dev/null, -u per finding F14) with a
@@ -21,6 +22,7 @@ SESSION="demo"
 CYCLOPS_HOME="$(mktemp -d "$(cyc_scratch_root)/cyclops-m1-demo.XXXXXX")"
 export CYCLOPS_HOME
 DAEMON_PID=""
+ADMIN_COMMAND_INDEX=0
 
 cd "$REPO"
 
@@ -30,6 +32,25 @@ done
 
 # Every tmux call in this script goes through the isolated socket.
 tmx() { command tmux -u -L "$SOCK" "$@"; }
+
+# Run an operator command from a short-lived tmux pane. This keeps the demo
+# valid when its parent shell belongs to a detected agent: the socket peer is
+# then an ordinary non-vendor pane, which Cyclops correctly authenticates as
+# the workspace administrator. tmux wait-for is the completion event, so the
+# demo never guesses how long the command needs.
+admin_command() {
+  ADMIN_COMMAND_INDEX=$((ADMIN_COMMAND_INDEX + 1))
+  local output="$CYCLOPS_HOME/admin-command-$ADMIN_COMMAND_INDEX.out"
+  local status="$CYCLOPS_HOME/admin-command-$ADMIN_COMMAND_INDEX.status"
+  local signal="cyc-m1-admin-$ADMIN_COMMAND_INDEX-$$"
+  local command_line="$1"
+
+  tmx new-window -d -t "$SESSION" \
+    "env CYCLOPS_HOME='$CYCLOPS_HOME' $command_line >'$output' 2>&1; result=\$?; printf '%s\\n' \"\$result\" >'$status'; command tmux -u -L '$SOCK' wait-for -S '$signal'"
+  tmx wait-for "$signal"
+  cat "$output"
+  test "$(cat "$status")" -eq 0
+}
 
 cleanup() {
   if [ -n "$DAEMON_PID" ]; then
@@ -46,8 +67,8 @@ trap cleanup EXIT
 echo "== demo home:   $CYCLOPS_HOME (removed on exit)"
 echo "== tmux server: -L $SOCK (isolated, removed on exit)"
 
-# Isolated server, session "demo", two cat panes. cat echoes whatever the
-# pipeline pastes, so the delivery is visible in a capture.
+# Isolated server, session "demo", two cat panes. They provide a visible
+# terminal wake target without either Cyclops UI.
 command tmux -u -f /dev/null -L "$SOCK" new-session -d -s "$SESSION" -x 200 -y 50 cat
 tmx split-window -d -h -t "$SESSION:0" cat
 
@@ -55,9 +76,10 @@ PANES=()
 while IFS= read -r p; do PANES+=("$p"); done < <(tmx list-panes -t "$SESSION" -F '#{pane_id}')
 echo "== panes: ${PANES[0]} (implementer)  ${PANES[1]} (reviewer)"
 
-# Demo manifest bound to cat panes: title tier always reads idle, staging
-# is verified by the message id, no hook ACK (screen tier). The shipped
-# manifests bind claude/codex/agy; a demo cat pane needs its own.
+# Demo manifest bound to cat panes: title tier always reads idle, but the
+# fixture intentionally declares no injection capability. This proves that
+# durable messaging still works when terminal notification is unavailable.
+# The shipped manifests bind real agent CLIs; a demo cat pane needs its own.
 mkdir -p "$CYCLOPS_HOME/manifests"
 cat > "$CYCLOPS_HOME/manifests/cat.toml" <<'EOF'
 [agent]
@@ -71,13 +93,6 @@ state = "idle"
 priority = 100
 region = "pane_title"
 regex = ['^']
-
-[injection]
-method = "load-buffer + paste-buffer -p"
-submit = "Enter"
-verify_before_submit = true
-verify_pattern = ["<message_id>"]
-safe_states = ["idle"]
 EOF
 
 # Daemon config. receipt_block_ms is raised above the 2500 default so a
@@ -116,9 +131,9 @@ if [ -z "$ok" ]; then
   exit 1
 fi
 
-# Adopt the panes through the registry: pane.label over the NDJSON socket
-# (the CLI grows a verb for this in M2). Retries while the daemon attaches
-# the session; each success writes a pane_labeled system line.
+# Adopt the panes through the registry over the NDJSON socket. Retries while
+# the daemon attaches the session; each success writes a pane_labeled system
+# line.
 echo "== labeling panes via pane.label"
 python3 - "$CYCLOPS_HOME/sock" "${PANES[0]}" implementer "${PANES[1]}" reviewer <<'EOF'
 import json, socket, sys, time
@@ -153,33 +168,31 @@ for pane, label in pairs:
 EOF
 
 echo
-echo "== cyclops send implementer (watch the paste land)"
-cargo run -q -p cyclops -- send implementer \
-  --subject "Review the rate limiter" \
-  --body $'Please look at retry.rs before the next run.\nBoth lines paste as one message.'
-
-echo
-echo "== implementer pane (${PANES[0]}) after delivery:"
-tmx capture-pane -p -t "${PANES[0]}" | awk 'NF{n=NR} {l[NR]=$0} END{for(i=1;i<=n;i++) print "   " l[i]}'
+echo "== cyclops send implementer (durable acceptance precedes the optional wake)"
+admin_command "'$REPO/target/debug/cyclops' send implementer --subject 'Review the rate limiter' --summary 'The rate limiter is ready for review. Check retry.rs before the next run.' --body 'Please look at retry.rs before the next run. Both lines remain one private message.'"
 
 echo
 echo "== cyclops send --all (broadcast: one ledger fact, N deliveries)"
-cargo run -q -p cyclops -- send --all \
-  --subject "standup" \
-  --body "Broadcast to every labeled pane."
-
-LEDGER="$CYCLOPS_HOME/ledger/$SESSION.ndjson"
-echo
-echo "== ledger msg lines ($LEDGER)"
-jq -c 'select(.kind == "msg") | {seq, id, from, to, subject}' "$LEDGER"
+admin_command "'$REPO/target/debug/cyclops' send --all --subject 'standup' --summary 'Standup is ready for both agents. Join after reaching a safe stopping point.' --body 'Broadcast to every labeled pane.'"
 
 echo
-echo "== ledger state lines (every delivery transition, causes never screens)"
-# kind=state also carries fused pane-state changes; to_state marks the
-# delivery transitions.
-jq -c 'select(.kind == "state" and .data.to_state != null)
-       | {seq, id, to: .data.to, from: .data.from, to_state: .data.to_state, cause: .data.cause}' \
-  "$LEDGER"
+echo "== body-free authenticated projection (no UI required)"
+admin_command "'$REPO/target/debug/cyclops' messages --plain"
+
+JOURNAL=""
+for candidate in "$CYCLOPS_HOME"/workspaces/*/messages.ndjson; do
+  if [ -f "$candidate" ]; then JOURNAL="$candidate"; break; fi
+done
+[ -n "$JOURNAL" ] || { echo "!! workspace journal was not created" >&2; exit 1; }
+
+echo
+echo "== workspace message facts ($JOURNAL; bodies intentionally omitted)"
+jq -c 'select(.kind == "msg") | {seq, id, from, to, subject}' "$JOURNAL"
+
+echo
+echo "== optional wake facts (content-free and honestly classified)"
+jq -c 'select(.data.type? == "notification_transition")
+       | {seq, id, state: .data.state, cause: .data.cause}' "$JOURNAL"
 
 echo
 echo "== done, cleaning up"

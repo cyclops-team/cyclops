@@ -14,7 +14,7 @@ The messaging protocol and the workspace are deliberately separate. Agents can
 use Cyclops without opening the UI. If the UI closes, accepted messages remain
 in the append-only journal.
 
-Cyclops is pre-release software at version `0.1.0`. It currently ships tested
+Cyclops is pre-release software at version `0.1.0-beta`. It currently ships tested
 manifests for Codex CLI, Claude Code, Antigravity CLI, and Cursor Agent CLI.
 Detection is conservative and version-sensitive: unknown terminal chrome holds
 a write instead of guessing. See [STATUS.md](STATUS.md) for current evidence and
@@ -69,22 +69,51 @@ rollback, and uninstall.
 
 ## Uninstall completely
 
-The managed uninstall stops the matching daemon, removes the installed binary
-pair, and removes the installer-owned PATH block. It deliberately preserves
-your mailbox history, configuration, and vendor settings:
+For a state-preserving uninstall, the managed uninstall stops the matching
+daemon, removes the installed binary pair and installer-owned PATH block, and
+deliberately leaves mailbox history, configuration, and vendor settings:
 
 ```bash
 curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
 ```
 
-For a complete removal, first copy any history you want to keep. Then remove
-the Cyclops hook commands from `~/.claude/settings.json`,
+For a complete uninstall, do the state-home steps below first, while the
+`cyclops` command is still installed. Use
+[`cyclops data inventory`](docs/guides/data.md) to see the retained journals
+and `cyclops data export --to <new-directory>` to make a portable copy. The
+same guide documents `cyclops data forget --all`: stop the daemon before its
+preview and keep it stopped through exact confirmation to remove only the
+journal scope, deliberately leaving configuration and other state behind.
+
+To remove the complete current state home, stop the daemon, preview its exact
+body-free inventory, then paste the confirmation it prints:
+
+```bash
+cyclops daemon stop
+cyclops data export --to <new-directory>
+cyclops remove --all
+cyclops remove --all --confirm <token-from-preview>
+```
+
+`cyclops remove --all` removes only the current state home. It does not remove
+installed binaries, the installer-owned PATH block, vendor configuration, or
+skill files in agent-owned directories, including a Cyclops-seeded copy. For
+the exact scope and interrupted-removal recovery boundary, follow the
+[complete state-home removal guide](docs/guides/data.md#remove-the-complete-current-state-home).
+Once that command has reported its result, run the managed uninstall:
+
+```bash
+curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
+```
+
+Then remove only the Cyclops hook commands from
+`~/.claude/settings.json`,
 `~/.codex/hooks.json`, `~/.agents/hooks.json`, and
 `~/.cursor/hooks.json` where those files exist, preserving every unrelated
-entry. Finally, delete `~/.cyclops`. This last step permanently removes local
-mailbox journals, configuration, themes, prepared hooks, and operational
-records. The [installation guide](docs/guides/install.md#uninstall) lists the
-records worth exporting before that irreversible step.
+entry. Skill files in agent-owned directories, including a Cyclops-seeded
+copy, are separately owned: remove one only when you have checked that it is
+not an operator customization. The [installation guide](docs/guides/install.md#uninstall)
+lists the full removal boundary.
 
 ## How to run Cyclops
 
@@ -164,9 +193,11 @@ daemon-owned recovery barrier remains blocked.
 For operators who prefer liveness over that final content guarantee, Settings
 includes a default-off `Force staged submit` timer from 0 to 20 seconds. It
 applies only after an exact notification was pasted but normal verification
-failed. The daemon rechecks the exact attempt and pane process, then presses
-Enter once without pasting again. A claim or replacement cancels it. This mode
-can submit human input, especially at 0 seconds, so it is never enabled by
+failed. The daemon rechecks the exact attempt and pane process, then reserves
+one key atomically with `inbox.claim` before pressing Enter without pasting
+again. A claim or replacement that wins before that reservation stops it. Once
+reserved, a later claim or setting change does not retract the one key. This
+mode can submit human input, especially at 0 seconds, so it is never enabled by
 default.
 
 <!-- Media slot: docs/public/images/composer-hold.png
@@ -202,7 +233,11 @@ Cyclops never converts uncertainty into success.
 - Stable tmux and process identities prevent a renamed or replaced pane from
   inheriting another occupant's delivery.
 - Raw tmux remains an operator-controlled emergency path, not an automatic
-  fallback and not a source of synthetic receipts.
+  fallback and not a source of synthetic receipts. A human may authorize one
+  exact, labeled, unrecorded pane write only after confirming Cyclops is
+  unavailable or broken. Slow delivery, a safety hold, or an ambiguous daemon
+  outcome is not confirmation of failure. See the
+  [raw-tmux emergency doctrine](docs/development/DELIVERY.md#raw-tmux-emergency-doctrine).
 
 Start troubleshooting with `cyclops health`, `cyclops status`, and
 [`docs/guides/troubleshooting.md`](docs/guides/troubleshooting.md).

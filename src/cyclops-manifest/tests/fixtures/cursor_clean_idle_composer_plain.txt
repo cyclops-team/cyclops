@@ -12,4 +12,3 @@
   Cursor Grok 4.5 High · 11.9%   Run Everything
   ~/Desktop/Code/rfq-automation-agent ·
   cyclops-video-take
-

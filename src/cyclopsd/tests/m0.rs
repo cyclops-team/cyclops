@@ -2,7 +2,7 @@
 //! daemon booted in-process, an NDJSON client on the Unix socket.
 //!
 //! Never touches the user's tmux: every tmux call carries
-//! `-L cyc-m0-<pid> -f /dev/null` through cyclops-testrig, which kills
+//! `-L cyc-m0-<pid>-<sequence> -f /dev/null` through cyclops-testrig, which kills
 //! the server and unlinks its socket on drop.
 //! Skips cleanly when tmux is not on PATH.
 //!
@@ -234,7 +234,8 @@ async fn m0_shadow_daemon_end_to_end() {
     // Hello and ping.
     let (mut c, hello) = TestClient::connect(&sock).await;
     assert_eq!(hello["proto"], 1);
-    assert_eq!(hello["build"], env!("CYCLOPS_BUILD_REF"));
+    assert_eq!(hello["cyclops"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(hello["build"], cyclops_proto::BUILD_REF);
     assert!(!hello["boot_id"].as_str().unwrap().is_empty());
     let resp = c.request("ping", json!({})).await;
     assert_eq!(resp["result"]["pong"], true);
@@ -263,7 +264,8 @@ async fn m0_shadow_daemon_end_to_end() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let pane_id = loop {
         let resp = c.request("status", json!({})).await;
-        assert_eq!(resp["result"]["daemon_build"], env!("CYCLOPS_BUILD_REF"));
+        assert_eq!(resp["result"]["daemon_build"], cyclops_proto::BUILD_REF);
+        assert_eq!(resp["result"]["daemon_version"], env!("CARGO_PKG_VERSION"));
         let session = &resp["result"]["sessions"][0];
         if session["attached"] == json!(true) {
             let pane = &session["panes"][0];

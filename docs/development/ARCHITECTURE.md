@@ -1,5 +1,7 @@
 # How a message gets from one pane to another
 
+**Status:** Current behavior contract
+
 Cyclops v2 is a tmux-backed coordination daemon for terminal coding agents.
 This page follows one message end to end and names, at every fork, the file
 that decides. Read it once and you can put your finger on where any
@@ -48,6 +50,108 @@ The sender is never in the request. The daemon resolves it from the peer
 credentials on the socket and walks that pid up to a watched pane, so
 nothing in a body can forge the header a recipient reads.
 
+## Current mailbox messaging: the durable operation boundary
+
+`src/cyclopsd/src/messaging.rs` contains the internal `WorkspaceMessaging`
+Module. The socket handlers authenticate the caller, then hand this Module an
+identity and a send, reply, inbox, claim, snapshot, follow, requeue, or exact
+pre-write withdrawal request. Alarm administration and attention selection use
+the same boundary. They do not receive the workspace journal, mailbox
+projection, publication lock, notification worker, unread scheduler, or pane
+route.
+
+`WorkspaceMessaging` owns the durable acceptance call and the complete
+post-commit sequence: subscribe before worker scheduling, schedule every exact
+recipient without revoking an accepted message, invalidate unread projections,
+observe the bounded durable receipt state, and resolve body-free pane metadata.
+It also owns body-free inbox and message reads, the compatibility-sensitive
+claim-locator choice, the durable claim transition, and the exact post-claim
+sequence for notification settlement, cancellation, recovery, FIFO advance,
+attention reconciliation, and unread invalidation. Socket adapters receive wire
+results rather than mailbox projection or claim-outcome types. Requeue and
+pre-write withdrawal also stay atomic at this boundary: the Module commits the
+durable mutation, then owns notification scheduling, exact cancellation, FIFO
+advance, and unread invalidation. Publication synchronization is owned inside
+the Module and exposed only through Module operations that require one
+consistent transaction. Delivery supplies immutable pre-write observations to
+the Module and receives only a body-free recorded-or-obsolete result. The
+Module synthesizes a content-free route baseline when readiness changed without
+one, selects the wake-block policy, commits the durable transition, classifies
+benign obsolete work, converts exhausted supervisors into a durable block, and
+publishes the first route consequence. Delivery retains physical route
+re-observation and faults its worker when storage is uncertain; it does not
+receive the publication lock or interpret journal states.
+The Module also owns body-free alarm summaries, administrator clearance, exact
+attention-target selection, ambiguity, and recipient visibility. The separate
+attention-resolution mechanism receives the selected attempt through a narrow
+internal handoff because it must inspect the terminal and may execute one
+manifest key. Resolution reservation, durable intent, accepted-action,
+consumption, final settlement, and pre-key withdrawal cross back through
+`WorkspaceMessaging`; terminal code does not append those facts itself. The
+Module also selects exact-owned reconciliation candidates, owns boot-local
+worker election and conflict parking, and returns one exact action at a time.
+The composition adapter hosts task execution, while the terminal mechanism no
+longer scans messaging projections or coordinates reconciliation workers.
+Expected payload reconstruction, current route lookup, exact consumption
+registration, and deterministic registration cleanup are named Module
+operations; terminal code never receives `MailboxService`. The socket adapter
+never receives the mailbox record or decides who may inspect it.
+Daemon status receives one body-free `WorkspaceMessaging` projection containing
+mailbox routes, unread counts, held attention, and the bounded blocked-wake
+sample. The same projection owns active composer-candidate cardinality, durable
+binding comparison, mailbox-state mapping, recovery policy, and the finished
+next action. It also joins durable gating records to current route and
+working-state evidence, then exposes only body-free foreground-watch candidates
+to the process diagnostic. Status composition supplies only current
+content-free pane evidence and keeps the legacy session-ledger fold separate;
+it does not inspect mailbox variants, recovery variants, worker ownership,
+directory fallbacks, or notification indexes. The process diagnostic knows
+only candidate attempt and pane facts plus the operating-system process
+snapshot; it cannot read the mailbox, resolve a route, or traverse daemon state.
+The daemon composition root in `src/cyclopsd/src/lib.rs` constructs the Module
+and supplies those downstream actions through one narrow effects capability.
+Only that composition adapter may upgrade the non-owning daemon-root reference;
+the `WorkspaceMessaging` operation code can name capabilities but cannot
+traverse `Inner`. The Module remains internal to `cyclopsd`; no messaging crate
+has been extracted. Daemon-root notification scheduling and terminal recovery
+live separately in `src/cyclopsd/src/messaging_runtime.rs`; a whole-file lint
+prevents the durable Module from recovering that adapter, the pane cache, task
+spawning, delivery enqueueing, or pane observation. Delivery and attention
+mechanisms report a changed durable notification head back to the Module; they
+no longer receive the mailbox service and call the recipient scheduler
+themselves. Fusion and authenticated ACK handling now publish immutable route
+evidence, while delivery and socket code invoke named Module operations after
+durable pre-write, notification, attention, and force-submit-setting changes.
+Those callers no longer choose route reconciliation, reminder, or force-submit
+workers. Authenticated receipt hooks also publish one immutable attention
+consumption observation. The Module owns exact candidate lookup, durable
+binding and payload comparison, and the one-shot signal; hook handling cannot
+reach the mailbox service or candidate storage. The retained runtime mechanisms
+are reachable only through the physically separate composition adapter.
+Durable messaging operations cannot use their daemon-root capabilities.
+
+The append and sync inside `MailboxService` are still the acceptance boundary.
+Notification and pane chrome remain effects of that durable fact, never a
+condition for whether the message exists.
+
+The full workspace's collapsed Messages rail is a body-free projection of the
+same authenticated snapshot as its open queue. It retains only snapshot counts,
+uses the shared refresh gate to distinguish current state from stale or unknown
+state, and refreshes on `messages.changed` even while the pane stays closed.
+It never opens the pane, stores another unread queue, or receives message
+content. Opening the pane requests a fresh detailed projection before enabling
+actions. This local rail does not replace the daemon-owned adopted-tmux border
+count, and direct native tmux remains intentionally chrome-free with manual
+inbox inspection.
+
+Fresh pane observation and durable messaging also meet at this boundary for
+the first extracted consequence family. Fusion commits the pane cache and
+returns an immutable quota-reset observation containing the exact recipient,
+pane, and session slot. `WorkspaceMessaging` turns that observation into
+`QuotaResetObserved` journal facts and decides the explicit administrator
+notice that the daemon composition root commits. The observer does not append
+those facts, and reset observation never requeues or writes to the terminal.
+
 ## Watching: how the daemon knows what a pane is doing
 
 ```mermaid
@@ -62,8 +166,12 @@ flowchart TD
     RC -->|"list-panes: the authoritative answer"| P["pane table, keyed by pane_id"]
     RW --> P
     P -->|"a row moved, a hook edge arrived,<br/>or a caller asked"| F["fusion"]
-    F -->|"the verdict moved"| O(["state event · ledger line · border repaint"])
+    F -->|"the verdict moved"| S(["state event · ledger line"])
     F -->|"a caller asked"| Q(["status · pane.read · agent.wait · the gate"])
+    F -->|"verdict + optional immutable evidence"| A["apply_pane_observation"]
+    A -->|"first: positive quota-reset evidence"| E["WorkspaceMessaging:<br/>durable reset fact + notice decision"]
+    E --> N["composition root:<br/>durable explicit notice"]
+    A -->|"then, after the durable handoff:<br/>the verdict moved"| O(["border repaint"])
 ```
 
 Notifications are hints, not truth. Truth comes from `list-panes`, and the
@@ -73,7 +181,7 @@ core). `src/cyclops-tmux/src/watcher.rs` owns this loop.
 
 ### Fusion: which sensor decides
 
-`src/cyclopsd/src/fusion.rs`, `recompute_pane`. Manifest rules are sorted by
+`src/cyclopsd/src/fusion.rs`, `observe_pane`. Manifest rules are sorted by
 priority once at load; every tier below picks the first rule that matches,
 and the fused verdict is whichever tier's winner sits earlier in that one
 order.
@@ -122,14 +230,37 @@ return to idle. Cyclops does not pair Claude's next `Stop` with that prompt by
 arrival order or elapsed time. Blocked states always come from rules because
 no tested CLI hook identifies its modals or quota screens.
 
+## Retained compatibility boundary
+
+`src/cyclopsd/src/compatibility.rs` is the explicit entry point for behavior
+that predates the workspace mailbox: direct in-process payload delivery,
+restart settlement of direct-delivery chains, and replay of session journals
+linked across session renames. It does not make those paths the current
+messaging contract and does not promise indefinite support.
+
+The direct writer and restart settlement functions in `delivery.rs` require a
+private capability value that only `compatibility.rs` owns. The hook self-test
+and `Daemon::deliver_payload` therefore cannot reach those writers without
+naming the compatibility boundary. `Daemon::deliver_payload` remains
+compatibility-sensitive and unchanged; its public support status is unverified.
+
+The history read model asks the same boundary for compatibility sources. That
+boundary owns session-journal discovery, safe rename-link traversal, and the
+`session-journal:<file>` source label. Ambiguously owned linked files remain
+readable and reserve their identifiers, but they cannot authorize restart
+settlement. Workspace-owned records still win identity and body collisions.
+Nothing in this quarantine rewrites, truncates, or deletes a journal.
+
 ## Legacy direct-payload sending: how a message becomes a receipt
 
 This section documents the compatibility pipeline. The public `msg.send`
 endpoint uses the mailbox path: it returns durable acceptance, then schedules a
 separate notification attempt as specified in [DELIVERY.md](DELIVERY.md). The
-internal `delivery::msg_send` compatibility function writes a session fact and
-fans out; one FIFO worker per recipient pane then carries each chain on its own.
-The implementation is `src/cyclopsd/src/delivery.rs`.
+`compatibility::deliver_payload` entry point delegates to the retained direct
+writer in `delivery.rs`, which writes a session fact and fans out; one FIFO
+worker per recipient pane then carries each chain on its own. The boundary is
+`src/cyclopsd/src/compatibility.rs`; the pipeline remains in
+`src/cyclopsd/src/delivery.rs`.
 
 ### The call: what the sender gets back
 
@@ -246,7 +377,7 @@ flowchart TD
     s7 -->|"modal or permission, otherwise:<br/>hold on the rule id, admin pinged once"| hold
     s7 -->|"working + live screen + clean composer proof"| s8
     s7 -->|"working without proof"| hold
-    s7 -->|"idle_with_input: human typing wins"| hold
+    s7 -->|"idle_with_input: visible input holds"| hold
     s7 -->|unknown| hold
     decline --> s1
     hold["8. hold: wait for a pane or state event,<br/>never a timer"] --> s1
@@ -305,8 +436,10 @@ therefore not in the queue that a park drains.
 
 One transition is missing from the diagram because it has no single source.
 A daemon restart closes every chain still in flight to `attention_required`
-with cause `daemon_restart`, whatever state it was in (`delivery.rs`,
-`close_limbo`). Limbo is a bug, so a restart never leaves a chain open.
+with cause `daemon_restart`, whatever state it was in
+(`compatibility::recover_direct_deliveries` delegates to the retained
+`delivery.rs` settlement). Limbo is a bug, so a restart never leaves a chain
+open.
 
 ## What needs a human, and who owns it
 
@@ -430,7 +563,7 @@ two:
 | Edge | Fired by |
 |---|---|
 | adoption | `adopt_pane` |
-| a fused state change | `fusion::recompute_pane_with_evidence` |
+| a fused state change | `apply_pane_observation` |
 | a clear | `unadopt_pane` |
 | a session attach | `reconcile_adoptions` |
 | a window move | `move_chrome` |
@@ -472,7 +605,7 @@ what it deliberately does not; read that before changing one.
 | `cyclops-ui` | The stream behind `cyclops watch`: admin view, firehose, the eye, jump-to-pane, windowed rendering over a 10k ring (docs/guides/ui.md). |
 | `cyclops-workspace` | The full-screen workspace behind bare `cyclops`: Ratatui/Crossterm chrome, embedded pane VT runtimes, direct manipulation, dialogs, and persistence. |
 | `cyclops-state` | Owner-only state paths beneath one validated root descriptor. Refuses links, unexpected file types, foreign owners, and paths that escape the root. |
-| `cyclops-ledger` | Crash-safe append-only NDJSON writer and cursor reader. Fsync before acknowledging; torn final lines are sealed, never rewritten. |
+| `cyclops-ledger` | Crash-safe append-only NDJSON writer and cursor reader. Fsync before acknowledging; newline-terminated records are immutable, while strict replay removes only an unterminated unacknowledged final tail. |
 | `cyclops-theme` | The semantic token vocabulary, theme files, 256-color fallback, selection and hot reload (docs/guides/themes.md). |
 | `cyclops-testrig` | Test-only. The isolated tmux server and the one statement of its teardown rule. |
 
@@ -497,7 +630,7 @@ its own CI job).
 | Sensor fusion with per-sensor readings and observable disagreement (revision 2) | Types in `src/cyclops-proto/src/state.rs`; engine in `src/cyclopsd/src/fusion.rs`; hook sensor fed from `src/cyclopsd/src/ack.rs` |
 | Detection rules are per-CLI data, not code (H2) | `cyclops-manifest`, `resources/manifests/{claude,codex,agy,cursor}.toml` |
 | NDJSON Unix socket, hello line first, version mismatch warns never rejects (S2) | `src/cyclops-proto/src/wire.rs`; server in `src/cyclopsd/src/server.rs` |
-| Append-only NDJSON ledger, monotonic seq plus boot_id, replayable by cursor (C6) | Schema in `src/cyclops-proto/src/ledger.rs`; writer in `cyclops-ledger`. The stream client backfills by reading session files directly; server-side cursor replay on `events.subscribe` is accepted and ignored, with no client that needs it |
+| Append-only NDJSON ledger, monotonic seq plus boot_id, replayable by cursor (C6) | Schema in `src/cyclops-proto/src/ledger.rs`; writer in `cyclops-ledger`. The daemon owns retained history traversal and serves the stream a bounded body-free `events.backfill` projection. `events.subscribe` is explicitly ephemeral; durable mailbox recovery uses `messages.follow` |
 | Delivery pipeline: queue, gate, paste, verify, submit, ACK; only proven pre-write failures retry, while after-write outcomes require attention | `src/cyclops-proto/src/ledger.rs` for the machine, `src/cyclopsd/src/delivery.rs` for the pipeline |
 | Turn detection from hooks via a `cyclops hook` receiver | `wire.rs` (`agent.state.report`), `src/cyclops/src/hook.rs`, `src/cyclopsd/src/ack.rs` |
 | Agent surface: thin CLI speaking NDJSON to the socket | `src/cyclops` |
@@ -543,9 +676,11 @@ Idle CPU near zero is a hard goal (GOALS.md). Concretely:
   doubt, never on a schedule.
 - Daemon stalls are in-band, not watchdog-polled: `pause-after` converts
   falling behind into `%pause` and `%continue` notifications (amendment a).
-- Clients never poll the daemon: `events.subscribe` pushes. The stream UI
-  backfills by reading the session ledger tails once at startup and rides
-  the push from there.
+- Clients never poll the daemon: `events.subscribe` pushes. After each
+  acknowledged connection, the stream UI installs one daemon-owned
+  `events.backfill` plus current-status replacement before it resumes live
+  events. A later replacement is caused only by an observed gap and explicit
+  reconnect.
 
 Timers do exist; none of them is an interval. Each is a one-shot tied to
 one thing that already happened: the paste verification re-reads, the

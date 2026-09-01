@@ -10,6 +10,7 @@ handoff. The remaining guides answer one operational question each.
 |---|---|
 | [Quickstart](QUICKSTART.md) | You want the shortest path from install to a claimed message and reply. |
 | [Install, update, and remove](install.md) | You need installation paths, rollback, update, or uninstall details. |
+| [Durable records](data.md) | You want to inventory, export, or explicitly forget retained journals. |
 | [Troubleshooting](troubleshooting.md) | A daemon, pane, notification, or receipt is not behaving as expected. |
 
 ## Message another agent

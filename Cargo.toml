@@ -7,6 +7,7 @@ members = [
     "src/cyclops-state",
     "src/cyclops-ledger",
     "src/cyclops-theme",
+    "src/cyclops-client",
     "src/cyclops-ui",
     "src/cyclopsd",
     "src/cyclops",
@@ -21,7 +22,7 @@ members = [
 exclude = ["website"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-beta"
 edition = "2021"
 
 [workspace.dependencies]
@@ -46,7 +47,8 @@ cyclops-tmux = { path = "src/cyclops-tmux" }
 cyclops-state = { path = "src/cyclops-state" }
 cyclops-ledger = { path = "src/cyclops-ledger" }
 cyclops-theme = { path = "src/cyclops-theme" }
-cyclops-ui = { path = "src/cyclops-ui" }
+cyclops-client = { path = "src/cyclops-client" }
+cyclops-ui = { path = "src/cyclops-ui", default-features = false }
 cyclops-testrig = { path = "tests/testrig" }
 cyclops-workspace = { path = "src/cyclops-workspace" }
 

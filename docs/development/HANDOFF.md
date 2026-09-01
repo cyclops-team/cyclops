@@ -4,12 +4,40 @@ A map, not a summary. Where things live, where to start reading for the
 job you have been handed, and which decisions were deliberate so you do not
 spend a day undoing one.
 
-For current behavior, start with this map and the normative contracts it links.
+For current behavior, start with this map and the behavior contracts below.
+The approved [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md)
+records Track A's scope and stop conditions. Its seven implementation
+milestones and focused acceptance corrections are complete, and the charter
+remains their behavior and compatibility authority.
+[Cyclops Beta Charter](CYCLOPS_BETA_CHARTER.md) controls the remaining
+whole-product beta scope, dependencies, stop conditions, and release boundary.
+[NEXT.md](NEXT.md) is the current whole-beta execution queue. The
+[Messaging Beta audit](MESSAGING_BETA_AUDIT.md) preserves the original
+completion evidence, the independently found gaps, and the evidence that
+closed them. The [final beta acceptance audit](CYCLOPS_BETA_FINAL_AUDIT.md)
+records the technical beta-acceptance decision for the audited candidate, not
+release authorization, and the remaining operator release gate.
+
+The
+[messaging architecture review](../MESSAGING_ARCHITECTURE_REVIEW.md) and its
+[addendum](../ADDENDUM_REVIEW.md) are supporting design records. They explain
+the reasoning behind the approved charter, but the charter controls
+implementation when the documents differ. The
+[whole-system architecture review](../CYCLOPS_SYSTEM_ARCHITECTURE_REVIEW.md)
+is the supporting evidence behind the Cyclops Beta Charter. Its reviewed
+revision and measurements remain historical; the charter records current
+finding dispositions. The
+[CI and test architecture review](CI_TEST_ARCHITECTURE_REVIEW.md) is the
+supporting design record behind the implemented [current CI contract](CI.md),
+not messaging authority. The reusable
+[architecture review method](ARCHITECTURE_REVIEW_PROCESS.md) is methodology,
+not a Cyclops behavior contract.
+
 The completed stabilization run is recorded in
-[STABILIZATION_HISTORY.md](STABILIZATION_HISTORY.md). The prioritized next
-architecture work is in [NEXT.md](NEXT.md). The
-[reliability roadmap](RELIABILITY_ROADMAP.md) is the frozen gate record for the
-stabilization campaign, not the current public starting point.
+[STABILIZATION_HISTORY.md](STABILIZATION_HISTORY.md). The
+[reliability roadmap](RELIABILITY_ROADMAP.md) is a frozen historical gate record,
+and [V5.md](V5.md) is a historical design record. Do not use them as current
+implementation authority.
 
 Cyclops coordinates terminal coding agents that are already running in your
 tmux session. It watches panes, works out whether each agent is idle,
@@ -23,7 +51,11 @@ For current messaging, start with [send.md](../guides/send.md),
 [PROTOCOL.md](../reference/PROTOCOL.md), `src/cyclopsd/src/mailbox.rs`, and
 `src/cyclopsd/src/messaging.rs`. Sections explicitly labeled legacy describe
 the compatibility path used by hook self-tests and old session records, not
-standard `cyclops send`.
+standard `cyclops send`. `src/cyclopsd/src/compatibility.rs` is the boundary
+around retained direct-delivery writers, restart settlement, and
+`CompatibilityHistoryAdapter`. `WorkspaceMessaging` owns policy for current
+history and threads. The adapter only discovers and replays retained session
+journals.
 
 ## Documentation map
 
@@ -34,9 +66,16 @@ contracts, and historical records separate:
 |---|---|---|
 | User operation | [User guides](../guides/README.md) | Install, message, monitor, recover, and use the workspace. |
 | Stable reference | [Technical reference](../reference/README.md) | Wire methods, manifests, hooks, and measured performance claims. |
-| Active contracts | [Architecture](ARCHITECTURE.md), [delivery](DELIVERY.md), [invariants](INVARIANTS.md), [goals](GOALS.md), and [style](STYLE.md) | Read before changing product behavior or tests. |
-| Prioritized work | [Next architecture work](NEXT.md) | Behavior-preserving work that is approved but not yet implemented. |
-| Frozen and historical records | [Reliability roadmap](RELIABILITY_ROADMAP.md), [stabilization history](STABILIZATION_HISTORY.md), [V5 line](V5.md), [changelog](../../CHANGELOG.md), and [findings](../../findings.md) | Preserve the reasoning and evidence behind the current system. Do not treat old plans as current behavior. |
+| Current behavior contracts | [Architecture](ARCHITECTURE.md), [delivery](DELIVERY.md), [invariants](INVARIANTS.md), [protocol](../reference/PROTOCOL.md), [goals](GOALS.md), and [style](STYLE.md) | Read before changing product behavior, wire behavior, rendering, or tests. |
+| Approved implementation authority | [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) and [Cyclops Beta Charter](CYCLOPS_BETA_CHARTER.md) | The messaging charter controls accepted Track A behavior. The beta charter controls remaining scope, dependencies, stop conditions, and release gates. |
+| Current execution queue | [NEXT.md](NEXT.md) | Active track, authorized order, release boundary, and explicit exclusions. |
+| Messaging beta audit | [Messaging Beta audit](MESSAGING_BETA_AUDIT.md) | Revision-bound architecture, regression, performance, migration, reliability, and journey evidence, including the focused Track A acceptance corrections. |
+| Final beta acceptance | [Final beta acceptance audit](CYCLOPS_BETA_FINAL_AUDIT.md) | Revision-bound whole-product acceptance record, release evidence, remaining known limits, and operator release gate. |
+| Supporting design records | [Whole-system architecture review](../CYCLOPS_SYSTEM_ARCHITECTURE_REVIEW.md), [messaging architecture review](../MESSAGING_ARCHITECTURE_REVIEW.md), and [addendum](../ADDENDUM_REVIEW.md) | Revision-bound reasoning behind the charters, not independent implementation authority. |
+| CI design record | [CI and test architecture review](CI_TEST_ARCHITECTURE_REVIEW.md) | Evidence and rationale behind the implemented [CI contract](CI.md), not messaging authority. |
+| Measured evidence | [findings.md](../../findings.md) | Probe-backed constraints on current code. This is live evidence, not a roadmap or archive. |
+| General methodology | [Architecture review method](ARCHITECTURE_REVIEW_PROCESS.md) | Reusable audit process, not a Cyclops behavior contract. |
+| Frozen and historical records | [Reliability roadmap](RELIABILITY_ROADMAP.md), [stabilization history](STABILIZATION_HISTORY.md), [V5 line](V5.md), and [changelog](../../CHANGELOG.md) | Preserve the reasoning behind the current system. Do not treat old plans as current behavior. |
 | Internal release material | [Media plan](../public/README.md) and [archived demo checklist](archive/demo-day-checklist.md) | Maintainer and historical material, not public onboarding. |
 | Repository instructions | [Agent entrypoint](../../AGENTS.md), [contributing](../../CONTRIBUTING.md), and [security](../../SECURITY.md) | Rules for automated contributors, human contributors, and vulnerability reports. |
 
@@ -67,13 +106,12 @@ flowchart LR
     data["resources/manifests/ resources/themes/<br/>resources/layouts/ resources/hooks/"]
     cli -->|"one request per command,<br/>held open until the daemon answers"| sock
     ws -->|"control mode: panes,<br/>layout, send-keys"| tmux
-    ui -->|"events.subscribe once;<br/>messages.snapshot after change edges;<br/>never polls"| sock
+    ui -->|"events.subscribe once;<br/>events.backfill at startup;<br/>messages.snapshot after change edges;<br/>never polls"| sock
     hk -->|"the vendor CLI fired a turn edge:<br/>agent.state.report"| sock
     sock -->|"one JSON object per line,<br/>hello line first"| daemon
     daemon -->|"every tmux call the daemon makes"| ad
     ad -->|"one tmux -C control client<br/>per watched session"| tmux
     daemon -->|"each fact appended<br/>to its owning journal"| led
-    ui -.->|"tail once at startup,<br/>then ride the push"| led
     data -.->|"data, never code: manifests once at boot,<br/>themes re-read when a repaint is already due"| daemon
 ```
 
@@ -90,12 +128,13 @@ are a rule implemented in a crate that should not have known about it.
 | `cyclops-proto` | Wire types, mailbox and journal schema, the legacy delivery state machine, the agent state model, the attention rule (what needs a human), scratch paths | Any IO. It does not know tmux exists, and it renders nothing |
 | `cyclops-manifest` | Manifest TOML schema, compiled rules, region parsing, priority evaluation | Deciding a pane's state (that is fusion), reading panes, hot reload (the daemon's job) |
 | `cyclops-tmux` | **Every tmux invocation in the product.** Control mode, reply correlation, flow control, the zero-polling pane table, layout capture and apply, focus | What an agent is. It has never heard of manifests, deliveries, or the ledger |
-| `cyclops-ledger` | Append, fsync, monotonic seq, torn-tail sealing, the cursor reader | What a line MEANS. The schema is `cyclops-proto`'s |
+| `cyclops-ledger` | Append, fsync, monotonic seq, strict and lenient torn-tail recovery, the cursor reader | What a line MEANS. The schema is `cyclops-proto`'s |
 | `cyclops-theme` | The semantic token vocabulary, the state-to-group mapping, theme files, selection, the reload rule | Painting. It resolves a token to a color; renderers turn colors into escape sequences |
+| `cyclops-client` | Hello-first daemon connection facts, bounded frames, request correlation, shared timeout defaults and certainty, refusal decoding, post-write uncertainty, and stream-gap classification | Domain policy, presentation, application retry schedules, projection restoration, or journal reads |
 | `cyclopsd` | The daemon: fusion, durable mailboxes, the notification worker, the legacy direct-delivery pipeline, the socket server, sender identity, the adoption registry, pane border chrome, hooks self-test, and journal read side | tmux specifics (adapter), the wire schema (proto), the attention rule (proto). It renders exactly one string: the border format |
 | `cyclops` | The CLI: a thin NDJSON client plus rendering on the shared grid | Business logic. `cyclops list` asks `status` for the roster rather than holding a second one |
-| `cyclops-ui` | The Admin, Firehose, and Messages views, filters, backfill, and the terminal backend (`cyclops watch`) |
-| `cyclops-workspace` | The full-screen workspace (`cyclops`): sidebar, tabs, pane canvas, mouse | The attention rule (reads proto), tmux (one focus helper in the adapter) |
+| `cyclops-ui` | Pure stream and messaging presentation models plus the concrete terminal renderer for `cyclops watch` | Daemon framing, journal paths, or tmux effects; it consumes `cyclops-client`, `events.backfill`, and a launcher focus capability |
+| `cyclops-workspace` | The full-screen workspace (`cyclops`): sidebar, tabs, pane canvas, mouse, and the body-free collapsed Messages rail projection | Messaging truth or a second unread queue; it renders authenticated daemon snapshot counts and reads the attention rule from proto |
 | `cyclops-testrig` | The isolated tmux server and its teardown rule, in one place | Anything shipped. `publish = false`, test-only |
 
 One honest exception to "every tmux invocation": `cyclopsd::probe_tmux`
@@ -120,9 +159,9 @@ are applied by `cyclops start` when it builds a workspace.
 
 ### Build and run it
 
-[install.md](../guides/install.md), then `cargo build`. To see the whole system work
-without wiring up a real agent, run a demo: it builds its own tmux server,
-its own home, and cleans both up.
+[install.md](../guides/install.md), then `cargo build`. To see durable mailbox
+acceptance work without either Cyclops UI or a real agent, run the maintained
+messaging demo. It builds its own tmux server and home, then cleans both up.
 
 ```bash
 ./demos/m1-send.sh
@@ -131,6 +170,8 @@ its own home, and cleans both up.
 Then [QUICKSTART.md](../guides/QUICKSTART.md) for the two-agent walk with your own
 CLIs. Development loop and gates: [CONTRIBUTING.md](../../CONTRIBUTING.md).
 Historical release-demo planning: [archived Demo Day checklist](archive/demo-day-checklist.md).
+The pre-mailbox M2 conversation and M3 stream scripts are retained in Git
+history rather than advertised as current runnable journeys.
 
 ### Explain current mailbox messaging
 
@@ -139,14 +180,24 @@ Read in this order:
 1. [send.md](../guides/send.md) for acceptance, claim, reply, notification, and recovery.
 2. [PROTOCOL.md](../reference/PROTOCOL.md) for `msg.send`, `inbox.list`,
    `inbox.claim`, `msg.reply`, and `messages.snapshot`.
-3. `src/cyclopsd/src/mailbox.rs` for the durable projection and mutations.
-4. `src/cyclopsd/src/messaging.rs` for acceptance-to-notification coordination.
+3. `src/cyclopsd/src/messaging.rs` for the internal `WorkspaceMessaging`
+   operation boundary, acceptance, claim, requeue, and exact pre-write
+   withdrawal coordination, body-free inbox, snapshot, follow, alarm, and
+   attention-selection reads, the body-free status projection, and durable
+   consequences of ordered typed pane observations.
+4. `src/cyclopsd/src/mailbox.rs` for the durable projection and mutations owned
+   behind that boundary.
 5. `src/cyclopsd/src/notification_adapter.rs` and the notification path in
    `src/cyclopsd/src/delivery.rs` for the content-free wake.
 
 The key boundary is durable acceptance before asynchronous notification. The
 recipient reads the body only by claiming the exact message. Standard send
 does not paste that body or return verified and unverified delivery tiers.
+`demos/m1-send.sh` demonstrates that boundary with notification-incapable cat
+panes: both sends are durable, the authenticated body-free projection remains
+usable, and the workspace journal records message metadata while omitting
+bodies from the demo output. The blocked optional wakes are reported as
+`composer_semantic_missing`; they do not undo acceptance or invent delivery.
 
 ### Explain a legacy direct-delivery self-test receipt
 
@@ -157,10 +208,12 @@ internal transport tests. Read in this order:
 2. `src/cyclops-proto/src/ledger.rs`, `DeliveryState::can_transition_to`. The
    legal moves are a table you can read in a minute; everything below is a
    drive through it.
-3. `src/cyclopsd/src/delivery.rs`, in call order: `msg_send` -> `worker_for` ->
+3. `src/cyclopsd/src/compatibility.rs`. The only entry to the retained writer,
+   restart settlement, and session-journal replay.
+4. `src/cyclopsd/src/delivery.rs`, in call order: `msg_send` -> `worker_for` ->
    `worker_loop` -> `process` -> `gate` -> `attempt_delivery` -> `inject`
    -> `await_ack` -> `receipt_of`.
-4. The two diagrams in [ARCHITECTURE.md](ARCHITECTURE.md): the gate's eight
+5. The two diagrams in [ARCHITECTURE.md](ARCHITECTURE.md): the gate's eight
    ordered checks, and send-to-receipt.
 
 The one idea to take away is that **verified** and **delivered** are not
@@ -178,23 +231,9 @@ the same claim, and the receipt never blurs them:
   transition out of a delivered state, and it exists so a receipt is never
   more confident than the evidence and never less.
 
-Then run the demo and read what it actually wrote:
-
-```
-$ ./demos/m1-send.sh
-== cyclops send implementer (watch the paste land)
-✓ delivered · unverified (screen)
-
-== ledger state lines (every delivery transition, causes never screens)
-{"seq":8,"id":"m-b90b2a","to":"implementer","from":"queued","to_state":"gating","cause":null}
-{"seq":10,"id":"m-b90b2a","to":"implementer","from":"gating","to_state":"pasting","cause":null}
-{"seq":11,"id":"m-b90b2a","to":"implementer","from":"pasting","to_state":"staged","cause":null}
-{"seq":12,"id":"m-b90b2a","to":"implementer","from":"staged","to_state":"submitted","cause":null}
-{"seq":13,"id":"m-b90b2a","to":"implementer","from":"submitted","to_state":"delivered_unverified","cause":"screen_evidence"}
-```
-
-Those panes run `cat`, not an agent, so there is no hook and the demo lands
-on tier 2 every time. That is the honest floor, not a failure.
+The retained direct-delivery behavior is covered by focused compatibility and
+self-test regression suites. Do not use the current mailbox demo as evidence
+for a legacy verified or screen-inferred receipt.
 
 ### Add support for a new agent CLI
 
@@ -311,9 +350,9 @@ GOALS lists PTY hosting as an anti-goal.
 work around, and a lot of `findings.md` is that tax. Control-mode lines are
 not UTF-8 (F22). tmux sanitizes replies for non-UTF-8 clients (F14). Format
 subscriptions tick at 1Hz (F23). A per-pane subscription can never report
-that pane's death (F25). The mitigation is that all of it is confined to
-one adapter crate, and an advisory CI job builds tmux master so the next
-surprise arrives as a warning rather than a bug report.
+that pane's death (F25). The mitigation is that all of it is confined to one
+adapter crate. Focused tmux HEAD evidence runs when adapter-owned inputs change,
+and the complete tmux HEAD gate remains scheduled and available before release.
 
 ### Manifests are data files
 
@@ -344,11 +383,13 @@ taken from cmux's `events.jsonl` rather than invented.
 
 **Why:** the record is the product. It has to be readable with `less` and
 queryable with `jq` by a person who has never heard of Cyclops, months
-after the fact, possibly out of a bug report attachment. It has to survive
-a crash mid-write, which append-only gets nearly for free: a torn final
-line is sealed with a newline on the next open and skipped by readers, and
-nothing acknowledged is ever lost. And an audit you can edit is not an
-audit.
+after the fact, possibly out of a bug report attachment. It has to survive a
+crash mid-write, which append-only gets nearly for free. Every acknowledged
+append ends in a newline and is fsynced; newline-terminated records are
+immutable. An unterminated final tail was never acknowledged: lenient replay
+adds its terminating newline and retains it when it validates, otherwise skips
+it; strict workspace replay removes only that tail and logs a warning. Neither
+path alters a complete record. And an audit you can edit is not an audit.
 
 **Measured, so it is not a guess:** no index is needed. A 10,000-line scan
 takes 7.3ms, which is why `msg.history` is a scan and not a database.
@@ -361,9 +402,15 @@ rather than an offset.
 
 **Chosen:** state changes arrive as control-mode notifications and
 subscription pushes; reconciliation is triggered by an event or a request.
-One 30ms debounce, one-shot timers inside a live delivery, and one
-event-armed candidate lifecycle settle timer per pane. The lifecycle worker
-evaluates each candidate generation once per observation and then parks.
+The long-lived coordination timers are named one-shots: one 30ms debounce,
+bounded timers inside a live delivery, one event-armed candidate lifecycle
+settle timer per pane, one unclaimed reminder per attempt, optional exact
+force-submit deadlines, and bounded post-action evidence checkpoints. Competing
+force-submit schedulers wait for a resolution-release event when needed; durable
+intent limits competing resolvers, and a final forced reservation elects at
+most one terminal key. The lifecycle worker evaluates each candidate generation
+once per observation and then parks. This is not an inventory of every bounded
+deadline in an explicit command or recovery action.
 
 **Rejected:** a 1Hz reconcile loop, which is the obvious design and would
 have been simpler.

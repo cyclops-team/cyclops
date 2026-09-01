@@ -116,7 +116,7 @@ pub struct Draft {
 }
 
 /// Leaves room for JSON escaping and request metadata inside one daemon frame.
-pub const DRAFT_MAX_BYTES: usize = crate::wire::MAX_FRAME_BYTES / 4;
+pub const DRAFT_MAX_BYTES: usize = cyclops_proto::FrameContract::MAX_JSON_BYTES / 4;
 
 impl Draft {
     pub fn text(&self) -> &str {
