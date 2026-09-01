@@ -16,7 +16,8 @@ use cyclops_proto::{
 };
 use cyclops_ui::queue::render;
 use cyclops_ui::{
-    rows_from_snapshot, Direction, HumanQueue, QueueTarget, RefreshGate, Scope, WakeWord,
+    render_chat, rows_from_snapshot, AvatarRegistry, ChatRenderContext, Direction, HumanQueue,
+    QueueTarget, RefreshGate, Scope, WakeWord,
 };
 
 const SIZES: [(usize, usize); 5] = [(14, 8), (24, 12), (80, 24), (96, 24), (160, 40)];
@@ -666,6 +667,10 @@ fn wake_states_map_without_losing_delivery_progress() {
     q.set_scope(Scope::All);
     let only = q.visible().next().unwrap();
     assert_eq!(only.wake, WakeWord::Cleared);
+    assert_eq!(
+        only.cause, None,
+        "an acknowledged historical cause is not an active hold"
+    );
     assert!(
         !only.can_manage_attention,
         "a cleared alarm is not an action target"
@@ -706,6 +711,66 @@ fn wake_states_map_without_losing_delivery_progress() {
         let only = q.visible().next().unwrap();
         assert_eq!(only.wake, word);
         assert!(!only.can_manage_attention);
+    }
+}
+
+/// A final notification outcome retires the active hold, even though the
+/// durable record retains the original cause for audit and recovery.
+///
+/// Without this boundary, a claimed message whose automatic reconciliation
+/// later submitted or discarded its doorbell rendered as `held: verify failed`.
+/// That makes a historical cause look like a current reason for an operator to
+/// intervene.
+#[test]
+fn resolved_notification_does_not_render_a_historical_verification_hold() {
+    for (resolution, word) in [
+        (
+            cyclops_proto::NotificationResolution::Complete,
+            WakeWord::ResolvedSubmitted,
+        ),
+        (
+            cyclops_proto::NotificationResolution::Discard,
+            WakeWord::ResolvedDiscarded,
+        ),
+    ] {
+        let mut notification = alarm(42, false);
+        notification.resolution = Some(resolution);
+        let mut recipient = alarmed("%1", "recipient", notification);
+        // The daemon removes a final resolution from the administrator's
+        // Work view. The claimed mailbox stays visible in All for history.
+        recipient.needs_action = false;
+        let snapshot = rows_from_snapshot(&snapshot(
+            1,
+            vec![row(
+                "m-resolved-notification",
+                1,
+                MessageDirection::Outbound,
+                false,
+                vec![recipient],
+            )],
+        ));
+        let only = &snapshot.rows[0];
+        assert_eq!(only.wake, word);
+        assert_eq!(
+            only.cause, None,
+            "a final resolution must not leave its historical cause active"
+        );
+        assert!(!only.needs_human());
+
+        let mut queue = HumanQueue::new();
+        queue.replace(snapshot);
+        assert_eq!(queue.len(), 0, "a final resolution is not current work");
+        queue.set_scope(Scope::All);
+        let registry = AvatarRegistry::default();
+        let frame = render_chat(&queue, ChatRenderContext::new(&registry), 80, 15).join("\n");
+        assert!(
+            frame.contains("Claimed"),
+            "claimed mailbox stays visible: {frame}"
+        );
+        assert!(
+            !frame.contains("held: verify failed"),
+            "a resolved notification must not look actively held: {frame}"
+        );
     }
 }
 
