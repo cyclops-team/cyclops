@@ -1000,15 +1000,33 @@ a restart. It does not touch `config.toml`: a restart goes back to
 watching only the configured list, not whatever a client added here in the
 meantime.
 
-A runtime watch remains pending if the session has not appeared yet. After it
-has attached successfully, positive tmux evidence that the session was removed
-retires that runtime watch from `status`. Recreating the same display name then
-creates a fresh session identity and watcher while reusing the existing durable
-ledger. Configured sessions are different: they remain persistent and keep
-waiting for `cyclops start` to recreate them.
+A runtime watch remains pending if the session has not appeared yet. Its
+creator calls `session.watch` again after it creates or restores the tmux
+session; `cyclops start` does this automatically. After a runtime watch has
+attached, positive tmux evidence that its session was removed retires the watch
+from `status`. Recreating the same display name then creates a fresh session
+identity and watcher while reusing the durable ledger.
 
-Watching a session that is already watched is a no-op, not an error:
-`added` is false and nothing is opened twice.
+Configured sessions are different: they remain persistent while absent and
+wait for the post-creation request. A configured slot recovered from a durable
+rename identity is stricter: the request checks the recorded target; if
+control mode can connect, the daemon validates identity before publishing a
+route. It cannot authorize a different same-named session to replace the
+recorded identity.
+
+An unavailable tmux socket is not evidence that a session disappeared. Before
+its first attachment, and after a previously live server socket vanishes, a
+watched slot retains its durable state and waits for `session.watch`
+without opening control mode. Other tmux failures remain honest uncertainty:
+before its first attachment the task waits for an explicit `session.watch`
+edge, while after a live observation it uses the ordinary transient reconnect
+path.
+
+For an already watched session, `added` is false: the daemon opens no second
+ledger or watcher. If that task is detached and waiting after a confirmed
+absence or unavailable server socket, the same idempotent request is an
+availability edge for its existing task. The daemon checks tmux before
+attaching, so the edge is not proof that an absent session is live.
 
 ```
 -> {"id":17,"method":"session.watch","params":{"session":"extra"}}
@@ -1017,8 +1035,8 @@ Watching a session that is already watched is a no-op, not an error:
 
 An absent, non-string, or empty/whitespace-only `session` is `bad_request`.
 A session name that does not exist yet on the tmux server is not an error
-either: the daemon watches for it exactly the way it waits for any
-configured session that has not been created yet.
+either: the daemon records a pending watch. Call `session.watch` again after
+creating that tmux session to supply its availability notification.
 
 ### agent.state.report
 

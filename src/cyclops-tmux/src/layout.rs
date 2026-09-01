@@ -261,6 +261,54 @@ pub fn session_exists(server: &Server, session: &str) -> Result<bool, TmuxError>
     }
 }
 
+/// Ask whether tmux positively confirms that this exact session is absent.
+///
+/// Unlike [`session_exists`], this is for a stateful caller that must not
+/// clear durable state merely because it could not reach tmux. A successful
+/// `has-session` says the target is present; tmux's specific missing-session
+/// reply says it is absent. A missing server socket, timeout, or any other
+/// command failure remains an error for the caller to classify honestly.
+pub fn session_missing(server: &Server, session: &str) -> Result<bool, TmuxError> {
+    match server.run(&["has-session", "-t", &session_target(session)]) {
+        Ok(_) => Ok(false),
+        Err(TmuxError::Command(reply)) if is_missing_session_reply(&reply) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether a `has-session` failure means the configured tmux server cannot
+/// be reached at all.
+///
+/// This is intentionally narrower than a general command failure. A daemon
+/// may safely reconnect after a reachable-server failure, but opening a
+/// control client against a missing socket can create an empty tmux server.
+pub fn session_server_unavailable(error: &TmuxError) -> bool {
+    matches!(
+        error,
+        TmuxError::Command(reply) if is_unavailable_session_server_reply(reply)
+    )
+}
+
+/// `has-session` has one command error that is positive evidence about its
+/// target. Do not fold connection failures such as `error connecting to ...`
+/// into this answer: they say nothing about whether a live session survived.
+fn is_missing_session_reply(reply: &str) -> bool {
+    reply
+        .lines()
+        .any(|line| line.trim_start().starts_with("can't find session:"))
+}
+
+/// tmux uses this connection failure when a configured `-L` socket path is
+/// absent. Some versions use the shorter `no server running` wording for the
+/// same server-unavailable condition. Neither reply is evidence that a
+/// previously observed target itself disappeared.
+fn is_unavailable_session_server_reply(reply: &str) -> bool {
+    reply.lines().map(str::trim_start).any(|line| {
+        (line.starts_with("error connecting to ") && line.contains("(No such file or directory)"))
+            || line.starts_with("no server running on ")
+    })
+}
+
 /// Read a session's structure as a layout.
 ///
 /// Steps, in the order they have to happen:
@@ -766,6 +814,40 @@ fn parse_u32(s: &str) -> Result<u32, TmuxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_named_missing_session_reply_proves_absence() {
+        assert!(is_missing_session_reply("can't find session: =main"));
+        assert!(is_missing_session_reply(
+            "warning\ncan't find session: =main"
+        ));
+        assert!(!is_missing_session_reply(
+            "error connecting to /private/tmp/tmux-501/main (No such file or directory)"
+        ));
+        assert!(!is_missing_session_reply(
+            "no server running on /private/tmp/tmux-501/main"
+        ));
+    }
+
+    #[test]
+    fn only_missing_socket_replies_mark_the_server_unavailable() {
+        assert!(is_unavailable_session_server_reply(
+            "error connecting to /private/tmp/tmux-501/main (No such file or directory)"
+        ));
+        assert!(is_unavailable_session_server_reply(
+            "no server running on /private/tmp/tmux-501/main"
+        ));
+        assert!(is_unavailable_session_server_reply(
+            "warning: inherited environment was not restored\nerror connecting to /private/tmp/tmux-501/main (No such file or directory)"
+        ));
+        assert!(is_unavailable_session_server_reply(
+            "warning: inherited environment was not restored\nno server running on /private/tmp/tmux-501/main"
+        ));
+        assert!(!is_unavailable_session_server_reply(
+            "can't find session: =main"
+        ));
+        assert!(!is_unavailable_session_server_reply("permission denied"));
+    }
 
     fn pane(label: Option<&str>, ratio: f64) -> Pane {
         Pane {

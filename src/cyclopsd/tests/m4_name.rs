@@ -760,8 +760,8 @@ async fn killing_a_watched_session_releases_its_labels() {
     rig.label(&aux_pane, "human").await;
     rig.tmux.run_ok(&["kill-session", "-t", "aux"]);
 
-    // Test-side bounded wait: the daemon notices on a reconnect attempt,
-    // and reconnects start at 200ms.
+    // Test-side bounded wait: the watcher reports the session disconnect and
+    // the daemon makes one existence check before it releases this label.
     let main_pane = rig.pane_ids().await[0].clone();
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

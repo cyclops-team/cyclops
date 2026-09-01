@@ -3134,7 +3134,11 @@ async fn replacement_recipient_bypasses_a_stale_prewrite_worker() {
     );
 
     rig.tmux.run_ok(&["kill-server"]);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    rig.ev
+        .wait_event(Duration::from_secs(10), |event| {
+            event["event"] == "session" && event["data"]["attached"] == false
+        })
+        .await;
     rig.tmux.run_ok(&[
         "new-session",
         "-d",
@@ -3146,6 +3150,20 @@ async fn replacement_recipient_bypasses_a_stale_prewrite_worker() {
         "40",
         &composer_pane(),
     ]);
+    let availability = rig
+        .ctl
+        .request("session.watch", json!({"session": "main"}))
+        .await;
+    assert_eq!(
+        availability["result"]["added"],
+        json!(false),
+        "{availability}"
+    );
+    assert_eq!(
+        availability["result"]["watching"],
+        json!(true),
+        "{availability}"
+    );
     rig.wait_attached(1).await;
     let replacement_pane = rig.pane_ids().await[0].clone();
     assert_eq!(

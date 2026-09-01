@@ -271,10 +271,10 @@ enum Watch {
     /// Running, but this session is not one it was told to watch.
     Elsewhere,
     /// Told to watch it, not connected to it yet. A session created a
-    /// moment ago is normally here: the daemon retries its attach on a
-    /// backoff, and until that lands it can resolve none of the session's
-    /// panes, so naming one would fail per pane with nothing useful to
-    /// say.
+    /// moment ago remains here until `cyclops start` sends its idempotent
+    /// `session.watch` creation edge and the daemon attaches. Until then it
+    /// can resolve none of the session's panes, so naming one would fail per
+    /// pane with nothing useful to say.
     NotYet,
     /// Watching it. Carries pane id to name for the session.
     Watching(BTreeMap<String, String>),
@@ -297,6 +297,15 @@ impl Watch {
 /// without a daemon, minus the names.
 fn watch_of(client: &mut Client, session: &str) -> Watch {
     session_view(client, session).0
+}
+
+/// Tell a live daemon that a caller has just created or restored this tmux
+/// session. The request is idempotent for configured slots and opens a
+/// runtime slot only when the daemon did not know this name yet.
+fn notify_session_available(client: &mut Client, session: &str) -> bool {
+    client
+        .request("session.watch", json!({"session": session}))
+        .is_ok()
 }
 
 /// One status request, answering both questions callers ask of it: what
@@ -334,9 +343,9 @@ fn session_view(client: &mut Client, session: &str) -> (Watch, HashSet<String>) 
     (Watch::Watching(labels), panes)
 }
 
-/// How long `start` waits for cyclopsd to connect to a session it just
-/// built. The daemon's reattach backoff caps at five seconds (cyclopsd's
-/// RECONNECT_MAX), so this is that plus a margin.
+/// How long `start` waits for the daemon to consume its explicit creation
+/// notification and read the pane table. This is bounded client patience, not
+/// a daemon retry cadence for a missing session.
 const ATTACH_WAIT: Duration = Duration::from_secs(6);
 
 /// Wait for cyclopsd to reach a session and read its panes, or give up.
@@ -815,10 +824,9 @@ pub fn run_start(
     // 4. Make sure there is a daemon, starting one if there is not.
     //
     //    Here, and not earlier, because the session now exists: a daemon
-    //    that boots with its session already there attaches at once
-    //    instead of retrying on a backoff, so the names below land in
-    //    this run. Starting it before building the session would work
-    //    too, and would spend up to five seconds waiting for the retry.
+    //    that boots with its session already there attaches at once, so
+    //    the names below land in this run. An external daemon that started
+    //    first is woken explicitly below after this creation succeeds.
     //
     //    A failure to start is a note, not an exit. The workspace is
     //    open and usable at this point; what is lost is naming, and the
@@ -848,15 +856,36 @@ pub fn run_start(
         None => Watch::Down,
         Some(c) => watch_of(c, &session),
     };
+    // A daemon started by an external supervisor can already hold this
+    // configured session in `NotYet`. `cyclops start` is the creator, so
+    // after it has built or restored the tmux session it sends the
+    // idempotent availability edge that releases the daemon's wait. Do not
+    // send this for `Elsewhere`: that state means the session is not
+    // configured, and turning it into a runtime watch would silently change
+    // the existing config-hint contract.
+    let mut notified_session = false;
+    if matches!(watch, Watch::NotYet) {
+        if let Some(c) = client.as_mut() {
+            if notify_session_available(c, &session) {
+                notified_session = true;
+                watch = watch_of(c, &session);
+            } else {
+                // We cannot honestly treat a failed creation notification as
+                // a watcher that will catch up on its own.
+                watch = Watch::Down;
+            }
+        }
+    }
     // A session built seconds ago is one cyclopsd has not connected to
     // yet, and until it does, no pane can be named. Waiting for it here is
     // what makes one `cyclops start` enough: without this the first run
     // builds the session, names nothing, and a second run is what puts the
     // names on.
     //
-    // Only when this run built the session, and only with a daemon there
-    // to wait for. Every other state is already its own answer.
-    if !existed && matches!(watch, Watch::NotYet | Watch::Watching(_)) {
+    // Only when this run built the session or successfully woke an existing
+    // daemon slot, and only with a daemon there to wait for. Every other
+    // state is already its own answer.
+    if (!existed || notified_session) && matches!(watch, Watch::NotYet | Watch::Watching(_)) {
         if let Some(c) = client.as_mut() {
             watch = wait_for_attach(c, &session, &pane_ids);
         }

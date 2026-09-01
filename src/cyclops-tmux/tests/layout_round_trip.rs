@@ -280,8 +280,22 @@ fn asking_about_a_session_that_is_not_there_is_not_an_error() {
     // No server is running yet on this socket: still an answer, not a
     // failure, because that is the state `cyclops start` starts from.
     assert!(!layout::session_exists(&server(&t), "ghost").expect("answers"));
+    let unavailable = layout::session_missing(&server(&t), "ghost")
+        .expect_err("a missing tmux server is uncertainty for a stateful caller");
+    assert!(
+        layout::session_server_unavailable(&unavailable),
+        "the adapter recognizes tmux's actual missing-socket reply: {unavailable}"
+    );
     build(&t, "real", &ops());
     assert!(layout::session_exists(&server(&t), "real").expect("answers"));
+    assert!(
+        !layout::session_missing(&server(&t), "real").expect("live session answers"),
+        "a reachable live session is present"
+    );
     // Exact match: "real" must not answer for "rea".
     assert!(!layout::session_exists(&server(&t), "rea").expect("answers"));
+    assert!(
+        layout::session_missing(&server(&t), "rea").expect("named absence answers"),
+        "a reachable server's named missing-session reply is positive evidence"
+    );
 }
