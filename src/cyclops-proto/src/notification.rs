@@ -634,12 +634,15 @@ impl NotificationRecord {
             .saturating_add(self.unclaimed_reminder_count)
     }
 
-    /// Whether this exact failed wake may enter automatic composer recovery.
+    /// Whether this exact failed wake may enter ordinary automatic composer
+    /// recovery.
     ///
-    /// The terminal still has to prove the complete binding, exact rendered
-    /// doorbell, and action-safe composer before it may send a key. This
-    /// predicate only selects the durable attempt class that supports that
-    /// proof.
+    /// Ordinary recovery still has to prove the complete binding, exact
+    /// rendered doorbell, and action-safe composer before it may send a key.
+    /// The separately configured force-submit fallback uses this predicate as a
+    /// narrow candidate selector, but deliberately bypasses composer-content
+    /// proof after its own binding checks and durable intent. This predicate
+    /// only selects the durable attempt class that supports either path.
     pub fn needs_exact_owned_reconciliation(&self) -> bool {
         self.state == NotificationState::AttentionRequired
             && self.cause == Some(NotificationAttentionCause::VerifyFailed)

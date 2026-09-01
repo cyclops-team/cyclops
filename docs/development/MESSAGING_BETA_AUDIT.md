@@ -203,11 +203,11 @@ artifact identifies the commit, dirty state, version, runner image, operating
 system, architecture, CPU count, Rust, Cargo, tmux, workload, timing, and
 result.
 
-Release evidence run
+The historical Track A release-evidence run
 [33331719737](https://github.com/cyclops-team/cyclops/actions/runs/33331719737)
-targets exact post-demo-repair integration commit
-`a1dfa125419bb59a6d2434e30bfed9a5449a615e`. Its final disposition is recorded
-below before this audit is merged.
+targeted exact post-demo-repair integration commit
+`a1dfa125419bb59a6d2434e30bfed9a5449a615e`. The final whole-product
+disposition is recorded in [CYCLOPS_BETA_FINAL_AUDIT.md](CYCLOPS_BETA_FINAL_AUDIT.md).
 
 ## Performance comparison
 
@@ -248,13 +248,17 @@ continuity passed.
 - `Daemon::deliver_payload` remains present and delegates through the explicit
   compatibility module. One retained self-test caller and nine test call sites
   are known. External embedder use remains unverified.
-- The interim lifecycle rule remains in force: no silent deletion, truncation,
-  or rewriting. A breaking migration requires an explicit export or migration
-  path.
+- The interim lifecycle rule remains in force: every acknowledged append ends
+  in a newline and is fsynced, and newline-terminated records are immutable.
+  A final unterminated tail was never acknowledged: lenient replay retains it
+  when valid and skips it otherwise, while strict replay removes only that
+  tail. No acknowledged record is silently deleted, truncated, or rewritten.
+  A breaking migration requires an explicit export or migration path.
 
-## Release evidence disposition
+## Historical Track A release evidence
 
-Verified. Run 33331719737 completed successfully at exact integration commit
+This is retained historical Track A evidence. Run 33331719737 completed
+successfully at exact integration commit
 `a1dfa125419bb59a6d2434e30bfed9a5449a615e`:
 
 - full clean-checkout repository gates passed on Linux and macOS;
@@ -267,6 +271,11 @@ Verified. Run 33331719737 completed successfully at exact integration commit
 The performance artifact identifies the exact clean commit, Cyclops 0.1.0,
 Ubuntu 24, x86-64, four CPUs, Rust 1.98.0, tmux 3.4, and all workload statuses
 as zero. The workflow did not merge, tag, name, or publish anything.
+
+The completed whole-product acceptance decision is recorded in
+[CYCLOPS_BETA_FINAL_AUDIT.md](CYCLOPS_BETA_FINAL_AUDIT.md). It cites the final
+functional candidate and its exact release-evidence run. This section remains
+as Track A provenance rather than the current release gate.
 
 ## Open gates and explicit non-results
 
@@ -288,12 +297,12 @@ as zero. The workflow did not merge, tag, name, or publish anything.
 
 ## Current acceptance and release boundary
 
-The retained release run is historical evidence for its exact commit, not the
-final whole-product beta gate. Track A continues to satisfy the corrected
-acceptance criteria. The whole-product implementation tracks are now integrated
-on the beta branch; a fresh final audit, exact-candidate release evidence, and
-release-identity reconciliation remain separate gates. See [NEXT.md](NEXT.md)
-for the current queue.
+Track A continues to satisfy the corrected acceptance criteria. The
+whole-product implementation tracks are integrated on the beta branch, and the
+technical beta-acceptance decision for the audited candidate, not release
+authorization, is [CYCLOPS_BETA_FINAL_AUDIT.md](CYCLOPS_BETA_FINAL_AUDIT.md).
+Release-identity reconciliation remains a separate operator gate. See
+[NEXT.md](NEXT.md) for the current queue.
 
 Keep **beta/messaging-rework** as the integration branch. Explicit operator
 approval is still required before merging it into `main`, creating or moving a

@@ -14,7 +14,7 @@ second place, that is the bug: this page is where they live.
 |---|---|---|
 | [1](#1-a-payload-never-reaches-a-pane-the-gate-did-not-admit) | A payload never reaches a pane the gate did not admit | A shell executes the message |
 | [2](#2-a-modal-is-never-cleared-generically) | A modal is never cleared generically | Escape exits the agent CLI |
-| [3](#3-cyclops-writes-only-with-fresh-positive-composer-and-occupant-evidence) | Cyclops writes only with fresh positive composer and occupant evidence | The human's half-written sentence is sent as part of the message |
+| [3](#3-cyclops-writes-only-with-fresh-positive-composer-and-occupant-evidence) | Ordinary delivery writes only with fresh positive composer and occupant evidence | The human's half-written sentence is sent as part of the message |
 | [4](#4-legacy-blocked_quota-parks-and-never-auto-retries) | Legacy `blocked_quota` parks and never auto-retries | A loop that cannot succeed, against a metered API |
 | [5](#5-every-delivery-ends-in-a-named-state) | Every delivery ends in a named state | Nobody chases what has no state |
 | [6](#6-the-sender-is-whoever-connected-not-whoever-says-so) | The sender is whoever connected, not whoever says so | The audit trail can be forged |
@@ -23,7 +23,7 @@ second place, that is the bug: this page is where they live.
 | [9](#9-zero-polling) | Zero polling | Idle battery burn, and a broken event path that looks fine |
 | [10](#10-vendor-quirks-are-data-not-code) | Vendor quirks are data, not code | A vendor ships a new dialog and you ship a release |
 | [11](#11-color-is-redundant-and-never-the-only-encoding) | Color is redundant and never the only encoding | The state is invisible under `NO_COLOR`, `--plain`, or a screen reader |
-| [12](#12-runtime-idleness-never-implies-terminal-write-readiness) | Runtime idleness never implies terminal write-readiness | A hook edge authorizes a paste over the human's staged text |
+| [12](#12-runtime-idleness-never-implies-terminal-write-readiness) | Runtime idleness never implies ordinary terminal-write readiness | A hook edge authorizes a paste over the human's staged text |
 
 ## 1. A payload never reaches a pane the gate did not admit
 
@@ -62,12 +62,20 @@ The screen read in step 6 is deliberately the last one before the paste. A
 gate that reads the screen early and pastes later is admitting a pane as it
 was, not as it is, and a human keystroke round-trip fits in that gap.
 
-Verification is the second half of the same rule. Enter is sent only when the
-normalized visible composer bytes exactly match the payload selected at the
-durable write boundary. A visible target or terminal sentinel is structural
-evidence, not ownership by itself. A collapsed chip proves only a vendor
-representation because its hidden bytes cannot be compared. It never
-authorizes Enter.
+Verification is the second half of the same rule. On ordinary delivery and
+`attention.complete`, Enter is sent only when the normalized visible composer
+bytes exactly match the payload selected at the durable write boundary. A
+visible target or terminal sentinel is structural evidence, not ownership by
+itself. A collapsed chip proves only a vendor representation because its hidden
+bytes cannot be compared. It never authorizes Enter.
+
+`notification.force_submit` is the separately documented default-off,
+administrator-controlled exception. It never pastes or replaces bytes. For one
+exact current `verify_failed` attempt, it rechecks the route and binding,
+records durable intent, then may send one submit key without composer-content
+proof. It can therefore submit trailing human input. Its exact-attempt,
+at-most-once, and cancellation checks remain mandatory; see
+[DELIVERY.md](DELIVERY.md).
 
 The irreversible boundary changes retry policy. A detach, missing manifest,
 pre-paste occupant rebind, or spool failure is proven before the pane write
@@ -119,8 +127,8 @@ Declines are bounded, never looped.
 
 ## 3. Cyclops writes only with fresh positive composer and occupant evidence
 
-**A composer with text in it is `idle_with_input`, and `idle_with_input`
-holds.**
+**On ordinary delivery and `attention.complete`, a composer with text in it is
+`idle_with_input`, and `idle_with_input` holds.**
 
 What breaks: the paste lands in a composer that already holds the human's
 half-written sentence, the two concatenate, and the submit key sends the
@@ -141,6 +149,13 @@ has no cooperative input lease across that interval. Cyclops therefore uses
 fresh positive evidence, checks the exact occupant, records intent before the
 effect, and treats ambiguous outcomes conservatively. Do not weaken those
 guards or describe them as proof that concurrent input is impossible.
+
+The default-off `notification.force_submit` recovery setting is deliberately
+outside this ordinary proof path. It does not add a paste or replace visible
+bytes, but it may send one submit key without composer-content proof for an
+exact `verify_failed` attempt and may therefore submit later human input. Its
+administrator setting, binding checks, durable intent, and cancellation rules
+are described in [DELIVERY.md](DELIVERY.md).
 
 - Enforced at: `src/cyclopsd/src/delivery.rs`, the `AgentState::
   IdleWithInput` arm of `gate`; `src/cyclopsd/src/fusion.rs` supplies
@@ -282,9 +297,13 @@ The rule is about what Cyclops reads off a screen on its own.
 What breaks: an audit you can edit is not an audit. Once a line can be
 changed after the fact, a corrected line and a forged line are the same
 artifact, and every reader has to take the writer's word for which it is.
-The append-only shape is also what makes crash safety cheap: a writer that
-never seeks backwards can only ever lose a tail that was never
-acknowledged.
+The append-only shape is also what makes crash safety cheap. Every
+acknowledged append ends in a newline and is fsynced. Newline-terminated
+records are immutable. An unterminated final tail was never acknowledged:
+lenient replay adds its terminating newline, retains it when it validates, and
+skips it when it does not. Strict workspace replay removes only that tail and
+logs a warning. A malformed complete line is rejected, not repaired. No
+acknowledged record is silently deleted, truncated, or rewritten.
 
 This has a consequence on screen that surprises people. When something that
 needed a human stops needing one, the alarm line stays where it is and the
@@ -294,10 +313,15 @@ still says "action required". `Clearance` distinguishes the two endings
 that are not the same story: somebody answered the prompt (`Moved`), or the
 pane closed on it (`PaneGone`).
 
-- Enforced at: `src/cyclops-ledger/src/lib.rs`, `LedgerWriter` (append
-  only, fsync before acknowledge, torn tails sealed and skipped rather than
-  repaired); `cyclops_proto::attention`, rule 3 and `Clearance`.
-- Proven by: `src/cyclopsd/tests/restart_eye.rs`,
+- Enforced at: `src/cyclops-ledger/src/lib.rs`, `LedgerWriter` (append only,
+  fsync before acknowledge, distinct strict and lenient handling for one
+  unacknowledged unterminated tail); `cyclops_proto::attention`, rule 3 and
+  `Clearance`.
+- Proven by: `src/cyclops-ledger/src/lib.rs`,
+  `torn_tail_is_sealed_and_skipped`,
+  `lenient_replay_seals_and_retains_a_valid_unterminated_tail`, and
+  `strict_replay_removes_only_an_unterminated_tail`; plus
+  `src/cyclopsd/tests/restart_eye.rs`,
   `the_restart_ping_never_outlives_the_deliveries_it_names`.
 
 ## 9. Zero polling
@@ -313,7 +337,10 @@ everything looks fine while the mechanism carrying the sub-second
 guarantees is dead, and you find out when a delivery is late by a second
 that used to be 30 milliseconds.
 
-What is allowed, and this is the whole list:
+The following are the long-lived coordination timers. This is not an inventory
+of every bounded deadline in an explicit command or recovery action. Each one
+is named, one-shot, armed by a specific state or request, and event-driven
+after it fires:
 
 - **One debounce.** `RECONCILE_DEBOUNCE`, 30ms, in
   `src/cyclops-tmux/src/watcher.rs`. Change hints arrive in bursts (a
@@ -326,6 +353,17 @@ What is allowed, and this is the whole list:
   checkpoints, the decline-key spacing, and the one-shot ping for a hold
   that has lasted too long. None of them repeat, and none of them exists
   when no delivery is in flight.
+- **One notification reminder and optional force-submit deadlines per exact
+  attempt.** The unclaimed reminder wakes at its recorded due time, makes one
+  durable change, and ends. More than one caller may arm a force-submit
+  deadline for the same exact `verify_failed` attempt. Each is one-shot; a
+  scheduler waits for a matching resolution-release event only after another
+  resolver owns the attempt, then rechecks or exits. Durable intent elects at
+  most one terminal key, and no scheduler repeats a terminal action.
+- **Post-action evidence checkpoints.** `attention_resolution.rs` arms the
+  bounded checkpoints for one named resolution action. They collect the
+  evidence required to settle that action, then terminate; they do not keep
+  asking a pane whether anything changed.
 - **One candidate lifecycle settle timer per pane.** An authenticated
   candidate edge arms its generation's deadline. One worker coalesces the
   pane's candidates, evaluates each generation once per observation, and
@@ -434,12 +472,13 @@ glyph, the glyph or the word is doing too little.
 
 ## 12. Runtime idleness never implies terminal write-readiness
 
-**A composer write requires current positive clean-input evidence from the
-admitted pane, and no conflicting blocked, modal, pane-mode, unknown, or
-input-present evidence. A running turn may write only when the same fresh
-capture contains a live screen `Working` reading plus an independent clean or
-ghost composer proof. Hook-derived idle or Working without that proof never
-authorizes a write.**
+**On ordinary delivery and `attention.complete`, a composer write requires
+current positive clean-input evidence from the admitted pane, and no
+conflicting blocked, modal, pane-mode, unknown, or input-present evidence. A
+running turn may write only when the same fresh capture contains a live screen
+`Working` reading plus an independent clean or ghost composer proof.
+Hook-derived idle or Working without that proof never authorizes an ordinary
+write.**
 
 What breaks: the same damage as rule 3, reached from the opposite
 direction. Rule 3 holds when the screen sensor SEES staged text. This rule

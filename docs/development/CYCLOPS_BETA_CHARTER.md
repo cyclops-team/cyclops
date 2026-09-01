@@ -1,7 +1,7 @@
 # Cyclops beta charter
 
-**Status:** Approved implementation authority; implementation complete, final
-acceptance audit open
+**Status:** Approved implementation authority; technical beta-acceptance
+decision complete for the audited candidate, operator release gate open
 
 **Approved:** 2026-08-30
 
@@ -14,8 +14,8 @@ The [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) remains the
 authority for accepted Track A behavior and compatibility.
 
 All approved implementation tracks are integrated into
-**beta/messaging-rework**. The final audit and its focused corrections decide
-whether to recommend a beta-to-`main` pull request; they do not authorize that
+**beta/messaging-rework**. The [final beta acceptance audit](CYCLOPS_BETA_FINAL_AUDIT.md)
+records the completed technical decision. It does not authorize a beta-to-`main`
 pull request, a tag, or a release. [NEXT.md](NEXT.md) is the current queue.
 
 ## Outcome and user journeys
@@ -86,26 +86,26 @@ wire fields, journals, files, or every `WorkspaceId` use.
 | Finding | Disposition | Owning work |
 |---|---|---|
 | F1 whole-beta authority | Resolved by this charter | Track 0 |
-| F2 configured tmux focus | Approved for beta | Direct user correctness |
-| F3 workspace interaction locality | Approved for beta | Track C |
-| F4 presentation-owned mechanisms | Resolved by Track A; re-audit before more extraction | Track D audit |
-| F5 headless build dependency | Approved for beta | Track F |
-| F6 broad daemon-root reach | Approved; partly reduced by Track A | Track B |
-| F7 overloaded `workspace` language | Approved for gradual correction | Every owning track |
-| F8 first-run goal versus source build | Approved, measurement first | Track F, then Track G if justified |
-| F9 distributed managed-asset knowledge | Approved for beta | Track G |
-| F10 inconsistent release identity | Approved for internal correction; public name gated | Direct user correctness |
-| F11 split configuration authority | Approved for beta | Track H |
-| F12 incomplete data lifecycle | Approved for beta | Track H |
-| F13 performance gaps | Unverified; measure before optimizing | Track I |
-| F14 weak test locality | Approved after owning production seams exist | Track I and each owning track |
-| F15 aging vendor evidence | Approved for beta | Track E |
+| F2 configured tmux focus | Resolved with focused configured-server evidence | Direct user correctness |
+| F3 workspace interaction locality | Resolved | Track C |
+| F4 presentation-owned mechanisms | Resolved by Track A and final re-audit | Track D audit |
+| F5 headless build dependency | Resolved for supported headless behavior | Track F |
+| F6 broad daemon-root reach | Accepted named composition boundary; reduced where messaging policy required it | Track B |
+| F7 overloaded `workspace` language | Accepted gradual correction | Every owning track |
+| F8 first-run goal versus source build | Accepted measured source-install path; no unapproved distribution claim | Track F and Track G |
+| F9 distributed managed-asset knowledge | Resolved | Track G |
+| F10 inconsistent release identity | Operator release gate remains open | Direct user correctness |
+| F11 split configuration authority | Resolved | Track H |
+| F12 incomplete data lifecycle | Accepted beta limitation; interim no-silent-loss rule remains binding | Track H |
+| F13 performance gaps | Accepted exact-workload evidence limit; broad claims remain unmade | Track I |
+| F14 weak test locality | Resolved with contract-focused suites and owned deterministic fixtures | Track I and each owning track |
+| F15 aging vendor evidence | Accepted current-evidence limit | Track E |
 
 No reviewed finding is rejected. F13 no longer describes the measurement suite
 as absent: the CI record covers daemon cold start and replay, concurrent
 mailbox acceptance, first durable handoff, and idle-observation counts. The
-remaining evidence gate is a fresh exact-candidate release run across Linux
-and macOS, with its retained performance comparison. Memory-growth and broad
+release-evidence run for the audited functional candidate passed on Linux and
+macOS with a retained performance artifact. Memory-growth and broad
 cross-platform performance conclusions remain intentionally unclaimed until
 comparable retained data supports them.
 
@@ -157,9 +157,13 @@ and remains an independent rollback point.
 - Durable acceptance is independent of both UIs and precedes notification.
 - Identity, per-recipient FIFO, claim authorization, reply ancestry, replay,
   and honest uncertainty remain intact.
-- Every currently readable journal format stays readable. There is no silent
-  deletion, truncation, or rewrite; breaking migration requires export or an
-  explicit migration path.
+- Every currently readable journal format stays readable. Every acknowledged
+  append ends in a newline and is fsynced; newline-terminated records are
+  immutable. An unterminated final tail was never acknowledged: lenient replay
+  seals it and retains it when valid, while strict replay removes only that
+  tail and logs a warning. No acknowledged record is silently deleted,
+  truncated, or rewritten; breaking migration requires export or an explicit
+  migration path.
 - Official clients retain bounded framing and shared certainty semantics.
 - Notification and activation remain optional. Stateful collapsed Messages,
   the body-free tmux border count, and intentionally chrome-free pane-only use

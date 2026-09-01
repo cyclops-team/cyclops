@@ -268,12 +268,21 @@ notification attempts.
 An ambiguous notification is never an invitation to resend blindly. Use its
 exact notification attempt id:
 
-Cyclops automatically handles a current exact-attempt `verify_failed` doorbell only
-when the complete durable binding and exact composer bytes still match. It
-submits once while the mailbox is pending. If the exact recipient claimed after
-the write, it clears that doorbell without submitting it. Durable intent blocks
-a second terminal key after an uncertain outcome. Human, trailing, changed, or
-unprovable content remains one visible attention item.
+On the ordinary automatic recovery path, Cyclops handles a current
+exact-attempt `verify_failed` doorbell only when the complete durable binding
+and exact composer bytes still match. It submits once while the mailbox is
+pending. If the exact recipient claimed after the write, it clears that
+doorbell without submitting it. Durable intent blocks a second terminal key
+after an uncertain outcome. Human, trailing, changed, or unprovable content
+remains one visible attention item.
+
+An administrator can separately enable the default-off force-submit control,
+stored as `force_notification_submit` and exposed through
+`notification.force_submit.set`; see [install.md](install.md) for the persisted
+configuration. It never pastes or replaces composer bytes, but it may send one
+submit key for one exact `verify_failed` attempt without composer-content proof
+and may therefore submit trailing human input. It is a deliberate liveness
+tradeoff, not an ordinary recovery path.
 
 ```bash
 cyclops attention show <attempt-id> --diff
