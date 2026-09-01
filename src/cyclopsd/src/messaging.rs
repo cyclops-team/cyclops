@@ -2106,6 +2106,22 @@ impl WorkspaceMessaging {
     /// force-submit. The server persists the setting; messaging owns the work
     /// that follows from it.
     pub(crate) fn force_submit_enabled(&self) {
+        self.schedule_force_submit_candidates();
+    }
+
+    /// Reconsider existing exact attention attempts after a watcher has
+    /// published its current routes.
+    ///
+    /// Boot discovers durable candidates before session watchers attach. A
+    /// missing route at that first pass is not a terminal refusal: the route
+    /// publication supplies the later, event-driven recheck. The runtime
+    /// still owns the enabled-setting, binding, claim-ordering, and one-key
+    /// checks.
+    pub(crate) fn force_submit_routes_available(&self) {
+        self.schedule_force_submit_candidates();
+    }
+
+    fn schedule_force_submit_candidates(&self) {
         match self.service.force_submit_candidates() {
             Ok(records) => {
                 for record in records {
