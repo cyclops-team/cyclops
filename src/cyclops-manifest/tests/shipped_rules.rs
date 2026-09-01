@@ -693,6 +693,40 @@ fn agy_working_outranks_the_cleared_composer() {
     assert_eq!(r.state, AgentState::Idle);
 }
 
+/// MEASURED 2026-09-01 (AGY 1.1.23): a narrow pane wraps an active
+/// doorbell across the blue prompt row and two unstyled continuation rows.
+/// The divider and status row below it mean the input rule needs a five-row
+/// window to see the prompt. The fixture is synthetic and redacted: it keeps
+/// only the measured layout and styling that classification depends on.
+#[test]
+fn agy_wrapped_active_composer_input_uses_the_full_window() {
+    let agy = &shipped()["agy"];
+    let esc = include_str!("fixtures/agy_wrapped_active_composer_1_1_23_esc.txt");
+    let plain = cyclops_manifest::strip_csi(esc);
+
+    let active = agy
+        .evaluate_esc("mac", &plain, Some(esc))
+        .expect("the active wrapped composer is classified");
+    assert_eq!(active.id, "composer_has_input");
+    assert_eq!(active.state, AgentState::IdleWithInput);
+    assert_eq!(active.composer_semantic, Some(ComposerSemantic::HumanInput));
+
+    // A submitted AGY prompt is echoed in the transcript with a different
+    // style. The enlarged window may now include that past row, but it must
+    // still classify the current empty composer as clean rather than treating
+    // transcript residue as input.
+    let transcript_esc = "\u{1b}[1m\u{1b}[34m> [redacted transcript echo]\u{1b}[39m\n\
+        \u{1b}[94m>\u{1b}[39m\n\
+        \u{1b}[90m────────────────────────────────────────────────────────\u{1b}[39m\n\
+        \u{1b}[38;2;152;193;217mGemini 3.7 Flash\u{1b}[39m \u{1b}[38;5;251m·\u{1b}[39m \u{1b}[38;5;217mHigh\u{1b}[39m";
+    let transcript_plain = cyclops_manifest::strip_csi(transcript_esc);
+    let empty = agy
+        .evaluate_esc("mac", &transcript_plain, Some(transcript_esc))
+        .expect("the current empty composer is classified");
+    assert_eq!(empty.id, "composer_empty");
+    assert_eq!(empty.state, AgentState::Idle);
+}
+
 /// MEASURED 2026-08-26 (agy 1.1.21, tmux 3.6a), SAFETY: a file-access
 /// decision replaces the composer and spinner with a numbered modal. The pane
 /// must read blocked_permission rather than falling through to unknown.

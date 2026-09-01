@@ -1,0 +1,5 @@
+[94m>[39m [redacted staged input]
+  [redacted continuation one]
+  [redacted continuation two]
+[90m────────────────────────────────────────────────────────[39m
+[38;2;152;193;217mGemini 3.7 Flash[39m [38;5;251m·[39m [38;5;217mHigh[39m [38;5;251m·[39m [38;5;151m<workspace>[39m [38;5;251m·[39m [38;5;182mFull[39m [38;5;251m·[39m [38;5;151mCtx: 100%[39m
