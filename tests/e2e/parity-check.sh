@@ -1308,19 +1308,36 @@ if [ -n "${RUSTUP_TOOLCHAIN:-}" ]; then
   TOOLCHAIN_KEEP+=("RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN")
 fi
 
-run_installer() {
-  local path="$1"; shift
+run_installer_in() {
+  local home="$1" path="$2" out="$3" marker="$4"; shift 4
   set +e
-  env -i \
-    PATH="$path" \
-    HOME="$INST" \
-    SHELL=/bin/zsh \
-    TERM=dumb \
-    NO_COLOR=1 \
-    "${TOOLCHAIN_KEEP[@]}" \
-    sh "$REPO/scripts/install.sh" "$@" > "$OUT" 2>&1
+  if [ -n "$marker" ]; then
+    env -i \
+      PATH="$path" \
+      HOME="$home" \
+      SHELL=/bin/zsh \
+      TERM=dumb \
+      NO_COLOR=1 \
+      "${TOOLCHAIN_KEEP[@]}" \
+      "CYCLOPS_TEST_COPY_FAILURE_MARKER=$marker" \
+      sh "$REPO/scripts/install.sh" "$@" > "$out" 2>&1
+  else
+    env -i \
+      PATH="$path" \
+      HOME="$home" \
+      SHELL=/bin/zsh \
+      TERM=dumb \
+      NO_COLOR=1 \
+      "${TOOLCHAIN_KEEP[@]}" \
+      sh "$REPO/scripts/install.sh" "$@" > "$out" 2>&1
+  fi
   printf '%s' "$?" > "$ROOT/exit"
   set -e
+}
+
+run_installer() {
+  local path="$1"; shift
+  run_installer_in "$INST" "$path" "$OUT" "" "$@"
 }
 
 printf '\n$ ./scripts/install.sh\n'
@@ -1352,6 +1369,31 @@ grep -c '>>> cyclops >>>' "$INST/.zshrc" > "$ROOT/blocks"
 cat "$OUT" | grep 'already has the cyclops block' || true
 check_file "a second run adds no second block" "$ROOT/blocks" '^1$'
 check_exit "the idempotent install exits 0" 0
+
+# A failed macOS clone-optimized copy must not make a successful build
+# un-installable. This wrapper fails only the first private client candidate
+# copy; every other cp call delegates to the system implementation.
+COPY_FALLBACK_HOME="$ROOT/copy-fallback"
+COPY_FALLBACK_PREFIX="$COPY_FALLBACK_HOME/bin"
+COPY_FALLBACK_OUT="$ROOT/copy-fallback.out"
+COPY_FALLBACK_MARKER="$ROOT/copy-fallback.marker"
+mkdir -p "$COPY_FALLBACK_HOME"
+printf '\n$ ./scripts/install.sh --prefix ...    # private candidate copy fallback\n'
+run_installer_in "$COPY_FALLBACK_HOME" \
+  "$REPO/tests/e2e/fixtures/installer-copy-fails:$PATH" \
+  "$COPY_FALLBACK_OUT" \
+  "$COPY_FALLBACK_MARKER" \
+  --prefix "$COPY_FALLBACK_PREFIX" --no-path
+tail -12 "$COPY_FALLBACK_OUT"
+check_exit "the private candidate copy fallback installs successfully" 0
+check_file "the fallback simulation reaches the private candidate copy" \
+  "$COPY_FALLBACK_MARKER" '^intentional private candidate copy failure$'
+check_file "the fallback installs the client" "$COPY_FALLBACK_PREFIX/cyclops" '.'
+check_file "and the fallback installs the daemon" "$COPY_FALLBACK_PREFIX/cyclopsd" '.'
+check_same_file "the fallback keeps client bytes exact" \
+  "$REPO/target/dist/cyclops" "$COPY_FALLBACK_PREFIX/cyclops"
+check_same_file "and the fallback keeps daemon bytes exact" \
+  "$REPO/target/dist/cyclopsd" "$COPY_FALLBACK_PREFIX/cyclopsd"
 
 echo
 echo "#### An installed pair completes the first durable handoff"
