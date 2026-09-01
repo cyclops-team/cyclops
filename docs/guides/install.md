@@ -220,6 +220,11 @@ complete for the installed consumers and 1 when setup needs repair. Add
 `--json` for a stable machine-readable report. The check reads setup state
 only. The standard setup workflow installs or repairs it.
 
+This can still leave `skill` at manual review and setup incomplete. It changes
+only the `mailbox` result: current exact bytes in a regular final `SKILL.md`
+can report `doorbell`, while setup still will not create or rewrite that
+directory.
+
 Review the managed setup seed decisions:
 
 ```
