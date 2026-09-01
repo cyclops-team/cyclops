@@ -307,8 +307,12 @@ locator.
    blocked reading, mode, stale observation, or named non-composer refusal
    withholds Enter even when the current screen still reads `working`. A
    screen `idle` or `idle_with_input` reading may describe the exact staged
-   composer row only because the owner and bytes are separately re-proven. A
-   refusal is never retried.
+   composer row only because the owner and bytes are separately re-proven.
+   The final proof uses the same bounded capture sequence as post-paste
+   verification: a terminal repaint can expose a partial frame, but only a
+   later current frame with the same exact doorbell can proceed. These are
+   rereads only, never another paste or Enter. If no reread proves the same
+   doorbell, the refusal is final for this attempt.
 
    `notification.force_submit` is a separately documented default-off,
    administrator-controlled fallback for one exact current `verify_failed`

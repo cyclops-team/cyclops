@@ -502,7 +502,10 @@ Enter as `verify_failed`. A retained lifecycle end/idle, unknown or blocked
 reading, stale evidence, mode, or named non-composer refusal is a live
 conflict and also withholds Enter, even if the screen still paints `working`.
 Only a screen `idle` or `idle_with_input` reading that describes the owned
-staged composer may coexist with the current Screen `working` reading.
+staged composer may coexist with the current Screen `working` reading. The
+final proof may take its bounded capture rereads to pass a partial terminal
+repaint, but that re-observation never repeats the paste or Enter: only a
+current frame with the same exact bytes can authorize the one reserved key.
 
 What breaks: the same damage as rule 3, reached from the opposite
 direction. Rule 3 holds when the screen sensor SEES staged text. This rule

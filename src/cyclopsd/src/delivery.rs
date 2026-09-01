@@ -68,8 +68,10 @@ const SCREEN_ACK_DEADLINE: Duration = Duration::from_secs(5);
 /// One-shot screen-evidence checkpoints after submit. Events also wake the
 /// waiter; these bound the captures per delivery.
 const ACK_CHECKPOINTS_MS: [u64; 5] = [250, 750, 1500, 3000, 5000];
-/// Post-paste verification re-reads (paste rendering can lag a frame).
-/// Offsets from the paste, one capture each; bounded per attempt.
+/// Post-paste and final-staging verification re-reads. A terminal renderer
+/// can lag one frame behind a paste or expose a partial repaint between two
+/// otherwise exact proofs. Offsets from the preceding write or reread, one
+/// capture each; bounded per attempt.
 const VERIFY_DELAYS_MS: [u64; 4] = [0, 120, 240, 480];
 /// Bottom non-empty lines scanned for the staged verify pattern.
 const VERIFY_REGION: usize = 15;
@@ -4584,34 +4586,37 @@ async fn attempt_delivery(
     // Verification proved a representation at a moment, and Enter is sent
     // at a later one. A person can append to the staged text, or replace
     // it, in between; pressing Enter then submits something nobody
-    // verified and nobody wrote. So the exact staged representation is
-    // proven again here, from a capture taken now.
-    let recheck = match injector.capture_joined_escaped(&handle.pane_id).await {
+    // verified and nobody wrote. Repaint is also not atomic: after a valid
+    // paste proof, a capture can land between the terminal clear and the
+    // renderer's next complete frame. Reuse the bounded post-paste evidence
+    // schedule so that transient incomplete frames do not turn a clean,
+    // owned doorbell into a false verify failure.
+    let recheck = match recheck_exact_staging_snapshot(
+        &injector,
+        &handle.pane_id,
+        manifest,
+        target,
+        &selected.bytes,
+        id_staged,
+        &payload_at_proof,
+    )
+    .await
+    {
         Ok(now) => now,
-        Err(_) => {
+        Err(ExactStagingRecheck::Unobservable) => {
             // Nobody looked, so nobody may press Enter.
             unregister_ack(inner, handle);
             gate_line(inner, handle, "rebound", None, Some("recheck_unobservable"));
             return AttemptOutcome::Failed(AttemptFailure::verify_timeout());
         }
+        Err(ExactStagingRecheck::Mismatch) => {
+            unregister_ack(inner, handle);
+            gate_line(inner, handle, "rebound", None, Some("staging_changed"));
+            return AttemptOutcome::Failed(AttemptFailure::verify_mismatch(
+                ComposerState::ComposerAmbiguous,
+            ));
+        }
     };
-    // Not just "something valid is staged": the SAME thing must be staged.
-    // A human can replace one verified representation with another between
-    // the proof and the key, and a validity-only check would wave it through.
-    if !exact_staging_snapshot_matches(
-        manifest,
-        &recheck,
-        target,
-        &selected.bytes,
-        id_staged,
-        &payload_at_proof,
-    ) {
-        unregister_ack(inner, handle);
-        gate_line(inner, handle, "rebound", None, Some("staging_changed"));
-        return AttemptOutcome::Failed(AttemptFailure::verify_mismatch(
-            ComposerState::ComposerAmbiguous,
-        ));
-    }
     // The capture above took time, so the occupant is checked once more
     // after it. Otherwise the last thing proven about who owns the pane is
     // older than the last thing proven about what is in it.
@@ -4659,28 +4664,18 @@ async fn attempt_delivery(
     // one key attempt; it never authorizes changed or unobservable bytes.
     if notification_submit_reserved {
         inject_pause(inner, "post_submit_reservation").await;
-        let reserved_recheck = injector.capture_joined_escaped(&handle.pane_id).await;
-        match reserved_recheck {
+        match recheck_exact_staging_snapshot(
+            &injector,
+            &handle.pane_id,
+            manifest,
+            target,
+            &selected.bytes,
+            id_staged,
+            &payload_at_proof,
+        )
+        .await
+        {
             Ok(now) => {
-                if !exact_staging_snapshot_matches(
-                    manifest,
-                    &now,
-                    target,
-                    &selected.bytes,
-                    id_staged,
-                    &payload_at_proof,
-                ) {
-                    gate_line(
-                        inner,
-                        handle,
-                        "rebound",
-                        None,
-                        Some("staging_changed_after_submit_reservation"),
-                    );
-                    return AttemptOutcome::Failed(AttemptFailure::verify_mismatch(
-                        ComposerState::ComposerAmbiguous,
-                    ));
-                }
                 if let Err(detail) =
                     notification_staged_action_safe(inner, handle, manifest, &now, &proven, true)
                 {
@@ -4694,7 +4689,19 @@ async fn attempt_delivery(
                     return AttemptOutcome::Failed(AttemptFailure::verify_failed());
                 }
             }
-            Err(_) => {
+            Err(ExactStagingRecheck::Mismatch) => {
+                gate_line(
+                    inner,
+                    handle,
+                    "rebound",
+                    None,
+                    Some("staging_changed_after_submit_reservation"),
+                );
+                return AttemptOutcome::Failed(AttemptFailure::verify_mismatch(
+                    ComposerState::ComposerAmbiguous,
+                ));
+            }
+            Err(ExactStagingRecheck::Unobservable) => {
                 gate_line(
                     inner,
                     handle,
@@ -8704,6 +8711,60 @@ fn exact_staging_snapshot_matches(
     let current = exact_staging_proof(manifest, screen, target, expected_payload);
     current.as_ref().map(|(_, proof)| proof.as_str()) == Some(payload_at_proof)
         && current.map(|(matched, _)| matched) == Some(id_staged)
+}
+
+/// Why the final exact-staging reread did not produce an owned doorbell.
+///
+/// A renderer can expose a partial frame while it clears and repaints. That
+/// is distinguishable from a broken capture pipe: if at least one capture
+/// completed but none restored the exact proof, the pane changed or remained
+/// ambiguous and Enter stays withheld.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactStagingRecheck {
+    Mismatch,
+    Unobservable,
+}
+
+/// Read the exact staged composer through the same bounded frame schedule as
+/// the post-paste proof. This is a re-observation only: it never writes, and
+/// it accepts only the same normalized payload and staging representation
+/// already proven for this notification.
+async fn recheck_exact_staging_snapshot<I: Injector>(
+    injector: &I,
+    pane_id: &str,
+    manifest: &Manifest,
+    target: StagingTarget<'_>,
+    expected_payload: &str,
+    id_staged: bool,
+    payload_at_proof: &str,
+) -> Result<String, ExactStagingRecheck> {
+    let mut last_delay = 0;
+    let mut observed = false;
+    for delay in VERIFY_DELAYS_MS {
+        if delay > last_delay {
+            tokio::time::sleep(Duration::from_millis(delay - last_delay)).await;
+        }
+        last_delay = delay;
+        let Ok(screen) = injector.capture_joined_escaped(pane_id).await else {
+            continue;
+        };
+        observed = true;
+        if exact_staging_snapshot_matches(
+            manifest,
+            &screen,
+            target,
+            expected_payload,
+            id_staged,
+            payload_at_proof,
+        ) {
+            return Ok(screen);
+        }
+    }
+    Err(if observed {
+        ExactStagingRecheck::Mismatch
+    } else {
+        ExactStagingRecheck::Unobservable
+    })
 }
 
 /// Closed screen-representation outcomes for the Gate 7 component harness.
@@ -15476,6 +15537,60 @@ composer_trailer_required_prefix = 1
         assert!(
             !would_submit_above,
             "recheck must detect draft row above doorbell and withhold enter"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exact_staging_recheck_waits_out_a_partial_repaint_but_not_a_draft() {
+        let manifest = sentinel_manifest();
+        let message_id = MessageId::new("m-3f9c2a").expect("valid message id");
+        let doorbell = cyclops_proto::render_doorbell_v1(&message_id);
+        let exact = format!("\u{1b}[39m❯ {doorbell}\n{CHROME}");
+        let (id_staged, payload_at_proof) = exact_staging_proof(
+            &manifest,
+            &exact,
+            StagingTarget::ExactRow(&doorbell),
+            &doorbell,
+        )
+        .expect("baseline exact proof");
+
+        // A terminal repaint can expose only the cleared prompt for one
+        // capture. A later complete frame with the same exact bytes is safe
+        // to use; this helper only reads and never widens the proof.
+        let partial_repaint = "\u{1b}[39m❯\n";
+        let repainting = MockInjector::new(vec![partial_repaint, exact.as_str()]);
+        assert_eq!(
+            recheck_exact_staging_snapshot(
+                &repainting,
+                "%1",
+                &manifest,
+                StagingTarget::ExactRow(&doorbell),
+                &doorbell,
+                id_staged,
+                &payload_at_proof,
+            )
+            .await,
+            Ok(exact.clone()),
+            "a partial redraw must not manufacture verify_failed after an exact paste proof"
+        );
+
+        // A stable human edit never becomes the earlier exact doorbell, so
+        // the bounded re-read still refuses to send Enter.
+        let human_draft = format!("\u{1b}[39m❯ {doorbell} human edit\n{CHROME}");
+        let edited = MockInjector::new(vec![human_draft.as_str(); VERIFY_DELAYS_MS.len()]);
+        assert_eq!(
+            recheck_exact_staging_snapshot(
+                &edited,
+                "%1",
+                &manifest,
+                StagingTarget::ExactRow(&doorbell),
+                &doorbell,
+                id_staged,
+                &payload_at_proof,
+            )
+            .await,
+            Err(ExactStagingRecheck::Mismatch),
+            "a durable human edit must still withhold Enter"
         );
     }
 
