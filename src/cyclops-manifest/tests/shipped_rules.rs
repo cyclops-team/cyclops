@@ -693,6 +693,41 @@ fn agy_working_outranks_the_cleared_composer() {
     assert_eq!(r.state, AgentState::Idle);
 }
 
+/// MEASURED 2026-09-01 (AGY 1.1.23): a 100-column pane wraps active input
+/// across the blue prompt row and two unstyled continuation rows. The divider
+/// and status row below it mean the input rule needs a five-row window to see
+/// the prompt. The fixture is a scrubbed `capture-pane -p -e -J` capture from
+/// an isolated probe: its staged text and private probe root are redacted.
+#[test]
+fn agy_wrapped_active_composer_input_uses_the_full_window() {
+    let agy = &shipped()["agy"];
+    let esc = include_str!("fixtures/agy_wrapped_active_composer_1_1_23_esc.txt");
+    let plain = cyclops_manifest::strip_csi(esc);
+
+    let active = agy
+        .evaluate_esc("mac", &plain, Some(esc))
+        .expect("the active wrapped composer is classified");
+    assert_eq!(active.id, "composer_has_input");
+    assert_eq!(active.state, AgentState::IdleWithInput);
+    assert_eq!(active.composer_semantic, Some(ComposerSemantic::HumanInput));
+
+    // This synthetic negative control puts a submitted AGY prompt in the
+    // fifth-from-bottom row, where the enlarged window now sees it. Its
+    // historical bold-blue style must not count as the current bright-blue
+    // composer, so the empty current composer must still remain clean.
+    let transcript_esc = "\u{1b}[1m\u{1b}[34m> [redacted transcript echo]\u{1b}[39m\n\
+        [redacted ordinary transcript row]\n\
+        \u{1b}[94m>\u{1b}[39m\n\
+        \u{1b}[90m────────────────────────────────────────────────────────\u{1b}[39m\n\
+        \u{1b}[38;2;152;193;217mGemini 3.7 Flash\u{1b}[39m \u{1b}[38;5;251m·\u{1b}[39m \u{1b}[38;5;217mHigh\u{1b}[39m";
+    let transcript_plain = cyclops_manifest::strip_csi(transcript_esc);
+    let empty = agy
+        .evaluate_esc("mac", &transcript_plain, Some(transcript_esc))
+        .expect("the current empty composer is classified");
+    assert_eq!(empty.id, "composer_empty");
+    assert_eq!(empty.state, AgentState::Idle);
+}
+
 /// MEASURED 2026-08-26 (agy 1.1.21, tmux 3.6a), SAFETY: a file-access
 /// decision replaces the composer and spinner with a numbered modal. The pane
 /// must read blocked_permission rather than falling through to unknown.
