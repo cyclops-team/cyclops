@@ -49,6 +49,15 @@ observable result.
 `--submit-log <path>` appends one line for every submit key the fixture
 receives. It lets recovery tests prove that reconciliation sends no second key.
 
+`--submit-event-socket <path>` sends one Unix datagram after the fixture
+consumes each submit key. It lets a test wait for the observed Enter rather
+than polling a log file.
+
+With that event socket, Ctrl-Q emits a `checkpoint` datagram after all earlier
+input in the same parser stream. Tests use it only after shutting down the
+delivery worker, so the checkpoint makes any duplicate queued Enter observable
+without a sleep.
+
 `--manual-lifecycle` consumes a successful submit but stays visually idle.
 Lifecycle tests then use Ctrl-T and Ctrl-Y to choose the observed start and
 end without wall-clock races.
@@ -65,6 +74,7 @@ current frame. Cyclops itself sends none of these keys.
 """
 
 import os
+import socket
 import sys
 import termios
 import time
@@ -78,8 +88,13 @@ START = b"\x1b[200~"
 END = b"\x1b[201~"
 
 
+def emit_event(path, event):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as event_socket:
+        event_socket.sendto(event, path)
+
+
 class Stream:
-    """Incremental reader: bytes in, (text, submit) events out.
+    """Incremental reader: bytes in, (text, submit, checkpoint) events out.
 
     Holds a tail of bytes that could still be the start of a delimiter,
     so a marker split across two reads is still recognized.
@@ -128,6 +143,11 @@ class Stream:
                         if j > start:
                             events.append(("text", head[start:j]))
                         events.append(("submit", b""))
+                        start = j + 1
+                    elif byte == 17:
+                        if j > start:
+                            events.append(("text", head[start:j]))
+                        events.append(("checkpoint", b""))
                         start = j + 1
                 if start < len(head):
                     events.append(("text", head[start:]))
@@ -181,6 +201,11 @@ def selftest():
     s = Stream()
     assert s.feed(b"\r") == [("submit", b"")]
 
+    # Ctrl-Q is a fixture-only checkpoint. It must follow an Enter that
+    # shared its PTY read, so a test can use it as a terminal-order fence.
+    s = Stream()
+    assert s.feed(b"\r\x11") == [("submit", b""), ("checkpoint", b"")]
+
     # A payload's line feeds are content even with no brackets in sight,
     # which is what keeps a multi-line paste in one piece when tmux does
     # not bracket it.
@@ -202,6 +227,9 @@ def main():
     submit_log = None
     if "--submit-log" in sys.argv:
         submit_log = sys.argv[sys.argv.index("--submit-log") + 1]
+    submit_event_socket = None
+    if "--submit-event-socket" in sys.argv:
+        submit_event_socket = sys.argv[sys.argv.index("--submit-event-socket") + 1]
     swallowed = False
     forced_working = False
     fd = sys.stdin.fileno()
@@ -265,10 +293,15 @@ def main():
                             staged += char
                     hidden = False
                     draw(transcript, staged, working=forced_working)
+                elif kind == "checkpoint":
+                    if submit_event_socket is not None:
+                        emit_event(submit_event_socket, b"checkpoint")
                 else:
                     if submit_log is not None:
                         with open(submit_log, "a", encoding="utf-8") as log:
                             log.write("submit\n")
+                    if submit_event_socket is not None:
+                        emit_event(submit_event_socket, b"submit")
                     if swallow or (swallow_once and not swallowed):
                         # The key arrived and was accepted. Nothing else
                         # happens: the composer keeps its text and no turn

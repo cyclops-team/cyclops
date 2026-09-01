@@ -2309,7 +2309,39 @@ pub(crate) fn staged_action_ready(
         .is_some_and(|entry| staged_entry_ready(entry, owner, expected, manifest))
 }
 
+/// Confirm that a Working-plus-clean notification may submit its one exact
+/// staged doorbell. The caller separately proves the final bytes and carries
+/// the pre-paste clean-composer admission; this predicate makes sure fusion
+/// has not since learned a live lifecycle, mode, or sensor conflict.
+pub(crate) fn staged_working_clean_action_ready(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    pane_id: &str,
+    owner: &str,
+    agent: cyclops_proto::ProcessInstanceId,
+    manifest: &str,
+) -> bool {
+    let expected = crate::identity::ProcId {
+        pid: agent.pid(),
+        birth: agent.birth(),
+    };
+    let map = inner.detections.lock().expect("detections lock");
+    map.get(&PaneKey::new(session_idx, pane_id))
+        .is_some_and(|entry| {
+            staged_entry_working_clean_action_ready(entry, owner, expected, manifest)
+        })
+}
+
 fn staged_entry_ready(
+    entry: &DetEntry,
+    owner: &str,
+    agent: crate::identity::ProcId,
+    manifest: &str,
+) -> bool {
+    staged_entry_binding_ready(entry, owner, agent, manifest) && staged_frame_is_quiet(entry)
+}
+
+fn staged_entry_binding_ready(
     entry: &DetEntry,
     owner: &str,
     agent: crate::identity::ProcId,
@@ -2319,7 +2351,62 @@ fn staged_entry_ready(
         && entry.hold_owner.as_deref() == Some(owner)
         && entry.agent == Some(agent)
         && entry.manifest.as_deref() == Some(manifest)
-        && staged_frame_is_quiet(entry)
+        && !entry.in_mode
+        && !entry.detection.stale
+}
+
+/// The Working-plus-clean submit path may retain its own barrier after fusion
+/// sees the exact staged doorbell as input during the already-running turn.
+/// That observation changes `Staged` to `StagedDuringTurn`; it does not make
+/// a human draft safe. Only the in-flight path, which separately carries its
+/// pre-paste clean admission and re-proves the exact bytes, may use this
+/// binding. Quiet, recovery, and operator paths remain `Staged`-only above.
+fn staged_entry_working_clean_binding_ready(
+    entry: &DetEntry,
+    owner: &str,
+    agent: crate::identity::ProcId,
+    manifest: &str,
+) -> bool {
+    matches!(
+        entry.hold,
+        ComposerHold::Staged | ComposerHold::StagedDuringTurn
+    ) && entry.hold_owner.as_deref() == Some(owner)
+        && entry.agent == Some(agent)
+        && entry.manifest.as_deref() == Some(manifest)
+        && !entry.in_mode
+        && !entry.detection.stale
+}
+
+/// The staged doorbell itself may legitimately make the screen's composer
+/// rule read idle-with-input, but the live runtime must still be an explicitly
+/// current, conflict-free Working frame. In particular, a late hook Stop is
+/// an Idle reading from a non-composer sensor, not a harmless description of
+/// the staged row.
+fn staged_entry_working_clean_action_ready(
+    entry: &DetEntry,
+    owner: &str,
+    agent: crate::identity::ProcId,
+    manifest: &str,
+) -> bool {
+    let permitted_staged_block = matches!(
+        entry.detection.write_block.as_deref(),
+        Some("composer_hold" | "no_write_safe_composer_evidence")
+    );
+    let current_screen_working =
+        entry.detection.readings.iter().any(|reading| {
+            reading.sensor == Sensor::Screen && reading.state == AgentState::Working
+        });
+    let no_live_conflict = entry.detection.readings.iter().all(|reading| {
+        reading.state == AgentState::Working
+            || (reading.sensor == Sensor::Screen
+                && matches!(reading.state, AgentState::Idle | AgentState::IdleWithInput))
+    });
+    staged_entry_working_clean_binding_ready(entry, owner, agent, manifest)
+        && entry.detection.state == AgentState::Working
+        && !entry.detection.disagreement
+        && permitted_staged_block
+        && current_screen_working
+        && no_live_conflict
 }
 
 /// Release this attempt's composer barrier after a guarded resolution.
@@ -9215,6 +9302,132 @@ regex = ['^']
             "att-1",
         );
         assert!(staged_entry_ready(&idle_with_input, "att-1", agent, "fix"));
+    }
+
+    #[test]
+    fn a_staged_doorbell_keeps_its_exact_binding_for_a_clean_working_submit() {
+        let agent = crate::identity::ProcId { pid: 7, birth: 70 };
+        // The staged doorbell now occupies the composer, so its current
+        // semantic is human_input. The normal delivery path separately
+        // proves these exact bytes, the current Working frame, and carries
+        // the pre-paste clean proof.
+        let mut working = staged_entry(
+            AgentState::Working,
+            Some(ComposerSemantic::HumanInput),
+            vec![
+                screen_reading(AgentState::Working),
+                screen_reading(AgentState::IdleWithInput),
+            ],
+            false,
+            false,
+            "att-1",
+        );
+        working.detection.write_block = Some("composer_hold".into());
+        assert!(
+            !staged_entry_ready(&working, "att-1", agent, "fix"),
+            "the quiet action path must remain unavailable while Working"
+        );
+        assert!(staged_entry_working_clean_action_ready(
+            &working, "att-1", agent, "fix"
+        ));
+
+        // Once fusion re-observes the exact doorbell, ordinary composer-hold
+        // semantics correctly remember that it appeared during this old
+        // Working turn. The one in-flight Working admission keeps its exact
+        // binding; the quiet path must stay closed.
+        let mut reobserved = working.clone();
+        reobserved.hold = ComposerHold::StagedDuringTurn;
+        assert!(
+            !staged_entry_ready(&reobserved, "att-1", agent, "fix"),
+            "the quiet action path must reject a staged-during-turn barrier"
+        );
+        assert!(staged_entry_working_clean_action_ready(
+            &reobserved,
+            "att-1",
+            agent,
+            "fix"
+        ));
+
+        let mut turn_started = reobserved.clone();
+        turn_started.hold = ComposerHold::TurnStarted { since_ms: 2 };
+        assert!(
+            !staged_entry_working_clean_action_ready(&turn_started, "att-1", agent, "fix"),
+            "a later turn-start mark cannot reuse the Working admission"
+        );
+
+        let mut late_stop = reobserved.clone();
+        late_stop.detection.readings.push(SensorReading {
+            sensor: Sensor::Hook,
+            state: AgentState::Idle,
+            rule: "hook:Stop".into(),
+            ts: 2,
+        });
+        assert!(
+            !staged_entry_working_clean_action_ready(&late_stop, "att-1", agent, "fix"),
+            "a late hook Stop is a live conflict, not composer context"
+        );
+
+        let mut blocked = reobserved.clone();
+        blocked.detection.readings.push(SensorReading {
+            sensor: Sensor::Screen,
+            state: AgentState::BlockedModal,
+            rule: "permission".into(),
+            ts: 2,
+        });
+        assert!(
+            !staged_entry_working_clean_action_ready(&blocked, "att-1", agent, "fix"),
+            "a blocking screen reading must withhold the Working exception"
+        );
+
+        let mut unknown = reobserved.clone();
+        unknown.detection.state = AgentState::Unknown;
+        assert!(
+            !staged_entry_working_clean_action_ready(&unknown, "att-1", agent, "fix"),
+            "unknown fusion state cannot reuse an earlier clean-composer proof"
+        );
+
+        let mut non_write_ready = reobserved.clone();
+        non_write_ready.detection.write_block = Some("occupant_unprovable".into());
+        assert!(
+            !staged_entry_working_clean_action_ready(&non_write_ready, "att-1", agent, "fix"),
+            "only the owned staged-composer refusal may remain"
+        );
+
+        let stale = staged_entry(
+            AgentState::Working,
+            Some(ComposerSemantic::HumanInput),
+            vec![screen_reading(AgentState::Working)],
+            true,
+            false,
+            "att-1",
+        );
+        assert!(!staged_entry_working_clean_action_ready(
+            &stale, "att-1", agent, "fix"
+        ));
+
+        let in_mode = staged_entry(
+            AgentState::Working,
+            Some(ComposerSemantic::HumanInput),
+            vec![screen_reading(AgentState::Working)],
+            false,
+            true,
+            "att-1",
+        );
+        assert!(!staged_entry_working_clean_action_ready(
+            &in_mode, "att-1", agent, "fix"
+        ));
+        assert!(!staged_entry_working_clean_action_ready(
+            &working, "att-2", agent, "fix"
+        ));
+        assert!(!staged_entry_working_clean_action_ready(
+            &working,
+            "att-1",
+            crate::identity::ProcId { pid: 8, birth: 80 },
+            "fix"
+        ));
+        assert!(!staged_entry_working_clean_action_ready(
+            &working, "att-1", agent, "other"
+        ));
     }
     /// Ordinary idle composer frames never end an authenticated confirmed
     /// start. One manifest-declared terminal winner may do so.
