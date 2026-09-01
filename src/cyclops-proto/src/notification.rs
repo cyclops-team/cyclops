@@ -1167,7 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn width_block_keeps_the_closed_prewrite_cause_rollback_decodable() {
+    fn pre_write_detail_keeps_the_closed_cause_rollback_decodable() {
         #[derive(Debug, Deserialize, PartialEq, Eq)]
         #[serde(rename_all = "snake_case")]
         enum LegacyPreWriteCause {
@@ -1188,7 +1188,8 @@ mod tests {
             "pre_write_observation": {
                 "selected_manifest": "codex",
                 "pane_width": 59,
-                "required_pane_width": 60
+                "required_pane_width": 60,
+                "write_block": "composer_semantic_ambiguous"
             }
         });
         let legacy: LegacyBlock = serde_json::from_value(current).unwrap();
@@ -1664,7 +1665,7 @@ mod tests {
                 }),
                 pane_width: Some(59),
                 required_pane_width: Some(60),
-                write_block: None,
+                write_block: Some("composer_semantic_ambiguous".into()),
             })),
         };
 
@@ -1674,7 +1675,8 @@ mod tests {
             serde_json::json!({
                 "route_evidence": {"boot_id": "boot-route", "generation": 9},
                 "pane_width": 59,
-                "required_pane_width": 60
+                "required_pane_width": 60,
+                "write_block": "composer_semantic_ambiguous"
             })
         );
         let decoded: NotificationFact = serde_json::from_value(encoded).unwrap();

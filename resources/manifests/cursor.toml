@@ -193,6 +193,31 @@ typing always wins (GOALS)."""
 evidence = "MEASURED: ' \\x1b[48;2;21;21;21m → what does add do'"
 
 [[rule]]
+id = "composer_clean_idle"
+state = "idle"
+composer_semantic = "clean"
+priority = 1025
+region = "bottom_non_empty_lines(6)"
+line_regex_esc = ['^(?:\s|\x1b\[[0-9;]*m)*\x1b\[(?:0;)?2m→\s+\x1b\[0;7m(?:\x1b\[[0-9;]*m)*[^\x1b]\x1b\[0;2m(?:\x1b\[[0-9;]*m)*[^\x1b]*\x1b\[0m(?:\s|\x1b\[[0-9;]*m)*$']
+note = """The empty composer at rest, and the only Cursor rule allowed to say
+so: the dim glyph, the reverse-video block cursor over the placeholder's first
+character, the dim remainder, and then NOTHING but background paint to the end
+of the line. The end anchor is what earns `clean` where composer_ghost_or_empty
+below stays `ambiguous`: Cursor paints its working hint 'ctrl+c to stop' on
+this same composer line for exactly the duration of the turn, so mid-turn the
+tail carries a second dim text run and this rule cannot match. Mid-turn writes
+stay unmeasured and fail closed on the ambiguous rule below; this rule can
+only ever certify a composer that is empty AND at rest. The placeholder text
+itself is still never matched — it is 'Plan, search, build anything' before
+the first turn and 'Add a follow-up' after it — only its styling frame is."""
+evidence = """MEASURED 2026-08-30, cursor-agent 2026.08.25-3e8eec8, live 49x15
+pane, fixtures/cursor_clean_idle_composer_esc.txt:
+' \\x1b[48;2;18;18;18m \\x1b[2m→ \\x1b[0;7m\\x1b[48;2;18;18;18mA\\x1b[0;2m\\x1b[48;2;18;18;18mdd a follow-up\\x1b[0m\\x1b[48;2;18;18;18m...\\x1b[49m'
+The mid-turn counter-capture is fixtures/cursor_working_composer_esc.txt, whose
+composer line ends '...follow-up\\x1b[0m\\x1b[48;2;21;21;21m...\\x1b[2mctrl+c to stop\\x1b[0m...':
+the plain 'c' after the tail SGR is what the end anchor refuses."""
+
+[[rule]]
 id = "composer_ghost_or_empty"
 state = "idle"
 composer_semantic = "ambiguous"
@@ -204,7 +229,14 @@ wrapped in SGR dim (ESC[2m) STARTING AT THE GLYPH — the opposite arrangement
 from Codex, where the glyph is bold and only the ghost text after it is dim.
 The placeholder text itself is not stable and must never be matched: it is
 'Plan, search, build anything' before the first turn and 'Add a follow-up'
-after it. Matching the dim glyph is what survives that change."""
+after it. Matching the dim glyph is what survives that change.
+
+Since composer_clean_idle above, this rule is the fail-closed net: it still
+matches the placeholder mid-turn (the dim glyph never leaves the screen while
+the agent generates) and on any rendering the end-anchored clean rule cannot
+prove, and its `ambiguous` semantic is what keeps those frames from ever
+reading write-safe. Do not promote it to `clean`: that would hand mid-turn
+frames, which are unmeasured for injection, a write-safe composer."""
 evidence = "MEASURED: ' \\x1b[48;2;21;21;21m \\x1b[2m→ \\x1b[0;7mP\\x1b[0;2m...lan, search, build anything'"
 
 [[rule]]

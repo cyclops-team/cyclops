@@ -23,9 +23,10 @@
 //! Zero-polling shape: workers sleep on queue notifies and wake on watcher
 //! or fusion events. Every timer is a one-shot tied to one delivery: the
 //! paste verification re-reads, the tier-1 ACK window, the screen-evidence
-//! checkpoints, the decline-key spacing, the gate's single wedged-hold
-//! ping, and the two deadlines a caller asked for (`receipt_block_ms`,
-//! and `timeout_ms` on a wait). Nothing runs on an interval.
+//! checkpoints, the decline-key spacing, the idle-ambiguous-composer settle
+//! deadline, the gate's single wedged-hold ping, and the two deadlines a
+//! caller asked for (`receipt_block_ms`, and `timeout_ms` on a wait). Nothing
+//! runs on an interval.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -5540,6 +5541,12 @@ pub(crate) async fn inject_pause(inner: &Arc<Inner>, phase: &'static str) {
 /// The gate hold cause that no pane event will ever clear: the daemon
 /// could not read who is in the pane.
 const OBSERVATION_HOLD: &str = "occupant_unprovable";
+/// The gate hold for an idle pane whose composer keeps reading `ambiguous`.
+/// Held on events like any composer cause, but also on a timed wake at the
+/// settle boundary: ambiguity that never changes emits no pane event, and
+/// without the timer the wake would wait in memory forever instead of
+/// settling as the durable `composer_semantic_ambiguous` block.
+const AMBIGUOUS_COMPOSER_HOLD: &str = "not_write_ready:composer_semantic_ambiguous";
 const WRITE_READINESS_OBSERVATION_HOLD: &str = "not_write_ready:occupant_unprovable";
 /// The write block a hook-liveness manifest stamps when no admitting hook
 /// edge has been published for the pane's current binding. Durable, never
@@ -5941,6 +5948,11 @@ async fn gate(
     // gap where a settled readiness edge can be published after an early pane
     // wake but before the next receiver exists, stranding a now-clean pane.
     let mut ev_rx = inner.events.subscribe();
+    // When the idle-ambiguous composer hold began. Cleared whenever any
+    // other verdict interrupts, so only unbroken ambiguity can outlive the
+    // settle window and become the durable block.
+    let mut ambiguous_since: Option<Instant> = None;
+    let ambiguous_settle = Duration::from_millis(inner.cfg.ambiguous_composer_settle_ms);
     'gate: loop {
         // The event receiver predates every evaluation, so events published
         // mid-evaluation or between iterations remain buffered. Evaluation
@@ -6233,6 +6245,71 @@ async fn gate(
                                             observation: Box::new(observation),
                                         };
                                     }
+                                    // A composer that reads `ambiguous` on an
+                                    // idle pane may be one frame from proof (a
+                                    // redraw caught mid-paint) or may never be
+                                    // provable at all (a manifest whose rules
+                                    // cannot classify this vendor's clean
+                                    // composer). No single frame separates the
+                                    // two, so the first reading holds — but
+                                    // only for the settle window. Ambiguity
+                                    // that outlives it is a manifest gap
+                                    // wearing a transient's clothes, and no
+                                    // pane event announces "still ambiguous",
+                                    // so the wake settles as a durable,
+                                    // operator-visible block instead of
+                                    // waiting in memory forever. Working
+                                    // frames never reach this arm (the
+                                    // Working arm above owns them), so
+                                    // mid-turn ambiguity — deliberate where a
+                                    // vendor's mid-turn injection is
+                                    // unmeasured — cannot escalate.
+                                    (false, Some("no_write_safe_composer_evidence"))
+                                        if handle.notification.is_some()
+                                            && det.composer_semantic
+                                                == Some(ComposerSemantic::Ambiguous) =>
+                                    {
+                                        let since =
+                                            *ambiguous_since.get_or_insert_with(Instant::now);
+                                        if since.elapsed() < ambiguous_settle {
+                                            Some(AMBIGUOUS_COMPOSER_HOLD.to_string())
+                                        } else {
+                                            let Some(mut observation) =
+                                                composer_semantic_observation(
+                                                    inner,
+                                                    handle,
+                                                    &row,
+                                                    &manifest_id,
+                                                )
+                                            else {
+                                                return GateOutcome::BlockedPreWrite {
+                                                    cause:
+                                                        NotificationPreWriteCause::BindingUnprovable,
+                                                    observation: Box::new(
+                                                        binding_unprovable_observation(
+                                                            inner,
+                                                            handle,
+                                                            row.pane_pid,
+                                                            &manifest_id,
+                                                        ),
+                                                    ),
+                                                };
+                                            };
+                                            // Keep the durable detail in the
+                                            // existing optional observation
+                                            // field. Adding a new persisted
+                                            // enum spelling would make an
+                                            // older journal reader reject a
+                                            // record it otherwise understands.
+                                            observation.write_block =
+                                                Some("composer_semantic_ambiguous".to_string());
+                                            return GateOutcome::BlockedPreWrite {
+                                                cause:
+                                                    NotificationPreWriteCause::WriteReadinessChanged,
+                                                observation: Box::new(observation),
+                                            };
+                                        }
+                                    }
                                     // A staged composer hold is an exact, durable
                                     // pre-write refusal. The daemon has observed
                                     // input it must not type over, so persist the
@@ -6447,6 +6524,11 @@ async fn gate(
                 }
             }
         };
+        // Only unbroken ambiguity may settle: any other verdict in between
+        // restarts the window from zero.
+        if hold.as_deref() != Some(AMBIGUOUS_COMPOSER_HOLD) {
+            ambiguous_since = None;
+        }
         if let Some(cause) = hold {
             handle.set_hold(Some(normalize_hold_cause(&cause)));
             if last_hold.as_deref() != Some(cause.as_str()) {
@@ -6476,7 +6558,17 @@ async fn gate(
             // answer, and neither produces a pane event to wake on.
             let unprovable =
                 cause == OBSERVATION_HOLD || cause == format!("not_write_ready:{OBSERVATION_HOLD}");
-            let retry_at = unprovable.then(|| Instant::now() + OBSERVATION_RETRY);
+            // The ambiguous-composer hold gets the same treatment for the
+            // same reason: unchanged ambiguity emits no pane event, so the
+            // settle boundary needs its own wake to become the durable
+            // block rather than an indefinite in-memory wait.
+            let retry_at = if unprovable {
+                Some(Instant::now() + OBSERVATION_RETRY)
+            } else if cause == AMBIGUOUS_COMPOSER_HOLD {
+                ambiguous_since.map(|since| since + ambiguous_settle)
+            } else {
+                None
+            };
             let exact_evidence = tokio::select! {
                 changed = wait_pane_change(
                     &mut ev_rx,

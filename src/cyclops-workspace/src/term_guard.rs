@@ -1,8 +1,10 @@
 //! Terminal guard: raw mode, alternate screen, panic-safe restore.
 
-use std::io::{self, Write};
+use std::io::{self, Read as _, Write};
 use std::panic::{self, AssertUnwindSafe};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
@@ -129,9 +131,74 @@ fn write_window_palette(out: &mut impl Write, fg: (u8, u8, u8), bg: (u8, u8, u8)
     );
 }
 
-/// Hand the terminal's default foreground and background back (OSC 110/111).
+/// One terminal color as 8-bit RGB.
+type Rgb = (u8, u8, u8);
+
+/// The terminal's own default foreground and background when an operator
+/// explicitly configured both values. An unset cell means there is no
+/// override, so restoration uses the terminal's OSC 110/111 reset request.
+static ORIGINAL_PALETTE: OnceLock<Option<(Rgb, Rgb)>> = OnceLock::new();
+
+fn original_palette() -> Option<(Rgb, Rgb)> {
+    ORIGINAL_PALETTE.get().copied().flatten()
+}
+
+/// Load an optional exact terminal palette from the operator's `[workspace]`
+/// settings. The UI never writes these keys and never asks the terminal to
+/// report them, so input still has exactly one owner.
+///
+/// Both values are required. A partial or malformed pair deliberately falls
+/// back to OSC 110/111 rather than guessing the terminal's defaults.
+pub fn configure_default_palette(home: &Path) {
+    let _ = ORIGINAL_PALETTE.set(configured_default_palette(home));
+}
+
+fn configured_default_palette(home: &Path) -> Option<(Rgb, Rgb)> {
+    let root = cyclops_state::StateRoot::open_existing(home).ok()??;
+    let mut file = root.open_read(Path::new("config.toml")).ok()??;
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    let table = text.parse::<toml::Table>().ok()?;
+    let workspace = table.get("workspace")?.as_table()?;
+    let fg = workspace
+        .get("terminal_default_fg")?
+        .as_str()
+        .and_then(parse_hex_color)?;
+    let bg = workspace
+        .get("terminal_default_bg")?
+        .as_str()
+        .and_then(parse_hex_color)?;
+    Some((fg, bg))
+}
+
+fn parse_hex_color(value: &str) -> Option<Rgb> {
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    Some((
+        u8::from_str_radix(&hex[0..2], 16).ok()?,
+        u8::from_str_radix(&hex[2..4], 16).ok()?,
+        u8::from_str_radix(&hex[4..6], 16).ok()?,
+    ))
+}
+
+/// Hand the terminal's default foreground and background back.
+///
+/// When the operator configured exact defaults, set those back with OSC
+/// 10/11. This supports terminals that ignore OSC 110/111. Otherwise ask
+/// the terminal to reset to its own defaults with OSC 110/111.
 fn reset_window_palette(out: &mut impl Write) {
-    let _ = write!(out, "\x1b]110\x1b\\\x1b]111\x1b\\");
+    write_reset(out, original_palette());
+}
+
+fn write_reset(out: &mut impl Write, original: Option<(Rgb, Rgb)>) {
+    match original {
+        Some((fg, bg)) => write_window_palette(out, fg, bg),
+        None => {
+            let _ = write!(out, "\x1b]110\x1b\\\x1b]111\x1b\\");
+        }
+    }
 }
 
 /// Hand the foreground and background back while the workspace keeps running.
@@ -257,6 +324,84 @@ mod tests {
             "\x1b]10;#3a2b26\x1b\\\x1b]11;#faf6e6\x1b\\",
             "foreground and background channels are lowercase, zero-padded hex"
         );
+    }
+
+    /// An operator-configured default is handed back with an OSC set, which
+    /// supports terminals that ignore the OSC 110/111 reset request.
+    #[test]
+    fn a_known_default_is_handed_back_by_setting_it_not_by_asking_for_a_reset() {
+        let mut out: Vec<u8> = Vec::new();
+        write_reset(&mut out, Some(((0x3a, 0x2b, 0x26), (0x00, 0x00, 0x00))));
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b]10;#3a2b26\x1b\\\x1b]11;#000000\x1b\\",
+            "an operator-provided default must be set back exactly"
+        );
+    }
+
+    /// With no valid operator override, ask the terminal to reset itself.
+    #[test]
+    fn an_unknown_default_falls_back_to_the_reset_request() {
+        let mut out: Vec<u8> = Vec::new();
+        write_reset(&mut out, None);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b]110\x1b\\\x1b]111\x1b\\",
+            "no operator default means ask the terminal to reset to its own"
+        );
+    }
+
+    /// The operator must supply one complete, strict `#rrggbb` pair. A
+    /// partial or malformed configuration must not guess a terminal palette.
+    #[test]
+    fn configured_default_palette_requires_a_valid_pair() {
+        use std::path::Path;
+
+        let home = cyclops_proto::scratch::scratch_dir("workspace-terminal-default-palette");
+        let _ = std::fs::remove_dir_all(&home);
+        let root = cyclops_state::StateRoot::open_or_create(&home).expect("safe home");
+
+        root.replace_file(
+            Path::new("config.toml"),
+            b"[workspace]\nterminal_default_fg = \"#3a2b26\"\nterminal_default_bg = \"#000000\"\n",
+        )
+        .expect("valid pair");
+        assert_eq!(
+            configured_default_palette(&home),
+            Some(((0x3a, 0x2b, 0x26), (0x00, 0x00, 0x00)))
+        );
+
+        root.replace_file(
+            Path::new("config.toml"),
+            b"[workspace]\nterminal_default_fg = \"#3a2b2\"\nterminal_default_bg = \"#000000\"\n",
+        )
+        .expect("malformed pair");
+        assert_eq!(configured_default_palette(&home), None);
+
+        root.replace_file(
+            Path::new("config.toml"),
+            b"[workspace]\nterminal_default_fg = \"#3a2b26\"\n",
+        )
+        .expect("partial pair");
+        assert_eq!(configured_default_palette(&home), None);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// Terminal input has a single owner: the application event thread.
+    /// This guard only writes terminal state and reads configuration files.
+    #[test]
+    fn the_terminal_guard_never_reads_terminal_input() {
+        let source = include_str!("term_guard.rs");
+        for forbidden in [
+            ["std::io", "::stdin"].concat(),
+            ["libc", "::read"].concat(),
+            ["event", "::read()"].concat(),
+        ] {
+            assert!(
+                !source.contains(&forbidden),
+                "terminal palette restoration must not read input through {forbidden}"
+            );
+        }
     }
 
     #[test]

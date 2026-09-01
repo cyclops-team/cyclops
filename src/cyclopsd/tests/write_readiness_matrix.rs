@@ -448,21 +448,52 @@ fn agy_deterministic_safety_matrix_9_states() {
     assert_eq!(det.write_block.as_deref(), Some("sensor_disagreement"));
 }
 
-// ── Separate Non-Authoritative Fixture: Cursor ────────────────────────────────
+// ── Cursor: measured clean-idle capture plus fail-closed shapes ───────────────
 
 #[test]
 fn cursor_offline_fixture_validation_unavailable_live_gate() {
     let manifests = shipped_manifests();
     let manifest = &manifests["cursor"];
 
-    // 1. Idle (clean composer with dim placeholder) -> write_ready == true
+    // 1a. Idle (clean composer, measured 'Add a follow-up' placeholder at
+    // rest, cursor-agent 2026.08.25-3e8eec8) -> write_ready == true. This is
+    // the 2026-08-30 repro: this exact screen read `ambiguous` and a wake to
+    // a visibly idle Cursor pane was held on no_write_safe_composer_evidence
+    // forever. composer_clean_idle's end-anchored escaped rule is what proves
+    // the composer write-safe.
     let clean_screen =
-        "Composer\n────────────────\n→ Plan, search, build\n────────────────\nCursor 0.45";
-    let clean_esc = "Composer\n────────────────\n\u{1b}[2m→\u{1b}[0m \u{1b}[2mPlan, search, build\u{1b}[0m\n────────────────\nCursor 0.45";
+        include_str!("../../cyclops-manifest/tests/fixtures/cursor_clean_idle_composer_plain.txt");
+    let clean_esc =
+        include_str!("../../cyclops-manifest/tests/fixtures/cursor_clean_idle_composer_esc.txt");
     let eval = manifest
-        .evaluate_esc("Cursor Agent", clean_screen, Some(clean_esc))
+        .evaluate_esc("Test Verification Agent", clean_screen, Some(clean_esc))
         .unwrap();
     assert_eq!(eval.state, AgentState::Idle);
+    assert_eq!(eval.id, "composer_clean_idle");
+    let det = fuse_detection(
+        "cursor",
+        AgentState::Idle,
+        &eval.id,
+        Some(AgentState::Idle),
+        false,
+        false,
+    );
+    assert!(
+        det.write_ready,
+        "clean idle cursor must be write_ready: {det:?}"
+    );
+
+    // 1b. A dim-glyph capture the end anchor cannot prove (here: a stylized
+    // placeholder shape without the measured block-cursor frame) still falls
+    // to composer_ghost_or_empty and stays held: ambiguity fails closed.
+    let vague_screen =
+        "Composer\n────────────────\n→ Plan, search, build\n────────────────\nCursor 0.45";
+    let vague_esc = "Composer\n────────────────\n\u{1b}[2m→\u{1b}[0m \u{1b}[2mPlan, search, build\u{1b}[0m\n────────────────\nCursor 0.45";
+    let eval = manifest
+        .evaluate_esc("Cursor Agent", vague_screen, Some(vague_esc))
+        .unwrap();
+    assert_eq!(eval.state, AgentState::Idle);
+    assert_eq!(eval.id, "composer_ghost_or_empty");
     let det = fuse_detection(
         "cursor",
         AgentState::Idle,
@@ -473,7 +504,7 @@ fn cursor_offline_fixture_validation_unavailable_live_gate() {
     );
     assert!(
         !det.write_ready,
-        "the offline Cursor fixture cannot prove a write-safe composer"
+        "an unproven dim-glyph composer must stay held"
     );
     assert_eq!(
         det.write_block.as_deref(),

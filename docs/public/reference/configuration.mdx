@@ -22,6 +22,7 @@ ack_timeout_ms = 1500
 delivery_retry_max = 1
 receipt_block_ms = 2500
 gate_hold_notify_ms = 120000
+ambiguous_composer_settle_ms = 10000
 unclaimed_reminder_ms = 0
 
 [workspace]
@@ -33,6 +34,8 @@ motion = true
 workspace_order = ["main"]
 agent_order = ["name:implementer", "name:reviewer"]
 folder_tracked = []
+terminal_default_fg = "#3a2b26" # optional pair for terminals that ignore OSC 111
+terminal_default_bg = "#000000"
 ```
 
 ## Top-level keys
@@ -46,7 +49,7 @@ folder_tracked = []
 | `tmux_config` | Optional tmux config path passed with `-f`. |
 | `theme` | Active theme name. `cyclops theme <name>` updates it safely. |
 | `chrome` | `"on"` or `"off"`; controls Cyclops-owned tmux border decoration. |
-| Delivery timing keys | ACK, receipt, held-delivery notification, and optional unclaimed-doorbell reminder settings. `delivery_retry_max` retries only failures proven before any payload bytes reach the pane. `unclaimed_reminder_ms` is disabled when absent or zero; a positive value permits one content-free reminder per exact unclaimed attempt through the ordinary composer-safety gate. |
+| Delivery timing keys | ACK, receipt, held-delivery notification, and optional unclaimed-doorbell reminder settings. `delivery_retry_max` retries only failures proven before any payload bytes reach the pane. `unclaimed_reminder_ms` is disabled when absent or zero; a positive value permits one content-free reminder per exact unclaimed attempt through the ordinary composer-safety gate. `ambiguous_composer_settle_ms` bounds how long an idle pane may keep reading an ambiguous composer before its wake settles as a durable `composer_semantic_ambiguous` pre-write block instead of waiting invisibly; later write-ready evidence reopens the wake once. |
 
 The full-screen workspace maintains `[workspace]` preferences: the
 sidebar's visibility and width, how many rows its file panel gets
@@ -54,7 +57,12 @@ sidebar's visibility and width, how many rows its file panel gets
 states (`motion`), the persisted workspace and agent order, which
 workspaces follow their active pane's folder (`folder_tracked`), and
 where the pinned file browser points (`files_pinned_root`). Unknown keys
-are preserved when it writes preferences.
+are preserved when it writes preferences. `terminal_default_fg` and
+`terminal_default_bg` are an operator-owned optional pair: each must be a
+`#rrggbb` value. Cyclops restores that pair through OSC 10/11 on workspace
+exit and focus loss when supplied; an absent, partial, or invalid pair uses
+the terminal's OSC 110/111 reset. Cyclops does not read terminal input to
+discover a palette.
 
 ## Runtime files
 

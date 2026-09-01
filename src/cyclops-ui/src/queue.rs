@@ -18,7 +18,7 @@
 
 use cyclops_proto::{
     MessageId, MessageRecipientRoute, MessageWakeBlock, NotificationAttemptId,
-    NotificationAttentionCause, NotificationPreWriteCause, RecipientKey,
+    NotificationAttentionCause, NotificationPreWriteCause, RecipientKey, SessionInstanceId,
 };
 
 use crate::grid::display_width;
@@ -362,40 +362,72 @@ impl QueueRow {
 }
 
 /// The one tmux session a reader has narrowed the queue to: its name for
-/// the header and the panes that are in it right now.
+/// the header, its durable identity, and the panes that are in it right
+/// now.
 ///
 /// A message belongs to a session through its parties. A row is in the
-/// session when its sender or its recipient sits in one of these panes;
-/// the current route counts as well, because a recipient that moved
-/// panes is still the same agent. Admin has no pane, so an admin message
-/// follows the agent on the other end, and a row with no agent in any
-/// pane (admin to admin) shows only when every session is shown.
+/// session when its sender or its recipient is addressed in this session
+/// and sits in one of these panes; the current route counts as well,
+/// because a recipient that moved panes is still the same agent. Both
+/// halves of the address are checked, never the pane alone: tmux hands
+/// pane ids out again after a server restart, so the `%1` of this session
+/// and the `%1` of the session that died before it are different agents,
+/// told apart only by the session instance in their keys. Admin has no
+/// pane, so an admin message follows the agent on the other end, and a row
+/// with no agent in any pane (admin to admin) shows only when every
+/// session is shown.
+///
+/// A session the daemon has not identified yet (`session` is `None`)
+/// holds no row at all: no mailbox can be addressed inside it, so no
+/// message can belong to it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SessionFilter {
     pub name: String,
+    /// The durable identity of this incarnation of the session, or `None`
+    /// while the daemon has not bound one.
+    pub session: Option<SessionInstanceId>,
     pub panes: std::collections::BTreeSet<String>,
 }
 
 impl SessionFilter {
-    pub fn new(name: impl Into<String>, panes: impl IntoIterator<Item = String>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        session: Option<SessionInstanceId>,
+        panes: impl IntoIterator<Item = String>,
+    ) -> Self {
         Self {
             name: name.into(),
+            session,
             panes: panes.into_iter().collect(),
         }
     }
 
+    /// Whether this key is addressed inside the session at all. Admin is
+    /// not; neither is anything while the session has no identity.
+    fn addressed_here(&self, key: RecipientKey) -> bool {
+        self.session.is_some() && key.session_instance_id() == self.session
+    }
+
     fn holds(&self, key: RecipientKey) -> bool {
-        key.pane_id()
-            .is_some_and(|pane| self.panes.contains(&pane.to_string()))
+        self.addressed_here(key)
+            && key
+                .pane_id()
+                .is_some_and(|pane| self.panes.contains(&pane.to_string()))
     }
 
     pub fn admits(&self, row: &QueueRow) -> bool {
-        self.holds(row.sender)
-            || self.holds(row.recipient)
-            || row
-                .current_route
-                .as_ref()
-                .is_some_and(|route| self.panes.contains(&route.pane_id.to_string()))
+        // The route is the recipient's: it may name a different pane than
+        // the recipient's key, but it is still the same agent, addressed
+        // in the same session. A route in one of these panes belonging to
+        // an agent of another session is a reused pane id, not a member.
+        let routed_here = || {
+            self.addressed_here(row.recipient)
+                && row
+                    .current_route
+                    .as_ref()
+                    .is_some_and(|route| self.panes.contains(&route.pane_id.to_string()))
+        };
+        self.holds(row.sender) || self.holds(row.recipient) || routed_here()
     }
 }
 

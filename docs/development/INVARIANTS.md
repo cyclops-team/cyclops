@@ -352,9 +352,13 @@ after it fires:
 - **One-shot timers inside a delivery**, each bounded and each listed in
   the header of `src/cyclopsd/src/delivery.rs`: the post-paste
   verification re-reads, the tier-1 ACK window, the screen-evidence
-  checkpoints, the decline-key spacing, and the one-shot ping for a hold
-  that has lasted too long. None of them repeat, and none of them exists
-  when no delivery is in flight.
+  checkpoints, the decline-key spacing, the idle-ambiguous-composer settle
+  deadline, and the one-shot ping for a hold that has lasted too long. The
+  ambiguous-composer deadline is armed only by one continuous ambiguous idle
+  reading and is cancelled by any changed verdict, cancellation, or durable
+  outcome. Its 10-second default is a deliberately conservative, configurable
+  provisional grace for a redraw caught mid-paint; it never repeats. None of
+  these timers exists when no delivery is in flight.
 - **One notification reminder and optional force-submit deadlines per exact
   attempt.** The unclaimed reminder wakes at its recorded due time, makes one
   durable change, and ends. More than one caller may arm a force-submit

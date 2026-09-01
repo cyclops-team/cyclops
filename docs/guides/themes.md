@@ -217,6 +217,24 @@ unthemeable here: they print onto the terminal's own background, the
 CLI has no background emitter, and the full-screen stream inherits the
 terminal's ground the same way.
 
+While the workspace runs it paints the terminal's own default background
+(the few pixels of window padding around the grid) with the theme ground,
+and asks the terminal to restore its own defaults when it exits or loses
+focus. Cyclops never reads terminal input to discover those colors: the
+workspace input thread is their only owner. If a terminal accepts OSC 11 but
+ignores the OSC 111 reset, configure both exact defaults yourself:
+
+```toml
+[workspace]
+terminal_default_fg = "#3a2b26"
+terminal_default_bg = "#000000"
+```
+
+With a complete valid pair Cyclops restores those colors through OSC 10/11;
+with either value missing or malformed it keeps the safe OSC 110/111 fallback.
+The UI preserves these operator-owned keys when it saves its other workspace
+preferences.
+
 Naming a `stream.*` token in a theme file warns on stderr and is
 skipped, and so does a per-state token name from before the groups
 (`state.idle`, `badge.attention`):
