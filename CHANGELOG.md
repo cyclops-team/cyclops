@@ -5,6 +5,10 @@ versions are unreleased until admin cuts a tag.
 
 ## [Unreleased]
 
+The selected prerelease identity for the audited Rust beta candidate is
+`0.1.0-beta` / `v0.1.0-beta`. The historical `v0.2.0-beta` tag remains attached
+to older source. No new tag or GitHub Release has been created.
+
 ### Fixed
 
 - A clean idle Cursor Agent composer could never prove itself write-safe:

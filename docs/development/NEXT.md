@@ -1,15 +1,15 @@
 # Current beta execution queue
 
-**Status:** Technical beta-acceptance decision complete for the current
-functional candidate; release identity is the sole remaining operator gate
+**Status:** Versioned beta candidate in review; exact-SHA release evidence and
+an open beta-to-main pull request are required before the operator can decide
+whether to promote it
 
 **Integration branch:** **beta/messaging-rework**
 
-**Current functional candidate:** `2c88b823c5ff25a0094a3006f409b0d73de52d86`
+**Selected package and release tag:** `0.1.0-beta` / `v0.1.0-beta`
 
-**Full release evidence:**
-[33475085967](https://github.com/cyclops-team/cyclops/actions/runs/33475085967),
-completed successfully at 2026-09-01T06:01:40Z
+**Historical tag preserved:** `v0.2.0-beta` remains attached to its existing
+historical commit. It is not this beta candidate's release tag.
 
 The [Cyclops Beta Charter](CYCLOPS_BETA_CHARTER.md) controls beta scope,
 stop conditions, and release gates. The
@@ -23,10 +23,12 @@ the authority for work in flight.
 
 ## Current work
 
-1. Reconcile release identity before naming or publishing a beta: the Cargo
-   workspace version, remote tag history, and GitHub Release state must agree.
-2. If a candidate-relevant merge lands, run the release-evidence lane against
-   that exact resulting candidate before treating it as release-ready.
+1. Merge the focused release-identity change.
+2. Run the release-evidence lane against its exact resulting beta commit.
+3. If that evidence passes, open the final **beta/messaging-rework** to `main`
+   pull request. Do not merge it, create the `v0.1.0-beta` tag, create a
+   GitHub Release, or publish anything without a subsequent explicit operator
+   authorization.
 
 The final audit is not a reason to weaken a contract. Preserve readable
 journals, honest uncertainty, no-silent-loss, `Daemon::deliver_payload`
@@ -43,6 +45,7 @@ at merge boundaries, not during routine implementation.
 
 ## Release boundary
 
-Do not merge **beta/messaging-rework** into `main`, create or move a tag, choose
-the final public beta version, or publish a release without explicit operator
-approval.
+The operator selected `0.1.0-beta` / `v0.1.0-beta` and authorized preparation
+of the beta-to-main pull request. Do not merge `main`, tag, create a GitHub
+Release, or publish until the exact candidate passes the complete
+release-evidence lane and the operator gives subsequent explicit approval.

@@ -15,6 +15,8 @@ use std::thread;
 
 use serde_json::{json, Value};
 
+const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Scratch home unique per test and process, under the relocatable
 /// scratch root. Kept short: Unix socket paths cap out around 104 bytes
 /// on macOS, which is why the root is not the OS temp dir (F24). That the
@@ -45,7 +47,7 @@ where
                 w,
                 "{}",
                 json!({
-                    "cyclops": "0.1.0",
+                    "cyclops": PACKAGE_VERSION,
                     "build": cyclops_proto::BUILD_REF,
                     "proto": 1,
                     "boot_id": "b-ui"
@@ -174,7 +176,7 @@ fn serve_canned(home: &Path) {
         ),
         Some("status") => (
             vec![json!({"id": req["id"], "result": {
-                "daemon_version": "0.1.0", "proto": 1, "boot_id": "b-ui",
+                "daemon_version": PACKAGE_VERSION, "proto": 1, "boot_id": "b-ui",
                 "uptime_ms": 1000, "tmux_version": "3.6a",
                 "sessions": [{"name": "main", "attached": true, "panes": [{
                     "pane_id": "%1", "window_id": "@1", "window_name": "agents",
@@ -325,7 +327,7 @@ fn ui_daemon_down_reports_and_exits_one() {
 /// asked (`cyclops_proto::StatusParams`).
 fn answer(open_deliveries: bool) -> Value {
     let mut result = json!({
-        "daemon_version": "0.1.0", "proto": 1, "boot_id": "b-ui",
+        "daemon_version": PACKAGE_VERSION, "proto": 1, "boot_id": "b-ui",
         "uptime_ms": 120_000, "tmux_version": "3.6a",
         "sessions": [{"name": "main", "attached": true, "panes": [{
             "pane_id": "%1", "window_id": "@1", "window_name": "agents",

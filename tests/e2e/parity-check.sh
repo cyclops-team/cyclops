@@ -54,6 +54,9 @@ DAEMON_PID=""
 INST_DAEMON_PID=""
 CHECKS=0
 FAILS=0
+# The install and update transcripts carry the package version. Accept the
+# SemVer prerelease form Cargo exposes, not only a final X.Y.Z version.
+PACKAGE_VERSION_RE='[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?'
 
 # The installer section is opt-in because it runs the installer's dist
 # build, and everything else here reuses the debug binaries that are
@@ -1348,7 +1351,7 @@ grep -v '^ *\(Compiling\|Finished\|Downloaded\|Blocking\|Updating\|Adding\)' "$O
 check "it says where each binary went"    "^  cyclops    $INST/.local/bin/cyclops$"
 check "and the daemon too"                "^  cyclopsd   $INST/.local/bin/cyclopsd$"
 check "and where the home is"             "^  home       $INST/.cyclops$"
-check "it reports the version it built"   '^✔ cyclops [0-9]+\.[0-9]+\.[0-9]+ \(([0-9a-f]+(\.dirty)?|unknown)\) is installed$'
+check "it reports the version it built"   "^✔ cyclops $PACKAGE_VERSION_RE \\(([0-9a-f]+(\\.dirty)?|unknown)\\) is installed$"
 check_absent "it gives no separate daemon step" 'cyclopsd &'
 check "step 2 opens the workspace"        '^  2  cyclops +open your workspace and start your agents$'
 check "it names the profile it edited"    "^  three lines added to $INST/.zshrc:$"
@@ -1583,10 +1586,10 @@ printf '\n$ cyclops update\n'
 run_update
 grep -v '^ *\(Compiling\|Finished\|Downloaded\|Blocking\|Updating\|Adding\)' "$OUT" | tail -24
 
-check "update names the running build"    '^cyclops [0-9]+\.[0-9]+\.[0-9]+ \(([0-9a-f]+(\.dirty)?|unknown)\)$'
+check "update names the running build"    "^cyclops $PACKAGE_VERSION_RE \\(([0-9a-f]+(\\.dirty)?|unknown)\\)$"
 check "and its source"                    "^  source $ROOT/remote at parity-update$"
-check "it reran the installer"            '^✔ cyclops [0-9]+\.[0-9]+\.[0-9]+ \([0-9a-f]+\) is installed$'
-check "and reports old build to new"      '^✔ updated · [0-9]+\.[0-9]+\.[0-9]+ \(([0-9a-f]+(\.dirty)?|unknown)\) → [0-9]+\.[0-9]+\.[0-9]+ \([0-9a-f]+\)$'
+check "it reran the installer"            "^✔ cyclops $PACKAGE_VERSION_RE \\([0-9a-f]+\\) is installed$"
+check "and reports old build to new"      "^✔ updated · $PACKAGE_VERSION_RE \\(([0-9a-f]+(\\.dirty)?|unknown)\\) → $PACKAGE_VERSION_RE \\([0-9a-f]+\\)$"
 check "and keeps a stopped daemon stopped" '^  no daemon was running; the selected pair remains stopped$'
 check_absent "it never stops the daemon itself" 'stopped cyclopsd'
 check_exit "an update exits 0" 0
