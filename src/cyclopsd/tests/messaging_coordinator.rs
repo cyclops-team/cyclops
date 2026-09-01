@@ -3133,7 +3133,7 @@ async fn replacement_recipient_bypasses_a_stale_prewrite_worker() {
         0
     );
 
-    rig.tmux.run_ok(&["kill-server"]);
+    rig.tmux.simulate_server_loss();
     rig.ev
         .wait_event(Duration::from_secs(10), |event| {
             event["event"] == "session" && event["data"]["attached"] == false

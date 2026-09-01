@@ -8890,7 +8890,7 @@ process_names = ["never"]
 
         let connect_attempts_before_loss = slot.control_connect_attempts();
         let unavailable_wait = slot.arm_missing_wait();
-        server.run_ok(&["kill-server"]);
+        server.simulate_server_loss();
         wait_for_session_lifecycle(&mut events, "main", false).await;
         tokio::time::timeout(Duration::from_secs(10), unavailable_wait.notified())
             .await

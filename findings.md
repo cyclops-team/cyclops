@@ -2265,7 +2265,7 @@ before or after attachment it retains identity and barriers, then waits for
 `session.watch` rather than opening control mode or retrying on a timer.
 Other failures stay `Unknown`: before first attachment the task waits for an
 explicit availability edge, while after a live observation it uses the
-ordinary transient reconnect path. After `kill-server`, a stale socket
+ordinary transient reconnect path. After a server disappears, a stale socket
 pathname may remain even though no listener exists, so the lifecycle test
 checks a passive connection as well as the no-connect-attempt counter. Probe:
 `cargo test -p cyclops-tmux --test layout_round_trip

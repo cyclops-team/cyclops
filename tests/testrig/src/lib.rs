@@ -218,6 +218,13 @@ impl TmuxServer {
         );
     }
 
+    /// Make this isolated server unavailable while retaining its cleanup
+    /// owner. A server-lifecycle test can then start the same address again;
+    /// dropping this fixture still removes any socket the loss left behind.
+    pub fn simulate_server_loss(&self) {
+        self.run_ok(&["kill-server"]);
+    }
+
     /// Visible screen of one pane, plain text.
     pub fn capture(&self, target: &str) -> String {
         let out = self.run(&["capture-pane", "-p", "-t", target]);

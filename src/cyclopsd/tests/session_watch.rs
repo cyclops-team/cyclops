@@ -184,7 +184,7 @@ async fn an_unavailable_runtime_watch_waits_for_an_explicit_availability_edge() 
     let before_loss = rig.ctl.request("status", json!({})).await;
     let before_identity = before_loss["result"]["sessions"][0]["identity"].clone();
 
-    rig.tmux.run_ok(&["kill-server"]);
+    rig.tmux.simulate_server_loss();
     rig.ev
         .wait_event(Duration::from_secs(10), |event| {
             event["event"] == "session"
