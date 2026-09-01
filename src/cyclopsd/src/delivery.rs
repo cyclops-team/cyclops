@@ -4973,7 +4973,7 @@ fn notification_staged_action_safe(
         &proven.manifest,
     );
     let working_staged_action = working_clean_submit
-        && fusion::staged_action_binding_ready(
+        && fusion::staged_working_clean_action_ready(
             inner,
             handle.session_idx,
             &handle.pane_id,

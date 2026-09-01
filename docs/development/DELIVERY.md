@@ -302,8 +302,13 @@ locator.
    plus a positive clean or ghost composer proof. That narrow capability does
    not survive retries, recovery, or operator resolution. The final capture
    must still prove the exact staged doorbell; a human or ambiguous change
-   fails that proof and withholds Enter as `verify_failed`. A refusal is never
-   retried.
+   fails that proof and withholds Enter as `verify_failed`. The fused frame
+   must also remain conflict-free: a retained hook idle/end, unknown or
+   blocked reading, mode, stale observation, or named non-composer refusal
+   withholds Enter even when the current screen still reads `working`. A
+   screen `idle` or `idle_with_input` reading may describe the exact staged
+   composer row only because the owner and bytes are separately re-proven. A
+   refusal is never retried.
 
    `notification.force_submit` is a separately documented default-off,
    administrator-controlled fallback for one exact current `verify_failed`

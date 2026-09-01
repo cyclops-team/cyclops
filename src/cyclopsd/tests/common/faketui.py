@@ -54,8 +54,9 @@ consumes each submit key. It lets a test wait for the observed Enter rather
 than polling a log file.
 
 With that event socket, Ctrl-Q emits a `checkpoint` datagram after all earlier
-terminal input. Tests use it only after shutting down the delivery worker, so
-the checkpoint makes any duplicate queued Enter observable without a sleep.
+input in the same parser stream. Tests use it only after shutting down the
+delivery worker, so the checkpoint makes any duplicate queued Enter observable
+without a sleep.
 
 `--manual-lifecycle` consumes a successful submit but stays visually idle.
 Lifecycle tests then use Ctrl-T and Ctrl-Y to choose the observed start and
@@ -93,7 +94,7 @@ def emit_event(path, event):
 
 
 class Stream:
-    """Incremental reader: bytes in, (text, submit) events out.
+    """Incremental reader: bytes in, (text, submit, checkpoint) events out.
 
     Holds a tail of bytes that could still be the start of a delimiter,
     so a marker split across two reads is still recognized.
@@ -142,6 +143,11 @@ class Stream:
                         if j > start:
                             events.append(("text", head[start:j]))
                         events.append(("submit", b""))
+                        start = j + 1
+                    elif byte == 17:
+                        if j > start:
+                            events.append(("text", head[start:j]))
+                        events.append(("checkpoint", b""))
                         start = j + 1
                 if start < len(head):
                     events.append(("text", head[start:]))
@@ -194,6 +200,11 @@ def selftest():
     # Outside a paste, a lone return is the submit key.
     s = Stream()
     assert s.feed(b"\r") == [("submit", b"")]
+
+    # Ctrl-Q is a fixture-only checkpoint. It must follow an Enter that
+    # shared its PTY read, so a test can use it as a terminal-order fence.
+    s = Stream()
+    assert s.feed(b"\r\x11") == [("submit", b""), ("checkpoint", b"")]
 
     # A payload's line feeds are content even with no brackets in sight,
     # which is what keeps a multi-line paste in one piece when tmux does
@@ -273,12 +284,6 @@ def main():
                 draw(transcript, staged, working=forced_working, hidden=hidden)
                 if not chunk:
                     continue
-            if b"\x11" in chunk:
-                chunk = chunk.replace(b"\x11", b"")
-                if submit_event_socket is not None:
-                    emit_event(submit_event_socket, b"checkpoint")
-                if not chunk:
-                    continue
             for kind, payload in stream.feed(chunk):
                 if kind == "text":
                     for char in payload.decode("utf-8", "replace"):
@@ -288,6 +293,9 @@ def main():
                             staged += char
                     hidden = False
                     draw(transcript, staged, working=forced_working)
+                elif kind == "checkpoint":
+                    if submit_event_socket is not None:
+                        emit_event(submit_event_socket, b"checkpoint")
                 else:
                     if submit_log is not None:
                         with open(submit_log, "a", encoding="utf-8") as log:

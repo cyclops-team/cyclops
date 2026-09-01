@@ -4854,6 +4854,130 @@ async fn a_working_pane_with_a_proven_clean_composer_submits_one_doorbell() {
     );
 }
 
+/// A current screen Working row cannot mask a late lifecycle end. The staged
+/// doorbell is still exact, but the retained Hook Idle says this is no longer
+/// the conflict-free Working frame that admitted the ordinary Enter.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_stop_after_a_working_clean_stage_withholds_enter() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let event_dir = cyclops_proto::scratch::scratch_dir(&format!("wcs-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&event_dir).unwrap();
+    let _event_guard = HomeGuard(event_dir.clone());
+    let submit_event_path = event_dir.join("submit.sock");
+    let submit_events =
+        UnixDatagram::bind(&submit_event_path).expect("bind fake composer submit event socket");
+    let pane_command = format!(
+        "python3 {} --manual-lifecycle --submit-event-socket {}",
+        faketui_path(),
+        submit_event_path.display()
+    );
+    let mut rig = Rig::new(
+        "workspace-working-clean-late-stop",
+        LIVENESS_MANIFEST,
+        &pane_command,
+        "delivery_retry_max = 0\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+
+    let start = report_hook(&rig, "SessionStart", 1, json!({"session_id": "session-1"})).await;
+    assert_eq!(start["applied"], true, "{start}");
+    wait_for_pane_write_block(&mut rig, &pane, None).await;
+    let prompt = report_hook(
+        &rig,
+        "UserPromptSubmit",
+        2,
+        json!({
+            "prompt": "the existing turn",
+            "session_id": "session-1",
+            "turn_id": "turn-1"
+        }),
+    )
+    .await;
+    assert_eq!(prompt["applied"], true, "{prompt}");
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "C-t"]);
+    wait_pane_state(&mut rig, "working").await;
+    wait_for_pane_write_block(&mut rig, &pane, None).await;
+
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let pause = Arc::clone(&release);
+    rig.daemon.set_inject_pause(move |phase| {
+        let entered_tx = entered_tx.clone();
+        let pause = Arc::clone(&pause);
+        Box::pin(async move {
+            if phase != "pre_submit" {
+                return;
+            }
+            let _ = entered_tx.send(());
+            pause.acquire_owned().await.unwrap().forget();
+        })
+    });
+
+    let sent =
+        send_workspace_message(&rig, "working-clean-late-stop", "Late stop", "private body").await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+        .await
+        .expect("doorbell reached the pre-submit pause")
+        .expect("pause sender stayed open");
+    wait_for_doorbell(&rig, &pane, &message_id).await;
+
+    // Keep the fixture's screen row Working, but publish an exact Stop for
+    // the active turn. Fusion must retain that Hook Idle as a conflict rather
+    // than trusting the raw screen winner alone.
+    let stop = report_hook(
+        &rig,
+        "Stop",
+        3,
+        json!({"session_id": "session-1", "turn_id": "turn-1"}),
+    )
+    .await;
+    assert_eq!(stop["applied"], true, "{stop}");
+    assert_eq!(
+        stop["state"], "idle",
+        "the hook end must reach fusion: {stop}"
+    );
+    assert!(
+        rig.tmux.capture(&pane).contains("FAKETUI-WORKING"),
+        "the fixture must keep the raw screen Working while fusion retains Hook Idle"
+    );
+    release.add_permits(1);
+
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::AttentionRequired).await;
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::Submitted),
+        0,
+        "a retained hook Stop must withhold Enter"
+    );
+    assert!(
+        rig.tmux
+            .capture(&pane)
+            .contains(&compact_doorbell(&rig, &message_id)),
+        "the withheld doorbell remains available for inspection"
+    );
+
+    // The fixture parses Ctrl-Q in terminal order. Once daemon shutdown has
+    // drained delivery workers, a checkpoint as the first event proves the
+    // fake composer received no Enter before it.
+    rig.daemon.shutdown().await;
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "C-q"]);
+    let mut event = [0_u8; 16];
+    let received = tokio::time::timeout(Duration::from_secs(5), submit_events.recv(&mut event))
+        .await
+        .expect("the fake composer did not acknowledge the terminal checkpoint")
+        .expect("read fake composer checkpoint event");
+    assert_eq!(
+        &event[..received],
+        b"checkpoint",
+        "the fake composer received Enter before the withheld-delivery checkpoint"
+    );
+}
+
 /// An opt-in stale reminder is another run of the ordinary notification
 /// worker, not a second injection path. It reuses the exact attempt locator,
 /// passes through the same composer gate, and spends one durable allowance.

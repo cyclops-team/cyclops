@@ -2309,10 +2309,11 @@ pub(crate) fn staged_action_ready(
         .is_some_and(|entry| staged_entry_ready(entry, owner, expected, manifest))
 }
 
-/// Confirm that the exact staged barrier still belongs to its original pane
-/// binding and remains observable. Callers add their own frame-specific
-/// evidence; this function alone never authorizes a terminal key.
-pub(crate) fn staged_action_binding_ready(
+/// Confirm that a Working-plus-clean notification may submit its one exact
+/// staged doorbell. The caller separately proves the final bytes and carries
+/// the pre-paste clean-composer admission; this predicate makes sure fusion
+/// has not since learned a live lifecycle, mode, or sensor conflict.
+pub(crate) fn staged_working_clean_action_ready(
     inner: &Arc<Inner>,
     session_idx: usize,
     pane_id: &str,
@@ -2326,7 +2327,9 @@ pub(crate) fn staged_action_binding_ready(
     };
     let map = inner.detections.lock().expect("detections lock");
     map.get(&PaneKey::new(session_idx, pane_id))
-        .is_some_and(|entry| staged_entry_binding_ready(entry, owner, expected, manifest))
+        .is_some_and(|entry| {
+            staged_entry_working_clean_action_ready(entry, owner, expected, manifest)
+        })
 }
 
 fn staged_entry_ready(
@@ -2350,6 +2353,38 @@ fn staged_entry_binding_ready(
         && entry.manifest.as_deref() == Some(manifest)
         && !entry.in_mode
         && !entry.detection.stale
+}
+
+/// The staged doorbell itself may legitimately make the screen's composer
+/// rule read idle-with-input, but the live runtime must still be an explicitly
+/// current, conflict-free Working frame. In particular, a late hook Stop is
+/// an Idle reading from a non-composer sensor, not a harmless description of
+/// the staged row.
+fn staged_entry_working_clean_action_ready(
+    entry: &DetEntry,
+    owner: &str,
+    agent: crate::identity::ProcId,
+    manifest: &str,
+) -> bool {
+    let permitted_staged_block = matches!(
+        entry.detection.write_block.as_deref(),
+        Some("composer_hold" | "no_write_safe_composer_evidence")
+    );
+    let current_screen_working =
+        entry.detection.readings.iter().any(|reading| {
+            reading.sensor == Sensor::Screen && reading.state == AgentState::Working
+        });
+    let no_live_conflict = entry.detection.readings.iter().all(|reading| {
+        reading.state == AgentState::Working
+            || (reading.sensor == Sensor::Screen
+                && matches!(reading.state, AgentState::Idle | AgentState::IdleWithInput))
+    });
+    staged_entry_binding_ready(entry, owner, agent, manifest)
+        && entry.detection.state == AgentState::Working
+        && !entry.detection.disagreement
+        && permitted_staged_block
+        && current_screen_working
+        && no_live_conflict
 }
 
 /// Release this attempt's composer barrier after a guarded resolution.
@@ -9254,7 +9289,7 @@ regex = ['^']
         // semantic is human_input. The normal delivery path separately
         // proves these exact bytes, the current Working frame, and carries
         // the pre-paste clean proof.
-        let working = staged_entry(
+        let mut working = staged_entry(
             AgentState::Working,
             Some(ComposerSemantic::HumanInput),
             vec![
@@ -9265,11 +9300,52 @@ regex = ['^']
             false,
             "att-1",
         );
+        working.detection.write_block = Some("composer_hold".into());
         assert!(
             !staged_entry_ready(&working, "att-1", agent, "fix"),
             "the quiet action path must remain unavailable while Working"
         );
-        assert!(staged_entry_binding_ready(&working, "att-1", agent, "fix"));
+        assert!(staged_entry_working_clean_action_ready(
+            &working, "att-1", agent, "fix"
+        ));
+
+        let mut late_stop = working.clone();
+        late_stop.detection.readings.push(SensorReading {
+            sensor: Sensor::Hook,
+            state: AgentState::Idle,
+            rule: "hook:Stop".into(),
+            ts: 2,
+        });
+        assert!(
+            !staged_entry_working_clean_action_ready(&late_stop, "att-1", agent, "fix"),
+            "a late hook Stop is a live conflict, not composer context"
+        );
+
+        let mut blocked = working.clone();
+        blocked.detection.readings.push(SensorReading {
+            sensor: Sensor::Screen,
+            state: AgentState::BlockedModal,
+            rule: "permission".into(),
+            ts: 2,
+        });
+        assert!(
+            !staged_entry_working_clean_action_ready(&blocked, "att-1", agent, "fix"),
+            "a blocking screen reading must withhold the Working exception"
+        );
+
+        let mut unknown = working.clone();
+        unknown.detection.state = AgentState::Unknown;
+        assert!(
+            !staged_entry_working_clean_action_ready(&unknown, "att-1", agent, "fix"),
+            "unknown fusion state cannot reuse an earlier clean-composer proof"
+        );
+
+        let mut non_write_ready = working.clone();
+        non_write_ready.detection.write_block = Some("occupant_unprovable".into());
+        assert!(
+            !staged_entry_working_clean_action_ready(&non_write_ready, "att-1", agent, "fix"),
+            "only the owned staged-composer refusal may remain"
+        );
 
         let stale = staged_entry(
             AgentState::Working,
@@ -9279,7 +9355,9 @@ regex = ['^']
             false,
             "att-1",
         );
-        assert!(!staged_entry_binding_ready(&stale, "att-1", agent, "fix"));
+        assert!(!staged_entry_working_clean_action_ready(
+            &stale, "att-1", agent, "fix"
+        ));
 
         let in_mode = staged_entry(
             AgentState::Working,
@@ -9289,15 +9367,19 @@ regex = ['^']
             true,
             "att-1",
         );
-        assert!(!staged_entry_binding_ready(&in_mode, "att-1", agent, "fix"));
-        assert!(!staged_entry_binding_ready(&working, "att-2", agent, "fix"));
-        assert!(!staged_entry_binding_ready(
+        assert!(!staged_entry_working_clean_action_ready(
+            &in_mode, "att-1", agent, "fix"
+        ));
+        assert!(!staged_entry_working_clean_action_ready(
+            &working, "att-2", agent, "fix"
+        ));
+        assert!(!staged_entry_working_clean_action_ready(
             &working,
             "att-1",
             crate::identity::ProcId { pid: 8, birth: 80 },
             "fix"
         ));
-        assert!(!staged_entry_binding_ready(
+        assert!(!staged_entry_working_clean_action_ready(
             &working, "att-1", agent, "other"
         ));
     }

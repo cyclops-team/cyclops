@@ -498,7 +498,11 @@ final screen cannot repeat the clean proof; it must instead prove the exact
 attempt-owned doorbell bytes, the same binding, and no mode or blocked state.
 This is not a recovery or operator-resolution permission. A human or
 ambiguous composer never gains it, and any changed staged bytes still withhold
-Enter as `verify_failed`.
+Enter as `verify_failed`. A retained lifecycle end/idle, unknown or blocked
+reading, stale evidence, mode, or named non-composer refusal is a live
+conflict and also withholds Enter, even if the screen still paints `working`.
+Only a screen `idle` or `idle_with_input` reading that describes the owned
+staged composer may coexist with the current Screen `working` reading.
 
 What breaks: the same damage as rule 3, reached from the opposite
 direction. Rule 3 holds when the screen sensor SEES staged text. This rule
