@@ -2272,3 +2272,22 @@ checks a passive connection as well as the no-connect-attempt counter. Probe:
 asking_about_a_session_that_is_not_there_is_not_an_error`,
 `unreachable_tmux_keeps_an_observed_session_identity`, and
 `a_vanished_tmux_server_waits_for_an_availability_edge`.
+
+## F81. A macOS candidate copy can fail after a successful Cargo build (MEASURED)
+
+MEASURED 2026-09-01 in the macOS release installer-and-user-journey job for
+candidate `6882baded55cff0fa82ef9020871ff31b21881ba`. Cargo finished the dist
+build, then BSD `cp` failed while staging `target/dist/cyclops` in a newly
+created private `/tmp/cyclops-pair.*` directory: `fcopyfile failed: Input/output
+error`. The matching Linux installer journey passed. A complete local macOS
+26.5.2 installer journey passed, so this records a platform runner failure
+mode, not a claim that every candidate copy fails.
+
+Probe: the installer parity journey puts a `cp` shim first in its isolated
+`PATH`. The shim fails only the first copy to the private client candidate and
+writes a marker that the test requires, while every other `cp` call delegates
+to the system implementation. Before the fallback, the installer stops before
+activation. With the fallback, it removes only that new private destination,
+performs a direct byte copy, compares the source and staged bytes, and then
+completes the normal pair validation and installation. The regression checks
+the installed client and daemon byte-for-byte against the built pair.
