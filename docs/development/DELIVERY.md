@@ -308,6 +308,10 @@ locator.
    withholds Enter even when the current screen still reads `working`. A
    screen `idle` or `idle_with_input` reading may describe the exact staged
    composer row only because the owner and bytes are separately re-proven.
+   When that same current `working` observation marks the owned barrier
+   `staged_during_turn`, it remains eligible only for this already-admitted
+   in-flight submit. It does not broaden the quiet, recovery, or human-draft
+   rules.
    The final proof uses the same bounded capture sequence as post-paste
    verification: a terminal repaint can expose a partial frame, but only a
    later current frame with the same exact doorbell can proceed. These are

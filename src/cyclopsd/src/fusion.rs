@@ -2355,6 +2355,28 @@ fn staged_entry_binding_ready(
         && !entry.detection.stale
 }
 
+/// The Working-plus-clean submit path may retain its own barrier after fusion
+/// sees the exact staged doorbell as input during the already-running turn.
+/// That observation changes `Staged` to `StagedDuringTurn`; it does not make
+/// a human draft safe. Only the in-flight path, which separately carries its
+/// pre-paste clean admission and re-proves the exact bytes, may use this
+/// binding. Quiet, recovery, and operator paths remain `Staged`-only above.
+fn staged_entry_working_clean_binding_ready(
+    entry: &DetEntry,
+    owner: &str,
+    agent: crate::identity::ProcId,
+    manifest: &str,
+) -> bool {
+    matches!(
+        entry.hold,
+        ComposerHold::Staged | ComposerHold::StagedDuringTurn
+    ) && entry.hold_owner.as_deref() == Some(owner)
+        && entry.agent == Some(agent)
+        && entry.manifest.as_deref() == Some(manifest)
+        && !entry.in_mode
+        && !entry.detection.stale
+}
+
 /// The staged doorbell itself may legitimately make the screen's composer
 /// rule read idle-with-input, but the live runtime must still be an explicitly
 /// current, conflict-free Working frame. In particular, a late hook Stop is
@@ -2379,7 +2401,7 @@ fn staged_entry_working_clean_action_ready(
             || (reading.sensor == Sensor::Screen
                 && matches!(reading.state, AgentState::Idle | AgentState::IdleWithInput))
     });
-    staged_entry_binding_ready(entry, owner, agent, manifest)
+    staged_entry_working_clean_binding_ready(entry, owner, agent, manifest)
         && entry.detection.state == AgentState::Working
         && !entry.detection.disagreement
         && permitted_staged_block
@@ -9309,7 +9331,31 @@ regex = ['^']
             &working, "att-1", agent, "fix"
         ));
 
-        let mut late_stop = working.clone();
+        // Once fusion re-observes the exact doorbell, ordinary composer-hold
+        // semantics correctly remember that it appeared during this old
+        // Working turn. The one in-flight Working admission keeps its exact
+        // binding; the quiet path must stay closed.
+        let mut reobserved = working.clone();
+        reobserved.hold = ComposerHold::StagedDuringTurn;
+        assert!(
+            !staged_entry_ready(&reobserved, "att-1", agent, "fix"),
+            "the quiet action path must reject a staged-during-turn barrier"
+        );
+        assert!(staged_entry_working_clean_action_ready(
+            &reobserved,
+            "att-1",
+            agent,
+            "fix"
+        ));
+
+        let mut turn_started = reobserved.clone();
+        turn_started.hold = ComposerHold::TurnStarted { since_ms: 2 };
+        assert!(
+            !staged_entry_working_clean_action_ready(&turn_started, "att-1", agent, "fix"),
+            "a later turn-start mark cannot reuse the Working admission"
+        );
+
+        let mut late_stop = reobserved.clone();
         late_stop.detection.readings.push(SensorReading {
             sensor: Sensor::Hook,
             state: AgentState::Idle,
@@ -9321,7 +9367,7 @@ regex = ['^']
             "a late hook Stop is a live conflict, not composer context"
         );
 
-        let mut blocked = working.clone();
+        let mut blocked = reobserved.clone();
         blocked.detection.readings.push(SensorReading {
             sensor: Sensor::Screen,
             state: AgentState::BlockedModal,
@@ -9333,14 +9379,14 @@ regex = ['^']
             "a blocking screen reading must withhold the Working exception"
         );
 
-        let mut unknown = working.clone();
+        let mut unknown = reobserved.clone();
         unknown.detection.state = AgentState::Unknown;
         assert!(
             !staged_entry_working_clean_action_ready(&unknown, "att-1", agent, "fix"),
             "unknown fusion state cannot reuse an earlier clean-composer proof"
         );
 
-        let mut non_write_ready = working.clone();
+        let mut non_write_ready = reobserved.clone();
         non_write_ready.detection.write_block = Some("occupant_unprovable".into());
         assert!(
             !staged_entry_working_clean_action_ready(&non_write_ready, "att-1", agent, "fix"),

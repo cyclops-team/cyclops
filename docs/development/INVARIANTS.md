@@ -503,6 +503,9 @@ reading, stale evidence, mode, or named non-composer refusal is a live
 conflict and also withholds Enter, even if the screen still paints `working`.
 Only a screen `idle` or `idle_with_input` reading that describes the owned
 staged composer may coexist with the current Screen `working` reading. The
+same current `working` observation may mark that owned barrier
+`staged_during_turn`; that marker remains eligible only for the already-
+admitted in-flight submit, never for a quiet, recovery, or human-draft path.
 final proof may take its bounded capture rereads to pass a partial terminal
 repaint, but that re-observation never repeats the paste or Enter: only a
 current frame with the same exact bytes can authorize the one reserved key.
