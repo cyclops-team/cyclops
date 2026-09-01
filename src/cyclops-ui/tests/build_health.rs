@@ -1,10 +1,10 @@
-use cyclops_client::RuntimeIdentity;
+use cyclops_client::{RuntimeIdentity, CLIENT_VERSION};
 use cyclops_proto::Hello;
 use cyclops_ui::{build, App, BuildHealth, Filter, Theme, View};
 
 fn hello(build: Option<&str>) -> Hello {
     Hello {
-        cyclops: "0.1.0".into(),
+        cyclops: CLIENT_VERSION.into(),
         build: build.map(str::to_string),
         daemon_process: None,
         daemon_executable: None,
@@ -29,7 +29,7 @@ fn hello_keeps_both_build_identities_or_names_a_legacy_daemon() {
             ref client
         } if daemon.build.as_deref() == Some("daemon-old")
             && client.build.as_deref() == Some(cyclops_proto::BUILD_REF)
-            && daemon.version == "0.1.0"
+            && daemon.version == CLIENT_VERSION
     ));
 
     let legacy = BuildHealth::from_hello(&hello(None));
@@ -44,7 +44,7 @@ fn hello_keeps_both_build_identities_or_names_a_legacy_daemon() {
 #[test]
 fn build_mismatch_stays_visible_after_transient_notices_clear() {
     let mut app = app(BuildHealth::Mismatch {
-        client: RuntimeIdentity::new("0.1.0", Some("client-new")),
+        client: RuntimeIdentity::new(CLIENT_VERSION, Some("client-new")),
         daemon: RuntimeIdentity::new("0.0.9", Some("daemon-old")),
     });
 
@@ -52,7 +52,7 @@ fn build_mismatch_stays_visible_after_transient_notices_clear() {
     assert!(first.contains("build mismatch"), "{first}");
     assert!(first.contains("client-new"), "{first}");
     assert!(first.contains("daemon-old"), "{first}");
-    assert!(first.contains("0.1.0"), "{first}");
+    assert!(first.contains(CLIENT_VERSION), "{first}");
     assert!(first.contains("0.0.9"), "{first}");
 
     app.notice = Some("temporary action result".into());
@@ -74,7 +74,7 @@ fn build_mismatch_stays_visible_after_transient_notices_clear() {
 #[test]
 fn a_legacy_daemon_without_build_identity_stays_visible() {
     let mut app = app(BuildHealth::UnverifiedDaemon {
-        client: RuntimeIdentity::new("0.1.0", Some("client-new")),
+        client: RuntimeIdentity::new(CLIENT_VERSION, Some("client-new")),
         daemon: RuntimeIdentity::new("0.0.8", None),
     });
 

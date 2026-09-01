@@ -94,7 +94,7 @@ fn answer_health_snapshot(stream: UnixStream) {
         json!({
             "id": request["id"],
             "result": {
-                "daemon_version": "0.1.0",
+                "daemon_version": cyclops_client::CLIENT_VERSION,
                 "proto": 1,
                 "boot_id": "health-boot",
                 "uptime_ms": 123,
@@ -451,7 +451,7 @@ fn health_reports_hello_identity_with_one_read_only_snapshot_request() {
             writer,
             "{}",
             json!({
-                "cyclops": "0.1.0",
+                "cyclops": cyclops_client::CLIENT_VERSION,
                 "build": cyclops_proto::BUILD_REF,
                 "daemon_process": { "pid": 4242, "birth": 818221 },
                 "daemon_executable": daemon_wire,
@@ -653,7 +653,7 @@ fn health_refuses_a_non_absolute_hello_executable() {
             writer,
             "{}",
             json!({
-                "cyclops": "0.1.0",
+                "cyclops": cyclops_client::CLIENT_VERSION,
                 "build": cyclops_proto::BUILD_REF,
                 "daemon_process": { "pid": 4242, "birth": 818221 },
                 "daemon_executable": "relative/cyclopsd",

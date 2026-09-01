@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 const GEMINI_ENDPOINT: &str =
     "agent:00000000-0000-4000-8000-000000000001/00000000-0000-4000-8000-000000000002/%9";
 const TEST_SUMMARY: &str = "Test message. Inspect the result.";
+const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Scratch home unique per test and process, under the relocatable
 /// scratch root. Kept short: Unix socket paths cap out around 104 bytes
@@ -30,7 +31,7 @@ fn scratch_home(tag: &str) -> PathBuf {
 
 fn hello(proto: u32) -> Value {
     json!({
-        "cyclops": "0.1.0",
+        "cyclops": PACKAGE_VERSION,
         "build": cyclops_proto::BUILD_REF,
         "proto": proto,
         "boot_id": "b-e2e"
@@ -224,7 +225,7 @@ fn run_cyclops_binary_io(
 
 fn canned_status() -> Value {
     json!({
-        "daemon_version": "0.1.0",
+        "daemon_version": PACKAGE_VERSION,
         "daemon_build": cyclops_proto::BUILD_REF,
         "proto": 1,
         "boot_id": "b-e2e",
@@ -780,7 +781,7 @@ fn daemon_restart_refuses_while_mid_flight() {
     let process = json!({"pid": pid, "birth": birth});
     let daemon_executable = daemon.display().to_string();
     let hello_line = json!({
-        "cyclops": "0.1.0",
+        "cyclops": PACKAGE_VERSION,
         "build": cyclops_proto::BUILD_REF,
         "daemon_process": process.clone(),
         "daemon_executable": daemon_executable.clone(),

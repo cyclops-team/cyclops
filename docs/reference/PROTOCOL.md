@@ -29,7 +29,7 @@ The daemon writes one hello line as soon as you connect, then one response
 line per request.
 
 ```
-{"cyclops":"0.1.0","build":"abc1234","proto":1,"boot_id":"b4ce18e9-c6d6-4473-af9b-a43b525106fe"}
+{"cyclops":"0.1.0-beta","build":"abc1234","proto":1,"boot_id":"b4ce18e9-c6d6-4473-af9b-a43b525106fe"}
 ```
 
 `boot_id` changes on every daemon restart, so a client can tell which
@@ -158,7 +158,7 @@ alphabet.
 
 ```
 -> {"id":2,"method":"status","params":{"open_deliveries":true}}
-<- {"id":2,"result":{"boot_id":"b4ce18e9-...","daemon_version":"0.1.0",
+<- {"id":2,"result":{"boot_id":"b4ce18e9-...","daemon_version":"0.1.0-beta",
     "daemon_build":"abc1234","daemon_executable":"/Users/me/.local/bin/cyclopsd",
     "daemon_process":{"pid":8123,"birth":981221},"pid":8123,
     "manifests":{"dir":"/private/tmp/cyclops-wire.l3llB0/home/manifests","ids":["demo"]},

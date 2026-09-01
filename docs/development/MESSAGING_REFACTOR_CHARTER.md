@@ -557,11 +557,13 @@ demonstrate that:
 - performance and reliability are measured against the existing system; and
 - the modular structure is easier to explain and change.
 
-Release identity is unresolved. Verified on 2026-08-29, the newest remote tag
-is `v0.2.0-beta`, created 2026-08-27; GitHub has no Release objects; and the
-workspace version in the repository-root `Cargo.toml` is `0.1.0`. Reconcile the
-version, tag, and release authorities before assigning or publishing a final
-beta version number.
+The release identity is selected but not published. The workspace package
+version is `0.1.0-beta`; the historical `v0.2.0-beta` tag remains attached to
+older source; and GitHub has no Release object for this candidate. Exact-SHA
+release evidence and the final beta-to-main pull request must be prepared
+before the operator decides whether to promote it. Do not merge `main`, create
+the `v0.1.0-beta` tag, create a GitHub Release, or publish without subsequent
+explicit operator approval.
 
 ## 16. One fully specified first tracer bullet
 

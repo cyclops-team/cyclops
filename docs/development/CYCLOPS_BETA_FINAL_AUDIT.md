@@ -10,7 +10,7 @@ remains an operator decision.
 [33475085967](https://github.com/cyclops-team/cyclops/actions/runs/33475085967),
 completed successfully at 2026-09-01T06:01:40Z
 
-This is the current final cross-track acceptance record for the Cyclops Beta
+This is the retained final cross-track acceptance record for the Cyclops Beta
 Rework. It supersedes the earlier audit of
 `b5f128fa70c67ce4bf9609b188643b71c44d236b` and records the post-audit delta
 merged in pull requests #188 through #194: final-audit documentation,
@@ -22,8 +22,10 @@ authority when this audit and a contract differ.
 The independent architecture, regression and migration, user-journey and
 performance, and standards audits identified no unresolved implementation
 blocker. This decision does not authorize a merge to `main`, a tag, a version
-number, a GitHub Release, or publication. Those remain operator decisions after
-release identity is reconciled.
+number, a GitHub Release, or publication. The current release queue is
+[NEXT.md](NEXT.md): the selected identity is `0.1.0-beta` / `v0.1.0-beta`, but
+merging `main`, tagging, creating a GitHub Release, and publication still need
+subsequent explicit operator approval.
 
 ## Decision
 
@@ -39,10 +41,12 @@ The beta has demonstrated the intended product shape:
   inspectable.
 
 The remaining gate is release authority, not an unfinished implementation
-track. The workspace still declares Cargo version `0.1.0`; the newest remote
-tag is `v0.2.0-beta` from 2026-08-27, which peels to historical ancestor
-`1155a50ce1db9256b114b1f89d203935324ceb52`; and GitHub has no Release object.
-Do not name or publish a beta until an operator reconciles those facts.
+track. At the time of this audit, the workspace declared Cargo version `0.1.0`,
+the newest remote tag was `v0.2.0-beta` from 2026-08-27, and GitHub had no
+Release object. That is historical context, not the current release status.
+The current candidate uses `0.1.0-beta` / `v0.1.0-beta`; the historical tag
+remains unchanged and no new tag or Release has been created. See
+[NEXT.md](NEXT.md) for the current gated release sequence.
 
 ## Evidence reviewed
 
