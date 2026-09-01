@@ -12362,6 +12362,7 @@ composer_trailer_required_prefix = 1
                 hold: ComposerHold::Clear,
                 turn: None,
                 hold_owner: None,
+                final_submit_conflict_owner: None,
                 composer: crate::ComposerProjection::default(),
                 working_confirmed: false,
                 since: std::time::Instant::now(),

@@ -498,9 +498,16 @@ final screen cannot repeat the clean proof; it must instead prove the exact
 attempt-owned doorbell bytes, the same binding, and no mode or blocked state.
 This is not a recovery or operator-resolution permission. A human or
 ambiguous composer never gains it, and any changed staged bytes still withhold
-Enter as `verify_failed`. A retained lifecycle end/idle, unknown or blocked
-reading, stale evidence, mode, or named non-composer refusal is a live
-conflict and also withholds Enter, even if the screen still paints `working`.
+Enter as `verify_failed`. Unknown or blocked reading, stale evidence, mode,
+or named non-composer refusal is a live conflict and also withholds Enter,
+even if the screen still paints `working`. A confirmed, exactly keyed terminal
+edge that arrives after this attempt was staged becomes a private final-submit
+conflict for that exact owner. A newer Screen `working` capture may correctly
+supersede the old Hook idle in public detection; the private conflict neither
+changes that public state nor authorizes a write. It only prevents this one
+Enter from racing the ended turn, and disappears when the owned barrier clears,
+changes owner or binding, or becomes a turn-start barrier. An unkeyed terminal
+event never acquires that conflict by arrival order.
 Only a screen `idle` or `idle_with_input` reading that describes the owned
 staged composer may coexist with the current Screen `working` reading. The
 same current `working` observation may mark that owned barrier
