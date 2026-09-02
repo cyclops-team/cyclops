@@ -605,6 +605,12 @@ fails. Durable records and existing setup files in your home are preserved.
 Known unedited shipped themes and hook artifacts may advance with the installed
 release; manifests and skills remain in place and can report outdated state.
 
+The source clone and candidate pair are temporary and disappear when the
+update ends. The only retained build artifact is Cargo's incremental cache:
+`~/Library/Caches/Cyclops/` on macOS and `~/.cache/cyclops/` on Linux. Cyclops
+prints its exact directory before building; it is user-owned and rebuildable.
+Set `CARGO_TARGET_DIR` if you deliberately want Cargo to use another location.
+
 The selected-pair record stores a content-free replay attestation bound to the
 exact client and daemon hashes plus the private snapshot identity. Older
 selection schemas remain readable and report replay as unproven. The
