@@ -4830,14 +4830,6 @@ async fn attempt_delivery(
     ) {
         return AttemptOutcome::Done;
     }
-    if handle.notification.is_some() {
-        fusion::clear_hold_owner(
-            inner,
-            handle.session_idx,
-            &handle.pane_id,
-            &handle.barrier_owner(),
-        );
-    }
     if !staging_verified {
         // One-time doorbell submitted unverified.
         // Enter was sent once, state is SubmittedUnverified, never duplicate Enter. Done.
