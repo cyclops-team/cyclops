@@ -1,5 +1,5 @@
 //! Performance, latency, throughput, and resource usage benchmark comparing
-//! Cyclops messaging against raw tmux commands.
+//! Cyclops messaging against raw tmux commands and ShawnPana's smux tmux-bridge.
 
 mod common;
 
@@ -89,12 +89,10 @@ fn measure_process_resources(pid: i32) -> ResourceSnapshot {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn benchmark_cyclops_vs_raw_tmux() {
-    println!("\n=========================================================================================");
-    println!(
-        "             CYCLOPS VS RAW TMUX COMMUNICATION BENCHMARK & RESOURCE PROFILE              "
-    );
-    println!("=========================================================================================\n");
+async fn benchmark_cyclops_vs_raw_tmux_and_smux() {
+    println!("\n=========================================================================================================");
+    println!("        CYCLOPS VS RAW TMUX VS SHAWNPANA/SMUX PROTOCOL BENCHMARK & ARCHITECTURAL COMPARISON              ");
+    println!("=========================================================================================================\n");
 
     let mut rig = Rig::new(
         "comm-bench",
@@ -106,14 +104,13 @@ async fn benchmark_cyclops_vs_raw_tmux() {
 
     let target_pane = "%0";
     let sender_label = "admin";
-
-    // -----------------------------------------------------------------------
-    // Benchmark 1: Raw tmux communication (tmux send-keys)
-    // -----------------------------------------------------------------------
     let sample_count = 50;
-    let mut tmux_samples_us = Vec::with_capacity(sample_count);
 
-    let tmux_bench_start = Instant::now();
+    // -----------------------------------------------------------------------
+    // Benchmark 1: Raw tmux send-keys (blind fire-and-forget keystroke injection)
+    // -----------------------------------------------------------------------
+    let mut tmux_send_samples_us = Vec::with_capacity(sample_count);
+    let tmux_send_bench_start = Instant::now();
     for i in 0..sample_count {
         let text = format!("[raw-tmux-msg-{i}] Hello pane from raw tmux\n");
         let start = Instant::now();
@@ -123,10 +120,82 @@ async fn benchmark_cyclops_vs_raw_tmux() {
             .output()
             .expect("raw tmux send-keys");
         let elapsed = start.elapsed().as_micros() as u64;
-        tmux_samples_us.push(elapsed);
+        tmux_send_samples_us.push(elapsed);
     }
-    let tmux_total_duration = tmux_bench_start.elapsed();
-    let tmux_stats = LatencyStats::compute(tmux_samples_us, tmux_total_duration);
+    let tmux_send_total_duration = tmux_send_bench_start.elapsed();
+    let tmux_send_stats = LatencyStats::compute(tmux_send_samples_us, tmux_send_total_duration);
+
+    // -----------------------------------------------------------------------
+    // Benchmark 2: Raw tmux capture-pane (screen capture inspection)
+    // -----------------------------------------------------------------------
+    let mut tmux_capture_samples_us = Vec::with_capacity(sample_count);
+    let tmux_capture_bench_start = Instant::now();
+    for _ in 0..sample_count {
+        let start = Instant::now();
+        let out = rig
+            .tmux
+            .cmd()
+            .args(["capture-pane", "-p", "-t", target_pane])
+            .output()
+            .expect("raw tmux capture-pane");
+        let elapsed = start.elapsed().as_micros() as u64;
+        tmux_capture_samples_us.push(elapsed);
+        assert!(!out.stdout.is_empty());
+    }
+    let tmux_capture_total_duration = tmux_capture_bench_start.elapsed();
+    let tmux_capture_stats =
+        LatencyStats::compute(tmux_capture_samples_us, tmux_capture_total_duration);
+
+    // -----------------------------------------------------------------------
+    // Benchmark 3: ShawnPana/smux tmux-bridge messaging cycle:
+    // (1) read-guard check & touch /tmp/tmux-bridge-read-*
+    // (2) tmux capture-pane -p -e -S -50 (read before act)
+    // (3) tmux send-keys -l (type text)
+    // (4) tmux send-keys Enter (submit keys)
+    // (5) clear read-guard rm -f /tmp/tmux-bridge-read-*
+    // -----------------------------------------------------------------------
+    let mut smux_samples_us = Vec::with_capacity(sample_count);
+    let guard_file = std::env::temp_dir().join("tmux-bridge-read-_0");
+    let smux_bench_start = Instant::now();
+    for i in 0..sample_count {
+        let text = format!("[tmux-bridge from:admin] Task instruction {i}");
+        let start = Instant::now();
+
+        // Step 1: Read guard mark
+        let _ = fs::write(&guard_file, b"read");
+
+        // Step 2: tmux capture-pane (reading target pane before acting)
+        let _ = rig
+            .tmux
+            .cmd()
+            .args(["capture-pane", "-p", "-e", "-S", "-50", "-t", target_pane])
+            .output()
+            .expect("smux capture-pane");
+
+        // Step 3: Type text without Enter (tmux send-keys -l)
+        let _ = rig
+            .tmux
+            .cmd()
+            .args(["send-keys", "-l", "-t", target_pane, &text])
+            .output()
+            .expect("smux send-keys literal");
+
+        // Step 4: Press Enter (tmux send-keys Enter)
+        let _ = rig
+            .tmux
+            .cmd()
+            .args(["send-keys", "-t", target_pane, "Enter"])
+            .output()
+            .expect("smux send-keys enter");
+
+        // Step 5: Clear read-guard
+        let _ = fs::remove_file(&guard_file);
+
+        let elapsed = start.elapsed().as_micros() as u64;
+        smux_samples_us.push(elapsed);
+    }
+    let smux_total_duration = smux_bench_start.elapsed();
+    let smux_stats = LatencyStats::compute(smux_samples_us, smux_total_duration);
 
     // Get tmux server PID and measure resources
     let tmux_pid_out = rig
@@ -142,7 +211,7 @@ async fn benchmark_cyclops_vs_raw_tmux() {
     let tmux_res = measure_process_resources(tmux_pid);
 
     // -----------------------------------------------------------------------
-    // Benchmark 2: Cyclops Messaging (Durable Journal Append + Socket Protocol)
+    // Benchmark 4: Cyclops msg_send (Durable Journal Append + FIFO Gating)
     // -----------------------------------------------------------------------
     let mut cyclops_send_samples_us = Vec::with_capacity(sample_count);
     let mut msg_ids = Vec::with_capacity(sample_count);
@@ -173,7 +242,7 @@ async fn benchmark_cyclops_vs_raw_tmux() {
     let cyclops_send_stats = LatencyStats::compute(cyclops_send_samples_us, cyclops_send_duration);
 
     // -----------------------------------------------------------------------
-    // Benchmark 3: Cyclops Claim Latency (Private Body Extraction via Socket)
+    // Benchmark 5: Cyclops inbox.claim (Private Body Extraction via Mailbox)
     // -----------------------------------------------------------------------
     let mut cyclops_claim_samples_us = Vec::with_capacity(sample_count);
     let cyclops_claim_start = Instant::now();
@@ -213,34 +282,52 @@ async fn benchmark_cyclops_vs_raw_tmux() {
     // -----------------------------------------------------------------------
     // Print Comparative Results
     // -----------------------------------------------------------------------
+    println!("---------------------------------------------------------------------------------------------------------");
     println!(
-        "-----------------------------------------------------------------------------------------"
-    );
-    println!(
-        "1. LATENCY & THROUGHPUT COMPARISON ({} operations each)",
+        "1. LATENCY & THROUGHPUT BENCHMARK ({} operations each)",
         sample_count
     );
+    println!("---------------------------------------------------------------------------------------------------------");
     println!(
-        "-----------------------------------------------------------------------------------------"
-    );
-    println!(
-        "{:<34} | {:>6} | {:>6} | {:>6} | {:>6} | {:>6} | {:>6} | {:>14}",
+        "{:<40} | {:>6} | {:>6} | {:>6} | {:>6} | {:>6} | {:>6} | {:>14}",
         "Communication Path", "min", "p50", "p95", "p99", "avg", "max", "Throughput (ops/s)"
     );
-    println!("-------------------------------------------------------------------------------------------------");
+    println!("---------------------------------------------------------------------------------------------------------");
     println!(
-        "{:<34} | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>14.1}",
-        "Raw tmux send-keys (unverified)",
-        tmux_stats.min_us,
-        tmux_stats.p50_us,
-        tmux_stats.p95_us,
-        tmux_stats.p99_us,
-        tmux_stats.avg_us,
-        tmux_stats.max_us,
-        tmux_stats.throughput_ops_per_sec
+        "{:<40} | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>14.1}",
+        "Raw tmux send-keys",
+        tmux_send_stats.min_us,
+        tmux_send_stats.p50_us,
+        tmux_send_stats.p95_us,
+        tmux_send_stats.p99_us,
+        tmux_send_stats.avg_us,
+        tmux_send_stats.max_us,
+        tmux_send_stats.throughput_ops_per_sec
     );
     println!(
-        "{:<34} | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>14.1}",
+        "{:<40} | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>14.1}",
+        "Raw tmux capture-pane",
+        tmux_capture_stats.min_us,
+        tmux_capture_stats.p50_us,
+        tmux_capture_stats.p95_us,
+        tmux_capture_stats.p99_us,
+        tmux_capture_stats.avg_us,
+        tmux_capture_stats.max_us,
+        tmux_capture_stats.throughput_ops_per_sec
+    );
+    println!(
+        "{:<40} | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>14.1}",
+        "smux tmux-bridge (guard + 3 calls)",
+        smux_stats.min_us,
+        smux_stats.p50_us,
+        smux_stats.p95_us,
+        smux_stats.p99_us,
+        smux_stats.avg_us,
+        smux_stats.max_us,
+        smux_stats.throughput_ops_per_sec
+    );
+    println!(
+        "{:<40} | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>14.1}",
         "Cyclops msg_send (durable append)",
         cyclops_send_stats.min_us,
         cyclops_send_stats.p50_us,
@@ -251,7 +338,7 @@ async fn benchmark_cyclops_vs_raw_tmux() {
         cyclops_send_stats.throughput_ops_per_sec
     );
     println!(
-        "{:<34} | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>14.1}",
+        "{:<40} | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>4}µs | {:>14.1}",
         "Cyclops inbox.claim (body access)",
         cyclops_claim_stats.min_us,
         cyclops_claim_stats.p50_us,
@@ -261,75 +348,98 @@ async fn benchmark_cyclops_vs_raw_tmux() {
         cyclops_claim_stats.max_us,
         cyclops_claim_stats.throughput_ops_per_sec
     );
-    println!("-----------------------------------------------------------------------------------------\n");
+    println!("---------------------------------------------------------------------------------------------------------\n");
 
+    println!("---------------------------------------------------------------------------------------------------------");
+    println!("2. RESOURCE CONSUMPTION PROFILE");
+    println!("---------------------------------------------------------------------------------------------------------");
     println!(
-        "-----------------------------------------------------------------------------------------"
-    );
-    println!("2. RESOURCE USAGE PROFILE");
-    println!(
-        "-----------------------------------------------------------------------------------------"
-    );
-    println!(
-        "{:<28} | {:>12} | {:>10} | {:>18}",
+        "{:<32} | {:>12} | {:>10} | {:>22}",
         "Process / Component", "RSS Memory", "Open FDs", "Persistence Footprint"
     );
+    println!("---------------------------------------------------------------------------------------------------------");
     println!(
-        "-----------------------------------------------------------------------------------------"
-    );
-    println!(
-        "{:<28} | {:>9.2} MB | {:>10} | {:>18}",
+        "{:<32} | {:>9.2} MB | {:>10} | {:>22}",
         format!("tmux server (pid {tmux_pid})"),
         tmux_res.rss_kb as f64 / 1024.0,
         tmux_res.fd_count,
         "0 bytes (ephemeral)"
     );
     println!(
-        "{:<28} | {:>9.2} MB | {:>10} | {:>15} KB",
+        "{:<32} | {:>9.2} MB | {:>10} | {:>19} KB",
         format!("cyclopsd (pid {daemon_pid})"),
         cyclops_res.rss_kb as f64 / 1024.0,
         cyclops_res.fd_count,
         journal_bytes / 1024
     );
-    println!("-----------------------------------------------------------------------------------------\n");
+    println!("---------------------------------------------------------------------------------------------------------\n");
 
+    println!("---------------------------------------------------------------------------------------------------------");
+    println!("3. ARCHITECTURAL & PROTOCOL COMPARISON: CYCLOPS VS SMUX VS RAW TMUX");
+    println!("---------------------------------------------------------------------------------------------------------");
     println!(
-        "-----------------------------------------------------------------------------------------"
+        "{:<26} | {:<22} | {:<24} | {:<22}",
+        "Dimension", "Raw tmux", "ShawnPana/smux", "Cyclops"
     );
-    println!("3. ARCHITECTURAL & SAFETY GUARANTEES");
+    println!("---------------------------------------------------------------------------------------------------------");
     println!(
-        "-----------------------------------------------------------------------------------------"
-    );
-    println!(
-        "{:<30} | {:<27} | {:<27}",
-        "Dimension", "Raw tmux send-keys", "Cyclops Messaging"
-    );
-    println!(
-        "-----------------------------------------------------------------------------------------"
+        "{:<26} | {:<22} | {:<24} | {:<22}",
+        "Durability", "None (dropped on crash)", "None (pipe lost on abort)", "Durable WAL Journal"
     );
     println!(
-        "{:<30} | {:<27} | {:<27}",
-        "Durability", "None (dropped on crash)", "Full (appended to journal)"
+        "{:<26} | {:<22} | {:<24} | {:<22}",
+        "Human Draft Protection",
+        "Overwrites typing",
+        "Overwrites if typing race",
+        "Preserved until clean"
     );
     println!(
-        "{:<30} | {:<27} | {:<27}",
-        "Human Draft Preservation", "None (overwrites user)", "Guaranteed (backs off)"
+        "{:<26} | {:<22} | {:<24} | {:<22}",
+        "Scrollback Hygiene", "Full payload pasted", "Full payload pasted", "Clean (doorbell only)"
     );
     println!(
-        "{:<30} | {:<27} | {:<27}",
-        "Payload Privacy", "Exposed in scrollback", "Private until claim"
+        "{:<26} | {:<22} | {:<24} | {:<22}",
+        "Delivery Confirmation",
+        "Blind fire-and-forget",
+        "Read guard file flag",
+        "Fused Sensor Receipt"
     );
     println!(
-        "{:<30} | {:<27} | {:<27}",
-        "Delivery Confirmation", "Blind fire-and-forget", "Proof-verified wake"
+        "{:<26} | {:<22} | {:<24} | {:<22}",
+        "Multi-Agent Ordering",
+        "Unordered write races",
+        "Unordered write races",
+        "Strict Monotonic FIFO"
     );
     println!(
-        "{:<30} | {:<27} | {:<27}",
-        "Ordering Contract", "Unordered race", "Strict monotonic FIFO"
+        "{:<26} | {:<22} | {:<24} | {:<22}",
+        "Duplicate Enter Guard",
+        "None (can duplicate)",
+        "None (can duplicate)",
+        "Exactly-One Enter Rule"
     );
-    println!("-----------------------------------------------------------------------------------------\n");
+    println!(
+        "{:<26} | {:<22} | {:<24} | {:<22}",
+        "Interactive TUI / Chrome", "None", "Basic Option keybinds", "Full Ratatui Workspace"
+    );
+    println!("---------------------------------------------------------------------------------------------------------\n");
 
-    assert_eq!(tmux_stats.count, sample_count);
+    println!("---------------------------------------------------------------------------------------------------------");
+    println!("4. CYCLOPS COMMAND REFERENCE (SUCCINCT SUMMARY)");
+    println!("---------------------------------------------------------------------------------------------------------");
+    println!("• cyclops send <to> --subject <s> --body <b>  : Durably stores message in recipient inbox; sends doorbell interrupt.");
+    println!("• cyclops reply <msg-id> --body <b>          : Atomically replies to a message sender in-thread with durable delivery.");
+    println!("• cyclops inbox claim <msg-id>               : Fetches full message payload without contaminating pane scrollback.");
+    println!("• cyclops inbox next                         : Non-destructive mailbox polling query; retrieves next unread message.");
+    println!("• cyclops watch                              : Streams live NDJSON delivery transitions and mailbox events.");
+    println!("• cyclops clear <agent>                      : Withdraws unwritten pane wakes for agent without deleting messages.");
+    println!("• cyclops status                             : Validates daemon health, active sessions, adopted panes, and routes.");
+    println!("• cyclops name <target> <label>              : Names a pane, tracks identity, and paints theme-aware pane border.");
+    println!("---------------------------------------------------------------------------------------------------------\n");
+
+    assert_eq!(tmux_send_stats.count, sample_count);
+    assert_eq!(tmux_capture_stats.count, sample_count);
+    assert_eq!(smux_stats.count, sample_count);
     assert_eq!(cyclops_send_stats.count, sample_count);
     assert_eq!(cyclops_claim_stats.count, sample_count);
 

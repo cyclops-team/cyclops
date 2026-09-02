@@ -4830,6 +4830,14 @@ async fn attempt_delivery(
     ) {
         return AttemptOutcome::Done;
     }
+    if handle.notification.is_some() {
+        fusion::clear_hold_owner(
+            inner,
+            handle.session_idx,
+            &handle.pane_id,
+            &handle.barrier_owner(),
+        );
+    }
     if !staging_verified {
         // One-time doorbell submitted unverified.
         // Enter was sent once, state is SubmittedUnverified, never duplicate Enter. Done.
@@ -6571,29 +6579,55 @@ async fn gate(
                             AgentState::Working => {
                                 // Runtime state is not permission to write,
                                 // but it is not an automatic refusal either.
-                                // A visibly working pane may expose an
                                 // Under the direct pane interruption contract:
-                                // Working state is an observation, not a delivery blocker.
-                                // Only a proven non-Cyclops draft in the composer holds delivery.
-                                if det.write_block.as_deref() == Some("composer_hold") {
-                                    Some("composer_hold".to_string())
+                                // For notification doorbells, working state is an observation,
+                                // not a delivery blocker. Only a proven non-Cyclops draft holds it.
+                                if handle.notification.is_some() {
+                                    if det.write_block.as_deref() == Some("composer_hold") {
+                                        Some("composer_hold".to_string())
+                                    } else {
+                                        match fusion::foreground_pid_checked(row.pane_pid) {
+                                            None if last_hold.as_deref()
+                                                == Some(OBSERVATION_HOLD) =>
+                                            {
+                                                return GateOutcome::BlockedPreWrite {
+                                                    cause:
+                                                        NotificationPreWriteCause::BindingUnprovable,
+                                                    observation: Box::new(
+                                                        binding_unprovable_observation(
+                                                            inner,
+                                                            handle,
+                                                            row.pane_pid,
+                                                            &manifest_id,
+                                                        ),
+                                                    ),
+                                                };
+                                            }
+                                            None => Some(OBSERVATION_HOLD.to_string()),
+                                            Some(pane_pid) => {
+                                                gate_line(
+                                                    inner,
+                                                    handle,
+                                                    "proceed",
+                                                    Some(&det.decided_by),
+                                                    None,
+                                                );
+                                                return GateOutcome::Proceed {
+                                                    manifest_id,
+                                                    pane_pid,
+                                                    regate_evidence_changed,
+                                                };
+                                            }
+                                        }
+                                    }
+                                } else if !det.write_ready {
+                                    Some(
+                                        det.write_block
+                                            .clone()
+                                            .unwrap_or_else(|| "working".to_string()),
+                                    )
                                 } else {
                                     match fusion::foreground_pid_checked(row.pane_pid) {
-                                        None if handle.notification.is_some()
-                                            && last_hold.as_deref() == Some(OBSERVATION_HOLD) =>
-                                        {
-                                            return GateOutcome::BlockedPreWrite {
-                                                cause: NotificationPreWriteCause::BindingUnprovable,
-                                                observation: Box::new(
-                                                    binding_unprovable_observation(
-                                                        inner,
-                                                        handle,
-                                                        row.pane_pid,
-                                                        &manifest_id,
-                                                    ),
-                                                ),
-                                            };
-                                        }
                                         None => Some(OBSERVATION_HOLD.to_string()),
                                         Some(pane_pid) => {
                                             gate_line(
