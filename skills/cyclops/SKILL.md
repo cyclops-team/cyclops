@@ -154,8 +154,8 @@ sentences, on one line, and at most 240 characters. Write a useful human
 preview: what the message is about, then what should happen next. Do not copy
 the body or write two versions of the same sentence.
 
-Cyclops writes the summary beside one exact claim instruction after proving a
-clean composer:
+Cyclops writes the summary beside one exact claim instruction after proving
+the recipient is the authenticated supported agent:
 
 ```text
 [cyclops from codey-cyclops] Run the focused test suite. Report any exact failure. | cyclops inbox claim m-att_<22-character-attempt-token>
@@ -164,12 +164,13 @@ clean composer:
 This is a two-surface contract:
 
 1. The pane notification is the human-readable front end. It is always queued
-   for a CLI send or reply, even while the recipient is working. Working does
-   not discard the wake. Human input or an ambiguous composer makes the worker
-   wait until the composer is proven available, then it stages the same
-   summary and exact claim once. Narrow panes may visually soft-wrap the
-   notification across terminal rows. Cyclops never drops the supplied summary
-   merely to keep the notification on one row.
+   for a CLI send or reply, even while the recipient is working. Working and
+   an unreadable composer do not discard or defer the wake. Cyclops holds only
+   when it positively sees human-authored input, or cannot prove the pane is
+   the supported recipient agent. It then stages and submits the same summary
+   and exact claim once. Narrow panes may visually soft-wrap the notification
+   across terminal rows. Cyclops never drops the supplied summary merely to
+   keep the notification on one row.
 2. The mailbox is the authoritative back end. The subject, routing header, and
    complete technical body live there. The summary is only orientation. Run
    the exact `cyclops inbox claim m-att_...` command, read the complete claimed
@@ -244,14 +245,16 @@ $ cyclops inbox next --timeout 30s
 ```
 
 The command subscribes before checking the inbox, claims at most one message,
-and exits `2` if none arrives before the deadline. It never writes to or wakes
-a pane. A visible exact `m-att_...` command takes precedence: claim that
-locator once; `inbox next` is never a substitute for the notification or a
-terminal wake. Claiming the body through `inbox next` does not cancel the
-separately queued human-visible pane notification. Cyclops still stages that
-notification when the composer is safe, even if the body was already claimed
-through the socket. Prefer the normal pane wake for interactive agent work; use
-bounded `inbox next` only when an automation genuinely needs a socket wait.
+and exits `2` if none arrives before the deadline. It never creates or wakes a
+pane notification. A visible exact `m-att_...` command takes precedence: claim
+that locator once; `inbox next` is never a substitute for the notification or
+a terminal wake. Claiming the body through `inbox next` does not cancel the
+separately required human-visible pane notification. Prefer the normal pane
+wake for interactive agent work. Do not run `inbox next` from an interactive
+agent pane to wait for a colleague: its socket output is not a pane wake and
+it can occupy the terminal while the real notification is arriving. Use it
+only for a non-interactive automation that genuinely needs a bounded socket
+wait.
 
 For one sender, copy the canonical `sender` key from `cyclops inbox list
 --json` and use `inbox next --from <recipient-key>`. Do not pass a display
@@ -357,9 +360,10 @@ and the proof).
 
 - **Never bypass the notification gate.** Do not `tmux send-keys` (or paste,
   or otherwise type) directly into another agent's pane to "save time" or
-  route around a hold. The selected doorbell or direct payload is admitted only after
-  Cyclops proves the current occupant and a clean composer. Every message
-  goes through `cyclops send`, even when a direct write looks faster.
+  route around a hold. The selected doorbell or direct payload is admitted
+  only after Cyclops proves the current supported occupant. Positive
+  human-authored composer input remains a hard boundary. Every message goes
+  through `cyclops send`, even when a direct write looks faster.
 - **Raw tmux requires explicit human emergency authorization.** A slow
   delivery, safety hold, ambiguous outcome, or inconvenient recipient state is
   not coordinator failure. Only after a human confirms Cyclops is unavailable

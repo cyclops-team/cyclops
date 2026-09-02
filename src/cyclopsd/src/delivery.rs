@@ -4286,10 +4286,16 @@ async fn attempt_delivery(
     .await
     {
         Some(det) => {
-            // Permission is a positive stamp, never the absence of a
-            // refusal: an unstamped verdict means nobody decided, and
-            // nobody deciding is not the same as deciding yes.
-            if !det.write_ready {
+            // A positive human draft remains a hard boundary. For an
+            // authenticated idle or working agent, however, an unreadable
+            // composer is not a reason to strand a durable doorbell after
+            // the gate already admitted the same live occupant.
+            let unproven_composer_is_still_eligible = handle.notification.is_some()
+                && watcher.pane(&handle.pane_id).is_some_and(|row| {
+                    notification_pane_for_unproven_composer(inner, handle, &row, manifest_id, &det)
+                        .is_some()
+                });
+            if !det.write_ready && !unproven_composer_is_still_eligible {
                 let reason = det.write_block.as_deref().unwrap_or("unstamped");
                 gate_line(
                     inner,
