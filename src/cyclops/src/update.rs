@@ -1332,6 +1332,19 @@ impl PairStore {
                 .as_ref()
                 .is_some_and(|m| m.file_type().is_symlink())
         {
+            let expected_cli = PathBuf::from(PAIR_ROOT).join(ACTIVE_SELECTOR).join("cyclops");
+            let expected_daemon = PathBuf::from(PAIR_ROOT)
+                .join(ACTIVE_SELECTOR)
+                .join("cyclopsd");
+            if std::fs::read_link(&cli).ok().as_ref() == Some(&expected_cli)
+                && std::fs::read_link(&daemon).ok().as_ref() == Some(&expected_daemon)
+            {
+                // A complete-state removal may have removed the selector store
+                // while leaving these two owned public links behind. There is
+                // no executable pair to preserve, so activation below may
+                // safely replace both links with the verified candidate.
+                return Ok(());
+            }
             return Err(PairChangeError::unchanged(
                 "managed Cyclops links have no active selector",
             ));
@@ -4517,6 +4530,32 @@ sys.exit(43)"#,
         assert_eq!(restored.active, old.active);
         assert_eq!(restored.known_good, candidate);
         assert_eq!(store.selection().unwrap(), Some(restored));
+    }
+
+    #[test]
+    fn reinstall_recovers_owned_public_links_after_the_pair_store_is_removed() {
+        let scratch = Scratch::create().unwrap();
+        let prefix = scratch.path().join("bin");
+        directory(&prefix);
+        let old_source = scratch.path().join("old");
+        let candidate_source = scratch.path().join("candidate");
+        pair_source(&old_source, "old-build");
+        pair_source(&candidate_source, "candidate-build");
+
+        let store = PairStore::open(&prefix).unwrap();
+        let old = store.stage(&old_source).unwrap();
+        store.activate(&old, recorded_replay(&store, &old, 1)).unwrap();
+        std::fs::remove_dir_all(&store.root).unwrap();
+
+        let recovered = PairStore::open(&prefix).unwrap();
+        let candidate = recovered.stage(&candidate_source).unwrap();
+        recovered.migrate_direct_pair(&candidate).unwrap();
+        recovered
+            .activate(&candidate, recorded_replay(&recovered, &candidate, 2))
+            .unwrap();
+
+        recovered.require_public_links().unwrap();
+        assert_eq!(recovered.selection().unwrap().unwrap().active, candidate);
     }
 
     #[test]
