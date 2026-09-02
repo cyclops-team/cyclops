@@ -94,6 +94,8 @@ pub enum WakeWord {
     Staged,
     /// The submit key was sent. This is not an agent acknowledgement.
     Submitted,
+    /// The submit key was sent without complete positive staging proof.
+    SubmittedUnverified,
     /// The attempt stopped before any terminal bytes were written.
     BlockedBeforeWrite,
     Notified,
@@ -155,6 +157,7 @@ impl WakeWord {
             WakeWord::Writing => "> writing",
             WakeWord::Staged => "> staged",
             WakeWord::Submitted => "^ submit sent",
+            WakeWord::SubmittedUnverified => "^ submit sent (unverified)",
             WakeWord::BlockedBeforeWrite => "! blocked before write",
             WakeWord::Notified => "> notified",
             WakeWord::Withdrawn => "= withdrawn",
@@ -178,6 +181,7 @@ impl WakeWord {
             WakeWord::Writing => ">write",
             WakeWord::Staged => ">stage",
             WakeWord::Submitted => "^submit",
+            WakeWord::SubmittedUnverified => "^unver",
             WakeWord::BlockedBeforeWrite => "!block",
             WakeWord::Notified => ">notf",
             WakeWord::Withdrawn => "=wdrn",

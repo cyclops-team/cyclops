@@ -286,17 +286,19 @@ pub struct StateInspector {
 }
 
 /// Descriptor-relative authority to publish one file below an existing,
-/// private consumer directory.
+/// operator-controlled consumer directory.
 ///
 /// Consumer directories are not Cyclops state roots: their permissions and
-/// unrelated entries belong to the consumer. The accepted parent is already
-/// owner-only, so this type never repairs it or creates descendants. It can
-/// create one missing final regular-file entry through the held descriptor.
+/// unrelated entries belong to the consumer. The accepted parent is owned by
+/// the current user and cannot be changed by another user, so this type never
+/// repairs it or creates descendants. It can create one missing final regular-
+/// file entry through the held descriptor.
 #[derive(Debug)]
 pub struct ManagedAssetRoot {
     directory: File,
     path: PathBuf,
     owner: u32,
+    owner_controlled: bool,
 }
 
 /// One exact inspected file or empty directory bound for explicit removal.
@@ -436,6 +438,22 @@ impl StateInspector {
         private_directory(&self.directory, &self.path, self.owner)
     }
 
+    /// Whether this held directory is stable and cannot be changed by another
+    /// user.
+    ///
+    /// Consumer skill directories are commonly mode 0755: their instructions
+    /// are visible to the local account, but no other user may write there.
+    /// That is sufficient for create-only publication of a non-secret skill.
+    /// Unlike [`Self::private_and_stable`], this deliberately accepts read and
+    /// search access while retaining the no-links, same-owner, no-ACL, and
+    /// no-external-write requirements.
+    pub fn owner_controlled_and_stable(&self) -> Result<bool, StateError> {
+        if !self.path_matches_held_root()? {
+            return Ok(false);
+        }
+        owner_controlled_directory(&self.directory, &self.path, self.owner)
+    }
+
     /// Transfer one verified, private directory into the narrowly scoped
     /// authority used to publish a declared managed asset.
     ///
@@ -454,6 +472,30 @@ impl StateInspector {
             directory: self.directory,
             path: self.path,
             owner: self.owner,
+            owner_controlled: false,
+        })
+    }
+
+    /// Transfer one verified operator-controlled directory into the narrowly
+    /// scoped authority used to publish one declared, non-secret managed
+    /// asset.
+    ///
+    /// This is for consumer-owned instruction directories such as
+    /// `~/.agents/skills/cyclops`. It accepts mode 0755 but still refuses a
+    /// path another user can write, a link, a foreign owner, an ACL-expanded
+    /// path, or a changed directory identity.
+    pub fn into_operator_owned_asset_root(self) -> Result<ManagedAssetRoot, StateError> {
+        if !self.owner_controlled_and_stable()? {
+            return Err(unsafe_path(
+                &self.path,
+                "managed asset parent is not operator-controlled or changed before publication",
+            ));
+        }
+        Ok(ManagedAssetRoot {
+            directory: self.directory,
+            path: self.path,
+            owner: self.owner,
+            owner_controlled: true,
         })
     }
 
@@ -1261,8 +1303,9 @@ impl ManagedAssetRoot {
     /// Create a managed file only when its final leaf is absent.
     ///
     /// The file is visible as soon as `openat(O_EXCL)` succeeds, so the
-    /// parent must already be private. This deliberately does not publish by
-    /// a mutable named temporary file or create a consumer-tree directory.
+    /// parent must remain private or owner-controlled, according to the
+    /// authority used to construct this value. This deliberately does not
+    /// publish by a mutable named temporary file or create a consumer-tree directory.
     /// Any raced or unsafe leaf stays exactly where it is. Callers must
     /// re-inspect it before deciding whether another action is permitted.
     pub fn create_file_once(
@@ -1278,7 +1321,7 @@ impl ManagedAssetRoot {
                 "managed asset publication must name one final leaf",
             ));
         }
-        self.validate_private_parent(&display_path)?;
+        self.validate_publication_parent(&display_path)?;
         let directory = clone_file(&self.directory, &display_path)?;
 
         let leaf = c_name(
@@ -1322,7 +1365,7 @@ impl ManagedAssetRoot {
                 .map_err(|source| io_error(&display_path, source))?;
             file.sync_all()
                 .map_err(|source| io_error(&display_path, source))?;
-            self.validate_private_parent(&display_path)?;
+            self.validate_publication_parent(&display_path)?;
             validate_created_leaf(&directory, &file, &leaf, &display_path, self.owner)?;
             sync_directory(&directory).map_err(|source| StateError::CreationDurabilityUnknown {
                 path: display_path.clone(),
@@ -1353,17 +1396,26 @@ impl ManagedAssetRoot {
         }
     }
 
-    fn validate_private_parent(&self, display_path: &Path) -> Result<(), StateError> {
+    fn validate_publication_parent(&self, display_path: &Path) -> Result<(), StateError> {
         if !self.path_matches_held_root()? {
             return Err(unsafe_path(
                 &self.path,
                 "managed asset parent changed before publication",
             ));
         }
-        if !private_directory(&self.directory, display_path, self.owner)? {
+        let safe = if self.owner_controlled {
+            owner_controlled_directory(&self.directory, display_path, self.owner)?
+        } else {
+            private_directory(&self.directory, display_path, self.owner)?
+        };
+        if !safe {
             return Err(unsafe_path(
                 display_path,
-                "managed asset parent is not private",
+                if self.owner_controlled {
+                    "managed asset parent is not owner-controlled"
+                } else {
+                    "managed asset parent is not private"
+                },
             ));
         }
         Ok(())
@@ -2938,6 +2990,22 @@ fn private_directory(file: &File, path: &Path, owner: u32) -> Result<bool, State
     let metadata = file.metadata().map_err(|source| io_error(path, source))?;
     validate_directory(file, path, owner)?;
     if metadata.mode() & 0o7777 & !DIRECTORY_MODE != 0 {
+        return Ok(false);
+    }
+    #[cfg(target_os = "macos")]
+    if !has_no_extended_acl(file, path)? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Confirm that a consumer-owned directory remains owned by this user and
+/// is not writable by group or world. Readable instruction directories are
+/// fine; writable ones are not a safe publication namespace.
+fn owner_controlled_directory(file: &File, path: &Path, owner: u32) -> Result<bool, StateError> {
+    let metadata = file.metadata().map_err(|source| io_error(path, source))?;
+    validate_directory(file, path, owner)?;
+    if metadata.mode() & 0o022 != 0 {
         return Ok(false);
     }
     #[cfg(target_os = "macos")]

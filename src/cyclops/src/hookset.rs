@@ -322,6 +322,40 @@ fn merge_into(dst: &mut serde_json::Value, src: &serde_json::Value) {
     }
 }
 
+/// Remove this project's entries from a vendor document without changing any
+/// sibling configuration. This is the inverse of [`merge_into`] for the
+/// arrays Cyclops owns; scalar configuration is never reset on uninstall.
+fn remove_from(dst: &mut serde_json::Value, src: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (dst, src) {
+        (Value::Object(d), Value::Object(s)) => {
+            let mut changed = false;
+            for (key, source_value) in s {
+                if let Some(destination_value) = d.get_mut(key) {
+                    changed |= remove_from(destination_value, source_value);
+                }
+            }
+            changed
+        }
+        (destination @ Value::Array(_), Value::Array(source)) => {
+            let own_bins = own_hook_bins(source);
+            let own_shells = own_group_shells(source);
+            let original = destination.as_array().expect("array matched above");
+            let kept: Vec<Value> = original
+                .iter()
+                .filter_map(|entry| without_cyclops_hooks(entry, &own_bins, &own_shells))
+                .collect();
+            if kept.len() == original.len() && kept == *original {
+                false
+            } else {
+                *destination = Value::Array(kept);
+                true
+            }
+        }
+        _ => false,
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum WiringState {
     Current,
@@ -377,6 +411,57 @@ pub struct WiredVendor {
     pub unchanged: bool,
     /// Where the pre-existing file was copied before the first edit.
     pub backup: Option<PathBuf>,
+}
+
+/// What explicit uninstall did to one vendor's shared hook file.
+pub struct UnwiredVendor {
+    pub vendor: &'static str,
+    pub path: PathBuf,
+    pub removed: bool,
+}
+
+/// Remove only Cyclops hook commands from one vendor config during explicit
+/// uninstall. The vendor file itself and every unrelated setting remain.
+pub fn remove_vendor_wiring(kind: CliKind) -> Result<Option<UnwiredVendor>, String> {
+    let Some(path) = vendor_hook_file(kind) else {
+        return Ok(None);
+    };
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("can't read {}: {error}", path.display())),
+    };
+    let mut document: serde_json::Value = if existing.trim().is_empty() {
+        return Ok(Some(UnwiredVendor {
+            vendor: kind.name(),
+            path,
+            removed: false,
+        }));
+    } else {
+        serde_json::from_str(&existing).map_err(|error| {
+            format!("{} is not valid JSON ({error}); left alone", path.display())
+        })?
+    };
+    let ours: serde_json::Value = serde_json::from_str(&render_shared(kind, &cyclops_bin()))
+        .map_err(|error| {
+            format!(
+                "rendered {} hook config is not valid JSON: {error}",
+                kind.name()
+            )
+        })?;
+    let removed = remove_from(&mut document, &ours);
+    if removed {
+        let mut text = serde_json::to_string_pretty(&document)
+            .map_err(|error| format!("can't serialize {}: {error}", path.display()))?;
+        text.push('\n');
+        write_atomic(&path, &text)
+            .map_err(|error| format!("can't write {}: {error}", path.display()))?;
+    }
+    Ok(Some(UnwiredVendor {
+        vendor: kind.name(),
+        path,
+        removed,
+    }))
 }
 
 /// Put this project's hook entries in the file `kind` reads on its own.
@@ -1445,6 +1530,40 @@ mod tests {
         let stop = stale["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 2, "the stale cyclops entry should be gone");
         assert!(!stale.to_string().contains("/old/path/cyclops"));
+    }
+
+    #[test]
+    fn explicit_uninstall_removes_only_cyclops_hook_entries() {
+        let theirs = serde_json::json!({
+            "hooks": {
+                "Stop": [
+                    { "hooks": [ { "type": "command", "command": "/bin/their-notifier" } ] },
+                    { "hooks": [ { "type": "command", "command": "/old/cyclops hook Stop" } ] }
+                ],
+                "SessionStart": [ { "hooks": [ { "type": "command", "command": "echo mine" } ] } ]
+            },
+            "unrelated": { "deeply": ["nested", "value"] }
+        });
+        let ours: serde_json::Value =
+            serde_json::from_str(&render_shared(CliKind::Codex, GOLDEN_BIN)).unwrap();
+        let mut document = theirs.clone();
+
+        assert!(remove_from(&mut document, &ours));
+        assert_eq!(document["unrelated"], theirs["unrelated"]);
+        assert_eq!(
+            document["hooks"]["SessionStart"],
+            theirs["hooks"]["SessionStart"]
+        );
+        assert_eq!(
+            document["hooks"]["Stop"],
+            serde_json::json!([{
+                "hooks": [{ "type": "command", "command": "/bin/their-notifier" }]
+            }])
+        );
+        assert!(
+            !remove_from(&mut document, &ours),
+            "second removal changed config"
+        );
     }
 
     #[test]

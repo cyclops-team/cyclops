@@ -137,7 +137,12 @@ pub const NO_AGENTS: &str =
 /// descriptions come from clap's command help, so discovery and detailed
 /// help cannot quietly describe the same spelling two different ways.
 pub const COMMAND_GROUPS: &[(&str, &[&str])] = &[
-    ("Everyday", &["send", "inbox", "reply", "status", "health"]),
+    (
+        "Everyday",
+        &[
+            "send", "inbox", "reply", "clear", "status", "health", "stop",
+        ],
+    ),
     (
         "Workspace",
         &["start", "workspace", "sizing", "name", "list", "watch"],

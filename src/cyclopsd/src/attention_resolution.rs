@@ -227,7 +227,6 @@ pub(crate) async fn force_complete(
         ));
     }
     delivery::inject_pause(inner, "force_submit_after_terminal_key_reservation").await;
-
     if route
         .watcher
         .client()
@@ -906,17 +905,15 @@ async fn assess(
         .evaluate_esc(&now.title, &plain, Some(&capture))
         .map(|rule| rule.state);
     let safe_staged_composer = staged_composer_state_is_safe(fresh_state);
-    checks.terminal_action_safe = !now.dead
-        && !now.in_mode
-        && safe_staged_composer
-        && fusion::staged_action_ready(
-            inner,
-            session_idx,
-            &now.pane_id,
-            &target.record.attempt_id.to_string(),
-            binding.agent,
-            binding.manifest.as_str(),
-        );
+    let staged_ready = fusion::staged_action_ready(
+        inner,
+        session_idx,
+        &now.pane_id,
+        &target.record.attempt_id.to_string(),
+        binding.agent,
+        binding.manifest.as_str(),
+    );
+    checks.terminal_action_safe = !now.dead && !now.in_mode && safe_staged_composer && staged_ready;
 
     // Composer extraction proves the terminal layout independently from
     // equality. An operator asking for a diff needs the actual mismatch,

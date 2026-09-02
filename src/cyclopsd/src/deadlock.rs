@@ -109,6 +109,10 @@ impl ProcessSnapshot {
     }
 }
 
+pub(crate) fn pane_runs_watch(pane_pid: i32) -> bool {
+    ProcessSnapshot::read().is_some_and(|ps| ps.pane_runs_watch(pane_pid))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -417,7 +417,14 @@ and there is no tab to keep open. It logs to `$CYCLOPS_HOME/cyclopsd.log`.
 ```bash
 cyclops daemon status   # ● cyclopsd is running · up 4m · pid 51230 · watching main
 cyclops daemon log      # what it has written
-cyclops daemon stop     # your tmux panes and the record are untouched
+cyclops stop            # stop Cyclops; your tmux panes and messages remain
+```
+
+If an earlier session left queued wake notifications for an agent, quiet those
+wakes without deleting its durable inbox entries:
+
+```bash
+cyclops clear gemmy
 ```
 
 There is no `daemon start`: `cyclops start` is that, and so is bare
@@ -717,8 +724,8 @@ wiring outside install and update.
 ## Uninstall
 
 The installer stops the validated selected daemon, removes the complete current
-Cyclops state home, the binaries, the validated managed pair store, and its
-PATH block. Pair-store removal holds the update lease
+Cyclops state home, the binaries, the validated managed pair store, its
+Cyclops hook entries, unedited seeded skills, and its PATH block. Pair-store removal holds the update lease
 and refuses unknown, linked, or ownership-changing entries instead of deleting
 an unproven tree. Both public names are removed only from one prefix, selected
 by `--prefix` or by the `cyclops` command on `PATH`. It never resolves a
@@ -741,14 +748,7 @@ Export first if you might need the history.
 
 `cyclops remove --all` remains available when you want its explicit preview
 and confirmation without removing the installed binary pair. The installer
-does not rewrite agent-owned hook configuration or skill files. To remove
-Cyclops command hooks from installed vendor configuration, check
-`~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.agents/hooks.json`, and
-`~/.cursor/hooks.json` where those files exist. Delete entries whose command
-invokes a `cyclops` binary followed by `hook <Event>`, while preserving every
-unrelated key, hook, and setting. Removing the binaries before these entries
-leaves the vendor CLI reporting hook exit code 127.
-
-Skill files in agent-owned directories, including a Cyclops-seeded copy, are
-not part of either `cyclops remove --all` or the managed installer uninstall.
-Remove one only after checking whether it is an operator customization.
+removes only exact Cyclops hook commands from vendor configuration and only
+byte-for-byte known Cyclops skill seeds. It preserves unrelated settings,
+handlers, and edited skills. If it cannot safely prove a vendor file or skill,
+it leaves that file untouched and stops before removing state or binaries.

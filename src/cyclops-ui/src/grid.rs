@@ -271,7 +271,13 @@ fn mailbox_receipt_badge(
     if let Some(ahead) = receipt.position.filter(|ahead| *ahead > 0) {
         words.push_str(&format!(" {sep} {ahead} ahead"));
     }
-    let wake = if let Some(cause) = receipt.pre_write_cause {
+    let wake = if receipt.held_by.as_deref() == Some("held_for_existing_draft")
+        || receipt.held_by.as_deref() == Some("composer_hold")
+        || receipt.pre_write_cause
+            == Some(cyclops_proto::NotificationPreWriteCause::HeldForExistingDraft)
+    {
+        "held_for_existing_draft".into()
+    } else if let Some(cause) = receipt.pre_write_cause {
         format!("blocked before write ({})", cause.label())
     } else if let Some(block) = receipt.wake_block {
         format!("blocked ({})", block.label())
@@ -286,10 +292,19 @@ fn mailbox_receipt_badge(
             None => match notification {
                 MessageNotificationState::NotStarted => "not started".into(),
                 MessageNotificationState::Queued => "queued".into(),
-                MessageNotificationState::Gating => "checking readiness".into(),
+                MessageNotificationState::Gating => {
+                    if receipt.held_by.as_deref() == Some("held_for_existing_draft")
+                        || receipt.held_by.as_deref() == Some("composer_hold")
+                    {
+                        "held_for_existing_draft".into()
+                    } else {
+                        "checking readiness".into()
+                    }
+                }
                 MessageNotificationState::Writing => "writing".into(),
                 MessageNotificationState::Staged => "staged".into(),
                 MessageNotificationState::Submitted => "submitted".into(),
+                MessageNotificationState::SubmittedUnverified => "submitted_unverified".into(),
                 MessageNotificationState::Notified => "notified".into(),
                 MessageNotificationState::AttentionRequired => "needs attention".into(),
                 MessageNotificationState::Superseded => "superseded".into(),
@@ -304,6 +319,7 @@ fn mailbox_receipt_badge(
 /// tokens degrade safely instead of exposing a vendor rule id.
 fn held_words(token: &str) -> &'static str {
     match token {
+        "held_for_existing_draft" | "composer_hold" => "composer has input",
         "working" => "recipient working",
         "idle_with_input" => "composer has input",
         "pane_in_mode" => "pane in copy mode",

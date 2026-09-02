@@ -3407,6 +3407,7 @@ fn recover_failed_job(
             NotificationState::BlockedPreWrite
             | NotificationState::QuotaHeld
             | NotificationState::QuotaResetObserved
+            | NotificationState::SubmittedUnverified
             | NotificationState::AttentionRequired
             | NotificationState::Withdrawn
             | NotificationState::WithdrawnAfterStaging
@@ -3528,6 +3529,7 @@ async fn persist_notification_prewrite_block(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegateAction {
     ImmediateReproof,
+    Hold,
     BlockPreWrite,
 }
 
@@ -3553,14 +3555,23 @@ impl RegateCause {
 fn regate_action(handle: &DeliveryHandle, cause: RegateCause) -> RegateAction {
     let mut state = handle.state.lock().expect("handle state lock");
     state.regates = state.regates.saturating_add(1);
-    let Some(slot) = cause.reproof_slot() else {
-        return RegateAction::BlockPreWrite;
-    };
-    if state.regate_reproof_used[slot] {
-        RegateAction::BlockPreWrite
-    } else {
-        state.regate_reproof_used[slot] = true;
-        RegateAction::ImmediateReproof
+    match cause {
+        RegateCause::BarrierHeld => {
+            if handle.notification.is_some() {
+                RegateAction::Hold
+            } else {
+                RegateAction::BlockPreWrite
+            }
+        }
+        RegateCause::BindingChanged | RegateCause::CapabilityChanged => {
+            let slot = cause.reproof_slot().expect("reproof slot");
+            if state.regate_reproof_used[slot] {
+                RegateAction::BlockPreWrite
+            } else {
+                state.regate_reproof_used[slot] = true;
+                RegateAction::ImmediateReproof
+            }
+        }
     }
 }
 
@@ -3844,6 +3855,9 @@ async fn process(inner: &Arc<Inner>, worker: &Arc<Worker>, handle: &Arc<Delivery
                             }
                             match action {
                                 RegateAction::ImmediateReproof => {}
+                                RegateAction::Hold => {
+                                    regate_hold = Some(failure.cause.clone());
+                                }
                                 RegateAction::BlockPreWrite => {
                                     if handle.notification.is_some() {
                                         persist_notification_prewrite_block(
@@ -4328,8 +4342,9 @@ async fn attempt_delivery(
             handle.set_working_clean_submit_admitted(
                 handle.notification.is_some()
                     && det.state == AgentState::Working
-                    && det.write_ready
-                    && det.screen_proves_write_safe_composer(),
+                    && (det.write_ready
+                        || det.screen_proves_write_safe_composer()
+                        || unproven_composer_is_still_eligible),
             );
         }
         None => {
@@ -4561,6 +4576,7 @@ async fn attempt_delivery(
             );
         }
     };
+    let mut staging_verified = !payload_at_proof.is_empty();
     if let Some(notification) = &handle.notification {
         if let Err(error) = notification.record_staged() {
             error!(id = %handle.msg_id, error = %error, "notification staged fact failed");
@@ -4597,31 +4613,45 @@ async fn attempt_delivery(
     // renderer's next complete frame. Reuse the bounded post-paste evidence
     // schedule so that transient incomplete frames do not turn a clean,
     // owned doorbell into a false verify failure.
-    let recheck = match recheck_exact_staging_snapshot(
-        &injector,
-        &handle.pane_id,
-        manifest,
-        target,
-        &selected.bytes,
-        id_staged,
-        &payload_at_proof,
-    )
-    .await
-    {
-        Ok(now) => now,
-        Err(ExactStagingRecheck::Unobservable) => {
-            // Nobody looked, so nobody may press Enter.
-            unregister_ack(inner, handle);
-            gate_line(inner, handle, "rebound", None, Some("recheck_unobservable"));
-            return AttemptOutcome::Failed(AttemptFailure::verify_timeout());
+    let recheck = if staging_verified {
+        match recheck_exact_staging_snapshot(
+            &injector,
+            &handle.pane_id,
+            manifest,
+            target,
+            &selected.bytes,
+            id_staged,
+            &payload_at_proof,
+        )
+        .await
+        {
+            Ok(now) => now,
+            Err(ExactStagingRecheck::Mismatch) => {
+                unregister_ack(inner, handle);
+                gate_line(inner, handle, "rebound", None, Some("staging_changed"));
+                return AttemptOutcome::Failed(AttemptFailure::verify_mismatch(
+                    ComposerState::ComposerAmbiguous,
+                ));
+            }
+            Err(ExactStagingRecheck::Unobservable) if handle.notification.is_some() => {
+                staging_verified = false;
+                injector
+                    .capture_joined_escaped(&handle.pane_id)
+                    .await
+                    .unwrap_or_default()
+            }
+            Err(ExactStagingRecheck::Unobservable) => {
+                // Nobody looked, so nobody may press Enter.
+                unregister_ack(inner, handle);
+                gate_line(inner, handle, "rebound", None, Some("recheck_unobservable"));
+                return AttemptOutcome::Failed(AttemptFailure::verify_timeout());
+            }
         }
-        Err(ExactStagingRecheck::Mismatch) => {
-            unregister_ack(inner, handle);
-            gate_line(inner, handle, "rebound", None, Some("staging_changed"));
-            return AttemptOutcome::Failed(AttemptFailure::verify_mismatch(
-                ComposerState::ComposerAmbiguous,
-            ));
-        }
+    } else {
+        injector
+            .capture_joined_escaped(&handle.pane_id)
+            .await
+            .unwrap_or_default()
     };
     // The capture above took time, so the occupant is checked once more
     // after it. Otherwise the last thing proven about who owns the pane is
@@ -4631,12 +4661,14 @@ async fn attempt_delivery(
         gate_line(inner, handle, "rebound", None, Some(&detail));
         return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
     }
-    if let Err(detail) =
-        notification_staged_action_safe(inner, handle, manifest, &recheck, &proven, true)
-    {
-        unregister_ack(inner, handle);
-        gate_line(inner, handle, "rebound", None, Some(&detail));
-        return AttemptOutcome::Failed(AttemptFailure::verify_failed());
+    if staging_verified {
+        if let Err(detail) =
+            notification_staged_action_safe(inner, handle, manifest, &recheck, &proven, true)
+        {
+            unregister_ack(inner, handle);
+            gate_line(inner, handle, "rebound", None, Some(&detail));
+            return AttemptOutcome::Failed(AttemptFailure::verify_failed());
+        }
     }
     let notification_submit_reserved = if let Some(notification) = &handle.notification {
         match notification.reserve_submit() {
@@ -4668,7 +4700,7 @@ async fn attempt_delivery(
     // content and process replacement window. Re-capture the composer and
     // re-prove the complete binding after that append. `Submitting` reserves
     // one key attempt; it never authorizes changed or unobservable bytes.
-    if notification_submit_reserved {
+    if notification_submit_reserved && staging_verified {
         inject_pause(inner, "post_submit_reservation").await;
         match recheck_exact_staging_snapshot(
             &injector,
@@ -4706,6 +4738,9 @@ async fn attempt_delivery(
                 return AttemptOutcome::Failed(AttemptFailure::verify_mismatch(
                     ComposerState::ComposerAmbiguous,
                 ));
+            }
+            Err(ExactStagingRecheck::Unobservable) if handle.notification.is_some() => {
+                staging_verified = false;
             }
             Err(ExactStagingRecheck::Unobservable) => {
                 gate_line(
@@ -4770,7 +4805,12 @@ async fn attempt_delivery(
         return AttemptOutcome::Failed(AttemptFailure::submit_failed());
     }
     if let Some(notification) = &handle.notification {
-        match notification.record_submitted() {
+        let record_res = if staging_verified {
+            notification.record_submitted()
+        } else {
+            notification.record_submitted_unverified()
+        };
+        match record_res {
             Ok(_) => {}
             Err(error) => {
                 error!(id = %handle.msg_id, error = %error, "notification submitted fact failed");
@@ -4788,6 +4828,11 @@ async fn attempt_delivery(
         &[DeliveryState::Staged],
         Step::to(DeliveryState::Submitted),
     ) {
+        return AttemptOutcome::Done;
+    }
+    if !staging_verified {
+        // One-time doorbell submitted unverified.
+        // Enter was sent once, state is SubmittedUnverified, never duplicate Enter. Done.
         return AttemptOutcome::Done;
     }
     // Take any accepted early receipt before claim settlement can return.
@@ -5580,9 +5625,24 @@ fn binding_unprovable_observation(
 /// authenticated agent that is visibly idle or working. A positive human-input
 /// reading is still a hard boundary: Cyclops must never type over it.
 fn unproven_composer_is_eligible(detection: &Detection) -> bool {
-    matches!(detection.state, AgentState::Idle | AgentState::Working)
-        && detection.composer_semantic != Some(ComposerSemantic::HumanInput)
-        && detection.write_block.as_deref() != Some("composer_hold")
+    if !matches!(detection.state, AgentState::Idle | AgentState::Working)
+        || detection.composer_semantic == Some(ComposerSemantic::HumanInput)
+    {
+        return false;
+    }
+    if detection.state == AgentState::Idle
+        && detection.composer_semantic == Some(ComposerSemantic::Ambiguous)
+    {
+        return false;
+    }
+    !matches!(
+        detection.write_block.as_deref(),
+        Some("composer_hold")
+            | Some(HOOK_ADMISSION_UNPROVEN)
+            | Some(OBSERVATION_HOLD)
+            | Some(WRITE_READINESS_OBSERVATION_HOLD)
+            | Some("pane_in_mode")
+    )
 }
 
 /// Return the current foreground agent process for the explicit liveness
@@ -5599,11 +5659,30 @@ fn notification_pane_for_unproven_composer(
     if !unproven_composer_is_eligible(detection) {
         return None;
     }
+    if crate::deadlock::pane_runs_watch(row.pane_pid) {
+        return None;
+    }
+    if let Some(manifest) = inner.manifests.get(manifest_id) {
+        if composer_semantic_missing(manifest, detection) {
+            return None;
+        }
+    }
     let binding = fusion::admitted_binding(inner, handle.session_idx, row)?;
     if binding.manifest != manifest_id {
         return None;
     }
     fusion::foreground_pid_checked(row.pane_pid)
+}
+
+fn composer_semantic_missing(manifest: &Manifest, detection: &Detection) -> bool {
+    detection
+        .readings
+        .iter()
+        .find(|reading| {
+            reading.sensor == cyclops_proto::Sensor::Screen && reading.state == AgentState::Idle
+        })
+        .and_then(|reading| manifest.rules.iter().find(|rule| rule.id == reading.rule))
+        .is_some_and(|rule| rule.composer_semantic.is_none())
 }
 
 fn composer_semantic_observation(
@@ -6162,17 +6241,7 @@ async fn gate(
                                 cause: "no_such_pane".to_string(),
                             };
                         };
-                        if handle.notification.is_some()
-                            && det.composer_semantic == Some(ComposerSemantic::HumanInput)
-                        {
-                            // A visible human draft is the one notification
-                            // boundary that must wait. Keep this exact
-                            // attempt in Gating and wake only on the pane's
-                            // next evidence edge, so Backspace can release
-                            // it without an operator requeue or a second
-                            // message.
-                            break 'pane Some("composer_hold".to_string());
-                        }
+
                         if handle.notification.is_some() {
                             if let Some(pane_pid) = notification_pane_for_unproven_composer(
                                 inner,
@@ -6181,13 +6250,7 @@ async fn gate(
                                 &manifest_id,
                                 &det,
                             ) {
-                                gate_line(
-                                    inner,
-                                    handle,
-                                    "proceed",
-                                    Some(&det.decided_by),
-                                    Some("composer_unproven"),
-                                );
+                                gate_line(inner, handle, "proceed", Some(&det.decided_by), None);
                                 return GateOutcome::Proceed {
                                     manifest_id,
                                     pane_pid,
@@ -6195,11 +6258,6 @@ async fn gate(
                                 };
                             }
                         }
-                        // Unproven hook admission is a durable block, not a
-                        // hold: no pane event clears it, only an admitting
-                        // edge from this boot, a claim, or a withdrawal. The
-                        // pane fuses to unknown under it, so this is decided
-                        // before the state match parks it on an event.
                         if handle.notification.is_some()
                             && det.write_block.as_deref() == Some(HOOK_ADMISSION_UNPROVEN)
                         {
@@ -6216,8 +6274,6 @@ async fn gate(
                                     )),
                                 };
                             };
-                            // No width fields: a width pair is a different
-                            // block, and a lone width is refused as partial.
                             observation.write_block = Some(HOOK_ADMISSION_UNPROVEN.to_string());
                             return GateOutcome::BlockedPreWrite {
                                 cause: NotificationPreWriteCause::WriteReadinessChanged,
@@ -6251,7 +6307,13 @@ async fn gate(
                                         // exited, and ending the delivery
                                         // there would summon a human for a
                                         // table that was about to catch up.
-                                        match fusion::foreground_pid_checked(row.pane_pid) {
+                                        let admitted = fusion::admitted_binding(
+                                            inner,
+                                            handle.session_idx,
+                                            &row,
+                                        )
+                                        .filter(|b| b.manifest == manifest_id);
+                                        match admitted {
                                             None if handle.notification.is_some()
                                                 && last_hold.as_deref()
                                                     == Some(OBSERVATION_HOLD) =>
@@ -6270,19 +6332,24 @@ async fn gate(
                                                 };
                                             }
                                             None => Some(OBSERVATION_HOLD.to_string()),
-                                            Some(pane_pid) => {
-                                                gate_line(
-                                                    inner,
-                                                    handle,
-                                                    "proceed",
-                                                    Some(&det.decided_by),
-                                                    None,
-                                                );
-                                                return GateOutcome::Proceed {
-                                                    manifest_id,
-                                                    pane_pid,
-                                                    regate_evidence_changed,
-                                                };
+                                            Some(_) => {
+                                                match fusion::foreground_pid_checked(row.pane_pid) {
+                                                    None => Some(OBSERVATION_HOLD.to_string()),
+                                                    Some(pane_pid) => {
+                                                        gate_line(
+                                                            inner,
+                                                            handle,
+                                                            "proceed",
+                                                            Some(&det.decided_by),
+                                                            None,
+                                                        );
+                                                        return GateOutcome::Proceed {
+                                                            manifest_id,
+                                                            pane_pid,
+                                                            regate_evidence_changed,
+                                                        };
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -6329,6 +6396,34 @@ async fn gate(
                                     // unmeasured — cannot escalate.
                                     (false, Some("no_write_safe_composer_evidence"))
                                         if handle.notification.is_some()
+                                            && composer_semantic_missing(manifest, &det) =>
+                                    {
+                                        let Some(observation) = composer_semantic_observation(
+                                            inner,
+                                            handle,
+                                            &row,
+                                            &manifest_id,
+                                        ) else {
+                                            return GateOutcome::BlockedPreWrite {
+                                                cause: NotificationPreWriteCause::BindingUnprovable,
+                                                observation: Box::new(
+                                                    binding_unprovable_observation(
+                                                        inner,
+                                                        handle,
+                                                        row.pane_pid,
+                                                        &manifest_id,
+                                                    ),
+                                                ),
+                                            };
+                                        };
+                                        return GateOutcome::BlockedPreWrite {
+                                            cause:
+                                                NotificationPreWriteCause::ComposerSemanticMissing,
+                                            observation: Box::new(observation),
+                                        };
+                                    }
+                                    (false, Some("no_write_safe_composer_evidence"))
+                                        if handle.notification.is_some()
                                             && det.composer_semantic
                                                 == Some(ComposerSemantic::Ambiguous) =>
                                     {
@@ -6358,12 +6453,6 @@ async fn gate(
                                                     ),
                                                 };
                                             };
-                                            // Keep the durable detail in the
-                                            // existing optional observation
-                                            // field. Adding a new persisted
-                                            // enum spelling would make an
-                                            // older journal reader reject a
-                                            // record it otherwise understands.
                                             observation.write_block =
                                                 Some("composer_semantic_ambiguous".to_string());
                                             return GateOutcome::BlockedPreWrite {
@@ -6482,13 +6571,48 @@ async fn gate(
                             AgentState::Working => {
                                 // Runtime state is not permission to write,
                                 // but it is not an automatic refusal either.
-                                // A visibly working pane may expose an
-                                // independent, positive composer proof (for
-                                // example a clean queue prompt); only that
-                                // stamped readiness can admit the doorbell.
-                                // A hook/title-only working hint, or missing
-                                // and ambiguous proof, remains fail-closed.
-                                if !det.write_ready {
+                                // Under the direct pane interruption contract:
+                                // For notification doorbells, working state is an observation,
+                                // not a delivery blocker. Only a proven non-Cyclops draft holds it.
+                                if handle.notification.is_some() {
+                                    if det.write_block.as_deref() == Some("composer_hold") {
+                                        Some("composer_hold".to_string())
+                                    } else {
+                                        match fusion::foreground_pid_checked(row.pane_pid) {
+                                            None if last_hold.as_deref()
+                                                == Some(OBSERVATION_HOLD) =>
+                                            {
+                                                return GateOutcome::BlockedPreWrite {
+                                                    cause:
+                                                        NotificationPreWriteCause::BindingUnprovable,
+                                                    observation: Box::new(
+                                                        binding_unprovable_observation(
+                                                            inner,
+                                                            handle,
+                                                            row.pane_pid,
+                                                            &manifest_id,
+                                                        ),
+                                                    ),
+                                                };
+                                            }
+                                            None => Some(OBSERVATION_HOLD.to_string()),
+                                            Some(pane_pid) => {
+                                                gate_line(
+                                                    inner,
+                                                    handle,
+                                                    "proceed",
+                                                    Some(&det.decided_by),
+                                                    None,
+                                                );
+                                                return GateOutcome::Proceed {
+                                                    manifest_id,
+                                                    pane_pid,
+                                                    regate_evidence_changed,
+                                                };
+                                            }
+                                        }
+                                    }
+                                } else if !det.write_ready {
                                     Some(
                                         det.write_block
                                             .clone()
@@ -6496,21 +6620,6 @@ async fn gate(
                                     )
                                 } else {
                                     match fusion::foreground_pid_checked(row.pane_pid) {
-                                        None if handle.notification.is_some()
-                                            && last_hold.as_deref() == Some(OBSERVATION_HOLD) =>
-                                        {
-                                            return GateOutcome::BlockedPreWrite {
-                                                cause: NotificationPreWriteCause::BindingUnprovable,
-                                                observation: Box::new(
-                                                    binding_unprovable_observation(
-                                                        inner,
-                                                        handle,
-                                                        row.pane_pid,
-                                                        &manifest_id,
-                                                    ),
-                                                ),
-                                            };
-                                        }
                                         None => Some(OBSERVATION_HOLD.to_string()),
                                         Some(pane_pid) => {
                                             gate_line(
@@ -6535,7 +6644,27 @@ async fn gate(
                             // for a turn that may never occur (for example a
                             // local slash command).
                             AgentState::IdleWithInput if handle.notification.is_some() => {
-                                Some("idle_with_input".to_string())
+                                let Some(mut observation) = composer_semantic_observation(
+                                    inner,
+                                    handle,
+                                    &row,
+                                    &manifest_id,
+                                ) else {
+                                    return GateOutcome::BlockedPreWrite {
+                                        cause: NotificationPreWriteCause::BindingUnprovable,
+                                        observation: Box::new(binding_unprovable_observation(
+                                            inner,
+                                            handle,
+                                            row.pane_pid,
+                                            &manifest_id,
+                                        )),
+                                    };
+                                };
+                                observation.write_block = Some("composer_hold".to_string());
+                                return GateOutcome::BlockedPreWrite {
+                                    cause: NotificationPreWriteCause::WriteReadinessChanged,
+                                    observation: Box::new(observation),
+                                };
                             }
                             AgentState::IdleWithInput => Some("idle_with_input".to_string()),
                             AgentState::Unknown => Some("unknown".to_string()),
@@ -6586,6 +6715,8 @@ async fn gate(
                 Some(Instant::now() + OBSERVATION_RETRY)
             } else if cause == AMBIGUOUS_COMPOSER_HOLD {
                 ambiguous_since.map(|since| since + ambiguous_settle)
+            } else if cause == "barrier_held" {
+                Some(Instant::now() + Duration::from_millis(50))
             } else {
                 None
             };
@@ -6641,6 +6772,7 @@ fn normalize_hold_cause(cause: &str) -> &'static str {
         "pane_in_mode" => "pane_in_mode",
         "working" => "working",
         "idle_with_input" => "idle_with_input",
+        "held_for_existing_draft" => "held_for_existing_draft",
         "blocked_quota" => "blocked_quota",
         "unknown" => "unknown",
         c if c.split(':').next() == Some("blocked") => "blocked",
@@ -6988,6 +7120,12 @@ pub(crate) fn settle_notification_claim(
             DeliveryState::DeliveredVerified | DeliveryState::DeliveredUnverified
         )
     {
+        fusion::clear_hold_owner(
+            inner,
+            handle.session_idx,
+            &handle.pane_id,
+            &handle.barrier_owner(),
+        );
         handle.ack.notify_one();
         return true;
     }
@@ -7333,6 +7471,17 @@ async fn inject<I: Injector>(
             }
             Err(e) => debug!(error = %e, "verify capture failed"),
         }
+    }
+    if handle.notification.is_some() {
+        let capture = injector
+            .capture_joined_escaped(&handle.pane_id)
+            .await
+            .unwrap_or_default();
+        return Ok((
+            bottom_window(&strip_csi(&capture), COMPOSER_WINDOW),
+            false,
+            String::new(),
+        ));
     }
     Err(InjectFailure::Other("verify_failed".to_string()))
 }
@@ -13946,10 +14095,10 @@ line_regex_esc = ['^❯$']
             },
         )
         .await;
-        assert_eq!(
-            result,
-            Err(InjectFailure::Other("verify_failed".to_string()))
-        );
+        let (capture, verified, _) =
+            result.expect("unverified staging succeeds for one unverified submit");
+        assert!(!verified);
+        assert_eq!(capture, "transcript\n❯\n? for shortcuts");
         assert_eq!(injector.pasted.lock().unwrap().len(), 1);
 
         context

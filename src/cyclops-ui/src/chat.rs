@@ -577,6 +577,7 @@ pub fn proven_status_label(mailbox: MailboxWord, wake: WakeWord) -> &'static str
         (_, WakeWord::Writing) => "Wake writing",
         (_, WakeWord::Staged) => "Wake staged",
         (_, WakeWord::Submitted) => "Wake submit sent",
+        (_, WakeWord::SubmittedUnverified) => "Wake submit sent (unverified)",
         (_, WakeWord::Notified) => "Wake notified",
         (_, WakeWord::ResolvedSubmitted) => "Wake submitted",
         (_, WakeWord::ResolvedDiscarded) => "Wake discarded",
@@ -602,7 +603,13 @@ pub fn proven_status_short(mailbox: MailboxWord, wake: WakeWord) -> &'static str
         (_, WakeWord::Queued | WakeWord::Gating | WakeWord::Writing | WakeWord::Staged) => {
             ".wake-pend"
         }
-        (_, WakeWord::Submitted | WakeWord::Notified | WakeWord::ResolvedSubmitted) => "^wake-sent",
+        (
+            _,
+            WakeWord::Submitted
+            | WakeWord::SubmittedUnverified
+            | WakeWord::Notified
+            | WakeWord::ResolvedSubmitted,
+        ) => "^wake-sent",
         (MailboxWord::Pending, WakeWord::NotStarted) => "*acc-nostart",
         (MailboxWord::DeliveredDirect, _) => "=dir",
         (MailboxWord::Superseded, _) => "-sprsd",

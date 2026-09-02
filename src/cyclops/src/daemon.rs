@@ -693,7 +693,7 @@ pub fn stop() -> Result<u32, String> {
             Err(AuthenticationError::Predates) => return Err(GENERATION_REQUIRED.to_string()),
             Err(AuthenticationError::Failed(error)) => return Err(error),
         },
-        Err(ClientError::NotRunning(_)) => return Err("cyclopsd is not running.".to_string()),
+        Err(ClientError::NotRunning(_)) => return stop_selected_orphan(),
         Err(e) => return Err(crate::copy::client_error(&e, None)),
     };
     if !generation_matches(running.process, observe_process(running.process.pid())) {
@@ -729,6 +729,152 @@ pub fn stop() -> Result<u32, String> {
     drop(running);
     wait_for_authenticated_exit(process, &boot_id)?;
     Ok(pid)
+}
+
+/// Stop one selected daemon that lost its socket before it could acknowledge
+/// shutdown. This is deliberately narrower than a process-name kill: it
+/// considers only the current user's process whose kernel executable resolves
+/// to the daemon paired with this client. A different installation is left
+/// alone, and an ambiguous pair is refused.
+fn stop_selected_orphan() -> Result<u32, String> {
+    let expected = binary()
+        .and_then(|path| std::fs::canonicalize(path).ok())
+        .ok_or_else(|| "cyclopsd is not running.".to_string())?;
+    let candidates = selected_orphan_processes(&expected)?;
+    let [process] = candidates.as_slice() else {
+        return match candidates.len() {
+            0 => Err("cyclopsd is not running.".to_string()),
+            count => Err(format!(
+                "found {count} detached selected cyclopsd processes; refusing to guess which one to stop"
+            )),
+        };
+    };
+    // SAFETY: `process` was read immediately above from the kernel, belongs to
+    // this user, and its executable was proven to be the selected pair.
+    if unsafe { libc::kill(process.pid(), libc::SIGTERM) } != 0 {
+        return Err(format!(
+            "signal detached cyclopsd pid {}: {}",
+            process.pid(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    wait_for_process_exit(*process)?;
+    Ok(process.pid() as u32)
+}
+
+fn selected_orphan_processes(expected: &Path) -> Result<Vec<ProcessInstanceId>, String> {
+    let ps = [Path::new("/bin/ps"), Path::new("/usr/bin/ps")]
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| "cannot inspect detached cyclopsd: no fixed ps executable".to_string())?;
+    let output = Command::new(ps)
+        .args(["-Ao", "pid=,uid=,comm="])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("inspect detached cyclopsd: start ps: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "inspect detached cyclopsd: ps exited with {}",
+            output.status
+        ));
+    }
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "inspect detached cyclopsd: ps output is not UTF-8".to_string())?;
+    // SAFETY: geteuid reads process credentials and has no pointer arguments.
+    let uid = unsafe { libc::geteuid() };
+    Ok(selected_orphan_processes_from_rows(
+        text,
+        uid,
+        expected,
+        observe_process,
+        process_executable,
+    ))
+}
+
+/// Filter a `ps` snapshot down to only live instances of the daemon paired
+/// with this client. Keeping the filter pure makes the destructive fallback
+/// testable without ever signalling a process in a regression test.
+fn selected_orphan_processes_from_rows(
+    text: &str,
+    uid: libc::uid_t,
+    expected: &Path,
+    observe: impl Fn(i32) -> Option<ProcessInstanceId>,
+    executable: impl Fn(i32) -> Option<PathBuf>,
+) -> Vec<ProcessInstanceId> {
+    let mut selected = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(pid), Some(row_uid), Some(command)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let (Ok(pid), Ok(row_uid)) = (pid.parse::<i32>(), row_uid.parse::<libc::uid_t>()) else {
+            continue;
+        };
+        if row_uid != uid
+            || Path::new(command)
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                != Some("cyclopsd")
+        {
+            continue;
+        }
+        let Some(process) = observe(pid) else {
+            continue;
+        };
+        if executable(pid).as_deref() == Some(expected) {
+            selected.push(process);
+        }
+    }
+    selected
+}
+
+#[cfg(target_os = "macos")]
+fn process_executable(pid: i32) -> Option<PathBuf> {
+    let mut bytes = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let written = unsafe {
+        libc::proc_pidpath(
+            pid,
+            bytes.as_mut_ptr().cast(),
+            libc::PROC_PIDPATHINFO_MAXSIZE as u32,
+        )
+    };
+    if written <= 0 {
+        return None;
+    }
+    let path = std::ffi::CStr::from_bytes_until_nul(&bytes)
+        .ok()?
+        .to_str()
+        .ok()?;
+    std::fs::canonicalize(path).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn process_executable(pid: i32) -> Option<PathBuf> {
+    std::fs::canonicalize(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_executable(_pid: i32) -> Option<PathBuf> {
+    None
+}
+
+fn wait_for_process_exit(process: ProcessInstanceId) -> Result<(), String> {
+    let deadline = Instant::now() + STOP_WAIT;
+    loop {
+        if observe_process(process.pid()) != Some(process) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "detached cyclopsd pid {} did not exit within {}s",
+                process.pid(),
+                STOP_WAIT.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -838,6 +984,31 @@ mod tests {
         assert!(generation_matches(expected, Some(expected)));
         assert!(!generation_matches(expected, Some(reused)));
         assert!(!generation_matches(expected, None));
+    }
+
+    #[test]
+    fn orphan_stop_only_accepts_the_exact_selected_daemon() {
+        let selected = Path::new("/opt/cyclops/pairs/current/cyclopsd");
+        let rows = "101 501 /opt/cyclops/pairs/current/cyclopsd\n\
+                    102 501 /opt/cyclops/pairs/older/cyclopsd\n\
+                    103 502 /opt/cyclops/pairs/current/cyclopsd\n\
+                    104 501 /usr/bin/not-cyclopsd\n";
+        let expected_process = ProcessInstanceId::new(101, 99).unwrap();
+
+        let found = selected_orphan_processes_from_rows(
+            rows,
+            501,
+            selected,
+            |pid| (pid == 101).then_some(expected_process),
+            |pid| match pid {
+                101 => Some(selected.to_path_buf()),
+                102 => Some(PathBuf::from("/opt/cyclops/pairs/older/cyclopsd")),
+                103 => Some(selected.to_path_buf()),
+                _ => None,
+            },
+        );
+
+        assert_eq!(found, vec![expected_process]);
     }
 
     #[test]

@@ -192,11 +192,15 @@ impl RecoveryCoordinator {
         }
 
         if same_composer_occupant(expected, live) {
-            if matches!(
+            let submitted_claimed = (record.state == cyclops_proto::NotificationState::Submitted
+                || record.state == cyclops_proto::NotificationState::SubmittedUnverified)
+                && legacy_claimed_clean;
+            if (matches!(
                 record.state,
                 cyclops_proto::NotificationState::Notified
                     | cyclops_proto::NotificationState::WithdrawnAfterStaging
-            ) && clean_composer
+            ) || submitted_claimed)
+                && clean_composer
             {
                 self.retiring.insert(record.attempt_id);
                 return Some(RecoveryAction::Retire {
@@ -321,12 +325,16 @@ pub(crate) fn clean_composer(det: &Detection, in_mode: bool) -> bool {
     !in_mode
         && !det.stale
         && !det.disagreement
-        && det.state == AgentState::Idle
-        && det.screen_proves_write_safe_composer()
-        && det
-            .readings
-            .iter()
-            .all(|reading| reading.state == AgentState::Idle)
+        && if det.state == AgentState::Working {
+            true
+        } else {
+            det.state == AgentState::Idle
+                && det.screen_proves_write_safe_composer()
+                && det
+                    .readings
+                    .iter()
+                    .all(|reading| reading.state == AgentState::Idle)
+        }
 }
 
 /// Bind clean-screen evidence to the manifest that authenticated the occupant.

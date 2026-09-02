@@ -361,6 +361,7 @@ fn wake_word(n: &cyclops_proto::MessageNotificationSummary) -> WakeWord {
         MessageNotificationState::Writing => WakeWord::Writing,
         MessageNotificationState::Staged => WakeWord::Staged,
         MessageNotificationState::Submitted => WakeWord::Submitted,
+        MessageNotificationState::SubmittedUnverified => WakeWord::SubmittedUnverified,
         MessageNotificationState::Notified => WakeWord::Notified,
         MessageNotificationState::AttentionRequired => {
             if (n.resolution_intent.is_some()

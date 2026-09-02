@@ -774,6 +774,10 @@ fn inspect_binaries_from(path: Option<&OsStr>, selected_client: PathBuf) -> Bina
         }
     }
 
+    // PATH may legitimately contain the same directory more than once. Keep
+    // the first observation so health reports candidates, not repetitions.
+    deduplicate_resolutions(&mut resolutions);
+
     let mut distinct_clients = Vec::<PathBuf>::new();
     let mut distinct_daemons = Vec::<PathBuf>::new();
     for entry in resolutions.iter().filter(|entry| entry.executable) {
@@ -797,7 +801,14 @@ fn inspect_binaries_from(path: Option<&OsStr>, selected_client: PathBuf) -> Bina
     let selected_daemon_resolved = std::fs::canonicalize(&selected_daemon).ok();
     let (selected_daemon_version, selected_daemon_build, selected_daemon_build_error) =
         if selected_daemon_ready {
-            match crate::update::candidate_identity(&selected_daemon, "cyclopsd") {
+            // A managed installation deliberately exposes a public symlink
+            // into its selected pair. Identity belongs to the resolved binary;
+            // rejecting that symlink makes every healthy paired install look
+            // unproven.
+            match crate::update::candidate_identity(
+                identity_path(&selected_daemon, selected_daemon_resolved.as_deref()),
+                "cyclopsd",
+            ) {
                 Ok(identity) => (Some(identity.version), identity.build, None),
                 Err(error) => (None, None, Some(error)),
             }
@@ -820,6 +831,22 @@ fn inspect_binaries_from(path: Option<&OsStr>, selected_client: PathBuf) -> Bina
         path_bytes,
         shadowed,
     }
+}
+
+fn identity_path<'a>(public_path: &'a Path, resolved: Option<&'a Path>) -> &'a Path {
+    resolved.unwrap_or(public_path)
+}
+
+fn deduplicate_resolutions(resolutions: &mut Vec<BinaryResolution>) {
+    let mut observed = BTreeSet::new();
+    resolutions.retain(|entry| {
+        observed.insert((
+            entry.name,
+            entry.path.clone(),
+            entry.resolved.clone(),
+            entry.selected,
+        ))
+    });
 }
 
 fn selected_public_prefix(binaries: &BinaryReport) -> Option<PathBuf> {
@@ -1788,8 +1815,9 @@ fn read_asset(root: &Path, relative: &Path) -> AssetRead {
     }
 }
 
-/// Health uses the same private-parent boundary as setup. A skill below a
-/// missing or unsafe consumer parent cannot establish a healthy installation.
+/// Health uses the same operator-controlled-parent boundary as setup. A skill
+/// below a missing or externally writable consumer parent cannot establish a
+/// healthy installation.
 fn read_skill_asset(location: &crate::consumer::AssetLocation) -> AssetRead {
     match crate::skillseed::inspect(location) {
         crate::skillseed::SkillInspection::Missing => AssetRead::Missing,
@@ -2634,7 +2662,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn current_doorbell_bytes_report_doorbell_even_when_skill_management_needs_review() {
+    fn current_doorbell_bytes_in_an_owner_controlled_parent_report_doorbell() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempfile::tempdir().unwrap();
@@ -2648,10 +2676,8 @@ mod tests {
             relative: PathBuf::from("skills/cyclops/SKILL.md"),
         };
 
-        assert_eq!(
-            inspect_skill(read_skill_asset(&location)),
-            ("unproven", false)
-        );
+        let asset = read_skill_asset(&location);
+        assert_eq!(inspect_skill(asset), ("current", true));
         assert!(cyclops_manifest::mailbox_capability::is_current(&skill));
         assert_eq!(mailbox_transport(true, Some(&skill)), Some("doorbell"));
     }
@@ -2714,6 +2740,34 @@ mod tests {
         assert_eq!(kind_word(InspectedKind::Socket), "socket");
         assert_eq!(kind_word(InspectedKind::Symlink), "symlink");
         assert_eq!(kind_word(InspectedKind::Other), "other");
+    }
+
+    #[test]
+    fn selected_daemon_identity_uses_the_pair_target_behind_a_public_link() {
+        let public = Path::new("/prefix/bin/cyclopsd");
+        let pair = Path::new("/prefix/.cyclops-pairs/pairs/pair.a/cyclopsd");
+
+        assert_eq!(identity_path(public, Some(pair)), pair);
+        assert_eq!(identity_path(public, None), public);
+    }
+
+    #[test]
+    fn repeated_path_entries_do_not_repeat_health_binary_lines() {
+        let path = PathBuf::from("/prefix/bin/cyclops");
+        let resolved = PathBuf::from("/prefix/.cyclops-pairs/pairs/pair.a/cyclops");
+        let resolution = BinaryResolution {
+            name: "cyclops",
+            path,
+            resolved: Some(resolved),
+            executable: true,
+            path_index: Some(0),
+            selected: true,
+        };
+        let mut resolutions = vec![resolution.clone(), resolution];
+
+        deduplicate_resolutions(&mut resolutions);
+
+        assert_eq!(resolutions.len(), 1);
     }
 
     #[test]

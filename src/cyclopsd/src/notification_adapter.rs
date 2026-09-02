@@ -298,6 +298,12 @@ impl NotificationContext {
         self.advance(NotificationState::Submitted, None, None)
     }
 
+    pub(crate) fn record_submitted_unverified(
+        &self,
+    ) -> Result<NotificationRecord, NotificationAdapterError> {
+        self.advance(NotificationState::SubmittedUnverified, None, None)
+    }
+
     pub(crate) fn record_notified(&self) -> Result<NotificationRecord, NotificationAdapterError> {
         self.record_terminal(NotificationState::Notified, None)
     }
@@ -334,7 +340,10 @@ impl NotificationContext {
         if current.state == NotificationState::Notified {
             return Ok(claimed);
         }
-        if current.state != NotificationState::Submitted || !claimed {
+        if (current.state != NotificationState::Submitted
+            && current.state != NotificationState::SubmittedUnverified)
+            || !claimed
+        {
             return Ok(false);
         }
         self.advance_locked(&mut store, NotificationState::Notified, None, None)?;

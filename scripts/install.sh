@@ -17,7 +17,9 @@
 # What it will and will not do: it never uses sudo, never touches your
 # tmux config, and never edits a shell profile without printing the exact
 # lines and where the backup went. Binaries go to the selected prefix;
-# state and installed-agent integration stay under your home.
+# state and installed-agent integration stay under your home. `--uninstall`
+# removes Cyclops-owned state, hooks, and unedited seeded skills after
+# stopping its matched daemon; unrelated vendor configuration stays intact.
 #
 # POSIX sh on purpose. It runs before cyclops exists on the machine, so it
 # cannot assume anything more than the system shell.
@@ -94,7 +96,7 @@ usage() {
     say "Options:"
     say "  --prefix DIR   install the binaries in DIR"
     say "  --no-path      do not edit a shell profile"
-    say "  --uninstall    stop the daemon, remove Cyclops state, binaries, and the PATH block"
+    say "  --uninstall    stop Cyclops, remove its state, binaries, hooks, skills, and PATH block"
     say "  --help         show this help"
     exit 0
 }
@@ -239,6 +241,16 @@ do_uninstall() {
     fi
     note "validated $pair_prefix and stopped its daemon if it was running"
 
+    # Vendor configuration belongs to the vendor, not Cyclops. The installed
+    # CLI removes only exact Cyclops hook entries and byte-for-byte known
+    # seeded skills; edited or unsafe files are left in place and make this
+    # uninstall stop before removing state or binaries.
+    if ! "$stopper" update --remove-integrations --prefix "$pair_prefix"; then
+        say "could not safely remove all Cyclops hook or skill entries; state, binaries, and PATH remain installed"
+        exit 1
+    fi
+    note "removed verified Cyclops hook and skill entries; unrelated vendor configuration was preserved"
+
     # `--uninstall` is an explicit request to remove Cyclops. Reuse the CLI's
     # complete-state remover after the exact installed daemon has stopped so
     # it keeps its private-root, lease, plan, and recovery protections. The
@@ -248,7 +260,6 @@ do_uninstall() {
         say "could not preview the current Cyclops state home; binaries and PATH remain installed"
         exit 1
     }
-    printf '%s\n' "$state_preview"
     state_confirmation="$(printf '%s\n' "$state_preview" | awk '
         /^  confirm     cyclops remove --all --confirm / {
             sub(/^  confirm     cyclops remove --all --confirm /, "")
@@ -261,6 +272,7 @@ do_uninstall() {
             say "complete Cyclops state removal did not finish; binaries and PATH remain installed"
             exit 1
         fi
+        note "removed Cyclops state at ${CYCLOPS_HOME:-$HOME/.cyclops}"
     else
         case "$state_preview" in
             *"result      the current Cyclops state home is absent"*) ;;
@@ -303,8 +315,9 @@ do_uninstall() {
 
     say ""
     say "${BOLD}✔ cyclops is uninstalled${OFF}"
-    note "removed the complete Cyclops state home at ${CYCLOPS_HOME:-$HOME/.cyclops}"
-    note "vendor hook configuration and skills in agent-owned directories remain outside this removal"
+    note "state removed from ${CYCLOPS_HOME:-$HOME/.cyclops}"
+    note "removed only Cyclops-owned hook entries and unedited seeded skills"
+    note "unrelated vendor configuration and edited skills were preserved"
     exit 0
 }
 
@@ -636,9 +649,9 @@ resolved="$(command -v cyclops 2>/dev/null || true)"
 
 say ""
 say "${BOLD}✔ $version is installed${OFF}"
-note "cyclops    $PREFIX/cyclops"
-note "cyclopsd   $PREFIX/cyclopsd"
-note "home       ${CYCLOPS_HOME:-$HOME/.cyclops}"
+note "command  $PREFIX/cyclops"
+note "daemon   $PREFIX/cyclopsd"
+note "state    ${CYCLOPS_HOME:-$HOME/.cyclops}"
 
 say ""
 say "Next:"

@@ -2572,7 +2572,7 @@ fn reply_prints_the_recipient_wake_state() {
     assert!(plain.status.success());
     assert_eq!(
         String::from_utf8_lossy(&plain.stdout),
-        "accepted m-reply-wake\nwake ✓ accepted · wake submitted\n"
+        "accepted m-reply-wake\n✓ accepted · wake submitted\n"
     );
 }
 

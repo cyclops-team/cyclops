@@ -3,7 +3,7 @@
 # client candidate copy and delegates every other use to the system cp.
 
 case "${2:-}" in
-    */cyclops-pair.*/cyclops)
+    */pair.*/cyclops)
         if [ -n "${CYCLOPS_TEST_COPY_FAILURE_MARKER:-}" ]; then
             printf '%s\n' 'intentional private candidate copy failure' > \
                 "$CYCLOPS_TEST_COPY_FAILURE_MARKER"

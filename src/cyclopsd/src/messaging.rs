@@ -405,7 +405,9 @@ fn ambiguous_runtime_composer_projection(
 
 fn notification_submission_recorded(record: &NotificationRecord) -> bool {
     match record.state {
-        NotificationState::Submitted | NotificationState::Notified => true,
+        NotificationState::Submitted
+        | NotificationState::SubmittedUnverified
+        | NotificationState::Notified => true,
         NotificationState::AttentionRequired => matches!(
             record.cause,
             Some(
@@ -1287,7 +1289,6 @@ impl WorkspaceMessaging {
                 .unwrap_or(false),
             _ => false,
         };
-        let legacy_claimed_clean = exact_claim_after_write && observation.legacy_composer_ready;
         let mut action = if let Some(reason) = probe.store_error {
             Some(crate::composer_recovery::RecoveryAction::Hold(reason))
         } else {
@@ -1298,7 +1299,7 @@ impl WorkspaceMessaging {
                     &probe.records,
                     observation.binding.as_ref(),
                     observation.clean_composer,
-                    legacy_claimed_clean,
+                    exact_claim_after_write,
                 )
         };
         let retired_attempt = match action.as_ref() {

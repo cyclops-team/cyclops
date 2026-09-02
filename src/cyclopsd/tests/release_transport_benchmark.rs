@@ -224,7 +224,7 @@ fn delivery_receipts_prove_wake(result: &Value) -> bool {
                 return false;
             }
             match receipt.get("notification_state").and_then(Value::as_str) {
-                Some("submitted" | "notified") => true,
+                Some("submitted" | "notified" | "submitted_unverified") => true,
                 Some(_) => false,
                 None => matches!(
                     state,
