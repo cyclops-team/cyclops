@@ -9031,17 +9031,26 @@ fn captured_content<'a>(pattern: &cyclops_manifest::Regex, row: &'a str) -> Opti
 /// The old shipped AGY pattern captured its renderer's two-cell continuation
 /// gutter as `content`. In the measured AGY 1.1.23 doorbell, a non-space
 /// payload byte immediately follows that gutter. Strip the gutter only for
-/// that exact legacy pattern and only when a third leading ASCII space is
-/// absent; a third space could be deliberate input and must remain a mismatch.
-/// New manifests express the gutter in their regex, so they never enter this
-/// compatibility path.
+/// the complete, exact pre-change shipped manifest source and only when a
+/// third leading ASCII space is absent; a third space could be deliberate
+/// input and must remain a mismatch. An operator-customized manifest with the
+/// same regex does not match that source fingerprint and therefore fails
+/// closed. New manifests express the gutter in their regex, so they never
+/// enter this compatibility path.
+const LEGACY_AGY_PRE_GUTTER_MANIFEST_SHA256: [u8; 32] = [
+    0x9c, 0xfc, 0x99, 0xfd, 0x61, 0xc8, 0x36, 0xa6, 0x54, 0xce, 0x15, 0x24, 0x2c, 0xca, 0xa3, 0x7c,
+    0xaf, 0x53, 0xaa, 0xbc, 0xee, 0x5e, 0xec, 0x1d, 0x02, 0xab, 0xee, 0x5b, 0xe2, 0x28, 0x94, 0x98,
+];
+
 fn captured_continuation_content<'a>(
     manifest: &Manifest,
     pattern: &cyclops_manifest::Regex,
     row: &'a str,
 ) -> Option<&'a str> {
     let content = captured_content(pattern, row)?;
-    let legacy_agy_pattern = manifest.agent.id == "agy" && pattern.as_str() == "^(?P<content>.*)$";
+    let legacy_agy_pattern = manifest.agent.id == "agy"
+        && manifest.source_digest() == LEGACY_AGY_PRE_GUTTER_MANIFEST_SHA256
+        && pattern.as_str() == "^(?P<content>.*)$";
     if legacy_agy_pattern && content.starts_with("  ") && content.as_bytes().get(2) != Some(&b' ') {
         return Some(&content[2..]);
     }
@@ -15382,12 +15391,33 @@ composer_trailer_required_prefix = 1
             "/../../resources/manifests/agy.toml"
         ))
         .replacen(
+            "# followed by one separator space and the exact compact doorbell. AGY 1.1.23\n\
+             # paints exactly two ASCII gutter columns before every wrapped continuation\n\
+             # row. They are renderer chrome, not message bytes, so the content capture\n\
+             # begins after them. The styled trailer still proves the active composer\n\
+             # boundary before Cyclops can submit. AGY 1.1.22 may leave the Ctx value empty\n\
+             # and paints the model name with truecolor instead of the earlier 256-color\n\
+             # palette; both measured shapes remain chrome-only.",
+            "# followed by one separator space and the exact compact doorbell. Joined\n\
+             # continuation rows carry no trusted chrome here, so preserve every byte and\n\
+             # let the exact payload comparison decide. The styled trailer still proves the\n\
+             # active composer boundary before Cyclops can submit. AGY 1.1.22 may leave the\n\
+             # Ctx value empty and paints the model name with truecolor instead of the\n\
+             # earlier 256-color palette; both measured shapes remain chrome-only.",
+            1,
+        )
+        .replacen(
             "composer_continuation_regex = '^  (?P<content>.*)$'",
             "composer_continuation_regex = '^(?P<content>.*)$'",
             1,
         );
         let legacy_manifest = Manifest::parse(&legacy_source, std::path::Path::new("agy.toml"))
             .expect("the previous shipped AGY manifest parses");
+        assert_eq!(
+            legacy_manifest.source_digest(),
+            LEGACY_AGY_PRE_GUTTER_MANIFEST_SHA256,
+            "the compatibility case is the exact historical shipped source",
+        );
         assert_eq!(
             exact_staging_proof(
                 &legacy_manifest,
@@ -15397,6 +15427,30 @@ composer_trailer_required_prefix = 1
             ),
             Some((true, expected.clone())),
             "an unedited old AGY seed still ignores its measured renderer gutter",
+        );
+
+        let customized_source = legacy_source.replacen(
+            "display_name = \"Antigravity CLI\"",
+            "display_name = \"Antigravity CLI (operator-customized)\"",
+            1,
+        );
+        let customized_manifest =
+            Manifest::parse(&customized_source, std::path::Path::new("agy.toml"))
+                .expect("an operator-customized AGY manifest parses");
+        assert_ne!(
+            customized_manifest.source_digest(),
+            LEGACY_AGY_PRE_GUTTER_MANIFEST_SHA256,
+            "a changed manifest must not inherit the historic seed exception",
+        );
+        assert!(
+            exact_staging_proof(
+                &customized_manifest,
+                &capture,
+                StagingTarget::ExactRow(&expected),
+                &expected,
+            )
+            .is_none(),
+            "an operator-customized generic continuation rule must retain every captured byte",
         );
 
         let with_user_space = capture.replacen(
