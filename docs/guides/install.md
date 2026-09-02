@@ -600,7 +600,7 @@ stops right there and exits 0:
 
 ```
 $ cyclops update
-cyclops 0.1.1-beta (1e16081)
+cyclops 0.1.2-beta (1e16081)
   source https://github.com/cyclops-team/cyclops.git at main
 ✔ already the latest main · nothing to update
 ```
@@ -630,7 +630,7 @@ journal replay performed by rollback.
   activated matched pair 1e16081
   no daemon was running; the selected pair remains stopped
 
-✔ updated · 0.1.1-beta (0876ed7) → 0.1.1-beta (1e16081)
+✔ updated · 0.1.1-beta (0876ed7) → 0.1.2-beta (1e16081)
 
   an open workspace stays on the old build until you detach (ctrl+b d) and run cyclops again
 ```

@@ -6,7 +6,7 @@ whether to promote it
 
 **Integration branch:** **beta/messaging-rework**
 
-**Selected package and release tag:** `0.1.1-beta` / `v0.1.1-beta`
+**Selected package and release tag:** `0.1.2-beta` / `v0.1.2-beta`
 
 **Historical tag preserved:** `v0.2.0-beta` remains attached to its existing
 historical commit. It is not this beta candidate's release tag.
@@ -26,7 +26,7 @@ the authority for work in flight.
 1. Merge the focused release-identity change.
 2. Run the release-evidence lane against its exact resulting beta commit.
 3. If that evidence passes, open the final **beta/messaging-rework** to `main`
-   pull request. Do not merge it, create the `v0.1.1-beta` tag, create a
+   pull request. Do not merge it, create the `v0.1.2-beta` tag, create a
    GitHub Release, or publish anything without a subsequent explicit operator
    authorization.
 
@@ -45,7 +45,7 @@ at merge boundaries, not during routine implementation.
 
 ## Release boundary
 
-The operator selected `0.1.1-beta` / `v0.1.1-beta` and authorized preparation
+The operator selected `0.1.2-beta` / `v0.1.2-beta` and authorized preparation
 of the beta-to-main pull request. Do not merge `main`, tag, create a GitHub
 Release, or publish until the exact candidate passes the complete
 release-evidence lane and the operator gives subsequent explicit approval.

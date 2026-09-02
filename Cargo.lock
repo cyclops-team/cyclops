@@ -378,7 +378,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "cyclops"
-version = "0.1.1-beta"
+version = "0.1.2-beta"
 dependencies = [
  "anyhow",
  "clap",
@@ -401,7 +401,7 @@ dependencies = [
 
 [[package]]
 name = "cyclops-client"
-version = "0.1.1-beta"
+version = "0.1.2-beta"
 dependencies = [
  "cyclops-proto",
  "libc",
@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "cyclops-ledger"
-version = "0.1.1-beta"
+version = "0.1.2-beta"
 dependencies = [
  "cyclops-proto",
  "cyclops-state",
@@ -423,7 +423,7 @@ dependencies = [
 
 [[package]]
 name = "cyclops-manifest"
-version = "0.1.1-beta"
+version = "0.1.2-beta"
 dependencies = [
  "cyclops-proto",
  "libc",
@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "cyclops-proto"
-version = "0.1.1-beta"
+version = "0.1.2-beta"
 dependencies = [
  "serde",
  "serde_json",
@@ -448,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "cyclops-state"
-version = "0.1.1-beta"
+version = "0.1.2-beta"
 dependencies = [
  "libc",
  "serde",
@@ -459,11 +459,11 @@ dependencies = [
 
 [[package]]
 name = "cyclops-testrig"
-version = "0.1.1-beta"
+version = "0.1.2-beta"
 
 [[package]]
 name = "cyclops-theme"
-version = "0.1.1-beta"
+version = "0.1.2-beta"
 dependencies = [
  "cyclops-proto",
  "cyclops-state",
@@ -474,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "cyclops-tmux"
-version = "0.1.1-beta"
+version = "0.1.2-beta"
 dependencies = [
  "cyclops-proto",
  "cyclops-state",
@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "cyclops-ui"
-version = "0.1.1-beta"
+version = "0.1.2-beta"
 dependencies = [
  "cyclops-client",
  "cyclops-ledger",
@@ -505,7 +505,7 @@ dependencies = [
 
 [[package]]
 name = "cyclops-workspace"
-version = "0.1.1-beta"
+version = "0.1.2-beta"
 dependencies = [
  "alacritty_terminal",
  "crossterm",
@@ -527,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "cyclopsd"
-version = "0.1.1-beta"
+version = "0.1.2-beta"
 dependencies = [
  "anyhow",
  "clap",
