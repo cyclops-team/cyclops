@@ -49,6 +49,20 @@ observable result.
 `--submit-log <path>` appends one line for every submit key the fixture
 receives. It lets recovery tests prove that reconciliation sends no second key.
 
+`--submit-event-socket <path>` sends one Unix datagram after the fixture
+consumes each submit key. It lets a test wait for the observed Enter rather
+than polling a log file.
+
+`--agy-layout` keeps the same input parser but paints the measured AGY 1.1.23
+composer shape: a blue `>` prompt, word-wrapped continuation rows with a
+two-cell gutter, and AGY's divider and status chrome. It is a test fixture for
+the renderer-owned gutter, not an implementation of the AGY CLI.
+
+With that event socket, Ctrl-Q emits a `checkpoint` datagram after all earlier
+input in the same parser stream. Tests use it only after shutting down the
+delivery worker, so the checkpoint makes any duplicate queued Enter observable
+without a sleep.
+
 `--manual-lifecycle` consumes a successful submit but stays visually idle.
 Lifecycle tests then use Ctrl-T and Ctrl-Y to choose the observed start and
 end without wall-clock races.
@@ -65,6 +79,7 @@ current frame. Cyclops itself sends none of these keys.
 """
 
 import os
+import socket
 import sys
 import termios
 import time
@@ -74,12 +89,24 @@ RULE = "\x1b[38;5;244m───────────────────�
 STATUS = "\x1b[38;5;152mModel x · Ctx: 78%\x1b[39m"
 STATUS_ALT = "\x1b[38;5;152mModel x · Ctx: 77%\x1b[39m"
 WORKING = "FAKETUI-WORKING"
+AGY_STATUS = "\x1b[38;2;174;198;207mGemini 3.7 Flash · High · ~ · Full · Ctx: 97%\x1b[39m"
+AGY_WORKING = "⣷ Generating..."
+# F83 measured AGY 1.1.23 in a 100x30 tmux pane. Its application-owned
+# composer has 95 content columns; the prompt or continuation gutter occupies
+# the remaining visible cells.
+AGY_CONTENT_COLUMNS = 95
+AGY_LAYOUT = False
 START = b"\x1b[200~"
 END = b"\x1b[201~"
 
 
+def emit_event(path, event):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as event_socket:
+        event_socket.sendto(event, path)
+
+
 class Stream:
-    """Incremental reader: bytes in, (text, submit) events out.
+    """Incremental reader: bytes in, (text, submit, checkpoint) events out.
 
     Holds a tail of bytes that could still be the start of a delimiter,
     so a marker split across two reads is still recognized.
@@ -129,23 +156,51 @@ class Stream:
                             events.append(("text", head[start:j]))
                         events.append(("submit", b""))
                         start = j + 1
+                    elif byte == 17:
+                        if j > start:
+                            events.append(("text", head[start:j]))
+                        events.append(("checkpoint", b""))
+                        start = j + 1
                 if start < len(head):
                     events.append(("text", head[start:]))
         return events
+
+
+def agy_composer_rows(staged):
+    """Render one logical composer value in AGY's measured F83 layout."""
+    rows = []
+    for logical_row in staged.split("\n"):
+        while len(logical_row) > AGY_CONTENT_COLUMNS:
+            boundary = logical_row.rfind(" ", 0, AGY_CONTENT_COLUMNS + 1)
+            if boundary > 0:
+                rows.append(logical_row[:boundary])
+                logical_row = logical_row[boundary + 1 :]
+            else:
+                rows.append(logical_row[:AGY_CONTENT_COLUMNS])
+                logical_row = logical_row[AGY_CONTENT_COLUMNS:]
+        rows.append(logical_row)
+    return rows
 
 
 def draw(transcript, staged, working=False, hidden=False, status=STATUS):
     rows = ["\x1b[2J\x1b[H"]
     rows.extend(transcript)
     if working:
-        rows.append(WORKING)
+        rows.append(AGY_WORKING if AGY_LAYOUT else WORKING)
     # Hidden means the text is still staged and simply not drawn, which
     # is what a wrapped payload looks like to a bottom-region rule.
-    staged_rows = [""] if hidden else staged.split("\n")
-    rows.append("\x1b[39m❯ " + staged_rows[0])
-    rows.extend(staged_rows[1:])
-    rows.append(RULE)
-    rows.append(status)
+    if AGY_LAYOUT:
+        staged_rows = agy_composer_rows("" if hidden else staged)
+        rows.append("\x1b[94m>\x1b[39m " + staged_rows[0])
+        rows.extend("  " + row for row in staged_rows[1:])
+        rows.append("\x1b[90m" + "─" * (AGY_CONTENT_COLUMNS + 5) + "\x1b[39m")
+        rows.append(AGY_STATUS)
+    else:
+        staged_rows = [""] if hidden else staged.split("\n")
+        rows.append("\x1b[39m❯ " + staged_rows[0])
+        rows.extend(staged_rows[1:])
+        rows.append(RULE)
+        rows.append(status)
     sys.stdout.write("\r\n".join(rows) + "\r\n")
     sys.stdout.flush()
 
@@ -181,6 +236,11 @@ def selftest():
     s = Stream()
     assert s.feed(b"\r") == [("submit", b"")]
 
+    # Ctrl-Q is a fixture-only checkpoint. It must follow an Enter that
+    # shared its PTY read, so a test can use it as a terminal-order fence.
+    s = Stream()
+    assert s.feed(b"\r\x11") == [("submit", b""), ("checkpoint", b"")]
+
     # A payload's line feeds are content even with no brackets in sight,
     # which is what keeps a multi-line paste in one piece when tmux does
     # not bracket it.
@@ -189,8 +249,17 @@ def selftest():
     assert events == [("text", b"one\ntwo\nthree")], events
     assert s.feed(b"\r") == [("submit", b"")]
 
+    # AGY consumes one space at a word boundary and paints exactly two
+    # renderer-owned cells before its continuation content.
+    assert agy_composer_rows("one two three four") == ["one two three four"]
+    assert agy_composer_rows("one " + "x" * 99) == ["one", "x" * 95, "x" * 4]
+
 
 def main():
+    global AGY_LAYOUT, AGY_CONTENT_COLUMNS
+    AGY_LAYOUT = "--agy-layout" in sys.argv
+    if "--agy-content-columns" in sys.argv:
+        AGY_CONTENT_COLUMNS = int(sys.argv[sys.argv.index("--agy-content-columns") + 1])
     if "--selftest" in sys.argv:
         selftest()
         return
@@ -202,6 +271,9 @@ def main():
     submit_log = None
     if "--submit-log" in sys.argv:
         submit_log = sys.argv[sys.argv.index("--submit-log") + 1]
+    submit_event_socket = None
+    if "--submit-event-socket" in sys.argv:
+        submit_event_socket = sys.argv[sys.argv.index("--submit-event-socket") + 1]
     swallowed = False
     forced_working = False
     fd = sys.stdin.fileno()
@@ -265,10 +337,15 @@ def main():
                             staged += char
                     hidden = False
                     draw(transcript, staged, working=forced_working)
+                elif kind == "checkpoint":
+                    if submit_event_socket is not None:
+                        emit_event(submit_event_socket, b"checkpoint")
                 else:
                     if submit_log is not None:
                         with open(submit_log, "a", encoding="utf-8") as log:
                             log.write("submit\n")
+                    if submit_event_socket is not None:
+                        emit_event(submit_event_socket, b"submit")
                     if swallow or (swallow_once and not swallowed):
                         # The key arrived and was accepted. Nothing else
                         # happens: the composer keeps its text and no turn

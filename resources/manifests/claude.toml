@@ -204,7 +204,7 @@ priority = 1050
 # The typed-input row is the same mid-turn prompt row: a composer semantic,
 # never lifecycle evidence of idle.
 lifecycle_evidence = false
-region = "bottom_non_empty_lines(6)"
+region = "bottom_non_empty_lines(10)"
 line_regex = ['^\s*❯\s+\S']
 line_regex_esc = ['\x1b\[39m❯\x{a0}[^\x1b]']
 note = """Do not inject: would concatenate with existing text. Includes the
@@ -233,7 +233,7 @@ priority = 1040
 # Ghost text is painted on the same mid-turn prompt row; an ambiguous frame
 # holds an active turn rather than ending it.
 lifecycle_evidence = false
-region = "bottom_non_empty_lines(6)"
+region = "bottom_non_empty_lines(10)"
 line_regex = ['^\s*❯\s+\S']
 line_regex_esc = ['❯\x{a0}\x1b\[2m\S']
 note = """A suggestion the product painted, not something a human staged.
@@ -256,7 +256,7 @@ priority = 1035
 # The typed-input row is the same mid-turn prompt row: a composer semantic,
 # never lifecycle evidence of idle.
 lifecycle_evidence = false
-region = "bottom_non_empty_lines(6)"
+region = "bottom_non_empty_lines(10)"
 line_regex = ['^\s*❯\s+\S']
 line_regex_esc = ['\x1b\[39m❯\x{a0}\x1b\[']
 note = """Composer content that is styled but not the dim ghost above.

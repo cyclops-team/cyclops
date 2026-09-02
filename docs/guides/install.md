@@ -101,10 +101,11 @@ the line printed and no edit.
 curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
 ```
 
-The managed uninstall removes both public binary links, the validated pair
-store, and the installer-owned PATH block. It preserves `~/.cyclops`, including
-the mailbox journal and session ledgers, and refuses an altered pair store or an
-ambiguous install prefix. The full safety contract is in [Uninstall](#uninstall).
+The managed uninstall stops the validated selected daemon, removes the complete
+current Cyclops state home, both public binary links, the validated pair store,
+and the installer-owned PATH block. Export anything you want to retain first.
+It refuses an altered pair store or an ambiguous install prefix. The full safety
+contract is in [Uninstall](#uninstall).
 
 From a clone, use `./scripts/install.sh --uninstall`.
 
@@ -220,6 +221,11 @@ complete for the installed consumers and 1 when setup needs repair. Add
 `--json` for a stable machine-readable report. The check reads setup state
 only. The standard setup workflow installs or repairs it.
 
+This can still leave `skill` at manual review and setup incomplete. It changes
+only the `mailbox` result: current exact bytes in a regular final `SKILL.md`
+can report `doorbell`, while setup still will not create or rewrite that
+directory.
+
 Review the managed setup seed decisions:
 
 ```
@@ -314,8 +320,8 @@ delivery_retry_max = 1       # retries only when no notification or legacy paylo
 receipt_block_ms = 2500      # cap for observing an immediately decidable receipt
 gate_hold_notify_ms = 120000 # one admin ping when a worker is held this long
 unclaimed_reminder_ms = 0    # disabled; positive arms one bounded reminder per unclaimed attempt
-force_notification_submit = "off"        # dangerous post-paste Enter fallback
-force_notification_submit_delay_ms = 5000 # 0 through 20000; used only when enabled
+force_notification_submit = "on"         # automatic one-key recovery after verify failure
+force_notification_submit_delay_ms = 0    # 0 through 20000; delay before that recovery
 ```
 
 Standard `cyclops send` acceptance is durable before notification scheduling.
@@ -337,14 +343,15 @@ message remains available for an exact claim throughout.
 `unclaimed_reminder_ms` is disabled when absent or zero. A positive value arms
 one content-free reminder after a doorbell remains unclaimed for that long.
 The reminder reuses the exact attempt locator and the ordinary composer gate:
-Working with positive clean-composer proof may write, while human input or
-ambiguous composer evidence still refuses. Claim, withdrawal, or replacement
+positive human input still refuses, while an authenticated idle or working
+pane with an inconclusive composer may receive and submit the one reminder.
+Claim, withdrawal, or replacement
 makes the timer obsolete without terminal IO. One durable allowance prevents a
 restart or duplicate timer from writing more than one reminder.
 
-`force_notification_submit` is a separate, default-off escape hatch for an
-exact notification that crossed the paste boundary and then reached
-`verify_failed`. It never pastes a second notification. After
+`force_notification_submit` is the default-on recovery for an exact
+notification that crossed the paste boundary and then reached `verify_failed`.
+It never pastes a second notification. After
 `force_notification_submit_delay_ms`, the daemon revalidates the exact pending
 attempt, bound process generation, manifest, pane, and tmux mode, checks the
 setting one final time, records durable intent, and reserves one key under the
@@ -584,7 +591,7 @@ stops right there and exits 0:
 
 ```
 $ cyclops update
-cyclops 0.1.0-beta (1e16081)
+cyclops 0.1.1-beta (1e16081)
   source https://github.com/cyclops-team/cyclops.git at main
 ✔ already the latest main · nothing to update
 ```
@@ -598,6 +605,12 @@ fails. Durable records and existing setup files in your home are preserved.
 Known unedited shipped themes and hook artifacts may advance with the installed
 release; manifests and skills remain in place and can report outdated state.
 
+The source clone and candidate pair are temporary and disappear when the
+update ends. The only retained build artifact is Cargo's incremental cache:
+`~/Library/Caches/Cyclops/` on macOS and `~/.cache/cyclops/` on Linux. Cyclops
+prints its exact directory before building; it is user-owned and rebuildable.
+Set `CARGO_TARGET_DIR` if you deliberately want Cargo to use another location.
+
 The selected-pair record stores a content-free replay attestation bound to the
 exact client and daemon hashes plus the private snapshot identity. Older
 selection schemas remain readable and report replay as unproven. The
@@ -608,7 +621,7 @@ journal replay performed by rollback.
   activated matched pair 1e16081
   no daemon was running; the selected pair remains stopped
 
-✔ updated · 0.1.0-beta (0876ed7) → 0.1.0-beta (1e16081)
+✔ updated · 0.1.1-beta (0876ed7) → 0.1.1-beta (1e16081)
 
   an open workspace stays on the old build until you detach (ctrl+b d) and run cyclops again
 ```
@@ -701,56 +714,33 @@ wiring outside install and update.
 
 ## Uninstall
 
-The installer removes the binaries, the validated managed pair store, and its
-PATH block but preserves your data. Pair-store removal holds the update lease
+The installer stops the validated selected daemon, removes the complete current
+Cyclops state home, the binaries, the validated managed pair store, and its
+PATH block. Pair-store removal holds the update lease
 and refuses unknown, linked, or ownership-changing entries instead of deleting
 an unproven tree. Both public names are removed only from one prefix, selected
 by `--prefix` or by the `cyclops` command on `PATH`. It never resolves a
 `cyclopsd` from another prefix. If only `cyclopsd` can be found, uninstall
 refuses and asks for an explicit prefix.
 
-For a state-preserving uninstall, run:
+Export anything you want to retain, then run:
 
 ```bash
 curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
 ```
 
-Do not run that command first when you intend to remove the complete state
-home: it removes the `cyclops` command needed for the state-home journey below.
-
-If you want to remove the retained journals but keep the rest of Cyclops
-state, start with the previewed
+If you want to remove only journals while keeping the rest of Cyclops state,
+start with the previewed
 [`cyclops data forget --all`](data.md#forget-the-retained-journal-scope)
 journey. Stop the daemon before its preview and keep it stopped through the
 exact confirmation. It removes only the previewed workspace and session NDJSON
 journals, and deliberately leaves configuration and vendor wiring alone.
 Export first if you might need the history.
 
-If you also want to remove all configuration and records in the current
-Cyclops state home, stop the daemon and copy out any history you want to keep.
-Then make the body-free preview and run only its exact confirmation:
-
-```bash
-cyclops daemon stop
-cyclops data export --to <new-directory>
-cyclops remove --all
-cyclops remove --all --confirm <token-from-preview>
-```
-
-This command removes only the selected current state home. It leaves installed
-binaries, the installer-owned PATH block, vendor configuration, and skill
-files in agent-owned directories, including a Cyclops-seeded copy, alone. For
-the exact scope and interrupted-removal recovery boundary, follow the
-[`cyclops remove --all` guide](data.md#remove-the-complete-current-state-home).
-
-After that state-home command reports its result, run the managed uninstall:
-
-```bash
-curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
-```
-
-The remaining complete-uninstall work is separately owned. Remove only the
-Cyclops command hooks from installed vendor configuration. Check
+`cyclops remove --all` remains available when you want its explicit preview
+and confirmation without removing the installed binary pair. The installer
+does not rewrite agent-owned hook configuration or skill files. To remove
+Cyclops command hooks from installed vendor configuration, check
 `~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.agents/hooks.json`, and
 `~/.cursor/hooks.json` where those files exist. Delete entries whose command
 invokes a `cyclops` binary followed by `hook <Event>`, while preserving every

@@ -1738,18 +1738,10 @@ fn inspect_setup(cyclops_home: &Path) -> SetupReport {
         } else {
             ("not_installed", true)
         };
-        let mailbox_transport = mailbox_capability
-            .as_deref()
-            .and_then(|declared| {
-                cyclops_manifest::mailbox_capability::resolve_path(declared, &user_home)
-            })
-            .map(|declared| {
-                if declared == skill_path && skill_state == "current" {
-                    "doorbell"
-                } else {
-                    "direct_payload"
-                }
-            });
+        let mailbox_capability_path = mailbox_capability.as_deref().and_then(|declared| {
+            cyclops_manifest::mailbox_capability::resolve_path(declared, &user_home)
+        });
+        let mailbox_transport = mailbox_transport(installed, mailbox_capability_path.as_deref());
         let receipt_ready = !installed || spec.receipt.accepts(ack_capable);
         let complete = !installed
             || (install_state == "present"
@@ -1769,7 +1761,7 @@ fn inspect_setup(cyclops_home: &Path) -> SetupReport {
             hook_state,
             skill_path,
             skill_state,
-            mailbox_transport: installed.then_some(mailbox_transport).flatten(),
+            mailbox_transport,
             complete,
         });
     }
@@ -1831,6 +1823,23 @@ fn inspect_skill(asset: AssetRead) -> (&'static str, bool) {
             (state.word(), state.ready())
         }
     }
+}
+
+/// This mirrors the daemon's runtime capability proof. A non-private parent
+/// still blocks managed skill writes, but it does not turn current exact bytes
+/// into a direct-payload transport.
+fn mailbox_transport(installed: bool, capability_path: Option<&Path>) -> Option<&'static str> {
+    installed
+        .then(|| {
+            capability_path.map(|declared| {
+                if cyclops_manifest::mailbox_capability::is_current(declared) {
+                    "doorbell"
+                } else {
+                    "direct_payload"
+                }
+            })
+        })
+        .flatten()
 }
 
 fn inspect_operational_state(home: &Path) -> (ExternalStateReport, ExternalStateReport) {
@@ -2622,6 +2631,30 @@ fn render_rollback_plain(report: &RollbackReport) -> Vec<String> {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    #[cfg(unix)]
+    #[test]
+    fn current_doorbell_bytes_report_doorbell_even_when_skill_management_needs_review() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("skills/cyclops");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let skill = parent.join("SKILL.md");
+        std::fs::write(&skill, crate::skillseed::SHIPPED).unwrap();
+        let location = crate::consumer::AssetLocation {
+            root: root.path().to_path_buf(),
+            relative: PathBuf::from("skills/cyclops/SKILL.md"),
+        };
+
+        assert_eq!(
+            inspect_skill(read_skill_asset(&location)),
+            ("unproven", false)
+        );
+        assert!(cyclops_manifest::mailbox_capability::is_current(&skill));
+        assert_eq!(mailbox_transport(true, Some(&skill)), Some("doorbell"));
+    }
 
     fn private_scratch() -> tempfile::TempDir {
         tempfile::Builder::new()

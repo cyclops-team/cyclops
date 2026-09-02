@@ -624,7 +624,7 @@ fn project_runtime_composer(
     };
     match &observation.capture {
         MessagingComposerCapture::Visible(actual)
-            if actual == &expected
+            if delivery::visible_single_line_payload_matches(actual, &expected)
                 && observation.semantic == Some(ComposerSemantic::HumanInput) =>
         {
             MessagingRuntimeComposerProjection {
@@ -2106,6 +2106,22 @@ impl WorkspaceMessaging {
     /// force-submit. The server persists the setting; messaging owns the work
     /// that follows from it.
     pub(crate) fn force_submit_enabled(&self) {
+        self.schedule_force_submit_candidates();
+    }
+
+    /// Reconsider existing exact attention attempts after a watcher has
+    /// published its current routes.
+    ///
+    /// Boot discovers durable candidates before session watchers attach. A
+    /// missing route at that first pass is not a terminal refusal: the route
+    /// publication supplies the later, event-driven recheck. The runtime
+    /// still owns the enabled-setting, binding, claim-ordering, and one-key
+    /// checks.
+    pub(crate) fn force_submit_routes_available(&self) {
+        self.schedule_force_submit_candidates();
+    }
+
+    fn schedule_force_submit_candidates(&self) {
         match self.service.force_submit_candidates() {
             Ok(records) => {
                 for record in records {
@@ -3379,6 +3395,41 @@ mod tests {}
         assert_eq!(submitted.state, ComposerState::CyclopsNotificationSubmitted);
         assert_eq!(submitted.proof, ComposerProof::ExactNotification);
         assert!(submitted.binding_verified);
+    }
+
+    #[test]
+    fn runtime_composer_projection_keeps_an_exact_wrapped_doorbell_owned() {
+        let (candidate, recipient, binding) =
+            runtime_composer_candidate(NotificationState::AttentionRequired);
+        let attempt = candidate.record.attempt_id;
+        let expected = cyclops_proto::render_doorbell_v3(attempt);
+        let (first, continuation) = expected
+            .split_once(" claim ")
+            .expect("format 3 has a claim continuation");
+        let visible = format!("{first}\nclaim {continuation}");
+        let probe = runtime_composer_probe(vec![candidate]);
+
+        let staged = probe.project(runtime_composer_observation(
+            Some(ComposerSemantic::HumanInput),
+            Some(attempt),
+            Some(recipient),
+            MessagingComposerBindingObservation::Bound(binding.clone()),
+            MessagingComposerCapture::Visible(visible.clone()),
+        ));
+        assert_eq!(staged.state, ComposerState::CyclopsNotificationStaged);
+        assert_eq!(staged.proof, ComposerProof::ExactNotification);
+        assert!(staged.binding_verified);
+
+        let changed = probe.project(runtime_composer_observation(
+            Some(ComposerSemantic::HumanInput),
+            Some(attempt),
+            Some(recipient),
+            MessagingComposerBindingObservation::Bound(binding),
+            MessagingComposerCapture::Visible(visible.replacen("claim", "claimed", 1)),
+        ));
+        assert_eq!(changed.state, ComposerState::ComposerAmbiguous);
+        assert_eq!(changed.reason, Some("composer_content_mismatch"));
+        assert!(!changed.binding_verified);
     }
 
     #[test]

@@ -127,13 +127,56 @@ fn clone(repo: &str, reff: &str, dest: &Path) -> Result<(), String> {
     }
 }
 
+/// The visible, user-owned root for retained update build artifacts.
+///
+/// macOS has a per-process temporary directory under `/private/var`; it is a
+/// bad home for a multi-gigabyte cache that persists after an update. Keep the
+/// cache in the platform cache location instead, where an operator can inspect
+/// or remove it without hunting through system temporary storage.
+fn build_cache_parent(home: &Path) -> PathBuf {
+    let user_home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| home.to_path_buf());
+    #[cfg(target_os = "macos")]
+    {
+        user_home.join("Library/Caches/Cyclops")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| user_home.join(".cache"))
+            .join("cyclops")
+    }
+}
+
 /// Where update keeps its build cache, so a rebuild is incremental.
 ///
 /// Outside the state root because Cargo writes executable build artifacts.
 pub(crate) fn build_cache(home: &Path) -> PathBuf {
-    let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
     let home_key = fnv64(home.as_os_str().as_bytes());
-    temp.join(format!("cyclops-build-cache-{home_key}"))
+    build_cache_parent(home).join(format!("build-{home_key}"))
+}
+
+/// Open the dedicated cache parent before its build-cache child. The standard
+/// platform cache directories may not exist on a minimal account, so create
+/// their ordinary ancestors first, then let `StateRoot` verify and own the
+/// Cyclops leaf without following links.
+fn open_build_cache(home: &Path) -> Result<cyclops_state::StateRoot, String> {
+    let cache = build_cache(home);
+    let parent = cache
+        .parent()
+        .ok_or_else(|| format!("build cache {} has no parent", cache.display()))?;
+    let ancestors = parent
+        .parent()
+        .ok_or_else(|| format!("build cache parent {} has no parent", parent.display()))?;
+    std::fs::create_dir_all(ancestors)
+        .map_err(|error| format!("create build-cache parent {}: {error}", ancestors.display()))?;
+    cyclops_state::StateRoot::open_or_create(parent)
+        .map_err(|error| format!("open build-cache parent {}: {error}", parent.display()))?;
+    cyclops_state::StateRoot::open_or_create(&cache)
+        .map_err(|error| format!("open build cache {}: {error}", cache.display()))
 }
 
 /// The build-cache lease shared by update and cleanup.
@@ -1289,6 +1332,21 @@ impl PairStore {
                 .as_ref()
                 .is_some_and(|m| m.file_type().is_symlink())
         {
+            let expected_cli = PathBuf::from(PAIR_ROOT)
+                .join(ACTIVE_SELECTOR)
+                .join("cyclops");
+            let expected_daemon = PathBuf::from(PAIR_ROOT)
+                .join(ACTIVE_SELECTOR)
+                .join("cyclopsd");
+            if std::fs::read_link(&cli).ok().as_ref() == Some(&expected_cli)
+                && std::fs::read_link(&daemon).ok().as_ref() == Some(&expected_daemon)
+            {
+                // A complete-state removal may have removed the selector store
+                // while leaving these two owned public links behind. There is
+                // no executable pair to preserve, so activation below may
+                // safely replace both links with the verified candidate.
+                return Ok(());
+            }
             return Err(PairChangeError::unchanged(
                 "managed Cyclops links have no active selector",
             ));
@@ -3083,6 +3141,7 @@ pub fn run(
     rollback: bool,
     install_pair: Option<&Path>,
     remove_pair_store: bool,
+    stop_selected_daemon: bool,
     prefix: Option<&Path>,
 ) -> i32 {
     if json {
@@ -3098,6 +3157,13 @@ pub fn run(
             return crate::EXIT_USAGE;
         };
         return run_remove_pair_store(prefix);
+    }
+    if stop_selected_daemon {
+        let Some(prefix) = prefix else {
+            eprintln!("--stop-selected-daemon requires --prefix");
+            return crate::EXIT_USAGE;
+        };
+        return run_stop_selected_daemon(prefix);
     }
     if let Some(source) = install_pair {
         let Some(prefix) = prefix else {
@@ -3181,7 +3247,7 @@ pub fn run(
     let mut held_cache = None;
     let mut held_cache_lease = None;
     if std::env::var_os("CARGO_TARGET_DIR").is_none() {
-        match cyclops_state::StateRoot::open_or_create(&cache) {
+        match open_build_cache(&cyclops_proto::cyclops_home()) {
             Ok(root) => match lock_build_cache(&root) {
                 Ok(lease) => {
                     installer.env("CARGO_TARGET_DIR", root.path());
@@ -3269,6 +3335,33 @@ fn run_remove_pair_store(prefix: &Path) -> i32 {
         }
     } else {
         0
+    }
+}
+
+/// Stop the selected daemon without changing the selected pair. The installer
+/// uses this before invoking the separately journaled complete-state remover;
+/// it must keep the client executable available until that remover finishes.
+fn run_stop_selected_daemon(prefix: &Path) -> i32 {
+    let daemon = match validate_uninstall_pair(prefix) {
+        Ok(daemon) => daemon,
+        Err(error) => {
+            eprintln!("uninstall refused: {error}");
+            return 1;
+        }
+    };
+    match crate::daemon::stop_selected_for_pair_change(&daemon) {
+        Ok(Some(pid)) => {
+            println!("stopped selected cyclopsd pid {pid}");
+            0
+        }
+        Ok(None) => {
+            println!("no selected cyclopsd was running");
+            0
+        }
+        Err(refusal) => {
+            eprintln!("uninstall refused: {}", refusal.why());
+            1
+        }
     }
 }
 
@@ -4439,6 +4532,34 @@ sys.exit(43)"#,
         assert_eq!(restored.active, old.active);
         assert_eq!(restored.known_good, candidate);
         assert_eq!(store.selection().unwrap(), Some(restored));
+    }
+
+    #[test]
+    fn reinstall_recovers_owned_public_links_after_the_pair_store_is_removed() {
+        let scratch = Scratch::create().unwrap();
+        let prefix = scratch.path().join("bin");
+        directory(&prefix);
+        let old_source = scratch.path().join("old");
+        let candidate_source = scratch.path().join("candidate");
+        pair_source(&old_source, "old-build");
+        pair_source(&candidate_source, "candidate-build");
+
+        let store = PairStore::open(&prefix).unwrap();
+        let old = store.stage(&old_source).unwrap();
+        store
+            .activate(&old, recorded_replay(&store, &old, 1))
+            .unwrap();
+        std::fs::remove_dir_all(&store.root).unwrap();
+
+        let recovered = PairStore::open(&prefix).unwrap();
+        let candidate = recovered.stage(&candidate_source).unwrap();
+        recovered.migrate_direct_pair(&candidate).unwrap();
+        recovered
+            .activate(&candidate, recorded_replay(&recovered, &candidate, 2))
+            .unwrap();
+
+        recovered.require_public_links().unwrap();
+        assert_eq!(recovered.selection().unwrap().unwrap().active, candidate);
     }
 
     #[test]

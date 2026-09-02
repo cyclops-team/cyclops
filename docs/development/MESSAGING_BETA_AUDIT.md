@@ -18,7 +18,7 @@ records those gaps, and separates current regression coverage from retained
 fail-before evidence.
 
 **Current release status:** This is a Track A acceptance record, not the live
-release queue. The current candidate uses `0.1.0-beta` / `v0.1.0-beta`; no new
+release queue. The current candidate uses `0.1.1-beta` / `v0.1.1-beta`; no new
 tag or GitHub Release has been created. See [NEXT.md](NEXT.md) for the current
 exact-SHA evidence and operator-approval boundary.
 
@@ -287,7 +287,7 @@ as Track A provenance rather than the current release gate.
 1. **Release identity was unresolved when this audit was written.** The newest
    remote tag by creator date was `v0.2.0-beta` from 2026-08-27, the repository
    had no GitHub Release objects, and the workspace version was `0.1.0`. The
-   current selected identity is `0.1.0-beta` / `v0.1.0-beta`; it still requires
+   current selected identity is `0.1.1-beta` / `v0.1.1-beta`; it still requires
    exact-SHA evidence and subsequent explicit operator approval before a tag,
    GitHub Release, or publication.
 2. **External support for `Daemon::deliver_payload` is unverified.** This blocks

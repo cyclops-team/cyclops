@@ -23,7 +23,7 @@ The independent architecture, regression and migration, user-journey and
 performance, and standards audits identified no unresolved implementation
 blocker. This decision does not authorize a merge to `main`, a tag, a version
 number, a GitHub Release, or publication. The current release queue is
-[NEXT.md](NEXT.md): the selected identity is `0.1.0-beta` / `v0.1.0-beta`, but
+[NEXT.md](NEXT.md): the selected identity is `0.1.1-beta` / `v0.1.1-beta`, but
 merging `main`, tagging, creating a GitHub Release, and publication still need
 subsequent explicit operator approval.
 
@@ -44,7 +44,7 @@ The remaining gate is release authority, not an unfinished implementation
 track. At the time of this audit, the workspace declared Cargo version `0.1.0`,
 the newest remote tag was `v0.2.0-beta` from 2026-08-27, and GitHub had no
 Release object. That is historical context, not the current release status.
-The current candidate uses `0.1.0-beta` / `v0.1.0-beta`; the historical tag
+The current candidate uses `0.1.1-beta` / `v0.1.1-beta`; the historical tag
 remains unchanged and no new tag or Release has been created. See
 [NEXT.md](NEXT.md) for the current gated release sequence.
 
@@ -126,11 +126,11 @@ state. This does not require eliminating every `Arc` or extracting a new crate.
 - A complete data-lifecycle policy is deliberately deferred. The interim rule
   is still binding: no silent loss, and any breaking migration needs an export
   or migration path.
-- Terminal injection is not claimed to be race-free. Ordinary paths require
-  fresh positive evidence and record intent before an effect. The separately
-  documented default-off administrator force-submit setting never replaces
-  bytes, but may submit trailing human input for one exact `verify_failed`
-  attempt; it is a bounded liveness tradeoff, not automatic raw-tmux fallback.
+- Terminal injection is not claimed to be race-free. Ordinary paths require a
+  current known manifest and process binding, then preserve only positively
+  observed human input. The documented default-on force-submit recovery never
+  replaces bytes, but may submit one exact `verify_failed` notification; it is
+  a bounded liveness tradeoff, not automatic raw-tmux fallback.
 
 ## CI and regression evidence
 

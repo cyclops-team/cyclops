@@ -337,6 +337,13 @@ enum Cmd {
         /// Remove one fully validated managed pair store during uninstall.
         #[arg(long, hide = true, conflicts_with_all = ["rollback", "install_pair"])]
         remove_pair_store: bool,
+        /// Stop the fully validated selected daemon before complete uninstall.
+        #[arg(
+            long,
+            hide = true,
+            conflicts_with_all = ["rollback", "install_pair", "remove_pair_store"]
+        )]
+        stop_selected_daemon: bool,
         /// Installation prefix used with an internal pair-store operation.
         #[arg(long, hide = true, value_name = "DIR")]
         prefix: Option<std::path::PathBuf>,
@@ -1109,6 +1116,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
             rollback,
             install_pair,
             remove_pair_store,
+            stop_selected_daemon,
             prefix,
         } => update::run(
             cli.json,
@@ -1116,6 +1124,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
             *rollback,
             install_pair.as_deref(),
             *remove_pair_store,
+            *stop_selected_daemon,
             prefix.as_deref(),
         ),
         // All three answer about a daemon rather than through one, so a
@@ -2908,6 +2917,12 @@ fn cmd_reply(cli: &Cli, style: &Style, args: &ReplyArgs) -> i32 {
         "already accepted"
     };
     println!("{verb} {}", style.accent(&result.msg_id));
+    if !result.deliveries.is_empty() {
+        println!(
+            "wake {}",
+            render::render_receipts(&result.deliveries, style)
+        );
+    }
     0
 }
 

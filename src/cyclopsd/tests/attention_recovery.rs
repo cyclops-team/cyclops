@@ -738,6 +738,127 @@ async fn pending_exact_owned_doorbell_submits_once_without_operator_input() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn working_pre_submit_recheck_submits_the_exact_doorbell_after_fresh_quiet_evidence() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+
+    let log_dir = cyclops_proto::scratch::scratch_dir(&format!(
+        "attention-working-recovery-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&log_dir).unwrap();
+    let submit_log = log_dir.join("submits.txt");
+    let pane_command = format!(
+        "python3 {} --clear-staged --submit-log {}",
+        faketui_path(),
+        submit_log.display()
+    );
+    let mut rig = Rig::new(
+        "attention-working-recovery",
+        &recovery_manifest(),
+        &pane_command,
+        "receipt_block_ms = 100\nack_timeout_ms = 300\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+
+    let (pre_submit_tx, mut pre_submit_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (automatic_tx, mut automatic_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (after_action_tx, mut after_action_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pre_submit = Arc::new(tokio::sync::Semaphore::new(0));
+    let automatic = Arc::new(tokio::sync::Semaphore::new(0));
+    let after_action = Arc::new(tokio::sync::Semaphore::new(0));
+    let paused_pre_submit = Arc::clone(&pre_submit);
+    let paused_automatic = Arc::clone(&automatic);
+    let paused_after_action = Arc::clone(&after_action);
+    rig.daemon.set_inject_pause(move |phase| {
+        let pause = match phase {
+            "pre_submit" => Some((pre_submit_tx.clone(), Arc::clone(&paused_pre_submit))),
+            "automatic_attention_before_resolve" => {
+                Some((automatic_tx.clone(), Arc::clone(&paused_automatic)))
+            }
+            "attention_after_action_accepted" => {
+                Some((after_action_tx.clone(), Arc::clone(&paused_after_action)))
+            }
+            _ => None,
+        };
+        Box::pin(async move {
+            if let Some((entered, paused)) = pause {
+                let _ = entered.send(());
+                paused.acquire_owned().await.unwrap().forget();
+            }
+        })
+    });
+
+    let sent = rig
+        .daemon
+        .msg_send(
+            "admin",
+            serde_json::from_value::<MsgSendParams>(json!({
+                "to": ["worker"],
+                "subject": "Working composer recovery",
+                "body": "private body",
+                "client_key": "working-composer-recovery"
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+    wait_for_inject_signal(&mut pre_submit_rx, "pre_submit").await;
+
+    // The recipient begins a turn after the doorbell has been staged but
+    // before Cyclops may send Enter. The final proof must withhold that key.
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "C-t"]);
+    common::wait_pane_state(&mut rig, "working").await;
+    pre_submit.add_permits(1);
+
+    let attempt_id = wait_for_alarm(&mut rig, &message_id).await;
+    assert_alarm_cause(&mut rig, &attempt_id, "verify_failed").await;
+    assert!(!submit_log.exists(), "working recheck sent a submit key");
+    let expected_doorbell = cyclops_proto::render_doorbell_v3(
+        cyclops_proto::NotificationAttemptId::parse(&attempt_id).unwrap(),
+    );
+    assert!(
+        rig.tmux.capture(&pane).contains(&expected_doorbell),
+        "working recheck changed the exact staged doorbell"
+    );
+    let lines = workspace_lines(&rig);
+    assert!(intent_lines(&lines, &attempt_id).is_empty());
+    assert!(accepted_action_lines(&lines, &attempt_id).is_empty());
+    assert!(consumption_lines(&lines, &attempt_id).is_empty());
+    assert!(resolution_lines(&lines, &attempt_id).is_empty());
+
+    // A fresh screen/composer observation restores the same exact doorbell
+    // without a running turn. It may re-elect normal reconciliation; no
+    // timer, poll, or force-submit path participates.
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "C-y"]);
+    common::wait_pane_state(&mut rig, "unknown").await;
+    wait_for_inject_signal(&mut automatic_rx, "automatic_attention_before_resolve").await;
+    automatic.add_permits(32);
+    wait_for_inject_signal(&mut after_action_rx, "attention_after_action_accepted").await;
+    rig.daemon
+        .claim_message_for_test("worker", &message_id)
+        .expect("claim after automatic action acceptance");
+    after_action.add_permits(32);
+
+    wait_for_resolution(&rig, &attempt_id, NotificationResolution::Complete).await;
+    wait_for_empty_composer(&rig, &pane).await;
+    let lines = workspace_lines(&rig);
+    assert_eq!(intent_lines(&lines, &attempt_id).len(), 1);
+    assert_eq!(accepted_action_lines(&lines, &attempt_id).len(), 1);
+    assert_eq!(consumption_lines(&lines, &attempt_id).len(), 1);
+    assert_eq!(resolution_lines(&lines, &attempt_id).len(), 1);
+    assert_eq!(fs::read_to_string(&submit_log).unwrap().lines().count(), 1);
+
+    rig.shutdown().await;
+    fs::remove_dir_all(log_dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn claimed_exact_owned_doorbell_clears_without_another_submit() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");

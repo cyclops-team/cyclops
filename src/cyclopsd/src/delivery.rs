@@ -43,8 +43,8 @@ use cyclops_proto::{
     NotificationAttentionCause, NotificationBinding, NotificationManifestId,
     NotificationPreWriteCause, NotificationPreWriteObservation, NotificationState,
     NotificationTransport, NotificationVerifyFailureKind, NotificationVerifyOutcome, NotifyLevel,
-    ProcessInstanceId, QuiesceResult, RecipientKey, Sensor, StatusDiagnostic, VerifiedBy,
-    WaitUntil, WireError,
+    ProcessInstanceId, QuiesceResult, RecipientKey, StatusDiagnostic, VerifiedBy, WaitUntil,
+    WireError,
 };
 use cyclops_tmux::{ControlClient, PaneEvent, PaneRow, SessionWatcher, TmuxError};
 use serde_json::{json, Value};
@@ -68,8 +68,10 @@ const SCREEN_ACK_DEADLINE: Duration = Duration::from_secs(5);
 /// One-shot screen-evidence checkpoints after submit. Events also wake the
 /// waiter; these bound the captures per delivery.
 const ACK_CHECKPOINTS_MS: [u64; 5] = [250, 750, 1500, 3000, 5000];
-/// Post-paste verification re-reads (paste rendering can lag a frame).
-/// Offsets from the paste, one capture each; bounded per attempt.
+/// Post-paste and final-staging verification re-reads. A terminal renderer
+/// can lag one frame behind a paste or expose a partial repaint between two
+/// otherwise exact proofs. Offsets from the preceding write or reread, one
+/// capture each; bounded per attempt.
 const VERIFY_DELAYS_MS: [u64; 4] = [0, 120, 240, 480];
 /// Bottom non-empty lines scanned for the staged verify pattern.
 const VERIFY_REGION: usize = 15;
@@ -1097,6 +1099,12 @@ pub(crate) struct DeliveryHandle {
     /// A readiness edge observed while this claimed-barrier run was active.
     /// Consumed only after the attempt index releases this handle.
     claimed_notification_rerun_requested: AtomicBool,
+    /// This ordinary notification was admitted immediately before paste while
+    /// the pane was visibly Working and its composer was positively clean or
+    /// ghosted. The staged doorbell naturally reads as input afterward, so
+    /// this one-attempt capability carries the pre-paste proof to the final
+    /// exact-byte submit check. It is never restored or used by recovery.
+    working_clean_submit_admitted: AtomicBool,
 }
 
 /// Evidence from a vendor hook that landed before the worker consumed it.
@@ -1327,6 +1335,7 @@ impl DeliveryHandle {
             write_boundary_crossed: AtomicBool::new(false),
             worker_recoveries: AtomicU64::new(0),
             claimed_notification_rerun_requested: AtomicBool::new(false),
+            working_clean_submit_admitted: AtomicBool::new(false),
         })
     }
 
@@ -1351,6 +1360,15 @@ impl DeliveryHandle {
             .notification_transport
             .lock()
             .expect("notification transport lock")
+    }
+
+    fn set_working_clean_submit_admitted(&self, admitted: bool) {
+        self.working_clean_submit_admitted
+            .store(admitted, Ordering::SeqCst);
+    }
+
+    fn working_clean_submit_admitted(&self) -> bool {
+        self.working_clean_submit_admitted.load(Ordering::SeqCst)
     }
 
     fn restore_claimed_notification_barrier(&self) {
@@ -4183,6 +4201,9 @@ async fn attempt_delivery(
     manifest_id: &str,
     admitted_pid: i32,
 ) -> AttemptOutcome {
+    // This capability belongs only to the capture immediately before this
+    // attempt's paste. A later retry must earn it again from fresh evidence.
+    handle.set_working_clean_submit_admitted(false);
     let watcher = match exact_prewrite_watcher(inner, handle, manifest_id) {
         Ok(watcher) => watcher,
         Err(failure) => return AttemptOutcome::Failed(failure),
@@ -4265,10 +4286,16 @@ async fn attempt_delivery(
     .await
     {
         Some(det) => {
-            // Permission is a positive stamp, never the absence of a
-            // refusal: an unstamped verdict means nobody decided, and
-            // nobody deciding is not the same as deciding yes.
-            if !det.write_ready {
+            // A positive human draft remains a hard boundary. For an
+            // authenticated idle or working agent, however, an unreadable
+            // composer is not a reason to strand a durable doorbell after
+            // the gate already admitted the same live occupant.
+            let unproven_composer_is_still_eligible = handle.notification.is_some()
+                && watcher.pane(&handle.pane_id).is_some_and(|row| {
+                    notification_pane_for_unproven_composer(inner, handle, &row, manifest_id, &det)
+                        .is_some()
+                });
+            if !det.write_ready && !unproven_composer_is_still_eligible {
                 let reason = det.write_block.as_deref().unwrap_or("unstamped");
                 gate_line(
                     inner,
@@ -4294,6 +4321,16 @@ async fn attempt_delivery(
                 }
                 return AttemptOutcome::Failed(AttemptFailure::pane_rebound_before_paste());
             }
+            // A Working runtime is safe only in this narrow, positive shape.
+            // Keep that admission with the in-flight notification: after the
+            // paste, the exact doorbell itself naturally renders as input and
+            // cannot repeat the clean-composer proof that made the write safe.
+            handle.set_working_clean_submit_admitted(
+                handle.notification.is_some()
+                    && det.state == AgentState::Working
+                    && det.write_ready
+                    && det.screen_proves_write_safe_composer(),
+            );
         }
         None => {
             injector.discard().await;
@@ -4555,34 +4592,37 @@ async fn attempt_delivery(
     // Verification proved a representation at a moment, and Enter is sent
     // at a later one. A person can append to the staged text, or replace
     // it, in between; pressing Enter then submits something nobody
-    // verified and nobody wrote. So the exact staged representation is
-    // proven again here, from a capture taken now.
-    let recheck = match injector.capture_joined_escaped(&handle.pane_id).await {
+    // verified and nobody wrote. Repaint is also not atomic: after a valid
+    // paste proof, a capture can land between the terminal clear and the
+    // renderer's next complete frame. Reuse the bounded post-paste evidence
+    // schedule so that transient incomplete frames do not turn a clean,
+    // owned doorbell into a false verify failure.
+    let recheck = match recheck_exact_staging_snapshot(
+        &injector,
+        &handle.pane_id,
+        manifest,
+        target,
+        &selected.bytes,
+        id_staged,
+        &payload_at_proof,
+    )
+    .await
+    {
         Ok(now) => now,
-        Err(_) => {
+        Err(ExactStagingRecheck::Unobservable) => {
             // Nobody looked, so nobody may press Enter.
             unregister_ack(inner, handle);
             gate_line(inner, handle, "rebound", None, Some("recheck_unobservable"));
             return AttemptOutcome::Failed(AttemptFailure::verify_timeout());
         }
+        Err(ExactStagingRecheck::Mismatch) => {
+            unregister_ack(inner, handle);
+            gate_line(inner, handle, "rebound", None, Some("staging_changed"));
+            return AttemptOutcome::Failed(AttemptFailure::verify_mismatch(
+                ComposerState::ComposerAmbiguous,
+            ));
+        }
     };
-    // Not just "something valid is staged": the SAME thing must be staged.
-    // A human can replace one verified representation with another between
-    // the proof and the key, and a validity-only check would wave it through.
-    if !exact_staging_snapshot_matches(
-        manifest,
-        &recheck,
-        target,
-        &selected.bytes,
-        id_staged,
-        &payload_at_proof,
-    ) {
-        unregister_ack(inner, handle);
-        gate_line(inner, handle, "rebound", None, Some("staging_changed"));
-        return AttemptOutcome::Failed(AttemptFailure::verify_mismatch(
-            ComposerState::ComposerAmbiguous,
-        ));
-    }
     // The capture above took time, so the occupant is checked once more
     // after it. Otherwise the last thing proven about who owns the pane is
     // older than the last thing proven about what is in it.
@@ -4591,7 +4631,8 @@ async fn attempt_delivery(
         gate_line(inner, handle, "rebound", None, Some(&detail));
         return AttemptOutcome::Failed(AttemptFailure::pane_rebound_after_paste());
     }
-    if let Err(detail) = notification_staged_action_safe(inner, handle, manifest, &recheck, &proven)
+    if let Err(detail) =
+        notification_staged_action_safe(inner, handle, manifest, &recheck, &proven, true)
     {
         unregister_ack(inner, handle);
         gate_line(inner, handle, "rebound", None, Some(&detail));
@@ -4629,30 +4670,20 @@ async fn attempt_delivery(
     // one key attempt; it never authorizes changed or unobservable bytes.
     if notification_submit_reserved {
         inject_pause(inner, "post_submit_reservation").await;
-        let reserved_recheck = injector.capture_joined_escaped(&handle.pane_id).await;
-        match reserved_recheck {
+        match recheck_exact_staging_snapshot(
+            &injector,
+            &handle.pane_id,
+            manifest,
+            target,
+            &selected.bytes,
+            id_staged,
+            &payload_at_proof,
+        )
+        .await
+        {
             Ok(now) => {
-                if !exact_staging_snapshot_matches(
-                    manifest,
-                    &now,
-                    target,
-                    &selected.bytes,
-                    id_staged,
-                    &payload_at_proof,
-                ) {
-                    gate_line(
-                        inner,
-                        handle,
-                        "rebound",
-                        None,
-                        Some("staging_changed_after_submit_reservation"),
-                    );
-                    return AttemptOutcome::Failed(AttemptFailure::verify_mismatch(
-                        ComposerState::ComposerAmbiguous,
-                    ));
-                }
                 if let Err(detail) =
-                    notification_staged_action_safe(inner, handle, manifest, &now, &proven)
+                    notification_staged_action_safe(inner, handle, manifest, &now, &proven, true)
                 {
                     gate_line(
                         inner,
@@ -4664,7 +4695,19 @@ async fn attempt_delivery(
                     return AttemptOutcome::Failed(AttemptFailure::verify_failed());
                 }
             }
-            Err(_) => {
+            Err(ExactStagingRecheck::Mismatch) => {
+                gate_line(
+                    inner,
+                    handle,
+                    "rebound",
+                    None,
+                    Some("staging_changed_after_submit_reservation"),
+                );
+                return AttemptOutcome::Failed(AttemptFailure::verify_mismatch(
+                    ComposerState::ComposerAmbiguous,
+                ));
+            }
+            Err(ExactStagingRecheck::Unobservable) => {
                 gate_line(
                     inner,
                     handle,
@@ -4890,14 +4933,18 @@ fn finish_attempt_delivery_inject_failure(
 /// Re-prove that an automatic notification submit still owns this exact
 /// staged composer. The caller separately compares the normalized bytes.
 /// This check binds that content to the current process generations and
-/// manifest, requires a terminal-safe visual state, and refuses any live
-/// lifecycle or blocked-state conflict retained by fusion.
+/// manifest, requires a terminal-safe visual state, and refuses any known
+/// blocked-state or final-submit conflict. An ordinary in-flight notification
+/// can use the exact proof when a vendor's short screen projection loses the
+/// prompt row to chrome; recovery and terminal clear paths stay on the
+/// quiet-frame rule.
 fn notification_staged_action_safe(
     inner: &Arc<Inner>,
     handle: &DeliveryHandle,
     manifest: &Manifest,
     capture: &str,
     proven: &fusion::Binding,
+    allow_inflight_working_admission: bool,
 ) -> Result<(), String> {
     let Some(notification) = &handle.notification else {
         return Ok(());
@@ -4921,20 +4968,63 @@ fn notification_staged_action_safe(
     let state = manifest
         .evaluate_esc(&row.title, &strip_csi(capture), Some(capture))
         .map(|rule| rule.state);
-    if !matches!(state, Some(AgentState::Idle | AgentState::IdleWithInput)) {
+    if matches!(
+        state,
+        Some(
+            AgentState::BlockedModal
+                | AgentState::BlockedPermission
+                | AgentState::BlockedQuota
+                | AgentState::Dead
+        )
+    ) {
         return Err("staged_manifest_state_unsafe".to_string());
     }
     let Some(agent) = process_instance_id(proven.agent) else {
         return Err("binding_unprovable".to_string());
     };
-    if !fusion::staged_action_ready(
+    // Exact bytes and an unchanged binding are stronger than a fixed tail
+    // window that happened to omit a long wrapped prompt. This is deliberately
+    // limited to a non-Working normal post-paste submit: a freshly observed
+    // Working edge still needs the separately recorded clean-composer
+    // admission. Claim recovery and terminal clear retain the stricter
+    // quiet-frame rule below.
+    if allow_inflight_working_admission
+        && fusion::staged_exact_submit_ready(
+            inner,
+            handle.session_idx,
+            &handle.pane_id,
+            &notification.attempt_id().to_string(),
+            agent,
+            &proven.manifest,
+        )
+    {
+        return Ok(());
+    }
+    let working_clean_submit = allow_inflight_working_admission
+        && state == Some(AgentState::Working)
+        && handle.working_clean_submit_admitted();
+    if !matches!(state, Some(AgentState::Idle | AgentState::IdleWithInput)) && !working_clean_submit
+    {
+        return Err("staged_manifest_state_unsafe".to_string());
+    }
+    let quiet_staged_action = fusion::staged_action_ready(
         inner,
         handle.session_idx,
         &handle.pane_id,
         &notification.attempt_id().to_string(),
         agent,
         &proven.manifest,
-    ) {
+    );
+    let working_staged_action = working_clean_submit
+        && fusion::staged_working_clean_action_ready(
+            inner,
+            handle.session_idx,
+            &handle.pane_id,
+            &notification.attempt_id().to_string(),
+            agent,
+            &proven.manifest,
+        );
+    if !quiet_staged_action && !working_staged_action {
         return Err("staged_action_unsafe".to_string());
     }
     Ok(())
@@ -5177,7 +5267,7 @@ async fn reconcile_claimed_notification_barrier<I: Injector>(
                 ));
             }
             if let Err(cause) =
-                notification_staged_action_safe(inner, handle, manifest, &staged, proven)
+                notification_staged_action_safe(inner, handle, manifest, &staged, proven, false)
             {
                 return AttemptOutcome::Failed(AttemptFailure::from_inject(cause));
             }
@@ -5347,7 +5437,8 @@ async fn observe_exact_composer_clear<I: Injector>(
         }
         if !row.in_mode
             && clean_composer_proof(manifest, &capture)
-            && notification_staged_action_safe(inner, handle, manifest, &capture, proven).is_ok()
+            && notification_staged_action_safe(inner, handle, manifest, &capture, proven, false)
+                .is_ok()
         {
             return true;
         }
@@ -5485,8 +5576,34 @@ fn binding_unprovable_observation(
     }
 }
 
-fn composer_semantic_missing(detection: &Detection) -> bool {
-    detection.composer_semantic.is_none()
+/// A notification may continue without a clean-composer proof only for an
+/// authenticated agent that is visibly idle or working. A positive human-input
+/// reading is still a hard boundary: Cyclops must never type over it.
+fn unproven_composer_is_eligible(detection: &Detection) -> bool {
+    matches!(detection.state, AgentState::Idle | AgentState::Working)
+        && detection.composer_semantic != Some(ComposerSemantic::HumanInput)
+        && detection.write_block.as_deref() != Some("composer_hold")
+}
+
+/// Return the current foreground agent process for the explicit liveness
+/// policy. Unreadable composers do not block a notification, but a stale or
+/// mismatched process binding still does: that would risk typing into a shell
+/// or a different agent.
+fn notification_pane_for_unproven_composer(
+    inner: &Inner,
+    handle: &DeliveryHandle,
+    row: &PaneRow,
+    manifest_id: &str,
+    detection: &Detection,
+) -> Option<i32> {
+    if !unproven_composer_is_eligible(detection) {
+        return None;
+    }
+    let binding = fusion::admitted_binding(inner, handle.session_idx, row)?;
+    if binding.manifest != manifest_id {
+        return None;
+    }
+    fusion::foreground_pid_checked(row.pane_pid)
 }
 
 fn composer_semantic_observation(
@@ -6028,36 +6145,6 @@ async fn gate(
                             };
                         };
                         let manifest_id = manifest.agent.id.clone();
-                        // Screen evidence cannot repair a manifest that has no
-                        // composer ownership vocabulary. Settle that static
-                        // configuration failure before waiting on pane events.
-                        if handle.notification.is_some()
-                            && !manifest
-                                .rules
-                                .iter()
-                                .any(|rule| rule.composer_semantic.is_some())
-                        {
-                            let Some(observation) =
-                                composer_semantic_observation(inner, handle, &row, &manifest_id)
-                            else {
-                                if last_hold.as_deref() == Some(OBSERVATION_HOLD) {
-                                    return GateOutcome::BlockedPreWrite {
-                                        cause: NotificationPreWriteCause::BindingUnprovable,
-                                        observation: Box::new(binding_unprovable_observation(
-                                            inner,
-                                            handle,
-                                            row.pane_pid,
-                                            &manifest_id,
-                                        )),
-                                    };
-                                }
-                                break 'pane Some(OBSERVATION_HOLD.to_string());
-                            };
-                            return GateOutcome::BlockedPreWrite {
-                                cause: NotificationPreWriteCause::ComposerSemanticMissing,
-                                observation: Box::new(observation),
-                            };
-                        }
                         let Some(det) = crate::observe_pane(
                             inner,
                             handle.session_idx,
@@ -6075,33 +6162,37 @@ async fn gate(
                                 cause: "no_such_pane".to_string(),
                             };
                         };
-                        let screen_reports_idle = det.readings.iter().any(|reading| {
-                            reading.sensor == Sensor::Screen && reading.state == AgentState::Idle
-                        });
-                        if handle.notification.is_some() && screen_reports_idle {
-                            if composer_semantic_missing(&det) {
-                                if let Some(observation) =
-                                    composer_semantic_observation(inner, handle, &row, &manifest_id)
-                                {
-                                    return GateOutcome::BlockedPreWrite {
-                                        cause: NotificationPreWriteCause::ComposerSemanticMissing,
-                                        observation: Box::new(observation),
-                                    };
-                                }
-                            }
-                            if fusion::admitted_binding(inner, handle.session_idx, &row).is_none() {
-                                if last_hold.as_deref() == Some(OBSERVATION_HOLD) {
-                                    return GateOutcome::BlockedPreWrite {
-                                        cause: NotificationPreWriteCause::BindingUnprovable,
-                                        observation: Box::new(binding_unprovable_observation(
-                                            inner,
-                                            handle,
-                                            row.pane_pid,
-                                            &manifest_id,
-                                        )),
-                                    };
-                                }
-                                break 'pane Some(OBSERVATION_HOLD.to_string());
+                        if handle.notification.is_some()
+                            && det.composer_semantic == Some(ComposerSemantic::HumanInput)
+                        {
+                            // A visible human draft is the one notification
+                            // boundary that must wait. Keep this exact
+                            // attempt in Gating and wake only on the pane's
+                            // next evidence edge, so Backspace can release
+                            // it without an operator requeue or a second
+                            // message.
+                            break 'pane Some("composer_hold".to_string());
+                        }
+                        if handle.notification.is_some() {
+                            if let Some(pane_pid) = notification_pane_for_unproven_composer(
+                                inner,
+                                handle,
+                                &row,
+                                &manifest_id,
+                                &det,
+                            ) {
+                                gate_line(
+                                    inner,
+                                    handle,
+                                    "proceed",
+                                    Some(&det.decided_by),
+                                    Some("composer_unproven"),
+                                );
+                                return GateOutcome::Proceed {
+                                    manifest_id,
+                                    pane_pid,
+                                    regate_evidence_changed,
+                                };
                             }
                         }
                         // Unproven hook admission is a durable block, not a
@@ -6217,34 +6308,6 @@ async fn gate(
                                             )),
                                         };
                                     }
-                                    (false, Some("no_write_safe_composer_evidence"))
-                                        if handle.notification.is_some()
-                                            && composer_semantic_missing(&det) =>
-                                    {
-                                        let Some(observation) = composer_semantic_observation(
-                                            inner,
-                                            handle,
-                                            &row,
-                                            &manifest_id,
-                                        ) else {
-                                            return GateOutcome::BlockedPreWrite {
-                                                cause: NotificationPreWriteCause::BindingUnprovable,
-                                                observation: Box::new(
-                                                    binding_unprovable_observation(
-                                                        inner,
-                                                        handle,
-                                                        row.pane_pid,
-                                                        &manifest_id,
-                                                    ),
-                                                ),
-                                            };
-                                        };
-                                        return GateOutcome::BlockedPreWrite {
-                                            cause:
-                                                NotificationPreWriteCause::ComposerSemanticMissing,
-                                            observation: Box::new(observation),
-                                        };
-                                    }
                                     // A composer that reads `ambiguous` on an
                                     // idle pane may be one frame from proof (a
                                     // redraw caught mid-paint) or may never be
@@ -6310,37 +6373,14 @@ async fn gate(
                                             };
                                         }
                                     }
-                                    // A staged composer hold is an exact, durable
-                                    // pre-write refusal. The daemon has observed
-                                    // input it must not type over, so persist the
-                                    // block now instead of leaving the notification
-                                    // in an in-memory gate wait until a later turn.
+                                    // A staged human draft is an exact boundary,
+                                    // not a terminal delivery outcome. Keep the
+                                    // notification in Gating until a pane edge
+                                    // proves the draft was submitted or erased.
                                     (false, Some("composer_hold"))
                                         if handle.notification.is_some() =>
                                     {
-                                        let Some(mut observation) = composer_semantic_observation(
-                                            inner,
-                                            handle,
-                                            &row,
-                                            &manifest_id,
-                                        ) else {
-                                            return GateOutcome::BlockedPreWrite {
-                                                cause: NotificationPreWriteCause::BindingUnprovable,
-                                                observation: Box::new(
-                                                    binding_unprovable_observation(
-                                                        inner,
-                                                        handle,
-                                                        row.pane_pid,
-                                                        &manifest_id,
-                                                    ),
-                                                ),
-                                            };
-                                        };
-                                        observation.write_block = Some("composer_hold".to_string());
-                                        return GateOutcome::BlockedPreWrite {
-                                            cause: NotificationPreWriteCause::WriteReadinessChanged,
-                                            observation: Box::new(observation),
-                                        };
+                                        Some("composer_hold".to_string())
                                     }
                                     (false, reason) => Some(format!(
                                         "not_write_ready:{}",
@@ -6495,27 +6535,7 @@ async fn gate(
                             // for a turn that may never occur (for example a
                             // local slash command).
                             AgentState::IdleWithInput if handle.notification.is_some() => {
-                                let Some(mut observation) = composer_semantic_observation(
-                                    inner,
-                                    handle,
-                                    &row,
-                                    &manifest_id,
-                                ) else {
-                                    return GateOutcome::BlockedPreWrite {
-                                        cause: NotificationPreWriteCause::BindingUnprovable,
-                                        observation: Box::new(binding_unprovable_observation(
-                                            inner,
-                                            handle,
-                                            row.pane_pid,
-                                            &manifest_id,
-                                        )),
-                                    };
-                                };
-                                observation.write_block = Some("composer_hold".to_string());
-                                return GateOutcome::BlockedPreWrite {
-                                    cause: NotificationPreWriteCause::WriteReadinessChanged,
-                                    observation: Box::new(observation),
-                                };
+                                Some("idle_with_input".to_string())
                             }
                             AgentState::IdleWithInput => Some("idle_with_input".to_string()),
                             AgentState::Unknown => Some("unknown".to_string()),
@@ -7583,7 +7603,8 @@ fn sentinel_proof(manifest: &Manifest, screen: &str, msg_id: &str) -> Option<Str
                     .composer_continuation
                     .as_ref()
                     .is_some_and(|continuation| {
-                        captured_content(continuation, plain) == Some(want.as_str())
+                        captured_continuation_content(manifest, continuation, plain)
+                            == Some(want.as_str())
                     })
         })
         .map(|(i, _)| i)
@@ -8602,7 +8623,7 @@ fn exact_staging_proof(
 /// composer row with ASCII spaces. Those renderer-owned suffix cells and the
 /// one ASCII separator consumed at a wrap boundary are ignored. No other byte
 /// may be added, removed, or reordered.
-fn visible_single_line_payload_matches(visible: &str, expected: &str) -> bool {
+pub(crate) fn visible_single_line_payload_matches(visible: &str, expected: &str) -> bool {
     if visible == expected {
         return true;
     }
@@ -8656,6 +8677,60 @@ fn exact_staging_snapshot_matches(
     let current = exact_staging_proof(manifest, screen, target, expected_payload);
     current.as_ref().map(|(_, proof)| proof.as_str()) == Some(payload_at_proof)
         && current.map(|(matched, _)| matched) == Some(id_staged)
+}
+
+/// Why the final exact-staging reread did not produce an owned doorbell.
+///
+/// A renderer can expose a partial frame while it clears and repaints. That
+/// is distinguishable from a broken capture pipe: if at least one capture
+/// completed but none restored the exact proof, the pane changed or remained
+/// ambiguous and Enter stays withheld.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactStagingRecheck {
+    Mismatch,
+    Unobservable,
+}
+
+/// Read the exact staged composer through the same bounded frame schedule as
+/// the post-paste proof. This is a re-observation only: it never writes, and
+/// it accepts only the same normalized payload and staging representation
+/// already proven for this notification.
+async fn recheck_exact_staging_snapshot<I: Injector>(
+    injector: &I,
+    pane_id: &str,
+    manifest: &Manifest,
+    target: StagingTarget<'_>,
+    expected_payload: &str,
+    id_staged: bool,
+    payload_at_proof: &str,
+) -> Result<String, ExactStagingRecheck> {
+    let mut last_delay = 0;
+    let mut observed = false;
+    for delay in VERIFY_DELAYS_MS {
+        if delay > last_delay {
+            tokio::time::sleep(Duration::from_millis(delay - last_delay)).await;
+        }
+        last_delay = delay;
+        let Ok(screen) = injector.capture_joined_escaped(pane_id).await else {
+            continue;
+        };
+        observed = true;
+        if exact_staging_snapshot_matches(
+            manifest,
+            &screen,
+            target,
+            expected_payload,
+            id_staged,
+            payload_at_proof,
+        ) {
+            return Ok(screen);
+        }
+    }
+    Err(if observed {
+        ExactStagingRecheck::Mismatch
+    } else {
+        ExactStagingRecheck::Unobservable
+    })
 }
 
 /// Closed screen-representation outcomes for the Gate 7 component harness.
@@ -8741,8 +8816,9 @@ pub(crate) fn composer_content_from_joined_capture(
         .iter()
         .enumerate()
         .filter_map(|(offset, (_, plain))| {
-            (captured_content(continuation, plain) == Some(want_sentinel.as_str()))
-                .then_some(start + offset)
+            (captured_continuation_content(manifest, continuation, plain)
+                == Some(want_sentinel.as_str()))
+            .then_some(start + offset)
         })
         .filter(|at| trailer_follows(manifest, &rows[*at + 1..]))
         .collect();
@@ -8773,7 +8849,7 @@ pub(crate) fn composer_content_from_joined_capture(
         }
         if plain.is_empty() {
             content.push(String::new());
-        } else if let Some(line) = captured_content(continuation, plain) {
+        } else if let Some(line) = captured_continuation_content(manifest, continuation, plain) {
             if line == want_sentinel {
                 sentinel_count += 1;
             }
@@ -8872,9 +8948,9 @@ fn exact_composer_content_for_state(
                 .then_some((at, content))
         })
         .filter(|(prompt_at, _)| {
-            window[prompt_at + 1..*trailer_at]
-                .iter()
-                .all(|(_, plain)| captured_content(continuation, plain).is_some())
+            window[prompt_at + 1..*trailer_at].iter().all(|(_, plain)| {
+                captured_continuation_content(manifest, continuation, plain).is_some()
+            })
         })
         .collect();
     let [(prompt_at, first)] = prompts.as_slice() else {
@@ -8886,7 +8962,7 @@ fn exact_composer_content_for_state(
         if captured_content(prompt, plain).is_some() {
             return ComposerContentProof::Unprovable;
         }
-        let Some(line) = captured_content(continuation, plain) else {
+        let Some(line) = captured_continuation_content(manifest, continuation, plain) else {
             return ComposerContentProof::Unprovable;
         };
         content.push(line.to_string());
@@ -8912,6 +8988,38 @@ fn captured_content<'a>(pattern: &cyclops_manifest::Regex, row: &'a str) -> Opti
         return None;
     }
     captures.name("content").map(|content| content.as_str())
+}
+
+/// Extract one continuation row without allowing a legacy seed to redefine
+/// the exact payload comparison.
+///
+/// The old shipped AGY pattern captured its renderer's two-cell continuation
+/// gutter as `content`. In the measured AGY 1.1.23 doorbell, a non-space
+/// payload byte immediately follows that gutter. Strip the gutter only for
+/// the complete, exact pre-change shipped manifest source and only when a
+/// third leading ASCII space is absent; a third space could be deliberate
+/// input and must remain a mismatch. An operator-customized manifest with the
+/// same regex does not match that source fingerprint and therefore fails
+/// closed. New manifests express the gutter in their regex, so they never
+/// enter this compatibility path.
+const LEGACY_AGY_PRE_GUTTER_MANIFEST_SHA256: [u8; 32] = [
+    0x9c, 0xfc, 0x99, 0xfd, 0x61, 0xc8, 0x36, 0xa6, 0x54, 0xce, 0x15, 0x24, 0x2c, 0xca, 0xa3, 0x7c,
+    0xaf, 0x53, 0xaa, 0xbc, 0xee, 0x5e, 0xec, 0x1d, 0x02, 0xab, 0xee, 0x5b, 0xe2, 0x28, 0x94, 0x98,
+];
+
+fn captured_continuation_content<'a>(
+    manifest: &Manifest,
+    pattern: &cyclops_manifest::Regex,
+    row: &'a str,
+) -> Option<&'a str> {
+    let content = captured_content(pattern, row)?;
+    let legacy_agy_pattern = manifest.agent.id == "agy"
+        && manifest.source_digest() == LEGACY_AGY_PRE_GUTTER_MANIFEST_SHA256
+        && pattern.as_str() == "^(?P<content>.*)$";
+    if legacy_agy_pattern && content.starts_with("  ") && content.as_bytes().get(2) != Some(&b' ') {
+        return Some(&content[2..]);
+    }
+    Some(content)
 }
 
 /// Does this pattern match the ENTIRE row, rather than some run inside it?
@@ -12253,6 +12361,7 @@ composer_trailer_required_prefix = 1
                 hold: ComposerHold::Clear,
                 turn: None,
                 hold_owner: None,
+                final_submit_conflict_owner: None,
                 composer: crate::ComposerProjection::default(),
                 working_confirmed: false,
                 since: std::time::Instant::now(),
@@ -14302,11 +14411,11 @@ line_regex_esc = ['^❯$']
     }
 
     #[test]
-    fn prewrite_uses_the_independent_composer_semantic_below_the_runtime_winner() {
+    fn notification_liveness_protects_only_positive_human_input() {
         let detection = Detection {
             state: AgentState::Idle,
             readings: vec![cyclops_proto::SensorReading {
-                sensor: Sensor::Screen,
+                sensor: cyclops_proto::Sensor::Screen,
                 state: AgentState::Idle,
                 rule: "runtime_idle".to_string(),
                 ts: 1,
@@ -14321,11 +14430,22 @@ line_regex_esc = ['^❯$']
         };
 
         assert!(
-            !composer_semantic_missing(&detection),
+            !unproven_composer_is_eligible(&detection),
             "a lower-priority composer rule already proved human input"
         );
-        assert!(composer_semantic_missing(&Detection {
+        assert!(unproven_composer_is_eligible(&Detection {
             composer_semantic: None,
+            write_block: Some("no_write_safe_composer_evidence".into()),
+            ..detection.clone()
+        }));
+        assert!(unproven_composer_is_eligible(&Detection {
+            state: AgentState::Working,
+            composer_semantic: Some(ComposerSemantic::Ambiguous),
+            write_block: Some("no_write_safe_composer_evidence".into()),
+            ..detection.clone()
+        }));
+        assert!(!unproven_composer_is_eligible(&Detection {
+            composer_semantic: Some(ComposerSemantic::HumanInput),
             ..detection
         }));
     }
@@ -15076,7 +15196,7 @@ composer_trailer_required_prefix = 1
             (
                 shipped("agy"),
                 format!(
-                    "\x1b[94m>\x1b[39m {}\n{}\n{}\n\x1b[90m{}\n\x1b[38;2;174;198;207mGemini 3.7 Flash · High · /tmp/work · Full · Ctx:",
+                    "\x1b[94m>\x1b[39m {}\n  {}\n  {}\n\x1b[90m{}\n\x1b[38;2;174;198;207mGemini 3.7 Flash · High · /tmp/work · Full · Ctx:",
                     padded(parts[0], 94), padded(parts[1], 96), padded(parts[2], 96), "─".repeat(96)
                 ),
             ),
@@ -15171,7 +15291,7 @@ composer_trailer_required_prefix = 1
             (
                 shipped("agy"),
                 format!(
-                    "\x1b[94m>\x1b[39m {}\n{}\n{}\n{}\n\x1b[90m{}\n\x1b[38;2;174;198;207mGemini 3.7 Flash · High · ~ · Full · Ctx:",
+                    "\x1b[94m>\x1b[39m {}\n  {}\n  {}\n  {}\n\x1b[90m{}\n\x1b[38;2;174;198;207mGemini 3.7 Flash · High · ~ · Full · Ctx:",
                     padded(parts[0], 58),
                     padded(parts[1], 60),
                     padded(parts[2], 60),
@@ -15194,6 +15314,182 @@ composer_trailer_required_prefix = 1
                 manifest.agent.id,
             );
         }
+    }
+
+    /// AGY 1.1.23 paints a two-column gutter before every application-owned
+    /// continuation row. The gutter is terminal chrome, not part of the
+    /// original single-line doorbell, so it must not turn an exact staged
+    /// notification into an ambiguous human draft.
+    #[test]
+    fn agy_indented_wrapped_doorbell_reaches_the_submit_gate() {
+        let manifest = Manifest::parse(
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../resources/manifests/agy.toml"
+            )),
+            std::path::Path::new("agy"),
+        )
+        .expect("shipped AGY manifest parses");
+        let attempt =
+            NotificationAttemptId::parse("att-01234567-89ab-4def-8123-456789abcdef").unwrap();
+        let expected = cyclops_proto::render_doorbell_v4(
+            "implementer",
+            "Check the exact wrapped doorbell before submitting it to the recipient.",
+            attempt,
+        );
+        let parts = [
+            "[cyclops from implementer] Check the exact wrapped doorbell before",
+            "submitting it to the recipient. | cyclops inbox claim",
+            "m-att_ASNFZ4mrTe-BI0VniavN7w",
+        ];
+        assert_eq!(parts.join(" "), expected);
+        let capture = format!(
+            "\x1b[94m>\x1b[39m {}\n  {}\n  {}\n\x1b[90m{}\n\x1b[38;2;174;198;207mGemini 3.7 Flash · High · ~ · Full · Ctx:",
+            parts[0],
+            parts[1],
+            parts[2],
+            "─".repeat(80),
+        );
+
+        assert_eq!(
+            exact_staging_proof(
+                &manifest,
+                &capture,
+                StagingTarget::ExactRow(&expected),
+                &expected,
+            ),
+            Some((true, expected.clone())),
+            "the measured AGY continuation gutter is renderer chrome, not user input",
+        );
+
+        let legacy_source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../resources/manifests/agy.toml"
+        ))
+        .replacen(
+            "region = \"bottom_non_empty_lines(8)\"",
+            "region = \"bottom_non_empty_lines(5)\"",
+            1,
+        )
+        .replacen(
+            "On 1.1.23, a 70-column pane can wrap a staged doorbell across the prompt and\n\
+             three unstyled continuation rows. The divider and status chrome below make\n\
+             this an eight-row bottom window. The extra rows are needed only to include the\n\
+             styled prompt; they do not relax the escaped discriminator.\n\n\
+             The empty composer still renders exactly 'ESC[94m>ESC[39m' with no ghost or\n\
+             suggestion text. If a future version paints one, this rule fails closed as\n\
+             input until that representation is measured.\"\"\"\n\
+             evidence = \"MEASURED: active staged doorbell ESC[94m>ESC[39m text and transcript echo ESC[1mESC[34m> text (2026-08-26, agy 1.1.21); a 4-row wrapped active doorbell at 70 columns needs the 8-row window (2026-09-02, agy 1.1.23); empty composer has no ghost text (2026-08-20, agy 1.1.13)\"",
+            "On 1.1.23, a narrow pane wrapped a staged doorbell across the prompt and two\n\
+             unstyled continuation rows. The divider and status row below make this a\n\
+             five-row bottom window. The extra row is needed only to include the styled\n\
+             prompt; it does not relax the escaped discriminator.\n\n\
+             The empty composer still renders exactly 'ESC[94m>ESC[39m' with no ghost or\n\
+             suggestion text. If a future version paints one, this rule fails closed as\n\
+             input until that representation is measured.\"\"\"\n\
+             evidence = \"MEASURED: active staged doorbell ESC[94m>ESC[39m text and transcript echo ESC[1mESC[34m> text (2026-08-26, agy 1.1.21); a 3-row wrapped active doorbell needs the 5-row window (2026-09-01, agy 1.1.23); empty composer has no ghost text (2026-08-20, agy 1.1.13)\"",
+            1,
+        )
+        .replacen(
+            "# followed by one separator space and the exact compact doorbell. AGY 1.1.23\n\
+             # paints exactly two ASCII gutter columns before every wrapped continuation\n\
+             # row. They are renderer chrome, not message bytes, so the content capture\n\
+             # begins after them. The styled trailer still proves the active composer\n\
+             # boundary before Cyclops can submit. AGY 1.1.22 may leave the Ctx value empty\n\
+             # and paints the model name with truecolor instead of the earlier 256-color\n\
+             # palette; both measured shapes remain chrome-only.",
+            "# followed by one separator space and the exact compact doorbell. Joined\n\
+             # continuation rows carry no trusted chrome here, so preserve every byte and\n\
+             # let the exact payload comparison decide. The styled trailer still proves the\n\
+             # active composer boundary before Cyclops can submit. AGY 1.1.22 may leave the\n\
+             # Ctx value empty and paints the model name with truecolor instead of the\n\
+             # earlier 256-color palette; both measured shapes remain chrome-only.",
+            1,
+        )
+        .replacen(
+            "composer_continuation_regex = '^  (?P<content>.*)$'",
+            "composer_continuation_regex = '^(?P<content>.*)$'",
+            1,
+        );
+        let legacy_manifest = Manifest::parse(&legacy_source, std::path::Path::new("agy.toml"))
+            .expect("the previous shipped AGY manifest parses");
+        assert_eq!(
+            legacy_manifest.source_digest(),
+            LEGACY_AGY_PRE_GUTTER_MANIFEST_SHA256,
+            "the compatibility case is the exact historical shipped source",
+        );
+        assert_eq!(
+            exact_staging_proof(
+                &legacy_manifest,
+                &capture,
+                StagingTarget::ExactRow(&expected),
+                &expected,
+            ),
+            Some((true, expected.clone())),
+            "an unedited old AGY seed still ignores its measured renderer gutter",
+        );
+
+        let customized_source = legacy_source.replacen(
+            "display_name = \"Antigravity CLI\"",
+            "display_name = \"Antigravity CLI (operator-customized)\"",
+            1,
+        );
+        let customized_manifest =
+            Manifest::parse(&customized_source, std::path::Path::new("agy.toml"))
+                .expect("an operator-customized AGY manifest parses");
+        assert_ne!(
+            customized_manifest.source_digest(),
+            LEGACY_AGY_PRE_GUTTER_MANIFEST_SHA256,
+            "a changed manifest must not inherit the historic seed exception",
+        );
+        assert!(
+            exact_staging_proof(
+                &customized_manifest,
+                &capture,
+                StagingTarget::ExactRow(&expected),
+                &expected,
+            )
+            .is_none(),
+            "an operator-customized generic continuation rule must retain every captured byte",
+        );
+
+        let with_user_space = capture.replacen(
+            &format!("\n  {}", parts[1]),
+            &format!("\n    {}", parts[1]),
+            1,
+        );
+        assert!(
+            exact_staging_proof(
+                &legacy_manifest,
+                &with_user_space,
+                StagingTarget::ExactRow(&expected),
+                &expected,
+            )
+            .is_none(),
+            "legacy compatibility must not strip a third leading input space",
+        );
+        assert!(
+            exact_staging_proof(
+                &manifest,
+                &with_user_space,
+                StagingTarget::ExactRow(&expected),
+                &expected,
+            )
+            .is_none(),
+            "the current extractor keeps deliberate spaces after its two-cell gutter",
+        );
+
+        let changed = capture.replacen(parts[1], "changed continuation", 1);
+        assert!(
+            exact_staging_proof(
+                &manifest,
+                &changed,
+                StagingTarget::ExactRow(&expected),
+                &expected,
+            )
+            .is_none(),
+            "normalizing the gutter must not normalize changed message content",
+        );
     }
 
     #[test]
@@ -15428,6 +15724,60 @@ composer_trailer_required_prefix = 1
         assert!(
             !would_submit_above,
             "recheck must detect draft row above doorbell and withhold enter"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exact_staging_recheck_waits_out_a_partial_repaint_but_not_a_draft() {
+        let manifest = sentinel_manifest();
+        let message_id = MessageId::new("m-3f9c2a").expect("valid message id");
+        let doorbell = cyclops_proto::render_doorbell_v1(&message_id);
+        let exact = format!("\u{1b}[39m❯ {doorbell}\n{CHROME}");
+        let (id_staged, payload_at_proof) = exact_staging_proof(
+            &manifest,
+            &exact,
+            StagingTarget::ExactRow(&doorbell),
+            &doorbell,
+        )
+        .expect("baseline exact proof");
+
+        // A terminal repaint can expose only the cleared prompt for one
+        // capture. A later complete frame with the same exact bytes is safe
+        // to use; this helper only reads and never widens the proof.
+        let partial_repaint = "\u{1b}[39m❯\n";
+        let repainting = MockInjector::new(vec![partial_repaint, exact.as_str()]);
+        assert_eq!(
+            recheck_exact_staging_snapshot(
+                &repainting,
+                "%1",
+                &manifest,
+                StagingTarget::ExactRow(&doorbell),
+                &doorbell,
+                id_staged,
+                &payload_at_proof,
+            )
+            .await,
+            Ok(exact.clone()),
+            "a partial redraw must not manufacture verify_failed after an exact paste proof"
+        );
+
+        // A stable human edit never becomes the earlier exact doorbell, so
+        // the bounded re-read still refuses to send Enter.
+        let human_draft = format!("\u{1b}[39m❯ {doorbell} human edit\n{CHROME}");
+        let edited = MockInjector::new(vec![human_draft.as_str(); VERIFY_DELAYS_MS.len()]);
+        assert_eq!(
+            recheck_exact_staging_snapshot(
+                &edited,
+                "%1",
+                &manifest,
+                StagingTarget::ExactRow(&doorbell),
+                &doorbell,
+                id_staged,
+                &payload_at_proof,
+            )
+            .await,
+            Err(ExactStagingRecheck::Mismatch),
+            "a durable human edit must still withhold Enter"
         );
     }
 

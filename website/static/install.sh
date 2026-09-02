@@ -10,8 +10,8 @@
 # Flags:
 #   --prefix DIR   install the binaries here instead of picking a directory
 #   --no-path      never edit a shell profile; print the line to add instead
-#   --uninstall    stop the daemon, remove the binaries and the profile
-#                  block, keep ~/.cyclops
+#   --uninstall    stop the daemon, remove the complete Cyclops state home,
+#                  binaries, and the profile block
 #   --help
 #
 # What it will and will not do: it never uses sudo, never touches your
@@ -80,7 +80,7 @@ usage() {
     say "Options:"
     say "  --prefix DIR   install the binaries in DIR"
     say "  --no-path      do not edit a shell profile"
-    say "  --uninstall    stop the daemon, remove binaries and the PATH block"
+    say "  --uninstall    stop the daemon, remove Cyclops state, binaries, and the PATH block"
     say "  --help         show this help"
     exit 0
 }
@@ -219,11 +219,48 @@ do_uninstall() {
     fi
     had_pair_root=0
     { [ -e "$pair_root" ] || [ -L "$pair_root" ]; } && had_pair_root=1
-    if ! "$stopper" update --remove-pair-store --prefix "$pair_prefix"; then
+    if ! "$stopper" update --stop-selected-daemon --prefix "$pair_prefix"; then
         say "refused to validate and stop the selected installation; nothing was removed"
         exit 1
     fi
     note "validated $pair_prefix and stopped its daemon if it was running"
+
+    # `--uninstall` is an explicit request to remove Cyclops. Reuse the CLI's
+    # complete-state remover after the exact installed daemon has stopped so
+    # it keeps its private-root, lease, plan, and recovery protections. The
+    # preview and confirmation occur back-to-back in this one process; a
+    # changed state home still refuses rather than deleting unpreviewed data.
+    state_preview="$("$stopper" remove --all)" || {
+        say "could not preview the current Cyclops state home; binaries and PATH remain installed"
+        exit 1
+    }
+    printf '%s\n' "$state_preview"
+    state_confirmation="$(printf '%s\n' "$state_preview" | awk '
+        /^  confirm     cyclops remove --all --confirm / {
+            sub(/^  confirm     cyclops remove --all --confirm /, "")
+            print
+            exit
+        }
+    ')"
+    if [ -n "$state_confirmation" ]; then
+        if ! "$stopper" remove --all --confirm "$state_confirmation"; then
+            say "complete Cyclops state removal did not finish; binaries and PATH remain installed"
+            exit 1
+        fi
+    else
+        case "$state_preview" in
+            *"result      the current Cyclops state home is absent"*) ;;
+            *)
+                say "could not obtain the exact confirmation for the current Cyclops state home; binaries and PATH remain installed"
+                exit 1
+                ;;
+        esac
+    fi
+
+    if ! "$stopper" update --remove-pair-store --prefix "$pair_prefix"; then
+        say "Cyclops state was removed, but the validated binary pair could not be removed"
+        exit 1
+    fi
     if [ "$had_pair_root" -eq 1 ]; then
         note "removed $pair_root"
     fi
@@ -252,8 +289,8 @@ do_uninstall() {
 
     say ""
     say "${BOLD}✔ cyclops is uninstalled${OFF}"
-    note "your record and config are untouched at ${CYCLOPS_HOME:-$HOME/.cyclops}"
-    note "inspect that state root and remove it yourself only when you no longer need the record"
+    note "removed the complete Cyclops state home at ${CYCLOPS_HOME:-$HOME/.cyclops}"
+    note "vendor hook configuration and skills in agent-owned directories remain outside this removal"
     exit 0
 }
 

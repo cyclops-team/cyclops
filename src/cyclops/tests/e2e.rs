@@ -2545,6 +2545,38 @@ fn default_reply_accepts_a_future_receipt_state_with_the_same_plain_warning() {
 }
 
 #[test]
+fn reply_prints_the_recipient_wake_state() {
+    let result = json!({
+        "msg_id": "m-reply-wake",
+        "seq": 3,
+        "inserted": true,
+        "deliveries": [{
+            "to": "gemmy",
+            "state": "queued",
+            "notification_state": "submitted"
+        }]
+    });
+
+    let plain = run_send_result(
+        "reply-wake-state",
+        result,
+        &[
+            "reply",
+            "m-parent",
+            "--summary",
+            TEST_SUMMARY,
+            "--body",
+            "reply",
+        ],
+    );
+    assert!(plain.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&plain.stdout),
+        "accepted m-reply-wake\nwake ✓ accepted · wake submitted\n"
+    );
+}
+
+#[test]
 fn default_reply_rejects_the_same_incomplete_acceptance_envelope_in_plain_and_json() {
     let plain = run_send_result(
         "rw-empty-reply-plain",
@@ -3619,6 +3651,7 @@ fn update_builds_into_a_cache_that_outlives_the_clone() {
         &[
             ("CYCLOPS_REPO", repo.to_str().expect("utf8")),
             ("CYCLOPS_REF", "HEAD"),
+            ("HOME", home.to_str().expect("utf8")),
         ],
         &["update", "--plain"],
         None,
@@ -3633,9 +3666,14 @@ fn update_builds_into_a_cache_that_outlives_the_clone() {
         .find_map(|line| line.strip_prefix("SAW "))
         .map(PathBuf::from)
         .expect("the installer should report its cache path");
+    let expected_cache_parent = if cfg!(target_os = "macos") {
+        home.join("Library/Caches/Cyclops")
+    } else {
+        home.join(".cache/cyclops")
+    };
     assert!(
-        !cache.starts_with(&home),
-        "Cargo build artifacts must stay outside CYCLOPS_HOME: {}",
+        cache.starts_with(&expected_cache_parent),
+        "Cargo build artifacts belong in the visible user cache: {}",
         cache.display()
     );
     // Named, because a gigabyte-scale directory the operator never asked

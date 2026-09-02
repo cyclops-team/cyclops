@@ -1648,6 +1648,12 @@ pub(crate) struct DetEntry {
     /// would settle B's barrier: promoting, releasing or clearing a
     /// hold that belongs to a payload A never wrote.
     pub(crate) hold_owner: Option<String>,
+    /// Exact staged delivery that saw a confirmed, exactly keyed terminal
+    /// edge after its Working-plus-clean admission and before its final
+    /// Enter. This is a runtime-only conflict for that final Enter, not a new
+    /// pane state or a general delivery hold. It survives only while the same
+    /// owner keeps a staged barrier on the same cached binding.
+    pub(crate) final_submit_conflict_owner: Option<String>,
     /// Content-free result of joining the current composer observation with
     /// the exact active notification barrier. Composer bytes never enter the
     /// cache or a status response.
@@ -3113,6 +3119,22 @@ impl Daemon {
         let detections = self.inner.detections.lock().expect("detections lock");
         let entry = detections.get(&PaneKey::new(session_idx, pane_id))?;
         Some((entry.hold, entry.hold_owner.clone()))
+    }
+
+    /// Test seam: inspect the one exact staged delivery whose final Enter is
+    /// blocked by a confirmed terminal lifecycle edge.
+    #[doc(hidden)]
+    pub fn final_submit_conflict_owner_for_test(
+        &self,
+        session_idx: usize,
+        pane_id: &str,
+    ) -> Option<String> {
+        self.inner
+            .detections
+            .lock()
+            .expect("detections lock")
+            .get(&PaneKey::new(session_idx, pane_id))
+            .and_then(|entry| entry.final_submit_conflict_owner.clone())
     }
 
     /// Test-only seam: panic at the synchronous on_write boundary before record_writing for the specified attempt.
@@ -5902,6 +5924,14 @@ async fn run_session(
         )
         .await;
         apply_route_evidence_observation(inner, idx, &row.pane_id, &route_evidence);
+    }
+    // Boot scans durable force-submit candidates before watcher tasks attach.
+    // Once this watcher has published its current routes, re-arm those exact
+    // candidates so a transient missing route did not discard the one-shot
+    // fallback. The messaging Module selects candidates; the runtime still
+    // rechecks binding and reserves the only terminal key.
+    if let Some(messaging) = inner.workspace_messaging() {
+        messaging.force_submit_routes_available();
     }
     // Per-pane debounce kickers for output activity.
     let mut debounce: HashMap<String, watch::Sender<u64>> = HashMap::new();
@@ -9193,6 +9223,7 @@ process_names = ["never"]
                 hold: cyclops_proto::ComposerHold::Staged,
                 turn: Some(turnkey::TurnKey::for_test(&["turn-1"])),
                 hold_owner: Some("m-old".into()),
+                final_submit_conflict_owner: None,
                 composer: ComposerProjection::default(),
                 working_confirmed: true,
                 since: Instant::now(),

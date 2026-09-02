@@ -279,6 +279,13 @@ fn skill_state(installation: Installation, asset: AssetRead) -> (&'static str, b
     }
 }
 
+/// Runtime doorbell capability and managed-skill ownership answer different
+/// questions. The daemon validates exact regular bytes without following the
+/// final link; managed writes additionally require a private, stable parent.
+fn mailbox_capability_ready(installed: bool, capability_path: Option<&Path>) -> Option<bool> {
+    installed.then(|| capability_path.is_some_and(cyclops_manifest::mailbox_capability::is_current))
+}
+
 fn hook_state(
     installation: Installation,
     kind: crate::hookset::CliKind,
@@ -332,11 +339,8 @@ fn consumer_check(
         .mailbox_capability_file
         .as_deref()
         .and_then(|path| cyclops_manifest::mailbox_capability::resolve_path(path, user_home));
-    let mailbox_capability_ready = installed.then(|| {
-        installation == Installation::Present
-            && mailbox_capability_path.as_deref() == Some(skill_path.as_path())
-            && skill_state == "current"
-    });
+    let mailbox_capability_ready =
+        mailbox_capability_ready(installed, mailbox_capability_path.as_deref());
     ConsumerCheck {
         id: spec.id,
         name: spec.name,
@@ -546,6 +550,30 @@ pub fn run_plan(json_out: bool, style: &Style) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_current_doorbell_skill_does_not_need_a_private_parent_to_report_runtime_capability() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("skills/cyclops");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let skill = parent.join("SKILL.md");
+        std::fs::write(&skill, crate::skillseed::SHIPPED).unwrap();
+        let location = crate::consumer::AssetLocation {
+            root: root.path().to_path_buf(),
+            relative: PathBuf::from("skills/cyclops/SKILL.md"),
+        };
+
+        assert!(matches!(
+            read_skill_asset(&location),
+            AssetRead::ManualReview
+        ));
+        assert!(cyclops_manifest::mailbox_capability::is_current(&skill));
+        assert_eq!(mailbox_capability_ready(true, Some(&skill)), Some(true));
+    }
 
     #[test]
     fn only_current_or_edited_owned_files_are_ready() {

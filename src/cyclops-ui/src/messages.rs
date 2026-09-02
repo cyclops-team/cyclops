@@ -273,7 +273,7 @@ fn row_for(
         subject: row.subject.as_deref().map(crate::grid::safe_text),
         mailbox: mailbox_word(&to.mailbox),
         wake,
-        cause: to.notification.cause,
+        cause: active_attention_cause(&to.notification, wake),
         pre_write_cause: to.notification.pre_write_cause,
         pre_write_block: to.notification.pre_write_block.clone(),
         wake_block: to.notification.wake_block,
@@ -284,6 +284,22 @@ fn row_for(
         seq: row.seq,
         updated_at: to.notification.updated_at.unwrap_or(row.ts),
         direction: direction(to.direction),
+    }
+}
+
+/// The current hold cause, if this wake is still asking someone to act.
+///
+/// Notification summaries retain an original after-write cause after a later
+/// resolution so the ledger can explain the attempt. The queue is a current
+/// work surface: showing that historical cause next to a submitted, discarded,
+/// or cleared wake makes a completed recovery look like an active hold.
+fn active_attention_cause(
+    notification: &cyclops_proto::MessageNotificationSummary,
+    wake: WakeWord,
+) -> Option<cyclops_proto::NotificationAttentionCause> {
+    match wake {
+        WakeWord::NeedsAttention | WakeWord::ResolutionIncomplete => notification.cause,
+        _ => None,
     }
 }
 

@@ -69,8 +69,8 @@ visible target or terminal sentinel is structural evidence, not ownership by
 itself. A collapsed chip proves only a vendor representation because its hidden
 bytes cannot be compared. It never authorizes Enter.
 
-`notification.force_submit` is the separately documented default-off,
-administrator-controlled exception. It never pastes or replaces bytes. For one
+`notification.force_submit` is the separately documented default-on,
+administrator-controlled recovery. It never pastes or replaces bytes. For one
 exact current `verify_failed` attempt, it rechecks the route and binding,
 records durable intent, and atomically reserves one forced key with
 `inbox.claim` before it may send without composer-content proof. It can
@@ -152,7 +152,7 @@ fresh positive evidence, checks the exact occupant, records intent before the
 effect, and treats ambiguous outcomes conservatively. Do not weaken those
 guards or describe them as proof that concurrent input is impossible.
 
-The default-off `notification.force_submit` recovery setting is deliberately
+The default-on `notification.force_submit` recovery setting is deliberately
 outside this ordinary proof path. It does not add a paste or replace visible
 bytes, but it may send one submit key without composer-content proof for an
 exact `verify_failed` attempt and may therefore submit later human input. Its
@@ -490,6 +490,37 @@ running turn may write only when the same fresh capture contains a live screen
 `Working` reading plus an independent clean or ghost composer proof.
 Hook-derived idle or Working without that proof never authorizes an ordinary
 write.**
+
+For an ordinary mailbox doorbell admitted in that exact Working-plus-proof
+shape, the same in-flight proof also permits its final Enter while the current
+frame remains Working. The paste itself now occupies the composer, so the
+final screen cannot repeat the clean proof; it must instead prove the exact
+attempt-owned doorbell bytes, the same binding, and no mode or blocked state.
+This is not a recovery or operator-resolution permission. A human or
+ambiguous composer never gains it, and any changed staged bytes still withhold
+Enter as `verify_failed`. Unknown or blocked reading, stale evidence, mode,
+or named non-composer refusal is a live conflict and also withholds Enter,
+even if the screen still paints `working`. A confirmed, exactly keyed terminal
+edge that arrives after this attempt was staged becomes a private final-submit
+conflict for that exact owner. A newer Screen `working` capture may correctly
+supersede the old Hook idle in public detection; the private conflict neither
+changes that public state nor authorizes a write. It only prevents this one
+Enter from racing the ended turn, and disappears when the owned barrier clears,
+changes owner or binding, or becomes a turn-start barrier. An unkeyed terminal
+event never acquires that conflict by arrival order.
+Only a screen `idle` or `idle_with_input` reading that describes the owned
+staged composer may coexist with the current Screen `working` reading. The
+same current `working` observation may mark that owned barrier
+`staged_during_turn`. While that frame is Working, the marker is eligible only
+for the already-admitted in-flight submit. If a later fresh quiet frame still
+shows the same exact attempt-owned doorbell, ordinary reconciliation may
+re-open only that owner. It must re-prove the recorded binding, manifest, no
+mode or stale conflict, and the exact visible bytes before reserving one
+existing key. It never makes the pane generally write-ready; human, changed,
+hidden, modal, or unprovable content still withholds Enter. The final proof may
+take its bounded capture rereads to pass a partial terminal
+repaint, but that re-observation never repeats the paste or Enter: only a
+current frame with the same exact bytes can authorize the one reserved key.
 
 What breaks: the same damage as rule 3, reached from the opposite
 direction. Rule 3 holds when the screen sensor SEES staged text. This rule

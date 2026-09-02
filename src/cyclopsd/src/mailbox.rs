@@ -5084,7 +5084,46 @@ impl MailboxService {
             .map(|entry| entry.message_id.clone())
     }
 
-    /// Queue or resume the oldest pending notification for one recipient.
+    /// Oldest mailbox entry whose pane doorbell has not reached a terminal
+    /// result. A socket claim retrieves the body, but does not cancel its
+    /// separate human-visible notification obligation.
+    fn first_actionable_notification_message_id(
+        store: &MessageStore,
+        recipient: RecipientKey,
+    ) -> Option<MessageId> {
+        store
+            .projection()
+            .mailboxes
+            .get(&recipient)?
+            .values()
+            .find(|entry| {
+                if entry.state.is_pending() {
+                    return !store
+                        .projection()
+                        .notification_withdrawn_by_operator(recipient, &entry.message_id);
+                }
+                if !entry.state.is_claimed() {
+                    return false;
+                }
+                store
+                    .projection()
+                    .notification(recipient, &entry.message_id)
+                    .is_none_or(|record| {
+                        matches!(
+                            record.state,
+                            NotificationState::Queued
+                                | NotificationState::Gating
+                                | NotificationState::Writing
+                                | NotificationState::Staged
+                                | NotificationState::Submitting
+                                | NotificationState::Submitted
+                        )
+                    })
+            })
+            .map(|entry| entry.message_id.clone())
+    }
+
+    /// Queue or resume the oldest unnotified doorbell for one recipient.
     ///
     /// This method owns the atomic mailbox decision so concurrent sends
     /// cannot mint two attempts. The scheduler binds or explicitly blocks
@@ -5126,7 +5165,8 @@ impl MailboxService {
             .then_some(record));
         }
         loop {
-            let Some(message_id) = Self::first_actionable_pending_message_id(&store, recipient)
+            let Some(message_id) =
+                Self::first_actionable_notification_message_id(&store, recipient)
             else {
                 return Ok(None);
             };
@@ -9768,6 +9808,60 @@ mod tests {
         let next = service.prepare_oldest_notification(bob).unwrap().unwrap();
         assert_eq!(next.message_id, second_id);
         assert_ne!(next.attempt_id, first_attempt);
+    }
+
+    #[test]
+    fn socket_claim_does_not_skip_a_later_reply_doorbell() {
+        let scratch = StoreScratch::new("claimed-replies-still-ring");
+        let root = scratch.root();
+        let journal = Path::new("workspaces/current/messages.ndjson");
+        let (workspace, _, bob, _) = test_context();
+        let directory = || {
+            MailboxDirectory::new(
+                workspace,
+                [MailboxIdentity {
+                    key: bob,
+                    label: "reviewer".into(),
+                }],
+            )
+            .unwrap()
+        };
+        let store = MessageStore::open(&root, journal, workspace, "boot").unwrap();
+        let service = MailboxService::new(directory(), store);
+        let first = service
+            .send(service.admin(), mailbox_send("reviewer", "First", ""))
+            .unwrap();
+        let second = service
+            .send(service.admin(), mailbox_send("reviewer", "Second", ""))
+            .unwrap();
+        let queued = service.prepare_oldest_notification(bob).unwrap().unwrap();
+        let context = crate::notification_adapter::NotificationContext::new(
+            service.store_handle(),
+            first.message_id.clone(),
+            bob,
+            queued.attempt_id,
+        );
+        let binding = notification_binding(bob);
+        context.record_gating().unwrap();
+        context
+            .record_writing(
+                binding.pane_root.unwrap(),
+                binding.leader.unwrap(),
+                binding.agent,
+                "codex",
+                NotificationTransport::Doorbell,
+                Some(4),
+            )
+            .unwrap();
+        context.record_staged().unwrap();
+        context.reserve_submit().unwrap();
+        context.record_submitted().unwrap();
+        context.record_notified().unwrap();
+        service.claim(bob, first.message_id).unwrap();
+
+        let next = service.prepare_oldest_notification(bob).unwrap().unwrap();
+        assert_eq!(next.message_id, second.message_id);
+        assert_eq!(next.state, NotificationState::Queued);
     }
 
     #[test]

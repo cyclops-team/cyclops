@@ -80,6 +80,7 @@ than a measurement.
 | F75 | A repaint must not query cursor position while the workspace event reader owns stdin | binds |
 | F79 | A watched session with an unavailable tmux server waits for an explicit `session.watch` availability edge; its creator supplies it after creation | binds |
 | F80 | `has-session` proves a named absence only with tmux's exact missing-session reply; an unreachable socket is uncertainty | binds |
+| F83 | AGY 1.1.23 wraps active composer input across three rows with a two-cell continuation gutter, so extraction must exclude the gutter before exact payload proof | binds |
 
 ## F13. refresh-client -B subscriptions work in control mode on tmux 3.6a (MEASURED)
 
@@ -2326,3 +2327,34 @@ it may retry a changed layout once, but does not loop over an unchanged clamp.
 Probes: `two_owned_sessions_without_a_displayed_background_tab_do_not_loop`
 and `a_target_tmux_declines_is_asked_for_once_not_forever` in
 `src/cyclops-workspace/src/app.rs` exercise the real tmux notification seam.
+
+## F83. AGY 1.1.23 can wrap active composer input across three rows (MEASURED)
+
+MEASURED 2026-09-01 in an isolated `tmux 3.6a` server, with AGY 1.1.23 in a
+100x30 pane. The probe launched AGY in a disposable `mktemp` root, accepted
+only its local project-trust dialog, staged a redacted long input with
+`load-buffer` plus `paste-buffer -p`, and did not press Enter. It then recorded
+`tmux -u -L <isolated-socket> capture-pane -p -e -J`.
+
+The pertinent escaped rows were:
+
+```text
+ESC[94m>ESC[39m [redacted staged input] ...
+  [redacted staged input] ...
+  [redacted staged input] ...
+ESC[90m────────────────...
+ESC[38;2;174;198;207mGemini 3.7 Flash ... Ctx: 100%
+```
+
+The scrubbed capture is
+`src/cyclops-manifest/tests/fixtures/agy_wrapped_active_composer_1_1_23_esc.txt`.
+It replaces the staged text and disposable root with redaction markers; it
+contains no user message, mailbox token, account identity, or real path.
+
+This proves the AGY painter's three-row active-composer shape, its two-cell
+continuation gutter, and the manifest classifier's required five-row window on
+this version and width. The delivery regression
+`agy_indented_wrapped_doorbell_reaches_the_submit_gate` uses this shape to
+prove that exact visible doorbells pass pre-Enter verification while a changed
+byte or a third leading input space still fails closed. It does not prove a
+receipt or behavior at every width and payload length.

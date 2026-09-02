@@ -51,12 +51,12 @@ pub struct Config {
     /// `None` is the shipped default. A configured positive duration arms one
     /// exact-attempt timer after the first proven doorbell notification.
     pub unclaimed_reminder_ms: Option<u64>,
-    /// Opt-in escape hatch for a notification already pasted into a composer
+    /// Automatic recovery for a notification already pasted into a composer
     /// but left in verify-failed attention. The daemon may press Enter once
     /// after this delay without exact composer-content proof.
     pub force_notification_submit: bool,
-    /// Delay retained while the escape hatch is off, so toggling it back on
-    /// restores the operator's chosen position.
+    /// Delay before the one automatic recovery submit. Set the feature off
+    /// only when an operator explicitly wants to retain the old hold.
     pub force_notification_submit_delay_ms: u64,
     /// Write `role • state` onto an adopted pane's tmux border. On by
     /// default: a named pane that does not say its name is the whole
@@ -79,8 +79,8 @@ impl Config {
             gate_hold_notify_ms: 120_000,
             ambiguous_composer_settle_ms: 10_000,
             unclaimed_reminder_ms: None,
-            force_notification_submit: false,
-            force_notification_submit_delay_ms: 5_000,
+            force_notification_submit: true,
+            force_notification_submit_delay_ms: 0,
             chrome: true,
         }
     }
@@ -189,17 +189,17 @@ impl Config {
                     Some("on") => cfg.force_notification_submit = true,
                     Some("off") => cfg.force_notification_submit = false,
                     _ => warnings.push(format!(
-                        "`force_notification_submit` must be \"on\" or \"off\", not {value}; leaving it off"
+                        "`force_notification_submit` must be \"on\" or \"off\", not {value}; leaving the automatic default on"
                     )),
                 },
                 "force_notification_submit_delay_ms" => match ms_value(value) {
                     Some(v) if v <= 20_000 => cfg.force_notification_submit_delay_ms = v,
                     Some(_) => warnings.push(
-                        "`force_notification_submit_delay_ms` must be between 0 and 20000; using 5000"
+                        "`force_notification_submit_delay_ms` must be between 0 and 20000; using 0"
                             .to_string(),
                     ),
                     None => warnings.push(format!(
-                        "`force_notification_submit_delay_ms` must be a non-negative integer, not a {}; using 5000",
+                        "`force_notification_submit_delay_ms` must be a non-negative integer, not a {}; using 0",
                         value.type_str()
                     )),
                 },
@@ -439,8 +439,8 @@ next_tab = "Alt+n"
         assert_eq!(cfg.gate_hold_notify_ms, 120_000);
         assert_eq!(cfg.ambiguous_composer_settle_ms, 10_000);
         assert_eq!(cfg.unclaimed_reminder_ms, None);
-        assert!(!cfg.force_notification_submit);
-        assert_eq!(cfg.force_notification_submit_delay_ms, 5_000);
+        assert!(cfg.force_notification_submit);
+        assert_eq!(cfg.force_notification_submit_delay_ms, 0);
 
         let text = "ack_timeout_ms = 200\ndelivery_retry_max = 0\nreceipt_block_ms = 900\ngate_hold_notify_ms = 300\nambiguous_composer_settle_ms = 250\nunclaimed_reminder_ms = 45000\nforce_notification_submit = \"on\"\nforce_notification_submit_delay_ms = 0\n";
         let (cfg, warnings) = Config::parse(text, Path::new("/h")).unwrap();
@@ -468,7 +468,7 @@ next_tab = "Alt+n"
         )
         .unwrap();
         assert!(cfg.force_notification_submit);
-        assert_eq!(cfg.force_notification_submit_delay_ms, 5_000);
+        assert_eq!(cfg.force_notification_submit_delay_ms, 0);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
 

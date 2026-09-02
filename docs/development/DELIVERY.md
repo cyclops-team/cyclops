@@ -206,24 +206,18 @@ settle deadline described below; otherwise it never runs on a timer. In order:
      of turn end).
    - `idle_with_input` (human typing, human always wins): hold in gating,
      re-check on the pane's next state change.
-   - `idle`: proceed only on a positive write-readiness stamp. A refusal
-     holds in gating and the gate line names it
-     (`not_write_ready:<reason>`). `composer_hold` is the one that
+   - `idle` and `working`: proceed on a positive write-readiness stamp. When
+     the occupant and manifest binding are current but the composer cannot be
+     read conclusively, a notification also proceeds and submits once. A
+     positive `human_input` reading remains a durable `composer_hold`; it is
+     the one that
      outlives the frame it was raised on: a pane seen holding text stays
      refused until a turn end with a clean screen reading consumes it, or a
      settled output observation proves that the operator erased the visible
      composer (INVARIANTS rule 12).
-     An idle `composer_semantic: ambiguous` reading holds for one continuous
-     `ambiguous_composer_settle_ms` grace (10 seconds by default). A changed
-     verdict, cancellation, or ordinary terminal outcome cancels that
-     one-shot deadline. If ambiguity still holds at the deadline, the wake
-     becomes a content-free `blocked_pre_write` record with the established
-     `write_readiness_changed` cause and
-     `write_block: composer_semantic_ambiguous` observation. Keeping the
-     detail in the optional observation preserves older strict journal
-     readers. No paste, doorbell, or submit key is attempted while the block
-     remains. Only later, complete route evidence that is write-ready may
-     reopen that exact attempt once.
+     Inconclusive composer evidence is not a permanent message hold. A missing
+     manifest, stale process binding, copy mode, modal prompt, quota block, or
+     dead pane remains a named gate outcome.
 4. Just before pasting, re-read title and capture once more (the gate
    snapshot must be fresher than any human keystroke round-trip). The
    admitted pid is the agent's, resolved fresh; a process table that
@@ -295,15 +289,40 @@ locator.
    On the ordinary notification path, automatic submit runs the full proof
    immediately before the reservation and again after it. Both checks require
    the same pane-root, terminal leader, agent generation, and manifest; no pane
-   mode; a current manifest state of `idle` or `idle_with_input`; and the exact
-   attempt-owned staged barrier with no live lifecycle or blocked-state
-   conflict. A refusal withholds Enter and settles once as `verify_failed`. It
-   is never retried.
+   mode; and the exact attempt-owned staged barrier with no live blocked-state
+   conflict. `idle` and `idle_with_input` qualify normally. A current
+   `working` state also qualifies only when this same in-flight notification
+   was admitted immediately before paste by a fresh screen `working` reading
+   plus a positive clean or ghost composer proof. That narrow capability does
+   not survive retries, recovery, or operator resolution. The final capture
+   must still prove the exact staged doorbell; a human or ambiguous change
+   fails that proof and withholds Enter as `verify_failed`. The fused frame
+   must also remain conflict-free: a retained hook idle/end, unknown or
+   blocked reading, mode, stale observation, or named non-composer refusal
+   withholds Enter even when the current screen still reads `working`. A
+   screen `idle` or `idle_with_input` reading may describe the exact staged
+   composer row only because the owner and bytes are separately re-proven.
+   When that same current `working` observation marks the owned barrier
+   `staged_during_turn`, it remains eligible for this already-admitted
+   in-flight submit while that frame is Working. If a later fresh quiet frame
+   still shows the exact attempt-owned doorbell, ordinary reconciliation may
+   re-open only that owner. It re-proves the recorded binding, manifest, no
+   mode or stale conflict, and exact visible bytes before selecting one
+   existing action. This never makes the pane generally write-ready; human,
+   changed, hidden, modal, or unprovable content still withholds Enter.
+   The final proof uses the same bounded capture sequence as post-paste
+   verification: a terminal repaint can expose a partial frame, but only a
+   later current frame with the same exact doorbell can proceed. These are
+   rereads only, never another paste or Enter. If no reread proves the same
+   doorbell, the refusal is final for this attempt.
 
-   `notification.force_submit` is a separately documented default-off,
-   administrator-controlled fallback for one exact current `verify_failed`
-   doorbell. It never pastes or replaces bytes. After exact binding and route
-   checks, it records durable intent. After its final route and payload proofs,
+   `notification.force_submit` is a separately documented default-on,
+   administrator-controlled recovery for one exact current `verify_failed`
+   doorbell. It never pastes or replaces bytes. Boot may discover a durable
+   candidate before a watcher has a current route; that temporary absence does
+   not settle or discard the candidate, which is reconsidered once the watcher
+   publishes its route. After exact binding and route checks, it records durable
+   intent. After its final route and payload proofs,
    it appends a content-free `notification_resolution_action_reserved` fact
    under the same workspace journal lock as `inbox.claim`, then may send one
    manifest submit key without composer-content proof. It can therefore submit
