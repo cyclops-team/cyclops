@@ -1391,6 +1391,10 @@ COPY_FALLBACK_HOME="$ROOT/copy-fallback"
 COPY_FALLBACK_PREFIX="$COPY_FALLBACK_HOME/bin"
 COPY_FALLBACK_OUT="$ROOT/copy-fallback.out"
 COPY_FALLBACK_MARKER="$ROOT/copy-fallback.marker"
+case "$(uname -s)" in
+  Darwin) COPY_FALLBACK_TARGET="$COPY_FALLBACK_HOME/Library/Caches/Cyclops/installer/target/dist" ;;
+  *) COPY_FALLBACK_TARGET="$COPY_FALLBACK_HOME/.cache/cyclops/installer/target/dist" ;;
+esac
 mkdir -p "$COPY_FALLBACK_HOME"
 printf '\n$ ./scripts/install.sh --prefix ...    # private candidate copy fallback\n'
 run_installer_in "$COPY_FALLBACK_HOME" \
@@ -1405,9 +1409,9 @@ check_file "the fallback simulation reaches the private candidate copy" \
 check_file "the fallback installs the client" "$COPY_FALLBACK_PREFIX/cyclops" '.'
 check_file "and the fallback installs the daemon" "$COPY_FALLBACK_PREFIX/cyclopsd" '.'
 check_same_file "the fallback keeps client bytes exact" \
-  "$REPO/target/dist/cyclops" "$COPY_FALLBACK_PREFIX/cyclops"
+  "$COPY_FALLBACK_TARGET/cyclops" "$COPY_FALLBACK_PREFIX/cyclops"
 check_same_file "and the fallback keeps daemon bytes exact" \
-  "$REPO/target/dist/cyclopsd" "$COPY_FALLBACK_PREFIX/cyclopsd"
+  "$COPY_FALLBACK_TARGET/cyclopsd" "$COPY_FALLBACK_PREFIX/cyclopsd"
 
 echo
 echo "#### An installed pair completes the first durable handoff"

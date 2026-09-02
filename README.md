@@ -70,8 +70,8 @@ rollback, and uninstall.
 ## Uninstall completely
 
 The managed uninstall stops the matching daemon, removes the complete current
-Cyclops state home, the installed binary pair, and the installer-owned PATH
-block:
+Cyclops state home, installed binary pair, Cyclops hook entries, unedited
+seeded skills, and installer-owned PATH block:
 
 ```bash
 curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
@@ -81,15 +81,11 @@ Export anything you want to retain before running it. `cyclops remove --all`
 remains available when you want its explicit preview and confirmation without
 removing the installed binary pair.
 
-Uninstall does not rewrite agent-owned hook configuration or skill files. If
-you want to remove Cyclops hook commands, delete only those entries from
-`~/.claude/settings.json`,
-`~/.codex/hooks.json`, `~/.agents/hooks.json`, and
-`~/.cursor/hooks.json` where those files exist, preserving every unrelated
-entry. Skill files in agent-owned directories, including a Cyclops-seeded
-copy, are separately owned: remove one only when you have checked that it is
-not an operator customization. The [installation guide](docs/guides/install.md#uninstall)
-lists the full removal boundary.
+It removes only exact Cyclops hook commands from vendor configuration and
+only byte-for-byte known Cyclops skill seeds. Unrelated hooks, settings, and
+edited skills stay untouched. If a file cannot be safely proved, uninstall
+stops before state or binaries are removed. The
+[installation guide](docs/guides/install.md#uninstall) lists the full boundary.
 
 ## How to run Cyclops
 

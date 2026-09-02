@@ -3142,6 +3142,7 @@ pub fn run(
     install_pair: Option<&Path>,
     remove_pair_store: bool,
     stop_selected_daemon: bool,
+    remove_integrations: bool,
     prefix: Option<&Path>,
 ) -> i32 {
     if json {
@@ -3164,6 +3165,13 @@ pub fn run(
             return crate::EXIT_USAGE;
         };
         return run_stop_selected_daemon(prefix);
+    }
+    if remove_integrations {
+        let Some(prefix) = prefix else {
+            eprintln!("--remove-integrations requires --prefix");
+            return crate::EXIT_USAGE;
+        };
+        return run_remove_integrations(prefix);
     }
     if let Some(source) = install_pair {
         let Some(prefix) = prefix else {
@@ -3363,6 +3371,59 @@ fn run_stop_selected_daemon(prefix: &Path) -> i32 {
             1
         }
     }
+}
+
+/// Remove only the vendor configuration and agent instructions that Cyclops
+/// itself can prove it owns. This is intentionally an installer-only step:
+/// state removal remains a separately confirmed operation.
+fn run_remove_integrations(prefix: &Path) -> i32 {
+    if let Err(error) = validate_uninstall_pair(prefix) {
+        eprintln!("uninstall refused: {error}");
+        return 1;
+    }
+    let mut failed = false;
+    for kind in [
+        crate::hookset::CliKind::Claude,
+        crate::hookset::CliKind::Codex,
+        crate::hookset::CliKind::Agy,
+        crate::hookset::CliKind::Cursor,
+    ] {
+        match crate::hookset::remove_vendor_wiring(kind) {
+            Ok(Some(result)) if result.removed => {
+                println!(
+                    "removed Cyclops {} hooks from {}",
+                    result.vendor,
+                    result.path.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                failed = true;
+                eprintln!("uninstall left vendor configuration unchanged: {error}");
+            }
+        }
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(home) = home {
+        for result in crate::skillseed::remove_owned(&home) {
+            match result.outcome {
+                crate::skillseed::RemovalOutcome::Removed => {
+                    println!(
+                        "removed Cyclops {} skill from {}",
+                        result.consumer,
+                        result.path.display()
+                    );
+                }
+                crate::skillseed::RemovalOutcome::Problem(detail) => {
+                    failed = true;
+                    eprintln!("uninstall left skill unchanged: {detail}");
+                }
+                crate::skillseed::RemovalOutcome::Missing
+                | crate::skillseed::RemovalOutcome::Kept => {}
+            }
+        }
+    }
+    i32::from(failed)
 }
 
 /// Prove that the internal uninstall command is running from the selected

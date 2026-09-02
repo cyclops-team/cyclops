@@ -102,6 +102,25 @@ pub struct SeededSkill {
     pub outcome: Outcome,
 }
 
+/// What explicit uninstall did with one canonical Cyclops skill file.
+///
+/// Uninstall removes only a byte-for-byte known Cyclops seed. A changed file
+/// is the operator's instruction, even when it lives at Cyclops's usual path.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RemovalOutcome {
+    Removed,
+    Missing,
+    Kept,
+    Problem(String),
+}
+
+/// One skill-cleanup result for installer reporting.
+pub(crate) struct RemovedSkill {
+    pub consumer: &'static str,
+    pub path: PathBuf,
+    pub outcome: RemovalOutcome,
+}
+
 /// One body-free preview of a consumer's skill destination.
 pub struct PlannedSkill {
     pub consumer: &'static str,
@@ -258,7 +277,32 @@ fn accepted_skill_parent(
     location: &crate::consumer::AssetLocation,
     create_missing: bool,
 ) -> Result<StateInspector, &'static str> {
-    let mut parent = match StateInspector::open_existing(&location.root) {
+    // Read-only inspection and removal do not need authority over the whole
+    // consumer tree. Open the final parent directly so an ordinary private
+    // scratch root under a platform-owned temporary directory is not mistaken
+    // for a writable consumer directory.
+    if !create_missing {
+        let target = location.path();
+        let parent_path = system_path_without_macos_var_alias(
+            target
+                .parent()
+                .ok_or("skill target has no parent directory")?,
+        );
+        let parent = match StateInspector::open_existing(&parent_path) {
+            Ok(Some(parent)) => parent,
+            Ok(None) => return Err("Cyclops skill directory is missing"),
+            Err(_) => return Err("Cyclops skill directory cannot be safely opened"),
+        };
+        return match parent.owner_controlled_and_stable() {
+            Ok(true) => Ok(parent),
+            Ok(false) => {
+                Err("Cyclops skill directory is not owned by this user or is writable by others")
+            }
+            Err(_) => Err("Cyclops skill directory cannot be safely verified"),
+        };
+    }
+    let root = system_path_without_macos_var_alias(&location.root);
+    let mut parent = match StateInspector::open_existing(&root) {
         Ok(Some(root)) => root,
         Ok(None) => return Err("consumer root is missing"),
         Err(_) => return Err("consumer root cannot be safely opened"),
@@ -309,6 +353,20 @@ fn accepted_skill_parent(
         }
     }
     Ok(parent)
+}
+
+/// macOS exposes `/var` as a system alias for `/private/var`. It is not an
+/// operator-controlled consumer link, but descriptor inspection correctly
+/// refuses arbitrary links. Normalize only that fixed system alias so a skill
+/// in a normal temporary test or installer scratch path remains inspectable.
+fn system_path_without_macos_var_alias(path: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(rest) = path.strip_prefix("/var") {
+            return Path::new("/private/var").join(rest);
+        }
+    }
+    path.to_path_buf()
 }
 
 fn skill_leaf(location: &crate::consumer::AssetLocation) -> Result<&OsStr, ()> {
@@ -613,6 +671,122 @@ pub fn seed() -> Vec<SeededSkill> {
         .collect()
 }
 
+/// Remove only unedited, shipped Cyclops skills during explicit uninstall.
+///
+/// This deliberately leaves consumer directories, unrelated skills, links,
+/// unreadable targets, and edited instructions alone. A failed proof is a
+/// reportable manual-cleanup case, never permission to delete a user path.
+pub(crate) fn remove_owned(home: &Path) -> Vec<RemovedSkill> {
+    targets(home)
+        .into_iter()
+        .map(|target| remove_owned_at(target.consumer, &target.location))
+        .collect()
+}
+
+fn remove_owned_at(
+    consumer: &'static str,
+    location: &crate::consumer::AssetLocation,
+) -> RemovedSkill {
+    let path = location.path();
+    let parent = match accepted_skill_parent(location, false) {
+        Ok(parent) => parent,
+        Err("consumer root is missing") | Err("Cyclops skill directory is missing") => {
+            return RemovedSkill {
+                consumer,
+                path,
+                outcome: RemovalOutcome::Missing,
+            };
+        }
+        Err(cause) => {
+            return RemovedSkill {
+                consumer,
+                path: path.clone(),
+                outcome: RemovalOutcome::Problem(format!(
+                    "manual review required for {}: {cause}; left untouched",
+                    path.display()
+                )),
+            };
+        }
+    };
+    let leaf = match skill_leaf(location) {
+        Ok(leaf) => leaf,
+        Err(()) => {
+            return RemovedSkill {
+                consumer,
+                path: path.clone(),
+                outcome: RemovalOutcome::Problem(format!(
+                    "manual review required for {}: target has no final file name; left untouched",
+                    path.display()
+                )),
+            };
+        }
+    };
+    let file = match parent.read_file(
+        Path::new(leaf),
+        cyclops_state::INSPECTION_FILE_BYTES_LIMIT_MAX,
+    ) {
+        Ok(None) => {
+            return RemovedSkill {
+                consumer,
+                path,
+                outcome: RemovalOutcome::Missing,
+            };
+        }
+        Ok(Some(file))
+            if !file.truncated
+                && skill_file_is_owner_controlled(&file)
+                && unedited_seed(&file.bytes) =>
+        {
+            file
+        }
+        Ok(Some(file)) if !file.truncated && skill_file_is_owner_controlled(&file) => {
+            return RemovedSkill {
+                consumer,
+                path,
+                outcome: RemovalOutcome::Kept,
+            };
+        }
+        Ok(Some(_)) | Err(_) => {
+            return RemovedSkill {
+                consumer,
+                path: path.clone(),
+                outcome: RemovalOutcome::Problem(format!(
+                    "manual review required for {}: skill cannot be safely proved as an unedited Cyclops seed; left untouched",
+                    path.display()
+                )),
+            };
+        }
+    };
+    let removal = match parent.bind_regular_file_for_removal(&file.entry) {
+        Ok(removal) => removal,
+        Err(error) => {
+            return RemovedSkill {
+                consumer,
+                path: path.clone(),
+                outcome: RemovalOutcome::Problem(format!(
+                    "manual review required for {}: {error}; left untouched",
+                    path.display()
+                )),
+            };
+        }
+    };
+    match removal.remove() {
+        Ok(()) => RemovedSkill {
+            consumer,
+            path,
+            outcome: RemovalOutcome::Removed,
+        },
+        Err(error) => RemovedSkill {
+            consumer,
+            path: path.clone(),
+            outcome: RemovalOutcome::Problem(format!(
+                "manual review required for {}: {error}; left untouched",
+                path.display()
+            )),
+        },
+    }
+}
+
 /// The note `cyclops start --setup-only` prints for one seed attempt.
 /// Only a write or a failure speaks: a kept file and an absent agent CLI
 /// are both the ordinary case on a rerun, and a note repeated on every
@@ -657,6 +831,45 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+
+    #[test]
+    fn explicit_uninstall_removes_only_an_unedited_shipped_skill() {
+        let home = cyclops_proto::scratch::scratch_dir("cyc-skillseed-uninstall");
+        let _ = std::fs::remove_dir_all(&home);
+        let parent = home.join(".claude/skills/cyclops");
+        std::fs::create_dir_all(&parent).expect("create Claude skill parent");
+        for directory in [
+            home.join(".claude"),
+            home.join(".claude/skills"),
+            parent.clone(),
+        ] {
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))
+                .expect("make normal owner-controlled directory");
+        }
+        let skill = parent.join("SKILL.md");
+        std::fs::write(&skill, SHIPPED).expect("write shipped skill");
+
+        let removed = remove_owned(&home);
+        let claude = removed
+            .iter()
+            .find(|outcome| outcome.consumer == "Claude Code")
+            .expect("Claude cleanup result");
+        assert_eq!(claude.outcome, RemovalOutcome::Removed);
+        assert!(!skill.exists(), "unedited Cyclops skill was not removed");
+
+        std::fs::write(&skill, "operator instruction\n").expect("write operator skill");
+        let retained = remove_owned(&home);
+        let claude = retained
+            .iter()
+            .find(|outcome| outcome.consumer == "Claude Code")
+            .expect("Claude cleanup result");
+        assert_eq!(claude.outcome, RemovalOutcome::Kept);
+        assert_eq!(
+            std::fs::read_to_string(&skill).unwrap(),
+            "operator instruction\n"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     /// The compiled-in copy has to be the file in the repo, and the file
     /// has to carry the frontmatter an agent skill loader looks for. A

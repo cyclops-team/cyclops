@@ -354,6 +354,13 @@ enum Cmd {
             conflicts_with_all = ["rollback", "install_pair", "remove_pair_store"]
         )]
         stop_selected_daemon: bool,
+        /// Remove only verified Cyclops hook and skill entries during explicit uninstall.
+        #[arg(
+            long,
+            hide = true,
+            conflicts_with_all = ["rollback", "install_pair", "remove_pair_store", "stop_selected_daemon"]
+        )]
+        remove_integrations: bool,
         /// Installation prefix used with an internal pair-store operation.
         #[arg(long, hide = true, value_name = "DIR")]
         prefix: Option<std::path::PathBuf>,
@@ -1128,6 +1135,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
             install_pair,
             remove_pair_store,
             stop_selected_daemon,
+            remove_integrations,
             prefix,
         } => update::run(
             cli.json,
@@ -1136,6 +1144,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
             install_pair.as_deref(),
             *remove_pair_store,
             *stop_selected_daemon,
+            *remove_integrations,
             prefix.as_deref(),
         ),
         // All three answer about a daemon rather than through one, so a

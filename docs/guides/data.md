@@ -79,12 +79,12 @@ Do not rely on an export while the marker exists or while completion is
 uncertain; inspect it or retry with another new destination. Source records
 are never modified by Cyclops either way.
 
-The current installer uninstall preserves the Cyclops state home and its
-journals. Use the explicit journey below when you want to remove the journal
-scope, use [`cyclops remove --all`](#remove-the-complete-current-state-home)
-when you want to remove the complete current state home, or follow the
-[uninstall guide](install.md#uninstall) for separately owned binaries and
-vendor-hook cleanup.
+The managed installer uninstall removes the complete current Cyclops state
+home, including its journals. Use the explicit journey below when you want to
+remove only the journal scope while keeping the rest of Cyclops state, use
+[`cyclops remove --all`](#remove-the-complete-current-state-home) when you
+want its explicit preview and confirmation, or follow the
+[uninstall guide](install.md#uninstall) for the complete removal boundary.
 
 ## Forget the retained journal scope
 
