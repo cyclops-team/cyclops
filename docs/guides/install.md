@@ -417,7 +417,14 @@ and there is no tab to keep open. It logs to `$CYCLOPS_HOME/cyclopsd.log`.
 ```bash
 cyclops daemon status   # ● cyclopsd is running · up 4m · pid 51230 · watching main
 cyclops daemon log      # what it has written
-cyclops daemon stop     # your tmux panes and the record are untouched
+cyclops stop            # stop Cyclops; your tmux panes and messages remain
+```
+
+If an earlier session left queued wake notifications for an agent, quiet those
+wakes without deleting its durable inbox entries:
+
+```bash
+cyclops clear gemmy
 ```
 
 There is no `daemon start`: `cyclops start` is that, and so is bare

@@ -61,6 +61,7 @@ mod themeseed;
 mod update;
 mod workspace;
 
+use std::collections::BTreeSet;
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::time::{Duration, Instant};
 
@@ -167,6 +168,9 @@ enum Cmd {
     /// Check installation and runtime problems without changing anything.
     #[command(display_order = 5)]
     Health,
+    /// Stop Cyclops now. Your tmux panes and durable messages stay intact.
+    #[command(display_order = 6)]
+    Stop,
     /// Inventory retained durable records first, or export them without changing source files.
     #[command(hide = true)]
     Data {
@@ -249,6 +253,12 @@ enum Cmd {
     /// Reply to a visible message using its sender and thread.
     #[command(display_order = 3)]
     Reply(ReplyArgs),
+    /// Quiet queued pane notifications for one agent. Messages remain in its inbox.
+    #[command(display_order = 4)]
+    Clear {
+        /// Agent label or canonical recipient key.
+        target: String,
+    },
     /// Requeue a message by identifier.
     #[command(hide = true)]
     Requeue(RequeueArgs),
@@ -1060,6 +1070,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
             sizing::run_release(&settings.server, &session, cli.json, &style_for(cli))
         }
         Cmd::Health => health::run(cli.json),
+        Cmd::Stop => cmd_daemon(cli, &style_for(cli), &DaemonCmd::Stop),
         Cmd::Data {
             cmd: DataCmd::Inventory,
         } => data::run_inventory(cli.json),
@@ -1213,6 +1224,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
         | Cmd::Thread { .. }
         | Cmd::Inbox(_)
         | Cmd::Messages(_)
+        | Cmd::Clear { .. }
         | Cmd::Requeue(_)
         | Cmd::Notification(_)
         | Cmd::Alarm(_)
@@ -1237,6 +1249,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 Cmd::Thread { id } => cmd_thread(&mut c, cli, &style, id),
                 Cmd::Inbox(args) => cmd_inbox(&mut c, cli, &style, args),
                 Cmd::Messages(args) => cmd_messages(&mut c, cli, &style, args),
+                Cmd::Clear { target } => cmd_clear(&mut c, cli, &style, target),
                 Cmd::Requeue(args) => cmd_requeue(&mut c, cli, &style, args),
                 Cmd::Notification(args) => cmd_notification(&mut c, cli, &style, args),
                 Cmd::Alarm(args) => cmd_alarm(&mut c, cli, &style, args),
@@ -1259,6 +1272,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 | Cmd::Start(_)
                 | Cmd::Setup { .. }
                 | Cmd::Health
+                | Cmd::Stop
                 | Cmd::Data { .. }
                 | Cmd::Remove { .. }
                 | Cmd::Cleanup { .. }
@@ -2997,6 +3011,156 @@ fn cmd_notification(c: &mut Client, cli: &Cli, style: &Style, args: &Notificatio
     }
 }
 
+/// Quiet the pre-write wake queue for one exact agent without erasing any
+/// durable mailbox entry. This is deliberately a convenience over the exact
+/// `notification withdraw` primitive: it resolves the current route once,
+/// then withdraws only attempts the daemon says this caller may withdraw.
+fn cmd_clear(c: &mut Client, cli: &Cli, style: &Style, target: &str) -> i32 {
+    let snapshot: cyclops_proto::MessagesSnapshotResult = match c.request(
+        "messages.snapshot",
+        serde_json::to_value(cyclops_proto::MessagesSnapshotParams::default())
+            .expect("messages.snapshot params serialize"),
+    ) {
+        Ok(value) => match serde_json::from_value(value) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                eprintln!("{}", copy::UNREADABLE_ANSWER);
+                return 1;
+            }
+        },
+        Err(error) => {
+            eprintln!("{}", copy::client_error(&error, Some(target)));
+            return 1;
+        }
+    };
+    let recipient = match clear_recipient(&snapshot, target) {
+        Ok(recipient) => recipient,
+        Err("none") => {
+            eprintln!("no retained Cyclops agent matches {target:?}");
+            return EXIT_USAGE;
+        }
+        Err("ambiguous") => {
+            eprintln!(
+                "more than one retained Cyclops agent matches {target:?}; use its canonical recipient key"
+            );
+            return EXIT_USAGE;
+        }
+        Err(_) => unreachable!("clear_recipient has only documented errors"),
+    };
+    let label = snapshot
+        .rows
+        .iter()
+        .flat_map(|row| &row.recipients)
+        .find(|entry| entry.recipient == recipient)
+        .map(|entry| entry.label.clone())
+        .unwrap_or_else(|| target.to_owned());
+    let attempts = withdrawable_notification_attempts(&snapshot, recipient);
+    let mut withdrawn = Vec::new();
+    for attempt_id in attempts {
+        let params = serde_json::to_value(cyclops_proto::NotificationWithdrawParams {
+            attempt_id,
+            recipient,
+        })
+        .expect("notification.withdraw params serialize");
+        let value = match c.request("notification.withdraw", params) {
+            Ok(value) => value,
+            Err(error) => {
+                if cli.json {
+                    println!(
+                        "{}",
+                        json!({
+                            "recipient": recipient,
+                            "label": label,
+                            "withdrawn_attempts": withdrawn,
+                            "error": copy::client_error(&error, Some(target)),
+                        })
+                    );
+                } else {
+                    eprintln!(
+                        "quieted {} queued pane notification(s) for {}; the remaining wake was not changed: {}",
+                        withdrawn.len(),
+                        label,
+                        copy::client_error(&error, Some(target))
+                    );
+                }
+                return 1;
+            }
+        };
+        let result: cyclops_proto::NotificationWithdrawResult = match serde_json::from_value(value)
+        {
+            Ok(result) => result,
+            Err(_) => {
+                eprintln!("{}", copy::UNREADABLE_ANSWER);
+                return 1;
+            }
+        };
+        withdrawn.push(result.attempt_id.to_string());
+    }
+    if cli.json {
+        println!(
+            "{}",
+            json!({
+                "recipient": recipient,
+                "label": label,
+                "withdrawn_attempts": withdrawn,
+                "messages_preserved": true,
+            })
+        );
+    } else if withdrawn.is_empty() {
+        println!(
+            "no queued pane notifications for {}; durable messages were left alone",
+            style.accent(&label)
+        );
+    } else {
+        println!(
+            "quieted {} queued pane notification(s) for {}; messages remain in that inbox",
+            withdrawn.len(),
+            style.accent(&label)
+        );
+    }
+    0
+}
+
+/// Resolve the one recipient named by an active or retained message row.
+/// Labels are allowed only while they identify one recipient; a label reused
+/// by multiple old sessions must be disambiguated with the canonical key.
+fn clear_recipient(
+    snapshot: &cyclops_proto::MessagesSnapshotResult,
+    target: &str,
+) -> Result<cyclops_proto::RecipientKey, &'static str> {
+    let recipients: BTreeSet<_> = snapshot
+        .rows
+        .iter()
+        .flat_map(|row| &row.recipients)
+        .filter(|entry| entry.label == target || entry.recipient.to_string() == target)
+        .map(|entry| entry.recipient)
+        .collect();
+    match recipients.len() {
+        0 => Err("none"),
+        1 => Ok(*recipients.iter().next().expect("one recipient")),
+        _ => Err("ambiguous"),
+    }
+}
+
+fn withdrawable_notification_attempts(
+    snapshot: &cyclops_proto::MessagesSnapshotResult,
+    recipient: cyclops_proto::RecipientKey,
+) -> Vec<cyclops_proto::NotificationAttemptId> {
+    let mut attempts = Vec::new();
+    for row in &snapshot.rows {
+        for entry in &row.recipients {
+            if entry.recipient == recipient && entry.can_withdraw_notification {
+                if let Some(attempt) = entry.notification.attempt_id {
+                    attempts.push(attempt);
+                }
+            }
+        }
+    }
+    attempts.sort();
+    attempts.dedup();
+    attempts
+}
+
 /// The wire spelling of one serializable value, for display.
 ///
 /// Printing what the daemon sent keeps the shown word and the JSON field
@@ -3868,7 +4032,9 @@ mod tests {
         let help = error.to_string();
 
         assert!(help.contains("Everyday commands:"), "{help}");
-        for command in ["send", "inbox", "reply", "status", "health", "commands"] {
+        for command in [
+            "send", "inbox", "reply", "clear", "status", "health", "stop", "commands",
+        ] {
             assert!(
                 help.lines()
                     .any(|line| line.trim_start().starts_with(command)),
@@ -3950,7 +4116,9 @@ mod tests {
             .collect();
         assert_eq!(
             visible,
-            BTreeSet::from(["commands", "health", "inbox", "reply", "send", "status"])
+            BTreeSet::from([
+                "clear", "commands", "health", "inbox", "reply", "send", "status", "stop",
+            ])
         );
     }
 
@@ -4213,6 +4381,12 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["cyclops", "requeue"]).is_err());
         assert!(Cli::try_parse_from(["cyclops", "requeue", "m-1"]).is_ok());
+        assert!(Cli::try_parse_from(["cyclops", "clear"]).is_err());
+        assert!(Cli::try_parse_from(["cyclops", "clear", "reviewer"]).is_ok());
+        assert!(matches!(
+            Cli::try_parse_from(["cyclops", "stop"]).unwrap().cmd,
+            Some(Cmd::Stop)
+        ));
     }
 
     #[test]
@@ -4293,6 +4467,73 @@ mod tests {
             "att-00000000-0000-4000-8000-{number:012x}"
         ))
         .unwrap()
+    }
+
+    fn message_snapshot(
+        rows: Vec<cyclops_proto::MessageSnapshotRow>,
+    ) -> cyclops_proto::MessagesSnapshotResult {
+        let workspace: cyclops_proto::WorkspaceId =
+            "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        cyclops_proto::MessagesSnapshotResult {
+            workspace_id: workspace,
+            caller: Some(cyclops_proto::RecipientKey::admin(workspace)),
+            workspace_seq: 3,
+            counts: cyclops_proto::MessagesSnapshotCounts {
+                visible_messages: rows.len() as u64,
+                returned_messages: rows.len() as u64,
+                inbox_messages: 0,
+                outbound_messages: rows.len() as u64,
+                work_messages: 0,
+                active_messages: rows.len() as u64,
+                settled_messages: 0,
+                pending_entries: rows.len() as u64,
+                claimed_entries: 0,
+                open_attention_entries: 0,
+            },
+            rows,
+            mailbox_attention: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn clear_finds_one_retained_recipient_and_only_its_withdrawable_wakes() {
+        let workspace: cyclops_proto::WorkspaceId =
+            "00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let session: cyclops_proto::SessionInstanceId =
+            "00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let reviewer =
+            cyclops_proto::RecipientKey::agent(workspace, session, "%1".parse().unwrap());
+        let other = cyclops_proto::RecipientKey::agent(workspace, session, "%2".parse().unwrap());
+        let mut review_row = pending_row_to(
+            reviewer,
+            "m-review",
+            1,
+            cyclops_proto::MessageNotificationState::Gating,
+            None,
+        );
+        review_row.recipients[0].can_withdraw_notification = true;
+        review_row.recipients[0].notification.attempt_id = Some(notification_attempt(1));
+        let mut other_row = pending_row_to(
+            other,
+            "m-other",
+            2,
+            cyclops_proto::MessageNotificationState::Gating,
+            None,
+        );
+        other_row.recipients[0].can_withdraw_notification = true;
+        other_row.recipients[0].notification.attempt_id = Some(notification_attempt(2));
+        other_row.recipients[0].label = "other".into();
+        let snapshot = message_snapshot(vec![review_row, other_row]);
+
+        assert_eq!(clear_recipient(&snapshot, "reviewer"), Ok(reviewer));
+        assert_eq!(
+            clear_recipient(&snapshot, &reviewer.to_string()),
+            Ok(reviewer)
+        );
+        assert_eq!(
+            withdrawable_notification_attempts(&snapshot, reviewer),
+            vec![notification_attempt(1)]
+        );
     }
 
     /// A queue that is not moving is named by its head and cause on every

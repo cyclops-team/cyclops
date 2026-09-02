@@ -15,13 +15,15 @@
 //! install`. Writing here follows the rules `hookset::wire_vendor`
 //! already set for vendor homes: only under the installer's
 //! `--wire-hooks` consent (given at install time, or recorded then and
-//! honored by a later boot: `workspace::finish_deferred_wiring`), only when
-//! a consumer's own directory and private final skill parent already exist,
-//! honoring `CYCLOPS_NO_VENDOR_HOOKS`, and creating only a missing shipped
-//! skill. Every existing skill, including a known old Cyclops seed, remains
-//! untouched.
+//! honored by a later boot: `workspace::finish_deferred_wiring`), only inside
+//! an installed consumer's user-owned, non-writable-by-others directory,
+//! honoring `CYCLOPS_NO_VENDOR_HOOKS`, and creating only Cyclops's missing
+//! `skills/cyclops` leaf and shipped skill. Every existing skill, including a
+//! known old Cyclops seed, remains untouched.
 
 use std::ffi::OsStr;
+use std::io::ErrorKind;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use cyclops_state::{CreateFileOutcome, StateError, StateInspector};
@@ -60,6 +62,8 @@ const EVER_SHIPPED_FNV64: &[&str] = &[
     "b3258aee445dc73b",
     "e90798f32ed52ec9",
     "2e02eea187f6c256",
+    "09725621ce15f9cf",
+    "4042d8569cf02694",
 ];
 
 /// FNV-1a 64, hex. Same non-cryptographic question as the manifest seed:
@@ -107,8 +111,9 @@ pub struct PlannedSkill {
 
 /// Read-only result for a canonical skill target.
 ///
-/// Missing describes only a missing final file beneath an accepted private
-/// parent. A missing or unsafe parent is manual review, not a create plan.
+/// Missing describes only a missing final file beneath an accepted
+/// operator-controlled parent. An unsafe parent is manual review, not a
+/// create plan.
 pub(crate) enum SkillInspection {
     Missing,
     Bytes(Vec<u8>),
@@ -242,42 +247,80 @@ pub fn plan(home: &Path) -> Vec<PlannedSkill> {
         .collect()
 }
 
-/// Open the existing final parent through a held no-follow descriptor.
+/// Ensure Cyclops's declared skill directory exists below an installed
+/// consumer root, then open it through a held no-follow descriptor.
 ///
-/// A managed skill may create only its final leaf. Consumer directory trees,
-/// including the shared `.agents` tree, remain the consumer's responsibility.
-/// A private parent gives `O_EXCL` publication one safe namespace.
+/// Consumer roots remain the consumer's responsibility. Once one exists and
+/// is controlled by this user, Cyclops may create only its own fixed
+/// `skills/cyclops` leaf path. That makes a normal 0755 consumer directory
+/// usable without treating it as private state or changing its permissions.
 fn accepted_skill_parent(
     location: &crate::consumer::AssetLocation,
+    create_missing: bool,
 ) -> Result<StateInspector, &'static str> {
-    let target = location.path();
-    let Some(parent) = target.parent() else {
-        return Err("skill target has no parent directory");
+    let mut parent = match StateInspector::open_existing(&location.root) {
+        Ok(Some(root)) => root,
+        Ok(None) => return Err("consumer root is missing"),
+        Err(_) => return Err("consumer root cannot be safely opened"),
     };
-    let parent = match StateInspector::open_existing(parent) {
-        Ok(Some(parent)) => parent,
-        Ok(None) => {
-            return Err("skill parent is missing; setup will not create consumer directories")
-        }
-        Err(_) => return Err("skill parent cannot be safely opened"),
-    };
-    match parent.private_and_stable() {
-        Ok(true) => Ok(parent),
-        Ok(false) => Err("skill parent is not private or changed during inspection"),
-        Err(_) => Err("skill parent cannot be safely verified"),
+    if !parent
+        .owner_controlled_and_stable()
+        .map_err(|_| "consumer root cannot be safely verified")?
+    {
+        return Err("consumer root is not owned by this user or is writable by others");
     }
+
+    let relative_parent = location
+        .relative
+        .parent()
+        .ok_or("skill target has no parent directory")?;
+    for component in relative_parent.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err("skill target has an invalid relative parent");
+        };
+        let child = parent.path().join(name);
+        match StateInspector::open_existing(&child) {
+            Ok(Some(existing)) => parent = existing,
+            Ok(None) => {
+                if !create_missing {
+                    return Err("Cyclops skill directory is missing");
+                }
+                match std::fs::create_dir(&child) {
+                    Ok(()) => {
+                        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700))
+                            .map_err(|_| "Cyclops skill directory permissions could not be set")?
+                    }
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                    Err(_) => return Err("Cyclops skill directory could not be created"),
+                }
+                parent = StateInspector::open_existing(&child)
+                    .map_err(|_| "Cyclops skill directory cannot be safely opened")?
+                    .ok_or("Cyclops skill directory disappeared during setup")?;
+            }
+            Err(_) => return Err("Cyclops skill directory cannot be safely opened"),
+        }
+        if !parent
+            .owner_controlled_and_stable()
+            .map_err(|_| "Cyclops skill directory cannot be safely verified")?
+        {
+            return Err(
+                "Cyclops skill directory is not owned by this user or is writable by others",
+            );
+        }
+    }
+    Ok(parent)
 }
 
 fn skill_leaf(location: &crate::consumer::AssetLocation) -> Result<&OsStr, ()> {
     location.relative.file_name().ok_or(())
 }
 
-/// Inspect one skill only after accepting its existing private parent.
+/// Inspect one skill only after accepting its operator-controlled parent.
 ///
 /// Setup check uses this same boundary as seeding so a current-looking leaf
 /// below a missing, linked, or nonprivate parent never claims healthy setup.
 pub(crate) fn inspect(location: &crate::consumer::AssetLocation) -> SkillInspection {
-    let parent = match accepted_skill_parent(location) {
+    let parent = match accepted_skill_parent(location, false) {
         Ok(parent) => parent,
         Err(_) => return SkillInspection::ManualReview,
     };
@@ -295,13 +338,13 @@ pub(crate) fn inspect(location: &crate::consumer::AssetLocation) -> SkillInspect
         Err(StateError::UnsafePath { .. }) => SkillInspection::ManualReview,
         Err(_) => SkillInspection::Unreadable,
     };
-    match parent.private_and_stable() {
+    match parent.owner_controlled_and_stable() {
         Ok(true) => inspection,
         Ok(false) | Err(_) => SkillInspection::ManualReview,
     }
 }
 
-/// Read one target through its final private parent. Links, multi-link files,
+/// Read one target through its final operator-controlled parent. Links, multi-link files,
 /// missing parents, failed reads, and an unproven consumer root cannot
 /// establish a safe create decision, so they remain untouched.
 fn seed_decision_at(
@@ -324,7 +367,7 @@ fn seed_decision_at(
     }
 }
 
-/// Read one target only through the private parent descriptor that will later
+/// Read one target only through the operator-controlled parent descriptor that will later
 /// be transferred into managed publication authority. The resulting decision
 /// never authorizes changing an existing leaf.
 fn inspected_seed_decision(
@@ -348,7 +391,7 @@ fn inspected_seed_decision(
         )),
         Ok(Some(_)) | Err(_) => Err(()),
     }?;
-    match parent.private_and_stable() {
+    match parent.owner_controlled_and_stable() {
         Ok(true) => Ok(decision),
         Ok(false) | Err(_) => Err(()),
     }
@@ -406,8 +449,9 @@ mod test_sync {
 /// Create the shipped skill only when its declared destination is missing.
 ///
 /// The installation proof is repeated immediately before each mutation. The
-/// final parent must already exist and be private, so setup never creates a
-/// direct consumer tree or the shared `.agents` tree.
+/// final parent is created only below an installed, operator-controlled
+/// consumer root. Setup never creates a consumer root or changes consumer
+/// directory permissions.
 fn seed_into(
     consumer: &'static str,
     installation_roots: &[PathBuf],
@@ -430,9 +474,9 @@ fn seed_into(
         };
     }
 
-    // Keep the private parent descriptor that classified the leaf. Publishing
+    // Keep the operator-controlled parent descriptor that classified the leaf. Publishing
     // never resolves the user path again before the final `O_EXCL` create.
-    let parent = match accepted_skill_parent(&location) {
+    let parent = match accepted_skill_parent(&location, true) {
         Ok(parent) => parent,
         Err(cause) => {
             return SeededSkill {
@@ -498,7 +542,7 @@ fn seed_into(
             };
         }
     };
-    let authority = match parent.into_managed_asset_root() {
+    let authority = match parent.into_operator_owned_asset_root() {
         Ok(authority) => authority,
         Err(error) => {
             return SeededSkill {
@@ -636,9 +680,9 @@ mod tests {
         );
     }
 
-    /// The whole policy in one run: a missing direct consumer root or skill
-    /// parent is not recreated, a private existing parent receives one fresh
-    /// leaf, and existing current or operator-owned bytes stay untouched.
+    /// The whole policy in one run: a missing direct consumer root is never
+    /// recreated, an installed consumer receives Cyclops's fixed skill leaf,
+    /// and existing current or operator-owned bytes stay untouched.
     #[test]
     fn the_seed_respects_the_vendor_dir_and_the_operators_edits() {
         let root = cyclops_proto::scratch::scratch_dir("cyc-skillseed");
@@ -657,24 +701,24 @@ mod tests {
         assert!(!agent_dir.exists(), "seeding invented the vendor dir");
         assert_eq!(note(&absent), None);
 
-        // A consumer root alone is not publication authority: setup leaves
-        // the missing consumer subtree for the consumer or operator to make.
+        // An installed consumer receives only Cyclops's fixed skill leaf.
+        // Its existing 0755 root is not rewritten or treated as private
+        // state, while the created nested directories are owner-only.
         std::fs::create_dir_all(&agent_dir).expect("create agent dir");
-        let missing_parent = seed_into("test agent", &installation_roots, skill.clone());
-        assert!(matches!(missing_parent.outcome, Outcome::Problem(_)));
-        assert!(
-            !agent_dir.join("skills").exists(),
-            "seeding created a consumer-tree directory"
-        );
-
-        // Once the consumer made a private final parent, setup may create
-        // only the missing shipped file and says so.
-        let parent = agent_dir.join("skills/cyclops");
-        std::fs::create_dir_all(&parent).expect("create skill parent");
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
-            .expect("make skill parent private");
         let first = seed_into("test agent", &installation_roots, skill.clone());
         assert_eq!(first.outcome, Outcome::Written);
+        assert!(
+            agent_dir.join("skills/cyclops").is_dir(),
+            "seeding created Cyclops's declared skill directory"
+        );
+        assert_eq!(
+            std::fs::metadata(agent_dir.join("skills/cyclops"))
+                .expect("created parent")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
         assert_eq!(
             std::fs::read_to_string(&first.path).expect("written"),
             SHIPPED

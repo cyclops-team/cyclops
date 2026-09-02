@@ -17,7 +17,8 @@
 # What it will and will not do: it never uses sudo, never touches your
 # tmux config, and never edits a shell profile without printing the exact
 # lines and where the backup went. Binaries go to the selected prefix;
-# state and installed-agent integration stay under your home.
+# state and installed-agent integration stay under your home. `--uninstall`
+# removes the Cyclops-owned state after stopping its matched daemon.
 #
 # POSIX sh on purpose. It runs before cyclops exists on the machine, so it
 # cannot assume anything more than the system shell.
@@ -94,7 +95,7 @@ usage() {
     say "Options:"
     say "  --prefix DIR   install the binaries in DIR"
     say "  --no-path      do not edit a shell profile"
-    say "  --uninstall    stop the daemon, remove Cyclops state, binaries, and the PATH block"
+    say "  --uninstall    stop Cyclops, remove its state, binaries, and the PATH block"
     say "  --help         show this help"
     exit 0
 }
@@ -248,7 +249,6 @@ do_uninstall() {
         say "could not preview the current Cyclops state home; binaries and PATH remain installed"
         exit 1
     }
-    printf '%s\n' "$state_preview"
     state_confirmation="$(printf '%s\n' "$state_preview" | awk '
         /^  confirm     cyclops remove --all --confirm / {
             sub(/^  confirm     cyclops remove --all --confirm /, "")
@@ -261,6 +261,7 @@ do_uninstall() {
             say "complete Cyclops state removal did not finish; binaries and PATH remain installed"
             exit 1
         fi
+        note "removed Cyclops state at ${CYCLOPS_HOME:-$HOME/.cyclops}"
     else
         case "$state_preview" in
             *"result      the current Cyclops state home is absent"*) ;;
@@ -303,7 +304,7 @@ do_uninstall() {
 
     say ""
     say "${BOLD}✔ cyclops is uninstalled${OFF}"
-    note "removed the complete Cyclops state home at ${CYCLOPS_HOME:-$HOME/.cyclops}"
+    note "state removed from ${CYCLOPS_HOME:-$HOME/.cyclops}"
     note "vendor hook configuration and skills in agent-owned directories remain outside this removal"
     exit 0
 }
@@ -636,9 +637,9 @@ resolved="$(command -v cyclops 2>/dev/null || true)"
 
 say ""
 say "${BOLD}✔ $version is installed${OFF}"
-note "cyclops    $PREFIX/cyclops"
-note "cyclopsd   $PREFIX/cyclopsd"
-note "home       ${CYCLOPS_HOME:-$HOME/.cyclops}"
+note "command  $PREFIX/cyclops"
+note "daemon   $PREFIX/cyclopsd"
+note "state    ${CYCLOPS_HOME:-$HOME/.cyclops}"
 
 say ""
 say "Next:"
