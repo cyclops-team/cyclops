@@ -29,10 +29,12 @@ curl -fsSL https://www.usecyclops.dev/install.sh | sh
 ```
 
 The hosted script is the same `scripts/install.sh` that this repository
-tests. It clones the current `main` branch into a temporary directory,
+tests. It clones the current `main` branch into Cyclops's user-owned cache,
 builds both binaries, puts them where your shell looks, writes the config
-and detection manifests, proves the result runs, and removes the clone.
-It never uses sudo.
+and detection manifests, proves the result runs, and removes the source clone.
+It never uses sudo. Its reusable Cargo build cache is
+`~/Library/Caches/Cyclops/installer/` on macOS and
+`~/.cache/cyclops/installer/` on Linux, never `/private/var`.
 
 The build step dominates the install time: an optimized compile of the
 two binaries and their dependencies, a few minutes on a fast machine and

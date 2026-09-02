@@ -1284,6 +1284,11 @@ INST="$ROOT/inst"
 mkdir -p "$INST"
 printf '# an existing profile\nexport EXAMPLE=1\n' > "$INST/.zshrc"
 cp "$INST/.zshrc" "$ROOT/zshrc.before"
+if [ "$(uname -s)" = Darwin ]; then
+  INST_INSTALLER_CACHE="$INST/Library/Caches/Cyclops/installer"
+else
+  INST_INSTALLER_CACHE="$INST/.cache/cyclops/installer"
+fi
 
 # Run it with almost nothing in the environment, so an install that only
 # works because of something this shell happens to export fails here.
@@ -1362,6 +1367,12 @@ check "and where the backup went"         "^  the file as it was: $INST/.zshrc.c
 check_file "the binaries are executable"  "$INST/.local/bin/cyclops" '.'
 check_file "and the home has a config"    "$INST/.cyclops/config.toml" '^sessions = '
 check_file "and the shipped manifests"    "$INST/.cyclops/manifests/claude.toml" '^id = "claude"$'
+if [ -d "$INST_INSTALLER_CACHE/target" ]; then
+  printf '   ok    installer keeps its build cache under the user cache\n'
+else
+  printf '   FAIL  installer build cache is missing: %s\n' "$INST_INSTALLER_CACHE/target"
+  FAILS=$((FAILS + 1))
+fi
 check_exit "a clean install exits 0" 0
 
 # The profile has exactly one block, not one per run, and the second run

@@ -27,6 +27,20 @@ set -eu
 REPO_URL="${CYCLOPS_REPO:-https://github.com/cyclops-team/cyclops.git}"
 REF="${CYCLOPS_REF:-main}"
 
+# Source installs must not hide an optimized Cargo build under macOS's
+# per-process /private temporary directory. Keep every rebuildable installer
+# artifact in the ordinary user cache instead. The source and private pair
+# staging directories are removed after activation; Cargo's target directory
+# remains for the next install or update.
+installer_cache_root() {
+    case "$(uname -s)" in
+        Darwin) printf '%s\n' "$HOME/Library/Caches/Cyclops/installer" ;;
+        *) printf '%s\n' "${XDG_CACHE_HOME:-$HOME/.cache}/cyclops/installer" ;;
+    esac
+}
+
+INSTALLER_CACHE="$(installer_cache_root)"
+
 # The block this script owns inside a shell profile. Matched literally on
 # both install and uninstall, which is what makes a second run a no-op
 # instead of a second copy.
@@ -369,11 +383,17 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+mkdir -p "$INSTALLER_CACHE" 2>/dev/null ||
+    die "cannot create the Cyclops build cache at $INSTALLER_CACHE"
+chmod 700 "$INSTALLER_CACHE" 2>/dev/null ||
+    die "cannot secure the Cyclops build cache at $INSTALLER_CACHE"
+note "build cache $INSTALLER_CACHE"
+
 if [ -z "$SRC" ]; then
     have git || die "git is not installed, and there is no clone to build from" \
         "install git, or clone the repo and run ./scripts/install.sh inside it"
     step "fetching the source"
-    CLONED="$(mktemp -d "${TMPDIR:-/tmp}/cyclops-install.XXXXXX")"
+    CLONED="$(mktemp -d "$INSTALLER_CACHE/source.XXXXXX")"
     git clone --depth 1 --branch "$REF" "$REPO_URL" "$CLONED/cyclops" >/dev/null 2>&1 ||
         die "could not clone $REPO_URL at $REF" "check the network, or set CYCLOPS_REF to a branch that exists"
     SRC="$CLONED/cyclops"
@@ -397,9 +417,10 @@ say "${DIM}  a first build takes a few minutes${OFF}"
 # The dist profile is release without the thin-LTO link step, and the two
 # named packages skip workspace members an install never runs. Both trims
 # exist because this compile happens on every installing machine.
-( cd "$SRC" && cargo build --profile dist -p cyclops -p cyclopsd ) || die "the build failed" "the cargo output above says why"
+BUILD_TARGET="${CARGO_TARGET_DIR:-$INSTALLER_CACHE/target}"
+( cd "$SRC" && CARGO_TARGET_DIR="$BUILD_TARGET" cargo build --profile dist -p cyclops -p cyclopsd ) || die "the build failed" "the cargo output above says why"
 
-TARGET="${CARGO_TARGET_DIR:-$SRC/target}/dist"
+TARGET="$BUILD_TARGET/dist"
 for name in cyclops cyclopsd; do
     [ -x "$TARGET/$name" ] || die "the build finished but $TARGET/$name is missing"
 done
@@ -427,7 +448,7 @@ copy_private_candidate() {
     return 1
 }
 
-PAIR_SOURCE="$(mktemp -d "${TMPDIR:-/tmp}/cyclops-pair.XXXXXX")" ||
+PAIR_SOURCE="$(mktemp -d "$INSTALLER_CACHE/pair.XXXXXX")" ||
     die "cannot create a private candidate directory"
 chmod 700 "$PAIR_SOURCE" || die "cannot secure the private candidate directory"
 for name in cyclops cyclopsd; do
