@@ -6140,13 +6140,9 @@ async fn a_working_turn_started_pane_submits_doorbell_without_barrier_held() {
     wait_for_doorbell(&rig, &pane, &message_id).await;
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
-        if notification_transition(&mut rig, &message_id, NotificationState::Submitted).is_some()
-            || notification_transition(
-                &mut rig,
-                &message_id,
-                NotificationState::SubmittedUnverified,
-            )
-            .is_some()
+        if notification_transition(&rig, &message_id, NotificationState::Submitted).is_some()
+            || notification_transition(&rig, &message_id, NotificationState::SubmittedUnverified)
+                .is_some()
         {
             break;
         }
