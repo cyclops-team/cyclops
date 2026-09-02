@@ -127,13 +127,56 @@ fn clone(repo: &str, reff: &str, dest: &Path) -> Result<(), String> {
     }
 }
 
+/// The visible, user-owned root for retained update build artifacts.
+///
+/// macOS has a per-process temporary directory under `/private/var`; it is a
+/// bad home for a multi-gigabyte cache that persists after an update. Keep the
+/// cache in the platform cache location instead, where an operator can inspect
+/// or remove it without hunting through system temporary storage.
+fn build_cache_parent(home: &Path) -> PathBuf {
+    let user_home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| home.to_path_buf());
+    #[cfg(target_os = "macos")]
+    {
+        user_home.join("Library/Caches/Cyclops")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| user_home.join(".cache"))
+            .join("cyclops")
+    }
+}
+
 /// Where update keeps its build cache, so a rebuild is incremental.
 ///
 /// Outside the state root because Cargo writes executable build artifacts.
 pub(crate) fn build_cache(home: &Path) -> PathBuf {
-    let temp = std::fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
     let home_key = fnv64(home.as_os_str().as_bytes());
-    temp.join(format!("cyclops-build-cache-{home_key}"))
+    build_cache_parent(home).join(format!("build-{home_key}"))
+}
+
+/// Open the dedicated cache parent before its build-cache child. The standard
+/// platform cache directories may not exist on a minimal account, so create
+/// their ordinary ancestors first, then let `StateRoot` verify and own the
+/// Cyclops leaf without following links.
+fn open_build_cache(home: &Path) -> Result<cyclops_state::StateRoot, String> {
+    let cache = build_cache(home);
+    let parent = cache
+        .parent()
+        .ok_or_else(|| format!("build cache {} has no parent", cache.display()))?;
+    let ancestors = parent
+        .parent()
+        .ok_or_else(|| format!("build cache parent {} has no parent", parent.display()))?;
+    std::fs::create_dir_all(ancestors)
+        .map_err(|error| format!("create build-cache parent {}: {error}", ancestors.display()))?;
+    cyclops_state::StateRoot::open_or_create(parent)
+        .map_err(|error| format!("open build-cache parent {}: {error}", parent.display()))?;
+    cyclops_state::StateRoot::open_or_create(&cache)
+        .map_err(|error| format!("open build cache {}: {error}", cache.display()))
 }
 
 /// The build-cache lease shared by update and cleanup.
@@ -3189,7 +3232,7 @@ pub fn run(
     let mut held_cache = None;
     let mut held_cache_lease = None;
     if std::env::var_os("CARGO_TARGET_DIR").is_none() {
-        match cyclops_state::StateRoot::open_or_create(&cache) {
+        match open_build_cache(&cyclops_proto::cyclops_home()) {
             Ok(root) => match lock_build_cache(&root) {
                 Ok(lease) => {
                     installer.env("CARGO_TARGET_DIR", root.path());
