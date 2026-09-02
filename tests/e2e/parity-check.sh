@@ -1656,11 +1656,32 @@ check_same_file "rollback leaves the durable handoff byte-identical" \
 # warm.
 rm -f "$REPO/target/dist/cyclops" "$REPO/target/dist/cyclopsd"
 
+# The real uninstall journey starts with a live daemon. This is the boundary
+# that used to make a user run a separate `cyclops daemon stop` before
+# uninstalling, so prove the installer stops only its validated daemon before
+# it removes the state home.
+start_installed_daemon
+if installed_daemon_up; then
+  printf '   ok    the daemon is live before uninstall\n'
+  CHECKS=$((CHECKS + 1))
+else
+  printf '   FAIL  the daemon is live before uninstall\n'
+  FAILS=$((FAILS + 1))
+fi
+
 printf '\n$ ./scripts/install.sh --uninstall\n'
 run_installer "$INST/.local/bin:$PATH" --uninstall
 cat "$OUT"
-check "uninstall keeps the record"        "your record and config are untouched at $INST/.cyclops"
+check "uninstall stops its validated daemon" '^stopped selected cyclopsd pid [0-9]+$'
+check "uninstall removes the complete state home" "removed the complete Cyclops state home at $INST/.cyclops"
 check_exit "uninstall exits 0" 0
+CHECKS=$((CHECKS + 1))
+if [ ! -e "$INST_HOME" ]; then
+  printf '   ok    uninstall removes the retained state files\n'
+else
+  printf '   FAIL  uninstall removes the retained state files\n'
+  FAILS=$((FAILS + 1))
+fi
 
 # The load-bearing one. A profile this touched has to come back byte for
 # byte, or the installer is something an operator cannot safely undo.

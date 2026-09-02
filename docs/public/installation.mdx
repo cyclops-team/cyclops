@@ -144,10 +144,10 @@ Without a clone:
 curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
 ```
 
-Uninstall removes the two public binary links, the validated managed pair
+Uninstall stops the validated selected daemon and removes the complete current
+Cyclops state home, the two public binary links, the validated managed pair
 store, and the installer-owned profile block. It refuses an altered pair store
-instead of deleting an unproven tree. It leaves `~/.cyclops` in place because
-that directory contains your record. Both public names are removed only from
+instead of deleting an unproven tree. Both public names are removed only from
 one prefix, selected by `--prefix` or by the `cyclops` command on `PATH`.
 Uninstall never resolves `cyclopsd` from a different prefix. If no `cyclops`
 anchor exists but `cyclopsd` is present, it refuses and asks for `--prefix`.

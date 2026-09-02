@@ -3083,6 +3083,7 @@ pub fn run(
     rollback: bool,
     install_pair: Option<&Path>,
     remove_pair_store: bool,
+    stop_selected_daemon: bool,
     prefix: Option<&Path>,
 ) -> i32 {
     if json {
@@ -3098,6 +3099,13 @@ pub fn run(
             return crate::EXIT_USAGE;
         };
         return run_remove_pair_store(prefix);
+    }
+    if stop_selected_daemon {
+        let Some(prefix) = prefix else {
+            eprintln!("--stop-selected-daemon requires --prefix");
+            return crate::EXIT_USAGE;
+        };
+        return run_stop_selected_daemon(prefix);
     }
     if let Some(source) = install_pair {
         let Some(prefix) = prefix else {
@@ -3269,6 +3277,33 @@ fn run_remove_pair_store(prefix: &Path) -> i32 {
         }
     } else {
         0
+    }
+}
+
+/// Stop the selected daemon without changing the selected pair. The installer
+/// uses this before invoking the separately journaled complete-state remover;
+/// it must keep the client executable available until that remover finishes.
+fn run_stop_selected_daemon(prefix: &Path) -> i32 {
+    let daemon = match validate_uninstall_pair(prefix) {
+        Ok(daemon) => daemon,
+        Err(error) => {
+            eprintln!("uninstall refused: {error}");
+            return 1;
+        }
+    };
+    match crate::daemon::stop_selected_for_pair_change(&daemon) {
+        Ok(Some(pid)) => {
+            println!("stopped selected cyclopsd pid {pid}");
+            0
+        }
+        Ok(None) => {
+            println!("no selected cyclopsd was running");
+            0
+        }
+        Err(refusal) => {
+            eprintln!("uninstall refused: {}", refusal.why());
+            1
+        }
     }
 }
 

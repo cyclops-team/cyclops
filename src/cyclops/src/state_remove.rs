@@ -31,7 +31,7 @@ const TOMBSTONE_SUFFIX: &str = ".removing";
 const CHECKPOINT_BYTES_LIMIT: usize = cyclops_state::INSPECTION_FILE_BYTES_LIMIT_MAX;
 const SCOPE: &str = "the complete current Cyclops state home only";
 const PRESERVED: &str = "installed binaries, the installer-owned PATH block, vendor hook configuration, and skill files in agent-owned directories (including a Cyclops-seeded copy) remain outside this state-home operation";
-const NEXT_STEP_SCOPE: &str = "remove the installed Cyclops binaries, pair store, and installer-owned PATH block; vendor configuration remains separate";
+const NEXT_STEP_SCOPE: &str = "remove the remaining installed Cyclops binaries, pair store, and installer-owned PATH block; vendor configuration remains separate";
 const INSTALLER_UNINSTALL_COMMAND: &str =
     "curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall";
 
