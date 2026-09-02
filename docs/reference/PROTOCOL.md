@@ -132,8 +132,8 @@ alphabet.
 | `messages.follow` | Page losslessly through body-free message changes after a sequence |
 | `msg.requeue` | Explicitly requeue a notification that permits the transition |
 | `notification.withdraw` | Suppress one exact `queued`, `gating`, or `blocked_pre_write` wake while leaving its mailbox item pending |
-| `notification.force_submit.get` | Read the administrator's default-off post-paste Enter fallback |
-| `notification.force_submit.set` | Persist and apply that fallback with a 0 to 20 second delay |
+| `notification.force_submit.get` | Read the administrator's automatic post-paste Enter recovery |
+| `notification.force_submit.set` | Persist and apply that recovery with a 0 to 20 second delay |
 | `alarm.preview` | Preview unresolved notification alarms older than a duration |
 | `attention.show` | Read safety checks for one staged notification attempt |
 | `attention.complete` | Submit one exact staged notification attempt |
@@ -677,8 +677,11 @@ not repeat clear or Enter. Recovery is `cyclops health`, repair state storage,
 then restart the daemon. Restart recovery may settle a claimed durable
 `staged` attempt whose doorbell is already gone only when the current manifest
 wins a `composer_semantic = "clean"` rule and exact extraction returns visible
-empty bytes under the same complete process binding. Unsupported, unprovable,
-hidden, or nonempty composer content remains ambiguous. A claim at `submitting`
+empty bytes under the same complete process binding. An unsupported or
+unprovable process binding, hidden pane state, or positively observed nonempty
+human composer content remains a terminal-input boundary. An authenticated idle
+or working pane with merely inconclusive composer extraction receives the one
+notification and submit. A claim at `submitting`
 succeeds once, but the reserved terminal key may still submit the same message
 id. `Submitting` is appended under the workspace journal lock before terminal
 IO and is the linearization point against claim. It is not proof that a key was

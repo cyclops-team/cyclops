@@ -126,11 +126,11 @@ state. This does not require eliminating every `Arc` or extracting a new crate.
 - A complete data-lifecycle policy is deliberately deferred. The interim rule
   is still binding: no silent loss, and any breaking migration needs an export
   or migration path.
-- Terminal injection is not claimed to be race-free. Ordinary paths require
-  fresh positive evidence and record intent before an effect. The separately
-  documented default-off administrator force-submit setting never replaces
-  bytes, but may submit trailing human input for one exact `verify_failed`
-  attempt; it is a bounded liveness tradeoff, not automatic raw-tmux fallback.
+- Terminal injection is not claimed to be race-free. Ordinary paths require a
+  current known manifest and process binding, then preserve only positively
+  observed human input. The documented default-on force-submit recovery never
+  replaces bytes, but may submit one exact `verify_failed` notification; it is
+  a bounded liveness tradeoff, not automatic raw-tmux fallback.
 
 ## CI and regression evidence
 
