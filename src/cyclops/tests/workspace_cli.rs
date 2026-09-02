@@ -1569,9 +1569,10 @@ fn setup_plan_lists_only_installed_skill_destinations_and_preserves_edits() {
         fs::read(&claude_skill).expect("read preserved Claude skill"),
         b"# operator-owned Claude skill\n"
     );
-    assert!(
-        !user.join(".agents/skills").exists(),
-        "setup created the missing shared consumer tree"
+    assert_eq!(
+        fs::read(user.join(".agents/skills/cyclops/SKILL.md"))
+            .expect("Codex setup seeds its shipped skill after its consumer root exists"),
+        shipped_skill()
     );
     assert_eq!(
         fs::read(&agy_skill).expect("read kept AGY skill"),
@@ -1594,12 +1595,9 @@ fn setup_plan_lists_only_installed_skill_destinations_and_preserves_edits() {
     }
 
     let check = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "check"]);
-    assert_eq!(check.status.code(), Some(1), "{check:?}");
+    assert!(check.status.success(), "{check:?}");
     let report: Value = serde_json::from_slice(&check.stdout).expect("setup check JSON");
-    assert_eq!(
-        report["consumers"][1]["skill"]["state"],
-        "manual_review_required"
-    );
+    assert_eq!(report["consumers"][1]["skill"]["state"], "current");
     for (path, bytes, identity) in &existing_before {
         assert_eq!(
             fs::read(path).unwrap(),
@@ -1620,7 +1618,7 @@ fn setup_plan_lists_only_installed_skill_destinations_and_preserves_edits() {
 }
 
 #[test]
-fn setup_refuses_a_nonprivate_skill_parent_without_creating_a_leaf() {
+fn setup_seeds_a_missing_skill_in_an_owner_controlled_parent() {
     let home = scratch_home("ws-setup-nonprivate-skill-parent");
     let user = scratch_home("ws-setup-nonprivate-skill-parent-user");
     fs::create_dir_all(user.join(".codex")).expect("create Codex home");
@@ -1640,8 +1638,8 @@ fn setup_refuses_a_nonprivate_skill_parent_without_creating_a_leaf() {
         .iter()
         .find(|asset| asset["consumer"] == "Codex")
         .expect("Codex skill plan");
-    assert_eq!(codex["observed_state"], "unreadable_or_unproven", "{codex}");
-    assert_eq!(codex["action"], "manual_review_required", "{codex}");
+    assert_eq!(codex["observed_state"], "missing", "{codex}");
+    assert_eq!(codex["action"], "create", "{codex}");
     assert_eq!(
         tree_snapshot(parent),
         parent_before,
@@ -1662,19 +1660,8 @@ fn setup_refuses_a_nonprivate_skill_parent_without_creating_a_leaf() {
         .iter()
         .find(|skill| skill["consumer"] == "Codex")
         .expect("Codex skill outcome");
-    assert_eq!(outcome["outcome"], "problem", "{outcome}");
-    assert_eq!(
-        outcome["detail"],
-        format!(
-            "manual review required for {}: skill parent is not private or changed during inspection; left untouched",
-            skill.display()
-        ),
-        "{outcome}"
-    );
-    assert!(
-        !skill.exists(),
-        "setup created a leaf in a nonprivate parent"
-    );
+    assert_eq!(outcome["outcome"], "written", "{outcome}");
+    assert_eq!(fs::read(&skill).expect("seeded skill"), shipped_skill());
     assert_eq!(
         fs::metadata(parent)
             .expect("parent metadata")
@@ -1684,17 +1671,11 @@ fn setup_refuses_a_nonprivate_skill_parent_without_creating_a_leaf() {
         0o755,
         "setup changed consumer permissions"
     );
-    assert_eq!(
-        tree_snapshot(parent),
-        parent_before,
-        "setup changed skill parent"
-    );
-
     let check = cyclops_in_user_home(&home, &user, &[], &["--json", "setup", "check"]);
-    assert_eq!(check.status.code(), Some(1), "{check:?}");
+    assert!(check.status.success(), "{check:?}");
     let check: Value = serde_json::from_slice(&check.stdout).expect("setup check JSON");
     assert_eq!(
-        check["consumers"][1]["skill"]["state"], "manual_review_required",
+        check["consumers"][1]["skill"]["state"], "current",
         "{check}"
     );
 

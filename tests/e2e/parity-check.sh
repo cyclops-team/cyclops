@@ -1353,9 +1353,9 @@ run_installer "$PATH"
 # The build log is noise here; the checks are all on what it says it did.
 grep -v '^ *\(Compiling\|Finished\|Downloaded\|Blocking\|Updating\|Adding\)' "$OUT" | tail -22
 
-check "it says where each binary went"    "^  cyclops    $INST/.local/bin/cyclops$"
-check "and the daemon too"                "^  cyclopsd   $INST/.local/bin/cyclopsd$"
-check "and where the home is"             "^  home       $INST/.cyclops$"
+check "it says where the command went"    "^  command  $INST/.local/bin/cyclops$"
+check "and the daemon too"                 "^  daemon   $INST/.local/bin/cyclopsd$"
+check "and where Cyclops stores state"     "^  state    $INST/.cyclops$"
 check "it reports the version it built"   "^✔ cyclops $PACKAGE_VERSION_RE \\(([0-9a-f]+(\\.dirty)?|unknown)\\) is installed$"
 check_absent "it gives no separate daemon step" 'cyclopsd &'
 check "step 2 opens the workspace"        '^  2  cyclops +open your workspace and start your agents$'
@@ -1684,7 +1684,7 @@ printf '\n$ ./scripts/install.sh --uninstall\n'
 run_installer "$INST/.local/bin:$PATH" --uninstall
 cat "$OUT"
 check "uninstall stops its validated daemon" '^stopped selected cyclopsd pid [0-9]+$'
-check "uninstall removes the complete state home" "removed the complete Cyclops state home at $INST/.cyclops"
+check "uninstall removes the complete state home" "state removed from $INST/.cyclops"
 check_exit "uninstall exits 0" 0
 CHECKS=$((CHECKS + 1))
 if [ ! -e "$INST_HOME" ]; then

@@ -553,7 +553,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_current_doorbell_skill_does_not_need_a_private_parent_to_report_runtime_capability() {
+    fn a_current_doorbell_skill_in_an_owner_controlled_parent_reports_runtime_capability() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempfile::tempdir().unwrap();
@@ -567,10 +567,7 @@ mod tests {
             relative: PathBuf::from("skills/cyclops/SKILL.md"),
         };
 
-        assert!(matches!(
-            read_skill_asset(&location),
-            AssetRead::ManualReview
-        ));
+        assert!(matches!(read_skill_asset(&location), AssetRead::Bytes(_)));
         assert!(cyclops_manifest::mailbox_capability::is_current(&skill));
         assert_eq!(mailbox_capability_ready(true, Some(&skill)), Some(true));
     }

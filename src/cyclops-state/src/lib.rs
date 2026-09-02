@@ -298,6 +298,7 @@ pub struct ManagedAssetRoot {
     directory: File,
     path: PathBuf,
     owner: u32,
+    owner_controlled: bool,
 }
 
 /// One exact inspected file or empty directory bound for explicit removal.
@@ -471,6 +472,7 @@ impl StateInspector {
             directory: self.directory,
             path: self.path,
             owner: self.owner,
+            owner_controlled: false,
         })
     }
 
@@ -493,6 +495,7 @@ impl StateInspector {
             directory: self.directory,
             path: self.path,
             owner: self.owner,
+            owner_controlled: true,
         })
     }
 
@@ -1300,8 +1303,9 @@ impl ManagedAssetRoot {
     /// Create a managed file only when its final leaf is absent.
     ///
     /// The file is visible as soon as `openat(O_EXCL)` succeeds, so the
-    /// parent must already be private. This deliberately does not publish by
-    /// a mutable named temporary file or create a consumer-tree directory.
+    /// parent must remain private or owner-controlled, according to the
+    /// authority used to construct this value. This deliberately does not
+    /// publish by a mutable named temporary file or create a consumer-tree directory.
     /// Any raced or unsafe leaf stays exactly where it is. Callers must
     /// re-inspect it before deciding whether another action is permitted.
     pub fn create_file_once(
@@ -1317,7 +1321,7 @@ impl ManagedAssetRoot {
                 "managed asset publication must name one final leaf",
             ));
         }
-        self.validate_private_parent(&display_path)?;
+        self.validate_publication_parent(&display_path)?;
         let directory = clone_file(&self.directory, &display_path)?;
 
         let leaf = c_name(
@@ -1361,7 +1365,7 @@ impl ManagedAssetRoot {
                 .map_err(|source| io_error(&display_path, source))?;
             file.sync_all()
                 .map_err(|source| io_error(&display_path, source))?;
-            self.validate_private_parent(&display_path)?;
+            self.validate_publication_parent(&display_path)?;
             validate_created_leaf(&directory, &file, &leaf, &display_path, self.owner)?;
             sync_directory(&directory).map_err(|source| StateError::CreationDurabilityUnknown {
                 path: display_path.clone(),
@@ -1392,17 +1396,26 @@ impl ManagedAssetRoot {
         }
     }
 
-    fn validate_private_parent(&self, display_path: &Path) -> Result<(), StateError> {
+    fn validate_publication_parent(&self, display_path: &Path) -> Result<(), StateError> {
         if !self.path_matches_held_root()? {
             return Err(unsafe_path(
                 &self.path,
                 "managed asset parent changed before publication",
             ));
         }
-        if !private_directory(&self.directory, display_path, self.owner)? {
+        let safe = if self.owner_controlled {
+            owner_controlled_directory(&self.directory, display_path, self.owner)?
+        } else {
+            private_directory(&self.directory, display_path, self.owner)?
+        };
+        if !safe {
             return Err(unsafe_path(
                 display_path,
-                "managed asset parent is not private",
+                if self.owner_controlled {
+                    "managed asset parent is not owner-controlled"
+                } else {
+                    "managed asset parent is not private"
+                },
             ));
         }
         Ok(())

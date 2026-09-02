@@ -332,7 +332,9 @@ pub(crate) fn inspect(location: &crate::consumer::AssetLocation) -> SkillInspect
         Path::new(leaf),
         cyclops_state::INSPECTION_FILE_BYTES_LIMIT_MAX,
     ) {
-        Ok(Some(file)) if !file.truncated => SkillInspection::Bytes(file.bytes),
+        Ok(Some(file)) if !file.truncated && skill_file_is_owner_controlled(&file) => {
+            SkillInspection::Bytes(file.bytes)
+        }
         Ok(Some(_)) => SkillInspection::Unreadable,
         Ok(None) => SkillInspection::Missing,
         Err(StateError::UnsafePath { .. }) => SkillInspection::ManualReview,
@@ -342,6 +344,13 @@ pub(crate) fn inspect(location: &crate::consumer::AssetLocation) -> SkillInspect
         Ok(true) => inspection,
         Ok(false) | Err(_) => SkillInspection::ManualReview,
     }
+}
+
+/// A consumer may choose a readable skill file, but another user must never
+/// be able to replace its instructions. `read_file` already proves regular
+/// type, ownership, no links, and stable identity through the held parent.
+fn skill_file_is_owner_controlled(file: &cyclops_state::FileInspection) -> bool {
+    file.entry.mode & 0o022 == 0
 }
 
 /// Read one target through its final operator-controlled parent. Links, multi-link files,
@@ -379,11 +388,13 @@ fn inspected_seed_decision(
         Path::new(leaf),
         cyclops_state::INSPECTION_FILE_BYTES_LIMIT_MAX,
     ) {
-        Ok(Some(file)) if !file.truncated => Ok(crate::managed_assets::seed_decision(
-            Some(&file.bytes),
-            SHIPPED.as_bytes(),
-            unedited_seed,
-        )),
+        Ok(Some(file)) if !file.truncated && skill_file_is_owner_controlled(&file) => {
+            Ok(crate::managed_assets::seed_decision(
+                Some(&file.bytes),
+                SHIPPED.as_bytes(),
+                unedited_seed,
+            ))
+        }
         Ok(None) => Ok(crate::managed_assets::seed_decision(
             None,
             SHIPPED.as_bytes(),

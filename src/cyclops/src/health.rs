@@ -1788,8 +1788,9 @@ fn read_asset(root: &Path, relative: &Path) -> AssetRead {
     }
 }
 
-/// Health uses the same private-parent boundary as setup. A skill below a
-/// missing or unsafe consumer parent cannot establish a healthy installation.
+/// Health uses the same operator-controlled-parent boundary as setup. A skill
+/// below a missing or externally writable consumer parent cannot establish a
+/// healthy installation.
 fn read_skill_asset(location: &crate::consumer::AssetLocation) -> AssetRead {
     match crate::skillseed::inspect(location) {
         crate::skillseed::SkillInspection::Missing => AssetRead::Missing,
@@ -2634,7 +2635,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn current_doorbell_bytes_report_doorbell_even_when_skill_management_needs_review() {
+    fn current_doorbell_bytes_in_an_owner_controlled_parent_report_doorbell() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempfile::tempdir().unwrap();
@@ -2650,7 +2651,7 @@ mod tests {
 
         assert_eq!(
             inspect_skill(read_skill_asset(&location)),
-            ("unproven", false)
+            ("current", true)
         );
         assert!(cyclops_manifest::mailbox_capability::is_current(&skill));
         assert_eq!(mailbox_transport(true, Some(&skill)), Some("doorbell"));
