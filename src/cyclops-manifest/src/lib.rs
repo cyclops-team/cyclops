@@ -41,6 +41,7 @@ pub use regex::Regex;
 
 use cyclops_proto::{AgentState, ComposerSemantic};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 fn enabled_by_default() -> bool {
     true
@@ -220,6 +221,10 @@ pub struct Manifest {
     pub composer_continuation: Option<regex::Regex>,
     /// Source path, for reload and error messages.
     pub path: PathBuf,
+    /// SHA-256 of the exact parsed source bytes. This is provenance for the
+    /// rare compatibility rule that must distinguish one known historic seed
+    /// from an operator-customized manifest with similar syntax.
+    source_digest: [u8; 32],
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1206,7 +1211,16 @@ impl Manifest {
             composer_prompt,
             composer_continuation,
             path: path.into(),
+            source_digest: Sha256::digest(text.as_bytes()).into(),
         })
+    }
+
+    /// SHA-256 of the exact TOML source parsed into this manifest.
+    ///
+    /// The value is intentionally not a version claim: a matching digest
+    /// means the complete source bytes match a known seed.
+    pub fn source_digest(&self) -> [u8; 32] {
+        self.source_digest
     }
 
     /// Evaluate title + screen against the rules. Returns the winning rule.

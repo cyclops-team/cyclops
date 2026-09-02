@@ -4926,6 +4926,165 @@ async fn a_working_pane_with_a_proven_clean_composer_submits_one_doorbell() {
     );
 }
 
+/// AGY 1.1.23 wraps an otherwise single-line doorbell into application-owned
+/// rows with a two-cell continuation gutter. The gutter is chrome, so the
+/// exact proof must still permit the one verified Enter, not hold forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn agy_indented_wrapped_doorbell_submits_one_enter() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let event_dir = cyclops_proto::scratch::scratch_dir(&format!(
+        "agy-indented-doorbell-submit-event-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&event_dir).unwrap();
+    let _event_guard = HomeGuard(event_dir.clone());
+    let submit_event_path = event_dir.join("submit.sock");
+    let submit_events =
+        UnixDatagram::bind(&submit_event_path).expect("bind AGY fixture submit event socket");
+    let pane_command = format!(
+        "python3 {} --agy-layout --submit-event-socket {}",
+        faketui_path(),
+        submit_event_path.display()
+    );
+    // Exercise the shipped AGY grammar and trailers. The fixture process is
+    // deliberately Python, and Rig supplies a private current skill so this
+    // is a format-4 mailbox doorbell instead of a legacy direct payload.
+    let manifest = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../resources/manifests/agy.toml"
+    ))
+    .replacen(
+        "process_names = [\"agy\"]",
+        "process_names = [\"python3\", \"python\", \"Python\"]",
+        1,
+    )
+    .replacen(
+        "[messaging]\nmailbox_capability_file = \"~/.gemini/antigravity-cli/skills/cyclops/SKILL.md\"\n\n",
+        "",
+        1,
+    );
+    assert!(
+        !manifest.contains("mailbox_capability_file"),
+        "Rig must install its private current capability"
+    );
+    let mut rig = Rig::new(
+        "agy-indented-doorbell-submit",
+        &manifest,
+        &pane_command,
+        "delivery_retry_max = 0\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+    // F83 measured this exact AGY composer shape in a 100x30 pane. Wait for
+    // daemon observation of both dimensions before staging the doorbell.
+    // The isolated server keeps tmux's one-row status line, so a 100x31
+    // window produces F83's observed 100x30 pane.
+    rig.tmux
+        .run_ok(&["resize-window", "-t", &pane, "-x", "100", "-y", "31"]);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = rig.ctl.request("status", json!({})).await;
+        let observed = status["result"]["sessions"][0]["panes"]
+            .as_array()
+            .expect("pane list")
+            .iter()
+            .any(|row| row["pane_id"] == pane && row["width"] == 100 && row["height"] == 30);
+        if observed {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the AGY fixture did not reach F83's measured 100x30 pane: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    wait_pane_state(&mut rig, "idle").await;
+
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let pause = Arc::clone(&release);
+    rig.daemon.set_inject_pause(move |phase| {
+        let entered_tx = entered_tx.clone();
+        let pause = Arc::clone(&pause);
+        Box::pin(async move {
+            if phase == "pre_submit" {
+                let _ = entered_tx.send(());
+                pause.acquire_owned().await.unwrap().forget();
+            }
+        })
+    });
+
+    let summary = "This message deliberately covers the measured AGY continuation boundary while remaining an ordinary concise mailbox notice for the receiving agent. Claim the durable body and continue with the requested work.";
+    let sent = send_summarized_workspace_message(
+        &rig,
+        "agy-indented-doorbell-submit",
+        "AGY wrapped doorbell",
+        summary,
+        "The durable body stays in the mailbox.",
+    )
+    .await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+
+    tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+        .await
+        .expect("AGY doorbell did not reach the pre-submit proof")
+        .expect("pre-submit pause sender stayed open");
+    let attempt = current_notification_attempt(&workspace_lines(&rig), &message_id)
+        .expect("the staged AGY doorbell has one exact attempt");
+    let expected = cyclops_proto::render_doorbell_v4("admin", summary, attempt);
+    let screen = rig.tmux.capture(&pane);
+    let continuation_rows: Vec<_> = screen.lines().filter(|row| row.starts_with("  ")).collect();
+    assert!(
+        continuation_rows.len() == 2,
+        "the AGY fixture must expose F83's three-row, two-cell-gutter composer:\n{screen}"
+    );
+    assert!(
+        continuation_rows
+            .iter()
+            .all(|row| row.as_bytes().get(2).is_some_and(|byte| !byte.is_ascii_whitespace())),
+        "the fixture rows must contain only the renderer gutter before application content: {continuation_rows:?}"
+    );
+    assert!(
+        expected.contains("cyclops inbox claim m-att_"),
+        "the staged row remains the format-4 mailbox doorbell"
+    );
+
+    release.add_permits(1);
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::Submitted).await;
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::Submitted),
+        1,
+        "the exact doorbell reserves and sends one Enter"
+    );
+    assert_eq!(
+        notification_state_count(&rig, &message_id, NotificationState::AttentionRequired),
+        0,
+        "the renderer gutter must not become verify_failed"
+    );
+    let mut event = [0_u8; 16];
+    let received = tokio::time::timeout(Duration::from_secs(5), submit_events.recv(&mut event))
+        .await
+        .expect("the AGY fixture did not receive Enter")
+        .expect("read AGY fixture submit event");
+    assert_eq!(&event[..received], b"submit");
+
+    rig.daemon.shutdown().await;
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "C-q"]);
+    let received = tokio::time::timeout(Duration::from_secs(5), submit_events.recv(&mut event))
+        .await
+        .expect("the AGY fixture did not acknowledge the terminal checkpoint")
+        .expect("read AGY fixture checkpoint event");
+    assert_eq!(
+        &event[..received],
+        b"checkpoint",
+        "the AGY fixture received an extra Enter before the shutdown checkpoint"
+    );
+}
+
 /// The Working exception belongs only to the exact pre-admitted doorbell. If
 /// a person changes those bytes after fusion has re-observed them under the
 /// running turn, the final exact capture must still withhold Enter.

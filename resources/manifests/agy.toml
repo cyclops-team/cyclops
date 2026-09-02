@@ -217,14 +217,15 @@ composer_trailer_regex_esc = [
 composer_trailer_required_prefix = 2
 # MEASURED live on agy 1.1.21 and 1.1.22. The active composer prompt is one
 # plain `>`
-# followed by one separator space and the exact compact doorbell. Joined
-# continuation rows carry no trusted chrome here, so preserve every byte and
-# let the exact payload comparison decide. The styled trailer still proves the
-# active composer boundary before Cyclops can submit. AGY 1.1.22 may leave the
-# Ctx value empty and paints the model name with truecolor instead of the
-# earlier 256-color palette; both measured shapes remain chrome-only.
+# followed by one separator space and the exact compact doorbell. AGY 1.1.23
+# paints exactly two ASCII gutter columns before every wrapped continuation
+# row. They are renderer chrome, not message bytes, so the content capture
+# begins after them. The styled trailer still proves the active composer
+# boundary before Cyclops can submit. AGY 1.1.22 may leave the Ctx value empty
+# and paints the model name with truecolor instead of the earlier 256-color
+# palette; both measured shapes remain chrome-only.
 composer_prompt_regex = '^\s*>\s?(?P<content>.*)$'
-composer_continuation_regex = '^(?P<content>.*)$'
+composer_continuation_regex = '^  (?P<content>.*)$'
 
 [context_leak]
 note = """agy auto-read ~/projects/COORDINATION.md and ~/projects/NOTES.md on the

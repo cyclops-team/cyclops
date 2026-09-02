@@ -7638,7 +7638,8 @@ fn sentinel_proof(manifest: &Manifest, screen: &str, msg_id: &str) -> Option<Str
                     .composer_continuation
                     .as_ref()
                     .is_some_and(|continuation| {
-                        captured_content(continuation, plain) == Some(want.as_str())
+                        captured_continuation_content(manifest, continuation, plain)
+                            == Some(want.as_str())
                     })
         })
         .map(|(i, _)| i)
@@ -8657,7 +8658,7 @@ fn exact_staging_proof(
 /// composer row with ASCII spaces. Those renderer-owned suffix cells and the
 /// one ASCII separator consumed at a wrap boundary are ignored. No other byte
 /// may be added, removed, or reordered.
-fn visible_single_line_payload_matches(visible: &str, expected: &str) -> bool {
+pub(crate) fn visible_single_line_payload_matches(visible: &str, expected: &str) -> bool {
     if visible == expected {
         return true;
     }
@@ -8850,8 +8851,9 @@ pub(crate) fn composer_content_from_joined_capture(
         .iter()
         .enumerate()
         .filter_map(|(offset, (_, plain))| {
-            (captured_content(continuation, plain) == Some(want_sentinel.as_str()))
-                .then_some(start + offset)
+            (captured_continuation_content(manifest, continuation, plain)
+                == Some(want_sentinel.as_str()))
+            .then_some(start + offset)
         })
         .filter(|at| trailer_follows(manifest, &rows[*at + 1..]))
         .collect();
@@ -8882,7 +8884,7 @@ pub(crate) fn composer_content_from_joined_capture(
         }
         if plain.is_empty() {
             content.push(String::new());
-        } else if let Some(line) = captured_content(continuation, plain) {
+        } else if let Some(line) = captured_continuation_content(manifest, continuation, plain) {
             if line == want_sentinel {
                 sentinel_count += 1;
             }
@@ -8981,9 +8983,9 @@ fn exact_composer_content_for_state(
                 .then_some((at, content))
         })
         .filter(|(prompt_at, _)| {
-            window[prompt_at + 1..*trailer_at]
-                .iter()
-                .all(|(_, plain)| captured_content(continuation, plain).is_some())
+            window[prompt_at + 1..*trailer_at].iter().all(|(_, plain)| {
+                captured_continuation_content(manifest, continuation, plain).is_some()
+            })
         })
         .collect();
     let [(prompt_at, first)] = prompts.as_slice() else {
@@ -8995,7 +8997,7 @@ fn exact_composer_content_for_state(
         if captured_content(prompt, plain).is_some() {
             return ComposerContentProof::Unprovable;
         }
-        let Some(line) = captured_content(continuation, plain) else {
+        let Some(line) = captured_continuation_content(manifest, continuation, plain) else {
             return ComposerContentProof::Unprovable;
         };
         content.push(line.to_string());
@@ -9021,6 +9023,38 @@ fn captured_content<'a>(pattern: &cyclops_manifest::Regex, row: &'a str) -> Opti
         return None;
     }
     captures.name("content").map(|content| content.as_str())
+}
+
+/// Extract one continuation row without allowing a legacy seed to redefine
+/// the exact payload comparison.
+///
+/// The old shipped AGY pattern captured its renderer's two-cell continuation
+/// gutter as `content`. In the measured AGY 1.1.23 doorbell, a non-space
+/// payload byte immediately follows that gutter. Strip the gutter only for
+/// the complete, exact pre-change shipped manifest source and only when a
+/// third leading ASCII space is absent; a third space could be deliberate
+/// input and must remain a mismatch. An operator-customized manifest with the
+/// same regex does not match that source fingerprint and therefore fails
+/// closed. New manifests express the gutter in their regex, so they never
+/// enter this compatibility path.
+const LEGACY_AGY_PRE_GUTTER_MANIFEST_SHA256: [u8; 32] = [
+    0x9c, 0xfc, 0x99, 0xfd, 0x61, 0xc8, 0x36, 0xa6, 0x54, 0xce, 0x15, 0x24, 0x2c, 0xca, 0xa3, 0x7c,
+    0xaf, 0x53, 0xaa, 0xbc, 0xee, 0x5e, 0xec, 0x1d, 0x02, 0xab, 0xee, 0x5b, 0xe2, 0x28, 0x94, 0x98,
+];
+
+fn captured_continuation_content<'a>(
+    manifest: &Manifest,
+    pattern: &cyclops_manifest::Regex,
+    row: &'a str,
+) -> Option<&'a str> {
+    let content = captured_content(pattern, row)?;
+    let legacy_agy_pattern = manifest.agent.id == "agy"
+        && manifest.source_digest() == LEGACY_AGY_PRE_GUTTER_MANIFEST_SHA256
+        && pattern.as_str() == "^(?P<content>.*)$";
+    if legacy_agy_pattern && content.starts_with("  ") && content.as_bytes().get(2) != Some(&b' ') {
+        return Some(&content[2..]);
+    }
+    Some(content)
 }
 
 /// Does this pattern match the ENTIRE row, rather than some run inside it?
@@ -15186,7 +15220,7 @@ composer_trailer_required_prefix = 1
             (
                 shipped("agy"),
                 format!(
-                    "\x1b[94m>\x1b[39m {}\n{}\n{}\n\x1b[90m{}\n\x1b[38;2;174;198;207mGemini 3.7 Flash · High · /tmp/work · Full · Ctx:",
+                    "\x1b[94m>\x1b[39m {}\n  {}\n  {}\n\x1b[90m{}\n\x1b[38;2;174;198;207mGemini 3.7 Flash · High · /tmp/work · Full · Ctx:",
                     padded(parts[0], 94), padded(parts[1], 96), padded(parts[2], 96), "─".repeat(96)
                 ),
             ),
@@ -15281,7 +15315,7 @@ composer_trailer_required_prefix = 1
             (
                 shipped("agy"),
                 format!(
-                    "\x1b[94m>\x1b[39m {}\n{}\n{}\n{}\n\x1b[90m{}\n\x1b[38;2;174;198;207mGemini 3.7 Flash · High · ~ · Full · Ctx:",
+                    "\x1b[94m>\x1b[39m {}\n  {}\n  {}\n  {}\n\x1b[90m{}\n\x1b[38;2;174;198;207mGemini 3.7 Flash · High · ~ · Full · Ctx:",
                     padded(parts[0], 58),
                     padded(parts[1], 60),
                     padded(parts[2], 60),
@@ -15304,6 +15338,158 @@ composer_trailer_required_prefix = 1
                 manifest.agent.id,
             );
         }
+    }
+
+    /// AGY 1.1.23 paints a two-column gutter before every application-owned
+    /// continuation row. The gutter is terminal chrome, not part of the
+    /// original single-line doorbell, so it must not turn an exact staged
+    /// notification into an ambiguous human draft.
+    #[test]
+    fn agy_indented_wrapped_doorbell_reaches_the_submit_gate() {
+        let manifest = Manifest::parse(
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../resources/manifests/agy.toml"
+            )),
+            std::path::Path::new("agy"),
+        )
+        .expect("shipped AGY manifest parses");
+        let attempt =
+            NotificationAttemptId::parse("att-01234567-89ab-4def-8123-456789abcdef").unwrap();
+        let expected = cyclops_proto::render_doorbell_v4(
+            "implementer",
+            "Check the exact wrapped doorbell before submitting it to the recipient.",
+            attempt,
+        );
+        let parts = [
+            "[cyclops from implementer] Check the exact wrapped doorbell before",
+            "submitting it to the recipient. | cyclops inbox claim",
+            "m-att_ASNFZ4mrTe-BI0VniavN7w",
+        ];
+        assert_eq!(parts.join(" "), expected);
+        let capture = format!(
+            "\x1b[94m>\x1b[39m {}\n  {}\n  {}\n\x1b[90m{}\n\x1b[38;2;174;198;207mGemini 3.7 Flash · High · ~ · Full · Ctx:",
+            parts[0],
+            parts[1],
+            parts[2],
+            "─".repeat(80),
+        );
+
+        assert_eq!(
+            exact_staging_proof(
+                &manifest,
+                &capture,
+                StagingTarget::ExactRow(&expected),
+                &expected,
+            ),
+            Some((true, expected.clone())),
+            "the measured AGY continuation gutter is renderer chrome, not user input",
+        );
+
+        let legacy_source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../resources/manifests/agy.toml"
+        ))
+        .replacen(
+            "# followed by one separator space and the exact compact doorbell. AGY 1.1.23\n\
+             # paints exactly two ASCII gutter columns before every wrapped continuation\n\
+             # row. They are renderer chrome, not message bytes, so the content capture\n\
+             # begins after them. The styled trailer still proves the active composer\n\
+             # boundary before Cyclops can submit. AGY 1.1.22 may leave the Ctx value empty\n\
+             # and paints the model name with truecolor instead of the earlier 256-color\n\
+             # palette; both measured shapes remain chrome-only.",
+            "# followed by one separator space and the exact compact doorbell. Joined\n\
+             # continuation rows carry no trusted chrome here, so preserve every byte and\n\
+             # let the exact payload comparison decide. The styled trailer still proves the\n\
+             # active composer boundary before Cyclops can submit. AGY 1.1.22 may leave the\n\
+             # Ctx value empty and paints the model name with truecolor instead of the\n\
+             # earlier 256-color palette; both measured shapes remain chrome-only.",
+            1,
+        )
+        .replacen(
+            "composer_continuation_regex = '^  (?P<content>.*)$'",
+            "composer_continuation_regex = '^(?P<content>.*)$'",
+            1,
+        );
+        let legacy_manifest = Manifest::parse(&legacy_source, std::path::Path::new("agy.toml"))
+            .expect("the previous shipped AGY manifest parses");
+        assert_eq!(
+            legacy_manifest.source_digest(),
+            LEGACY_AGY_PRE_GUTTER_MANIFEST_SHA256,
+            "the compatibility case is the exact historical shipped source",
+        );
+        assert_eq!(
+            exact_staging_proof(
+                &legacy_manifest,
+                &capture,
+                StagingTarget::ExactRow(&expected),
+                &expected,
+            ),
+            Some((true, expected.clone())),
+            "an unedited old AGY seed still ignores its measured renderer gutter",
+        );
+
+        let customized_source = legacy_source.replacen(
+            "display_name = \"Antigravity CLI\"",
+            "display_name = \"Antigravity CLI (operator-customized)\"",
+            1,
+        );
+        let customized_manifest =
+            Manifest::parse(&customized_source, std::path::Path::new("agy.toml"))
+                .expect("an operator-customized AGY manifest parses");
+        assert_ne!(
+            customized_manifest.source_digest(),
+            LEGACY_AGY_PRE_GUTTER_MANIFEST_SHA256,
+            "a changed manifest must not inherit the historic seed exception",
+        );
+        assert!(
+            exact_staging_proof(
+                &customized_manifest,
+                &capture,
+                StagingTarget::ExactRow(&expected),
+                &expected,
+            )
+            .is_none(),
+            "an operator-customized generic continuation rule must retain every captured byte",
+        );
+
+        let with_user_space = capture.replacen(
+            &format!("\n  {}", parts[1]),
+            &format!("\n    {}", parts[1]),
+            1,
+        );
+        assert!(
+            exact_staging_proof(
+                &legacy_manifest,
+                &with_user_space,
+                StagingTarget::ExactRow(&expected),
+                &expected,
+            )
+            .is_none(),
+            "legacy compatibility must not strip a third leading input space",
+        );
+        assert!(
+            exact_staging_proof(
+                &manifest,
+                &with_user_space,
+                StagingTarget::ExactRow(&expected),
+                &expected,
+            )
+            .is_none(),
+            "the current extractor keeps deliberate spaces after its two-cell gutter",
+        );
+
+        let changed = capture.replacen(parts[1], "changed continuation", 1);
+        assert!(
+            exact_staging_proof(
+                &manifest,
+                &changed,
+                StagingTarget::ExactRow(&expected),
+                &expected,
+            )
+            .is_none(),
+            "normalizing the gutter must not normalize changed message content",
+        );
     }
 
     #[test]
