@@ -6075,3 +6075,104 @@ async fn decoy_replacement_generation_does_not_inherit_prior_occupant_composer_h
 
     rig.daemon.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_working_turn_started_pane_submits_doorbell_without_barrier_held() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let event_dir = cyclops_proto::scratch::scratch_dir(&format!("wts-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&event_dir).unwrap();
+    let _event_guard = HomeGuard(event_dir.clone());
+    let submit_event_path = event_dir.join("submit.sock");
+    let submit_events =
+        UnixDatagram::bind(&submit_event_path).expect("bind fake composer submit event socket");
+    let pane_command = format!(
+        "python3 {} --manual-lifecycle --submit-event-socket {}",
+        faketui_path(),
+        submit_event_path.display()
+    );
+    let manifest = keyed_liveness_manifest();
+    let mut rig = Rig::new(
+        "workspace-working-turn-started",
+        &manifest,
+        &pane_command,
+        "delivery_retry_max = 0\n",
+    )
+    .await;
+    let pane = rig.pane_ids().await[0].clone();
+    rig.label(&pane, "worker").await;
+
+    let start = report_hook(&rig, "SessionStart", 1, json!({"session_id": "session-1"})).await;
+    assert_eq!(start["applied"], true, "{start}");
+    wait_for_pane_write_block(&mut rig, &pane, None).await;
+
+    // Simulate agent turn start (e.g. UserPromptSubmit), putting the pane in TurnStarted hold
+    let prompt = report_hook(
+        &rig,
+        "UserPromptSubmit",
+        2,
+        json!({
+            "prompt": "solve guitar chords",
+            "session_id": "session-1",
+            "turn_id": "turn-1"
+        }),
+    )
+    .await;
+    assert_eq!(prompt["applied"], true, "{prompt}");
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "C-t"]);
+    wait_pane_state(&mut rig, "working").await;
+
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let pause = Arc::clone(&release);
+    rig.daemon.set_inject_pause(move |phase| {
+        let entered_tx = entered_tx.clone();
+        let pause = Arc::clone(&pause);
+        Box::pin(async move {
+            if phase != "pre_submit" {
+                return;
+            }
+            let _ = entered_tx.send(());
+            pause.acquire_owned().await.unwrap().forget();
+        })
+    });
+
+    // Send a message/reply to this working pane
+    let sent = send_workspace_message(
+        &rig,
+        "working-turn-started",
+        "Guitar chord recommendations",
+        "E minor and G major chords",
+    )
+    .await;
+    let message_id = sent["msg_id"].as_str().unwrap().to_string();
+
+    // The message must transition through Writing and be submitted directly to the composer
+    // without failing or sticking in barrier_held!
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::Writing).await;
+    wait_for_doorbell(&rig, &pane, &message_id).await;
+    tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+        .await
+        .expect("doorbell reached the pre-submit pause")
+        .expect("pause sender stayed open");
+
+    refresh_exact_working_doorbell(&mut rig, &pane).await;
+    release.add_permits(1);
+
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::Submitted).await;
+
+    let mut event = [0_u8; 16];
+    let received = tokio::time::timeout(Duration::from_secs(5), submit_events.recv(&mut event))
+        .await
+        .expect("the fake composer did not receive Enter")
+        .expect("read fake composer submit event");
+    assert_eq!(
+        &event[..received],
+        b"submit",
+        "the doorbell must be submitted with Enter"
+    );
+
+    rig.daemon.shutdown().await;
+}

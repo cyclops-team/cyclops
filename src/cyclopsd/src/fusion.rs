@@ -2266,7 +2266,7 @@ pub(crate) fn claim_hold(
         // produces exactly that. Only the same owner may re-claim a
         // barrier it already holds.
         match (entry.hold, entry.hold_owner.as_deref()) {
-            (ComposerHold::Clear, None) => {}
+            (ComposerHold::Clear, None) | (ComposerHold::TurnStarted { .. }, None) => {}
             (_, Some(held)) if held == owner => {}
             _ => return false,
         }
@@ -2451,6 +2451,27 @@ pub(crate) fn record_final_submit_conflict(
     } else {
         None
     }
+}
+
+/// Does the pane hold an unsubmitted draft or active human typing?
+///
+/// An active agent turn (TurnStarted) with no hold owner is an active process,
+/// not an unsubmitted draft. True human typing or staged content requires
+/// Staged, StagedDuringTurn, or explicit HumanInput / IdleWithInput semantics.
+pub(crate) fn composer_has_unsubmitted_draft(
+    inner: &Inner,
+    session_idx: usize,
+    pane_id: &str,
+) -> bool {
+    let map = inner.detections.lock().expect("detections lock");
+    let Some(entry) = map.get(&PaneKey::new(session_idx, pane_id)) else {
+        return false;
+    };
+    matches!(
+        entry.hold,
+        ComposerHold::Staged | ComposerHold::StagedDuringTurn
+    ) || entry.detection.composer_semantic == Some(ComposerSemantic::HumanInput)
+        || entry.detection.state == AgentState::IdleWithInput
 }
 
 /// Keep a final-submit conflict only while it still names this exact staged
@@ -8742,10 +8763,7 @@ contains = ["done"]
 
         // The race this exists for: a person types between the proof and
         // the write, a recompute records the text, and nobody owns it.
-        for hold in [
-            ComposerHold::Staged,
-            ComposerHold::TurnStarted { since_ms: 9 },
-        ] {
+        for hold in [ComposerHold::Staged, ComposerHold::StagedDuringTurn] {
             put(entry(hold, None));
             assert!(
                 !claim_hold(&inner, 0, "%1", "m-3#1", agent, Some("bash")),
@@ -8753,6 +8771,15 @@ contains = ["done"]
             );
             assert_eq!(hold_now(), (hold, None), "a refused claim changes nothing");
         }
+
+        // An active turn without a hold owner does not hold an unsubmitted draft;
+        // it admits a delivery doorbell interruption.
+        put(entry(ComposerHold::TurnStarted { since_ms: 9 }, None));
+        assert!(claim_hold(&inner, 0, "%1", "m-3#1", agent, Some("bash")));
+        assert_eq!(
+            hold_now(),
+            (ComposerHold::Staged, Some("m-3#1".to_string()))
+        );
 
         // A proven binding is still required on top of all of that.
         put(entry(ComposerHold::Clear, None));

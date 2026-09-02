@@ -6575,7 +6575,11 @@ async fn gate(
                                 // For notification doorbells, working state is an observation,
                                 // not a delivery blocker. Only a proven non-Cyclops draft holds it.
                                 if handle.notification.is_some() {
-                                    if det.write_block.as_deref() == Some("composer_hold") {
+                                    if fusion::composer_has_unsubmitted_draft(
+                                        inner,
+                                        handle.session_idx,
+                                        &handle.pane_id,
+                                    ) {
                                         Some("composer_hold".to_string())
                                     } else {
                                         match fusion::foreground_pid_checked(row.pane_pid) {
