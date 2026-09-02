@@ -1,7 +1,7 @@
 # Status
 
 Updated 2026-09-01. Cyclops is pre-release software; the Cargo workspace
-currently declares `0.1.0-beta`. `main` is the stable line and
+currently declares `0.1.1-beta`. `main` is the stable line and
 **beta/messaging-rework** is the active beta integration line. The shell/Python
 implementation remains available as the read-only `v1-final` tag.
 
@@ -13,7 +13,7 @@ The whole-product implementation tracks and technical beta-acceptance decision
 are complete for the audited candidate. The
 [final beta acceptance audit](docs/development/CYCLOPS_BETA_FINAL_AUDIT.md)
 records the evidence and remaining known limits. The selected release identity
-is `0.1.0-beta` / `v0.1.0-beta`. Exact-SHA release evidence and a later
+is `0.1.1-beta` / `v0.1.1-beta`. Exact-SHA release evidence and a later
 explicit operator authorization are required before merging `main`, tagging,
 creating a GitHub Release, or publishing. The historical `v0.2.0-beta` tag
 remains attached to its older source commit and does not name this candidate.

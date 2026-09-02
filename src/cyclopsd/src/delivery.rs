@@ -14463,7 +14463,7 @@ line_regex_esc = ['^❯$']
         let detection = Detection {
             state: AgentState::Idle,
             readings: vec![cyclops_proto::SensorReading {
-                sensor: Sensor::Screen,
+                sensor: cyclops_proto::Sensor::Screen,
                 state: AgentState::Idle,
                 rule: "runtime_idle".to_string(),
                 ts: 1,

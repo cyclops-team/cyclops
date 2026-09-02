@@ -558,11 +558,11 @@ demonstrate that:
 - the modular structure is easier to explain and change.
 
 The release identity is selected but not published. The workspace package
-version is `0.1.0-beta`; the historical `v0.2.0-beta` tag remains attached to
+version is `0.1.1-beta`; the historical `v0.2.0-beta` tag remains attached to
 older source; and GitHub has no Release object for this candidate. Exact-SHA
 release evidence and the final beta-to-main pull request must be prepared
 before the operator decides whether to promote it. Do not merge `main`, create
-the `v0.1.0-beta` tag, create a GitHub Release, or publish without subsequent
+the `v0.1.1-beta` tag, create a GitHub Release, or publish without subsequent
 explicit operator approval.
 
 ## 16. One fully specified first tracer bullet
