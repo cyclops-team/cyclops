@@ -2467,8 +2467,10 @@ pub(crate) fn composer_has_unsubmitted_draft(
     let Some(entry) = map.get(&PaneKey::new(session_idx, pane_id)) else {
         return false;
     };
-    matches!(entry.hold, ComposerHold::Staged | ComposerHold::StagedDuringTurn)
-        || entry.detection.composer_semantic == Some(ComposerSemantic::HumanInput)
+    matches!(
+        entry.hold,
+        ComposerHold::Staged | ComposerHold::StagedDuringTurn
+    ) || entry.detection.composer_semantic == Some(ComposerSemantic::HumanInput)
         || entry.detection.state == AgentState::IdleWithInput
 }
 
@@ -8761,10 +8763,7 @@ contains = ["done"]
 
         // The race this exists for: a person types between the proof and
         // the write, a recompute records the text, and nobody owns it.
-        for hold in [
-            ComposerHold::Staged,
-            ComposerHold::StagedDuringTurn,
-        ] {
+        for hold in [ComposerHold::Staged, ComposerHold::StagedDuringTurn] {
             put(entry(hold, None));
             assert!(
                 !claim_hold(&inner, 0, "%1", "m-3#1", agent, Some("bash")),
@@ -8777,7 +8776,10 @@ contains = ["done"]
         // it admits a delivery doorbell interruption.
         put(entry(ComposerHold::TurnStarted { since_ms: 9 }, None));
         assert!(claim_hold(&inner, 0, "%1", "m-3#1", agent, Some("bash")));
-        assert_eq!(hold_now(), (ComposerHold::Staged, Some("m-3#1".to_string())));
+        assert_eq!(
+            hold_now(),
+            (ComposerHold::Staged, Some("m-3#1".to_string()))
+        );
 
         // A proven binding is still required on top of all of that.
         put(entry(ComposerHold::Clear, None));
