@@ -413,9 +413,9 @@ switching sections never resizes it.
   missing or there is no player for it; only a system with no alert
   sound at all falls back to the terminal bell, which many terminals
   ship with the sound turned off.
-- **Delivery** contains the default-off `Force staged submit` switch and its
+- **Delivery** contains the default-on `Force staged submit` switch and its
   0 to 20 second delay. Select `Delay` and use `←`/`→` to move the slider.
-  This escape hatch applies only after Cyclops has pasted an exact notification
+  This recovery applies only after Cyclops has pasted an exact notification
   and ordinary verification fails. It does not paste again. At expiry the
   daemon rechecks the exact attempt and bound pane process, then reserves one
   key with `inbox.claim` before pressing Enter once. A claim, withdrawal, or

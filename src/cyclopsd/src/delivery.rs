@@ -43,8 +43,8 @@ use cyclops_proto::{
     NotificationAttentionCause, NotificationBinding, NotificationManifestId,
     NotificationPreWriteCause, NotificationPreWriteObservation, NotificationState,
     NotificationTransport, NotificationVerifyFailureKind, NotificationVerifyOutcome, NotifyLevel,
-    ProcessInstanceId, QuiesceResult, RecipientKey, Sensor, StatusDiagnostic, VerifiedBy,
-    WaitUntil, WireError,
+    ProcessInstanceId, QuiesceResult, RecipientKey, StatusDiagnostic, VerifiedBy, WaitUntil,
+    WireError,
 };
 use cyclops_tmux::{ControlClient, PaneEvent, PaneRow, SessionWatcher, TmuxError};
 use serde_json::{json, Value};
@@ -4286,10 +4286,16 @@ async fn attempt_delivery(
     .await
     {
         Some(det) => {
-            // Permission is a positive stamp, never the absence of a
-            // refusal: an unstamped verdict means nobody decided, and
-            // nobody deciding is not the same as deciding yes.
-            if !det.write_ready {
+            // A positive human draft remains a hard boundary. For an
+            // authenticated idle or working agent, however, an unreadable
+            // composer is not a reason to strand a durable doorbell after
+            // the gate already admitted the same live occupant.
+            let unproven_composer_is_still_eligible = handle.notification.is_some()
+                && watcher.pane(&handle.pane_id).is_some_and(|row| {
+                    notification_pane_for_unproven_composer(inner, handle, &row, manifest_id, &det)
+                        .is_some()
+                });
+            if !det.write_ready && !unproven_composer_is_still_eligible {
                 let reason = det.write_block.as_deref().unwrap_or("unstamped");
                 gate_line(
                     inner,
@@ -5570,8 +5576,34 @@ fn binding_unprovable_observation(
     }
 }
 
-fn composer_semantic_missing(detection: &Detection) -> bool {
-    detection.composer_semantic.is_none()
+/// A notification may continue without a clean-composer proof only for an
+/// authenticated agent that is visibly idle or working. A positive human-input
+/// reading is still a hard boundary: Cyclops must never type over it.
+fn unproven_composer_is_eligible(detection: &Detection) -> bool {
+    matches!(detection.state, AgentState::Idle | AgentState::Working)
+        && detection.composer_semantic != Some(ComposerSemantic::HumanInput)
+        && detection.write_block.as_deref() != Some("composer_hold")
+}
+
+/// Return the current foreground agent process for the explicit liveness
+/// policy. Unreadable composers do not block a notification, but a stale or
+/// mismatched process binding still does: that would risk typing into a shell
+/// or a different agent.
+fn notification_pane_for_unproven_composer(
+    inner: &Inner,
+    handle: &DeliveryHandle,
+    row: &PaneRow,
+    manifest_id: &str,
+    detection: &Detection,
+) -> Option<i32> {
+    if !unproven_composer_is_eligible(detection) {
+        return None;
+    }
+    let binding = fusion::admitted_binding(inner, handle.session_idx, row)?;
+    if binding.manifest != manifest_id {
+        return None;
+    }
+    fusion::foreground_pid_checked(row.pane_pid)
 }
 
 fn composer_semantic_observation(
@@ -6113,36 +6145,6 @@ async fn gate(
                             };
                         };
                         let manifest_id = manifest.agent.id.clone();
-                        // Screen evidence cannot repair a manifest that has no
-                        // composer ownership vocabulary. Settle that static
-                        // configuration failure before waiting on pane events.
-                        if handle.notification.is_some()
-                            && !manifest
-                                .rules
-                                .iter()
-                                .any(|rule| rule.composer_semantic.is_some())
-                        {
-                            let Some(observation) =
-                                composer_semantic_observation(inner, handle, &row, &manifest_id)
-                            else {
-                                if last_hold.as_deref() == Some(OBSERVATION_HOLD) {
-                                    return GateOutcome::BlockedPreWrite {
-                                        cause: NotificationPreWriteCause::BindingUnprovable,
-                                        observation: Box::new(binding_unprovable_observation(
-                                            inner,
-                                            handle,
-                                            row.pane_pid,
-                                            &manifest_id,
-                                        )),
-                                    };
-                                }
-                                break 'pane Some(OBSERVATION_HOLD.to_string());
-                            };
-                            return GateOutcome::BlockedPreWrite {
-                                cause: NotificationPreWriteCause::ComposerSemanticMissing,
-                                observation: Box::new(observation),
-                            };
-                        }
                         let Some(det) = crate::observe_pane(
                             inner,
                             handle.session_idx,
@@ -6160,33 +6162,48 @@ async fn gate(
                                 cause: "no_such_pane".to_string(),
                             };
                         };
-                        let screen_reports_idle = det.readings.iter().any(|reading| {
-                            reading.sensor == Sensor::Screen && reading.state == AgentState::Idle
-                        });
-                        if handle.notification.is_some() && screen_reports_idle {
-                            if composer_semantic_missing(&det) {
-                                if let Some(observation) =
-                                    composer_semantic_observation(inner, handle, &row, &manifest_id)
-                                {
-                                    return GateOutcome::BlockedPreWrite {
-                                        cause: NotificationPreWriteCause::ComposerSemanticMissing,
-                                        observation: Box::new(observation),
-                                    };
-                                }
-                            }
-                            if fusion::admitted_binding(inner, handle.session_idx, &row).is_none() {
-                                if last_hold.as_deref() == Some(OBSERVATION_HOLD) {
-                                    return GateOutcome::BlockedPreWrite {
-                                        cause: NotificationPreWriteCause::BindingUnprovable,
-                                        observation: Box::new(binding_unprovable_observation(
-                                            inner,
-                                            handle,
-                                            row.pane_pid,
-                                            &manifest_id,
-                                        )),
-                                    };
-                                }
-                                break 'pane Some(OBSERVATION_HOLD.to_string());
+                        if handle.notification.is_some()
+                            && det.composer_semantic == Some(ComposerSemantic::HumanInput)
+                        {
+                            let Some(mut observation) =
+                                composer_semantic_observation(inner, handle, &row, &manifest_id)
+                            else {
+                                return GateOutcome::BlockedPreWrite {
+                                    cause: NotificationPreWriteCause::BindingUnprovable,
+                                    observation: Box::new(binding_unprovable_observation(
+                                        inner,
+                                        handle,
+                                        row.pane_pid,
+                                        &manifest_id,
+                                    )),
+                                };
+                            };
+                            observation.write_block = Some("composer_hold".to_string());
+                            return GateOutcome::BlockedPreWrite {
+                                cause: NotificationPreWriteCause::WriteReadinessChanged,
+                                observation: Box::new(observation),
+                            };
+                        }
+                        if handle.notification.is_some() {
+                            if let Some(pane_pid) = notification_pane_for_unproven_composer(
+                                inner,
+                                handle,
+                                &row,
+                                &manifest_id,
+                                &det,
+                            ) {
+                                gate_line(
+                                    inner,
+                                    handle,
+                                    "proceed",
+                                    Some(&det.decided_by),
+                                    Some("composer_unproven"),
+                                );
+                                return GateOutcome::Proceed {
+                                    manifest_id,
+                                    pane_pid,
+                                    regate_evidence_changed,
+                                };
                             }
                         }
                         // Unproven hook admission is a durable block, not a
@@ -6300,34 +6317,6 @@ async fn gate(
                                                 row.pane_pid,
                                                 &manifest_id,
                                             )),
-                                        };
-                                    }
-                                    (false, Some("no_write_safe_composer_evidence"))
-                                        if handle.notification.is_some()
-                                            && composer_semantic_missing(&det) =>
-                                    {
-                                        let Some(observation) = composer_semantic_observation(
-                                            inner,
-                                            handle,
-                                            &row,
-                                            &manifest_id,
-                                        ) else {
-                                            return GateOutcome::BlockedPreWrite {
-                                                cause: NotificationPreWriteCause::BindingUnprovable,
-                                                observation: Box::new(
-                                                    binding_unprovable_observation(
-                                                        inner,
-                                                        handle,
-                                                        row.pane_pid,
-                                                        &manifest_id,
-                                                    ),
-                                                ),
-                                            };
-                                        };
-                                        return GateOutcome::BlockedPreWrite {
-                                            cause:
-                                                NotificationPreWriteCause::ComposerSemanticMissing,
-                                            observation: Box::new(observation),
                                         };
                                     }
                                     // A composer that reads `ambiguous` on an
@@ -14476,11 +14465,11 @@ line_regex_esc = ['^❯$']
     }
 
     #[test]
-    fn prewrite_uses_the_independent_composer_semantic_below_the_runtime_winner() {
+    fn notification_liveness_protects_only_positive_human_input() {
         let detection = Detection {
             state: AgentState::Idle,
             readings: vec![cyclops_proto::SensorReading {
-                sensor: Sensor::Screen,
+                sensor: cyclops_proto::Sensor::Screen,
                 state: AgentState::Idle,
                 rule: "runtime_idle".to_string(),
                 ts: 1,
@@ -14495,11 +14484,22 @@ line_regex_esc = ['^❯$']
         };
 
         assert!(
-            !composer_semantic_missing(&detection),
+            !unproven_composer_is_eligible(&detection),
             "a lower-priority composer rule already proved human input"
         );
-        assert!(composer_semantic_missing(&Detection {
+        assert!(unproven_composer_is_eligible(&Detection {
             composer_semantic: None,
+            write_block: Some("no_write_safe_composer_evidence".into()),
+            ..detection.clone()
+        }));
+        assert!(unproven_composer_is_eligible(&Detection {
+            state: AgentState::Working,
+            composer_semantic: Some(ComposerSemantic::Ambiguous),
+            write_block: Some("no_write_safe_composer_evidence".into()),
+            ..detection.clone()
+        }));
+        assert!(!unproven_composer_is_eligible(&Detection {
+            composer_semantic: Some(ComposerSemantic::HumanInput),
             ..detection
         }));
     }

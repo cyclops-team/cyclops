@@ -105,14 +105,17 @@ bytes, and Cyclops never drops the summary because of pane width. Summaryless
 legacy wire clients retain their versioned Format 3 and direct-payload
 compatibility paths.
 
-Both shapes are written once, only after proving the pane occupant, manifest,
-and clean composer. An ambiguous write or submit raises attention. Cyclops does
-not write either shape again automatically.
+Both shapes are written once after proving the pane occupant and manifest. A
+positive human-input reading protects that draft. For an authenticated idle or
+working agent whose composer cannot be read conclusively, Cyclops prioritizes
+the durable conversation: it writes the one notification and submits it. An
+unknown manifest, stale process binding, copy mode, or modal prompt still
+stops terminal input.
 
-The workspace Settings card has an optional `Force staged submit` escape hatch
-for a narrower failure: Cyclops already pasted the exact notification, but its
-normal verification could not confirm Enter. It is off by default. When enabled,
-the daemon waits the selected 0 to 20 seconds, rechecks the exact recipient,
+The workspace Settings card exposes `Force staged submit` for the narrower
+failure where Cyclops already pasted the exact notification but normal
+verification could not confirm Enter. It is on with no delay by default. The
+daemon rechecks the exact recipient,
 pane process generation, manifest, and tmux mode, then reserves one key with
 `inbox.claim` before pressing the manifest's submit key without re-pasting the
 notification. A claim, withdrawal, replacement attempt, or settled barrier
@@ -280,8 +283,8 @@ doorbell without submitting it. Durable intent blocks a second terminal key
 after an uncertain outcome. Human, trailing, changed, or unprovable content
 remains one visible attention item.
 
-An administrator can separately enable the default-off force-submit control,
-stored as `force_notification_submit` and exposed through
+An administrator can turn off the automatic force-submit control, stored as
+`force_notification_submit` and exposed through
 `notification.force_submit.set`; see [install.md](install.md) for the persisted
 configuration. It never pastes or replaces composer bytes, but it may send one
 submit key for one exact `verify_failed` attempt without composer-content proof

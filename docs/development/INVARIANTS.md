@@ -69,8 +69,8 @@ visible target or terminal sentinel is structural evidence, not ownership by
 itself. A collapsed chip proves only a vendor representation because its hidden
 bytes cannot be compared. It never authorizes Enter.
 
-`notification.force_submit` is the separately documented default-off,
-administrator-controlled exception. It never pastes or replaces bytes. For one
+`notification.force_submit` is the separately documented default-on,
+administrator-controlled recovery. It never pastes or replaces bytes. For one
 exact current `verify_failed` attempt, it rechecks the route and binding,
 records durable intent, and atomically reserves one forced key with
 `inbox.claim` before it may send without composer-content proof. It can
@@ -152,7 +152,7 @@ fresh positive evidence, checks the exact occupant, records intent before the
 effect, and treats ambiguous outcomes conservatively. Do not weaken those
 guards or describe them as proof that concurrent input is impossible.
 
-The default-off `notification.force_submit` recovery setting is deliberately
+The default-on `notification.force_submit` recovery setting is deliberately
 outside this ordinary proof path. It does not add a paste or replace visible
 bytes, but it may send one submit key without composer-content proof for an
 exact `verify_failed` attempt and may therefore submit later human input. Its

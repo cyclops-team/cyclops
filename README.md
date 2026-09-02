@@ -14,7 +14,7 @@ The messaging protocol and the workspace are deliberately separate. Agents can
 use Cyclops without opening the UI. If the UI closes, accepted messages remain
 in the append-only journal.
 
-Cyclops is pre-release software at version `0.1.0-beta`. It currently ships tested
+Cyclops is pre-release software at version `0.1.1-beta`. It currently ships tested
 manifests for Codex CLI, Claude Code, Antigravity CLI, and Cursor Agent CLI.
 Detection is conservative and version-sensitive: unknown terminal chrome holds
 a write instead of guessing. See [STATUS.md](STATUS.md) for current evidence and

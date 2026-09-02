@@ -320,8 +320,8 @@ delivery_retry_max = 1       # retries only when no notification or legacy paylo
 receipt_block_ms = 2500      # cap for observing an immediately decidable receipt
 gate_hold_notify_ms = 120000 # one admin ping when a worker is held this long
 unclaimed_reminder_ms = 0    # disabled; positive arms one bounded reminder per unclaimed attempt
-force_notification_submit = "off"        # dangerous post-paste Enter fallback
-force_notification_submit_delay_ms = 5000 # 0 through 20000; used only when enabled
+force_notification_submit = "on"         # automatic one-key recovery after verify failure
+force_notification_submit_delay_ms = 0    # 0 through 20000; delay before that recovery
 ```
 
 Standard `cyclops send` acceptance is durable before notification scheduling.
@@ -343,14 +343,15 @@ message remains available for an exact claim throughout.
 `unclaimed_reminder_ms` is disabled when absent or zero. A positive value arms
 one content-free reminder after a doorbell remains unclaimed for that long.
 The reminder reuses the exact attempt locator and the ordinary composer gate:
-Working with positive clean-composer proof may write, while human input or
-ambiguous composer evidence still refuses. Claim, withdrawal, or replacement
+positive human input still refuses, while an authenticated idle or working
+pane with an inconclusive composer may receive and submit the one reminder.
+Claim, withdrawal, or replacement
 makes the timer obsolete without terminal IO. One durable allowance prevents a
 restart or duplicate timer from writing more than one reminder.
 
-`force_notification_submit` is a separate, default-off escape hatch for an
-exact notification that crossed the paste boundary and then reached
-`verify_failed`. It never pastes a second notification. After
+`force_notification_submit` is the default-on recovery for an exact
+notification that crossed the paste boundary and then reached `verify_failed`.
+It never pastes a second notification. After
 `force_notification_submit_delay_ms`, the daemon revalidates the exact pending
 attempt, bound process generation, manifest, pane, and tmux mode, checks the
 setting one final time, records durable intent, and reserves one key under the
@@ -590,7 +591,7 @@ stops right there and exits 0:
 
 ```
 $ cyclops update
-cyclops 0.1.0-beta (1e16081)
+cyclops 0.1.1-beta (1e16081)
   source https://github.com/cyclops-team/cyclops.git at main
 ✔ already the latest main · nothing to update
 ```
@@ -604,6 +605,12 @@ fails. Durable records and existing setup files in your home are preserved.
 Known unedited shipped themes and hook artifacts may advance with the installed
 release; manifests and skills remain in place and can report outdated state.
 
+The source clone and candidate pair are temporary and disappear when the
+update ends. The only retained build artifact is Cargo's incremental cache:
+`~/Library/Caches/Cyclops/` on macOS and `~/.cache/cyclops/` on Linux. Cyclops
+prints its exact directory before building; it is user-owned and rebuildable.
+Set `CARGO_TARGET_DIR` if you deliberately want Cargo to use another location.
+
 The selected-pair record stores a content-free replay attestation bound to the
 exact client and daemon hashes plus the private snapshot identity. Older
 selection schemas remain readable and report replay as unproven. The
@@ -614,7 +621,7 @@ journal replay performed by rollback.
   activated matched pair 1e16081
   no daemon was running; the selected pair remains stopped
 
-✔ updated · 0.1.0-beta (0876ed7) → 0.1.0-beta (1e16081)
+✔ updated · 0.1.1-beta (0876ed7) → 0.1.1-beta (1e16081)
 
   an open workspace stays on the old build until you detach (ctrl+b d) and run cyclops again
 ```
