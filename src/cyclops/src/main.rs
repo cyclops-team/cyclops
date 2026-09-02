@@ -2917,6 +2917,12 @@ fn cmd_reply(cli: &Cli, style: &Style, args: &ReplyArgs) -> i32 {
         "already accepted"
     };
     println!("{verb} {}", style.accent(&result.msg_id));
+    if !result.deliveries.is_empty() {
+        println!(
+            "wake {}",
+            render::render_receipts(&result.deliveries, style)
+        );
+    }
     0
 }
 

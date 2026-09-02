@@ -187,8 +187,10 @@ their versioned Format 3 notification and direct-payload compatibility paths;
 new `cyclops send` and `cyclops reply` commands always create the
 summary-bearing exact claim above.
 
-Both transports are one-shot. If the outcome is ambiguous, attention is
-raised. Never resend or requeue blindly. The full workflow and attention
+Both transports are one-shot. Cyclops protects a positively observed human
+draft, but a known idle or working agent with an inconclusive composer still
+receives the one direct notification and submit. Never resend or requeue
+blindly. The full workflow and attention
 commands are in
 [docs/guides/send.md](https://github.com/cyclops-team/cyclops/blob/beta/messaging-rework/docs/guides/send.md).
 

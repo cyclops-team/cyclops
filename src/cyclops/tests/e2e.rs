@@ -2545,6 +2545,38 @@ fn default_reply_accepts_a_future_receipt_state_with_the_same_plain_warning() {
 }
 
 #[test]
+fn reply_prints_the_recipient_wake_state() {
+    let result = json!({
+        "msg_id": "m-reply-wake",
+        "seq": 3,
+        "inserted": true,
+        "deliveries": [{
+            "to": "gemmy",
+            "state": "queued",
+            "notification_state": "submitted"
+        }]
+    });
+
+    let plain = run_send_result(
+        "reply-wake-state",
+        result,
+        &[
+            "reply",
+            "m-parent",
+            "--summary",
+            TEST_SUMMARY,
+            "--body",
+            "reply",
+        ],
+    );
+    assert!(plain.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&plain.stdout),
+        "accepted m-reply-wake\nwake ✓ accepted · wake submitted\n"
+    );
+}
+
+#[test]
 fn default_reply_rejects_the_same_incomplete_acceptance_envelope_in_plain_and_json() {
     let plain = run_send_result(
         "rw-empty-reply-plain",
