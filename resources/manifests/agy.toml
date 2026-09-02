@@ -83,7 +83,7 @@ id = "composer_has_input"
 state = "idle_with_input"
 composer_semantic = "human_input"
 priority = 1050
-region = "bottom_non_empty_lines(5)"
+region = "bottom_non_empty_lines(8)"
 line_regex = ['^\s*>\s+\S']
 line_regex_esc = ['^\x1b\[94m>\x1b\[39m\s+\S']
 note = """The escaped discriminator separates the active composer from AGY's
@@ -93,15 +93,15 @@ paints the whole row bold blue. Both become `> text` after escape stripping,
 so a plain-only rule would mistake old transcript input for the composer and
 make later exact-doorbell verification ambiguous.
 
-On 1.1.23, a narrow pane wrapped a staged doorbell across the prompt and two
-unstyled continuation rows. The divider and status row below make this a
-five-row bottom window. The extra row is needed only to include the styled
-prompt; it does not relax the escaped discriminator.
+On 1.1.23, a 70-column pane can wrap a staged doorbell across the prompt and
+three unstyled continuation rows. The divider and status chrome below make
+this an eight-row bottom window. The extra rows are needed only to include the
+styled prompt; they do not relax the escaped discriminator.
 
 The empty composer still renders exactly 'ESC[94m>ESC[39m' with no ghost or
 suggestion text. If a future version paints one, this rule fails closed as
 input until that representation is measured."""
-evidence = "MEASURED: active staged doorbell ESC[94m>ESC[39m text and transcript echo ESC[1mESC[34m> text (2026-08-26, agy 1.1.21); a 3-row wrapped active doorbell needs the 5-row window (2026-09-01, agy 1.1.23); empty composer has no ghost text (2026-08-20, agy 1.1.13)"
+evidence = "MEASURED: active staged doorbell ESC[94m>ESC[39m text and transcript echo ESC[1mESC[34m> text (2026-08-26, agy 1.1.21); a 4-row wrapped active doorbell at 70 columns needs the 8-row window (2026-09-02, agy 1.1.23); empty composer has no ghost text (2026-08-20, agy 1.1.13)"
 
 [[rule]]
 id = "screen_working"

@@ -4927,10 +4927,11 @@ fn finish_attempt_delivery_inject_failure(
 /// Re-prove that an automatic notification submit still owns this exact
 /// staged composer. The caller separately compares the normalized bytes.
 /// This check binds that content to the current process generations and
-/// manifest, requires a terminal-safe visual state, and refuses any live
-/// lifecycle or blocked-state conflict retained by fusion. Only the ordinary
-/// in-flight submit passes `allow_inflight_working_admission`; recovery and
-/// terminal clear paths stay on the quiet-frame rule.
+/// manifest, requires a terminal-safe visual state, and refuses any known
+/// blocked-state or final-submit conflict. An ordinary in-flight notification
+/// can use the exact proof when a vendor's short screen projection loses the
+/// prompt row to chrome; recovery and terminal clear paths stay on the
+/// quiet-frame rule.
 fn notification_staged_action_safe(
     inner: &Arc<Inner>,
     handle: &DeliveryHandle,
@@ -4961,6 +4962,38 @@ fn notification_staged_action_safe(
     let state = manifest
         .evaluate_esc(&row.title, &strip_csi(capture), Some(capture))
         .map(|rule| rule.state);
+    if matches!(
+        state,
+        Some(
+            AgentState::BlockedModal
+                | AgentState::BlockedPermission
+                | AgentState::BlockedQuota
+                | AgentState::Dead
+        )
+    ) {
+        return Err("staged_manifest_state_unsafe".to_string());
+    }
+    let Some(agent) = process_instance_id(proven.agent) else {
+        return Err("binding_unprovable".to_string());
+    };
+    // Exact bytes and an unchanged binding are stronger than a fixed tail
+    // window that happened to omit a long wrapped prompt. This is deliberately
+    // limited to a non-Working normal post-paste submit: a freshly observed
+    // Working edge still needs the separately recorded clean-composer
+    // admission. Claim recovery and terminal clear retain the stricter
+    // quiet-frame rule below.
+    if allow_inflight_working_admission
+        && fusion::staged_exact_submit_ready(
+            inner,
+            handle.session_idx,
+            &handle.pane_id,
+            &notification.attempt_id().to_string(),
+            agent,
+            &proven.manifest,
+        )
+    {
+        return Ok(());
+    }
     let working_clean_submit = allow_inflight_working_admission
         && state == Some(AgentState::Working)
         && handle.working_clean_submit_admitted();
@@ -4968,9 +5001,6 @@ fn notification_staged_action_safe(
     {
         return Err("staged_manifest_state_unsafe".to_string());
     }
-    let Some(agent) = process_instance_id(proven.agent) else {
-        return Err("binding_unprovable".to_string());
-    };
     let quiet_staged_action = fusion::staged_action_ready(
         inner,
         handle.session_idx,
