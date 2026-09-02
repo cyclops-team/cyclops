@@ -15421,6 +15421,30 @@ composer_trailer_required_prefix = 1
             "/../../resources/manifests/agy.toml"
         ))
         .replacen(
+            "region = \"bottom_non_empty_lines(8)\"",
+            "region = \"bottom_non_empty_lines(5)\"",
+            1,
+        )
+        .replacen(
+            "On 1.1.23, a 70-column pane can wrap a staged doorbell across the prompt and\n\
+             three unstyled continuation rows. The divider and status chrome below make\n\
+             this an eight-row bottom window. The extra rows are needed only to include the\n\
+             styled prompt; they do not relax the escaped discriminator.\n\n\
+             The empty composer still renders exactly 'ESC[94m>ESC[39m' with no ghost or\n\
+             suggestion text. If a future version paints one, this rule fails closed as\n\
+             input until that representation is measured.\"\"\"\n\
+             evidence = \"MEASURED: active staged doorbell ESC[94m>ESC[39m text and transcript echo ESC[1mESC[34m> text (2026-08-26, agy 1.1.21); a 4-row wrapped active doorbell at 70 columns needs the 8-row window (2026-09-02, agy 1.1.23); empty composer has no ghost text (2026-08-20, agy 1.1.13)\"",
+            "On 1.1.23, a narrow pane wrapped a staged doorbell across the prompt and two\n\
+             unstyled continuation rows. The divider and status row below make this a\n\
+             five-row bottom window. The extra row is needed only to include the styled\n\
+             prompt; it does not relax the escaped discriminator.\n\n\
+             The empty composer still renders exactly 'ESC[94m>ESC[39m' with no ghost or\n\
+             suggestion text. If a future version paints one, this rule fails closed as\n\
+             input until that representation is measured.\"\"\"\n\
+             evidence = \"MEASURED: active staged doorbell ESC[94m>ESC[39m text and transcript echo ESC[1mESC[34m> text (2026-08-26, agy 1.1.21); a 3-row wrapped active doorbell needs the 5-row window (2026-09-01, agy 1.1.23); empty composer has no ghost text (2026-08-20, agy 1.1.13)\"",
+            1,
+        )
+        .replacen(
             "# followed by one separator space and the exact compact doorbell. AGY 1.1.23\n\
              # paints exactly two ASCII gutter columns before every wrapped continuation\n\
              # row. They are renderer chrome, not message bytes, so the content capture\n\
