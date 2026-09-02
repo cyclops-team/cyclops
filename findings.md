@@ -80,7 +80,7 @@ than a measurement.
 | F75 | A repaint must not query cursor position while the workspace event reader owns stdin | binds |
 | F79 | A watched session with an unavailable tmux server waits for an explicit `session.watch` availability edge; its creator supplies it after creation | binds |
 | F80 | `has-session` proves a named absence only with tmux's exact missing-session reply; an unreachable socket is uncertainty | binds |
-| F83 | AGY 1.1.23 can wrap active composer input across three rows, so its prompt detector needs the prompt, two continuations, divider, and status row | binds |
+| F83 | AGY 1.1.23 wraps active composer input across three rows with a two-cell continuation gutter, so extraction must exclude the gutter before exact payload proof | binds |
 
 ## F13. refresh-client -B subscriptions work in control mode on tmux 3.6a (MEASURED)
 
@@ -2351,7 +2351,10 @@ The scrubbed capture is
 It replaces the staged text and disposable root with redaction markers; it
 contains no user message, mailbox token, account identity, or real path.
 
-This proves the AGY painter's three-row active-composer shape and the manifest
-classifier's required five-row window on this version and width. It does not
-prove daemon delivery, a receipt, forced submission, or behavior at every
-width and payload length.
+This proves the AGY painter's three-row active-composer shape, its two-cell
+continuation gutter, and the manifest classifier's required five-row window on
+this version and width. The delivery regression
+`agy_indented_wrapped_doorbell_reaches_the_submit_gate` uses this shape to
+prove that exact visible doorbells pass pre-Enter verification while a changed
+byte or a third leading input space still fails closed. It does not prove a
+receipt or behavior at every width and payload length.
