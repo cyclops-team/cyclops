@@ -721,8 +721,7 @@ async fn authenticated_claim_preserves_blocked_attempt_until_operator_withdrawal
         .await;
     assert!(withdrawn["error"].is_null(), "{withdrawn}");
     let second_attempt = wait_for_notification_attempt(&rig, &second_id).await;
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_notification_state(&rig, &second_id, "writing").await;
     assert_eq!(notification_attempts(&rig, &first_id).len(), 1);
     assert_eq!(notification_attempts(&rig, &second_id).len(), 1);
     assert_ne!(first_attempt, second_attempt);

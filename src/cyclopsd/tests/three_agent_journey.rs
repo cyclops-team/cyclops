@@ -88,29 +88,26 @@ fn workspace_lines(rig: &Rig) -> Vec<Value> {
         .collect()
 }
 
-fn notification_state_count(rig: &Rig, message_id: &str, state: &str) -> usize {
-    workspace_lines(rig)
-        .into_iter()
-        .filter(|line| {
-            line["id"] == message_id
-                && line["data"]["type"] == "notification_transition"
-                && line["data"]["state"] == state
-        })
-        .count()
-}
-
-async fn wait_for_notification_submitted(rig: &Rig, message_id: &str) {
-    let deadline = Instant::now() + Duration::from_secs(8);
+async fn wait_for_notification_submitted(rig: &Rig, message_id: &str, expected_count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if notification_state_count(rig, message_id, "submitted") > 0
-            || notification_state_count(rig, message_id, "submitted_unverified") > 0
-            || notification_state_count(rig, message_id, "notified") > 0
-        {
+        let count = workspace_lines(rig)
+            .into_iter()
+            .filter(|line| {
+                line["id"] == message_id
+                    && line["data"]["type"] == "notification_transition"
+                    && matches!(
+                        line["data"]["state"].as_str(),
+                        Some("submitted" | "submitted_unverified" | "notified")
+                    )
+            })
+            .count();
+        if count >= expected_count {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "notification {message_id} was not submitted: {:#?}",
+            "notification {message_id} was not submitted (got {count}/{expected_count}): {:#?}",
             workspace_lines(rig)
                 .into_iter()
                 .filter(|line| line["id"] == message_id)
@@ -145,6 +142,7 @@ async fn pane_request(
     params: Value,
 ) -> Value {
     let out = rig.home.join(format!("{tag}.json"));
+    rig.tmux.run_ok(&["send-keys", "-t", pane, "C-u"]);
     rig.tmux.run_ok(&[
         "send-keys",
         "-t",
@@ -256,7 +254,7 @@ async fn test_three_agent_journey() {
     println!(
         "\n--- Step 2: Waiting for Gemmy and Claudey to receive visible pane notifications ---"
     );
-    wait_for_notification_submitted(&rig, &broadcast_id).await;
+    wait_for_notification_submitted(&rig, &broadcast_id, 2).await;
     wait_for_pane_text(
         &rig,
         &gemmy_pane,
@@ -421,7 +419,7 @@ async fn test_three_agent_journey() {
     println!("\n--- Step 6: Verifying Codey receives direct pane notifications while working ---");
     // Under our new contract: Working state does not silently prevent submission!
     // Codey receives Gemmy's reply notification in pane while working
-    wait_for_notification_submitted(&rig, &gemmy_reply_id).await;
+    wait_for_notification_submitted(&rig, &gemmy_reply_id, 1).await;
     wait_for_pane_text(
         &rig,
         &codey_pane,
@@ -454,7 +452,7 @@ async fn test_three_agent_journey() {
 
     // Once the first message is claimed, the next queued message for Codey (Claudey's reply)
     // is scheduled and delivered to Codey while still working!
-    wait_for_notification_submitted(&rig, &claudey_reply_id).await;
+    wait_for_notification_submitted(&rig, &claudey_reply_id, 1).await;
     println!("✓ Codey received Claudey's reply notification in pane while working");
 
     // Codey claims Claudey's reply from inside its pane
