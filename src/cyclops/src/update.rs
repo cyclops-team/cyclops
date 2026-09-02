@@ -1282,19 +1282,40 @@ impl PairStore {
         let daemon = self.prefix.join("cyclopsd");
         let cli_meta = std::fs::symlink_metadata(&cli).ok();
         let daemon_meta = std::fs::symlink_metadata(&daemon).ok();
-        if cli_meta
-            .as_ref()
-            .is_some_and(|m| m.file_type().is_symlink())
-            || daemon_meta
-                .as_ref()
-                .is_some_and(|m| m.file_type().is_symlink())
-        {
-            return Err(PairChangeError::unchanged(
-                "managed Cyclops links have no active selector",
-            ));
-        }
         match (cli_meta, daemon_meta) {
             (None, None) => Ok(()),
+            (Some(cli_meta), Some(daemon_meta))
+                if cli_meta.file_type().is_symlink() && daemon_meta.file_type().is_symlink() =>
+            {
+                // A prior uninstall may have removed an active selection after
+                // leaving the two public links behind. They are recoverable
+                // only when both have Cyclops' exact managed targets; never
+                // remove a foreign link just because this store is empty.
+                for name in ["cyclops", "cyclopsd"] {
+                    let public = self.prefix.join(name);
+                    let expected = PathBuf::from(PAIR_ROOT).join(ACTIVE_SELECTOR).join(name);
+                    let actual = std::fs::read_link(&public).map_err(|error| {
+                        PairChangeError::unchanged(format!("read public {name}: {error}"))
+                    })?;
+                    if actual != expected {
+                        return Err(PairChangeError::unchanged(format!(
+                            "public {name} selector points outside the pair store"
+                        )));
+                    }
+                }
+                std::fs::remove_file(&cli).map_err(|error| {
+                    PairChangeError::unchanged(format!(
+                        "remove orphaned public cyclops selector: {error}"
+                    ))
+                })?;
+                std::fs::remove_file(&daemon).map_err(|error| {
+                    PairChangeError::unchanged(format!(
+                        "remove orphaned public cyclopsd selector: {error}"
+                    ))
+                })?;
+                sync_directory(&self.prefix).map_err(PairChangeError::unchanged)?;
+                Ok(())
+            }
             (Some(cli_meta), Some(daemon_meta)) if cli_meta.is_file() && daemon_meta.is_file() => {
                 let source = self.prefix.clone();
                 let matched = prove_pair_identity(&source).is_ok();
@@ -4474,6 +4495,60 @@ sys.exit(43)"#,
         assert_eq!(restored.active, old.active);
         assert_eq!(restored.known_good, candidate);
         assert_eq!(store.selection().unwrap(), Some(restored));
+    }
+
+    #[test]
+    fn orphaned_managed_public_links_do_not_block_a_fresh_install() {
+        let scratch = Scratch::create().unwrap();
+        let prefix = scratch.path().join("bin");
+        directory(&prefix);
+        let store = PairStore::open(&prefix).unwrap();
+        let source = scratch.path().join("candidate");
+        pair_source(&source, "new-build");
+        let candidate = store.stage(&source).unwrap();
+
+        for name in ["cyclops", "cyclopsd"] {
+            std::os::unix::fs::symlink(
+                PathBuf::from(PAIR_ROOT).join(ACTIVE_SELECTOR).join(name),
+                prefix.join(name),
+            )
+            .unwrap();
+        }
+
+        store.migrate_direct_pair(&candidate).unwrap();
+        assert!(store.selection().unwrap().is_none());
+        assert!(!prefix.join("cyclops").exists());
+        assert!(!prefix.join("cyclopsd").exists());
+
+        store
+            .activate(&candidate, recorded_replay(&store, &candidate, 42))
+            .unwrap();
+        store.require_public_links().unwrap();
+    }
+
+    #[test]
+    fn orphaned_foreign_public_links_are_not_removed() {
+        let scratch = Scratch::create().unwrap();
+        let prefix = scratch.path().join("bin");
+        directory(&prefix);
+        let store = PairStore::open(&prefix).unwrap();
+        let source = scratch.path().join("candidate");
+        pair_source(&source, "new-build");
+        let candidate = store.stage(&source).unwrap();
+        let outside = scratch.path().join("outside");
+        write_new(&outside, b"outside\n", 0o700).unwrap();
+        std::os::unix::fs::symlink(&outside, prefix.join("cyclops")).unwrap();
+        std::os::unix::fs::symlink(
+            PathBuf::from(PAIR_ROOT)
+                .join(ACTIVE_SELECTOR)
+                .join("cyclopsd"),
+            prefix.join("cyclopsd"),
+        )
+        .unwrap();
+
+        let error = store.migrate_direct_pair(&candidate).unwrap_err();
+        assert!(error.to_string().contains("outside the pair store"));
+        assert_eq!(std::fs::read_link(prefix.join("cyclops")).unwrap(), outside);
     }
 
     #[test]
