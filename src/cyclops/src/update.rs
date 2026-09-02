@@ -1332,7 +1332,9 @@ impl PairStore {
                 .as_ref()
                 .is_some_and(|m| m.file_type().is_symlink())
         {
-            let expected_cli = PathBuf::from(PAIR_ROOT).join(ACTIVE_SELECTOR).join("cyclops");
+            let expected_cli = PathBuf::from(PAIR_ROOT)
+                .join(ACTIVE_SELECTOR)
+                .join("cyclops");
             let expected_daemon = PathBuf::from(PAIR_ROOT)
                 .join(ACTIVE_SELECTOR)
                 .join("cyclopsd");
@@ -4544,7 +4546,9 @@ sys.exit(43)"#,
 
         let store = PairStore::open(&prefix).unwrap();
         let old = store.stage(&old_source).unwrap();
-        store.activate(&old, recorded_replay(&store, &old, 1)).unwrap();
+        store
+            .activate(&old, recorded_replay(&store, &old, 1))
+            .unwrap();
         std::fs::remove_dir_all(&store.root).unwrap();
 
         let recovered = PairStore::open(&prefix).unwrap();
