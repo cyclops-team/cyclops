@@ -101,10 +101,11 @@ the line printed and no edit.
 curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
 ```
 
-The managed uninstall removes both public binary links, the validated pair
-store, and the installer-owned PATH block. It preserves `~/.cyclops`, including
-the mailbox journal and session ledgers, and refuses an altered pair store or an
-ambiguous install prefix. The full safety contract is in [Uninstall](#uninstall).
+The managed uninstall stops the validated selected daemon, removes the complete
+current Cyclops state home, both public binary links, the validated pair store,
+and the installer-owned PATH block. Export anything you want to retain first.
+It refuses an altered pair store or an ambiguous install prefix. The full safety
+contract is in [Uninstall](#uninstall).
 
 From a clone, use `./scripts/install.sh --uninstall`.
 
@@ -706,56 +707,33 @@ wiring outside install and update.
 
 ## Uninstall
 
-The installer removes the binaries, the validated managed pair store, and its
-PATH block but preserves your data. Pair-store removal holds the update lease
+The installer stops the validated selected daemon, removes the complete current
+Cyclops state home, the binaries, the validated managed pair store, and its
+PATH block. Pair-store removal holds the update lease
 and refuses unknown, linked, or ownership-changing entries instead of deleting
 an unproven tree. Both public names are removed only from one prefix, selected
 by `--prefix` or by the `cyclops` command on `PATH`. It never resolves a
 `cyclopsd` from another prefix. If only `cyclopsd` can be found, uninstall
 refuses and asks for an explicit prefix.
 
-For a state-preserving uninstall, run:
+Export anything you want to retain, then run:
 
 ```bash
 curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
 ```
 
-Do not run that command first when you intend to remove the complete state
-home: it removes the `cyclops` command needed for the state-home journey below.
-
-If you want to remove the retained journals but keep the rest of Cyclops
-state, start with the previewed
+If you want to remove only journals while keeping the rest of Cyclops state,
+start with the previewed
 [`cyclops data forget --all`](data.md#forget-the-retained-journal-scope)
 journey. Stop the daemon before its preview and keep it stopped through the
 exact confirmation. It removes only the previewed workspace and session NDJSON
 journals, and deliberately leaves configuration and vendor wiring alone.
 Export first if you might need the history.
 
-If you also want to remove all configuration and records in the current
-Cyclops state home, stop the daemon and copy out any history you want to keep.
-Then make the body-free preview and run only its exact confirmation:
-
-```bash
-cyclops daemon stop
-cyclops data export --to <new-directory>
-cyclops remove --all
-cyclops remove --all --confirm <token-from-preview>
-```
-
-This command removes only the selected current state home. It leaves installed
-binaries, the installer-owned PATH block, vendor configuration, and skill
-files in agent-owned directories, including a Cyclops-seeded copy, alone. For
-the exact scope and interrupted-removal recovery boundary, follow the
-[`cyclops remove --all` guide](data.md#remove-the-complete-current-state-home).
-
-After that state-home command reports its result, run the managed uninstall:
-
-```bash
-curl -fsSL https://www.usecyclops.dev/install.sh | sh -s -- --uninstall
-```
-
-The remaining complete-uninstall work is separately owned. Remove only the
-Cyclops command hooks from installed vendor configuration. Check
+`cyclops remove --all` remains available when you want its explicit preview
+and confirmation without removing the installed binary pair. The installer
+does not rewrite agent-owned hook configuration or skill files. To remove
+Cyclops command hooks from installed vendor configuration, check
 `~/.claude/settings.json`, `~/.codex/hooks.json`, `~/.agents/hooks.json`, and
 `~/.cursor/hooks.json` where those files exist. Delete entries whose command
 invokes a `cyclops` binary followed by `hook <Event>`, while preserving every
