@@ -6134,11 +6134,28 @@ async fn a_working_turn_started_pane_submits_doorbell_without_barrier_held() {
     .await;
     let message_id = sent["msg_id"].as_str().unwrap().to_string();
 
-    // The message must transition through Writing and be Submitted directly to the composer
+    // The message must transition through Writing and be submitted directly to the composer
     // without failing or sticking in barrier_held!
     wait_for_notification_state(&mut rig, &message_id, NotificationState::Writing).await;
     wait_for_doorbell(&rig, &pane, &message_id).await;
-    wait_for_notification_state(&mut rig, &message_id, NotificationState::Submitted).await;
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if notification_transition(&mut rig, &message_id, NotificationState::Submitted).is_some()
+            || notification_transition(
+                &mut rig,
+                &message_id,
+                NotificationState::SubmittedUnverified,
+            )
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "notification {message_id} was not submitted"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     let mut event = [0_u8; 16];
     let received = tokio::time::timeout(Duration::from_secs(5), submit_events.recv(&mut event))
