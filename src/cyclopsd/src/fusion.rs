@@ -2342,6 +2342,29 @@ pub(crate) fn staged_action_ready(
         .is_some_and(|entry| staged_entry_ready(entry, owner, expected, manifest))
 }
 
+/// Confirm that one ordinary notification may submit an exact, still-owned
+/// staged doorbell even when a vendor's short screen projection cannot classify
+/// the composer. The delivery path separately re-proves the visible bytes and
+/// rejects every known blocked manifest state. This predicate keeps that
+/// narrow exception tied to the current pane, process generation, manifest,
+/// hold owner, freshness, and final-submit conflict marker.
+pub(crate) fn staged_exact_submit_ready(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    pane_id: &str,
+    owner: &str,
+    agent: cyclops_proto::ProcessInstanceId,
+    manifest: &str,
+) -> bool {
+    let expected = crate::identity::ProcId {
+        pid: agent.pid(),
+        birth: agent.birth(),
+    };
+    let map = inner.detections.lock().expect("detections lock");
+    map.get(&PaneKey::new(session_idx, pane_id))
+        .is_some_and(|entry| staged_entry_exact_submit_ready(entry, owner, expected, manifest))
+}
+
 /// Confirm that a Working-plus-clean notification may submit its one exact
 /// staged doorbell. The caller separately proves the final bytes and carries
 /// the pre-paste clean-composer admission; this predicate makes sure fusion
@@ -2440,6 +2463,17 @@ fn staged_entry_binding_ready(
         && entry.manifest.as_deref() == Some(manifest)
         && !entry.in_mode
         && !entry.detection.stale
+}
+
+fn staged_entry_exact_submit_ready(
+    entry: &DetEntry,
+    owner: &str,
+    agent: crate::identity::ProcId,
+    manifest: &str,
+) -> bool {
+    staged_entry_binding_ready(entry, owner, agent, manifest)
+        && entry.detection.state != AgentState::Working
+        && entry.final_submit_conflict_owner.as_deref() != Some(owner)
 }
 
 /// The Working-plus-clean submit path may retain its own barrier after fusion
@@ -8571,6 +8605,9 @@ contains = ["done"]
         assert!(staged_action_ready(
             &inner, 0, "%1", attempt, process, "bash"
         ));
+        assert!(staged_exact_submit_ready(
+            &inner, 0, "%1", attempt, process, "bash"
+        ));
         assert!(!staged_action_ready(
             &inner,
             0,
@@ -8580,6 +8617,7 @@ contains = ["done"]
             "bash"
         ));
         let mut working = entry(ComposerHold::Staged, Some(attempt));
+        working.detection.state = AgentState::Working;
         working.detection.readings.push(SensorReading {
             sensor: Sensor::Hook,
             state: AgentState::Working,
@@ -8590,6 +8628,10 @@ contains = ["done"]
         assert!(!staged_action_ready(
             &inner, 0, "%1", attempt, process, "bash"
         ));
+        assert!(
+            !staged_exact_submit_ready(&inner, 0, "%1", attempt, process, "bash"),
+            "a current Working edge needs the separately recorded clean-composer admission"
+        );
 
         let mut blocked = entry(ComposerHold::Staged, Some(attempt));
         blocked.detection.state = AgentState::BlockedPermission;
@@ -8597,6 +8639,21 @@ contains = ["done"]
         assert!(!staged_action_ready(
             &inner, 0, "%1", attempt, process, "bash"
         ));
+        assert!(staged_exact_submit_ready(
+            &inner, 0, "%1", attempt, process, "bash"
+        ));
+
+        inner
+            .detections
+            .lock()
+            .expect("detections lock")
+            .get_mut(&pane())
+            .expect("blocked entry")
+            .final_submit_conflict_owner = Some(attempt.into());
+        assert!(
+            !staged_exact_submit_ready(&inner, 0, "%1", attempt, process, "bash"),
+            "a terminal edge for this exact attempt still blocks the one Enter"
+        );
 
         let mut stale = entry(ComposerHold::Staged, Some(attempt));
         stale.detection.stale = true;

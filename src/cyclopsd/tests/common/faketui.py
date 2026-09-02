@@ -89,7 +89,6 @@ RULE = "\x1b[38;5;244m───────────────────�
 STATUS = "\x1b[38;5;152mModel x · Ctx: 78%\x1b[39m"
 STATUS_ALT = "\x1b[38;5;152mModel x · Ctx: 77%\x1b[39m"
 WORKING = "FAKETUI-WORKING"
-AGY_RULE = "\x1b[90m" + "─" * 100 + "\x1b[39m"
 AGY_STATUS = "\x1b[38;2;174;198;207mGemini 3.7 Flash · High · ~ · Full · Ctx: 97%\x1b[39m"
 AGY_WORKING = "⣷ Generating..."
 # F83 measured AGY 1.1.23 in a 100x30 tmux pane. Its application-owned
@@ -194,7 +193,7 @@ def draw(transcript, staged, working=False, hidden=False, status=STATUS):
         staged_rows = agy_composer_rows("" if hidden else staged)
         rows.append("\x1b[94m>\x1b[39m " + staged_rows[0])
         rows.extend("  " + row for row in staged_rows[1:])
-        rows.append(AGY_RULE)
+        rows.append("\x1b[90m" + "─" * (AGY_CONTENT_COLUMNS + 5) + "\x1b[39m")
         rows.append(AGY_STATUS)
     else:
         staged_rows = [""] if hidden else staged.split("\n")
@@ -257,8 +256,10 @@ def selftest():
 
 
 def main():
-    global AGY_LAYOUT
+    global AGY_LAYOUT, AGY_CONTENT_COLUMNS
     AGY_LAYOUT = "--agy-layout" in sys.argv
+    if "--agy-content-columns" in sys.argv:
+        AGY_CONTENT_COLUMNS = int(sys.argv[sys.argv.index("--agy-content-columns") + 1])
     if "--selftest" in sys.argv:
         selftest()
         return

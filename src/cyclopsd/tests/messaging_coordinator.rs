@@ -4945,13 +4945,17 @@ async fn agy_indented_wrapped_doorbell_submits_one_enter() {
     let submit_events =
         UnixDatagram::bind(&submit_event_path).expect("bind AGY fixture submit event socket");
     let pane_command = format!(
-        "python3 {} --agy-layout --submit-event-socket {}",
+        "python3 {} --agy-layout --agy-content-columns 65 --submit-event-socket {}",
         faketui_path(),
         submit_event_path.display()
     );
-    // Exercise the shipped AGY grammar and trailers. The fixture process is
-    // deliberately Python, and Rig supplies a private current skill so this
-    // is a format-4 mailbox doorbell instead of a legacy direct payload.
+    // Preserve the installed 1.1.23 input projection here: its five-row tail
+    // loses this four-row prompt below AGY's divider and status chrome. The
+    // shipped-manifest tests cover the repaired eight-row rule; this delivery
+    // regression proves that an existing installed copy still submits only
+    // after exact bytes and binding have been re-proven. The fixture process
+    // is deliberately Python, and Rig supplies a private current skill so
+    // this is a format-4 mailbox doorbell instead of a legacy direct payload.
     let manifest = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../resources/manifests/agy.toml"
@@ -4965,10 +4969,19 @@ async fn agy_indented_wrapped_doorbell_submits_one_enter() {
         "[messaging]\nmailbox_capability_file = \"~/.gemini/antigravity-cli/skills/cyclops/SKILL.md\"\n\n",
         "",
         1,
+    )
+    .replacen(
+        "region = \"bottom_non_empty_lines(8)\"",
+        "region = \"bottom_non_empty_lines(5)\"",
+        1,
     );
     assert!(
         !manifest.contains("mailbox_capability_file"),
         "Rig must install its private current capability"
+    );
+    assert!(
+        manifest.contains("region = \"bottom_non_empty_lines(5)\""),
+        "the regression must retain AGY's previously shipped input projection"
     );
     let mut rig = Rig::new(
         "agy-indented-doorbell-submit",
@@ -4979,12 +4992,13 @@ async fn agy_indented_wrapped_doorbell_submits_one_enter() {
     .await;
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
-    // F83 measured this exact AGY composer shape in a 100x30 pane. Wait for
-    // daemon observation of both dimensions before staging the doorbell.
-    // The isolated server keeps tmux's one-row status line, so a 100x31
-    // window produces F83's observed 100x30 pane.
+    // The live failure was a 70-column AGY pane. Wait for the exact narrow
+    // geometry before staging a doorbell whose prompt spans four rows.
+    // The isolated server keeps tmux's one-row status line, so a 70x31
+    // window produces the observed 70x30 pane.
     rig.tmux
-        .run_ok(&["resize-window", "-t", &pane, "-x", "100", "-y", "31"]);
+        .run_ok(&["resize-window", "-t", &pane, "-x", "70", "-y", "31"]);
+    rig.tmux.run_ok(&["send-keys", "-t", &pane, "C-l"]);
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let status = rig.ctl.request("status", json!({})).await;
@@ -4992,13 +5006,13 @@ async fn agy_indented_wrapped_doorbell_submits_one_enter() {
             .as_array()
             .expect("pane list")
             .iter()
-            .any(|row| row["pane_id"] == pane && row["width"] == 100 && row["height"] == 30);
+            .any(|row| row["pane_id"] == pane && row["width"] == 70 && row["height"] == 30);
         if observed {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "the AGY fixture did not reach F83's measured 100x30 pane: {status}"
+            "the AGY fixture did not reach the live 70x30 pane: {status}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -5018,7 +5032,7 @@ async fn agy_indented_wrapped_doorbell_submits_one_enter() {
         })
     });
 
-    let summary = "This message deliberately covers the measured AGY continuation boundary while remaining an ordinary concise mailbox notice for the receiving agent. Claim the durable body and continue with the requested work.";
+    let summary = "This concise notice reproduces the narrow AGY four-row doorbell shape. Claim the durable body and continue with the requested work.";
     let sent = send_summarized_workspace_message(
         &rig,
         "agy-indented-doorbell-submit",
@@ -5038,9 +5052,10 @@ async fn agy_indented_wrapped_doorbell_submits_one_enter() {
     let expected = cyclops_proto::render_doorbell_v4("admin", summary, attempt);
     let screen = rig.tmux.capture(&pane);
     let continuation_rows: Vec<_> = screen.lines().filter(|row| row.starts_with("  ")).collect();
-    assert!(
-        continuation_rows.len() == 2,
-        "the AGY fixture must expose F83's three-row, two-cell-gutter composer:\n{screen}"
+    assert_eq!(
+        continuation_rows.len(),
+        3,
+        "the AGY fixture must expose the live four-row, two-cell-gutter composer:\n{screen}"
     );
     assert!(
         continuation_rows
