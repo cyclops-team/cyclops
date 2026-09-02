@@ -132,6 +132,11 @@ fn clone(repo: &str, reff: &str, dest: &Path) -> Result<(), String> {
 /// macOS has a per-process temporary directory under `/private/var`; it is a
 /// bad home for a multi-gigabyte cache that persists after an update. Keep the
 /// cache in the platform cache location instead, where an operator can inspect
+/// The visible, user-owned root for retained update build artifacts.
+///
+/// macOS has a per-process temporary directory under `/private/var`; it is a
+/// bad home for a multi-gigabyte cache that persists after an update. Keep the
+/// cache in the platform cache location instead, where an operator can inspect
 /// or remove it without hunting through system temporary storage.
 fn build_cache_parent(home: &Path) -> PathBuf {
     let user_home = std::env::var_os("HOME")
@@ -3135,6 +3140,7 @@ fn updated_badge(old: &str, new: &str, style: &Style) -> String {
 /// 4. The candidate installer validates the matched pair, proves journal replay,
 ///    quiesces the exact daemon generation, changes one selector, and restarts.
 /// 5. Report old to new from the selected binary's own `--version`.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     json: bool,
     style: &Style,

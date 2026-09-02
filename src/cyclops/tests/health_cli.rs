@@ -346,7 +346,7 @@ fn health_accepts_cargo_modes_beneath_a_private_build_cache() {
     let (_temp, home, user, runtime_temp) = scratch("cyclops-health-cache-cargo-modes");
     let baseline = parse(&run_health(&home, &user, &runtime_temp, ""));
     let cache = PathBuf::from(baseline["build_cache"]["path"].as_str().unwrap());
-    fs::create_dir(&cache).unwrap();
+    fs::create_dir_all(&cache).unwrap();
     fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(cache.join(".lease"), b"").unwrap();
     fs::set_permissions(cache.join(".lease"), fs::Permissions::from_mode(0o600)).unwrap();
@@ -384,7 +384,7 @@ fn health_recursively_refuses_a_link_inside_the_build_cache() {
     let (_temp, home, user, runtime_temp) = scratch("cyclops-health-cache-link");
     let baseline = parse(&run_health(&home, &user, &runtime_temp, ""));
     let cache = PathBuf::from(baseline["build_cache"]["path"].as_str().unwrap());
-    fs::create_dir(&cache).unwrap();
+    fs::create_dir_all(&cache).unwrap();
     fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(cache.join(".lease"), b"").unwrap();
     fs::set_permissions(cache.join(".lease"), fs::Permissions::from_mode(0o600)).unwrap();

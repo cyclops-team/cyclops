@@ -1053,6 +1053,7 @@ pub enum MessageNotificationState {
     Writing,
     Staged,
     Submitted,
+    SubmittedUnverified,
     Notified,
     AttentionRequired,
     Superseded,
@@ -1078,6 +1079,7 @@ impl From<crate::notification::NotificationState> for MessageNotificationState {
             // until the following Submitted fact. Keep old clients honest.
             NotificationState::Submitting => Self::Staged,
             NotificationState::Submitted => Self::Submitted,
+            NotificationState::SubmittedUnverified => Self::SubmittedUnverified,
             NotificationState::Notified => Self::Notified,
             NotificationState::AttentionRequired => Self::AttentionRequired,
             // A pre-write withdrawal never proved that its wake reached the

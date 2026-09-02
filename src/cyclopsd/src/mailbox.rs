@@ -5117,6 +5117,7 @@ impl MailboxService {
                                 | NotificationState::Staged
                                 | NotificationState::Submitting
                                 | NotificationState::Submitted
+                                | NotificationState::SubmittedUnverified
                         )
                     })
             })
@@ -7117,6 +7118,7 @@ impl MessageStore {
             .filter(|record| {
                 record.transport == NotificationTransport::Doorbell
                     && (record.state == NotificationState::Submitted
+                        || record.state == NotificationState::SubmittedUnverified
                         || (record.state == NotificationState::Notified
                             && prior_claim_seq == Some(record.updated_seq)))
             })
@@ -8288,6 +8290,7 @@ impl MessageStore {
                         | NotificationState::Staged
                         | NotificationState::Submitting
                         | NotificationState::Submitted
+                        | NotificationState::SubmittedUnverified
                 )
             })
             .cloned()
@@ -8306,7 +8309,8 @@ impl MessageStore {
                 // its binding so the exact attempt can resume clear proof.
                 continue;
             }
-            let (state, cause) = if record.state == NotificationState::Submitted
+            let (state, cause) = if (record.state == NotificationState::Submitted
+                || record.state == NotificationState::SubmittedUnverified)
                 && record.transport == NotificationTransport::Doorbell
                 && claimed
             {

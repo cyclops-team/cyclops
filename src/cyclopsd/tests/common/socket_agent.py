@@ -22,4 +22,7 @@ sys.stdout.flush()
 for line in sys.stdin:
     sys.stdout.write(f"\x1b[2J\x1b[H{WORKING}\n")
     sys.stdout.flush()
-    subprocess.run(shlex.split(line), check=False)
+    try:
+        subprocess.run(shlex.split(line), check=False)
+    except Exception:
+        pass

@@ -55,7 +55,7 @@ fn named_clients(tag: &str) -> PathBuf {
 
 fn agent_command_loop(client_dir: &Path) -> String {
     format!(
-        "{}/cycagent -u -c 'import shlex,subprocess,sys; [subprocess.run(shlex.split(line)) for line in sys.stdin]'",
+        "{}/cycagent -u -c 'import shlex,subprocess,sys\nfor line in sys.stdin:\n try: subprocess.run(shlex.split(line))\n except Exception: pass'",
         client_dir.display()
     )
 }
@@ -200,6 +200,27 @@ async fn wait_for_notification_state(rig: &Rig, message_id: &str, state: &str) {
     }
 }
 
+async fn wait_for_notification_submitted(rig: &Rig, message_id: &str) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if notification_state_count(rig, message_id, "submitted") > 0
+            || notification_state_count(rig, message_id, "submitted_unverified") > 0
+            || notification_state_count(rig, message_id, "notified") > 0
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "notification {message_id} was not submitted: {:#?}",
+            workspace_lines(rig)
+                .into_iter()
+                .filter(|line| line["id"] == message_id)
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn wait_for_notification_attempt(rig: &Rig, message_id: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
@@ -274,6 +295,7 @@ async fn history_and_thread_release_bodies_only_after_the_exact_claim() {
         .as_str()
         .expect("accepted message id")
         .to_string();
+    wait_for_notification_submitted(&rig, &message_id).await;
 
     let recipient_history = pane_request(
         &mut rig,
@@ -469,7 +491,7 @@ async fn an_unadopted_pane_cannot_claim_its_former_mailbox_body() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn claiming_the_oldest_preserves_its_notification_fifo_until_operator_withdrawal() {
+async fn claiming_the_oldest_withdraws_only_its_attempt_and_schedules_the_next() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -515,6 +537,8 @@ async fn claiming_the_oldest_preserves_its_notification_fifo_until_operator_with
     assert_eq!(notification_attempts(&rig, &first_id).len(), 1);
     assert!(notification_attempts(&rig, &second_id).is_empty());
 
+    wait_for_notification_submitted(&rig, &first_id).await;
+
     let claimed = pane_request(
         &mut rig,
         &client_dir,
@@ -548,30 +572,10 @@ async fn claiming_the_oldest_preserves_its_notification_fifo_until_operator_with
         .find(|row| row["message_id"] == second_id)
         .unwrap();
     assert_eq!(first_row["recipients"][0]["mailbox"]["status"], "claimed");
-    assert!(matches!(
-        first_row["recipients"][0]["notification"]["state"].as_str(),
-        Some("queued" | "gating")
-    ));
-    assert!(first_row["recipients"][0]["notification"]["settlement"].is_null());
     assert_eq!(second_row["recipients"][0]["mailbox"]["status"], "pending");
-    assert_eq!(
-        second_row["recipients"][0]["notification"]["state"],
-        "not_started"
-    );
-    assert_eq!(notification_attempts(&rig, &first_id).len(), 1);
-    assert!(notification_attempts(&rig, &second_id).is_empty());
-
-    let attempt_id = first_row["recipients"][0]["notification"]["attempt_id"].clone();
-    let recipient_key = first_row["recipients"][0]["recipient"].clone();
-    let withdrawn = rig
-        .ctl
-        .request(
-            "notification.withdraw",
-            json!({"attempt_id": attempt_id, "recipient": recipient_key}),
-        )
-        .await;
-    assert!(withdrawn["error"].is_null(), "{withdrawn}");
     let second_attempt = wait_for_notification_attempt(&rig, &second_id).await;
+    assert_eq!(notification_attempts(&rig, &first_id).len(), 1);
+    assert_eq!(notification_attempts(&rig, &second_id).len(), 1);
     assert_ne!(
         notification_attempts(&rig, &first_id),
         BTreeSet::from([second_attempt])
@@ -723,10 +727,9 @@ async fn authenticated_claim_preserves_blocked_attempt_until_operator_withdrawal
     assert_eq!(notification_attempts(&rig, &second_id).len(), 1);
     assert_ne!(first_attempt, second_attempt);
     assert_eq!(notification_state_count(&rig, &first_id, "writing"), 0);
-    assert_eq!(notification_state_count(&rig, &second_id, "writing"), 0);
+    assert!(notification_state_count(&rig, &second_id, "writing") > 0);
     let history = pane_history(&rig, &recipient);
     assert!(!history.contains(&compact_doorbell(&first_attempt)));
-    assert!(!history.contains(&compact_doorbell(&second_attempt)));
 
     rig.shutdown().await;
 }

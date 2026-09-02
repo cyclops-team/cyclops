@@ -448,6 +448,17 @@ pub(crate) fn inspect_operational_assets(home: &Path) -> OperationalAssetInvento
             });
         }
     }
+    if cache.parent() != Some(&temp_root) && cache.exists() {
+        if let Ok(Some(inspector)) = StateInspector::open_existing(&cache) {
+            let entry = inspector.root().clone();
+            candidates.push(inspect_operational_candidate(
+                &inspector,
+                &entry,
+                AssetClass::BuildCache,
+                None,
+            ));
+        }
+    }
     OperationalAssetInventory {
         temp_root,
         root_safe: true,
@@ -1101,12 +1112,36 @@ fn inspect_build_cache(
     report: &mut CleanupReport,
 ) {
     if cache.parent() != Some(temp.path()) {
-        report.candidates.push(CandidateReport::new(
+        if !cache.exists() {
+            report.candidates.push(CandidateReport::new(
+                AssetClass::BuildCache,
+                cache.to_path_buf(),
+                CandidateState::Absent,
+                "no managed build cache is present",
+            ));
+            return;
+        }
+        let inspector = match StateInspector::open_existing(cache) {
+            Ok(Some(insp)) => insp,
+            _ => {
+                report.candidates.push(CandidateReport::new(
+                    AssetClass::BuildCache,
+                    cache.to_path_buf(),
+                    CandidateState::Unsupported,
+                    "build-cache root is not inspectable",
+                ));
+                return;
+            }
+        };
+        let entry = inspector.root().clone();
+        inspect_candidate(
+            &inspector,
+            &entry,
             AssetClass::BuildCache,
-            cache.to_path_buf(),
-            CandidateState::Unsupported,
-            "build-cache path is outside the validated temporary root",
-        ));
+            None,
+            apply,
+            report,
+        );
         return;
     }
     let mut matched = false;
@@ -1241,10 +1276,15 @@ fn is_verified_tombstone(
 }
 
 fn cache_key(path: &Path) -> Option<&str> {
-    path.file_name()?
-        .to_str()?
+    let name = path.file_name()?.to_str()?;
+    let key = name
         .strip_prefix("cyclops-build-cache-")
-        .filter(|key| is_cache_key(key))
+        .or_else(|| name.strip_prefix("build-"))?;
+    if is_cache_key(key) {
+        Some(key)
+    } else {
+        None
+    }
 }
 
 fn is_cache_key(key: &str) -> bool {

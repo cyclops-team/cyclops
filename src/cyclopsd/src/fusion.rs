@@ -2321,6 +2321,33 @@ pub(crate) fn release_unwritten_hold(
     true
 }
 
+/// Release a barrier when a claim settles or a submitted turn completes.
+pub(crate) fn clear_hold_owner(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    pane_id: &str,
+    owner: &str,
+) -> bool {
+    let (prior_ready, now_key, det) = {
+        let mut map = inner.detections.lock().expect("detections lock");
+        let Some(entry) = map.get_mut(&PaneKey::new(session_idx, pane_id)) else {
+            return false;
+        };
+        if entry.hold_owner.as_deref() != Some(owner) {
+            return false;
+        }
+        let prior_ready = readiness_key(entry);
+        entry.hold = ComposerHold::Clear;
+        entry.hold_owner = None;
+        entry.final_submit_conflict_owner = None;
+        entry.turn = None;
+        entry.detection = entry.detection.clone().stamped(entry.in_mode, entry.hold);
+        (prior_ready, readiness_key(entry), entry.detection.clone())
+    };
+    wake_readiness_after_mutation(inner, session_idx, pane_id, prior_ready, now_key, &det);
+    true
+}
+
 /// Confirm that a guarded resolution still owns the staged composer.
 ///
 /// Exact payload capture proves the bytes. This check proves that no live
@@ -2511,7 +2538,7 @@ fn staged_entry_working_clean_action_ready(
 ) -> bool {
     let permitted_staged_block = matches!(
         entry.detection.write_block.as_deref(),
-        Some("composer_hold" | "no_write_safe_composer_evidence")
+        Some("working" | "composer_hold" | "no_write_safe_composer_evidence")
     );
     let current_screen_working =
         entry.detection.readings.iter().any(|reading| {

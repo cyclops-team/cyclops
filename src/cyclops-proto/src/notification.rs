@@ -154,6 +154,9 @@ pub enum NotificationState {
     /// was still pending. No submit key is proven until `Submitted` follows.
     Submitting,
     Submitted,
+    /// Terminal submit key was pressed once without complete positive
+    /// post-paste staging proof. It is never submitted a second time.
+    SubmittedUnverified,
     Notified,
     AttentionRequired,
     /// An authenticated claim made this pre-write wake unnecessary.
@@ -189,8 +192,9 @@ impl NotificationState {
             // notification projection and cannot be expressed by states alone.
             Writing => matches!(next, Staged | AttentionRequired),
             Staged => matches!(next, Submitting | AttentionRequired),
-            Submitting => matches!(next, Submitted | AttentionRequired),
+            Submitting => matches!(next, Submitted | SubmittedUnverified | AttentionRequired),
             Submitted => matches!(next, Notified | AttentionRequired),
+            SubmittedUnverified => matches!(next, Notified | AttentionRequired),
             Notified
             | AttentionRequired
             | Withdrawn
@@ -219,7 +223,7 @@ impl NotificationState {
                 Queued | Gating | BlockedPreWrite | QuotaHeld | QuotaResetObserved,
                 NotificationTransport::DirectPayload,
             ) => Withdrawn,
-            (Submitted, NotificationTransport::Doorbell) => Notified,
+            (Submitted | SubmittedUnverified, NotificationTransport::Doorbell) => Notified,
             _ => self,
         }
     }
@@ -229,6 +233,7 @@ impl NotificationState {
             self,
             Self::QuotaHeld
                 | Self::QuotaResetObserved
+                | Self::SubmittedUnverified
                 | Self::Notified
                 | Self::AttentionRequired
                 | Self::Withdrawn
@@ -243,6 +248,9 @@ impl NotificationState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationPreWriteCause {
+    /// A proven non-Cyclops draft is actively typed in the composer; delivery is
+    /// held until the composer clears.
+    HeldForExistingDraft,
     /// The session or pane route was unavailable before the terminal write.
     SessionUnavailable,
     /// No manifest could be selected for the live pane before the write.
@@ -274,6 +282,7 @@ impl NotificationPreWriteCause {
     /// Stable protocol spelling used by terminal and JSON clients.
     pub const fn wire_name(self) -> &'static str {
         match self {
+            Self::HeldForExistingDraft => "held_for_existing_draft",
             Self::SessionUnavailable => "session_unavailable",
             Self::ManifestUnavailable => "manifest_unavailable",
             Self::PayloadUnavailable => "payload_unavailable",
@@ -290,6 +299,7 @@ impl NotificationPreWriteCause {
     /// Human-readable reason without changing the protocol vocabulary.
     pub const fn label(self) -> &'static str {
         match self {
+            Self::HeldForExistingDraft => "held for existing draft",
             Self::SessionUnavailable => "session unavailable",
             Self::ManifestUnavailable => "manifest unavailable",
             Self::PayloadUnavailable => "payload unavailable",
@@ -495,7 +505,7 @@ impl NotificationAttentionCause {
                     | DaemonRestart
                     | TransportOutcomeUnknown
             ),
-            Submitted => matches!(
+            Submitted | SubmittedUnverified => matches!(
                 self,
                 ReceiptOccupantChanged | AckTimeout | DaemonRestart | TransportOutcomeUnknown
             ),
@@ -1072,7 +1082,7 @@ pub fn render_legacy_doorbell(oldest_msg_id: &MessageId) -> String {
 mod tests {
     use super::*;
 
-    const STATES: [NotificationState; 15] = [
+    const STATES: [NotificationState; 16] = [
         NotificationState::Queued,
         NotificationState::Gating,
         NotificationState::BlockedPreWrite,
@@ -1082,6 +1092,7 @@ mod tests {
         NotificationState::Staged,
         NotificationState::Submitting,
         NotificationState::Submitted,
+        NotificationState::SubmittedUnverified,
         NotificationState::Notified,
         NotificationState::AttentionRequired,
         NotificationState::Withdrawn,
@@ -1271,9 +1282,12 @@ mod tests {
             (Staged, Submitting),
             (Staged, AttentionRequired),
             (Submitting, Submitted),
+            (Submitting, SubmittedUnverified),
             (Submitting, AttentionRequired),
             (Submitted, Notified),
             (Submitted, AttentionRequired),
+            (SubmittedUnverified, Notified),
+            (SubmittedUnverified, AttentionRequired),
         ];
 
         for from in STATES {
@@ -1347,14 +1361,16 @@ mod tests {
                 state
             );
         }
-        assert_eq!(
-            Submitted.settled_by_claim(NotificationTransport::Doorbell),
-            Notified
-        );
-        assert_eq!(
-            Submitted.settled_by_claim(NotificationTransport::DirectPayload),
-            Submitted
-        );
+        for state in [Submitted, SubmittedUnverified] {
+            assert_eq!(
+                state.settled_by_claim(NotificationTransport::Doorbell),
+                Notified
+            );
+            assert_eq!(
+                state.settled_by_claim(NotificationTransport::DirectPayload),
+                state
+            );
+        }
         for state in [
             Writing,
             Notified,

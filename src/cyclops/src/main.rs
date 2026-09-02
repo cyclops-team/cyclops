@@ -2714,6 +2714,9 @@ fn message_recipient_cell(
                         cyclops_proto::MessageNotificationState::AttentionRequired => {
                             "needs attention".to_string()
                         }
+                        cyclops_proto::MessageNotificationState::SubmittedUnverified => {
+                            "submitted (unverified)".to_string()
+                        }
                         state => wire_word(serde_json::to_value(state).unwrap_or(Value::Null)),
                     },
                 },
@@ -2941,10 +2944,7 @@ fn cmd_reply(cli: &Cli, style: &Style, args: &ReplyArgs) -> i32 {
     };
     println!("{verb} {}", style.accent(&result.msg_id));
     if !result.deliveries.is_empty() {
-        println!(
-            "wake {}",
-            render::render_receipts(&result.deliveries, style)
-        );
+        println!("{}", render::render_receipts(&result.deliveries, style));
     }
     0
 }

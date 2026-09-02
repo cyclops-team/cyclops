@@ -121,6 +121,7 @@ fn notification_words(state: NotificationState) -> &'static str {
         NotificationState::Staged => "waiting for submit",
         NotificationState::Submitting => "submit intent recorded",
         NotificationState::Submitted => "submitted",
+        NotificationState::SubmittedUnverified => "submitted (unverified)",
         NotificationState::Notified => "notified",
         NotificationState::AttentionRequired => "needs attention",
         NotificationState::Withdrawn => "withdrawn",
