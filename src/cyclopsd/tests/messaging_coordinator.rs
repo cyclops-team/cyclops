@@ -6124,6 +6124,21 @@ async fn a_working_turn_started_pane_submits_doorbell_without_barrier_held() {
     rig.tmux.run_ok(&["send-keys", "-t", &pane, "C-t"]);
     wait_pane_state(&mut rig, "working").await;
 
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let pause = Arc::clone(&release);
+    rig.daemon.set_inject_pause(move |phase| {
+        let entered_tx = entered_tx.clone();
+        let pause = Arc::clone(&pause);
+        Box::pin(async move {
+            if phase != "pre_submit" {
+                return;
+            }
+            let _ = entered_tx.send(());
+            pause.acquire_owned().await.unwrap().forget();
+        })
+    });
+
     // Send a message/reply to this working pane
     let sent = send_workspace_message(
         &rig,
@@ -6138,20 +6153,15 @@ async fn a_working_turn_started_pane_submits_doorbell_without_barrier_held() {
     // without failing or sticking in barrier_held!
     wait_for_notification_state(&mut rig, &message_id, NotificationState::Writing).await;
     wait_for_doorbell(&rig, &pane, &message_id).await;
-    let deadline = Instant::now() + Duration::from_secs(8);
-    loop {
-        if notification_transition(&rig, &message_id, NotificationState::Submitted).is_some()
-            || notification_transition(&rig, &message_id, NotificationState::SubmittedUnverified)
-                .is_some()
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "notification {message_id} was not submitted"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+        .await
+        .expect("doorbell reached the pre-submit pause")
+        .expect("pause sender stayed open");
+
+    refresh_exact_working_doorbell(&mut rig, &pane).await;
+    release.add_permits(1);
+
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::Submitted).await;
 
     let mut event = [0_u8; 16];
     let received = tokio::time::timeout(Duration::from_secs(5), submit_events.recv(&mut event))
