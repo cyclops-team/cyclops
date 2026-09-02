@@ -112,6 +112,10 @@ pub enum HitTarget {
     AttentionIndicator {
         pane_id: String,
     },
+    /// A clear / backspace button on the pane frame to unblock or wipe a composer draft.
+    PaneClear {
+        pane_id: String,
+    },
     AppMenu,
     NewWorkspaceButton,
     MenuItem {

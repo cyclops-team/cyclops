@@ -4349,6 +4349,7 @@ async fn handle_mouse(
                 | HitTarget::DialogTitleBar
                 | HitTarget::SettingsSection { .. }
                 | HitTarget::SettingsRow { .. } => return Ok(()),
+                HitTarget::PaneClear { .. } => {}
             }
             if let Some(action) = action::route_mouse_click(&target, MouseButton::Left) {
                 let outcome = exec::execute(app, client, action).await?;

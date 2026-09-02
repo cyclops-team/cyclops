@@ -625,6 +625,30 @@ fn paint_pane_frame(
         border_style,
     );
 
+    // A clear / backspace button on the left border ~20% up from the bottom,
+    // right beside the CLI composer area to quickly wipe stuck composer drafts.
+    if vis.height > 6 {
+        let y_20 = vis
+            .y
+            .saturating_add(vis.height.saturating_sub((vis.height / 5).max(2)));
+        if y_20 > top && y_20 < bottom && y_20 < bounds.y.saturating_add(bounds.height) {
+            super::overlay_text(buf, bounds, left, y_20, "⌫", border_style);
+            ctx.hits.push(
+                Rect::new(left, y_20, 1, 1),
+                HitTarget::PaneClear {
+                    pane_id: slot.pane_id.clone(),
+                },
+            );
+        }
+    } else if bottom > top + 1 {
+        ctx.hits.push(
+            Rect::new(left, bottom.saturating_sub(1), 1, 1),
+            HitTarget::PaneClear {
+                pane_id: slot.pane_id.clone(),
+            },
+        );
+    }
+
     let Some(decoration) = ctx
         .decoration
         .pane(&slot.pane_id)

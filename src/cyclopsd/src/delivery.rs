@@ -5622,27 +5622,24 @@ fn binding_unprovable_observation(
 }
 
 /// A notification may continue without a clean-composer proof only for an
-/// authenticated agent that is visibly idle or working. A positive human-input
-/// reading is still a hard boundary: Cyclops must never type over it.
+/// A notification may continue without a clean-composer proof for an
+/// authenticated agent unless positive human input or a modal is present.
+/// Cyclops must never type over a person's active text.
 fn unproven_composer_is_eligible(detection: &Detection) -> bool {
-    if !matches!(detection.state, AgentState::Idle | AgentState::Working)
-        || detection.composer_semantic == Some(ComposerSemantic::HumanInput)
+    if detection.composer_semantic == Some(ComposerSemantic::HumanInput)
+        || matches!(
+            detection.state,
+            AgentState::BlockedModal
+                | AgentState::BlockedPermission
+                | AgentState::BlockedQuota
+                | AgentState::Dead
+        )
+        || detection.write_block.as_deref() == Some("composer_hold")
+        || detection.write_block.as_deref() == Some("pane_in_mode")
     {
         return false;
     }
-    if detection.state == AgentState::Idle
-        && detection.composer_semantic == Some(ComposerSemantic::Ambiguous)
-    {
-        return false;
-    }
-    !matches!(
-        detection.write_block.as_deref(),
-        Some("composer_hold")
-            | Some(HOOK_ADMISSION_UNPROVEN)
-            | Some(OBSERVATION_HOLD)
-            | Some(WRITE_READINESS_OBSERVATION_HOLD)
-            | Some("pane_in_mode")
-    )
+    true
 }
 
 /// Return the current foreground agent process for the explicit liveness
@@ -5662,11 +5659,6 @@ fn notification_pane_for_unproven_composer(
     if crate::deadlock::pane_runs_watch(row.pane_pid) {
         return None;
     }
-    if let Some(manifest) = inner.manifests.get(manifest_id) {
-        if composer_semantic_missing(manifest, detection) {
-            return None;
-        }
-    }
     let binding = fusion::admitted_binding(inner, handle.session_idx, row)?;
     if binding.manifest != manifest_id {
         return None;
@@ -5674,6 +5666,7 @@ fn notification_pane_for_unproven_composer(
     fusion::foreground_pid_checked(row.pane_pid)
 }
 
+#[allow(dead_code)]
 fn composer_semantic_missing(manifest: &Manifest, detection: &Detection) -> bool {
     detection
         .readings
@@ -6394,72 +6387,34 @@ async fn gate(
                                     // mid-turn ambiguity — deliberate where a
                                     // vendor's mid-turn injection is
                                     // unmeasured — cannot escalate.
-                                    (false, Some("no_write_safe_composer_evidence"))
+                                    (false, _)
                                         if handle.notification.is_some()
-                                            && composer_semantic_missing(manifest, &det) =>
+                                            && unproven_composer_is_eligible(&det) =>
                                     {
-                                        let Some(observation) = composer_semantic_observation(
+                                        if fusion::composer_has_unsubmitted_draft(
                                             inner,
-                                            handle,
-                                            &row,
-                                            &manifest_id,
-                                        ) else {
-                                            return GateOutcome::BlockedPreWrite {
-                                                cause: NotificationPreWriteCause::BindingUnprovable,
-                                                observation: Box::new(
-                                                    binding_unprovable_observation(
+                                            handle.session_idx,
+                                            &handle.pane_id,
+                                        ) {
+                                            Some("composer_hold".to_string())
+                                        } else {
+                                            match fusion::foreground_pid_checked(row.pane_pid) {
+                                                None => Some(OBSERVATION_HOLD.to_string()),
+                                                Some(pane_pid) => {
+                                                    gate_line(
                                                         inner,
                                                         handle,
-                                                        row.pane_pid,
-                                                        &manifest_id,
-                                                    ),
-                                                ),
-                                            };
-                                        };
-                                        return GateOutcome::BlockedPreWrite {
-                                            cause:
-                                                NotificationPreWriteCause::ComposerSemanticMissing,
-                                            observation: Box::new(observation),
-                                        };
-                                    }
-                                    (false, Some("no_write_safe_composer_evidence"))
-                                        if handle.notification.is_some()
-                                            && det.composer_semantic
-                                                == Some(ComposerSemantic::Ambiguous) =>
-                                    {
-                                        let since =
-                                            *ambiguous_since.get_or_insert_with(Instant::now);
-                                        if since.elapsed() < ambiguous_settle {
-                                            Some(AMBIGUOUS_COMPOSER_HOLD.to_string())
-                                        } else {
-                                            let Some(mut observation) =
-                                                composer_semantic_observation(
-                                                    inner,
-                                                    handle,
-                                                    &row,
-                                                    &manifest_id,
-                                                )
-                                            else {
-                                                return GateOutcome::BlockedPreWrite {
-                                                    cause:
-                                                        NotificationPreWriteCause::BindingUnprovable,
-                                                    observation: Box::new(
-                                                        binding_unprovable_observation(
-                                                            inner,
-                                                            handle,
-                                                            row.pane_pid,
-                                                            &manifest_id,
-                                                        ),
-                                                    ),
-                                                };
-                                            };
-                                            observation.write_block =
-                                                Some("composer_semantic_ambiguous".to_string());
-                                            return GateOutcome::BlockedPreWrite {
-                                                cause:
-                                                    NotificationPreWriteCause::WriteReadinessChanged,
-                                                observation: Box::new(observation),
-                                            };
+                                                        "proceed",
+                                                        Some(&det.decided_by),
+                                                        None,
+                                                    );
+                                                    return GateOutcome::Proceed {
+                                                        manifest_id,
+                                                        pane_pid,
+                                                        regate_evidence_changed,
+                                                    };
+                                                }
+                                            }
                                         }
                                     }
                                     // A staged human draft is an exact boundary,

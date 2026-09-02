@@ -383,6 +383,10 @@ pub(super) async fn execute(
             super::handle_messages_key(app, KeyEvent::new(code, modifiers)).await?;
             Ok(Outcome::default())
         }
+        Action::ClearPaneComposer { pane_id } => {
+            let _ = client.send_keys(&pane_id, &["C-u"]).await;
+            Ok(Outcome::default())
+        }
         Action::ToggleTabBar => {
             // The strip's row moves between chrome and the declared grid
             // whole, so every flip re-declares the client size exactly the

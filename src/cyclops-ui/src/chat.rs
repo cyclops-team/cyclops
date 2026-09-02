@@ -563,15 +563,15 @@ pub fn wrap_words(text: &str, width: usize) -> Vec<String> {
 /// Computes the exact proven delivery truth label from mailbox and wake states.
 pub fn proven_status_label(mailbox: MailboxWord, wake: WakeWord) -> &'static str {
     match (mailbox, wake) {
+        (_, WakeWord::Withdrawn) => "Withdrawn",
+        (_, WakeWord::WithdrawnByOperator) => "Wake withdrawn",
+        (MailboxWord::Claimed, _) => "Claimed",
         (_, WakeWord::NeedsAttention) => "Attention",
         (_, WakeWord::QuotaHeld) => "Quota held",
         (_, WakeWord::QuotaResetObserved) => "Quota reset",
         (_, WakeWord::BlockedBeforeWrite) => "Blocked before write",
         (_, WakeWord::ResolutionIncomplete) => "Resolution open",
-        (_, WakeWord::Withdrawn) => "Withdrawn",
-        (_, WakeWord::WithdrawnByOperator) => "Wake withdrawn",
         (_, WakeWord::Superseded) => "Superseded",
-        (MailboxWord::Claimed, _) => "Claimed",
         (_, WakeWord::Queued) => "Wake queued",
         (_, WakeWord::Gating) => "Wake gating",
         (_, WakeWord::Writing) => "Wake writing",
@@ -591,15 +591,15 @@ pub fn proven_status_label(mailbox: MailboxWord, wake: WakeWord) -> &'static str
 /// Short code for narrow display.
 pub fn proven_status_short(mailbox: MailboxWord, wake: WakeWord) -> &'static str {
     match (mailbox, wake) {
+        (_, WakeWord::Withdrawn | WakeWord::WithdrawnByOperator) => "=wdrn",
+        (MailboxWord::Claimed, _) => "=claim",
         (_, WakeWord::NeedsAttention) => "!attn",
         (_, WakeWord::QuotaHeld) => "!quota",
         (_, WakeWord::QuotaResetObserved) => "!reset",
         (_, WakeWord::BlockedBeforeWrite) => "!block",
         (_, WakeWord::ResolutionIncomplete) => "!incomp",
-        (_, WakeWord::Withdrawn | WakeWord::WithdrawnByOperator) => "=wdrn",
         (_, WakeWord::Superseded) => "-sprsd",
         (_, WakeWord::Cleared | WakeWord::ResolvedDiscarded) => "xclear",
-        (MailboxWord::Claimed, _) => "=claim",
         (_, WakeWord::Queued | WakeWord::Gating | WakeWord::Writing | WakeWord::Staged) => {
             ".wake-pend"
         }

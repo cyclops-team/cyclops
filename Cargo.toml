@@ -22,7 +22,7 @@ members = [
 exclude = ["website"]
 
 [workspace.package]
-version = "0.1.2-beta"
+version = "1.0.0-beta"
 edition = "2021"
 
 [workspace.dependencies]
