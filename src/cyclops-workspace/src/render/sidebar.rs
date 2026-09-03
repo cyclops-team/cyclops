@@ -588,6 +588,31 @@ pub fn paint_messages(
             " Messages "
         };
         super::overlay_text(buf, area, area.x + 2, area.y, title, border_style);
+
+        if !view_journal && area.width > 24 {
+            let scope_chip = match queue.scope() {
+                cyclops_ui::Scope::All => "[All ▾]",
+                cyclops_ui::Scope::Work => "[Work ▾]",
+                cyclops_ui::Scope::Inbox => "[Inbox ▾]",
+                cyclops_ui::Scope::Outbound => "[Outbox ▾]",
+            };
+            let chip_w = scope_chip.len() as u16;
+            let chip_x = area.x + 2 + title.len() as u16;
+            if chip_x + chip_w + 2 < area.x + area.width {
+                super::overlay_text(
+                    buf,
+                    area,
+                    chip_x,
+                    area.y,
+                    scope_chip,
+                    theme::sidebar_footer_button(paint),
+                );
+                hits.push(
+                    Rect::new(chip_x, area.y, chip_w, 1),
+                    HitTarget::MessagesAction(cyclops_ui::ChatAction::Scope),
+                );
+            }
+        }
     }
 
     // The left edge of the Messages pane is the divider/toggle.

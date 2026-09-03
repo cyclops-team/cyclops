@@ -593,6 +593,16 @@ fn paint_pane_frame(
             PANE_GRIP,
             border_style,
         );
+        if let Some(rename) = controls.rename {
+            super::overlay_text(
+                buf,
+                bounds,
+                rename.x,
+                rename.y,
+                "[ren]",
+                border_style,
+            );
+        }
         super::overlay_text(
             buf,
             bounds,
@@ -634,24 +644,35 @@ fn paint_pane_frame(
         bottom.saturating_sub(1)
     };
     if clear_y > top && clear_y < bottom && clear_y < bounds.y.saturating_add(bounds.height) {
-        let clear_label = if vis.width >= 20 {
-            "[⌫ clear]"
-        } else {
-            "[⌫]"
-        };
-        let label_w = u16::try_from(Span::raw(clear_label).width()).unwrap_or(3);
         let clear_style = if slot.focused {
             theme::pane_border_focused(paint).add_modifier(Modifier::BOLD)
         } else {
             theme::pane_border(paint)
         };
-        super::overlay_text(buf, bounds, left, clear_y, clear_label, clear_style);
-        ctx.hits.push(
-            Rect::new(left, clear_y, label_w, 1),
-            HitTarget::PaneClear {
-                pane_id: slot.pane_id.clone(),
-            },
-        );
+        let y_start = clear_y.saturating_sub(1);
+        if vis.height > 6
+            && y_start > top
+            && clear_y.saturating_add(1) < bottom
+            && clear_y.saturating_add(1) < bounds.y.saturating_add(bounds.height)
+        {
+            super::overlay_text(buf, bounds, left, y_start, "[", clear_style);
+            super::overlay_text(buf, bounds, left, clear_y, "⌫", clear_style);
+            super::overlay_text(buf, bounds, left, clear_y + 1, "]", clear_style);
+            ctx.hits.push(
+                Rect::new(left, y_start, 2, 3),
+                HitTarget::PaneClear {
+                    pane_id: slot.pane_id.clone(),
+                },
+            );
+        } else {
+            super::overlay_text(buf, bounds, left, clear_y, "⌫", clear_style);
+            ctx.hits.push(
+                Rect::new(left, clear_y, 2, 1),
+                HitTarget::PaneClear {
+                    pane_id: slot.pane_id.clone(),
+                },
+            );
+        }
     }
 
     let Some(decoration) = ctx
@@ -812,6 +833,7 @@ fn paint_scroll_hint(
 #[derive(Debug, Clone, Copy)]
 struct PaneControls {
     grip: Rect,
+    rename: Option<Rect>,
     split_right: Rect,
     split_down: Rect,
 }
@@ -882,9 +904,16 @@ fn pane_controls(slot: &PaneSlot, bounds: Rect) -> Option<PaneControls> {
 
     let split_down = Rect::new(right.saturating_sub(3), top, 3, 1);
     let split_right = Rect::new(split_down.x.saturating_sub(3), top, 3, 1);
-    let grip = Rect::new(split_right.x.saturating_sub(3), top, 3, 1);
+    let (rename, grip_right) = if right.saturating_sub(left) >= 42 {
+        let rename_rect = Rect::new(split_right.x.saturating_sub(5), top, 5, 1);
+        (Some(rename_rect), rename_rect.x)
+    } else {
+        (None, split_right.x)
+    };
+    let grip = Rect::new(grip_right.saturating_sub(3), top, 3, 1);
     Some(PaneControls {
         grip,
+        rename,
         split_right,
         split_down,
     })
@@ -923,6 +952,14 @@ fn push_pane_overlay_hits(
         hits.push(rect, target);
     }
     if let Some(controls) = controls {
+        if let Some(rename) = controls.rename {
+            hits.push(
+                rename,
+                HitTarget::PaneRename {
+                    pane_id: slot.pane_id.clone(),
+                },
+            );
+        }
         hits.push(
             controls.split_right,
             HitTarget::PaneSplitRight {
@@ -3238,12 +3275,6 @@ mod tests {
         })
         .unwrap();
 
-        let flat = flatten(term.backend().buffer());
-        assert!(
-            flat.contains("[⌫ clear]"),
-            "buffer must contain enlarged clear button: {flat}"
-        );
-
         let clear_region = hits
             .regions()
             .iter()
@@ -3255,14 +3286,72 @@ mod tests {
         );
         let region = clear_region.unwrap();
         assert_eq!(
-            region.rect.width, 9,
-            "clear button hit target must be 9 cells wide"
+            region.rect.height, 3,
+            "clear button hit target must be 3 cells tall"
         );
         let clear_hit = hits.hit(region.rect.x, region.rect.y);
         assert!(
             matches!(clear_hit, Some(HitTarget::PaneClear { pane_id }) if pane_id == "%0"),
             "expected PaneClear hit target when clicked: {:?}",
             clear_hit
+        );
+    }
+
+    #[test]
+    fn pane_rename_button_renders_on_wide_pane_and_registers_hit_target() {
+        let node = crate::layout::parse_layout("b26f,80x20,0,0,0").unwrap();
+        let layout = crate::layout::resolve_layout(&node, &[]).unwrap();
+        let tab = TabModel {
+            window_id: "@0".to_string(),
+            name: "main".to_string(),
+            layout,
+            active_pane: "%0".to_string(),
+            zoomed: false,
+            minimized: std::collections::HashMap::new(),
+            minimization_provenance: std::collections::HashMap::new(),
+        };
+        let backend = TestBackend::new(80, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+        let mut hits = HitMap::default();
+        let decoration = DecorationSnapshot::default();
+        term.draw(|frame| {
+            let runtimes = RuntimeRegistry::default();
+            let paused = std::collections::HashSet::new();
+            let mut ctx = ctx_defaults(&mut hits, &paused, &decoration);
+            paint_window(
+                &tab,
+                &runtimes,
+                frame.area(),
+                frame.buffer_mut(),
+                &theme,
+                &mut ctx,
+            );
+        })
+        .unwrap();
+
+        let flat = flatten(term.backend().buffer());
+        assert!(
+            flat.contains("[ren]"),
+            "buffer must contain rename button: {flat}"
+        );
+
+        let rename_region = hits
+            .regions()
+            .iter()
+            .find(|r| matches!(r.target, HitTarget::PaneRename { .. }));
+        assert!(
+            rename_region.is_some(),
+            "expected PaneRename hit region registered in hits: {:?}",
+            hits.regions()
+        );
+        let region = rename_region.unwrap();
+        assert_eq!(region.rect.width, 5);
+        let rename_hit = hits.hit(region.rect.x, region.rect.y);
+        assert!(
+            matches!(rename_hit, Some(HitTarget::PaneRename { pane_id }) if pane_id == "%0"),
+            "expected PaneRename hit target when clicked: {:?}",
+            rename_hit
         );
     }
 }

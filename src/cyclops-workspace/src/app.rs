@@ -4159,7 +4159,9 @@ async fn handle_mouse(
                     ));
                     return Ok(());
                 }
-                HitTarget::PaneSplitRight { .. } | HitTarget::PaneSplitDown { .. } => {
+                HitTarget::PaneSplitRight { .. }
+                | HitTarget::PaneSplitDown { .. }
+                | HitTarget::PaneRename { .. } => {
                     app.close_menu();
                 }
                 HitTarget::Divider { pane_id, dir } => {
