@@ -61,8 +61,8 @@ use crate::notice::NoticeState;
 use crate::persist::{self, load_prefs, set_last_active, SidebarTab, WorkspacePrefs};
 use crate::render::{
     paint_dialog, paint_menu, paint_messages, paint_messages_rail, paint_messages_resize_feedback,
-    paint_sidebar, paint_sidebar_rail, paint_sidebar_resize_feedback, paint_tab_bar, paint_window,
-    MessagesRailCue,
+    paint_sidebar_filtered, paint_sidebar_rail, paint_sidebar_resize_feedback, paint_tab_bar,
+    paint_window, MessagesRailCue,
 };
 use crate::resilience::{self, LinkState};
 use crate::selection::{self, SelectionState};
@@ -491,6 +491,7 @@ struct App {
     /// written back on every change, so a workspace reopens on the tab it
     /// was left on.
     sidebar_tab: SidebarTab,
+    sidebar_filter: crate::persist::SidebarFilter,
     /// The sidebar's file panel. Rooted on the focused pane's directory the
     /// first time that probe answers, and then only where the operator
     /// walks it.
@@ -1336,6 +1337,7 @@ pub async fn run_async() -> i32 {
         expanded_for: None,
         watched_sessions: HashSet::new(),
         sidebar_tab: prefs.sidebar_tab,
+        sidebar_filter: crate::persist::SidebarFilter::default(),
         files: crate::files::FileTree::new(),
         files_pinned: {
             let mut pinned = crate::files::FileTree::new();
@@ -4352,7 +4354,7 @@ async fn handle_mouse(
                 | HitTarget::DialogTitleBar
                 | HitTarget::SettingsSection { .. }
                 | HitTarget::SettingsRow { .. } => return Ok(()),
-                HitTarget::PaneClear { .. } => {}
+                HitTarget::PaneClear { .. } | HitTarget::SidebarFilter { .. } => {}
             }
             if let Some(action) = action::route_mouse_click(&target, MouseButton::Left) {
                 let outcome = exec::execute(app, client, action).await?;
@@ -4383,7 +4385,21 @@ async fn handle_mouse(
                 }
             } else if let Some(anchor) = app.selection.anchor_pane().map(str::to_string) {
                 if let Some(geom) = app.hit_map.pane_geometry(&anchor) {
-                    if let Some(cell) = crate::input::mouse::HitMap::cell_at(geom, col, row) {
+                    if let Some(cell) = crate::input::mouse::HitMap::cell_at_clamped(geom, col, row)
+                    {
+                        // Auto-scroll when dragging vertically beyond pane boundaries
+                        let max_row = geom.inner.y + geom.inner.height.saturating_sub(1);
+                        if row < geom.inner.y {
+                            let delta = (geom.inner.y - row).min(5) as i32;
+                            if let Some(rt) = app.runtimes.get_mut(&anchor) {
+                                rt.scroll(-delta);
+                            }
+                        } else if row > max_row {
+                            let delta = (row - max_row).min(5) as i32;
+                            if let Some(rt) = app.runtimes.get_mut(&anchor) {
+                                rt.scroll(delta);
+                            }
+                        }
                         let step = app.selection.drag_to(&anchor, cell);
                         if let Some(rt) = app.runtimes.get_mut(&anchor) {
                             match step {
@@ -5886,6 +5902,22 @@ async fn handle_dialog_key(
                 *error = None;
             }
         }
+        DialogKeyAction::DeleteWord => {
+            if let Some(buffer) = app.dialog.as_mut().and_then(dialog::dialog_buffer_mut) {
+                dialog::delete_word(buffer);
+            }
+            if let Some(Dialog::NamePane { error, .. }) = app.dialog.as_mut() {
+                *error = None;
+            }
+        }
+        DialogKeyAction::Clear => {
+            if let Some(buffer) = app.dialog.as_mut().and_then(dialog::dialog_buffer_mut) {
+                buffer.clear();
+            }
+            if let Some(Dialog::NamePane { error, .. }) = app.dialog.as_mut() {
+                *error = None;
+            }
+        }
         DialogKeyAction::Append(c) => {
             let mut encoded = [0; 4];
             dialog::append_dialog_text(app.dialog.as_mut(), c.encode_utf8(&mut encoded));
@@ -6177,13 +6209,14 @@ fn draw<B: Backend>(
         .draw(|f| {
             let areas = app.chrome(f.area());
             if let Some(sidebar) = areas.sidebar {
-                paint_sidebar(
+                paint_sidebar_filtered(
                     &app.model.workspaces,
                     app.model.active_workspace,
                     &app.model.active_tab().active_pane,
                     &app.expanded_workspaces,
                     &app.prefs.agent_order,
                     app.sidebar_tab,
+                    app.sidebar_filter,
                     &app.record,
                     match app.files_view {
                         crate::files::FilesView::Agent => &mut app.files,
@@ -7792,6 +7825,7 @@ mod tests {
             expanded_for: None,
             watched_sessions: HashSet::new(),
             sidebar_tab: SidebarTab::default(),
+            sidebar_filter: crate::persist::SidebarFilter::default(),
             files: crate::files::FileTree::new(),
             files_pinned: crate::files::FileTree::new(),
             files_view: crate::files::FilesView::default(),

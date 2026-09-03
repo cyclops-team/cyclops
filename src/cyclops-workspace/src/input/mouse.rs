@@ -54,6 +54,10 @@ pub enum HitTarget {
     SidebarTab {
         tab: crate::persist::SidebarTab,
     },
+    /// One chip of the sidebar's session tree filter header.
+    SidebarFilter {
+        filter: crate::persist::SidebarFilter,
+    },
     SidebarDivider,
     /// One entry of the file panel. Carries what a click needs so the
     /// handler never re-reads the filesystem to answer a press: `path` to
@@ -276,6 +280,24 @@ impl HitMap {
         Some(crate::runtime::CellPos {
             col: col - geom.inner.x,
             row: row - geom.inner.y,
+        })
+    }
+
+    /// Map terminal coordinates to a cell inside a pane body, clamping to its
+    /// bounds if the coordinates extend outside the pane (e.g. during a drag selection).
+    pub fn cell_at_clamped(
+        geom: &PaneGeometry,
+        col: u16,
+        row: u16,
+    ) -> Option<crate::runtime::CellPos> {
+        if geom.inner.width == 0 || geom.inner.height == 0 {
+            return None;
+        }
+        let max_col = geom.inner.x + geom.inner.width - 1;
+        let max_row = geom.inner.y + geom.inner.height - 1;
+        Some(crate::runtime::CellPos {
+            col: col.clamp(geom.inner.x, max_col) - geom.inner.x,
+            row: row.clamp(geom.inner.y, max_row) - geom.inner.y,
         })
     }
 }

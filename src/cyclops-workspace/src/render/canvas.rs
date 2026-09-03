@@ -634,7 +634,12 @@ fn paint_pane_frame(
         bottom.saturating_sub(1)
     };
     if clear_y > top && clear_y < bottom && clear_y < bounds.y.saturating_add(bounds.height) {
-        let clear_label = "⌫";
+        let clear_label = if vis.width >= 20 {
+            "[⌫ clear]"
+        } else {
+            "[⌫]"
+        };
+        let label_w = u16::try_from(Span::raw(clear_label).width()).unwrap_or(3);
         let clear_style = if slot.focused {
             theme::pane_border_focused(paint).add_modifier(Modifier::BOLD)
         } else {
@@ -642,7 +647,7 @@ fn paint_pane_frame(
         };
         super::overlay_text(buf, bounds, left, clear_y, clear_label, clear_style);
         ctx.hits.push(
-            Rect::new(left, clear_y, 2, 1),
+            Rect::new(left, clear_y, label_w, 1),
             HitTarget::PaneClear {
                 pane_id: slot.pane_id.clone(),
             },
@@ -668,10 +673,10 @@ fn paint_pane_frame(
         // against the glyph and `○────` reads as one joined mark rather
         // than a status next to a line.
         let full_suffix = 4usize.saturating_add(Span::raw(full.as_str()).width());
-        if slot.focused
+        let show_word = (slot.focused || status.attention || status.color_state.is_blocked())
             && Span::raw(label).width().saturating_add(full_suffix)
-                <= usize::from(title_bounds.width)
-        {
+                <= usize::from(title_bounds.width);
+        if show_word {
             full
         } else {
             status.glyph.to_string()
@@ -711,7 +716,7 @@ fn paint_pane_frame(
         x,
         top,
         &shown_state,
-        if status.attention {
+        if status.attention || status.color_state.is_blocked() || status.word == "waiting" {
             theme::attention_eye(paint)
         } else {
             paint.state(status.color_state)
@@ -3207,6 +3212,57 @@ mod tests {
         assert_eq!(open_60_chrome.tmux_sizing_canvas().width, 210);
         assert!(
             open_60_chrome.tmux_sizing_canvas().width < closed_chrome.tmux_sizing_canvas().width
+        );
+    }
+
+    #[test]
+    fn clear_composer_button_renders_bracketed_and_registers_hit_target() {
+        let tab = single_pane_tab();
+        let backend = TestBackend::new(50, 15);
+        let mut term = Terminal::new(backend).unwrap();
+        let theme = Paint::for_test();
+        let mut hits = HitMap::default();
+        let decoration = DecorationSnapshot::default();
+        term.draw(|frame| {
+            let runtimes = RuntimeRegistry::default();
+            let paused = std::collections::HashSet::new();
+            let mut ctx = ctx_defaults(&mut hits, &paused, &decoration);
+            paint_window(
+                &tab,
+                &runtimes,
+                frame.area(),
+                frame.buffer_mut(),
+                &theme,
+                &mut ctx,
+            );
+        })
+        .unwrap();
+
+        let flat = flatten(term.backend().buffer());
+        assert!(
+            flat.contains("[⌫ clear]"),
+            "buffer must contain enlarged clear button: {flat}"
+        );
+
+        let clear_region = hits
+            .regions()
+            .iter()
+            .find(|r| matches!(r.target, HitTarget::PaneClear { .. }));
+        assert!(
+            clear_region.is_some(),
+            "expected PaneClear hit region registered in hits: {:?}",
+            hits.regions()
+        );
+        let region = clear_region.unwrap();
+        assert_eq!(
+            region.rect.width, 9,
+            "clear button hit target must be 9 cells wide"
+        );
+        let clear_hit = hits.hit(region.rect.x, region.rect.y);
+        assert!(
+            matches!(clear_hit, Some(HitTarget::PaneClear { pane_id }) if pane_id == "%0"),
+            "expected PaneClear hit target when clicked: {:?}",
+            clear_hit
         );
     }
 }

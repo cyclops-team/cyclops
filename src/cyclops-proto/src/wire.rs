@@ -245,6 +245,9 @@ pub struct StatusResetParams {
     /// Remove adoptions for panes that no longer exist or are dead.
     #[serde(default = "default_true")]
     pub prune_stale_adoptions: bool,
+    /// Flush message ledgers and queues so history/messages view starts blank.
+    #[serde(default)]
+    pub flush_messages: bool,
 }
 
 impl Default for StatusResetParams {
@@ -253,6 +256,7 @@ impl Default for StatusResetParams {
             kill_dead_panes: true,
             prune_stale_sessions: true,
             prune_stale_adoptions: true,
+            flush_messages: false,
         }
     }
 }
@@ -266,6 +270,8 @@ pub struct StatusResetResult {
     pub pruned_adoptions: usize,
     pub active_panes: usize,
     pub active_sessions: usize,
+    #[serde(default)]
+    pub flushed_messages: usize,
 }
 
 /// Content-free warning about a notification that cannot wake its recipient.
