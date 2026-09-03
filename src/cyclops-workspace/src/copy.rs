@@ -328,7 +328,7 @@ pub const VIEW_FILES_NOTE: &str = "A file browser at the foot of the sidebar.";
 
 /// The view section's footer: its rows do not wait for Apply the way
 /// the sections beside it do, and this is where that is said.
-pub const VIEW_HINT: &str = "Enter or a click flips a row. Changes take effect at once.";
+pub const VIEW_HINT: &str = "Enter or Space flips a row. Changes take effect at once.";
 
 /// The sound section's two rows. "Sound notifs" rather than "Sounds":
 /// the switch is about being told, not about the workspace making noise.

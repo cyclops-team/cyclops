@@ -473,7 +473,7 @@ pub fn dialog_key_action(dialog: &Dialog, key: &KeyEvent) -> DialogKeyAction {
     if matches!(dialog, Dialog::Settings { .. }) {
         return match key.code {
             KeyCode::Esc => DialogKeyAction::Cancel,
-            KeyCode::Enter => DialogKeyAction::Confirm,
+            KeyCode::Enter | KeyCode::Char(' ') => DialogKeyAction::Confirm,
             KeyCode::Up => DialogKeyAction::Scroll(-1),
             KeyCode::Down => DialogKeyAction::Scroll(1),
             KeyCode::PageUp => DialogKeyAction::Scroll(-8),
@@ -980,6 +980,10 @@ mod tests {
         );
         assert_eq!(
             dialog_key_action(&dialog, &key(KeyCode::Enter)),
+            DialogKeyAction::Confirm
+        );
+        assert_eq!(
+            dialog_key_action(&dialog, &key(KeyCode::Char(' '))),
             DialogKeyAction::Confirm
         );
         assert_eq!(
