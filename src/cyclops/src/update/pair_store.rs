@@ -2117,8 +2117,7 @@ pub(crate) fn prove_pair_identity(directory: &Path) -> Result<String, String> {
 
 // A concurrent fork can briefly inherit a newly staged executable's writable
 // descriptor. Linux rejects execution until that child reaches exec and
-// closes the descriptor, so retry only that transient kernel result.
-const TEXT_BUSY_RETRY_DELAYS_MS: [u64; 3] = [100, 200, 400];
+pub(crate) const TEXT_BUSY_RETRY_DELAYS_MS: [u64; 3] = [100, 200, 400];
 
 pub(crate) fn retry_text_busy<T>(
     mut operation: impl FnMut() -> std::io::Result<T>,
