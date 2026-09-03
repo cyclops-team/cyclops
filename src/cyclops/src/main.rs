@@ -266,7 +266,7 @@ enum Cmd {
     #[command(hide = true)]
     Reset,
     /// Flush message ledgers, cleanse state, and reset sessions to start clean.
-    #[command(display_order = 5)]
+    #[command(hide = true)]
     Flush {
         /// Also prune dead panes and stale sessions (default true).
         #[arg(long, default_value_t = true)]
