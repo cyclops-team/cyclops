@@ -368,6 +368,16 @@ async fn history_and_thread_release_bodies_only_after_the_exact_claim() {
         .get("body")
         .is_none());
 
+    let admin_thread_full = rig
+        .ctl
+        .request("msg.thread", json!({"id": message_id, "body": true}))
+        .await;
+    assert_eq!(
+        message_line(&admin_thread_full, &message_id)["body"],
+        secret,
+        "an inspecting admin with body: true must be authorized to inspect the message body"
+    );
+
     let observer_history = pane_request(
         &mut rig,
         &client_dir,

@@ -1460,7 +1460,7 @@ impl SessionSlot {
         self.persistent.store(true, Ordering::Release);
     }
 
-    fn is_persistent(&self) -> bool {
+    pub(crate) fn is_persistent(&self) -> bool {
         self.persistent.load(Ordering::Acquire)
     }
 
@@ -1478,8 +1478,22 @@ impl SessionSlot {
         self.observed_live.load(Ordering::Acquire)
     }
 
-    fn retire_if_runtime(&self) -> bool {
+    pub(crate) fn retire_if_runtime(&self) -> bool {
         if self.persistent.load(Ordering::Acquire) || !self.observed_live.load(Ordering::Acquire) {
+            return false;
+        }
+        let retired = self
+            .retired
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if retired {
+            self.retired_changed.send_replace(true);
+        }
+        retired
+    }
+
+    pub(crate) fn retire_runtime_slot(&self) -> bool {
+        if self.persistent.load(Ordering::Acquire) {
             return false;
         }
         let retired = self

@@ -120,6 +120,7 @@ alphabet.
 |---|---|
 | `ping` | Liveness and round trip |
 | `status` | Every watched session and pane, with fused state |
+| `status.reset` | Reset and cleanse status: close dead panes, prune stale sessions and orphan adoptions |
 | `health.snapshot` | Last committed daemon status without pane capture or state mutation |
 | `pane.read` | A pane's screen, its recent output, or the detection view |
 | `pane.label` | Give a pane a name, or take it back |
@@ -254,6 +255,29 @@ administrator's durable inbox. Older daemons omit it and clients read zero.
 `blocked_notifications` is a bounded body-free sample of pre-write failures.
 `blocked_notifications_total` is the complete count, so omitted sample rows are
 visible without making normal status output grow with the journal.
+
+### status.reset
+
+`status.reset` accepts optional boolean parameters:
+
+| Field | Type | Default | What it controls |
+|---|---|---|---|
+| `kill_dead_panes` | bool | `true` | Close panes whose processes have exited (`dead: true`) |
+| `prune_stale_sessions` | bool | `true` | Retire unattached non-persistent runtime sessions |
+| `prune_stale_adoptions` | bool | `true` | Forget orphan adoptions for panes that no longer exist |
+
+It cleanses runtime state so status is not flooded by old or terminated processes, refreshes live observations, and returns:
+
+```json
+{
+  "reset": true,
+  "pruned_panes": 2,
+  "pruned_sessions": 1,
+  "pruned_adoptions": 1,
+  "active_panes": 3,
+  "active_sessions": 1
+}
+```
 
 ### health.snapshot
 

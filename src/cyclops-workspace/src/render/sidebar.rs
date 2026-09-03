@@ -510,6 +510,7 @@ pub fn paint_messages(
     status: Option<&str>,
     retry_available: bool,
     focused: bool,
+    view_journal: bool,
     area: Rect,
     buf: &mut Buffer,
     paint: &Paint,
@@ -536,7 +537,12 @@ pub fn paint_messages(
         .render(area, buf);
 
     if area.width > 11 {
-        super::overlay_text(buf, area, area.x + 2, area.y, " Messages ", border_style);
+        let title = if view_journal {
+            " Journal "
+        } else {
+            " Messages "
+        };
+        super::overlay_text(buf, area, area.x + 2, area.y, title, border_style);
     }
 
     // The left edge of the Messages pane is the divider/toggle.
@@ -576,6 +582,7 @@ pub fn paint_messages(
             status,
             retry_available,
             now_ms,
+            view_journal,
         },
         content_w,
         content_h,
@@ -3653,8 +3660,8 @@ mod tests {
         let queue = cyclops_ui::HumanQueue::new();
         let registry = cyclops_ui::AvatarRegistry::default();
         paint_messages(
-            &queue, None, None, &registry, None, None, None, false, false, area, &mut buf, &paint,
-            &mut hits, None,
+            &queue, None, None, &registry, None, None, None, false, false, false, area, &mut buf,
+            &paint, &mut hits, None,
         );
 
         let content_w = area.width.saturating_sub(2) as usize;
@@ -3705,8 +3712,8 @@ mod tests {
                 let mut buf = Buffer::empty(area);
                 let mut hits = HitMap::default();
                 paint_messages(
-                    &queue, None, None, &registry, None, None, None, false, false, area, &mut buf,
-                    &paint, &mut hits, None,
+                    &queue, None, None, &registry, None, None, None, false, false, false, area,
+                    &mut buf, &paint, &mut hits, None,
                 );
                 matches!(hits.hit(x, y), Some(HitTarget::MessagesAction(found)) if *found == action)
             })
@@ -3716,8 +3723,8 @@ mod tests {
             let mut buf = Buffer::empty(area);
             let mut hits = HitMap::default();
             paint_messages(
-                &queue, None, None, &registry, None, None, None, false, false, area, &mut buf,
-                &paint, &mut hits, hover,
+                &queue, None, None, &registry, None, None, None, false, false, false, area,
+                &mut buf, &paint, &mut hits, hover,
             );
             buf
         };
@@ -3789,8 +3796,8 @@ mod tests {
         let mut buf = Buffer::empty(area);
         let mut hits = HitMap::default();
         paint_messages(
-            &queue, None, None, &registry, None, None, None, false, false, area, &mut buf, &paint,
-            &mut hits, None,
+            &queue, None, None, &registry, None, None, None, false, false, false, area, &mut buf,
+            &paint, &mut hits, None,
         );
         let row_text = |y: u16| -> String {
             (area.x..area.right())
@@ -3918,6 +3925,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
             false,
             area,

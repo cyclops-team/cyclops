@@ -538,6 +538,8 @@ struct App {
     messages_detail: Option<cyclops_ui::Detail>,
     /// Bounded group-chat composer state.
     messages_composer: cyclops_ui::ComposerState,
+    /// View mode for the Messages pane: false for timeline cards, true for chronological journal.
+    pub messages_view_journal: bool,
     /// Data-driven avatar registry for resolving agent/sender initials and icons.
     avatar_registry: cyclops_ui::AvatarRegistry,
     /// Startup ordering and seq dedup for `record`
@@ -1351,6 +1353,7 @@ pub async fn run_async() -> i32 {
         messages_caller: None,
         messages_detail: None,
         messages_composer: cyclops_ui::ComposerState::default(),
+        messages_view_journal: false,
         avatar_registry: cyclops_ui::AvatarRegistry::default(),
         stream_projection: cyclops_ui::StreamProjectionState::new(),
         stream_reconciling: false,
@@ -4821,6 +4824,17 @@ async fn handle_messages_key(
             app.messages_queue.set_scope(next);
             return Ok(Some(InputOutcome::Redraw));
         }
+        KeyCode::Char('v') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.messages_view_journal = !app.messages_view_journal;
+            let mode = if app.messages_view_journal {
+                "journal"
+            } else {
+                "timeline"
+            };
+            app.notice
+                .show(format!("Messages view: {mode}"), Instant::now());
+            return Ok(Some(InputOutcome::Redraw));
+        }
         KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             let through = app.messages_queue.watermark();
             app.prefs.messages_cleared_through_seq =
@@ -6238,6 +6252,7 @@ fn draw<B: Backend>(
                     link_status,
                     app.messages_refresh_error.is_some(),
                     app.messages_focused,
+                    app.messages_view_journal,
                     messages,
                     f.buffer_mut(),
                     &app.paint,
@@ -7788,6 +7803,7 @@ mod tests {
             messages_caller: None,
             messages_detail: None,
             messages_composer: cyclops_ui::ComposerState::default(),
+            messages_view_journal: false,
             avatar_registry: cyclops_ui::AvatarRegistry::default(),
             stream_projection: cyclops_ui::StreamProjectionState::new(),
             stream_reconciling: false,

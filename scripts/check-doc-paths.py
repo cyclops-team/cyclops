@@ -84,6 +84,8 @@ LITERAL_SKIPS = {
     "tests/raw/m1-soak/summary.json": "one such run's verdict, quoted by BENCHMARKS.md as a local artifact",
     "tests/raw/m1-soak-2/summary.json": "one such run's verdict, quoted by BENCHMARKS.md as a local artifact",
     "@src/main.rs": "a reference in the OPERATOR's project, not this one: workspace-ui.md uses it to show that a file panel reference stays relative to the pane's folder after browsing elsewhere",
+    "src/cyclopsd/src/delivery.rs": "pre-modularization monolith path, now modularized under src/cyclopsd/src/delivery/",
+    "src/cyclopsd/src/mailbox.rs": "pre-modularization monolith path, now modularized under src/cyclopsd/src/mailbox/",
 }
 
 # A code span is a candidate when it has a slash and no whitespace. That
