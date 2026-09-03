@@ -179,7 +179,13 @@ async fn open_message(sock: &Path, message_id: &MessageId, claim: bool) -> Actio
             Err(e) => return e.into_outcome(),
         }
     }
-    match call(sock, "msg.thread", json!({ "id": message_id.to_string() })).await {
+    match call(
+        sock,
+        "msg.thread",
+        json!({ "id": message_id.to_string(), "body": true }),
+    )
+    .await
+    {
         Ok(value) => {
             let want = message_id.to_string();
             let thread_problem = match value["lines"].as_array() {

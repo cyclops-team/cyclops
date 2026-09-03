@@ -229,6 +229,45 @@ pub struct StatusParams {
     pub open_deliveries: bool,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// Parameters for `status.reset`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusResetParams {
+    /// Kill panes that have exited (`dead: true`) in watched sessions.
+    #[serde(default = "default_true")]
+    pub kill_dead_panes: bool,
+    /// Retire unattached non-persistent runtime sessions.
+    #[serde(default = "default_true")]
+    pub prune_stale_sessions: bool,
+    /// Remove adoptions for panes that no longer exist or are dead.
+    #[serde(default = "default_true")]
+    pub prune_stale_adoptions: bool,
+}
+
+impl Default for StatusResetParams {
+    fn default() -> Self {
+        Self {
+            kill_dead_panes: true,
+            prune_stale_sessions: true,
+            prune_stale_adoptions: true,
+        }
+    }
+}
+
+/// Result of `status.reset`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusResetResult {
+    pub reset: bool,
+    pub pruned_panes: usize,
+    pub pruned_sessions: usize,
+    pub pruned_adoptions: usize,
+    pub active_panes: usize,
+    pub active_sessions: usize,
+}
+
 /// Content-free warning about a notification that cannot wake its recipient.
 /// The durable recipient key and attempt id keep the warning bound to one
 /// route and one notification while display labels remain presentation only.
@@ -953,6 +992,8 @@ pub struct HistoryResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadParams {
     pub id: String,
+    #[serde(default)]
+    pub body: bool,
 }
 
 /// msg.thread result: the message's folded msg line, every state/gate line

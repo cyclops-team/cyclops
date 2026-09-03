@@ -243,6 +243,9 @@ fn title_hint(p: &PaneStatus, label: &str) -> Option<String> {
 /// alone. The agent binary as a command repeats the manifest, so it is
 /// suppressed too.
 fn detail_for(p: &PaneStatus, label: &str) -> Option<String> {
+    if p.dead {
+        return Some("process terminated".to_string());
+    }
     if let Some(t) = title_hint(p, label) {
         return Some(t);
     }
@@ -394,6 +397,13 @@ pub fn render_status(res: &StatusResult, style: &Style, _config_path: &Path) -> 
     out.extend(blocked_notification_rows(res, style));
     out.extend(diagnostic_rows(res, style));
     out.extend(waiting_rows(res, style));
+    if res.sessions.iter().any(|s| s.panes.iter().any(|p| p.dead)) {
+        out.push(String::new());
+        out.push(format!(
+            "  {}",
+            style.dim("Terminated processes detected. Run 'cyclops reset' to clear dead panes and cleanse status.")
+        ));
+    }
     out.join("\n")
 }
 
@@ -1736,6 +1746,18 @@ mod tests {
         status.admin_unread = 3;
         let rendered = render_status(&status, &Style::none(), Path::new("/x/config.toml"));
         assert!(rendered.lines().next().unwrap().contains("admin inbox 3"));
+    }
+
+    #[test]
+    fn status_renders_terminated_panes_and_reset_tip() {
+        let mut fix = fixture();
+        fix.sessions[0].panes[1].dead = true;
+        let got = render_status(&fix, &Style::none(), Path::new("/x/config.toml"));
+        assert!(got.contains("process terminated"), "{got}");
+        assert!(
+            got.contains("Terminated processes detected. Run 'cyclops reset' to clear dead panes and cleanse status."),
+            "{got}"
+        );
     }
 
     #[test]

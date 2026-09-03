@@ -1573,16 +1573,19 @@ impl WorkspaceMessaging {
         &self,
         caller: MailboxIdentity,
         id: &str,
+        reveal_body: bool,
         compatibility: CompatibilityHistorySources,
     ) -> Result<ThreadResult, cyclops_proto::WireError> {
         let reader = crate::history::HistoryReader::workspace(caller.label.clone(), caller.key);
         let record = self.history_record(compatibility);
         let mut result = crate::history::query_thread(&record, id, Some(&reader))?;
-        crate::mailbox::redact_message_bodies(
-            Some(&self.service),
-            Some(caller.key),
-            &mut result.lines,
-        );
+        if !(caller.key.is_admin() && reveal_body) {
+            crate::mailbox::redact_message_bodies(
+                Some(&self.service),
+                Some(caller.key),
+                &mut result.lines,
+            );
+        }
         Ok(result)
     }
 
@@ -3068,7 +3071,7 @@ mod tests {}
         }
 
         for (adapter, source) in [
-            ("delivery", include_str!("delivery.rs")),
+            ("delivery", include_str!("delivery/mod.rs")),
             ("messaging runtime", include_str!("messaging_runtime.rs")),
             ("ack", include_str!("ack.rs")),
         ] {
@@ -3934,6 +3937,7 @@ mod tests {}
             .thread(
                 observer_identity,
                 accepted.message_id.as_str(),
+                false,
                 compatibility(),
             )
             .unwrap_err();
@@ -3955,6 +3959,7 @@ mod tests {}
             .thread(
                 reviewer_identity,
                 accepted.message_id.as_str(),
+                false,
                 compatibility(),
             )
             .unwrap();
@@ -4398,7 +4403,7 @@ mod tests {}
     #[test]
     fn mechanisms_cannot_schedule_recipient_fifos_directly() {
         for (name, source) in [
-            ("delivery", include_str!("delivery.rs")),
+            ("delivery", include_str!("delivery/mod.rs")),
             (
                 "attention resolution",
                 include_str!("attention_resolution.rs"),
@@ -4424,7 +4429,7 @@ mod tests {}
         for (name, source) in [
             ("fusion", include_str!("fusion.rs")),
             ("authenticated ACK", include_str!("ack.rs")),
-            ("delivery", include_str!("delivery.rs")),
+            ("delivery", include_str!("delivery/mod.rs")),
             ("socket server", include_str!("server.rs")),
         ] {
             for forbidden in ["messaging::schedule_", "messaging_runtime::schedule_"] {
@@ -4547,7 +4552,7 @@ mod tests {}
     /// append a pre-write transition itself.
     #[test]
     fn delivery_cannot_own_the_prewrite_transaction() {
-        let source = include_str!("delivery.rs");
+        let source = include_str!("delivery/mod.rs");
         let production = source_before_primary_tests(source, "delivery.rs");
 
         for required in [

@@ -192,14 +192,21 @@ pub(crate) fn msg_history(
 /// msg.thread: one id resolves to its folded msg line, every state/gate
 /// line sharing the id, and every msg whose reply_to chains to it (each
 /// folded), ordered oldest first.
-pub(crate) fn msg_thread(inner: &Arc<Inner>, id: &str, peer: Peer) -> Result<Value, WireError> {
+pub(crate) fn msg_thread(
+    inner: &Arc<Inner>,
+    id: &str,
+    reveal_body: bool,
+    peer: Peer,
+) -> Result<Value, WireError> {
     if id.is_empty() {
         return Err(wire_err("bad_request", "msg.thread needs a message id"));
     }
     let caller = crate::server::workspace_messaging_caller_if_available(inner, peer)?;
     let compatibility = compatibility::CompatibilityHistoryAdapter::capture(inner).read();
     let result = match caller {
-        Some((messaging, caller)) => messaging.thread(caller, id, compatibility)?,
+        Some((messaging, caller)) => {
+            messaging.thread(caller, id, reveal_body, compatibility)?
+        }
         None => {
             let record = HistoryRecord::new(None, compatibility);
             let mut result = query_thread(&record, id, None)?;

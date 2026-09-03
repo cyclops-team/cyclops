@@ -870,6 +870,7 @@ pub struct ChatRenderContext<'a> {
     /// operator-triggered action.
     pub retry_available: bool,
     pub now_ms: Option<u64>,
+    pub view_journal: bool,
 }
 
 impl<'a> ChatRenderContext<'a> {
@@ -883,6 +884,7 @@ impl<'a> ChatRenderContext<'a> {
             status: None,
             retry_available: false,
             now_ms: None,
+            view_journal: false,
         }
     }
 
@@ -903,6 +905,11 @@ impl<'a> ChatRenderContext<'a> {
 
     pub fn with_retry_available(mut self) -> Self {
         self.retry_available = true;
+        self
+    }
+
+    pub fn with_view_journal(mut self, view_journal: bool) -> Self {
+        self.view_journal = view_journal;
         self
     }
 
@@ -986,6 +993,7 @@ pub fn render_chat_lines(
         status,
         retry_available,
         now_ms,
+        view_journal,
     } = context;
     if width == 0 || height == 0 {
         return Vec::new();
@@ -1158,6 +1166,109 @@ pub fn render_chat_lines(
                 }
             }
         }
+    } else if view_journal {
+        // Transmission Journal mode: clean chronological log of every message delivery fact
+        let body_width = width.saturating_sub(4).max(1);
+        for row in &visible_rows {
+            let is_selected = selected_target == Some(&row.target);
+            let time_str = format_time(row.ts, now_ms);
+            let short_msg = short_id(&row.message_id);
+            let status = proven_status_label(row.mailbox, row.wake);
+
+            let mut heading = ChatLine::new(ChatLineKind::Message);
+            heading.push(if is_selected { "> " } else { "  " }, ChatInk::Accent);
+            heading.push(format!("[{time_str}] "), ChatInk::Dim);
+            heading.push(&row.sender_label, ChatInk::Role(row.sender_label.clone()));
+            if let Some(pane) = row.sender.pane_id() {
+                heading.push(format!(" ({pane})"), ChatInk::Dim);
+            } else if row.sender.is_admin() {
+                heading.push(" [admin]", ChatInk::Dim);
+            }
+            heading.push(" → ", ChatInk::Dim);
+            heading.push(&row.recipient_label, ChatInk::Role(row.recipient_label.clone()));
+            if let Some(pane) = row.recipient.pane_id() {
+                heading.push(format!(" ({pane})"), ChatInk::Dim);
+            }
+            heading.push(" · ", ChatInk::Dim);
+            heading.push(status, ChatInk::Accent);
+
+            let used = heading.width();
+            let id_w = display_width(short_msg);
+            if used + 2 + id_w <= width {
+                heading.push(" ".repeat(width - used - id_w), ChatInk::Text);
+                heading.push(short_msg, ChatInk::Dim);
+            }
+            timeline.push(heading.fitted(width));
+            if is_selected {
+                selected_anchor_line = Some(timeline.len().saturating_sub(1));
+            }
+
+            if let Some(ref reply) = row.reply_to {
+                let mut line = ChatLine::new(ChatLineKind::Message);
+                line.push("   ↳ reply to ", ChatInk::Dim);
+                line.push(short_id(reply), ChatInk::Dim);
+                timeline.push(line.fitted(width));
+            }
+
+            // Expose full message body if available from detail, or fallback to metadata subject
+            let full_body = detail.and_then(|d| {
+                let loaded = d.loaded();
+                if d.target().target.message_id == row.message_id {
+                    loaded.body.as_ref()
+                } else {
+                    loaded
+                        .thread
+                        .iter()
+                        .find(|e| e.message_id == row.message_id.as_str())
+                        .and_then(|e| e.body.as_ref())
+                }
+            });
+
+            if let Some(body_text) = full_body {
+                let show_subject = row.reply_to.is_none()
+                    && row
+                        .subject
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .is_some_and(|s| s != "Direct Message" && !body_text.starts_with(s));
+                if show_subject {
+                    if let Some(ref subj) = row.subject {
+                        for line_text in wrap_words(subj, body_width) {
+                            let mut line = ChatLine::new(ChatLineKind::Message);
+                            line.push("   ", ChatInk::Text);
+                            line.push(line_text, ChatInk::Role(row.sender_label.clone()));
+                            timeline.push(line.fitted(width));
+                        }
+                    }
+                }
+                for line_text in wrap_words(body_text, body_width) {
+                    let mut line = ChatLine::new(ChatLineKind::Message);
+                    line.push("   | ", ChatInk::Dim);
+                    line.push(line_text, ChatInk::Text);
+                    timeline.push(line.fitted(width));
+                }
+            } else if let Some(ref subject) = row.subject {
+                for line_text in wrap_words(subject, body_width) {
+                    let mut line = ChatLine::new(ChatLineKind::Message);
+                    line.push("   ", ChatInk::Text);
+                    line.push(line_text, ChatInk::Text);
+                    timeline.push(line.fitted(width));
+                }
+            }
+
+            if let Some(ref cause) = row.cause {
+                let mut line = ChatLine::new(ChatLineKind::Status);
+                line.push(format!("   ! cause: {}", attention_cause_label(*cause)), ChatInk::Attention);
+                timeline.push(line.fitted(width));
+            }
+            if let Some(ref block) = row.pre_write_block {
+                let mut line = ChatLine::new(ChatLineKind::Status);
+                line.push(format!("   ! block: {}", block), ChatInk::Attention);
+                timeline.push(line.fitted(width));
+            }
+
+            timeline.push(plain(ChatLineKind::Blank, "", width));
+        }
     } else {
         // Full group-chat mode: one heading, the wrapped body, one proven
         // fact per recipient.
@@ -1269,6 +1380,9 @@ pub fn render_chat_lines(
                 if item.is_broadcast {
                     line.push(if r.is_selected { "  > " } else { "    " }, ChatInk::Accent);
                     line.push(&r.label, ChatInk::Role(r.label.clone()));
+                    if let Some(pane) = r.recipient.pane_id() {
+                        line.push(format!(" ({pane})"), ChatInk::Dim);
+                    }
                     line.push(" ", ChatInk::Text);
                 } else {
                     line.push("   ", ChatInk::Text);

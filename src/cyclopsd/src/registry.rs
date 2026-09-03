@@ -580,6 +580,41 @@ impl Registry {
         }
     }
 
+    /// Prune orphan adoptions whose pane IDs are not present in `live_panes`.
+    pub(crate) fn prune_orphans(&mut self, live_panes: &HashSet<String>) -> Result<usize, StateError> {
+        let mut panes = self.panes.clone();
+        let mut legacy_panes = self.legacy_panes.clone();
+        let mut removed = 0;
+        let mut freed_windows = Vec::new();
+
+        panes.retain(|_, adoption| {
+            let keep = live_panes.contains(&adoption.pane_id);
+            if !keep {
+                removed += 1;
+                freed_windows.push(adoption.window_id.clone());
+            }
+            keep
+        });
+
+        legacy_panes.retain(|adoption| {
+            let keep = live_panes.contains(&adoption.pane_id);
+            if !keep {
+                removed += 1;
+                freed_windows.push(adoption.window_id.clone());
+            }
+            keep
+        });
+
+        if removed > 0 {
+            let mut windows = self.windows.clone();
+            for win_id in freed_windows {
+                let _ = release_window(&panes, &legacy_panes, &mut windows, &win_id);
+            }
+            self.commit(panes, legacy_panes, windows)?;
+        }
+        Ok(removed)
+    }
+
     /// Write the candidate state, then take it. Order matters: a caller
     /// that saw Ok must be able to restart and find the same roster.
     fn commit(

@@ -440,6 +440,20 @@ pub(crate) async fn dispatch(
                 None,
             )
         }
+        "status.reset" => {
+            let params: cyclops_proto::StatusResetParams = match req.params {
+                Value::Null => cyclops_proto::StatusResetParams::default(),
+                given => match decode_params(&id, given, "status.reset params") {
+                    Ok(p) => p,
+                    Err(r) => return (r, None),
+                },
+            };
+            let result = status_reset(inner, params).await;
+            (
+                Response::ok(id, serde_json::to_value(result).expect("status reset serializes")),
+                None,
+            )
+        }
         "health.snapshot" => {
             if !matches!(&req.params, Value::Null)
                 && !matches!(&req.params, Value::Object(fields) if fields.is_empty())
@@ -569,7 +583,10 @@ pub(crate) async fn dispatch(
                     Err(r) => return (r, None),
                 };
             (
-                from_result(id, crate::history::msg_thread(inner, &params.id, peer)),
+                from_result(
+                    id,
+                    crate::history::msg_thread(inner, &params.id, params.body, peer),
+                ),
                 None,
             )
         }
@@ -1839,6 +1856,118 @@ fn refuse_incomplete_status(pane: &mut cyclops_proto::PaneStatus) {
     }
     pane.working_confirmed = None;
     pane.hooks_verified = None;
+}
+
+/// Reset and cleanse status: close dead tmux panes, prune stale unattached
+/// runtime sessions, forget orphan adoptions, and refresh live observations.
+pub(crate) async fn status_reset(
+    inner: &Arc<Inner>,
+    params: cyclops_proto::StatusResetParams,
+) -> cyclops_proto::StatusResetResult {
+    let mut pruned_panes = 0;
+    let mut pruned_sessions = 0;
+    let mut pruned_adoptions = 0;
+
+    // 1. Kill dead panes in attached watchers
+    if params.kill_dead_panes {
+        let slots = inner.active_session_slots();
+        for (_, slot) in &slots {
+            let watcher = {
+                let link = slot.link.lock().expect("session link lock");
+                link.watcher.as_ref().map(Arc::clone)
+            };
+            if let Some(w) = watcher {
+                let snapshot = w.snapshot();
+                let dead_panes: Vec<String> = snapshot
+                    .into_iter()
+                    .filter(|p| p.dead)
+                    .map(|p| p.pane_id)
+                    .collect();
+                for pane_id in &dead_panes {
+                    if w.client().kill_pane(pane_id).await.is_ok() {
+                        pruned_panes += 1;
+                    }
+                }
+                if !dead_panes.is_empty() {
+                    let _ = w.reconcile_now().await;
+                }
+            }
+        }
+    }
+
+    // 2. Retire unattached / stale non-persistent sessions
+    if params.prune_stale_sessions {
+        let slots = inner.active_session_slots();
+        for (_, slot) in &slots {
+            if !slot.is_persistent() {
+                let is_attached = {
+                    let link = slot.link.lock().expect("session link lock");
+                    link.attached
+                };
+                if !is_attached {
+                    if slot.retire_runtime_slot() {
+                        pruned_sessions += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Collect active pane ids across all live watchers
+    let live_pane_ids: HashSet<String> = {
+        let slots = inner.active_session_slots();
+        let mut set = HashSet::new();
+        for (_, slot) in &slots {
+            let link = slot.link.lock().expect("session link lock");
+            if let Some(w) = &link.watcher {
+                for p in w.snapshot() {
+                    if !p.dead {
+                        set.insert(p.pane_id);
+                    }
+                }
+            }
+        }
+        set
+    };
+
+    // 4. Prune orphan adoptions
+    if params.prune_stale_adoptions {
+        let mut reg = inner.registry.lock().expect("registry lock");
+        if let Ok(count) = reg.prune_orphans(&live_pane_ids) {
+            pruned_adoptions = count;
+        }
+    }
+
+    // 5. Clean up detections cache for non-live panes
+    {
+        let mut detections = inner.detections.lock().expect("detections lock");
+        detections.retain(|key, _| live_pane_ids.contains(&key.pane_id));
+    }
+
+    // 6. Refresh observations
+    let _ = crate::refresh_status_observations(inner).await;
+
+    let (active_sessions, active_panes) = {
+        let slots = inner.active_session_slots();
+        let s_count = slots.len();
+        let mut p_count = 0;
+        for (_, slot) in &slots {
+            let link = slot.link.lock().expect("session link lock");
+            if let Some(w) = &link.watcher {
+                p_count += w.snapshot().iter().filter(|p| !p.dead).count();
+            }
+        }
+        (s_count, p_count)
+    };
+
+    cyclops_proto::StatusResetResult {
+        reset: true,
+        pruned_panes,
+        pruned_sessions,
+        pruned_adoptions,
+        active_panes,
+        active_sessions,
+    }
 }
 
 /// Assemble StatusResult from the session slots and the detection cache.

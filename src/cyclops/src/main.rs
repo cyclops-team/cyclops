@@ -253,12 +253,19 @@ enum Cmd {
     /// Reply to a visible message using its sender and thread.
     #[command(display_order = 3)]
     Reply(ReplyArgs),
-    /// Quiet queued pane notifications for one agent. Messages remain in its inbox.
+    /// Quiet queued pane notifications for one agent, or cleanse status.
     #[command(display_order = 4)]
     Clear {
-        /// Agent label or canonical recipient key.
-        target: String,
+        /// Agent label, canonical recipient key, or "status" to cleanse dead processes.
+        #[arg(required_unless_present = "status")]
+        target: Option<String>,
+        /// Reset status so it is not flooded by old, dead, or stale processes.
+        #[arg(long)]
+        status: bool,
     },
+    /// Reset status by clearing old, terminated, and stale processes and sessions.
+    #[command(hide = true)]
+    Reset,
     /// Requeue a message by identifier.
     #[command(hide = true)]
     Requeue(RequeueArgs),
@@ -1234,6 +1241,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
         | Cmd::Inbox(_)
         | Cmd::Messages(_)
         | Cmd::Clear { .. }
+        | Cmd::Reset
         | Cmd::Requeue(_)
         | Cmd::Notification(_)
         | Cmd::Alarm(_)
@@ -1258,7 +1266,14 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 Cmd::Thread { id } => cmd_thread(&mut c, cli, &style, id),
                 Cmd::Inbox(args) => cmd_inbox(&mut c, cli, &style, args),
                 Cmd::Messages(args) => cmd_messages(&mut c, cli, &style, args),
-                Cmd::Clear { target } => cmd_clear(&mut c, cli, &style, target),
+                Cmd::Clear { target, status } => {
+                    if *status || target.as_deref() == Some("status") {
+                        cmd_reset(&mut c, cli, &style)
+                    } else {
+                        cmd_clear(&mut c, cli, &style, target.as_deref().unwrap())
+                    }
+                }
+                Cmd::Reset => cmd_reset(&mut c, cli, &style),
                 Cmd::Requeue(args) => cmd_requeue(&mut c, cli, &style, args),
                 Cmd::Notification(args) => cmd_notification(&mut c, cli, &style, args),
                 Cmd::Alarm(args) => cmd_alarm(&mut c, cli, &style, args),
@@ -2620,9 +2635,14 @@ fn message_snapshot_line(
         .collect::<Vec<_>>()
         .join(", ");
     let subject = row.subject.as_deref().unwrap_or("(no subject)");
+    let sender_display = if let Some(pane) = row.sender.pane_id() {
+        format!("{} ({pane})", row.sender_label)
+    } else {
+        row.sender_label.clone()
+    };
     format!(
-        "{styled_id} {direction}{work} · {} -> {recipients} · {subject} · thread {}",
-        row.sender_label, row.thread_message_count
+        "{styled_id} {direction}{work} · {sender_display} -> {recipients} · {subject} · thread {}",
+        row.thread_message_count
     )
 }
 
@@ -3018,6 +3038,46 @@ fn cmd_notification(c: &mut Client, cli: &Cli, style: &Style, args: &Notificatio
             0
         }
     }
+}
+
+/// Reset status by closing dead panes, pruning stale sessions and orphan adoptions,
+/// and refreshing live observations so status is not flooded by old processes.
+fn cmd_reset(c: &mut Client, cli: &Cli, style: &Style) -> i32 {
+    let params = cyclops_proto::StatusResetParams::default();
+    let result: cyclops_proto::StatusResetResult = match ask(
+        c,
+        "status.reset",
+        serde_json::to_value(&params).expect("status.reset params serialize"),
+        cli.json,
+        None,
+        serde_json::from_value,
+    ) {
+        Ok(Some(r)) => r,
+        Ok(None) => return 0,
+        Err(code) => return code,
+    };
+    if cli.json {
+        return 0;
+    }
+    if result.pruned_panes == 0 && result.pruned_sessions == 0 && result.pruned_adoptions == 0 {
+        println!(
+            "{} Status is clean: no dead processes or stale sessions ({} session(s), {} active pane(s)).",
+            style.accent("✔"),
+            result.active_sessions,
+            result.active_panes,
+        );
+    } else {
+        println!(
+            "{} Status cleansed: {} dead pane(s) closed, {} stale session(s) pruned, {} orphan adoption(s) removed ({} session(s), {} active pane(s) remaining).",
+            style.accent("✔"),
+            result.pruned_panes,
+            result.pruned_sessions,
+            result.pruned_adoptions,
+            result.active_sessions,
+            result.active_panes,
+        );
+    }
+    0
 }
 
 /// Quiet the pre-write wake queue for one exact agent without erasing any
@@ -4392,6 +4452,12 @@ mod tests {
         assert!(Cli::try_parse_from(["cyclops", "requeue", "m-1"]).is_ok());
         assert!(Cli::try_parse_from(["cyclops", "clear"]).is_err());
         assert!(Cli::try_parse_from(["cyclops", "clear", "reviewer"]).is_ok());
+        assert!(Cli::try_parse_from(["cyclops", "clear", "status"]).is_ok());
+        assert!(Cli::try_parse_from(["cyclops", "clear", "--status"]).is_ok());
+        assert!(matches!(
+            Cli::try_parse_from(["cyclops", "reset"]).unwrap().cmd,
+            Some(Cmd::Reset)
+        ));
         assert!(matches!(
             Cli::try_parse_from(["cyclops", "stop"]).unwrap().cmd,
             Some(Cmd::Stop)

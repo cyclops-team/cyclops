@@ -385,6 +385,8 @@ pub(super) async fn execute(
         }
         Action::ClearPaneComposer { pane_id } => {
             let _ = client.send_keys(&pane_id, &["C-u"]).await;
+            app.notice
+                .show(format!("Cleared composer in pane {pane_id}"), tokio::time::Instant::now());
             Ok(Outcome::default())
         }
         Action::ToggleTabBar => {
@@ -2031,6 +2033,7 @@ mod tests {
             messages_caller: None,
             messages_detail: None,
             messages_composer: cyclops_ui::ComposerState::default(),
+            messages_view_journal: false,
             avatar_registry: cyclops_ui::AvatarRegistry::default(),
             stream_projection: cyclops_ui::StreamProjectionState::new(),
             stream_reconciling: false,
