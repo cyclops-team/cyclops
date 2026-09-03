@@ -1655,6 +1655,15 @@ pub(crate) async fn attempt_delivery(
     if !staging_verified {
         // One-time doorbell submitted unverified.
         // Enter was sent once, state is SubmittedUnverified, never duplicate Enter. Done.
+        let _ = advance(
+            inner,
+            handle,
+            &[DeliveryState::Submitted],
+            Step::to(DeliveryState::DeliveredUnverified)
+                .cause("unverified_staging")
+                .verified(VerifiedBy::Screen),
+        );
+        unregister_ack(inner, handle);
         return AttemptOutcome::Done;
     }
     // Take any accepted early receipt before claim settlement can return.

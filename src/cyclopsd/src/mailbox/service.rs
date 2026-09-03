@@ -426,7 +426,7 @@ impl MailboxService {
                 store
                     .projection()
                     .notification(recipient, &entry.message_id)
-                    .is_none_or(|record| {
+                    .is_some_and(|record| {
                         matches!(
                             record.state,
                             NotificationState::Queued

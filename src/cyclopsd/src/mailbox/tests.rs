@@ -1531,6 +1531,37 @@ fn socket_claim_does_not_skip_a_later_reply_doorbell() {
 }
 
 #[test]
+fn claimed_message_without_prior_notification_does_not_block_later_pending_doorbell() {
+    let scratch = StoreScratch::new("claimed-no-notification-still-rings");
+    let root = scratch.root();
+    let journal = Path::new("workspaces/current/messages.ndjson");
+    let (workspace, _, bob, _) = test_context();
+    let directory = || {
+        MailboxDirectory::new(
+            workspace,
+            [MailboxIdentity {
+                key: bob,
+                label: "reviewer".into(),
+            }],
+        )
+        .unwrap()
+    };
+    let store = MessageStore::open(&root, journal, workspace, "boot").unwrap();
+    let service = MailboxService::new(directory(), store);
+    let first = service
+        .send(service.admin(), mailbox_send("reviewer", "First", ""))
+        .unwrap();
+    service.claim(bob, first.message_id).unwrap();
+
+    let second = service
+        .send(service.admin(), mailbox_send("reviewer", "Second", ""))
+        .unwrap();
+    let next = service.prepare_oldest_notification(bob).unwrap().unwrap();
+    assert_eq!(next.message_id, second.message_id);
+    assert_eq!(next.state, NotificationState::Queued);
+}
+
+#[test]
 fn unclaimed_reminder_reopens_one_exact_pending_doorbell_once() {
     let scratch = StoreScratch::new("unclaimed-reminder-once");
     let root = scratch.root();

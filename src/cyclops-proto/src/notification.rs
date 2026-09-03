@@ -223,6 +223,7 @@ impl NotificationState {
                 Queued | Gating | BlockedPreWrite | QuotaHeld | QuotaResetObserved,
                 NotificationTransport::DirectPayload,
             ) => Withdrawn,
+            (BlockedPreWrite, NotificationTransport::Doorbell) => Withdrawn,
             (Submitted | SubmittedUnverified, NotificationTransport::Doorbell) => Notified,
             _ => self,
         }
@@ -1336,13 +1337,7 @@ mod tests {
     fn claim_settlement_preserves_operator_doorbells_but_withdraws_direct_payloads() {
         use NotificationState::*;
 
-        for state in [
-            Queued,
-            Gating,
-            BlockedPreWrite,
-            QuotaHeld,
-            QuotaResetObserved,
-        ] {
+        for state in [Queued, Gating, QuotaHeld, QuotaResetObserved] {
             assert_eq!(
                 state.settled_by_claim(NotificationTransport::Doorbell),
                 state
@@ -1352,6 +1347,14 @@ mod tests {
                 Withdrawn
             );
         }
+        assert_eq!(
+            BlockedPreWrite.settled_by_claim(NotificationTransport::Doorbell),
+            Withdrawn
+        );
+        assert_eq!(
+            BlockedPreWrite.settled_by_claim(NotificationTransport::DirectPayload),
+            Withdrawn
+        );
         for state in [Staged, Submitting] {
             assert_eq!(
                 state.settled_by_claim(NotificationTransport::Doorbell),
