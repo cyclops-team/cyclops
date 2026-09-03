@@ -3157,7 +3157,6 @@ fn cmd_flush(client: Option<&mut Client>, cli: &Cli, style: &Style, prune: bool)
     );
     0
 }
-
 /// Quiet the pre-write wake queue for one exact agent without erasing any
 /// durable mailbox entry. This is deliberately a convenience over the exact
 /// `notification withdraw` primitive: it resolves the current route once,
