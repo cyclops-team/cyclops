@@ -3,7 +3,29 @@
 use cyclops_manifest::{strip_csi, Manifest};
 use cyclops_proto::{AgentState, ComposerSemantic, Kind, LedgerLine};
 
-use super::{exact_composer_content_for_state, render_payload, ComposerContentProof};
+use super::{exact_composer_content_for_state, ComposerContentProof};
+
+/// The terminal sentinel: the last line of every direct delivery payload.
+pub(crate) fn sentinel_for(msg_id: &str) -> String {
+    format!("[cyclops:end {msg_id}]")
+}
+
+/// Render the human-readable payload string for a direct message.
+pub fn render_payload(msg_id: &str, from: &str, subject: &str, body: &str, fyi: bool) -> String {
+    let mut lines = vec![format!(
+        "[cyclops {msg_id}] FROM: {from}  SUBJECT: {subject}"
+    )];
+    if !body.is_empty() {
+        lines.push(body.to_string());
+    }
+    if !fyi && from != cyclops_proto::label::ADMIN {
+        lines.push(format!(
+            "Reply: cyclops send {from} --subject \"...\" --summary \"First sentence. Second sentence.\""
+        ));
+    }
+    lines.push(sentinel_for(msg_id));
+    lines.join("\n")
+}
 
 /// Render the canonical payload for a direct message ledger line.
 pub(crate) fn render_canonical_message_payload(message: &LedgerLine) -> String {
@@ -14,11 +36,6 @@ pub(crate) fn render_canonical_message_payload(message: &LedgerLine) -> String {
         message.body.as_deref().unwrap_or_default(),
         message.kind == Kind::Fyi,
     )
-}
-
-/// The terminal sentinel: the last line of every direct delivery payload.
-pub(crate) fn sentinel_for(msg_id: &str) -> String {
-    format!("[cyclops:end {msg_id}]")
 }
 
 /// Is this hook prompt the payload this delivery rendered?

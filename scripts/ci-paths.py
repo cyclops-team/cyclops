@@ -111,7 +111,6 @@ def classify(paths: list[str]) -> dict[str, bool]:
             "src/cyclops/src/cleanup.rs",
             "src/cyclops/src/daemon.rs",
             "src/cyclops/src/health.rs",
-            "src/cyclops/src/update.rs",
         } or under(path, "src/cyclops/src/update/") or under(path, "src/cyclops/tests/")
         result["tmux_head"] |= control or cargo or under(
             path,

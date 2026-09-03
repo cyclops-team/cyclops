@@ -6526,3 +6526,17 @@ mod composer_content_proof {
         );
     }
 }
+
+#[tokio::test]
+async fn delivery_engine_spawns_injector_for_buffer() {
+    let tmux = cyclops_testrig::TmuxServer::new("enginetest");
+    let spool = cyclops_proto::scratch::scratch_dir("cyc-enginetest-spool");
+    let cfg = cyclops_tmux::ControlConfig::new_session("enginetest")
+        .on_socket(tmux.socket())
+        .with_config_file("/dev/null")
+        .with_buffer_spool_dir(&spool);
+    let (client, _rx) = ControlClient::spawn(cfg).await.expect("tmux spawns");
+    let engine = DeliveryEngine::new(Arc::new(client));
+    let injector = engine.injector("cyc-test-buf");
+    assert_eq!(injector.buffer, "cyc-test-buf");
+}

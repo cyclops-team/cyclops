@@ -83,6 +83,382 @@ pub(crate) const PIPELINE_TRANSITIONS: &[(DeliveryState, DeliveryState)] = {
     ]
 };
 
+#[derive(Debug, Clone)]
+pub(crate) struct MailboxCapabilityProof {
+    pub(crate) recipient: RecipientKey,
+    pub(crate) agent: crate::identity::ProcId,
+    pub(crate) manifest: String,
+    pub(crate) file: PathBuf,
+    pub(crate) expected_digest: [u8; 32],
+}
+
+pub(crate) struct AttemptPayload {
+    pub(crate) bytes: String,
+    pub(crate) transport: Option<NotificationTransport>,
+    pub(crate) doorbell_format: Option<u32>,
+    pub(crate) capability: Option<MailboxCapabilityProof>,
+    pub(crate) capability_required: bool,
+}
+
+impl AttemptPayload {
+    pub(crate) fn required_pane_width(&self) -> Option<u32> {
+        None
+    }
+}
+
+impl MailboxCapabilityProof {
+    pub(crate) fn recheck(
+        &self,
+        recipient: RecipientKey,
+        agent: crate::identity::ProcId,
+        manifest: &str,
+    ) -> bool {
+        self.recipient == recipient
+            && self.agent == agent
+            && self.manifest == manifest
+            && mailbox_capability::file_digest(&self.file) == Some(self.expected_digest)
+    }
+}
+
+/// Recheck format-specific authority before considering terminal geometry.
+///
+/// Capability loss is an identity failure and must not be hidden by a narrow
+/// pane. Both pre-write bookends use this exact ordering.
+pub(crate) fn notification_prewrite_bookend(
+    selected: &AttemptPayload,
+    recipient: Option<RecipientKey>,
+    binding: &fusion::Binding,
+    pane_width: u32,
+) -> Option<String> {
+    if matches!(selected.transport, Some(NotificationTransport::Doorbell))
+        && selected.capability_required
+    {
+        let current =
+            recipient
+                .zip(selected.capability.as_ref())
+                .is_some_and(|(recipient, proof)| {
+                    proof.recheck(recipient, binding.agent, &binding.manifest)
+                });
+        if !current {
+            return Some("capability_changed".to_string());
+        }
+    }
+    if selected
+        .required_pane_width()
+        .is_some_and(|required| pane_width < required)
+    {
+        return Some(format!("pane_too_narrow:{pane_width}"));
+    }
+    None
+}
+
+pub(crate) fn select_mailbox_capability(
+    manifest: &Manifest,
+    recipient: RecipientKey,
+    agent: crate::identity::ProcId,
+    manifest_id: &str,
+) -> Option<MailboxCapabilityProof> {
+    if manifest.agent.id != manifest_id {
+        return None;
+    }
+    let declared = manifest.messaging.mailbox_capability_file.as_ref()?;
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let file = mailbox_capability::resolve_path(declared, &home)?;
+    let expected_digest = mailbox_capability::shipped_digest();
+    if mailbox_capability::file_digest(&file) != Some(expected_digest) {
+        return None;
+    }
+    Some(MailboxCapabilityProof {
+        recipient,
+        agent,
+        manifest: manifest_id.to_string(),
+        file,
+        expected_digest,
+    })
+}
+
+pub(crate) fn select_attempt_payload(
+    handle: &DeliveryHandle,
+    manifest: &Manifest,
+    observed: Option<&fusion::Binding>,
+    _pane_width: Option<u32>,
+) -> Result<AttemptPayload, NotificationAdapterError> {
+    let Some(notification) = &handle.notification else {
+        return Ok(AttemptPayload {
+            bytes: handle.payload(),
+            transport: None,
+            doorbell_format: None,
+            capability: None,
+            capability_required: false,
+        });
+    };
+    let capability = observed.and_then(|binding| {
+        select_mailbox_capability(
+            manifest,
+            notification.recipient(),
+            binding.agent,
+            &binding.manifest,
+        )
+    });
+    let message = notification.message_line()?;
+    let metadata = message.data.as_ref().and_then(|data| {
+        serde_json::from_value::<cyclops_proto::MessageMetadata>(data.clone()).ok()
+    });
+    if let Some(metadata) = metadata {
+        if let Some(summary) = metadata.summary {
+            let bytes = cyclops_proto::render_doorbell_v4(
+                &metadata.presentation.sender_label,
+                &summary,
+                notification.attempt_id(),
+            );
+            return Ok(AttemptPayload {
+                bytes,
+                transport: Some(NotificationTransport::Doorbell),
+                doorbell_format: Some(cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM),
+                capability: None,
+                capability_required: false,
+            });
+        }
+    }
+    let reminder = notification.current_record()?.unclaimed_reminder_count > 0;
+    if capability.is_some() || reminder {
+        return Ok(AttemptPayload {
+            bytes: cyclops_proto::render_doorbell_v3(notification.attempt_id()),
+            transport: Some(NotificationTransport::Doorbell),
+            doorbell_format: Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
+            capability,
+            capability_required: true,
+        });
+    }
+
+    Ok(AttemptPayload {
+        bytes: render_canonical_message_payload(&message),
+        transport: Some(NotificationTransport::DirectPayload),
+        doorbell_format: None,
+        capability: None,
+        capability_required: false,
+    })
+}
+
+/// Rebuild the exact payload selected at this notification's write boundary.
+///
+/// Delivery recovery and composer projection share this owner so a transport
+/// format cannot be actionable in one path and unprovable in the other.
+pub(crate) fn expected_notification_payload(
+    record: &cyclops_proto::NotificationRecord,
+    message: &LedgerLine,
+) -> Option<String> {
+    if message.id != record.message_id.as_str() {
+        return None;
+    }
+    match (record.transport, record.doorbell_format) {
+        (NotificationTransport::Doorbell, format) => match format {
+            None => Some(cyclops_proto::render_legacy_doorbell(&record.message_id)),
+            Some(cyclops_proto::DOORBELL_FORMAT_COMPACT_CLAIM) => {
+                Some(cyclops_proto::render_doorbell_v1(&record.message_id))
+            }
+            Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_CLAIM) => Some(
+                cyclops_proto::render_doorbell_v2(&record.message_id, record.attempt_id),
+            ),
+            Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM) => {
+                Some(cyclops_proto::render_doorbell_v3(record.attempt_id))
+            }
+            Some(cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM) => message
+                .data
+                .as_ref()
+                .and_then(|data| {
+                    serde_json::from_value::<cyclops_proto::MessageMetadata>(data.clone()).ok()
+                })
+                .and_then(|metadata| {
+                    metadata.summary.map(|summary| {
+                        cyclops_proto::render_doorbell_v4(
+                            &metadata.presentation.sender_label,
+                            &summary,
+                            record.attempt_id,
+                        )
+                    })
+                }),
+            Some(_) => None,
+        },
+        (NotificationTransport::DirectPayload, None) => {
+            Some(render_canonical_message_payload(message))
+        }
+        (NotificationTransport::DirectPayload, Some(_)) => None,
+    }
+}
+
+/// Will the gate reach a verdict on this pane without waiting on the agent
+/// or the human? That is the question the receipt blocks on, and it is not
+/// the same question as "is the pane idle".
+///
+/// Two shapes answer immediately and they end opposite ways. An idle pane
+/// proceeds and the delivery resolves inside the block. A pane no manifest
+/// binds is refused: the gate returns no_manifest before it ever looks at a
+/// state (MEASURED at 7ms), because nothing can be typed into a pane cyclops
+/// cannot read. Reporting that one "queued · 0 ahead" and exiting 0 told the
+/// sender their message was on its way to a pane it could never reach.
+///
+/// Everything else holds: a working pane without positive composer proof, a
+/// human mid-keystroke, a modal
+/// waiting on a person. Those senders get their queue position now rather
+/// than a 2.5s wait for a badge that is not coming, which is the property
+/// docs/guides/send.md promises for a busy target.
+///
+/// The verdict itself stays the gate's: this only decides whether the
+/// receipt is worth waiting for. A pane that binds a manifest between this
+/// call and the gate simply takes the idle path, and the block is capped
+/// either way.
+pub(crate) fn gate_answers_now(inner: &Arc<Inner>, session_idx: usize, pane_id: &str) -> bool {
+    let cached = inner.cached_state(session_idx, pane_id);
+    if matches!(
+        cached,
+        AgentState::Idle | AgentState::BlockedQuota | AgentState::Dead
+    ) {
+        return true;
+    }
+    let Some(watcher) = inner.watcher_of(session_idx) else {
+        // Detached: the gate holds until the session comes back.
+        return false;
+    };
+    // A pane that left the table between resolution and here is answered
+    // by the gate's no_such_pane, which is just as immediate.
+    match watcher.pane(pane_id) {
+        Some(row) => row.dead || fusion::bind_manifest_for(inner, session_idx, &row).is_none(),
+        None => true,
+    }
+}
+
+/// Best synchronous estimate of the first gate hold. This is only a receipt
+/// seed; the event-driven gate remains authoritative and replaces or clears
+/// it as soon as it evaluates the pane. No capture or retry is introduced.
+pub(crate) fn initial_hold(
+    inner: &Arc<Inner>,
+    session_idx: usize,
+    pane_id: &str,
+) -> Option<&'static str> {
+    let Some(watcher) = inner.watcher_of(session_idx) else {
+        return Some("session_detached");
+    };
+    let Some(row) = watcher.pane(pane_id) else {
+        return Some("unknown");
+    };
+    if row.in_mode {
+        return Some("pane_in_mode");
+    }
+    match inner.cached_state(session_idx, pane_id) {
+        AgentState::Working => Some("working"),
+        AgentState::IdleWithInput => Some("idle_with_input"),
+        AgentState::BlockedModal | AgentState::BlockedPermission => Some("blocked"),
+        AgentState::Unknown => Some("unknown"),
+        AgentState::Idle | AgentState::BlockedQuota | AgentState::Dead => None,
+    }
+}
+
+/// Result of checking the live route against its durable mailbox binding.
+pub(crate) enum HandleRoute {
+    Exact(Arc<SessionWatcher>),
+    BindingChanged,
+    BindingUnprovable { pane_pid: i32 },
+    Unavailable,
+}
+
+/// Classify the live watcher without treating an identity mismatch as absence.
+///
+/// A pane replacement can reach the watcher before the ordered registry event.
+/// That route is present but changed, so the pre-write barrier must record a
+/// reprovable identity change instead of a permanent session-unavailable block.
+pub(crate) fn handle_route(inner: &Inner, handle: &DeliveryHandle) -> HandleRoute {
+    let Some(notification) = &handle.notification else {
+        return inner
+            .watcher_of(handle.session_idx)
+            .map(HandleRoute::Exact)
+            .unwrap_or(HandleRoute::Unavailable);
+    };
+    let recipient = notification.recipient();
+    let Some(session_instance_id) = recipient.session_instance_id() else {
+        return HandleRoute::Unavailable;
+    };
+    let Some(pane_id) = recipient.pane_id() else {
+        return HandleRoute::Unavailable;
+    };
+    if pane_id.to_string() != handle.pane_id {
+        return HandleRoute::BindingChanged;
+    }
+    let Some(slot) = inner.session(handle.session_idx) else {
+        return HandleRoute::Unavailable;
+    };
+    let watcher = {
+        let link = slot.link.lock().expect("session link lock");
+        if !link.attached
+            || link
+                .identity
+                .as_ref()
+                .map(|identity| identity.session_instance_id())
+                != Some(session_instance_id)
+        {
+            return HandleRoute::Unavailable;
+        }
+        link.watcher.as_ref().map(Arc::clone)
+    };
+    let Some(watcher) = watcher else {
+        return HandleRoute::Unavailable;
+    };
+    let Some(row) = watcher.pane(&handle.pane_id) else {
+        return HandleRoute::Unavailable;
+    };
+    let Some(root) = crate::identity::ProcId::of(row.pane_pid) else {
+        return HandleRoute::BindingUnprovable {
+            pane_pid: row.pane_pid,
+        };
+    };
+    let Ok(pane_root) = ProcessInstanceId::new(root.pid, root.birth) else {
+        return HandleRoute::BindingUnprovable {
+            pane_pid: row.pane_pid,
+        };
+    };
+    let registry = inner.registry.lock().expect("registry lock");
+    if registry.for_route(recipient, pane_root).is_some() {
+        HandleRoute::Exact(watcher)
+    } else if registry.for_recipient(recipient).is_some() {
+        HandleRoute::BindingChanged
+    } else {
+        HandleRoute::BindingUnprovable {
+            pane_pid: row.pane_pid,
+        }
+    }
+}
+
+/// Resolve only a watcher whose durable route binding is exact.
+pub(crate) fn watcher_for_handle(
+    inner: &Inner,
+    handle: &DeliveryHandle,
+) -> Option<Arc<SessionWatcher>> {
+    match handle_route(inner, handle) {
+        HandleRoute::Exact(watcher) => Some(watcher),
+        HandleRoute::BindingChanged
+        | HandleRoute::BindingUnprovable { .. }
+        | HandleRoute::Unavailable => None,
+    }
+}
+
+/// Resolve the route for a write that has not crossed the terminal boundary.
+pub(crate) fn exact_prewrite_watcher(
+    inner: &Inner,
+    handle: &DeliveryHandle,
+    manifest_id: &str,
+) -> Result<Arc<SessionWatcher>, AttemptFailure> {
+    match handle_route(inner, handle) {
+        HandleRoute::Exact(watcher) => Ok(watcher),
+        HandleRoute::BindingChanged => Err(AttemptFailure::pane_rebound_before_paste()),
+        HandleRoute::BindingUnprovable { pane_pid } => {
+            Err(AttemptFailure::binding_unprovable(Some(
+                binding_unprovable_observation(inner, handle, pane_pid, manifest_id),
+            )))
+        }
+        HandleRoute::Unavailable => Err(AttemptFailure::session_detached()),
+    }
+}
+
 /// Write one direct-delivery transition to the record: the `Kind::State`
 /// line in every named session ledger, then the matching `delivery-state`
 /// event. Mailbox notifications never call this function because their
