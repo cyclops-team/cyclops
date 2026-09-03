@@ -9997,7 +9997,5 @@ fn until_word(until: WaitUntil) -> &'static str {
     }
 }
 
-
 #[cfg(test)]
 mod tests;
-

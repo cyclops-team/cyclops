@@ -4826,8 +4826,13 @@ async fn handle_messages_key(
         }
         KeyCode::Char('v') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.messages_view_journal = !app.messages_view_journal;
-            let mode = if app.messages_view_journal { "journal" } else { "timeline" };
-            app.notice.show(format!("Messages view: {mode}"), Instant::now());
+            let mode = if app.messages_view_journal {
+                "journal"
+            } else {
+                "timeline"
+            };
+            app.notice
+                .show(format!("Messages view: {mode}"), Instant::now());
             return Ok(Some(InputOutcome::Redraw));
         }
         KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => {

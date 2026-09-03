@@ -450,7 +450,10 @@ pub(crate) async fn dispatch(
             };
             let result = status_reset(inner, params).await;
             (
-                Response::ok(id, serde_json::to_value(result).expect("status reset serializes")),
+                Response::ok(
+                    id,
+                    serde_json::to_value(result).expect("status reset serializes"),
+                ),
                 None,
             )
         }
@@ -1904,10 +1907,8 @@ pub(crate) async fn status_reset(
                     let link = slot.link.lock().expect("session link lock");
                     link.attached
                 };
-                if !is_attached {
-                    if slot.retire_runtime_slot() {
-                        pruned_sessions += 1;
-                    }
+                if !is_attached && slot.retire_runtime_slot() {
+                    pruned_sessions += 1;
                 }
             }
         }

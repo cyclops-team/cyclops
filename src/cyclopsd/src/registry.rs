@@ -581,7 +581,10 @@ impl Registry {
     }
 
     /// Prune orphan adoptions whose pane IDs are not present in `live_panes`.
-    pub(crate) fn prune_orphans(&mut self, live_panes: &HashSet<String>) -> Result<usize, StateError> {
+    pub(crate) fn prune_orphans(
+        &mut self,
+        live_panes: &HashSet<String>,
+    ) -> Result<usize, StateError> {
         let mut panes = self.panes.clone();
         let mut legacy_panes = self.legacy_panes.clone();
         let mut removed = 0;

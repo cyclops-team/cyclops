@@ -1168,6 +1168,11 @@ pub fn render_chat_lines(
         }
     } else if view_journal {
         // Transmission Journal mode: clean chronological log of every message delivery fact
+        if visible_rows.is_empty() {
+            let mut empty = ChatLine::new(ChatLineKind::Status);
+            empty.push("  No transmission records in journal", ChatInk::Dim);
+            timeline.push(empty.fitted(width));
+        }
         let body_width = width.saturating_sub(4).max(1);
         for row in &visible_rows {
             let is_selected = selected_target == Some(&row.target);
@@ -1185,7 +1190,10 @@ pub fn render_chat_lines(
                 heading.push(" [admin]", ChatInk::Dim);
             }
             heading.push(" → ", ChatInk::Dim);
-            heading.push(&row.recipient_label, ChatInk::Role(row.recipient_label.clone()));
+            heading.push(
+                &row.recipient_label,
+                ChatInk::Role(row.recipient_label.clone()),
+            );
             if let Some(pane) = row.recipient.pane_id() {
                 heading.push(format!(" ({pane})"), ChatInk::Dim);
             }
@@ -1258,7 +1266,10 @@ pub fn render_chat_lines(
 
             if let Some(ref cause) = row.cause {
                 let mut line = ChatLine::new(ChatLineKind::Status);
-                line.push(format!("   ! cause: {}", attention_cause_label(*cause)), ChatInk::Attention);
+                line.push(
+                    format!("   ! cause: {}", attention_cause_label(*cause)),
+                    ChatInk::Attention,
+                );
                 timeline.push(line.fitted(width));
             }
             if let Some(ref block) = row.pre_write_block {
@@ -1382,6 +1393,8 @@ pub fn render_chat_lines(
                     line.push(&r.label, ChatInk::Role(r.label.clone()));
                     if let Some(pane) = r.recipient.pane_id() {
                         line.push(format!(" ({pane})"), ChatInk::Dim);
+                    } else if r.recipient.is_admin() {
+                        line.push(" [admin]", ChatInk::Dim);
                     }
                     line.push(" ", ChatInk::Text);
                 } else {

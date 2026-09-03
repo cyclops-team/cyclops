@@ -537,7 +537,11 @@ pub fn paint_messages(
         .render(area, buf);
 
     if area.width > 11 {
-        let title = if view_journal { " Journal " } else { " Messages " };
+        let title = if view_journal {
+            " Journal "
+        } else {
+            " Messages "
+        };
         super::overlay_text(buf, area, area.x + 2, area.y, title, border_style);
     }
 
@@ -3656,8 +3660,8 @@ mod tests {
         let queue = cyclops_ui::HumanQueue::new();
         let registry = cyclops_ui::AvatarRegistry::default();
         paint_messages(
-            &queue, None, None, &registry, None, None, None, false, false, false, area, &mut buf, &paint,
-            &mut hits, None,
+            &queue, None, None, &registry, None, None, None, false, false, false, area, &mut buf,
+            &paint, &mut hits, None,
         );
 
         let content_w = area.width.saturating_sub(2) as usize;
@@ -3708,8 +3712,8 @@ mod tests {
                 let mut buf = Buffer::empty(area);
                 let mut hits = HitMap::default();
                 paint_messages(
-                    &queue, None, None, &registry, None, None, None, false, false, false, area, &mut buf,
-                    &paint, &mut hits, None,
+                    &queue, None, None, &registry, None, None, None, false, false, false, area,
+                    &mut buf, &paint, &mut hits, None,
                 );
                 matches!(hits.hit(x, y), Some(HitTarget::MessagesAction(found)) if *found == action)
             })
@@ -3719,8 +3723,8 @@ mod tests {
             let mut buf = Buffer::empty(area);
             let mut hits = HitMap::default();
             paint_messages(
-                &queue, None, None, &registry, None, None, None, false, false, false, area, &mut buf,
-                &paint, &mut hits, hover,
+                &queue, None, None, &registry, None, None, None, false, false, false, area,
+                &mut buf, &paint, &mut hits, hover,
             );
             buf
         };

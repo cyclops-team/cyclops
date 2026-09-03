@@ -204,9 +204,7 @@ pub(crate) fn msg_thread(
     let caller = crate::server::workspace_messaging_caller_if_available(inner, peer)?;
     let compatibility = compatibility::CompatibilityHistoryAdapter::capture(inner).read();
     let result = match caller {
-        Some((messaging, caller)) => {
-            messaging.thread(caller, id, reveal_body, compatibility)?
-        }
+        Some((messaging, caller)) => messaging.thread(caller, id, reveal_body, compatibility)?,
         None => {
             let record = HistoryRecord::new(None, compatibility);
             let mut result = query_thread(&record, id, None)?;

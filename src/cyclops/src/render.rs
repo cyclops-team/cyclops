@@ -401,7 +401,7 @@ pub fn render_status(res: &StatusResult, style: &Style, _config_path: &Path) -> 
         out.push(String::new());
         out.push(format!(
             "  {}",
-            style.dim("Terminated processes detected. Run 'cyclops reset' to clear dead panes and cleanse status.")
+            style.dim("Terminated processes detected. Run 'cyclops clear' or 'cyclops reset' to clear dead panes and cleanse status.")
         ));
     }
     out.join("\n")
@@ -1755,7 +1755,7 @@ mod tests {
         let got = render_status(&fix, &Style::none(), Path::new("/x/config.toml"));
         assert!(got.contains("process terminated"), "{got}");
         assert!(
-            got.contains("Terminated processes detected. Run 'cyclops reset' to clear dead panes and cleanse status."),
+            got.contains("Terminated processes detected. Run 'cyclops clear' or 'cyclops reset' to clear dead panes and cleanse status."),
             "{got}"
         );
     }

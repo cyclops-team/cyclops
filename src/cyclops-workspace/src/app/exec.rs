@@ -385,8 +385,10 @@ pub(super) async fn execute(
         }
         Action::ClearPaneComposer { pane_id } => {
             let _ = client.send_keys(&pane_id, &["C-u"]).await;
-            app.notice
-                .show(format!("Cleared composer in pane {pane_id}"), tokio::time::Instant::now());
+            app.notice.show(
+                format!("Cleared composer in pane {pane_id}"),
+                tokio::time::Instant::now(),
+            );
             Ok(Outcome::default())
         }
         Action::ToggleTabBar => {

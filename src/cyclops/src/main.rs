@@ -256,8 +256,7 @@ enum Cmd {
     /// Quiet queued pane notifications for one agent, or cleanse status.
     #[command(display_order = 4)]
     Clear {
-        /// Agent label, canonical recipient key, or "status" to cleanse dead processes.
-        #[arg(required_unless_present = "status")]
+        /// Agent label or canonical recipient key; omit or pass "status" to cleanse status.
         target: Option<String>,
         /// Reset status so it is not flooded by old, dead, or stale processes.
         #[arg(long)]
@@ -1267,7 +1266,7 @@ fn run_cmd(cli: &Cli, cmd: &Cmd) -> i32 {
                 Cmd::Inbox(args) => cmd_inbox(&mut c, cli, &style, args),
                 Cmd::Messages(args) => cmd_messages(&mut c, cli, &style, args),
                 Cmd::Clear { target, status } => {
-                    if *status || target.as_deref() == Some("status") {
+                    if *status || target.is_none() || target.as_deref() == Some("status") {
                         cmd_reset(&mut c, cli, &style)
                     } else {
                         cmd_clear(&mut c, cli, &style, target.as_deref().unwrap())
@@ -4450,7 +4449,14 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["cyclops", "requeue"]).is_err());
         assert!(Cli::try_parse_from(["cyclops", "requeue", "m-1"]).is_ok());
-        assert!(Cli::try_parse_from(["cyclops", "clear"]).is_err());
+        assert!(Cli::try_parse_from(["cyclops", "clear"]).is_ok());
+        assert!(matches!(
+            Cli::try_parse_from(["cyclops", "clear"]).unwrap().cmd,
+            Some(Cmd::Clear {
+                target: None,
+                status: false
+            })
+        ));
         assert!(Cli::try_parse_from(["cyclops", "clear", "reviewer"]).is_ok());
         assert!(Cli::try_parse_from(["cyclops", "clear", "status"]).is_ok());
         assert!(Cli::try_parse_from(["cyclops", "clear", "--status"]).is_ok());
