@@ -1397,11 +1397,7 @@ impl ManagedAssetRoot {
     }
 
     /// Atomically replace an existing managed file.
-    pub fn replace_file(
-        &self,
-        descendant: &Path,
-        contents: &[u8],
-    ) -> Result<(), StateError> {
+    pub fn replace_file(&self, descendant: &Path, contents: &[u8]) -> Result<(), StateError> {
         let parts = inspection_descendant_parts(descendant)?;
         let display_path = self.path.join(descendant);
         if parts.len() != 1 {
@@ -1413,7 +1409,9 @@ impl ManagedAssetRoot {
         self.validate_publication_parent(&display_path)?;
         let directory = clone_file(&self.directory, &display_path)?;
 
-        let leaf_str = parts.last().expect("managed asset descendant has one component");
+        let leaf_str = parts
+            .last()
+            .expect("managed asset descendant has one component");
         let leaf = c_name(&display_path, leaf_str)?;
 
         let tmp_leaf_str = format!(".{}.tmp.{}", leaf_str.to_string_lossy(), std::process::id());

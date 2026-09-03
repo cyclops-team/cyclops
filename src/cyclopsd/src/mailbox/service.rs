@@ -1155,7 +1155,7 @@ impl MailboxService {
                 .notification_by_attempt(attempt_id)
                 .cloned()
                 .map(|record| record.message_id)
-                .ok_or_else(|| MailboxError::NotificationAttemptUnknown(attempt_id))?
+                .ok_or(MailboxError::NotificationAttemptUnknown(attempt_id))?
         } else {
             reference
         };

@@ -4782,7 +4782,9 @@ async fn handle_messages_key(
                 return Ok(Some(InputOutcome::Redraw));
             }
         }
-        KeyCode::Char('a') | KeyCode::Char('@') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('a') | KeyCode::Char('@')
+            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
             let routes = &app.decoration.mailbox_routes;
             if routes.is_empty() {
                 app.messages_composer.record_not_sent(

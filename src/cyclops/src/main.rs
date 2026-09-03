@@ -1999,12 +1999,12 @@ fn auto_derive_summary(body: &str, fallback_subject: &str) -> String {
                 cut -= 1;
             }
             let s2_cut = s2[..cut].trim_end();
-            let s2_clean = if s2_cut.ends_with('.') || s2_cut.ends_with('?') || s2_cut.ends_with('!')
-            {
-                s2_cut.to_string()
-            } else {
-                format!("{s2_cut}.")
-            };
+            let s2_clean =
+                if s2_cut.ends_with('.') || s2_cut.ends_with('?') || s2_cut.ends_with('!') {
+                    s2_cut.to_string()
+                } else {
+                    format!("{s2_cut}.")
+                };
             format!("{s1} {s2_clean}")
         } else {
             let mut cut = 180.min(s1.len());
@@ -2012,12 +2012,12 @@ fn auto_derive_summary(body: &str, fallback_subject: &str) -> String {
                 cut -= 1;
             }
             let s1_cut = s1[..cut].trim_end();
-            let s1_clean = if s1_cut.ends_with('.') || s1_cut.ends_with('?') || s1_cut.ends_with('!')
-            {
-                s1_cut.to_string()
-            } else {
-                format!("{s1_cut}.")
-            };
+            let s1_clean =
+                if s1_cut.ends_with('.') || s1_cut.ends_with('?') || s1_cut.ends_with('!') {
+                    s1_cut.to_string()
+                } else {
+                    format!("{s1_cut}.")
+                };
             format!("{s1_clean} Done.")
         }
     } else {

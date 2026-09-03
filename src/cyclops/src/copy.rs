@@ -150,7 +150,8 @@ pub const COMMAND_GROUPS: &[(&str, &[&str])] = &[
     (
         "Operations",
         &[
-            "setup", "hooks", "theme", "daemon", "update", "cleanup", "data", "remove", "reset", "flush",
+            "setup", "hooks", "theme", "daemon", "update", "cleanup", "data", "remove", "reset",
+            "flush",
         ],
     ),
     (

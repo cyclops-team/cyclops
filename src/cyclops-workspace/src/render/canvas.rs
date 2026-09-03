@@ -594,14 +594,7 @@ fn paint_pane_frame(
             border_style,
         );
         if let Some(rename) = controls.rename {
-            super::overlay_text(
-                buf,
-                bounds,
-                rename.x,
-                rename.y,
-                "[✎]",
-                border_style,
-            );
+            super::overlay_text(buf, bounds, rename.x, rename.y, "[✎]", border_style);
         }
         super::overlay_text(
             buf,
@@ -3312,7 +3305,10 @@ mod tests {
         .unwrap();
 
         let flat = flatten(term.backend().buffer());
-        assert!(flat.contains("X"), "buffer must contain clear button X: {flat}");
+        assert!(
+            flat.contains("X"),
+            "buffer must contain clear button X: {flat}"
+        );
 
         let clear_region = hits
             .regions()
@@ -3348,10 +3344,16 @@ mod tests {
         // Verify that if a SidebarDivider is pushed along the leftmost canvas column,
         // reassert_pane_clear_hits restores PaneClear priority over the button cells.
         let canvas = Rect::new(0, 0, 50, 15);
-        hits.push(Rect::new(canvas.x, canvas.y, 1, canvas.height), HitTarget::SidebarDivider);
+        hits.push(
+            Rect::new(canvas.x, canvas.y, 1, canvas.height),
+            HitTarget::SidebarDivider,
+        );
         // Before reassert, SidebarDivider shadows column region_rect.x
         assert!(
-            matches!(hits.hit(region_rect.x, region_rect.y), Some(HitTarget::SidebarDivider)),
+            matches!(
+                hits.hit(region_rect.x, region_rect.y),
+                Some(HitTarget::SidebarDivider)
+            ),
             "SidebarDivider must initially shadow the column"
         );
         reassert_pane_clear_hits(&tab, canvas, &mut hits);
