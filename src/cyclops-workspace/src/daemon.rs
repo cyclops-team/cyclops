@@ -166,10 +166,26 @@ pub fn send_message(
     body: &str,
     client_key: &str,
 ) -> SendOutcome {
+    let to_recipients: Vec<String> = to
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            if s == "all" || s == "@all" || s == "*" {
+                "*".to_string()
+            } else {
+                s.to_string()
+            }
+        })
+        .collect();
     send_message_request(
         home,
         MessageRequest {
-            to: vec![to.to_string()],
+            to: if to_recipients.is_empty() {
+                vec![to.to_string()]
+            } else {
+                to_recipients
+            },
             recipient_keys: None,
             expected_caller: None,
             subject,

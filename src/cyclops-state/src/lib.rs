@@ -1396,6 +1396,85 @@ impl ManagedAssetRoot {
         }
     }
 
+    /// Atomically replace an existing managed file.
+    pub fn replace_file(
+        &self,
+        descendant: &Path,
+        contents: &[u8],
+    ) -> Result<(), StateError> {
+        let parts = inspection_descendant_parts(descendant)?;
+        let display_path = self.path.join(descendant);
+        if parts.len() != 1 {
+            return Err(unsafe_path(
+                &display_path,
+                "managed asset publication must name one final leaf",
+            ));
+        }
+        self.validate_publication_parent(&display_path)?;
+        let directory = clone_file(&self.directory, &display_path)?;
+
+        let leaf_str = parts.last().expect("managed asset descendant has one component");
+        let leaf = c_name(&display_path, leaf_str)?;
+
+        let tmp_leaf_str = format!(".{}.tmp.{}", leaf_str.to_string_lossy(), std::process::id());
+        let tmp_leaf = c_name(&display_path, std::ffi::OsStr::new(&tmp_leaf_str))?;
+
+        let flags =
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                tmp_leaf.as_ptr(),
+                flags,
+                FILE_MODE as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(path_error(
+                &display_path,
+                std::io::Error::last_os_error(),
+                "could not create temporary file for managed asset replacement",
+            ));
+        }
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        let result = (|| {
+            repair_descriptor_permissions(&file, &display_path, FILE_MODE)?;
+            validate_regular(&file, &display_path, self.owner)?;
+            file.write_all(contents)
+                .map_err(|source| io_error(&display_path, source))?;
+            file.sync_all()
+                .map_err(|source| io_error(&display_path, source))?;
+            self.validate_publication_parent(&display_path)?;
+            let rename_rc = unsafe {
+                libc::renameat(
+                    directory.as_raw_fd(),
+                    tmp_leaf.as_ptr(),
+                    directory.as_raw_fd(),
+                    leaf.as_ptr(),
+                )
+            };
+            if rename_rc != 0 {
+                return Err(path_error(
+                    &display_path,
+                    std::io::Error::last_os_error(),
+                    "could not atomically replace managed asset file",
+                ));
+            }
+            sync_directory(&directory).map_err(|source| StateError::CreationDurabilityUnknown {
+                path: display_path.clone(),
+                source,
+            })?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            unsafe {
+                libc::unlinkat(directory.as_raw_fd(), tmp_leaf.as_ptr(), 0);
+            }
+        }
+        result
+    }
+
     fn validate_publication_parent(&self, display_path: &Path) -> Result<(), StateError> {
         if !self.path_matches_held_root()? {
             return Err(unsafe_path(

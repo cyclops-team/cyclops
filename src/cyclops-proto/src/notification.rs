@@ -1044,6 +1044,7 @@ pub fn parse_notification_attempt_claim_locator(
 pub fn parse_doorbell_v3(payload: &str) -> Option<NotificationAttemptId> {
     let payload = payload.strip_suffix('\n').unwrap_or(payload);
     let locator = payload.strip_prefix("cyclops inbox claim ")?;
+    let locator = locator.strip_suffix(" --json").unwrap_or(locator);
     let message_id = MessageId::new(locator).ok()?;
     parse_notification_attempt_claim_locator(&message_id)
 }

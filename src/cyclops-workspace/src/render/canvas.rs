@@ -599,7 +599,7 @@ fn paint_pane_frame(
                 bounds,
                 rename.x,
                 rename.y,
-                "[ren]",
+                "[✎]",
                 border_style,
             );
         }
@@ -637,42 +637,13 @@ fn paint_pane_frame(
 
     // A clear / backspace button on the left border ~20% up from the bottom,
     // right beside the CLI composer area to quickly wipe stuck composer drafts.
-    let clear_y = if vis.height > 6 {
-        vis.y
-            .saturating_add(vis.height.saturating_sub((vis.height / 5).max(2)))
-    } else {
-        bottom.saturating_sub(1)
-    };
-    if clear_y > top && clear_y < bottom && clear_y < bounds.y.saturating_add(bounds.height) {
+    if let Some((clear_x, clear_y)) = pane_clear_cell(slot, bounds) {
         let clear_style = if slot.focused {
             theme::pane_border_focused(paint).add_modifier(Modifier::BOLD)
         } else {
             theme::pane_border(paint)
         };
-        let y_start = clear_y.saturating_sub(1);
-        if vis.height > 6
-            && y_start > top
-            && clear_y.saturating_add(1) < bottom
-            && clear_y.saturating_add(1) < bounds.y.saturating_add(bounds.height)
-        {
-            super::overlay_text(buf, bounds, left, y_start, "[", clear_style);
-            super::overlay_text(buf, bounds, left, clear_y, "⌫", clear_style);
-            super::overlay_text(buf, bounds, left, clear_y + 1, "]", clear_style);
-            ctx.hits.push(
-                Rect::new(left, y_start, 2, 3),
-                HitTarget::PaneClear {
-                    pane_id: slot.pane_id.clone(),
-                },
-            );
-        } else {
-            super::overlay_text(buf, bounds, left, clear_y, "⌫", clear_style);
-            ctx.hits.push(
-                Rect::new(left, clear_y, 2, 1),
-                HitTarget::PaneClear {
-                    pane_id: slot.pane_id.clone(),
-                },
-            );
-        }
+        super::overlay_text(buf, bounds, clear_x, clear_y, "X", clear_style);
     }
 
     let Some(decoration) = ctx
@@ -905,7 +876,7 @@ fn pane_controls(slot: &PaneSlot, bounds: Rect) -> Option<PaneControls> {
     let split_down = Rect::new(right.saturating_sub(3), top, 3, 1);
     let split_right = Rect::new(split_down.x.saturating_sub(3), top, 3, 1);
     let (rename, grip_right) = if right.saturating_sub(left) >= 42 {
-        let rename_rect = Rect::new(split_right.x.saturating_sub(5), top, 5, 1);
+        let rename_rect = Rect::new(split_right.x.saturating_sub(3), top, 3, 1);
         (Some(rename_rect), rename_rect.x)
     } else {
         (None, split_right.x)
@@ -917,6 +888,39 @@ fn pane_controls(slot: &PaneSlot, bounds: Rect) -> Option<PaneControls> {
         split_right,
         split_down,
     })
+}
+
+/// The cell where the pane's clear button is placed on the left border, if it fits.
+pub fn pane_clear_cell(slot: &PaneSlot, bounds: Rect) -> Option<(u16, u16)> {
+    let vis = slot.rect;
+    let left = vis.x.saturating_sub(1).max(bounds.x);
+    let top = vis.y.saturating_sub(1).max(bounds.y);
+    let bottom = (vis.y + vis.height).min(bounds.y + bounds.height - 1);
+    let clear_y = if vis.height > 6 {
+        vis.y
+            .saturating_add(vis.height.saturating_sub((vis.height / 5).max(2)))
+    } else {
+        bottom.saturating_sub(1)
+    };
+    if clear_y > top && clear_y < bottom && clear_y < bounds.y.saturating_add(bounds.height) {
+        Some((left, clear_y))
+    } else {
+        None
+    }
+}
+
+/// Hit region for the pane composer clear button. Covers both the border glyph
+/// cell and the adjacent cell inside the pane, and is 3 rows tall so it is easy
+/// to hit with a mouse.
+pub fn pane_clear_hit_rect(slot: &PaneSlot, bounds: Rect) -> Option<Rect> {
+    let (left, clear_y) = pane_clear_cell(slot, bounds)?;
+    let vis = slot.rect;
+    let top = vis.y.saturating_sub(1).max(bounds.y);
+    let bottom = (vis.y + vis.height).min(bounds.y + bounds.height - 1);
+    let clear_top = clear_y.saturating_sub(1).max(top + 1);
+    let clear_bottom = (clear_y + 1).min(bottom.saturating_sub(1));
+    let clear_h = clear_bottom.saturating_sub(clear_top).saturating_add(1);
+    Some(Rect::new(left, clear_top, 2, clear_h.max(1)))
 }
 
 /// Hit regions for the controls painted over a pane's frame: the labeled
@@ -952,6 +956,12 @@ fn push_pane_overlay_hits(
         hits.push(rect, target);
     }
     if let Some(controls) = controls {
+        hits.push(
+            controls.grip,
+            HitTarget::PaneGrip {
+                pane_id: slot.pane_id.clone(),
+            },
+        );
         if let Some(rename) = controls.rename {
             hits.push(
                 rename,
@@ -972,14 +982,6 @@ fn push_pane_overlay_hits(
                 pane_id: slot.pane_id.clone(),
             },
         );
-        // The grip's hit rides with the other two now. It used to sit on
-        // the opposite corner of the frame, one cell wide.
-        hits.push(
-            controls.grip,
-            HitTarget::PaneGrip {
-                pane_id: slot.pane_id.clone(),
-            },
-        );
     }
     if let Some(cell) = minimize_cell(slot, bounds, can_shrink) {
         hits.push(
@@ -988,6 +990,40 @@ fn push_pane_overlay_hits(
                 pane_id: slot.pane_id.clone(),
             },
         );
+    }
+
+    if let Some(rect) = pane_clear_hit_rect(slot, bounds) {
+        hits.push(
+            rect,
+            HitTarget::PaneClear {
+                pane_id: slot.pane_id.clone(),
+            },
+        );
+    }
+}
+
+/// Re-assert pane clear hit targets over any canvas-level resize divider that
+/// shares the canvas's leftmost column.
+pub fn reassert_pane_clear_hits(tab: &TabModel, canvas: Rect, hits: &mut HitMap) {
+    let inner = pane_canvas(canvas);
+    let slots = if tab.zoomed {
+        vec![PaneSlot {
+            pane_id: tab.active_pane.clone(),
+            rect: inner,
+            focused: true,
+        }]
+    } else {
+        layout_geometry(&tab.layout, inner, &tab.active_pane, PANE_GAPS).slots
+    };
+    for slot in &slots {
+        if let Some(rect) = pane_clear_hit_rect(slot, canvas) {
+            hits.push(
+                rect,
+                HitTarget::PaneClear {
+                    pane_id: slot.pane_id.clone(),
+                },
+            );
+        }
     }
 }
 
@@ -3275,6 +3311,9 @@ mod tests {
         })
         .unwrap();
 
+        let flat = flatten(term.backend().buffer());
+        assert!(flat.contains("X"), "buffer must contain clear button X: {flat}");
+
         let clear_region = hits
             .regions()
             .iter()
@@ -3284,21 +3323,52 @@ mod tests {
             "expected PaneClear hit region registered in hits: {:?}",
             hits.regions()
         );
-        let region = clear_region.unwrap();
+        let region_rect = clear_region.unwrap().rect;
         assert_eq!(
-            region.rect.height, 3,
-            "clear button hit target must be 3 cells tall"
+            region_rect.width, 2,
+            "clear button hit target must be 2 cells wide"
         );
-        let clear_hit = hits.hit(region.rect.x, region.rect.y);
+        assert!(
+            region_rect.height >= 1,
+            "clear button hit target must be at least 1 cell tall"
+        );
+        let clear_hit = hits.hit(region_rect.x, region_rect.y);
         assert!(
             matches!(clear_hit, Some(HitTarget::PaneClear { pane_id }) if pane_id == "%0"),
             "expected PaneClear hit target when clicked: {:?}",
             clear_hit
         );
+        let clear_hit_right = hits.hit(region_rect.x + 1, region_rect.y);
+        assert!(
+            matches!(clear_hit_right, Some(HitTarget::PaneClear { pane_id }) if pane_id == "%0"),
+            "expected PaneClear hit target when clicked on adjacent interior cell: {:?}",
+            clear_hit_right
+        );
+
+        // Verify that if a SidebarDivider is pushed along the leftmost canvas column,
+        // reassert_pane_clear_hits restores PaneClear priority over the button cells.
+        let canvas = Rect::new(0, 0, 50, 15);
+        hits.push(Rect::new(canvas.x, canvas.y, 1, canvas.height), HitTarget::SidebarDivider);
+        // Before reassert, SidebarDivider shadows column region_rect.x
+        assert!(
+            matches!(hits.hit(region_rect.x, region_rect.y), Some(HitTarget::SidebarDivider)),
+            "SidebarDivider must initially shadow the column"
+        );
+        reassert_pane_clear_hits(&tab, canvas, &mut hits);
+        assert!(
+            matches!(hits.hit(region_rect.x, region_rect.y), Some(HitTarget::PaneClear { pane_id }) if pane_id == "%0"),
+            "reassert_pane_clear_hits must restore PaneClear priority on button cell: {:?}",
+            hits.hit(region_rect.x, region_rect.y)
+        );
+        // But other rows on that column still belong to SidebarDivider
+        assert!(
+            matches!(hits.hit(region_rect.x, 0), Some(HitTarget::SidebarDivider)),
+            "non-button rows on canvas.x must remain SidebarDivider"
+        );
     }
 
     #[test]
-    fn pane_rename_button_renders_on_wide_pane_and_registers_hit_target() {
+    fn pane_rename_button_renders_icon_and_registers_hit_target() {
         let node = crate::layout::parse_layout("b26f,80x20,0,0,0").unwrap();
         let layout = crate::layout::resolve_layout(&node, &[]).unwrap();
         let tab = TabModel {
@@ -3332,8 +3402,8 @@ mod tests {
 
         let flat = flatten(term.backend().buffer());
         assert!(
-            flat.contains("[ren]"),
-            "buffer must contain rename button: {flat}"
+            flat.contains("[✎]"),
+            "buffer must contain rename pencil icon button: {flat}"
         );
 
         let rename_region = hits
@@ -3346,7 +3416,7 @@ mod tests {
             hits.regions()
         );
         let region = rename_region.unwrap();
-        assert_eq!(region.rect.width, 5);
+        assert_eq!(region.rect.width, 3);
         let rename_hit = hits.hit(region.rect.x, region.rect.y);
         assert!(
             matches!(rename_hit, Some(HitTarget::PaneRename { pane_id }) if pane_id == "%0"),

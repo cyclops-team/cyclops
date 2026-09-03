@@ -52,8 +52,8 @@ use crate::runtime::{Color, GridCell};
 use crate::theme::Paint;
 
 pub use canvas::{
-    paint_window, tmux_client_size, window_target_size_for_layout, HostCursor, WindowPaintCtx,
-    MINIMIZED_ROWS, PANE_GRIP,
+    paint_window, reassert_pane_clear_hits, tmux_client_size, window_target_size_for_layout,
+    HostCursor, WindowPaintCtx, MINIMIZED_ROWS, PANE_GRIP,
 };
 /// For the arithmetic check in
 /// `app::tests::narrowing_the_sidebar_strands_canvas_columns_until_tmux_is_told`,

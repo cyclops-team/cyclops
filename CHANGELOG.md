@@ -3,6 +3,20 @@
 All notable changes to Cyclops v2. Format follows Keep a Changelog;
 versions are unreleased until admin cuts a tag.
 
+## [1.0.2] - 2026-09-03
+
+### Added
+- Multi-recipient sending: `cyclops send` supports multiple recipients separated by commas (via positional argument or `--to`).
+- Global `@all` broadcasting: message all adopted agents simultaneously using `@all`, `all`, or `*` via CLI and the TUI `@` button / compose dialog.
+- Auto-derived summaries: `--summary` is now optional on `cyclops send` and `cyclops reply`; two-sentence previews are automatically derived from the message body or subject.
+- Flexible reply locators: `cyclops reply` now accepts attempt tokens (`m-att_...`), canonical IDs, and `--last` or `-` to reply directly to the most recently claimed message.
+- Piped stdin support: `cyclops send` and `cyclops reply` automatically read piped stdin when no body flag is provided, or via `--body-file -`.
+- Quickstart guide: added a streamlined claiming and replying section to `SKILL.md`.
+
+### Fixed
+- Transient write readiness holds: pre-paste readiness checks now return `barrier_held` when a recipient's composer is temporarily busy, holding and retrying until the pane recovers instead of permanently aborting delivery.
+- Claude turn end detection: allowed the idle title sparkle rule (`title_idle_sparkle`) to certify idle when the composer is clean, clearing lingering "working" status and conflicting evidence after turn completion.
+
 ## [1.0.1] - 2026-09-03
 
 ### Added

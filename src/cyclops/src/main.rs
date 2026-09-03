@@ -616,9 +616,9 @@ struct SendArgs {
     /// One line the recipient sees first.
     #[arg(long)]
     subject: String,
-    /// Exactly two sentences shown beside the recipient's inbox claim.
+    /// One-line preview shown beside the recipient's inbox claim (auto-derived from body if omitted).
     #[arg(long)]
-    summary: String,
+    summary: Option<String>,
     /// Message body text.
     #[arg(long, conflicts_with = "body_file")]
     body: Option<String>,
@@ -672,29 +672,30 @@ enum InboxCmd {
         #[arg(long)]
         limit: Option<u32>,
     },
-    /// Claim one message and print its payload.
+    /// Wait for and claim the next pending message.
+    Next {
+        /// Maximum duration to wait (e.g. 5s, 1m). Exits 2 if no message arrives.
+        #[arg(long, default_value = "5s")]
+        timeout: String,
+        /// Only messages from this sender label.
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Atomically claim a message and print its body.
     Claim {
         /// Message identifier to claim.
         message_id: String,
-    },
-    /// Wait for and claim the oldest pending message over the daemon socket.
-    Next {
-        /// Only messages from this canonical sender endpoint.
-        #[arg(long, value_name = "RECIPIENT_KEY")]
-        from: Option<String>,
-        /// Stop waiting when no pending message arrives within this duration.
-        #[arg(long, default_value = "30s")]
-        timeout: String,
     },
 }
 
 #[derive(clap::Args)]
 struct ReplyArgs {
-    /// Message identifier being answered.
+    /// Message identifier being answered, attempt token m-att_..., or '-' / '--last'.
+    #[arg(default_value = "--last")]
     message_id: String,
-    /// Exactly two sentences shown beside the recipient's inbox claim.
+    /// One-line preview shown beside the recipient's inbox claim (auto-derived from body if omitted).
     #[arg(long)]
-    summary: String,
+    summary: Option<String>,
     /// Reply body text.
     #[arg(long, conflicts_with = "body_file")]
     body: Option<String>,
@@ -704,6 +705,9 @@ struct ReplyArgs {
     /// Sender-scoped idempotency key.
     #[arg(long)]
     client_key: Option<String>,
+    /// Reply to the most recently claimed message in this pane.
+    #[arg(long)]
+    last: bool,
 }
 
 #[derive(clap::Args)]
@@ -1930,22 +1934,119 @@ fn cmd_read(
     0
 }
 
+fn auto_derive_summary(body: &str, fallback_subject: &str) -> String {
+    let source = if body.trim().is_empty() {
+        fallback_subject.trim()
+    } else {
+        body.trim()
+    };
+    if source.is_empty() {
+        return "Message sent. The payload is ready.".to_string();
+    }
+    let flat: String = source
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let flat: String = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    let mut sentences: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = flat.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        current.push(chars[i]);
+        if matches!(chars[i], '.' | '!' | '?') {
+            while i + 1 < chars.len() && matches!(chars[i + 1], '.' | '!' | '?') {
+                i += 1;
+                current.push(chars[i]);
+            }
+            if i + 1 == chars.len() || chars[i + 1].is_whitespace() {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    sentences.push(trimmed);
+                }
+                current.clear();
+            }
+        }
+        i += 1;
+    }
+    let rest = current.trim();
+    if !rest.is_empty() {
+        sentences.push(format!("{rest}."));
+    }
+
+    let summary = if sentences.len() >= 2 {
+        format!("{} {}", sentences[0], sentences[1])
+    } else if sentences.len() == 1 {
+        format!("{} The message is ready.", sentences[0])
+    } else {
+        "Message sent. The payload is ready.".to_string()
+    };
+
+    if summary.chars().count() > 230 {
+        let s1 = &sentences[0];
+        if s1.chars().count() < 180 {
+            let max_s2 = 230 - s1.chars().count() - 2;
+            let s2 = if sentences.len() >= 2 {
+                &sentences[1]
+            } else {
+                "The message is ready."
+            };
+            let mut cut = max_s2.min(s2.len());
+            while !s2.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let s2_cut = s2[..cut].trim_end();
+            let s2_clean = if s2_cut.ends_with('.') || s2_cut.ends_with('?') || s2_cut.ends_with('!')
+            {
+                s2_cut.to_string()
+            } else {
+                format!("{s2_cut}.")
+            };
+            format!("{s1} {s2_clean}")
+        } else {
+            let mut cut = 180.min(s1.len());
+            while !s1.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let s1_cut = s1[..cut].trim_end();
+            let s1_clean = if s1_cut.ends_with('.') || s1_cut.ends_with('?') || s1_cut.ends_with('!')
+            {
+                s1_cut.to_string()
+            } else {
+                format!("{s1_cut}.")
+            };
+            format!("{s1_clean} Done.")
+        }
+    } else {
+        summary
+    }
+}
+
 fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
     let mut to: Vec<String> = Vec::new();
     if args.all {
         to.push("*".into());
     }
     for t in args.target.iter().chain(args.to.iter()) {
-        if !to.contains(t) {
-            to.push(t.clone());
+        for item in t.split(',') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            if item == "@all" || item == "all" || item == "*" {
+                if !to.contains(&"*".to_string()) {
+                    to.push("*".into());
+                }
+            } else if !to.contains(&item.to_string()) {
+                to.push(item.to_string());
+            }
         }
     }
     if to.is_empty() && args.reply_to.is_none() {
         eprintln!("{}", copy::NO_RECIPIENT);
-        return EXIT_USAGE;
-    }
-    if let Err(error) = cyclops_proto::validate_message_summary(&args.summary) {
-        eprintln!("{error}");
         return EXIT_USAGE;
     }
     let body = match (&args.body, &args.body_file) {
@@ -1957,8 +2058,26 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
                 return EXIT_USAGE;
             }
         },
-        (None, None) => String::new(),
+        (None, None) => {
+            use std::io::IsTerminal;
+            if !std::io::stdin().is_terminal() {
+                match read_bounded_body(std::io::stdin()) {
+                    Ok(b) if !b.is_empty() => b,
+                    _ => String::new(),
+                }
+            } else {
+                String::new()
+            }
+        }
     };
+    let summary = match &args.summary {
+        Some(s) if !s.trim().is_empty() => s.clone(),
+        _ => auto_derive_summary(&body, &args.subject),
+    };
+    if let Err(error) = cyclops_proto::validate_message_summary(&summary) {
+        eprintln!("{error}");
+        return EXIT_USAGE;
+    }
     let mut c = match connect() {
         Ok(c) => c,
         Err(code) => return code,
@@ -1978,7 +2097,7 @@ fn cmd_send(cli: &Cli, style: &Style, args: &SendArgs) -> i32 {
         recipient_keys: None,
         expected_caller: None,
         subject: args.subject.clone(),
-        summary: Some(args.summary.clone()),
+        summary: Some(summary),
         body,
         fyi: args.fyi,
         client_key: args.client_key.clone(),
@@ -2905,17 +3024,22 @@ fn print_claim_payload(message: &cyclops_proto::InboxMessage) {
 }
 
 fn cmd_reply(cli: &Cli, style: &Style, args: &ReplyArgs) -> i32 {
-    let message_id = match cyclops_proto::MessageId::new(&args.message_id) {
+    let raw_id = if args.last
+        || args.message_id == "--last"
+        || args.message_id == "-"
+        || args.message_id.is_empty()
+    {
+        "--last"
+    } else {
+        args.message_id.as_str()
+    };
+    let message_id = match cyclops_proto::MessageId::new(raw_id) {
         Ok(id) => id,
         Err(error) => {
             eprintln!("{error}");
             return EXIT_USAGE;
         }
     };
-    if let Err(error) = cyclops_proto::validate_message_summary(&args.summary) {
-        eprintln!("{error}");
-        return EXIT_USAGE;
-    }
     let body = match (&args.body, &args.body_file) {
         (Some(body), _) => body.clone(),
         (None, Some(path)) => match read_body_file(path) {
@@ -2925,15 +3049,33 @@ fn cmd_reply(cli: &Cli, style: &Style, args: &ReplyArgs) -> i32 {
                 return EXIT_USAGE;
             }
         },
-        (None, None) => String::new(),
+        (None, None) => {
+            use std::io::IsTerminal;
+            if !std::io::stdin().is_terminal() {
+                match read_bounded_body(std::io::stdin()) {
+                    Ok(b) if !b.is_empty() => b,
+                    _ => String::new(),
+                }
+            } else {
+                String::new()
+            }
+        }
     };
+    let summary = match &args.summary {
+        Some(s) if !s.trim().is_empty() => s.clone(),
+        _ => auto_derive_summary(&body, "Reply"),
+    };
+    if let Err(error) = cyclops_proto::validate_message_summary(&summary) {
+        eprintln!("{error}");
+        return EXIT_USAGE;
+    }
     let mut c = match connect() {
         Ok(c) => c,
         Err(code) => return code,
     };
     let params = serde_json::to_value(cyclops_proto::ReplyParams {
         message_id,
-        summary: Some(args.summary.clone()),
+        summary: Some(summary),
         body,
         client_key: args.client_key.clone(),
     })
@@ -4385,9 +4527,9 @@ mod tests {
     }
 
     #[test]
-    fn send_and_reply_require_a_summary_argument() {
+    fn send_and_reply_summary_argument_is_optional_and_supported() {
         assert!(
-            Cli::try_parse_from(["cyclops", "send", "reviewer", "--subject", "Review",]).is_err()
+            Cli::try_parse_from(["cyclops", "send", "reviewer", "--subject", "Review",]).is_ok()
         );
         assert!(Cli::try_parse_from([
             "cyclops",
@@ -4399,7 +4541,8 @@ mod tests {
             "Review the patch. Report any blocker.",
         ])
         .is_ok());
-        assert!(Cli::try_parse_from(["cyclops", "reply", "m-parent"]).is_err());
+        assert!(Cli::try_parse_from(["cyclops", "reply", "m-parent"]).is_ok());
+        assert!(Cli::try_parse_from(["cyclops", "reply"]).is_ok());
         assert!(Cli::try_parse_from([
             "cyclops",
             "reply",
