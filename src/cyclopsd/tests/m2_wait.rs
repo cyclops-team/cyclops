@@ -381,12 +381,22 @@ async fn send_wait_pins_the_submitted_occupant_not_the_impostor() {
         // would resume against the very row it is supposed to catch
         // changing. The pane pid would be the exact discriminator, but
         // status does not carry it, so the command name has to differ.
-        tmux.run_ok(&["respawn-pane", "-k", "-t", &pane, "cat"]);
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        tmux.run_ok(&["set-option", "-p", "-t", &pane, "remain-on-exit", "on"]);
+        tmux.run_ok(&["respawn-pane", "-k", "-t", &pane, "sleep 60"]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
             let status = ctl.request("status", json!({})).await;
-            let cmd = status["result"]["sessions"][0]["panes"][0]["current_command"].clone();
-            if cmd == "cat" {
+            let cmd = status["result"]["sessions"]
+                .as_array()
+                .and_then(|sessions| {
+                    sessions
+                        .iter()
+                        .flat_map(|s| s["panes"].as_array().into_iter().flatten())
+                        .find(|p| p["pane_id"].as_str() == Some(&pane))
+                })
+                .and_then(|p| p["current_command"].as_str())
+                .unwrap_or_default();
+            if cmd == "sleep" {
                 break;
             }
             assert!(

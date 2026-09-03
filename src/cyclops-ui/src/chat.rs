@@ -273,9 +273,7 @@ pub fn chat_actions(refresh_failed: bool) -> Vec<ChatAction> {
         ChatAction::Reply,
         ChatAction::Announce,
         ChatAction::Open,
-        ChatAction::Scope,
         ChatAction::Clear,
-        ChatAction::Sessions,
     ];
     if refresh_failed {
         actions.insert(0, ChatAction::Retry);
@@ -1549,7 +1547,7 @@ mod strip_tests {
     #[test]
     fn every_reported_span_covers_exactly_its_own_verb() {
         let (row, spans) = chat_action_strip(80, false);
-        assert_eq!(spans.len(), 6, "{row}");
+        assert_eq!(spans.len(), chat_actions(false).len(), "{row}");
         for (action, start, end) in spans {
             assert_eq!(
                 &row[start..end],

@@ -19,6 +19,30 @@ machine before relying on a command in this page: `cyclops --help` and
 `cyclops <subcommand> --help` are the source of truth, and they can drift
 from any doc, including this one.
 
+## Quickstart: Claiming and Replying
+
+When you receive a notification in your composer:
+1. **Claim the message** with structured JSON output:
+   ```bash
+   cyclops inbox claim m-att_... --json
+   ```
+2. **Reply to the sender**:
+   ```bash
+   # Shorthand using the attempt token:
+   cyclops reply m-att_... --body "Your answer here"
+
+   # Or reply to the last claimed message:
+   cyclops reply --last --body "Your answer here"
+
+   # Or pipe multi-line markdown via stdin:
+   cyclops reply --last --body-file - << 'EOF'
+   ### Recommendations
+   1. Song One
+   2. Song Two
+   EOF
+   ```
+*Note*: `--summary` is optional (auto-derived from `--body` if omitted). You can reply directly to the `m-att_...` attempt token, canonical ID, or use `--last` / `-`.
+
 ## Before you do anything
 
 Check the daemon is reachable and see the roster:

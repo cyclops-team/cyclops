@@ -27,6 +27,9 @@ pub enum HitTarget {
     PaneSplitDown {
         pane_id: String,
     },
+    PaneRename {
+        pane_id: String,
+    },
     Divider {
         pane_id: String,
         dir: SplitDir,

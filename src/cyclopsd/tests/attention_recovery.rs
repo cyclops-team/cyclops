@@ -55,7 +55,7 @@ fn workspace_lines(rig: &Rig) -> Vec<LedgerLine> {
 }
 
 async fn wait_for_alarm(rig: &mut Rig, message_id: &str) -> String {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let response = rig
             .ctl

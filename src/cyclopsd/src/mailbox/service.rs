@@ -1135,6 +1135,30 @@ impl MailboxService {
         // acceptance and inherit the predecessor's thread.
         let directory = self.directory()?;
         let mut store = self.store()?;
+        let reference = if reference.as_str() == "--last" || reference.as_str() == "-" {
+            store
+                .projection()
+                .mailboxes
+                .get(&sender.key)
+                .and_then(|m| {
+                    m.values()
+                        .filter(|e| e.state.is_claimed())
+                        .max_by_key(|e| e.seq)
+                        .map(|e| e.message_id.clone())
+                })
+                .ok_or_else(|| MailboxError::MessageNotFound(reference.clone()))?
+        } else if let Some(attempt_id) =
+            cyclops_proto::parse_notification_attempt_claim_locator(&reference)
+        {
+            store
+                .projection()
+                .notification_by_attempt(attempt_id)
+                .cloned()
+                .map(|record| record.message_id)
+                .ok_or(MailboxError::NotificationAttemptUnknown(attempt_id))?
+        } else {
+            reference
+        };
         let recipient = store
             .projection()
             .derive_reply(sender.key, &reference)?

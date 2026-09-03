@@ -1155,7 +1155,7 @@ pub(crate) async fn attempt_delivery(
                         observation,
                     ));
                 }
-                return AttemptOutcome::Failed(AttemptFailure::pane_rebound_before_paste());
+                return AttemptOutcome::Failed(AttemptFailure::barrier_held());
             }
             // A Working runtime is safe only in this narrow, positive shape.
             // Keep that admission with the in-flight notification: after the

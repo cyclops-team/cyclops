@@ -384,7 +384,11 @@ pub(super) async fn execute(
             Ok(Outcome::default())
         }
         Action::ClearPaneComposer { pane_id } => {
-            let _ = client.send_keys(&pane_id, &["C-u"]).await;
+            let focus_intent = crate::focus::Intent::Pane {
+                pane_id: pane_id.clone(),
+            };
+            let _ = execute_focus(app, client, focus_intent).await;
+            let _ = client.send_keys(&pane_id, &["C-e", "C-u"]).await;
             app.notice.show(
                 format!("Cleared composer in pane {pane_id}"),
                 tokio::time::Instant::now(),

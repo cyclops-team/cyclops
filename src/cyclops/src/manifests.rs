@@ -146,6 +146,7 @@ const EVER_SHIPPED_FNV64: &[&str] = &[
     "9e4d60c2da88e88e",
     "ed6a0d16eff01e23",
     "86f0219077c6bae3",
+    "b327aa8824a51b94",
 ];
 
 /// True when these bytes are a manifest this project released, so setup can

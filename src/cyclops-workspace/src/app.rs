@@ -4159,8 +4159,12 @@ async fn handle_mouse(
                     ));
                     return Ok(());
                 }
-                HitTarget::PaneSplitRight { .. } | HitTarget::PaneSplitDown { .. } => {
+                HitTarget::PaneSplitRight { .. }
+                | HitTarget::PaneSplitDown { .. }
+                | HitTarget::PaneRename { .. }
+                | HitTarget::PaneClear { .. } => {
                     app.close_menu();
+                    clear_selection(app);
                 }
                 HitTarget::Divider { pane_id, dir } => {
                     clear_selection(app);
@@ -4354,7 +4358,7 @@ async fn handle_mouse(
                 | HitTarget::DialogTitleBar
                 | HitTarget::SettingsSection { .. }
                 | HitTarget::SettingsRow { .. } => return Ok(()),
-                HitTarget::PaneClear { .. } | HitTarget::SidebarFilter { .. } => {}
+                HitTarget::SidebarFilter { .. } => {}
             }
             if let Some(action) = action::route_mouse_click(&target, MouseButton::Left) {
                 let outcome = exec::execute(app, client, action).await?;
@@ -4778,7 +4782,9 @@ async fn handle_messages_key(
                 return Ok(Some(InputOutcome::Redraw));
             }
         }
-        KeyCode::Char('a') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('a') | KeyCode::Char('@')
+            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
             let routes = &app.decoration.mailbox_routes;
             if routes.is_empty() {
                 app.messages_composer.record_not_sent(
@@ -4788,9 +4794,12 @@ async fn handle_messages_key(
                     .show("Refused: no reachable mailbox routes", Instant::now());
                 return Ok(Some(InputOutcome::Redraw));
             }
-            // `@all` means everyone the Messages pane is showing: narrowed
-            // to one session, an announcement stays inside that session.
-            let session = app.messages_queue.session_filter();
+            let is_global = matches!(key.code, KeyCode::Char('@'));
+            let session = if is_global {
+                None
+            } else {
+                app.messages_queue.session_filter()
+            };
             let recipients: Vec<(cyclops_proto::RecipientKey, String)> = routes
                 .iter()
                 .filter(|r| {
@@ -4804,9 +4813,9 @@ async fn handle_messages_key(
                 .collect();
             if recipients.is_empty() {
                 app.messages_composer
-                    .record_not_sent("no mailbox routes in this session".into());
+                    .record_not_sent("no mailbox routes available".into());
                 app.notice
-                    .show("Refused: no mailbox routes in this session", Instant::now());
+                    .show("Refused: no mailbox routes available", Instant::now());
                 return Ok(Some(InputOutcome::Redraw));
             }
             messages_composer_changed(app);
@@ -6365,6 +6374,10 @@ fn draw<B: Backend>(
                     app.hover,
                     app.drag.as_ref(),
                 );
+                // Re-assert pane clear hits over the sidebar divider so clicking
+                // the 'X' button on any left-aligned pane clears the composer rather
+                // than starting a sidebar resize drag.
+                crate::render::reassert_pane_clear_hits(tab, areas.canvas, &mut app.hit_map);
             }
             if let Some(messages) = areas.messages {
                 if areas.canvas.width > 0 && areas.canvas.height > 0 {

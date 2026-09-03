@@ -767,6 +767,11 @@ pub fn route_mouse_click(target: &HitTarget, button: MouseButton) -> Option<Acti
                 placement: SplitPlacement::Down,
             }))
         }
+        (HitTarget::PaneRename { pane_id }, MouseButton::Left) => {
+            Some(Action::RequestNamePane {
+                pane_id: pane_id.clone(),
+            })
+        }
         (HitTarget::NewTabButton, MouseButton::Left) => Some(Action::RequestNewTab),
         // The same action Ctrl+B @ routes to. A control that opened a
         // different composer from the chord would be a second code path

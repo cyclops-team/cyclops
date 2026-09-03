@@ -94,6 +94,7 @@ evidence = "MEASURED claude_busy_titles.json; spinner appears 10 ms after UserPr
 [[rule]]
 id = "title_idle_sparkle"
 state = "idle"
+lifecycle_evidence = true
 priority = 1000
 region = "pane_title"
 # U+2733 replaces the spinner when the turn ends.
@@ -159,7 +160,7 @@ composer_semantic = "clean"
 lifecycle_evidence = true
 active_start_terminal = true
 priority = 1148
-region = "bottom_non_empty_lines(24)"
+region = "bottom_non_empty_lines(40)"
 regex = ['(?m)^[·✶✽✳✢✻]\s+\S+\s+for\s+\d+[smhd](?:\s+\d+[smhd])*\s+·\s+done\s+\d{1,2}:\d{2}\s+(?:AM|PM)\s*\n(?:[^·✶✽✳✢✻\n][^\n]*\n)*─{32,}\s*\n❯\s*\n─{32,}\s*\n(?:\s{0,4}(?:\S[^·\n]*(?: · [^·\n]+){2,} · \d+K window(?: · \d+K used)?(?:\s+/rc)?|(?:Opus|Sonnet|Haiku) \d+(?:\.\d+)?(?: \([^·\n]*\))? · (?:xhigh|high|medium|low)(?: · [^·\n]+)* · [^·\n]*…)\s*(?:\n\s{0,4}paste again to expand\s*)?(?:\n\s{0,4}(?:⏸|⏵⏵) [^·\n]*\b(?:on|off)\b(?: \([^)]*\))?(?: · .+)?\s*)?|\s{0,4}(?:⏸|⏵⏵) [^·\n]*\b(?:on|off)\b(?: \([^)]*\))?(?: · .+)?\s*)\z']
 # One ordered escaped pattern, anchored at the end of the region: the
 # uniform-246 completed row, then only rows that do not open with the active
