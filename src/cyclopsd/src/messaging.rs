@@ -4552,8 +4552,13 @@ mod tests {}
     /// append a pre-write transition itself.
     #[test]
     fn delivery_cannot_own_the_prewrite_transaction() {
-        let source = include_str!("delivery/mod.rs");
-        let production = source_before_primary_tests(source, "delivery.rs");
+        let production = format!(
+            "{}{}{}{}",
+            include_str!("delivery/worker.rs"),
+            include_str!("delivery/gate.rs"),
+            include_str!("delivery/inject.rs"),
+            source_before_primary_tests(include_str!("delivery/mod.rs"), "delivery.rs"),
+        );
 
         for required in [
             "record_notification_prewrite_block(",
