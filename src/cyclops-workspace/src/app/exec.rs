@@ -704,6 +704,10 @@ pub(super) async fn execute(
                 ..Outcome::default()
             })
         }
+        Action::SelectSidebarFilter { filter } => {
+            app.sidebar_filter = filter;
+            Ok(Outcome::default())
+        }
         Action::ShowSettings { section } => {
             let (names, active) = theme_rows(&app.home);
             let delivery = match crate::daemon::force_submit_settings(&app.home) {
@@ -2029,6 +2033,7 @@ mod tests {
             expanded_for: None,
             watched_sessions: HashSet::new(),
             sidebar_tab: SidebarTab::default(),
+            sidebar_filter: crate::persist::SidebarFilter::default(),
             record: cyclops_ui::Record::new(),
             messages_queue: cyclops_ui::HumanQueue::default(),
             messages_snapshot_counts: None,

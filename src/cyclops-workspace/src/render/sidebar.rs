@@ -136,6 +136,7 @@ pub fn paint_daemon_status(
 
 /// Render the workspace sidebar: the tab header, the selected tab's body,
 /// the shared footer, and the collapse chevron on its outer edge.
+#[allow(dead_code)]
 pub fn paint_sidebar(
     workspaces: &[WorkspaceRow],
     active: usize,
@@ -143,6 +144,49 @@ pub fn paint_sidebar(
     expanded_workspaces: &std::collections::HashSet<String>,
     agent_order: &[String],
     tab: SidebarTab,
+    record: &Record,
+    files: &mut crate::files::FileTree,
+    files_view: crate::files::FilesView,
+    files_rows: u16,
+    area: Rect,
+    buf: &mut Buffer,
+    paint: &Paint,
+    hits: &mut HitMap,
+    decoration: &DecorationSnapshot,
+    hover: Option<(u16, u16)>,
+    drag: Option<&DragState>,
+) {
+    paint_sidebar_filtered(
+        workspaces,
+        active,
+        active_pane,
+        expanded_workspaces,
+        agent_order,
+        tab,
+        crate::persist::SidebarFilter::All,
+        record,
+        files,
+        files_view,
+        files_rows,
+        area,
+        buf,
+        paint,
+        hits,
+        decoration,
+        hover,
+        drag,
+    );
+}
+
+/// Render the workspace sidebar with active session tree filter.
+pub fn paint_sidebar_filtered(
+    workspaces: &[WorkspaceRow],
+    active: usize,
+    active_pane: &str,
+    expanded_workspaces: &std::collections::HashSet<String>,
+    agent_order: &[String],
+    tab: SidebarTab,
+    filter: crate::persist::SidebarFilter,
     record: &Record,
     files: &mut crate::files::FileTree,
     files_view: crate::files::FilesView,
@@ -211,7 +255,7 @@ pub fn paint_sidebar(
     // row to give.
     let bar_y = (body_bottom < footer_y).then_some(body_bottom);
 
-    paint_tab_header(inner, tab, buf, paint, hits);
+    paint_tab_header(inner, tab, filter, buf, paint, hits);
     // The Sessions tab is two panels sharing one column: who is running,
     // and what is on disk. The seam between them is where the session tree
     // stops; the Stream tab has no second panel and keeps the whole body.
@@ -232,6 +276,7 @@ pub fn paint_sidebar(
             active_pane,
             expanded_workspaces,
             agent_order,
+            filter,
             area,
             inner,
             content,
@@ -861,6 +906,7 @@ fn paint_wordmark(row: Rect, right: u16, used: u16, buf: &mut Buffer, paint: &Pa
 fn paint_tab_header(
     inner: Rect,
     tab: SidebarTab,
+    filter: crate::persist::SidebarFilter,
     buf: &mut Buffer,
     paint: &Paint,
     hits: &mut HitMap,
@@ -884,8 +930,40 @@ fn paint_tab_header(
             copy::SIDEBAR_TAB_SESSIONS,
             theme::sidebar_label(paint),
         );
-        let used =
+        let mut used =
             lead + u16::try_from(Span::raw(copy::SIDEBAR_TAB_SESSIONS).width()).unwrap_or(u16::MAX);
+
+        let next_filter = match filter {
+            crate::persist::SidebarFilter::All => crate::persist::SidebarFilter::Active,
+            crate::persist::SidebarFilter::Active => crate::persist::SidebarFilter::Agents,
+            crate::persist::SidebarFilter::Agents => crate::persist::SidebarFilter::All,
+        };
+        let filter_name = match filter {
+            crate::persist::SidebarFilter::All => "[All]",
+            crate::persist::SidebarFilter::Active => "[Active]",
+            crate::persist::SidebarFilter::Agents => "[Agents]",
+        };
+        let filter_w = u16::try_from(Span::raw(filter_name).width()).unwrap_or(u16::MAX);
+        if row.x + used + 1 + filter_w < right.saturating_sub(6) {
+            let fx = row.x + used + 1;
+            let chip_rect = Rect::new(fx, row.y, filter_w, 1);
+            hits.push(
+                chip_rect,
+                HitTarget::SidebarFilter {
+                    filter: next_filter,
+                },
+            );
+            super::overlay_text(
+                buf,
+                chip_rect,
+                fx,
+                row.y,
+                filter_name,
+                theme::sidebar_wordmark_eye(paint),
+            );
+            used += 1 + filter_w;
+        }
+
         paint_wordmark(row, right, used, buf, paint);
         return;
     }
@@ -980,6 +1058,7 @@ fn paint_session_tree(
     active_pane: &str,
     expanded_workspaces: &std::collections::HashSet<String>,
     agent_order: &[String],
+    filter: crate::persist::SidebarFilter,
     area: Rect,
     inner: Rect,
     content: Rect,
@@ -999,15 +1078,10 @@ fn paint_session_tree(
             DragTarget::Workspace { session_id, .. } => Some(session_id.as_str()),
             _ => None,
         });
+
     // The header owns row 0 and a blank row separates it from the tree, so
     // rows start on the row the old title left them on.
     let mut y = content.y + 2;
-    // The daemon's note owns this row whether or not it has anything to
-    // say. cyclopsd answers a beat or two after launch, and a row that
-    // existed only while the note did would slide the whole tree up one
-    // row at exactly that moment, under a pointer already on a target.
-    // Same reasoning as the pane notice line (`canvas::paint_notice`):
-    // chrome that appears and expires must not move what is around it.
     if !decoration.online {
         super::overlay_text_ellipsized(
             buf,
@@ -1020,8 +1094,15 @@ fn paint_session_tree(
     }
     y += 1;
 
+    let active_session_id = workspaces
+        .get(active)
+        .map(|w| w.session_id.as_str())
+        .unwrap_or("");
     let mut clipped = 0usize;
     for (i, ws) in workspaces.iter().enumerate() {
+        if filter == crate::persist::SidebarFilter::Active && ws.session_id != active_session_id {
+            continue;
+        }
         let expanded = expanded_workspaces.contains(&ws.session_id);
         // Resolved before the room check so a clipped workspace can report
         // the agent rows it would have opened, not just itself.
@@ -1030,6 +1111,12 @@ fn paint_session_tree(
         } else {
             Vec::new()
         };
+        if filter == crate::persist::SidebarFilter::Agents {
+            let all_agents = decoration.agent_rows_for_window_ids(&ws.window_ids, agent_order);
+            if all_agents.is_empty() {
+                continue;
+            }
+        }
         if y >= footer_y {
             clipped += 1 + agents.len();
             continue;

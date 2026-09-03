@@ -18,6 +18,15 @@ pub enum SidebarTab {
     Stream,
 }
 
+/// Scope filter for the sidebar session tree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum SidebarFilter {
+    #[default]
+    All,
+    Active,
+    Agents,
+}
+
 /// Whether the sidebar offers its Stream tab.
 ///
 /// Off while the stream is revised. A switch rather than deleted code: the

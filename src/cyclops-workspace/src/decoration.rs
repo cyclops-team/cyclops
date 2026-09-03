@@ -117,7 +117,7 @@ impl DecorationSnapshot {
         if dec.needs_attention {
             return Some(PrimaryStatus {
                 glyph: "⚠",
-                word: "needs attention",
+                word: "waiting",
                 color_state: dec.state,
                 attention: true,
             });
@@ -142,19 +142,16 @@ impl DecorationSnapshot {
                 color_state: AgentState::Dead,
                 attention: false,
             }),
-            // Occupied, not free: real work and a block the register has not
-            // flagged both read ● on a compact surface. Whether a block needs
-            // a human is the register's call alone (`needs_attention` above);
-            // the exact state only picks the color token, through the one
-            // owner of "is this blocked".
-            state => Some(PrimaryStatus {
+            state if state.is_blocked() => Some(PrimaryStatus {
+                glyph: "⏳",
+                word: "waiting",
+                color_state: state,
+                attention: false,
+            }),
+            _ => Some(PrimaryStatus {
                 glyph: "●",
                 word: "working",
-                color_state: if state.is_blocked() {
-                    state
-                } else {
-                    AgentState::Working
-                },
+                color_state: AgentState::Working,
                 attention: false,
             }),
         }
@@ -447,7 +444,7 @@ mod tests {
             DecorationSnapshot::primary_status(&blocked),
             Some(PrimaryStatus {
                 glyph: "⚠",
-                word: "needs attention",
+                word: "waiting",
                 color_state: AgentState::BlockedPermission,
                 attention: true,
             })
@@ -501,12 +498,12 @@ mod tests {
             assert_eq!(
                 DecorationSnapshot::primary_status(&dec),
                 Some(PrimaryStatus {
-                    glyph: "●",
-                    word: "working",
+                    glyph: "⏳",
+                    word: "waiting",
                     color_state: state,
                     attention: false,
                 }),
-                "{state} without needs_attention must not read as needs attention"
+                "{state} without needs_attention reads as waiting"
             );
         }
     }

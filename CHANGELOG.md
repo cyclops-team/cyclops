@@ -3,6 +3,17 @@
 All notable changes to Cyclops v2. Format follows Keep a Changelog;
 versions are unreleased until admin cuts a tag.
 
+## [1.0.1] - 2026-09-03
+
+### Added
+- Mouse drag auto-scrolling: clicking and dragging outside a pane's bounds continues selection and smoothly scrolls the pane viewport into history or tail.
+- Input editing shortcuts: added `Ctrl+Backspace` / `Alt+Backspace` / `Ctrl+W` to delete words, and `Ctrl+U` / `Cmd+A` to clear input buffers in modal dialogs.
+- Pane border status badges: persistent status badges on pane borders showing `○ idle`, `● working`, or `⏳ waiting` (highlighted in yellow/amber when blocked).
+- Unified sidebar filtering: added unified filter pills (`All`, `Active`, `Agents`) at the top of the session tree to easily declutter multiple workspaces.
+- `cyclops flush`: added dedicated command to completely reset session state, prune dead panes, and flush the message ledger for a pristine restart.
+- Modal toggle on Space: keyboard-only navigation in Settings where Space toggles switches and checkboxes instantly.
+- Enlarged composer clear button: expanded the clear composer control into a bracketed button (`[⌫ clear]` / `[⌫]`) with an expanded hit target for easier mouse clicking.
+
 ## [Unreleased]
 
 The selected prerelease identity for the audited Rust beta candidate is

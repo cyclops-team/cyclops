@@ -315,6 +315,10 @@ pub enum Action {
     SelectSidebarTab {
         tab: crate::persist::SidebarTab,
     },
+    /// Select one of the session tree filters (All, Active, Agents).
+    SelectSidebarFilter {
+        filter: crate::persist::SidebarFilter,
+    },
     /// Open the settings card on one of its sections. Carries no other
     /// target: the theme listing is read from the themes directory at
     /// execution time, so a file added or removed between the click and
@@ -770,6 +774,9 @@ pub fn route_mouse_click(target: &HitTarget, button: MouseButton) -> Option<Acti
         (HitTarget::ComposeButton, MouseButton::Left) => Some(Action::RequestCompose),
         (HitTarget::SidebarTab { tab }, MouseButton::Left) => {
             Some(Action::SelectSidebarTab { tab: *tab })
+        }
+        (HitTarget::SidebarFilter { filter }, MouseButton::Left) => {
+            Some(Action::SelectSidebarFilter { filter: *filter })
         }
         (HitTarget::NewWorkspaceButton, MouseButton::Left) => Some(Action::NewWorkspace),
         // The chevron is the mouse's half of Ctrl+B b, on the panel edge

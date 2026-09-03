@@ -1945,7 +1945,25 @@ pub(crate) async fn status_reset(
         detections.retain(|key, _| live_pane_ids.contains(&key.pane_id));
     }
 
-    // 6. Refresh observations
+    // 6. Flush message ledgers if requested
+    let mut flushed_messages = 0;
+    if params.flush_messages {
+        let ledger_dir = inner.state_root.path().join("ledger");
+        if let Ok(entries) = std::fs::read_dir(&ledger_dir) {
+            for entry in entries.flatten() {
+                if entry.path().extension().and_then(|s| s.to_str()) == Some("ndjson") {
+                    if let Ok(meta) = entry.metadata() {
+                        if meta.len() > 0 {
+                            flushed_messages += 1;
+                            let _ = std::fs::write(entry.path(), b"");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 7. Refresh observations
     let _ = crate::refresh_status_observations(inner).await;
 
     let (active_sessions, active_panes) = {
@@ -1968,6 +1986,7 @@ pub(crate) async fn status_reset(
         pruned_adoptions,
         active_panes,
         active_sessions,
+        flushed_messages,
     }
 }
 

@@ -434,6 +434,8 @@ pub enum DialogKeyAction {
     Confirm,
     Cancel,
     Backspace,
+    DeleteWord,
+    Clear,
     Append(char),
     /// Break the line in a multi-line field. Never a confirm: the only
     /// dialogs that produce this are the ones Enter alone still sends.
@@ -446,6 +448,22 @@ pub enum DialogKeyAction {
     /// Left/right adjustment for a selected settings slider.
     Adjust(i16),
     Ignore,
+}
+
+/// Remove the trailing word from an editable buffer.
+pub fn delete_word(buffer: &mut String) {
+    while buffer.ends_with(|c: char| c.is_whitespace()) {
+        buffer.pop();
+    }
+    while let Some(c) = buffer.chars().last() {
+        if c.is_whitespace() {
+            break;
+        }
+        buffer.pop();
+    }
+    while buffer.ends_with(|c: char| c.is_whitespace()) {
+        buffer.pop();
+    }
 }
 
 /// Resolve dialog keys without mutating application state. Every modal
@@ -473,7 +491,7 @@ pub fn dialog_key_action(dialog: &Dialog, key: &KeyEvent) -> DialogKeyAction {
     if matches!(dialog, Dialog::Settings { .. }) {
         return match key.code {
             KeyCode::Esc => DialogKeyAction::Cancel,
-            KeyCode::Enter => DialogKeyAction::Confirm,
+            KeyCode::Enter | KeyCode::Char(' ') => DialogKeyAction::Confirm,
             KeyCode::Up => DialogKeyAction::Scroll(-1),
             KeyCode::Down => DialogKeyAction::Scroll(1),
             KeyCode::PageUp => DialogKeyAction::Scroll(-8),
@@ -486,6 +504,25 @@ pub fn dialog_key_action(dialog: &Dialog, key: &KeyEvent) -> DialogKeyAction {
             KeyCode::Right => DialogKeyAction::Adjust(1),
             _ => DialogKeyAction::Ignore,
         };
+    }
+    if dialog.has_input() {
+        // Word delete: Ctrl+Backspace, Alt+Backspace, or Ctrl+W
+        if (key.code == KeyCode::Backspace
+            && (key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.modifiers.contains(KeyModifiers::ALT)))
+            || (key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            return DialogKeyAction::DeleteWord;
+        }
+        // Clear all / delete all: Ctrl+U, Cmd+A, or Cmd+Backspace
+        if (key.code == KeyCode::Char('u') && key.modifiers.contains(KeyModifiers::CONTROL))
+            || (key.code == KeyCode::Char('a')
+                && (key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::SUPER)))
+            || (key.code == KeyCode::Backspace && key.modifiers.contains(KeyModifiers::SUPER))
+        {
+            return DialogKeyAction::Clear;
+        }
     }
     let text_key = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
     match key.code {
@@ -983,6 +1020,10 @@ mod tests {
             DialogKeyAction::Confirm
         );
         assert_eq!(
+            dialog_key_action(&dialog, &key(KeyCode::Char(' '))),
+            DialogKeyAction::Confirm
+        );
+        assert_eq!(
             dialog_key_action(&dialog, &key(KeyCode::Esc)),
             DialogKeyAction::Cancel
         );
@@ -1399,6 +1440,64 @@ mod tests {
             Dialog::NewTab {
                 buffer: "review-api".into()
             }
+        );
+    }
+
+    #[test]
+    fn delete_word_removes_trailing_token_and_whitespace() {
+        let mut buf = "hello world foo".to_string();
+        delete_word(&mut buf);
+        assert_eq!(buf, "hello world");
+        delete_word(&mut buf);
+        assert_eq!(buf, "hello");
+        delete_word(&mut buf);
+        assert_eq!(buf, "");
+    }
+
+    #[test]
+    fn input_dialog_supports_word_delete_and_clear_chords() {
+        let dialog = Dialog::NewTab {
+            buffer: "hello world".into(),
+        };
+        // Ctrl+Backspace
+        assert_eq!(
+            dialog_key_action(
+                &dialog,
+                &KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL)
+            ),
+            DialogKeyAction::DeleteWord
+        );
+        // Alt+Backspace
+        assert_eq!(
+            dialog_key_action(
+                &dialog,
+                &KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)
+            ),
+            DialogKeyAction::DeleteWord
+        );
+        // Ctrl+W
+        assert_eq!(
+            dialog_key_action(
+                &dialog,
+                &KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)
+            ),
+            DialogKeyAction::DeleteWord
+        );
+        // Ctrl+U
+        assert_eq!(
+            dialog_key_action(
+                &dialog,
+                &KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)
+            ),
+            DialogKeyAction::Clear
+        );
+        // Cmd+A / Ctrl+A
+        assert_eq!(
+            dialog_key_action(
+                &dialog,
+                &KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)
+            ),
+            DialogKeyAction::Clear
         );
     }
 }
