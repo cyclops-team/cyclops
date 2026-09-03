@@ -1,13 +1,7 @@
 //! Binary pairing, verification, and transactional selection store.
 
-use std::fs::{File, OpenOptions};
-use std::io::{Read as _, Seek as _};
-use std::os::fd::AsRawFd as _;
-use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{
-    DirBuilderExt as _, FileTypeExt as _, MetadataExt as _, OpenOptionsExt as _,
-    PermissionsExt as _,
-};
+use std::io::Seek as _;
+use std::os::unix::fs::FileTypeExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
