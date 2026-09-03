@@ -1573,16 +1573,19 @@ impl WorkspaceMessaging {
         &self,
         caller: MailboxIdentity,
         id: &str,
+        reveal_body: bool,
         compatibility: CompatibilityHistorySources,
     ) -> Result<ThreadResult, cyclops_proto::WireError> {
         let reader = crate::history::HistoryReader::workspace(caller.label.clone(), caller.key);
         let record = self.history_record(compatibility);
         let mut result = crate::history::query_thread(&record, id, Some(&reader))?;
-        crate::mailbox::redact_message_bodies(
-            Some(&self.service),
-            Some(caller.key),
-            &mut result.lines,
-        );
+        if !(caller.key.is_admin() && reveal_body) {
+            crate::mailbox::redact_message_bodies(
+                Some(&self.service),
+                Some(caller.key),
+                &mut result.lines,
+            );
+        }
         Ok(result)
     }
 
@@ -2986,6 +2989,17 @@ mod tests {
             .0
     }
 
+    fn delivery_production_source() -> String {
+        format!(
+            "{}{}{}{}{}",
+            include_str!("delivery/worker.rs"),
+            include_str!("delivery/gate.rs"),
+            include_str!("delivery/inject.rs"),
+            include_str!("delivery/terminal.rs"),
+            source_before_primary_tests(include_str!("delivery/mod.rs"), "delivery.rs"),
+        )
+    }
+
     /// Obsolete when these lints select Rust items structurally instead of
     /// finding the production prefix with a textual module boundary.
     #[test]
@@ -3067,8 +3081,9 @@ mod tests {}
             );
         }
 
+        let delivery_src = delivery_production_source();
         for (adapter, source) in [
-            ("delivery", include_str!("delivery.rs")),
+            ("delivery", delivery_src.as_str()),
             ("messaging runtime", include_str!("messaging_runtime.rs")),
             ("ack", include_str!("ack.rs")),
         ] {
@@ -3934,6 +3949,7 @@ mod tests {}
             .thread(
                 observer_identity,
                 accepted.message_id.as_str(),
+                false,
                 compatibility(),
             )
             .unwrap_err();
@@ -3955,6 +3971,7 @@ mod tests {}
             .thread(
                 reviewer_identity,
                 accepted.message_id.as_str(),
+                false,
                 compatibility(),
             )
             .unwrap();
@@ -4397,8 +4414,9 @@ mod tests {}
     /// scheduler with a mailbox projection themselves.
     #[test]
     fn mechanisms_cannot_schedule_recipient_fifos_directly() {
+        let delivery_src = delivery_production_source();
         for (name, source) in [
-            ("delivery", include_str!("delivery.rs")),
+            ("delivery", delivery_src.as_str()),
             (
                 "attention resolution",
                 include_str!("attention_resolution.rs"),
@@ -4421,10 +4439,11 @@ mod tests {}
     /// choose one of the retained scheduling mechanisms.
     #[test]
     fn runtime_callers_cannot_schedule_messaging_work_directly() {
+        let delivery_src = delivery_production_source();
         for (name, source) in [
             ("fusion", include_str!("fusion.rs")),
             ("authenticated ACK", include_str!("ack.rs")),
-            ("delivery", include_str!("delivery.rs")),
+            ("delivery", delivery_src.as_str()),
             ("socket server", include_str!("server.rs")),
         ] {
             for forbidden in ["messaging::schedule_", "messaging_runtime::schedule_"] {
@@ -4547,8 +4566,7 @@ mod tests {}
     /// append a pre-write transition itself.
     #[test]
     fn delivery_cannot_own_the_prewrite_transaction() {
-        let source = include_str!("delivery.rs");
-        let production = source_before_primary_tests(source, "delivery.rs");
+        let production = delivery_production_source();
 
         for required in [
             "record_notification_prewrite_block(",

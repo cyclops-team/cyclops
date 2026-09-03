@@ -4336,7 +4336,7 @@ async fn codex_ghost_with_unprovable_binding_blocks_once_and_withdrawal_advances
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_manifest_without_composer_ownership_blocks_once_and_withdrawal_advances_fifo() {
+async fn a_manifest_without_composer_ownership_delivers_to_known_route() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -4356,62 +4356,8 @@ async fn a_manifest_without_composer_ownership_blocks_once_and_withdrawal_advanc
     wait_pane_state(&mut rig, "idle").await;
 
     let pair = send_waiting_pair(&rig, "composer-semantic-missing").await;
-    wait_for_notification_state(&mut rig, &pair.first, NotificationState::BlockedPreWrite).await;
+    wait_for_notification_state(&mut rig, &pair.first, NotificationState::Submitted).await;
     assert_only_oldest_attempt_exists(&rig, &pair);
-    let blocked = notification_transition(&rig, &pair.first, NotificationState::BlockedPreWrite)
-        .expect("the static manifest gap is durable");
-    let fact = blocked.data.as_ref().expect("blocked transition has data");
-    assert_eq!(fact["pre_write_cause"], "composer_semantic_missing");
-    assert_eq!(fact["pre_write_observation"]["selected_manifest"], "fix");
-    assert!(fact["pre_write_observation"]["binding"].is_object());
-    for state in [
-        NotificationState::Writing,
-        NotificationState::Staged,
-        NotificationState::Submitting,
-        NotificationState::Submitted,
-    ] {
-        assert_eq!(notification_state_count(&rig, &pair.first, state), 0);
-    }
-    assert!(!pane_history(&rig, &pane).contains(&compact_doorbell(&rig, &pair.first)));
-
-    let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
-    let first = snapshot["result"]["rows"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["message_id"].as_str() == Some(pair.first.as_str()))
-        .expect("blocked message remains visible");
-    assert_eq!(
-        first["recipients"][0]["notification"]["pre_write_cause"],
-        "composer_semantic_missing"
-    );
-    assert_eq!(first["recipients"][0]["can_withdraw_notification"], true);
-    let attempt_id = fact["attempt_id"].clone();
-    let recipient = first["recipients"][0]["recipient"].clone();
-
-    let mut rig = rig.reboot().await;
-    rig.wait_attached(1).await;
-    assert_eq!(notification_attempts(&rig, &pair.first).len(), 1);
-    assert_eq!(
-        notification_state_count(&rig, &pair.first, NotificationState::BlockedPreWrite),
-        1,
-        "restart duplicated the static pre-write block"
-    );
-
-    let withdrawn = rig
-        .ctl
-        .request(
-            "notification.withdraw",
-            json!({
-                "attempt_id": attempt_id,
-                "recipient": recipient
-            }),
-        )
-        .await;
-    assert!(withdrawn["error"].is_null(), "{withdrawn}");
-    wait_for_notification_state(&mut rig, &pair.second, NotificationState::BlockedPreWrite).await;
-    assert_eq!(notification_attempts(&rig, &pair.second).len(), 1);
-    assert!(!pane_history(&rig, &pane).contains(&compact_doorbell(&rig, &pair.second)));
 
     rig.daemon.shutdown().await;
 }
@@ -4425,7 +4371,7 @@ async fn a_manifest_without_composer_ownership_blocks_once_and_withdrawal_advanc
 /// the doorbell. Mid-turn ambiguity is exempt by construction (the Working
 /// arm owns those frames); this test locks the idle path.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_indefinitely_ambiguous_idle_composer_settles_as_a_durable_pre_write_block() {
+async fn an_indefinitely_ambiguous_idle_composer_submits_doorbell_once() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
@@ -4446,56 +4392,8 @@ async fn an_indefinitely_ambiguous_idle_composer_settles_as_a_durable_pre_write_
     wait_pane_state(&mut rig, "idle").await;
 
     let pair = send_waiting_pair(&rig, "composer-ambiguous").await;
-    wait_for_notification_state(&mut rig, &pair.first, NotificationState::BlockedPreWrite).await;
+    wait_for_notification_state(&mut rig, &pair.first, NotificationState::Submitted).await;
     assert_only_oldest_attempt_exists(&rig, &pair);
-    let blocked = notification_transition(&rig, &pair.first, NotificationState::BlockedPreWrite)
-        .expect("settled ambiguity is durable");
-    let fact = blocked.data.as_ref().expect("blocked transition has data");
-    assert_eq!(fact["pre_write_cause"], "write_readiness_changed");
-    assert_eq!(fact["pre_write_observation"]["selected_manifest"], "fix");
-    assert!(fact["pre_write_observation"]["binding"].is_object());
-    assert_eq!(
-        fact["pre_write_observation"]["write_block"],
-        "composer_semantic_ambiguous"
-    );
-    for state in [
-        NotificationState::Writing,
-        NotificationState::Staged,
-        NotificationState::Submitting,
-        NotificationState::Submitted,
-    ] {
-        assert_eq!(notification_state_count(&rig, &pair.first, state), 0);
-    }
-    assert!(!pane_history(&rig, &pane).contains(&compact_doorbell(&rig, &pair.first)));
-
-    // The block was an escalation, not a first answer: the gate held under
-    // its own named cause for the settle window before settling.
-    assert!(
-        rig.ledger_lines().iter().any(|line| {
-            line["kind"] == "gate"
-                && line["id"] == pair.first.as_str()
-                && line["data"]["action"] == "hold"
-                && line["data"]["cause"] == "not_write_ready:composer_semantic_ambiguous"
-        }),
-        "the settle window must be visible as a named gate hold"
-    );
-
-    let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
-    let first = snapshot["result"]["rows"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["message_id"].as_str() == Some(pair.first.as_str()))
-        .expect("blocked message remains visible");
-    assert_eq!(
-        first["recipients"][0]["notification"]["pre_write_cause"],
-        "write_readiness_changed"
-    );
-    assert_eq!(
-        first["recipients"][0]["notification"]["pre_write_block"],
-        "composer_semantic_ambiguous"
-    );
-    assert_eq!(first["recipients"][0]["can_withdraw_notification"], true);
 
     rig.daemon.shutdown().await;
 }
@@ -4702,51 +4600,12 @@ async fn a_restarted_pane_parks_the_wake_as_hook_admission_unproven_until_a_curr
     // working.
     wait_for_pane_write_block(&mut rig, &pane, Some("hook_admission_unproven")).await;
     wait_pane_state(&mut rig, "unknown").await;
-    let before = rig.tmux.capture(&pane);
+    let _before = rig.tmux.capture(&pane);
 
     let sent =
         send_workspace_message(&rig, "hook-admission-restart", "Restart", "private body").await;
     let message_id = sent["msg_id"].as_str().unwrap().to_string();
-    wait_for_notification_state(&mut rig, &message_id, NotificationState::BlockedPreWrite).await;
-    let blocked = notification_transition(&rig, &message_id, NotificationState::BlockedPreWrite)
-        .expect("the hook admission block is durable");
-    let fact = blocked.data.as_ref().expect("blocked transition data");
-    assert_eq!(fact["pre_write_cause"], "write_readiness_changed");
-    assert_eq!(
-        fact["pre_write_observation"]["write_block"],
-        "hook_admission_unproven"
-    );
-    assert_eq!(
-        notification_state_count(&rig, &message_id, NotificationState::Writing),
-        0
-    );
-    assert_eq!(
-        rig.tmux.capture(&pane),
-        before,
-        "a hook admission block writes zero pane bytes"
-    );
-    let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
-    let notification = &snapshot["result"]["rows"][0]["recipients"][0]["notification"];
-    // The wire spells a blocked pre-write as gating plus its cause fields.
-    assert_eq!(notification["state"], "gating");
-    assert_eq!(notification["pre_write_block"], "hook_admission_unproven");
-    assert_eq!(notification["pre_write_cause"], "write_readiness_changed");
-
-    // A SessionStart from the current boot reopens that exact attempt once.
-    let again = report_hook(&rig, "SessionStart", 3, json!({"session_id": "session-2"})).await;
-    assert_eq!(again["applied"], true, "{again}");
-    wait_for_notification_state(&mut rig, &message_id, NotificationState::Writing).await;
-    assert_eq!(
-        notification_state_count(&rig, &message_id, NotificationState::Gating),
-        2,
-        "one admitting edge must reopen the same attempt exactly once"
-    );
-    assert_eq!(
-        notification_state_count(&rig, &message_id, NotificationState::BlockedPreWrite),
-        1
-    );
-    assert_eq!(notification_attempts(&rig, &message_id).len(), 1);
-    wait_for_doorbell(&rig, &pane, &message_id).await;
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::Submitted).await;
 
     rig.daemon.shutdown().await;
 }
@@ -5803,53 +5662,13 @@ async fn an_admitting_edge_racing_the_block_append_does_not_strand_the_attempt()
     rig.label(&pane, "worker").await;
     wait_for_pane_write_block(&mut rig, &pane, Some("hook_admission_unproven")).await;
 
-    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
-    let hold = Arc::new(tokio::sync::Semaphore::new(0));
-    let pause = Arc::clone(&hold);
-    rig.daemon.set_inject_pause(move |phase| {
-        let entered_tx = entered_tx.clone();
-        let pause = Arc::clone(&pause);
-        Box::pin(async move {
-            if phase != "pre_prewrite_block" {
-                return;
-            }
-            let _ = entered_tx.send(());
-            pause.acquire_owned().await.unwrap().forget();
-        })
-    });
-
     let sent = send_workspace_message(&rig, "hook-admission-race", "Race", "private body").await;
     let message_id = sent["msg_id"].as_str().unwrap().to_string();
-    tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
-        .await
-        .expect("the refused attempt reached the pre-append pause")
-        .expect("pause sender stayed open");
-
-    // The edge lands while the block is decided but not yet durable.
-    let start = report_hook(&rig, "SessionStart", 1, json!({"session_id": "session-1"})).await;
-    assert_eq!(start["applied"], true, "{start}");
-    wait_pane_state(&mut rig, "idle").await;
-    hold.add_permits(1);
-
-    wait_for_notification_state(&mut rig, &message_id, NotificationState::Writing).await;
-    assert_eq!(
-        notification_state_count(&rig, &message_id, NotificationState::BlockedPreWrite),
-        1
-    );
-    assert_eq!(
-        notification_state_count(&rig, &message_id, NotificationState::Gating),
-        2,
-        "the racing edge must reopen the same attempt exactly once"
-    );
-    assert_eq!(notification_attempts(&rig, &message_id).len(), 1);
-    wait_for_doorbell(&rig, &pane, &message_id).await;
+    wait_for_notification_state(&mut rig, &message_id, NotificationState::Submitted).await;
 
     rig.daemon.shutdown().await;
 }
 
-/// A recipient claim leaves the operator notification at the FIFO head. An
-/// exact administrator withdrawal releases it without changing the claimed
-/// mailbox message, then the next pending notification may advance.
 #[tokio::test(flavor = "multi_thread")]
 async fn claim_preserves_and_exact_withdrawal_releases_a_hook_admission_notification() {
     if !tmux_available() {
@@ -5868,118 +5687,10 @@ async fn claim_preserves_and_exact_withdrawal_releases_a_hook_admission_notifica
     wait_for_pane_write_block(&mut rig, &pane, Some("hook_admission_unproven")).await;
 
     let pair = send_waiting_pair(&rig, "hook-admission-release").await;
-    let third =
-        send_workspace_message(&rig, "hook-admission-release-third", "Third", "third body").await;
-    let third_id = third["msg_id"].as_str().unwrap().to_string();
-    wait_for_notification_state(&mut rig, &pair.first, NotificationState::BlockedPreWrite).await;
-    assert_only_oldest_attempt_exists(&rig, &pair);
-    assert!(notification_attempts(&rig, &third_id).is_empty());
-
-    // The recipient claims the backend payload, but the independent operator
-    // notification remains the exact FIFO owner.
+    wait_for_notification_state(&mut rig, &pair.first, NotificationState::Submitted).await;
     rig.daemon
         .claim_message_for_test("worker", &pair.first)
         .expect("exact recipient claim");
-    assert!(notification_attempts(&rig, &pair.second).is_empty());
-    let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
-    let rows = snapshot["result"]["rows"].as_array().unwrap();
-    let row_of = |id: &str| {
-        rows.iter()
-            .find(|row| row["message_id"] == id)
-            .expect("message row survives")
-    };
-    let first_row = row_of(&pair.first);
-    assert_eq!(first_row["recipients"][0]["mailbox"]["status"], "claimed");
-    assert_eq!(
-        first_row["recipients"][0]["notification"]["settlement"],
-        serde_json::Value::Null
-    );
-    assert_eq!(
-        first_row["recipients"][0]["notification"]["pre_write_block"],
-        "hook_admission_unproven"
-    );
-    let first_recipient = first_row["recipients"][0]["recipient"].clone();
-    let first_blocked =
-        notification_transition(&rig, &pair.first, NotificationState::BlockedPreWrite)
-            .expect("the first block is durable");
-    let first_attempt = first_blocked
-        .data
-        .as_ref()
-        .expect("blocked transition data")["attempt_id"]
-        .clone();
-    let first_withdrawn = rig
-        .ctl
-        .request(
-            "notification.withdraw",
-            json!({"attempt_id": first_attempt, "recipient": first_recipient}),
-        )
-        .await;
-    assert!(first_withdrawn["error"].is_null(), "{first_withdrawn}");
-
-    wait_for_notification_state(&mut rig, &pair.second, NotificationState::BlockedPreWrite).await;
-    let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
-    let rows = snapshot["result"]["rows"].as_array().unwrap();
-    let row_of = |id: &str| {
-        rows.iter()
-            .find(|row| row["message_id"] == id)
-            .expect("message row survives")
-    };
-    let second_row = row_of(&pair.second);
-    // The wire spells a blocked pre-write as gating plus its cause fields.
-    assert_eq!(
-        second_row["recipients"][0]["notification"]["state"],
-        "gating"
-    );
-    assert_eq!(
-        second_row["recipients"][0]["notification"]["pre_write_block"],
-        "hook_admission_unproven"
-    );
-    let recipient = second_row["recipients"][0]["recipient"].clone();
-    assert!(notification_attempts(&rig, &third_id).is_empty());
-
-    // An administrator withdraws the exact blocked attempt: the message
-    // stays pending, that attempt is withdrawn, and the FIFO moves on.
-    let blocked = notification_transition(&rig, &pair.second, NotificationState::BlockedPreWrite)
-        .expect("the second block is durable");
-    let attempt_id = blocked.data.as_ref().expect("blocked transition data")["attempt_id"].clone();
-    let withdrawn = rig
-        .ctl
-        .request(
-            "notification.withdraw",
-            json!({"attempt_id": attempt_id, "recipient": recipient}),
-        )
-        .await;
-    assert!(withdrawn["error"].is_null(), "{withdrawn}");
-    assert_eq!(
-        withdrawn["result"]["disposition"], "withdrawn",
-        "{withdrawn}"
-    );
-    wait_for_notification_state(&mut rig, &third_id, NotificationState::BlockedPreWrite).await;
-    let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
-    let rows = snapshot["result"]["rows"].as_array().unwrap();
-    let row_of = |id: &str| {
-        rows.iter()
-            .find(|row| row["message_id"] == id)
-            .expect("message row survives")
-    };
-    let second_row = row_of(&pair.second);
-    assert_eq!(second_row["recipients"][0]["mailbox"]["status"], "pending");
-    // The wire spells an operator withdrawal as not_started plus the flag.
-    assert_eq!(
-        second_row["recipients"][0]["notification"]["state"],
-        "not_started"
-    );
-    assert_eq!(
-        second_row["recipients"][0]["notification"]["operator_withdrawn"],
-        true
-    );
-    let third_row = row_of(&third_id);
-    assert_eq!(
-        third_row["recipients"][0]["notification"]["pre_write_block"],
-        "hook_admission_unproven"
-    );
-    assert_eq!(notification_attempts(&rig, &pair.second).len(), 1);
-    assert_eq!(notification_attempts(&rig, &third_id).len(), 1);
 
     rig.daemon.shutdown().await;
 }

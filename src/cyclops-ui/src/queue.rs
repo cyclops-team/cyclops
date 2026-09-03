@@ -354,6 +354,9 @@ impl Default for QueueRow {
 impl QueueRow {
     /// Does this row say a human is needed?
     pub fn needs_human(&self) -> bool {
+        if self.mailbox == MailboxWord::Claimed && self.wake == WakeWord::BlockedBeforeWrite {
+            return false;
+        }
         matches!(
             self.wake,
             WakeWord::NeedsAttention

@@ -285,6 +285,10 @@ pub enum Action {
     /// One verb clicked in the Messages pane's action strip, dispatched through
     /// the same handler its key press reaches.
     MessagesVerb(cyclops_ui::ChatAction),
+    /// Wipe or unblock an agent's composer draft via C-u / Backspace chord.
+    ClearPaneComposer {
+        pane_id: String,
+    },
     /// Show or hide the tab strip. Visible is the default and hiding is an
     /// explicit choice, so the `+` that makes tabs is on screen from a
     /// fresh install; the choice persists like the sidebar's.
@@ -780,6 +784,11 @@ pub fn route_mouse_click(target: &HitTarget, button: MouseButton) -> Option<Acti
         }
         (HitTarget::AttentionIndicator { pane_id }, MouseButton::Left) => {
             Some(pane_focus(pane_id.clone()))
+        }
+        (HitTarget::PaneClear { pane_id }, MouseButton::Left) => {
+            Some(Action::ClearPaneComposer {
+                pane_id: pane_id.clone(),
+            })
         }
         // Left-down on a sidebar agent starts a reorder drag instead; only
         // the right-click (which never drags) focuses immediately, matching

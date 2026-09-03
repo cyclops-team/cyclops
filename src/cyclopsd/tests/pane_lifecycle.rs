@@ -53,3 +53,21 @@ async fn a_pane_leaving_the_table_is_announced_to_subscribers() {
 
     rig.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_reset_rpc_prunes_dead_panes_and_cleanses_status() {
+    if !tmux_available() {
+        eprintln!("skipping: tmux not on PATH");
+        return;
+    }
+    let mut rig = Rig::new("resetrpc", CAT_MANIFEST, "cat", "").await;
+    rig.wait_attached(1).await;
+    rig.tmux.run_ok(&["split-window", "-t", "main", "cat"]);
+    rig.wait_attached(2).await;
+
+    let res = rig.ctl.request("status.reset", json!({})).await;
+    assert_eq!(res["result"]["reset"], true);
+    assert_eq!(res["result"]["active_panes"], 2);
+
+    rig.shutdown().await;
+}
