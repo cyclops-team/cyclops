@@ -70,6 +70,9 @@ fn install_writes_the_default_dest_and_prints_the_wiring() {
         ("codex", "hooks.json"),
         ("agy", "hooks.json"),
         ("cursor", "hooks.json"),
+        ("gemini", "settings.json"),
+        ("qwen", "settings.json"),
+        ("goose", "hooks.json"),
     ];
     let mut artifacts = Vec::new();
 
@@ -84,7 +87,9 @@ fn install_writes_the_default_dest_and_prints_the_wiring() {
         let text = fs::read_to_string(&path).expect("rendered hook artifact");
         let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
         assert!(value.is_object(), "{vendor}: {text}");
-        if vendor == "claude" {
+        // Claude and the vendors added after it carry no label: the daemon
+        // derives the reporter from the authenticated socket peer.
+        if matches!(vendor, "claude" | "gemini" | "qwen" | "goose") {
             assert!(!text.contains("--agent"), "{vendor}: {text}");
         } else {
             assert!(text.contains("--agent reviewer"), "{vendor}: {text}");
@@ -117,7 +122,7 @@ fn install_writes_the_default_dest_and_prints_the_wiring() {
     // collide. A second prepare is byte-for-byte stable and leaves no temp
     // artifacts behind.
     let paths: Vec<_> = artifacts.iter().map(|(path, _)| path).collect();
-    assert_eq!(paths.len(), 4);
+    assert_eq!(paths.len(), vendors.len());
     for left in 0..paths.len() {
         for right in (left + 1)..paths.len() {
             assert_ne!(paths[left], paths[right]);

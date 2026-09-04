@@ -508,7 +508,7 @@ run "$CYC" start --setup-only --plain
 check "setup writes the config"           'wrote .*/config\.toml$'
 check "setup installs the themes"         '^  wrote 17 themes to .*/themes$'
 check "setup installs the sounds"         '^  wrote 2 sounds to .*/sounds$'
-check "setup installs the manifests"      '^  wrote 5 detection manifests to .*/manifests$'
+check "setup installs the manifests"      '^  wrote 12 detection manifests to .*/manifests$'
 
 # The stand-in's own manifest, written the way docs/reference/MANIFESTS.md says to
 # write one: a file in the home directory the daemon reads at boot. It
@@ -985,7 +985,7 @@ printf '\n$ cd ~/scratch && cyclops start --setup-only\n'
 duo "$CYC" start --setup-only --plain > "$OUT" 2>&1
 cat "$OUT"
 check "setup writes the config"           'wrote .*/config\.toml$'
-check "and installs the manifests"        '^  wrote 5 detection manifests to .*/manifests$'
+check "and installs the manifests"        '^  wrote 12 detection manifests to .*/manifests$'
 check_absent "and opens nothing"          'workspace ready'
 
 printf '%s\n' 'set-option -g exit-empty off' 'set-option -g exit-unattached off' \

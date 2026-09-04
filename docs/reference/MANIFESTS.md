@@ -4,10 +4,18 @@ Everything cyclops knows about an agent CLI is one TOML file: which
 processes it runs as, how to tell working from idle by looking at the pane,
 and how to type into it. No code, no plugin, no wrapper around the CLI.
 
-Four ship inside the `cyclops` binary and land in `~/.cyclops/manifests`
-on your first `cyclops start`: `claude.toml`, `codex.toml`, `agy.toml`,
-`cursor.toml`. Their source is [`resources/manifests/`](../../resources/manifests/). A fifth is
-three steps away.
+Twelve ship inside the `cyclops` binary and land in `~/.cyclops/manifests`
+on your first `cyclops start`. Five are measured against a live CLI:
+`claude.toml`, `codex.toml`, `agy.toml`, `cursor.toml`, `kimi.toml`. Seven
+are written from vendor documentation alone and say so with
+`version_tested = "unverified"`: `gemini.toml`, `qwen.toml`, `goose.toml`,
+`opencode.toml`, `amp.toml`, `crush.toml`, `aider.toml`. An unverified file
+binds the pane, declares the hook events the vendor documents, and carries
+no idle or working rule, so a delivery to that pane fails closed
+(`not write-ready`) until someone measures its composer and edits the file.
+Each header names its sources and what was and was not observed. Their
+source is [`resources/manifests/`](../../resources/manifests/). A
+thirteenth is three steps away.
 
 ## Add one
 
@@ -123,6 +131,15 @@ name for the resolved executable, so a native Claude install, where
 `~/.local/bin/claude` is a symlink into `versions/2.1.220`, reports
 `2.1.220` and `process_names = ["claude"]` never matches. Cyclops falls back
 to reading the pane process's argv.
+
+A CLI that runs under an interpreter defeats both lists today. MEASURED on
+Gemini CLI 0.45.2: `gemini` is a Node script, so `#{pane_current_command}`
+reads `node` and `ps -o args=` on the pane's foreground process reads
+`node /.../bin/gemini`; the daemon takes only the first argv token. Qwen
+Code and Amp are Node scripts and aider is a Python script, so the same
+holds for them. Never list the interpreter name: `node` would claim every
+Node pane on the machine. Pin those panes by hand until the daemon reads
+the script path behind an interpreter.
 
 When neither list matches, the pane reads `? unknown` and nothing addresses
 it. `cyclops name %4 reviewer --manifest demo` pins one by hand; the pin

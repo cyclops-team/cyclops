@@ -159,7 +159,7 @@ $ cyclops start --setup-only
   wrote /Users/you/.cyclops/config.toml
   wrote 17 themes to /Users/you/.cyclops/themes
   wrote 2 sounds to /Users/you/.cyclops/sounds
-  wrote 5 detection manifests to /Users/you/.cyclops/manifests
+  wrote 12 detection manifests to /Users/you/.cyclops/manifests
 ```
 
 Two things, and both matter. The config says which tmux sessions to watch.
@@ -178,14 +178,26 @@ final Cyclops skill file at the canonical destination for each installed
 consumer:
 
 - Claude Code: `~/.claude/skills/cyclops/SKILL.md`
-- Codex and Cursor: `~/.agents/skills/cyclops/SKILL.md`
 - Antigravity CLI: `~/.gemini/antigravity-cli/skills/cyclops/SKILL.md`
+- Kimi Code CLI: `~/.kimi-code/skills/cyclops/SKILL.md`
+- Qwen Code: `~/.qwen/skills/cyclops/SKILL.md`
+- Codex, Cursor, Gemini CLI, goose, OpenCode, Amp, and Crush:
+  `~/.agents/skills/cyclops/SKILL.md`
 
-Codex and Cursor share one copy. Codex is installed when `$CODEX_HOME`, or
-`~/.codex` when unset, exists; Cursor is installed when `~/.cursor` exists.
-The shared destination alone does not trigger either consumer. Claude Code
-requires `~/.claude`, and Antigravity CLI requires
-`~/.gemini/antigravity-cli`. Setup creates no home for an absent
+Every CLI that reads `~/.agents/skills` shares that one copy, because a
+vendor that reads two of its skill roots warns about the duplicate (Gemini
+CLI 0.45.2 prints "Skill conflict detected" when `~/.gemini/skills` and
+`~/.agents/skills` hold the same skill). A consumer counts as installed when
+its own config directory exists: `$CODEX_HOME` or `~/.codex`, `~/.cursor`,
+`~/.config/goose`, `~/.config/opencode`, `~/.config/amp`, `~/.config/crush`.
+Gemini CLI is the exception: Antigravity CLI lives under
+`~/.gemini/antigravity-cli`, so `~/.gemini` exists on every AGY machine, and
+Cyclops instead requires `~/.gemini/tmp` (under `$GEMINI_CLI_HOME` when set),
+which Gemini CLI creates the first time it starts and AGY never does. The
+shared destination alone does not trigger any of them. Claude Code requires
+`~/.claude`, Antigravity CLI `~/.gemini/antigravity-cli`, Kimi `~/.kimi-code`
+(or `$KIMI_CODE_HOME`), and Qwen `~/.qwen` (or `$QWEN_HOME`). Setup creates
+no home for an absent
 consumer and never seeds duplicate skill locations. Skill seeding never
 creates `.agents`, `skills`, or `cyclops` directories: it creates only a
 missing final `SKILL.md` below an existing private canonical parent. A missing
@@ -476,7 +488,7 @@ $ cyclops status
 
   %0  ? unknown  zsh
 
-  1 pane reads unknown: none of agy, claude, codex, cursor matches what is running there. Nothing can be delivered to an unknown pane. Pin one: cyclops name %0 <label> --manifest <id>. Teaching cyclops a new CLI is one file: docs/reference/MANIFESTS.md.
+  1 pane reads unknown: none of agy, aider, amp, claude, codex, crush, cursor, gemini, goose, kimi, opencode, qwen matches what is running there. Nothing can be delivered to an unknown pane. Pin one: cyclops name %0 <label> --manifest <id>. Teaching cyclops a new CLI is one file: docs/reference/MANIFESTS.md.
 ```
 
 With no manifests at all it says that instead, because the fix is the
@@ -486,12 +498,34 @@ whole install and not one pane:
   1 pane reads unknown: cyclopsd loaded no detection manifests. Nothing can be delivered to an unknown pane. Install them and restart: cyclops start, then restart cyclopsd.
 ```
 
-The shipped manifests cover Claude Code, Codex CLI, Antigravity CLI,
-Cursor Agent CLI, and Kimi CLI. Cursor detection has fixture coverage, but the current-version
-terminal notification path has not completed live validation because no current
-Cursor binary was available on the evidence host. It fails closed when exact
-evidence is unavailable; socket claims remain usable. See
-[Known limits](../../STATUS.md#known-limits).
+Twelve manifests ship. Five are measured against a live CLI; seven are
+written from vendor documentation and say so (`version_tested =
+"unverified"`): they bind the pane and seed the skill, and a delivery to
+one of them fails closed until someone measures its composer.
+
+| CLI | manifest id | tier | binds the pane by | hooks Cyclops wires | skill file |
+|---|---|---|---|---|---|
+| Claude Code | `claude` | verified | process and argv | `~/.claude/settings.json` | `~/.claude/skills/cyclops/SKILL.md` |
+| Codex CLI | `codex` | verified | process | `$CODEX_HOME/hooks.json` | `~/.agents/skills/cyclops/SKILL.md` |
+| Antigravity CLI | `agy` | verified | process | `~/.agents/hooks.json` | `~/.gemini/antigravity-cli/skills/cyclops/SKILL.md` |
+| Cursor Agent CLI | `cursor` | verified (fixtures) | argv | `~/.cursor/hooks.json` | `~/.agents/skills/cyclops/SKILL.md` |
+| Kimi Code CLI | `kimi` | verified | process and argv | `~/.kimi-code/config.toml` | `~/.kimi-code/skills/cyclops/SKILL.md` |
+| Gemini CLI | `gemini` | unverified | pin by hand (Node script) | `~/.gemini/settings.json` | `~/.agents/skills/cyclops/SKILL.md` |
+| Qwen Code | `qwen` | unverified | pin by hand (Node script) | `~/.qwen/settings.json` | `~/.qwen/skills/cyclops/SKILL.md` |
+| goose | `goose` | unverified | process `goose` | `~/.agents/plugins/cyclops/hooks/hooks.json` | `~/.agents/skills/cyclops/SKILL.md` |
+| OpenCode | `opencode` | unverified | process `opencode` | none (JavaScript plugin API only) | `~/.agents/skills/cyclops/SKILL.md` |
+| Amp | `amp` | unverified | pin by hand (Node script) | none (TypeScript plugin API only) | `~/.agents/skills/cyclops/SKILL.md` |
+| Crush | `crush` | unverified | process `crush` | none (`PreToolUse` only; see hooks.md) | `~/.agents/skills/cyclops/SKILL.md` |
+| aider | `aider` | unverified | pin by hand (Python script) | none | none (add the skill to `read:`) |
+
+"Pin by hand" means `cyclops name %N <label> --manifest <id>`: a CLI that
+runs under an interpreter reports `node` or `python` as its command, so no
+manifest can bind it automatically yet ([MANIFESTS.md](../reference/MANIFESTS.md)
+explains the measurement). Cursor detection has fixture coverage, but the
+current-version terminal notification path has not completed live
+validation because no current Cursor binary was available on the evidence
+host. It fails closed when exact evidence is unavailable; socket claims
+remain usable. See [Known limits](../../STATUS.md#known-limits).
 Teaching it another one is a single TOML file:
 [MANIFESTS.md](../reference/MANIFESTS.md). More symptoms and their next steps:
 [troubleshooting.md](troubleshooting.md).

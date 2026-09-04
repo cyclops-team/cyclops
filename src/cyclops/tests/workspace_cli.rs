@@ -718,7 +718,7 @@ fn setup_only_writes_the_home_and_opens_nothing() {
     let text = stdout(&out);
     assert!(text.starts_with("✔ cyclops is set up\n"), "got {text:?}");
     assert!(text.contains("config.toml"), "{text}");
-    assert!(text.contains("5 detection manifests"), "{text}");
+    assert!(text.contains("12 detection manifests"), "{text}");
     // No workspace, so no next steps: whoever called this owns what comes
     // after it.
     assert!(!text.contains("Next:"), "{text}");
@@ -1193,7 +1193,7 @@ fn setup_check_reports_an_incomplete_empty_home_without_writing() {
             .iter()
             .map(|row| row["id"].as_str().expect("consumer id"))
             .collect::<Vec<_>>(),
-        ["claude", "codex", "cursor", "agy", "kimi"]
+        ["claude", "codex", "cursor", "agy", "kimi", "gemini", "qwen", "goose"]
     );
     assert_eq!(
         consumers[0]["skill"]["path"],
@@ -1243,7 +1243,7 @@ fn setup_plan_is_body_free_read_only_and_ignores_uninstalled_consumers() {
     assert_eq!(plan["apply_available"], false, "{plan}");
     assert!(plan.get("apply").is_none(), "{plan}");
     let assets = plan["assets"].as_array().expect("plan assets");
-    assert_eq!(assets.len(), 5, "{plan}");
+    assert_eq!(assets.len(), 12, "{plan}");
     for asset in assets {
         assert_eq!(asset["kind"], "manifest", "{asset}");
         assert_eq!(asset["observed_state"], "missing", "{asset}");
@@ -1970,6 +1970,11 @@ fn setup_check_reports_complete_setup_and_changes_no_metadata() {
         user.join(".cursor"),
         user.join(".gemini/antigravity-cli"),
         user.join(".kimi-code"),
+        // Gemini CLI proves itself with its tmp directory, not ~/.gemini,
+        // which Antigravity also creates.
+        user.join(".gemini/tmp"),
+        user.join(".qwen"),
+        user.join(".config/goose"),
     ] {
         fs::create_dir_all(consumer).expect("create consumer home");
     }

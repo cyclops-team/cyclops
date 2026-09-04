@@ -1262,15 +1262,10 @@ fn wire_vendor_homes() -> (
 /// Claude receives both this safe merge for normal direct launches and a
 /// per-pane settings file when Cyclops starts the pane itself.
 fn wire_installed_vendors() -> Vec<crate::hookset::WiredVendor> {
-    use crate::hookset::CliKind;
     let mut out = Vec::new();
-    for kind in [
-        CliKind::Claude,
-        CliKind::Codex,
-        CliKind::Agy,
-        CliKind::Cursor,
-        CliKind::Kimi,
-    ] {
+    // The consumer catalog is the one list of hook-wired vendors; a vendor
+    // added there is wired here without a second list to forget.
+    for kind in crate::consumer::SHIPPED.iter().map(|spec| spec.kind) {
         match crate::hookset::wire_vendor(kind) {
             Ok(Some(w)) => out.push(w),
             // Not installed is ordinary and not worth a line.

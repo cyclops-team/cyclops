@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook SessionStart" } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook UserPromptSubmit" } ] }
+    ],
+    "PreToolUse": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook PreToolUse" } ] }
+    ],
+    "PostToolUse": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook PostToolUse" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook Stop" } ] }
+    ],
+    "StopFailure": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook StopFailure" } ] }
+    ],
+    "Notification": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook Notification" } ] }
+    ],
+    "PermissionRequest": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook PermissionRequest" } ] }
+    ]
+  }
+}

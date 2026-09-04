@@ -1,0 +1,22 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook SessionStart" } ] }
+    ],
+    "BeforeAgent": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook BeforeAgent" } ] }
+    ],
+    "BeforeTool": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook BeforeTool" } ] }
+    ],
+    "AfterTool": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook AfterTool" } ] }
+    ],
+    "AfterAgent": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook AfterAgent" } ] }
+    ],
+    "Notification": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook Notification" } ] }
+    ]
+  }
+}

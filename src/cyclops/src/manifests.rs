@@ -34,6 +34,14 @@ const SHIPPED: &[(&str, &str)] = &[
         include_str!("../../../resources/manifests/agy.toml"),
     ),
     (
+        "aider.toml",
+        include_str!("../../../resources/manifests/aider.toml"),
+    ),
+    (
+        "amp.toml",
+        include_str!("../../../resources/manifests/amp.toml"),
+    ),
+    (
         "claude.toml",
         include_str!("../../../resources/manifests/claude.toml"),
     ),
@@ -42,12 +50,32 @@ const SHIPPED: &[(&str, &str)] = &[
         include_str!("../../../resources/manifests/codex.toml"),
     ),
     (
+        "crush.toml",
+        include_str!("../../../resources/manifests/crush.toml"),
+    ),
+    (
         "cursor.toml",
         include_str!("../../../resources/manifests/cursor.toml"),
     ),
     (
+        "gemini.toml",
+        include_str!("../../../resources/manifests/gemini.toml"),
+    ),
+    (
+        "goose.toml",
+        include_str!("../../../resources/manifests/goose.toml"),
+    ),
+    (
         "kimi.toml",
         include_str!("../../../resources/manifests/kimi.toml"),
+    ),
+    (
+        "opencode.toml",
+        include_str!("../../../resources/manifests/opencode.toml"),
+    ),
+    (
+        "qwen.toml",
+        include_str!("../../../resources/manifests/qwen.toml"),
     ),
 ];
 
@@ -153,6 +181,13 @@ const EVER_SHIPPED_FNV64: &[&str] = &[
     "b327aa8824a51b94",
     "38c8d60f54914523",
     "16f1cc714b44548c",
+    "32cbf16f4ecde8e9",
+    "df257d8320645462",
+    "7de414306cccebc3",
+    "5be3ed83f3683522",
+    "f519b6f9f9a6cbb4",
+    "d184c3a8a39327f5",
+    "d4a0c49fff22fe23",
 ];
 
 /// True when these bytes are a manifest this project released, so setup can

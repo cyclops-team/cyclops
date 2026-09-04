@@ -40,6 +40,9 @@ const CODEX_TMPL: &str = include_str!("../../../resources/hooks/codex/hooks.json
 const AGY_TMPL: &str = include_str!("../../../resources/hooks/agy/hooks.json.tmpl");
 const CURSOR_TMPL: &str = include_str!("../../../resources/hooks/cursor/hooks.json.tmpl");
 const KIMI_TMPL: &str = include_str!("../../../resources/hooks/kimi/config.toml.tmpl");
+const GEMINI_TMPL: &str = include_str!("../../../resources/hooks/gemini/settings.json.tmpl");
+const QWEN_TMPL: &str = include_str!("../../../resources/hooks/qwen/settings.json.tmpl");
+const GOOSE_TMPL: &str = include_str!("../../../resources/hooks/goose/hooks.json.tmpl");
 
 /// Read timeout for hooks.selftest: the daemon waits up to 10s for the
 /// delivery to resolve, so the client waits a little longer.
@@ -55,6 +58,7 @@ const VENDOR_DIRS: &[&str] = &[
     ".cursor",
     ".kimi",
     ".kimi-code",
+    ".qwen",
 ];
 
 /// The receipt install drops beside every artifact it prepares.
@@ -76,6 +80,9 @@ pub enum CliKind {
     Agy,
     Cursor,
     Kimi,
+    Gemini,
+    Qwen,
+    Goose,
 }
 
 impl CliKind {
@@ -86,14 +93,17 @@ impl CliKind {
             CliKind::Agy => AGY_TMPL,
             CliKind::Cursor => CURSOR_TMPL,
             CliKind::Kimi => KIMI_TMPL,
+            CliKind::Gemini => GEMINI_TMPL,
+            CliKind::Qwen => QWEN_TMPL,
+            CliKind::Goose => GOOSE_TMPL,
         }
     }
 
     /// Rendered file name in the destination directory.
     fn file_name(self) -> &'static str {
         match self {
-            CliKind::Claude => "settings.json",
-            CliKind::Codex | CliKind::Agy | CliKind::Cursor => "hooks.json",
+            CliKind::Claude | CliKind::Gemini | CliKind::Qwen => "settings.json",
+            CliKind::Codex | CliKind::Agy | CliKind::Cursor | CliKind::Goose => "hooks.json",
             CliKind::Kimi => "config.toml",
         }
     }
@@ -105,6 +115,9 @@ impl CliKind {
             CliKind::Agy => "agy",
             CliKind::Cursor => "cursor",
             CliKind::Kimi => "kimi",
+            CliKind::Gemini => "gemini",
+            CliKind::Qwen => "qwen",
+            CliKind::Goose => "goose",
         }
     }
 
@@ -118,6 +131,9 @@ impl CliKind {
             "agy" => Some(CliKind::Agy),
             "cursor" => Some(CliKind::Cursor),
             "kimi" => Some(CliKind::Kimi),
+            "gemini" => Some(CliKind::Gemini),
+            "qwen" => Some(CliKind::Qwen),
+            "goose" => Some(CliKind::Goose),
             _ => None,
         }
     }
@@ -796,6 +812,56 @@ fn instructions(kind: CliKind, rendered: &Path, label: &str) -> String {
              \x20 cyclops start --setup-only --wire-hooks\n\
              \n\
              then restart Kimi.\n\
+             Then prove it fires: cyclops hooks selftest {label}"
+        ),
+        CliKind::Gemini => format!(
+            "Wire it (Gemini reads the hooks object in ~/.gemini/settings.json;\n\
+             GEMINI_CLI_HOME relocates that directory):\n\
+             \n\
+             If ~/.gemini/settings.json does not exist, copy {p} there.\n\
+             If it already exists, merge only Cyclops' event entries from {p};\n\
+             preserve every unrelated setting and handler. Never overwrite it.\n\
+             \n\
+             For automatic wiring, run:\n\
+             \n\
+             \x20 cyclops start --setup-only --wire-hooks\n\
+             \n\
+             then restart Gemini and check that /hooks panel lists the entries.\n\
+             This vendor is unverified: no Gemini edge has been measured yet.\n\
+             Then prove it fires: cyclops hooks selftest {label}"
+        ),
+        CliKind::Qwen => format!(
+            "Wire it (Qwen Code reads the hooks object in ~/.qwen/settings.json;\n\
+             QWEN_HOME relocates that directory):\n\
+             \n\
+             If ~/.qwen/settings.json does not exist, copy {p} there.\n\
+             If it already exists, merge only Cyclops' event entries from {p};\n\
+             preserve every unrelated setting and handler. Never overwrite it.\n\
+             \n\
+             For automatic wiring, run:\n\
+             \n\
+             \x20 cyclops start --setup-only --wire-hooks\n\
+             \n\
+             then restart Qwen Code.\n\
+             This vendor is unverified: no Qwen edge has been measured yet.\n\
+             Then prove it fires: cyclops hooks selftest {label}"
+        ),
+        CliKind::Goose => format!(
+            "Wire it (goose discovers hooks from plugin directories, never from\n\
+             config.yaml):\n\
+             \n\
+             If ~/.agents/plugins/cyclops/hooks/hooks.json does not exist, copy {p}\n\
+             there. If it already exists, merge only Cyclops' event entries from\n\
+             {p}; preserve every unrelated handler. Never overwrite it. No\n\
+             plugin.json is needed: goose names a hook-only plugin after its\n\
+             directory.\n\
+             \n\
+             For automatic wiring, run:\n\
+             \n\
+             \x20 cyclops start --setup-only --wire-hooks\n\
+             \n\
+             then restart goose.\n\
+             This vendor is unverified: no goose edge has been measured yet.\n\
              Then prove it fires: cyclops hooks selftest {label}"
         ),
     }
@@ -1778,6 +1844,9 @@ mod tests {
             (CliKind::Agy, "hooks.json"),
             (CliKind::Cursor, "hooks.json"),
             (CliKind::Kimi, "config.toml"),
+            (CliKind::Gemini, "settings.json"),
+            (CliKind::Qwen, "settings.json"),
+            (CliKind::Goose, "hooks.json"),
         ] {
             let p = vendor_hook_file(kind).expect("has a discovered path");
             assert_eq!(p.file_name().unwrap(), file);
@@ -1801,6 +1870,9 @@ mod tests {
             (CliKind::Agy, "agy.hooks.json"),
             (CliKind::Cursor, "cursor.hooks.json"),
             (CliKind::Kimi, "kimi.config.toml"),
+            (CliKind::Gemini, "gemini.settings.json"),
+            (CliKind::Qwen, "qwen.settings.json"),
+            (CliKind::Goose, "goose.hooks.json"),
         ] {
             assert_eq!(
                 render(kind, GOLDEN_LABEL, GOLDEN_BIN),
@@ -1817,17 +1889,29 @@ mod tests {
             CliKind::Codex,
             CliKind::Agy,
             CliKind::Cursor,
+            CliKind::Gemini,
+            CliKind::Qwen,
+            CliKind::Goose,
         ] {
             let out = render(kind, GOLDEN_LABEL, GOLDEN_BIN);
             let v: serde_json::Value = serde_json::from_str(&out)
                 .unwrap_or_else(|e| panic!("{} render is not JSON: {e}", kind.name()));
             // No placeholder survives rendering.
             assert!(!out.contains("{label}") && !out.contains("{cyclops_bin}"));
-            // Every registered command is self-tagging. Claude omits the
-            // mutable display label and relies on authenticated peer identity.
+            // Every registered command is self-tagging. Claude and the vendors
+            // added after it omit the mutable display label and rely on
+            // authenticated peer identity.
             let text = v.to_string();
-            if kind == CliKind::Claude {
-                assert!(!text.contains("--agent"), "Claude config embeds a label");
+            let peer_identified = matches!(
+                kind,
+                CliKind::Claude | CliKind::Gemini | CliKind::Qwen | CliKind::Goose
+            );
+            if peer_identified {
+                assert!(
+                    !text.contains("--agent"),
+                    "{} config embeds a label",
+                    kind.name()
+                );
             } else {
                 assert!(
                     text.contains(&format!("--agent {GOLDEN_LABEL}")),
@@ -1836,6 +1920,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// goose matchers are regexes, and a bare "*" is an invalid regex that
+    /// makes goose skip the whole rule without a visible error (documented).
+    /// Omitting the matcher is the only way to register for every event.
+    #[test]
+    fn goose_rules_declare_no_matcher() {
+        let v: serde_json::Value = serde_json::from_str(&render(CliKind::Goose, "r", "c")).unwrap();
+        let hooks = v["hooks"].as_object().expect("hooks object");
+        let mut events: Vec<&String> = hooks.keys().collect();
+        events.sort();
+        assert_eq!(
+            events,
+            [
+                "PostToolUse",
+                "PreToolUse",
+                "SessionStart",
+                "Stop",
+                "UserPromptSubmit"
+            ]
+        );
+        for (event, entries) in hooks {
+            for entry in entries.as_array().expect("rule array") {
+                assert!(entry.get("matcher").is_none(), "{event} carries a matcher");
+            }
+        }
+    }
+
+    /// Gemini names its prompt edge BeforeAgent and its end AfterAgent, and
+    /// the manifest declares those same names. A template drifting to
+    /// Claude's event names would register hooks the daemon never classifies.
+    #[test]
+    fn gemini_registers_the_agent_edges_the_manifest_declares() {
+        let v: serde_json::Value =
+            serde_json::from_str(&render(CliKind::Gemini, "r", "c")).unwrap();
+        let mut events: Vec<&String> = v["hooks"].as_object().unwrap().keys().collect();
+        events.sort();
+        assert_eq!(
+            events,
+            [
+                "AfterAgent",
+                "AfterTool",
+                "BeforeAgent",
+                "BeforeTool",
+                "Notification",
+                "SessionStart"
+            ]
+        );
     }
 
     #[test]

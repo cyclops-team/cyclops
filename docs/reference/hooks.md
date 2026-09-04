@@ -22,14 +22,19 @@ $CYCLOPS_HOME/hooks/claude/<label>/settings.json
 $CYCLOPS_HOME/hooks/codex/<label>/hooks.json
 $CYCLOPS_HOME/hooks/agy/<label>/hooks.json
 $CYCLOPS_HOME/hooks/cursor/<label>/hooks.json
+$CYCLOPS_HOME/hooks/kimi/<label>/config.toml
+$CYCLOPS_HOME/hooks/gemini/<label>/settings.json
+$CYCLOPS_HOME/hooks/qwen/<label>/settings.json
+$CYCLOPS_HOME/hooks/goose/<label>/hooks.json
 ```
 
 For example, `cyclops hooks install codex --agent reviewer` prepares
 `$CYCLOPS_HOME/hooks/codex/reviewer/hooks.json`. `--dry-run` prints without
 writing, and `--dest <dir>` remains an explicit directory: the selected
 vendor file is written directly inside that directory. Cyclops refuses to
-write into `~/.claude`, `~/.codex`, `~/.gemini`, or any `.agents` or `.cursor`
-directory: you wire your real setup once, deliberately. The prepare uses a
+write into `~/.claude`, `~/.codex`, `~/.gemini`, `~/.kimi-code`, `~/.qwen`,
+or any `.agents` or `.cursor` directory: you wire your real setup once,
+deliberately. The prepare uses a
 same-directory temporary file and atomic rename, so an interrupted write
 cannot leave partial JSON. Templates live in `resources/hooks/` in the repo.
 
@@ -65,6 +70,37 @@ Wiring per CLI:
   prompt text and could match an exact payload. No current Cursor binary was
   available for the release validation run, so that historical measurement is
   not a current verified-tier claim. Current unknowns fail closed.
+- **kimi**: if `~/.kimi-code/config.toml` does not exist, copy the rendered
+  artifact there. If it exists, merge only Cyclops' `[[hooks]]` entries,
+  preserving every unrelated key and handler; never overwrite it. Restart
+  Kimi afterwards.
+
+Three more vendors are wired from their documentation alone. No edge from
+any of them has been measured by Cyclops yet, so each is best effort until
+`cyclops hooks verify` shows edges arriving:
+
+- **gemini**: merge the `hooks` object into `~/.gemini/settings.json`
+  (`GEMINI_CLI_HOME` relocates that directory). Its events are Gemini's own
+  names: `BeforeAgent` carries the prompt and is the dispatch candidate,
+  `AfterAgent` and the tool events are liveness telemetry. `/hooks panel`
+  inside Gemini lists what loaded.
+- **qwen**: merge the `hooks` object into `~/.qwen/settings.json`
+  (`QWEN_HOME` relocates that directory). The shape and event names are
+  Claude's; `UserPromptSubmit` carries `prompt`.
+- **goose**: goose reads hooks from plugin directories, never from
+  `config.yaml`. Place the rendered file at
+  `~/.agents/plugins/cyclops/hooks/hooks.json`; a hook-only plugin needs no
+  `plugin.json`. `UserPromptSubmit` carries the prompt in `message`. No
+  entry declares a matcher: goose matchers are regexes and a bare `*` makes
+  it skip the rule silently.
+
+Four shipped manifests carry no hook wiring because the vendor offers no
+shell-command hook: OpenCode exposes lifecycle events only to JavaScript
+plugins, Amp only to TypeScript plugins and fixed `amp.hooks` action types,
+Crush documents `PreToolUse` alone (wire it by hand with
+`hook add PreToolUse --name cyclops --command "cyclops hook PreToolUse"` in
+`~/.config/crush/crushrc` for tool-activity liveness), and aider has no hook
+mechanism. Those manifests bind the pane and seed the skill, nothing more.
 
 For every vendor, a missing destination can receive the prepared file. An
 existing destination must be merged by hand so existing handlers and unrelated
@@ -78,10 +114,14 @@ reload is needed, run the selftest after reloading or restarting it.
 the one opt-in that lets cyclops do the wiring above itself: it merges
 cyclops' hook entries into the config each installed vendor CLI reads on
 its own (`~/.claude/settings.json`, `$CODEX_HOME/hooks.json`,
-`~/.agents/hooks.json`, `~/.cursor/hooks.json`). It also seeds the same agent skill at each canonical
-destination: `~/.claude/skills/cyclops/SKILL.md`, one shared
-`~/.agents/skills/cyclops/SKILL.md` for Codex and Cursor, and
-`~/.gemini/antigravity-cli/skills/cyclops/SKILL.md` for AGY. It creates only a
+`~/.agents/hooks.json`, `~/.cursor/hooks.json`, `~/.kimi-code/config.toml`,
+`~/.gemini/settings.json`, `~/.qwen/settings.json`,
+`~/.agents/plugins/cyclops/hooks/hooks.json`). It also seeds the same agent
+skill at each canonical destination: `~/.claude/skills/cyclops/SKILL.md`,
+`~/.kimi-code/skills/cyclops/SKILL.md`, `~/.qwen/skills/cyclops/SKILL.md`,
+`~/.gemini/antigravity-cli/skills/cyclops/SKILL.md` for AGY, and one shared
+`~/.agents/skills/cyclops/SKILL.md` for every CLI that reads that directory:
+Codex, Cursor, Gemini, goose, OpenCode, Amp, and Crush. It creates only a
 missing final skill file below an existing private canonical parent, never a
 consumer skill directory or duplicate vendor copy. A vendor directory that
 does not exist is never created, your own entries are merged around rather

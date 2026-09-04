@@ -77,6 +77,85 @@ fn shipped_composer_semantics_match_measured_rules_only() {
     );
 }
 
+/// Manifests written from vendor documentation alone say so, and claim
+/// nothing a live capture has not proven: no rule reads idle or working (so
+/// none can confirm or end a turn), no composer meaning, no clear keys, and
+/// delivery stays gated on an idle verdict that no shipped rule of theirs can
+/// produce. Promoting one means a measured fixture, a real `version_tested`,
+/// and leaving this list.
+#[test]
+fn documentation_only_manifests_claim_no_measured_behavior() {
+    let all = shipped();
+    let unverified = [
+        "aider", "amp", "crush", "gemini", "goose", "opencode", "qwen",
+    ];
+    for id in unverified {
+        let manifest = &all[id];
+        assert_eq!(manifest.agent.id, id);
+        assert_eq!(manifest.agent.version_tested, "unverified", "{id}");
+        assert!(
+            !manifest.agent.process_names.is_empty() && !manifest.agent.argv_basenames.is_empty(),
+            "{id} binds nothing"
+        );
+        for rule in &manifest.rules {
+            assert!(
+                matches!(rule.state, AgentState::Unknown | AgentState::BlockedModal),
+                "{id}/{} claims a state only a measurement can back",
+                rule.id
+            );
+            assert!(rule.composer_semantic.is_none(), "{id}/{}", rule.id);
+            assert!(
+                !rule.auto_dismiss,
+                "{id}/{} presses keys unmeasured",
+                rule.id
+            );
+        }
+        assert!(manifest.injection.clear_keys.is_empty(), "{id}");
+        assert!(manifest.injection.verify_before_submit, "{id}");
+        assert_eq!(manifest.injection.safe_states, ["idle"], "{id}");
+    }
+    // Five measured manifests plus the seven above.
+    assert_eq!(all.len(), 12, "{:?}", all.keys().collect::<Vec<_>>());
+}
+
+/// Each wired documentation-only vendor names the payload field its prompt
+/// event carries, because that is what a dispatch ACK reads: BeforeAgent's
+/// `prompt` on Gemini, UserPromptSubmit's `prompt` on Qwen, and goose's
+/// UserPromptSubmit `message`. The vendors without a shell hook declare
+/// no ack at all, so the receipt floor fails closed for them.
+#[test]
+fn documentation_only_hooks_declare_what_the_docs_say() {
+    let all = shipped();
+    for (id, start, field) in [
+        ("gemini", "BeforeAgent", "prompt"),
+        ("qwen", "UserPromptSubmit", "prompt"),
+        ("goose", "UserPromptSubmit", "message"),
+    ] {
+        let hooks = &all[id].hooks;
+        assert_eq!(hooks.turn_start.as_deref(), Some(start), "{id}");
+        assert_eq!(
+            hooks.turn_start_evidence,
+            LifecycleCertainty::Candidate,
+            "{id}"
+        );
+        assert_eq!(hooks.ack.as_deref(), Some(start), "{id}");
+        assert_eq!(hooks.ack_payload_field.as_deref(), Some(field), "{id}");
+        assert_eq!(hooks.ack_evidence, AckEvidence::Dispatch, "{id}");
+        assert!(
+            hooks.turn_key_fields.is_empty(),
+            "{id} claims turn correlation"
+        );
+    }
+    for id in ["aider", "amp", "crush", "opencode"] {
+        let hooks = &all[id].hooks;
+        assert!(hooks.ack.is_none(), "{id}");
+        assert!(
+            hooks.turn_start.is_none() && hooks.turn_end.is_none(),
+            "{id}"
+        );
+    }
+}
+
 fn version_between<'a>(capture: &'a str, start: &str, end: &str) -> &'a str {
     let value = capture
         .split_once(start)

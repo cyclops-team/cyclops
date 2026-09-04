@@ -96,7 +96,45 @@ pub(crate) const SHIPPED: &[Spec] = &[
         kind: CliKind::Kimi,
         receipt: ReceiptRequirement::ExactHook,
     },
+    // The three below are wired from vendor documentation alone; no live
+    // edge has been measured. Their manifests say so (version_tested =
+    // "unverified") and declare an ack field, which is what the receipt
+    // floor reads.
+    Spec {
+        id: "gemini",
+        name: "Gemini CLI",
+        skill_name: "Gemini",
+        kind: CliKind::Gemini,
+        receipt: ReceiptRequirement::ExactHook,
+    },
+    Spec {
+        id: "qwen",
+        name: "Qwen Code",
+        skill_name: "Qwen",
+        kind: CliKind::Qwen,
+        receipt: ReceiptRequirement::ExactHook,
+    },
+    Spec {
+        id: "goose",
+        name: "goose",
+        skill_name: "goose",
+        kind: CliKind::Goose,
+        receipt: ReceiptRequirement::ExactHook,
+    },
 ];
+
+/// The shared skill file every consumer that reads `~/.agents/skills`
+/// receives once. Codex, Cursor, Gemini (documented alias of
+/// `~/.gemini/skills`), and goose read it, and so do the skill-only
+/// consumers in `crate::skillseed`. One copy, because a vendor that reads
+/// two of its skill roots warns about the duplicate (MEASURED on Gemini CLI
+/// 0.45.2: "Skill conflict detected").
+pub(crate) fn shared_agents_skill(user_home: &Path) -> AssetLocation {
+    AssetLocation {
+        root: user_home.join(".agents"),
+        relative: PathBuf::from("skills/cyclops/SKILL.md"),
+    }
+}
 
 pub(crate) fn spec(kind: CliKind) -> &'static Spec {
     SHIPPED
@@ -125,6 +163,20 @@ impl Spec {
             CliKind::Kimi => std::env::var_os("KIMI_CODE_HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| user_home.join(".kimi-code")),
+            // Antigravity CLI lives under ~/.gemini/antigravity-cli, so
+            // ~/.gemini itself exists on every AGY machine and proves
+            // nothing about Gemini CLI. MEASURED 2026-09-04: with AGY
+            // installed and Gemini CLI never run, ~/.gemini/tmp was absent;
+            // it appeared the moment Gemini CLI 0.45.2 started, and AGY keeps
+            // its own installation_id and settings.json inside its subdirectory.
+            CliKind::Gemini => gemini_home(user_home).join("tmp"),
+            // Documented: QWEN_HOME "customizes the global configuration
+            // directory (default: ~/.qwen)".
+            CliKind::Qwen => std::env::var_os("QWEN_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| user_home.join(".qwen")),
+            // Documented: ~/.config/goose/config.yaml on macOS and Linux.
+            CliKind::Goose => user_home.join(".config/goose"),
         };
         let hook = match self.kind {
             CliKind::Claude => AssetLocation {
@@ -143,16 +195,30 @@ impl Spec {
                 root: install_root.clone(),
                 relative: PathBuf::from("config.toml"),
             },
+            CliKind::Gemini => AssetLocation {
+                root: gemini_home(user_home),
+                relative: PathBuf::from("settings.json"),
+            },
+            CliKind::Qwen => AssetLocation {
+                root: install_root.clone(),
+                relative: PathBuf::from("settings.json"),
+            },
+            // goose reads hooks from plugin directories, never from its
+            // config.yaml; a hook-only plugin is one hooks/hooks.json under a
+            // directory named for the plugin.
+            CliKind::Goose => AssetLocation {
+                root: user_home.join(".agents/plugins/cyclops"),
+                relative: PathBuf::from("hooks/hooks.json"),
+            },
         };
         let skill = match self.kind {
-            CliKind::Claude | CliKind::Agy | CliKind::Kimi => AssetLocation {
+            CliKind::Claude | CliKind::Agy | CliKind::Kimi | CliKind::Qwen => AssetLocation {
                 root: install_root.clone(),
                 relative: PathBuf::from("skills/cyclops/SKILL.md"),
             },
-            CliKind::Codex | CliKind::Cursor => AssetLocation {
-                root: user_home.join(".agents"),
-                relative: PathBuf::from("skills/cyclops/SKILL.md"),
-            },
+            CliKind::Codex | CliKind::Cursor | CliKind::Gemini | CliKind::Goose => {
+                shared_agents_skill(user_home)
+            }
         };
         Locations {
             install_root,
@@ -160,6 +226,14 @@ impl Spec {
             skill,
         }
     }
+}
+
+/// Gemini CLI's own directory. MEASURED in the installed bundle:
+/// `process.env.GEMINI_CLI_HOME || join(homedir, ".gemini")`.
+fn gemini_home(user_home: &Path) -> PathBuf {
+    std::env::var_os("GEMINI_CLI_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| user_home.join(".gemini"))
 }
 
 /// Resolve the config root that proves a consumer is installed.
@@ -235,6 +309,30 @@ mod tests {
                     home.join(".kimi-code"),
                     home.join(".kimi-code/config.toml"),
                     home.join(".kimi-code/skills/cyclops/SKILL.md"),
+                ),
+                (
+                    "gemini",
+                    "Gemini",
+                    1,
+                    home.join(".gemini/tmp"),
+                    home.join(".gemini/settings.json"),
+                    home.join(".agents/skills/cyclops/SKILL.md"),
+                ),
+                (
+                    "qwen",
+                    "Qwen",
+                    1,
+                    home.join(".qwen"),
+                    home.join(".qwen/settings.json"),
+                    home.join(".qwen/skills/cyclops/SKILL.md"),
+                ),
+                (
+                    "goose",
+                    "goose",
+                    1,
+                    home.join(".config/goose"),
+                    home.join(".agents/plugins/cyclops/hooks/hooks.json"),
+                    home.join(".agents/skills/cyclops/SKILL.md"),
                 ),
             ]
         );

@@ -1,0 +1,107 @@
+# Cyclops detection manifest: Gemini CLI (Google)
+# UNVERIFIED best effort. Written from primary documentation plus one local
+# startup probe; no live turn was measured, so this file binds the pane and
+# recognizes its startup dialogs and nothing more. Sources:
+#   https://geminicli.com/docs/hooks/           hook events, settings.json layers
+#   https://geminicli.com/docs/hooks/reference/ BeforeAgent payload carries `prompt`
+#   https://geminicli.com/docs/cli/skills/      ~/.gemini/skills and ~/.agents/skills alias
+#   Local probe 2026-09-04: Gemini CLI 0.45.2 started in tmux 3.6a, 120x40,
+#   in an untrusted directory. The CLI reached its folder-trust dialog and
+#   then a sign-in failure dialog; OAuth was refused, so no prompt was ever
+#   submitted and busy, idle, and composer shapes are unmeasured.
+#
+# Sensor summary for this CLI:
+#   process  MEASURED: gemini is a Node script (#!/usr/bin/env node), so
+#            #{pane_current_command} reads "node" and `ps -o args=` on the
+#            pane leader begins "node /.../bin/gemini". The daemon reads only
+#            the first argv token, so neither list below binds today. "node"
+#            is deliberately NOT listed: it would claim every Node process.
+#            Until the daemon reads the script path behind an interpreter,
+#            pin the pane: cyclops name %N <label> --manifest gemini.
+#   title    MEASURED: "_  Ready (<cwd basename>)" while the folder-trust
+#            and sign-in dialogs owned the keyboard. Ready is painted before
+#            the CLI can take input, and a matching title rule would outrank
+#            the screen while a dialog is up, so the title carries no rule.
+#   hooks    DOCUMENTED: BeforeAgent fires after the user submits a prompt
+#            and its payload carries `prompt`, so it is the dispatch
+#            candidate and the ACK field. AfterAgent fires once per turn but
+#            a retry re-fires it (stop_hook_active) and no field ties it to
+#            its BeforeAgent, so no end is declared: the loader refuses a
+#            candidate end without turn_key_fields, the same reason Claude
+#            declares none. AfterAgent is still wired, as liveness telemetry.
+#   screen   MEASURED only for the two startup dialogs below. No idle or
+#            working rule ships, so deliveries to a Gemini pane fail closed
+#            (not write-ready) until someone measures the composer.
+
+[agent]
+id = "gemini"
+display_name = "Gemini CLI"
+version_tested = "unverified"
+process_names = ["gemini"]
+argv_basenames = ["gemini"]
+launch = "gemini"
+
+[messaging]
+# Gemini reads ~/.agents/skills as an alias of ~/.gemini/skills (documented),
+# and MEASURED 0.45.2 warns "Skill conflict detected" when both hold the
+# same skill name, so Cyclops seeds only the shared copy.
+mailbox_capability_file = "~/.agents/skills/cyclops/SKILL.md"
+
+[hooks]
+# `hooks` object in ~/.gemini/settings.json (user layer), .gemini/settings.json
+# (project layer, fingerprinted and re-confirmed when a command changes), or
+# /etc/gemini-cli/settings.json. GEMINI_CLI_HOME relocates ~/.gemini
+# (MEASURED in the installed bundle: process.env.GEMINI_CLI_HOME || ~/.gemini).
+config_mechanism = "hooks object in ~/.gemini/settings.json"
+turn_start = "BeforeAgent"
+turn_start_evidence = "candidate"
+ack = "BeforeAgent"
+ack_payload_field = "prompt"
+ack_evidence = "dispatch"
+attention = "Notification"
+available = [
+  "SessionStart", "SessionEnd", "BeforeAgent", "AfterAgent", "BeforeModel",
+  "AfterModel", "BeforeToolSelection", "BeforeTool", "AfterTool",
+  "PreCompress", "Notification",
+]
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "The title says Ready before the CLI can take input; see the header."
+evidence = "MEASURED 2026-09-04, Gemini CLI 0.45.2: title '_  Ready (probe)' under the trust dialog"
+
+[[rule]]
+id = "trust_dialog"
+state = "blocked_modal"
+priority = 1300
+region = "bottom_non_empty_lines(20)"
+contains = ["Do you trust the files in this folder?"]
+note = """Folder-trust dialog on first launch in a directory: '1. Trust folder /
+2. Trust parent folder / 3. Don't trust'. Trust is a human decision and the
+effect of Escape is unmeasured, so never auto-dismiss. Same policy as the
+Claude and Cursor trust dialogs."""
+evidence = "MEASURED 2026-09-04, Gemini CLI 0.45.2 startup in an untrusted directory"
+auto_dismiss = false
+
+[[rule]]
+id = "startup_modal"
+state = "blocked_modal"
+priority = 1200
+region = "bottom_non_empty_lines(20)"
+contains = ["(Use Enter to select)"]
+note = """Any Gemini selection dialog (sign-in, theme, auth) prints this hint
+while it owns the keyboard. A paste would land in the dialog, so park the
+delivery. Never auto-dismiss: which key cancels each dialog is unmeasured."""
+evidence = "MEASURED 2026-09-04, Gemini CLI 0.45.2 sign-in failure dialog"
+auto_dismiss = false
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

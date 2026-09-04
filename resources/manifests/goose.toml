@@ -1,0 +1,68 @@
+# Cyclops detection manifest: goose (Block)
+# UNVERIFIED best effort from primary documentation. No goose binary was
+# available on the evidence host, so this file binds the pane and declares
+# the documented hook contract and nothing more. Sources:
+#   https://github.com/block/goose/blob/main/documentation/docs/guides/context-engineering/hooks.md
+#   https://github.com/block/goose/blob/main/documentation/docs/guides/context-engineering/plugins.md
+#   https://github.com/block/goose/blob/main/documentation/docs/guides/context-engineering/using-skills.md
+#   https://github.com/block/goose/blob/main/documentation/docs/guides/config-files.md
+#
+# Sensor summary for this CLI:
+#   process  goose is a native binary, so #{pane_current_command} is
+#            expected to read "goose" (inferred, not measured).
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED: hooks are discovered from plugin directories, not
+#            from config.yaml. Cyclops wires ~/.agents/plugins/cyclops/hooks/
+#            hooks.json, a hook-only Open Plugin (no plugin.json needed: goose
+#            infers the plugin name from the directory). UserPromptSubmit
+#            carries the prompt in `message`, not `prompt`. Stop may be
+#            blocked by a hook and re-fired and shares no turn field with
+#            UserPromptSubmit (payloads carry only session_id), so no end is
+#            declared: the loader refuses a candidate end without
+#            turn_key_fields, the same reason Claude declares none. Stop is
+#            still wired for liveness. A bare "*" matcher is an invalid regex
+#            that silently skips the rule, so the template declares none.
+#   screen   UNMEASURED. No idle or working rule ships, so deliveries fail
+#            closed (not write-ready) until someone measures the composer.
+
+[agent]
+id = "goose"
+display_name = "goose"
+version_tested = "unverified"
+process_names = ["goose"]
+argv_basenames = ["goose"]
+# `goose session` is the interactive chat; bare `goose` prints usage.
+launch = "goose session"
+
+[messaging]
+# goose loads skills from ~/.agents/skills/ and .agents/skills/ only.
+mailbox_capability_file = "~/.agents/skills/cyclops/SKILL.md"
+
+[hooks]
+config_mechanism = "hooks/hooks.json in ~/.agents/plugins/cyclops/"
+turn_start = "UserPromptSubmit"
+turn_start_evidence = "candidate"
+ack = "UserPromptSubmit"
+ack_payload_field = "message"
+ack_evidence = "dispatch"
+available = [
+  "SessionStart", "SessionEnd", "Stop", "UserPromptSubmit", "PreToolUse",
+  "PreToolUseResult", "PostToolUse", "PostToolUseFailure", "BeforeReadFile",
+  "AfterFileEdit", "BeforeShellExecution", "AfterShellExecution",
+]
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for goose."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]

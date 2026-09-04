@@ -1,0 +1,72 @@
+# Cyclops detection manifest: Qwen Code (Alibaba)
+# UNVERIFIED best effort from primary documentation. No Qwen Code binary was
+# available on the evidence host, so this file binds the pane and declares
+# the documented hook contract and nothing more. Sources:
+#   https://github.com/QwenLM/qwen-code/blob/main/docs/users/features/hooks.md
+#   https://github.com/QwenLM/qwen-code/blob/main/docs/users/features/skills.md
+#   https://github.com/QwenLM/qwen-code/blob/main/docs/users/configuration/settings.md
+#
+# Sensor summary for this CLI:
+#   process  Qwen Code is an npm package run by Node, like Gemini CLI, so
+#            #{pane_current_command} is expected to read "node" and argv[0]
+#            "node" (MEASURED for gemini, inferred here). "node" is not
+#            listed: it would claim every Node process. Until the daemon
+#            reads the script path behind an interpreter, pin the pane:
+#            cyclops name %N <label> --manifest qwen.
+#   title    UNMEASURED.
+#   hooks    DOCUMENTED, Claude-shaped: UserPromptSubmit carries `prompt`
+#            (the model-bound text, which may include appended context) and
+#            an optional `submitted_prompt` (the raw TUI submission). Stop
+#            can loop through stop_hook_active and shares no turn field with
+#            UserPromptSubmit in the docs, so no end is declared (the loader
+#            refuses a candidate end without turn_key_fields; Claude declares
+#            none for the same reason). Stop is still wired for liveness.
+#   screen   UNMEASURED. No idle or working rule ships, so deliveries fail
+#            closed (not write-ready) until someone measures the composer.
+
+[agent]
+id = "qwen"
+display_name = "Qwen Code"
+version_tested = "unverified"
+process_names = ["qwen"]
+argv_basenames = ["qwen"]
+launch = "qwen"
+
+[messaging]
+# Personal skills live in ~/.qwen/skills/<name>/SKILL.md; the docs list no
+# ~/.agents/skills alias, so Qwen gets its own copy.
+mailbox_capability_file = "~/.qwen/skills/cyclops/SKILL.md"
+
+[hooks]
+# `hooks` object in ~/.qwen/settings.json (user) or .qwen/settings.json
+# (project, requires trusted-folder status). QWEN_HOME relocates ~/.qwen.
+config_mechanism = "hooks object in ~/.qwen/settings.json"
+turn_start = "UserPromptSubmit"
+turn_start_evidence = "candidate"
+ack = "UserPromptSubmit"
+ack_payload_field = "prompt"
+ack_evidence = "dispatch"
+attention = "Notification"
+available = [
+  "PreToolUse", "PostToolUse", "PostToolUseFailure", "UserPromptSubmit",
+  "SessionStart", "SessionEnd", "SessionDelete", "MessageDisplay", "Stop",
+  "StopFailure", "SubagentStart", "SubagentStop", "PreCompact", "PostCompact",
+  "Notification", "PermissionRequest", "PermissionDenied", "TodoCreated",
+  "TodoCompleted",
+]
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "No title measurement exists for Qwen Code."
+evidence = "UNMEASURED"
+
+[injection]
+method = "load-buffer + paste-buffer -p"
+submit = "Enter"
+verify_before_submit = true
+verify_pattern = ["<message_id>"]
+safe_states = ["idle"]
+unsafe_states = ["blocked_modal", "blocked_permission", "idle_with_input"]
