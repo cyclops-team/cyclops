@@ -5,14 +5,15 @@
 
 	const MANIFESTS_URL = `${REPO_URL}/blob/main/docs/reference/MANIFESTS.md`;
 
-	// The four manifests that ship (resources/manifests/*.toml): each row is
+	// The shipped manifests (resources/manifests/*.toml): each row is
 	// the CLI's command, the way a pane names it, and the manifest's display
-	// name. The fifth agent is the reader's, and it gets the mark.
+	// name. The next agent is the reader's, and it gets the mark.
 	const detected = [
 		{ cmd: 'claude', name: 'Claude Code' },
 		{ cmd: 'codex', name: 'Codex CLI' },
 		{ cmd: 'cursor-agent', name: 'Cursor Agent' },
-		{ cmd: 'agy', name: 'Antigravity CLI' }
+		{ cmd: 'agy', name: 'Antigravity CLI' },
+		{ cmd: 'kimi', name: 'Kimi Code CLI' }
 	];
 </script>
 
@@ -23,7 +24,7 @@
 			<h3 class="statement">If it runs in your terminal,<br />it can run in Cyclops.</h3>
 			<p class="lede">
 				Cyclops detects supported agents automatically. Each one is described by a small manifest
-				file: what its process is called, how it reports back, and how to tell when it's busy. 4
+				file: what its process is called, how it reports back, and how to tell when it's busy. 5
 				agents detected out of the box. Teaching Cyclops a new agent CLI is one file.
 			</p>
 		</div>

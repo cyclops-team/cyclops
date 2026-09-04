@@ -718,7 +718,7 @@ fn setup_only_writes_the_home_and_opens_nothing() {
     let text = stdout(&out);
     assert!(text.starts_with("✔ cyclops is set up\n"), "got {text:?}");
     assert!(text.contains("config.toml"), "{text}");
-    assert!(text.contains("4 detection manifests"), "{text}");
+    assert!(text.contains("5 detection manifests"), "{text}");
     // No workspace, so no next steps: whoever called this owns what comes
     // after it.
     assert!(!text.contains("Next:"), "{text}");
@@ -1193,7 +1193,7 @@ fn setup_check_reports_an_incomplete_empty_home_without_writing() {
             .iter()
             .map(|row| row["id"].as_str().expect("consumer id"))
             .collect::<Vec<_>>(),
-        ["claude", "codex", "cursor", "agy"]
+        ["claude", "codex", "cursor", "agy", "kimi"]
     );
     assert_eq!(
         consumers[0]["skill"]["path"],
@@ -1211,6 +1211,12 @@ fn setup_check_reports_an_incomplete_empty_home_without_writing() {
     assert_eq!(
         consumers[3]["skill"]["path"],
         user.join(".gemini/antigravity-cli/skills/cyclops/SKILL.md")
+            .display()
+            .to_string()
+    );
+    assert_eq!(
+        consumers[4]["skill"]["path"],
+        user.join(".kimi-code/skills/cyclops/SKILL.md")
             .display()
             .to_string()
     );
@@ -1237,7 +1243,7 @@ fn setup_plan_is_body_free_read_only_and_ignores_uninstalled_consumers() {
     assert_eq!(plan["apply_available"], false, "{plan}");
     assert!(plan.get("apply").is_none(), "{plan}");
     let assets = plan["assets"].as_array().expect("plan assets");
-    assert_eq!(assets.len(), 4, "{plan}");
+    assert_eq!(assets.len(), 5, "{plan}");
     for asset in assets {
         assert_eq!(asset["kind"], "manifest", "{asset}");
         assert_eq!(asset["observed_state"], "missing", "{asset}");
@@ -1963,6 +1969,7 @@ fn setup_check_reports_complete_setup_and_changes_no_metadata() {
         user.join(".codex"),
         user.join(".cursor"),
         user.join(".gemini/antigravity-cli"),
+        user.join(".kimi-code"),
     ] {
         fs::create_dir_all(consumer).expect("create consumer home");
     }
@@ -1970,6 +1977,7 @@ fn setup_check_reports_complete_setup_and_changes_no_metadata() {
         user.join(".claude/skills/cyclops/SKILL.md"),
         user.join(".agents/skills/cyclops/SKILL.md"),
         user.join(".gemini/antigravity-cli/skills/cyclops/SKILL.md"),
+        user.join(".kimi-code/skills/cyclops/SKILL.md"),
     ] {
         create_private_skill_parent(&path);
     }
@@ -2008,6 +2016,10 @@ fn setup_check_reports_complete_setup_and_changes_no_metadata() {
     assert_eq!(consumers[3]["hook"]["required_receipt_tier"], 2);
     assert_eq!(consumers[3]["hook"]["ack_capable"], false);
     assert_eq!(consumers[3]["hook"]["receipt_ready"], true);
+    assert_eq!(consumers[4]["hook"]["state"], "current");
+    assert_eq!(consumers[4]["hook"]["required_receipt_tier"], 1);
+    assert_eq!(consumers[4]["hook"]["ack_capable"], true);
+    assert_eq!(consumers[4]["hook"]["receipt_ready"], true);
 
     let human = cyclops_in_user_home(&home, &user, &[], &["--plain", "setup", "check"]);
     assert!(human.status.success(), "{human:?}");

@@ -1,0 +1,27 @@
+[[hooks]]
+event = "SessionStart"
+command = "/opt/cyclops/bin/cyclops hook SessionStart"
+
+[[hooks]]
+event = "UserPromptSubmit"
+command = "/opt/cyclops/bin/cyclops hook UserPromptSubmit"
+
+[[hooks]]
+event = "PreToolUse"
+command = "/opt/cyclops/bin/cyclops hook PreToolUse"
+
+[[hooks]]
+event = "PostToolUse"
+command = "/opt/cyclops/bin/cyclops hook PostToolUse"
+
+[[hooks]]
+event = "Stop"
+command = "/opt/cyclops/bin/cyclops hook Stop"
+
+[[hooks]]
+event = "StopFailure"
+command = "/opt/cyclops/bin/cyclops hook StopFailure"
+
+[[hooks]]
+event = "Notification"
+command = "/opt/cyclops/bin/cyclops hook Notification"

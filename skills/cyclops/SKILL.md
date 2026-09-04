@@ -444,5 +444,5 @@ and the proof).
 
 Doc links point at the repository on GitHub, so this file works from
 wherever it is installed. `cyclops start --setup-only --wire-hooks` seeds it
-for installed Claude Code, Codex or Cursor, and Antigravity CLI consumers
+for installed Claude Code, Codex, Cursor, Kimi, and Antigravity CLI consumers
 without overwriting operator-edited copies.

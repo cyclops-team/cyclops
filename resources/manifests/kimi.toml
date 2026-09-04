@@ -1,0 +1,77 @@
+# Cyclops detection manifest: Kimi Code CLI (Moonshot AI)
+# Verified against kimi / kimi-code CLI running inside tmux.
+#
+# Sensor summary for this CLI:
+#   title  USELESS for state. #{pane_title} is set by tmux or the terminal,
+#          carrying no reliable agent state.
+#   hooks  AUTHORITATIVE for turn start and the delivery ACK (UserPromptSubmit).
+#          Stop provides turn-end telemetry. PreToolUse and PostToolUse provide
+#          tool activity telemetry.
+#   screen REQUIRED for busy/idle and input state.
+
+[agent]
+id = "kimi"
+display_name = "Kimi Code CLI"
+version_tested = "1.0.0"
+process_names = ["kimi", "kimi-code"]
+argv_basenames = ["kimi", "kimi-code"]
+launch = "kimi"
+
+[messaging]
+mailbox_capability_file = "~/.kimi-code/skills/cyclops/SKILL.md"
+
+[hooks]
+config_mechanism = "config.toml in ~/.kimi-code/"
+turn_start = "UserPromptSubmit"
+turn_start_evidence = "candidate"
+ack = "UserPromptSubmit"
+ack_payload_field = "prompt"
+ack_evidence = "dispatch"
+attention = "Notification"
+available = [
+  "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "StopFailure",
+  "PreToolUse", "PostToolUse", "Notification",
+]
+
+[[rule]]
+id = "title_useless"
+state = "unknown"
+priority = 0
+region = "pane_title"
+note = "Kimi does not publish agent state to the pane title."
+evidence = "Observed static pane title"
+
+[[rule]]
+id = "screen_working"
+state = "working"
+priority = 1100
+region = "bottom_non_empty_lines(10)"
+any = [
+  { line_regex = ['[\x{2800}-\x{28FF}]'] },
+  { line_regex = ['\[\d+\s+agents?\s+running\]'] },
+  { line_regex = ['(?i)\b(?:thinking|generating|running|processing)\b'] },
+]
+note = "Active turn status: braille spinner, background agent count, or status indicator."
+evidence = "Observed status line during turn"
+
+[[rule]]
+id = "composer_typed_input"
+state = "idle_with_input"
+composer_semantic = "human_input"
+priority = 1050
+region = "bottom_non_empty_lines(8)"
+line_regex = ['^[│\|\s]*>[ \t]*[^│\|\s\x{2580}-\x{259F}]']
+note = "Typed input in composer: non-whitespace characters follow prompt symbol."
+evidence = "Observed typed input"
+
+[[rule]]
+id = "composer_empty"
+state = "idle"
+composer_semantic = "clean"
+lifecycle_evidence = true
+active_start_terminal = true
+priority = 1000
+region = "bottom_non_empty_lines(8)"
+line_regex = ['^[│\|\s]*>[ \t\x{2580}-\x{259F}]*[│\|\s]*$']
+note = "Empty composer: bare prompt symbol > waiting for input."
+evidence = "Observed empty composer at rest"

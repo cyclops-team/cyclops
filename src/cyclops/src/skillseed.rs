@@ -65,6 +65,7 @@ const EVER_SHIPPED_FNV64: &[&str] = &[
     "09725621ce15f9cf",
     "4042d8569cf02694",
     "15c4ccb5851c02bb",
+    "a6368bc6a8d3e602",
 ];
 
 /// FNV-1a 64, hex. Same non-cryptographic question as the manifest seed:
@@ -248,6 +249,14 @@ fn targets(home: &Path) -> Vec<SkillTarget> {
         installation: Installation::inspect(&agy_locations.install_root),
         installation_roots: vec![agy_locations.install_root.clone()],
         location: agy_locations.skill,
+    });
+    let kimi = crate::consumer::spec(crate::hookset::CliKind::Kimi);
+    let kimi_locations = kimi.locations(home);
+    targets.push(SkillTarget {
+        consumer: kimi.skill_name,
+        installation: Installation::inspect(&kimi_locations.install_root),
+        installation_roots: vec![kimi_locations.install_root.clone()],
+        location: kimi_locations.skill,
     });
     targets
 }

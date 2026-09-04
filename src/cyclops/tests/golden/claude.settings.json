@@ -6,6 +6,12 @@
     "UserPromptSubmit": [
       { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook UserPromptSubmit" } ] }
     ],
+    "PreToolUse": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook PreToolUse" } ] }
+    ],
+    "PostToolUse": [
+      { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook PostToolUse" } ] }
+    ],
     "Stop": [
       { "hooks": [ { "type": "command", "command": "/opt/cyclops/bin/cyclops hook Stop" } ] }
     ],

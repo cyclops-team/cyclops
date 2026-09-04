@@ -159,7 +159,7 @@ $ cyclops start --setup-only
   wrote /Users/you/.cyclops/config.toml
   wrote 17 themes to /Users/you/.cyclops/themes
   wrote 2 sounds to /Users/you/.cyclops/sounds
-  wrote 4 detection manifests to /Users/you/.cyclops/manifests
+  wrote 5 detection manifests to /Users/you/.cyclops/manifests
 ```
 
 Two things, and both matter. The config says which tmux sessions to watch.
@@ -486,8 +486,8 @@ whole install and not one pane:
   1 pane reads unknown: cyclopsd loaded no detection manifests. Nothing can be delivered to an unknown pane. Install them and restart: cyclops start, then restart cyclopsd.
 ```
 
-The shipped manifests cover Claude Code, Codex CLI, Antigravity CLI, and
-Cursor Agent CLI. Cursor detection has fixture coverage, but the current-version
+The shipped manifests cover Claude Code, Codex CLI, Antigravity CLI,
+Cursor Agent CLI, and Kimi CLI. Cursor detection has fixture coverage, but the current-version
 terminal notification path has not completed live validation because no current
 Cursor binary was available on the evidence host. It fails closed when exact
 evidence is unavailable; socket claims remain usable. See

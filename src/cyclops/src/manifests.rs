@@ -45,6 +45,10 @@ const SHIPPED: &[(&str, &str)] = &[
         "cursor.toml",
         include_str!("../../../resources/manifests/cursor.toml"),
     ),
+    (
+        "kimi.toml",
+        include_str!("../../../resources/manifests/kimi.toml"),
+    ),
 ];
 
 /// A manifest is small configuration, not an unbounded data channel. A plan
@@ -147,6 +151,8 @@ const EVER_SHIPPED_FNV64: &[&str] = &[
     "ed6a0d16eff01e23",
     "86f0219077c6bae3",
     "b327aa8824a51b94",
+    "38c8d60f54914523",
+    "16f1cc714b44548c",
 ];
 
 /// True when these bytes are a manifest this project released, so setup can

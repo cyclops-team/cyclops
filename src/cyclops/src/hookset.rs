@@ -39,6 +39,7 @@ const CLAUDE_TMPL: &str = include_str!("../../../resources/hooks/claude/settings
 const CODEX_TMPL: &str = include_str!("../../../resources/hooks/codex/hooks.json.tmpl");
 const AGY_TMPL: &str = include_str!("../../../resources/hooks/agy/hooks.json.tmpl");
 const CURSOR_TMPL: &str = include_str!("../../../resources/hooks/cursor/hooks.json.tmpl");
+const KIMI_TMPL: &str = include_str!("../../../resources/hooks/kimi/config.toml.tmpl");
 
 /// Read timeout for hooks.selftest: the daemon waits up to 10s for the
 /// delivery to resolve, so the client waits a little longer.
@@ -46,7 +47,15 @@ const SELFTEST_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Path components that mark a vendor CLI's own config tree. Install
 /// refuses to write anywhere inside one, whatever the --dest says.
-const VENDOR_DIRS: &[&str] = &[".claude", ".codex", ".gemini", ".agents", ".cursor"];
+const VENDOR_DIRS: &[&str] = &[
+    ".claude",
+    ".codex",
+    ".gemini",
+    ".agents",
+    ".cursor",
+    ".kimi",
+    ".kimi-code",
+];
 
 /// The receipt install drops beside every artifact it prepares.
 ///
@@ -66,6 +75,7 @@ pub enum CliKind {
     Codex,
     Agy,
     Cursor,
+    Kimi,
 }
 
 impl CliKind {
@@ -75,6 +85,7 @@ impl CliKind {
             CliKind::Codex => CODEX_TMPL,
             CliKind::Agy => AGY_TMPL,
             CliKind::Cursor => CURSOR_TMPL,
+            CliKind::Kimi => KIMI_TMPL,
         }
     }
 
@@ -83,6 +94,7 @@ impl CliKind {
         match self {
             CliKind::Claude => "settings.json",
             CliKind::Codex | CliKind::Agy | CliKind::Cursor => "hooks.json",
+            CliKind::Kimi => "config.toml",
         }
     }
 
@@ -92,6 +104,7 @@ impl CliKind {
             CliKind::Codex => "codex",
             CliKind::Agy => "agy",
             CliKind::Cursor => "cursor",
+            CliKind::Kimi => "kimi",
         }
     }
 
@@ -104,6 +117,7 @@ impl CliKind {
             "codex" => Some(CliKind::Codex),
             "agy" => Some(CliKind::Agy),
             "cursor" => Some(CliKind::Cursor),
+            "kimi" => Some(CliKind::Kimi),
             _ => None,
         }
     }
@@ -356,6 +370,55 @@ fn remove_from(dst: &mut serde_json::Value, src: &serde_json::Value) -> bool {
     }
 }
 
+fn is_cyclops_hook_toml(hook: &toml::Value, own_bins: &[&str]) -> bool {
+    hook.get("command")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|command| is_cyclops_hook_command(command, own_bins))
+}
+
+fn own_hook_bins_toml(src: &[toml::Value]) -> Vec<&str> {
+    let mut bins = Vec::new();
+    for hook in src {
+        if let Some(command) = hook.get("command").and_then(toml::Value::as_str) {
+            if let Some(bin) = command.split_whitespace().next() {
+                if !bins.contains(&bin) {
+                    bins.push(bin);
+                }
+            }
+        }
+    }
+    bins
+}
+
+fn merge_into_toml(dst: &mut toml::Table, src: &toml::Table) {
+    if let Some(src_hooks) = src.get("hooks").and_then(toml::Value::as_array) {
+        let entry = dst
+            .entry("hooks".to_string())
+            .or_insert_with(|| toml::Value::Array(Vec::new()));
+        if let toml::Value::Array(dst_hooks) = entry {
+            let own_bins = own_hook_bins_toml(src_hooks);
+            let kept: Vec<toml::Value> = dst_hooks
+                .iter()
+                .filter(|hook| !is_cyclops_hook_toml(hook, &own_bins))
+                .cloned()
+                .collect();
+            *dst_hooks = kept.into_iter().chain(src_hooks.iter().cloned()).collect();
+        }
+    }
+}
+
+fn remove_from_toml(dst: &mut toml::Table, src: &toml::Table) -> bool {
+    if let Some(src_hooks) = src.get("hooks").and_then(toml::Value::as_array) {
+        if let Some(toml::Value::Array(dst_hooks)) = dst.get_mut("hooks") {
+            let own_bins = own_hook_bins_toml(src_hooks);
+            let original_len = dst_hooks.len();
+            dst_hooks.retain(|hook| !is_cyclops_hook_toml(hook, &own_bins));
+            return dst_hooks.len() != original_len;
+        }
+    }
+    false
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum WiringState {
     Current,
@@ -384,6 +447,27 @@ pub(crate) fn inspect_wiring_bytes(kind: CliKind, bytes: &[u8]) -> WiringState {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return WiringState::Unreadable;
     };
+    if kind == CliKind::Kimi {
+        let mut document: toml::Table = if text.trim().is_empty() {
+            toml::Table::new()
+        } else {
+            match text.parse::<toml::Table>() {
+                Ok(doc) => doc,
+                Err(_) => return WiringState::Invalid,
+            }
+        };
+        let before = document.clone();
+        let expected_text = render_shared(kind, &cyclops_bin());
+        let expected: toml::Table = expected_text
+            .parse::<toml::Table>()
+            .expect("shipped hook template is valid TOML");
+        merge_into_toml(&mut document, &expected);
+        return if document == before {
+            WiringState::Current
+        } else {
+            WiringState::NeedsUpdate
+        };
+    }
     let mut document: serde_json::Value = if text.trim().is_empty() {
         serde_json::json!({})
     } else {
@@ -431,6 +515,42 @@ pub fn remove_vendor_wiring(kind: CliKind) -> Result<Option<UnwiredVendor>, Stri
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("can't read {}: {error}", path.display())),
     };
+    if kind == CliKind::Kimi {
+        let mut document: toml::Table = if existing.trim().is_empty() {
+            return Ok(Some(UnwiredVendor {
+                vendor: kind.name(),
+                path,
+                removed: false,
+            }));
+        } else {
+            existing.parse::<toml::Table>().map_err(|error| {
+                format!("{} is not valid TOML ({error}); left alone", path.display())
+            })?
+        };
+        let ours: toml::Table = render_shared(kind, &cyclops_bin())
+            .parse::<toml::Table>()
+            .map_err(|error| {
+                format!(
+                    "rendered {} hook config is not valid TOML: {error}",
+                    kind.name()
+                )
+            })?;
+        let removed = remove_from_toml(&mut document, &ours);
+        if removed {
+            let mut text = toml::to_string_pretty(&document)
+                .map_err(|error| format!("can't serialize {}: {error}", path.display()))?;
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            write_atomic(&path, &text)
+                .map_err(|error| format!("can't write {}: {error}", path.display()))?;
+        }
+        return Ok(Some(UnwiredVendor {
+            vendor: kind.name(),
+            path,
+            removed,
+        }));
+    }
     let mut document: serde_json::Value = if existing.trim().is_empty() {
         return Ok(Some(UnwiredVendor {
             vendor: kind.name(),
@@ -493,6 +613,55 @@ pub fn wire_vendor(kind: CliKind) -> Result<Option<WiredVendor>, String> {
             .map_err(|e| format!("can't create hook directory {}: {e}", dir.display()))?;
     }
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if kind == CliKind::Kimi {
+        let mut doc: toml::Table = if existing.trim().is_empty() {
+            toml::Table::new()
+        } else {
+            existing
+                .parse::<toml::Table>()
+                .map_err(|e| format!("{} is not valid TOML ({e}); left alone", path.display()))?
+        };
+        let ours: toml::Table = render_shared(kind, &cyclops_bin())
+            .parse::<toml::Table>()
+            .map_err(|e| {
+                format!(
+                    "rendered {} hook config is not valid TOML: {e}",
+                    kind.name()
+                )
+            })?;
+        let before = doc.clone();
+        merge_into_toml(&mut doc, &ours);
+        if doc == before {
+            return Ok(Some(WiredVendor {
+                vendor: kind.name(),
+                path,
+                unchanged: true,
+                backup: None,
+            }));
+        }
+        let mut backup = None;
+        if !existing.is_empty() {
+            let bak = PathBuf::from(format!("{}.before-cyclops", path.display()));
+            if !bak.exists() {
+                std::fs::copy(&path, &bak).map_err(|e| {
+                    format!("can't back up {} to {}: {e}", path.display(), bak.display())
+                })?;
+            }
+            backup = Some(bak);
+        }
+        let mut text = toml::to_string_pretty(&doc)
+            .map_err(|e| format!("can't serialize {}: {e}", path.display()))?;
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        write_atomic(&path, &text).map_err(|e| format!("can't write {}: {e}", path.display()))?;
+        return Ok(Some(WiredVendor {
+            vendor: kind.name(),
+            path,
+            unchanged: false,
+            backup,
+        }));
+    }
     let mut doc: serde_json::Value = if existing.trim().is_empty() {
         serde_json::json!({})
     } else {
@@ -613,6 +782,20 @@ fn instructions(kind: CliKind, rendered: &Path, label: &str) -> String {
              \n\
              CURSOR_CONFIG_DIR does NOT work for hooks: it relocates\n\
              cli-config.json but hooks.json placed there fires zero events.\n\
+             Then prove it fires: cyclops hooks selftest {label}"
+        ),
+        CliKind::Kimi => format!(
+            "Wire it (Kimi reads config.toml from ~/.kimi-code/config.toml):\n\
+             \n\
+             If ~/.kimi-code/config.toml does not exist, copy {p} there.\n\
+             If it already exists, merge the [[hooks]] array entries from {p};\n\
+             preserve every unrelated key and handler. Never overwrite it.\n\
+             \n\
+             For automatic wiring, run:\n\
+             \n\
+             \x20 cyclops start --setup-only --wire-hooks\n\
+             \n\
+             then restart Kimi.\n\
              Then prove it fires: cyclops hooks selftest {label}"
         ),
     }
@@ -1594,6 +1777,7 @@ mod tests {
             (CliKind::Codex, "hooks.json"),
             (CliKind::Agy, "hooks.json"),
             (CliKind::Cursor, "hooks.json"),
+            (CliKind::Kimi, "config.toml"),
         ] {
             let p = vendor_hook_file(kind).expect("has a discovered path");
             assert_eq!(p.file_name().unwrap(), file);
@@ -1616,6 +1800,7 @@ mod tests {
             (CliKind::Codex, "codex.hooks.json"),
             (CliKind::Agy, "agy.hooks.json"),
             (CliKind::Cursor, "cursor.hooks.json"),
+            (CliKind::Kimi, "kimi.config.toml"),
         ] {
             assert_eq!(
                 render(kind, GOLDEN_LABEL, GOLDEN_BIN),
@@ -1654,6 +1839,49 @@ mod tests {
     }
 
     #[test]
+    fn rendered_kimi_template_is_valid_vendor_toml() {
+        let out = render(CliKind::Kimi, GOLDEN_LABEL, GOLDEN_BIN);
+        let v: toml::Table = out
+            .parse()
+            .unwrap_or_else(|e| panic!("kimi render is not TOML: {e}"));
+        assert!(!out.contains("{label}") && !out.contains("{cyclops_bin}"));
+        let hooks = v
+            .get("hooks")
+            .and_then(toml::Value::as_array)
+            .expect("hooks array");
+        assert!(!hooks.is_empty());
+    }
+
+    #[test]
+    fn explicit_uninstall_removes_only_cyclops_kimi_hook_entries() {
+        let theirs = r#"
+default_model = "k3"
+
+[[hooks]]
+event = "Stop"
+command = "/bin/their-notifier"
+
+[[hooks]]
+event = "Stop"
+command = "/old/cyclops hook Stop"
+"#;
+        let mut doc: toml::Table = theirs.parse().unwrap();
+        let ours: toml::Table = render_shared(CliKind::Kimi, GOLDEN_BIN).parse().unwrap();
+        assert!(remove_from_toml(&mut doc, &ours));
+        assert_eq!(
+            doc.get("default_model").and_then(toml::Value::as_str),
+            Some("k3")
+        );
+        let hooks = doc.get("hooks").and_then(toml::Value::as_array).unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(
+            hooks[0].get("command").and_then(toml::Value::as_str),
+            Some("/bin/their-notifier")
+        );
+        assert!(!remove_from_toml(&mut doc, &ours));
+    }
+
+    #[test]
     fn claude_and_codex_share_the_measured_hook_shape() {
         for kind in [CliKind::Claude, CliKind::Codex] {
             let v: serde_json::Value = serde_json::from_str(&render(kind, "r", "cyclops")).unwrap();
@@ -1680,6 +1908,8 @@ mod tests {
             [
                 "Notification",
                 "PermissionRequest",
+                "PostToolUse",
+                "PreToolUse",
                 "SessionStart",
                 "Stop",
                 "StopFailure",

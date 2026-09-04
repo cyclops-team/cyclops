@@ -38,6 +38,8 @@ fn shipped_composer_semantics_match_measured_rules_only() {
         ("cursor", "composer_plain_fallback", Ambiguous),
         ("agy", "composer_empty", Clean),
         ("agy", "composer_has_input", HumanInput),
+        ("kimi", "composer_empty", Clean),
+        ("kimi", "composer_typed_input", HumanInput),
     ];
 
     for &(manifest_id, rule_id, semantic) in &expected {

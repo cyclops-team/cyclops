@@ -1,0 +1,37 @@
+# Cyclops hook config template: Kimi Code CLI config.toml.
+# Rendered by `cyclops hooks install kimi --agent <label>`; '#' lines are
+# stripped, {label} and {cyclops_bin} are substituted.
+#
+# Wiring: Kimi Code CLI reads ~/.kimi-code/config.toml.
+# The [[hooks]] array registers lifecycle hooks.
+#
+# Events: UserPromptSubmit is the delivery ACK (payload carries the prompt),
+# Stop is turn end. PreToolUse and PostToolUse provide tool activity telemetry.
+# Notification provides attention edges.
+[[hooks]]
+event = "SessionStart"
+command = "{cyclops_bin} hook SessionStart"
+
+[[hooks]]
+event = "UserPromptSubmit"
+command = "{cyclops_bin} hook UserPromptSubmit"
+
+[[hooks]]
+event = "PreToolUse"
+command = "{cyclops_bin} hook PreToolUse"
+
+[[hooks]]
+event = "PostToolUse"
+command = "{cyclops_bin} hook PostToolUse"
+
+[[hooks]]
+event = "Stop"
+command = "{cyclops_bin} hook Stop"
+
+[[hooks]]
+event = "StopFailure"
+command = "{cyclops_bin} hook StopFailure"
+
+[[hooks]]
+event = "Notification"
+command = "{cyclops_bin} hook Notification"

@@ -4654,11 +4654,7 @@ async fn observe_pane_with_evidence(
         let s_rule = screen
             .as_deref()
             .and_then(|s| screen_winner_esc(m, s, screen_esc.as_deref()));
-        idle_confirmed = winner_confirms_idle(s_rule)
-            || (winner_confirms_idle(t_rule)
-                && s_rule.is_some_and(|rule| {
-                    matches!(rule.state, AgentState::Idle | AgentState::IdleWithInput)
-                }));
+        idle_confirmed = winner_confirms_idle(s_rule);
         active_start_terminal = s_rule.is_some_and(|rule| rule.active_start_terminal);
         screen_winner_id = s_rule.map(|rule| rule.id.clone());
         let mut det = fuse(

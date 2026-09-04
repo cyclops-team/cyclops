@@ -94,7 +94,6 @@ evidence = "MEASURED claude_busy_titles.json; spinner appears 10 ms after UserPr
 [[rule]]
 id = "title_idle_sparkle"
 state = "idle"
-lifecycle_evidence = true
 priority = 1000
 region = "pane_title"
 # U+2733 replaces the spinner when the turn ends.

@@ -89,6 +89,13 @@ pub(crate) const SHIPPED: &[Spec] = &[
         kind: CliKind::Agy,
         receipt: ReceiptRequirement::Screen,
     },
+    Spec {
+        id: "kimi",
+        name: "Kimi Code CLI",
+        skill_name: "Kimi",
+        kind: CliKind::Kimi,
+        receipt: ReceiptRequirement::ExactHook,
+    },
 ];
 
 pub(crate) fn spec(kind: CliKind) -> &'static Spec {
@@ -115,6 +122,9 @@ impl Spec {
             CliKind::Codex => codex_root.to_path_buf(),
             CliKind::Cursor => user_home.join(".cursor"),
             CliKind::Agy => user_home.join(".gemini/antigravity-cli"),
+            CliKind::Kimi => std::env::var_os("KIMI_CODE_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| user_home.join(".kimi-code")),
         };
         let hook = match self.kind {
             CliKind::Claude => AssetLocation {
@@ -129,9 +139,13 @@ impl Spec {
                 root: user_home.join(".agents"),
                 relative: PathBuf::from("hooks.json"),
             },
+            CliKind::Kimi => AssetLocation {
+                root: install_root.clone(),
+                relative: PathBuf::from("config.toml"),
+            },
         };
         let skill = match self.kind {
-            CliKind::Claude | CliKind::Agy => AssetLocation {
+            CliKind::Claude | CliKind::Agy | CliKind::Kimi => AssetLocation {
                 root: install_root.clone(),
                 relative: PathBuf::from("skills/cyclops/SKILL.md"),
             },
@@ -213,6 +227,14 @@ mod tests {
                     home.join(".gemini/antigravity-cli"),
                     home.join(".agents/hooks.json"),
                     home.join(".gemini/antigravity-cli/skills/cyclops/SKILL.md"),
+                ),
+                (
+                    "kimi",
+                    "Kimi",
+                    1,
+                    home.join(".kimi-code"),
+                    home.join(".kimi-code/config.toml"),
+                    home.join(".kimi-code/skills/cyclops/SKILL.md"),
                 ),
             ]
         );

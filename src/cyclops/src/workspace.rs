@@ -1269,6 +1269,7 @@ fn wire_installed_vendors() -> Vec<crate::hookset::WiredVendor> {
         CliKind::Codex,
         CliKind::Agy,
         CliKind::Cursor,
+        CliKind::Kimi,
     ] {
         match crate::hookset::wire_vendor(kind) {
             Ok(Some(w)) => out.push(w),
