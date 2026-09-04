@@ -56,17 +56,20 @@ when the exact recipient composer becomes safe.
 not decide whether a notification may write. Composer evidence answers that
 separate safety question:
 
-- `Clean` can admit a notification while the agent is idle or working.
-- `WithInput` holds the notification without changing durable acceptance.
-- `Ambiguous` also holds. Absence of detected text is never proof of a clean
-  composer.
-- modal, permission, quota, dead, and unknown runtime states keep their own
+- `Clean` admits a notification while the agent is idle or working.
+- `WithInput` (detected human input) holds the notification without changing
+  durable acceptance.
+- `Ambiguous` or unproven composer: for direct payload deliveries, ambiguous
+  composer holds. For mailbox doorbells, unproven composers are eligible to
+  proceed unless positive human input (`HumanInput`), active modals, or an
+  explicit composer hold is present (`unproven_composer_is_eligible`).
+- Modal, permission, quota, dead, and unknown runtime states keep their own
   explicit refusal or attention semantics.
 
 The daemon reacts to pane and lifecycle evidence rather than polling. When a
-held composer becomes positively clean, the same FIFO attempt resumes; the
-sender does not requeue it. The mailbox body remains claimable over the socket
-throughout the hold.
+held composer clears, the same FIFO attempt resumes; the sender does not
+requeue it. The mailbox body remains claimable over the socket throughout the
+hold.
 
 The terminal write is only a notification transport. Mailbox acceptance,
 claim, reply, ordering, and replay do not depend on the full-screen workspace
@@ -247,10 +250,13 @@ locator.
 
 1. `load-buffer` from a temp file into buffer `cyc-<bootpid>-<seq>` (unique
    per delivery, amendment e), `paste-buffer -p -d`.
-2. Capture the joined, escaped composer region. Doorbells require their exact
-   fixed row. Direct payloads require byte-for-byte reconstruction through the
-   terminal sentinel. In both cases the extracted composer bytes must equal
-   the payload selected at the durable write boundary.
+2. Capture the joined, escaped composer region. Direct payloads require
+   byte-for-byte reconstruction through the terminal sentinel, and the
+   extracted composer bytes must equal the payload selected at the durable write
+   boundary. Doorbells verify their exact fixed row when observable; if staging
+   is unobservable (e.g. CLI agents that do not echo bracketed paste into
+   visible composer rows), doorbells proceed to submit once and finish as
+   `delivered_unverified` with cause `"unverified_staging"`.
 
    A measured collapsed-paste chip is representation evidence only. The hidden
    bytes cannot be compared, so a chip never proves Cyclops ownership and never

@@ -37,7 +37,7 @@ config and detection manifests. It ends by telling you whether this shell
 can already find them:
 
 ```
-✔ cyclops 0.1.2-beta is installed
+✔ cyclops 1.0.2 is installed
   cyclops    /Users/you/.local/bin/cyclops
   cyclopsd   /Users/you/.local/bin/cyclopsd
   home       /Users/you/.cyclops

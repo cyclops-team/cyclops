@@ -1,22 +1,13 @@
 # Status
 
-Updated 2026-09-02. Cyclops is pre-release software; the Cargo workspace
-currently declares `0.1.2-beta`. `main` is the stable line and
-**beta/messaging-rework** is the active beta integration line. The shell/Python
-implementation remains available as the read-only `v1-final` tag.
+Updated 2026-09-04. Cyclops is at version `1.0.2`. `main` is the primary stable
+line. The legacy shell/Python implementation remains available as the read-only
+`v1-final` tag.
 
-Track A, the Messaging Beta Rework, is accepted. `WorkspaceMessaging` now owns
-current durable messaging policy. Retained session-journal discovery and replay
-go through the narrow compatibility-history adapter.
-
-The whole-product implementation tracks and technical beta-acceptance decision
-are complete for the audited candidate. The
-[final beta acceptance audit](docs/development/CYCLOPS_BETA_FINAL_AUDIT.md)
-records the evidence and remaining known limits. The selected release identity
-is `0.1.2-beta` / `v0.1.2-beta`. Exact-SHA release evidence and a later
-explicit operator authorization are required before merging `main`, tagging,
-creating a GitHub Release, or publishing. The historical `v0.2.0-beta` tag
-remains attached to its older source commit and does not name this candidate.
+`WorkspaceMessaging` owns current durable messaging policy. Retained
+session-journal discovery and replay go through the narrow
+compatibility-history adapter. Historical beta audits and charter documents
+are preserved under `docs/development/` for architectural provenance.
 
 ## Built
 
@@ -36,11 +27,13 @@ remains attached to its older source commit and does not name this candidate.
 - Notification recovery is append-only and operator explicit. Eligible
   messages can be requeued, and alarms can be cleared by exact id or through
   an age preview whose exact id set is confirmed before mutation.
-- Agent activity and composer safety are separate. Visible human input holds a
-  notification even when the agent is idle. Partial deletion remains held; a
-  settled exact empty composer releases the same unowned human attempt through
-  the ordinary gate. Hidden, ambiguous, stale, modal, replacement, and
-  recovery-owned holds remain blocked.
+- Agent activity and composer safety are separate. Direct message payloads are
+  strictly verified before submission. Pane doorbells (Format 4) prioritize
+  liveness: they proceed as unverified when staging is unobservable, holding when
+  positive human typing, active drafts, or modals are detected. Partial deletion
+  remains held; a settled exact empty composer releases the held attempt through
+  the ordinary gate. Hidden, modal, replacement, and recovery-owned holds
+  remain blocked.
 - Bare `cyclops` opens the full-screen workspace, seeding the shipped
   themes on the way in. It provides a workspace sidebar, tabs, embedded
   pane terminals, split controls, pane swapping by keyboard or drag,
@@ -106,6 +99,13 @@ head has already rerun every campaign.
 
 ## Known limits
 
+- Doorbell staging verification vs. liveness: Pane doorbells prioritize agent
+  liveness. If terminal staging cannot be echo-verified on screen (common in CLI
+  agents without bracketed paste echo verification), doorbells proceed to submit
+  Enter and transition to `delivered_unverified` with cause `"unverified_staging"`.
+  Doorbells hold when positive human input or modals are detected on screen,
+  relying on prompt heuristics to prevent typing over human drafts. Direct
+  payload deliveries strictly require exact byte verification before submission.
 - A quota-held mailbox notification never retries automatically. After fresh
   screen evidence records that quota has reset, the workspace administrator
   must run `cyclops requeue <message-id>`. Legacy direct-delivery quota parks
@@ -140,8 +140,8 @@ head has already rerun every campaign.
   | Cursor Agent CLI | 2026.07.23-e383d2b | No installed binary on the evidence host | Installed current binary, full matrix, and paired start and end hook payloads |
 
   The soak proves staging verification and cleanup only. It does not promote a
-  whole manifest to the newer version. Track E owns the remaining current
-  vendor-capability evidence and conservative manifest updates.
+  whole manifest to the newer version. Manifest updates and evidence snapshots
+  are maintained across released vendor updates.
 
 For the repository map and design boundaries, read
 [docs/development/HANDOFF.md](docs/development/HANDOFF.md). For user-facing

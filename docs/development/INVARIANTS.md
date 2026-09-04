@@ -62,12 +62,20 @@ The screen read in step 6 is deliberately the last one before the paste. A
 gate that reads the screen early and pastes later is admitting a pane as it
 was, not as it is, and a human keystroke round-trip fits in that gap.
 
-Verification is the second half of the same rule. On ordinary delivery and
-`attention.complete`, Enter is sent only when the normalized visible composer
+Verification is the second half of the same rule. For direct payload deliveries
+and `attention.complete`, Enter is sent only when the normalized visible composer
 bytes exactly match the payload selected at the durable write boundary. A
 visible target or terminal sentinel is structural evidence, not ownership by
 itself. A collapsed chip proves only a vendor representation because its hidden
-bytes cannot be compared. It never authorizes Enter.
+bytes cannot be compared. It never authorizes Enter for direct payloads.
+
+For pane doorbells (Format 4), which carry short wake signals and claim tokens
+rather than raw message bodies, Cyclops prioritizes multi-agent liveness. If
+terminal staging is unobservable (common in CLI agents that do not echo
+bracketed paste into visible composer rows), the doorbell proceeds to submit
+Enter once and transitions to `delivered_unverified` with cause
+`unverified_staging`. Direct payloads strictly refuse submission if exact bytes
+cannot be verified.
 
 `notification.force_submit` is the separately documented default-on,
 administrator-controlled recovery. It never pastes or replaces bytes. For one
@@ -129,8 +137,8 @@ Declines are bounded, never looped.
 
 ## 3. Cyclops writes only with fresh positive composer and occupant evidence
 
-**On ordinary delivery and `attention.complete`, a composer with text in it is
-`idle_with_input`, and `idle_with_input` holds.**
+**On ordinary delivery and `attention.complete`, a composer with detected human
+input holds the notification.**
 
 What breaks: the paste lands in a composer that already holds the human's
 half-written sentence, the two concatenate, and the submit key sends the
@@ -145,12 +153,17 @@ only discriminator is that the ghost text is SGR-dim and typed text is bare
 time whenever the bound manifest has such rules. Take that away and the
 gate reads a typing human as an idle agent.
 
-This is a strong guard, not an absolute exclusion guarantee. A person can type
-after the final observation and before the tmux write. The current transport
-has no cooperative input lease across that interval. Cyclops therefore uses
-fresh positive evidence, checks the exact occupant, records intent before the
-effect, and treats ambiguous outcomes conservatively. Do not weaken those
-guards or describe them as proof that concurrent input is impossible.
+This is a conservative guard, not an absolute exclusion guarantee. Direct
+payload deliveries require positive clean-composer evidence before write and
+exact byte verification before submit. For mailbox doorbells, an unproven or
+unreadable composer is eligible to receive the wake notification unless positive
+human input (`HumanInput`), an active modal, or an explicit composer hold is
+detected. A person can type after the final observation and before the tmux
+write: the current transport has no cooperative input lease across that interval.
+Cyclops relies on prompt heuristics and conservative hold rules to protect human
+drafts, but doorbells do not guarantee absolute protection if human typing is
+unclassified by the manifest. Do not describe these guards as proof that
+concurrent input is impossible.
 
 The default-on `notification.force_submit` recovery setting is deliberately
 outside this ordinary proof path. It does not add a paste or replace visible

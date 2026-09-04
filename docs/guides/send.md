@@ -2,7 +2,7 @@
 
 `cyclops send` records one immutable message in each recipient's durable
 mailbox and returns after acceptance. Terminal delivery is asynchronous. A
-CLI send or reply queues a two-sentence preview and exact claim command through
+CLI send or reply queues a summary preview and exact claim command through
 the safe terminal gate. The full technical body remains in the authenticated
 mailbox.
 
@@ -80,13 +80,15 @@ after valid acceptance. Plain output prints the accepted message id and warns
 that the wake receipt state is unknown to this client; JSON preserves the raw
 response. An incomplete acceptance envelope exits 1 in both modes.
 
-The body and wake use different paths. The terminal wake stages the required
-two-sentence summary and one exact `inbox claim` command, never the full body.
-Working state does not discard the wake. Human input or an ambiguous composer
-makes it wait until the composer is proven available. A pull client may claim
-the same message through the authenticated socket without changing the
-composer or canceling the independently queued terminal wake. `cyclops
-messages` is the authoritative combined view of mailbox and wake state.
+The body and wake use different paths. The terminal wake stages a short
+summary and one exact `inbox claim` command, never the full body.
+Working state does not discard the wake. Detected human input holds the wake
+until the composer is proven clean. For direct payloads, an ambiguous composer
+also holds; for doorbells, unproven composers proceed if no human input or modal
+is detected. A pull client may claim the same message through the authenticated
+socket without changing the composer or canceling the independently queued
+terminal wake. `cyclops messages` is the authoritative combined view of mailbox
+and wake state.
 
 ## Receive
 

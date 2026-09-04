@@ -14,7 +14,7 @@ The messaging protocol and the workspace are deliberately separate. Agents can
 use Cyclops without opening the UI. If the UI closes, accepted messages remain
 in the append-only journal.
 
-Cyclops is pre-release software at version `0.1.2-beta`. It currently ships tested
+Cyclops is at version `1.0.2`. It currently ships tested
 manifests for Codex CLI, Claude Code, Antigravity CLI, and Cursor Agent CLI.
 Detection is conservative and version-sensitive: unknown terminal chrome holds
 a write instead of guessing. See [STATUS.md](STATUS.md) for current evidence and
@@ -33,17 +33,21 @@ human is typing. Cyclops adds those missing boundaries:
 
 - A send is durably accepted before terminal notification begins.
 - Message bodies remain in the authenticated mailbox. CLI pane notifications
-  show a required two-sentence preview beside the exact claim command.
+  show a summary beside the exact claim command.
 - Notifications are FIFO per recipient and remain tied to stable pane and
   process identities.
-- Terminal writes require current composer evidence. Human input, a modal,
-  ambiguous chrome, or a replaced process fails closed.
+- Terminal writes inspect current composer evidence: detected human input or an
+  active modal holds the notification.
+- Deliveries are guarded: direct message payloads require strict screen
+  verification before submission. Pane doorbells prioritize liveness and proceed
+  as unverified if staging is unobservable, holding when positive human typing or
+  modals are detected.
 - Claims, replies, recovery, and operator actions are append-only facts that can
   be inspected later.
 
 ### Benchmarks: Agent CLI Commands vs. Raw tmux, smux, and commPact
 
-The table below measures the actual end-to-end CLI commands executed by AI agents in active terminal panes. Unlike file-lock wrappers or raw terminal scripts, Cyclops guarantees hardware-level crash durability, monotonic sequence ordering, and absolute human composer protection:
+The table below measures the actual end-to-end CLI commands executed by AI agents in active terminal panes. Unlike file-lock wrappers or raw terminal scripts, Cyclops provides hardware-level crash durability, monotonic sequence ordering, and conservative composer draft holds:
 
 | Executed Command | System & Architecture | Latency p50 | Latency p95 | Worst Case (p99) | Throughput | Zero-Loss Durability | Human Draft Safety |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -51,8 +55,8 @@ The table below measures the actual end-to-end CLI commands executed by AI agent
 | `tmux send-keys -t %0 "..." Enter` | Raw tmux (ephemeral IPC) | 2.64 ms | 2.76 ms | 6.25 ms | 371.7 ops/s | ❌ None | ❌ Overwrites drafts |
 | `smux send %0 "..."` | ShawnPana `smux` (file locks) | 8.04 ms | 8.28 ms | 18.20 ms | 123.3 ops/s | ❌ Crash loss | ❌ No sensing |
 | `commpact send --to %0 "..."` | commPact v1 (flock + pipes) | 12.40 ms | 16.80 ms | 31.50 ms | 80.6 ops/s | ❌ Stale locks | ❌ No sensing |
-| **`cyclops send "@agent ..."`** | **Cyclops CLI (WAL + Sentinel)** | **10.99 ms** | **12.97 ms** | **14.96 ms** | **90.9 ops/s** | **Full WAL Fsync** | **Guaranteed** |
-| **`cyclops inbox claim`** | **Cyclops CLI (Auth IPC + Claim)** | **10.04 ms** | **15.80 ms** | **27.03 ms** | **91.6 ops/s** | **Full WAL Fsync** | **Guaranteed** |
+| **`cyclops send "@agent ..."`** | **Cyclops CLI (WAL + Sentinel)** | **10.99 ms** | **12.97 ms** | **14.96 ms** | **90.9 ops/s** | **Full WAL Fsync** | **Conservative Hold** |
+| **`cyclops inbox claim`** | **Cyclops CLI (Auth IPC + Claim)** | **10.04 ms** | **15.80 ms** | **27.03 ms** | **91.6 ops/s** | **Full WAL Fsync** | **Conservative Hold** |
 
 *(Note: When called internally or over persistent daemon sockets, `msg.send` completes in **3.99 ms** / 252 ops/s, and socket pings in **0.012 ms**.)*
 
@@ -61,7 +65,7 @@ Raw `tmux send-keys` is a fire-and-forget socket pipe that does not verify messa
 1. **Process Bootstrap (~2.5 ms)**: Starting the standalone `cyclops` binary (`fork`/`exec` and runtime init).
 2. **Peer Credential Handshake (~3.0 ms)**: Verifying caller UID and socket peer PID (`LOCAL_PEEREPID` / `SO_PEERCRED`) so malicious processes cannot spoof agent identities.
 3. **Monotonic WAL Fsync (~4.5 ms)**: Executing a synchronous hardware `fsync` to `record.jsonl` ensuring zero message loss on machine crashes or daemon restarts.
-4. **Composer Protection**: Inspecting recipient screen lines to verify the agent is idle and that human keyboard drafts remain untouched.
+4. **Composer Protection**: Inspecting recipient screen lines to verify the agent is idle and holding writes when human keyboard drafts are detected.
 
 ## First five minutes
 
@@ -173,26 +177,35 @@ These are different facts:
 
 Agent activity and composer safety are independent.
 
-- `idle` and `working` describe activity for the human.
-- `clean`, `withInput`, and `ambiguous` determine whether Cyclops may write.
+- `idle` and `working` describe agent activity for the human.
+- `clean`, `withInput`, and `ambiguous` inform whether Cyclops may write:
+  detected human input (`withInput`) holds the notification. Direct payloads
+  require strict clean-composer proof and exact staging verification. Doorbells
+  prioritize liveness and proceed when the composer is unproven, holding when
+  human input, drafts, modals, or replaced occupants are detected.
 
 An idle agent with visible human input is not safe to notify. A working agent
 with a structurally proven clean composer may be safe. Cyclops holds the same
-notification attempt while input remains. Partial backspacing remains held;
+notification attempt while human input remains. Partial backspacing remains held;
 when the final visible character is erased and the settled composer is proven
-exactly empty, that same attempt re-enters the normal gate automatically. A
-hidden editor, modal, stale frame, ambiguous composer, replaced occupant, or
+empty, that same attempt re-enters the normal gate automatically. A
+hidden editor, modal, stale frame, replaced occupant, or
 daemon-owned recovery barrier remains blocked.
 
-For operators who prefer liveness over that final content guarantee, Settings
-includes a default-off `Force staged submit` timer from 0 to 20 seconds. It
-applies only after an exact notification was pasted but normal verification
-failed. The daemon rechecks the exact attempt and pane process, then reserves
-one key atomically with `inbox.claim` before pressing Enter without pasting
-again. A claim or replacement that wins before that reservation stops it. Once
-reserved, a later claim or setting change does not retract the one key. This
-mode can submit human input, especially at 0 seconds, so it is never enabled by
-default.
+To preserve multi-agent liveness across diverse agent CLI versions, pane
+doorbells (Format 4) act as wake signals and proceed even if terminal staging
+cannot be echo-verified on screen, provided no human input or modal is detected.
+Full message bodies remain guarded in the authenticated mailbox until claimed.
+
+For operators who prefer liveness over the final content guarantee on direct
+deliveries, Settings includes a default-off `Force staged submit` timer from 0 to
+20 seconds. It applies only after an exact notification was pasted but normal
+verification failed. The daemon rechecks the exact attempt and pane process,
+then reserves one key atomically with `inbox.claim` before pressing Enter without
+pasting again. A claim or replacement that wins before that reservation stops
+it. Once reserved, a later claim or setting change does not retract the one key.
+This mode can submit human input, especially at 0 seconds, so it is never
+enabled by default.
 
 <!-- Media slot: docs/public/images/composer-hold.png
      Suggested content: visible draft, held notification, final erase, same attempt released. -->
