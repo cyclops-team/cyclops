@@ -3,9 +3,9 @@
 **Status:** Historical, frozen stabilization roadmap
 
 **Authority:** Not current implementation authority. For current behavior, use
-the contracts linked from [HANDOFF.md](HANDOFF.md). For Messaging Beta Rework
+the contracts linked from [HANDOFF.md](../HANDOFF.md). For Messaging Beta Rework
 implementation, use the approved
-[Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) and [NEXT.md](NEXT.md).
+[Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) and [NEXT.md](../NEXT.md).
 
 Frozen planning baseline:
 
@@ -125,8 +125,8 @@ must not branch on vendor names.
 ### Claim and terminal submit ordering
 
 The normative transition and recovery contracts live in
-[Delivery](DELIVERY.md#per-recipient-pipeline) and
-[Protocol](../reference/PROTOCOL.md#mailbox-and-notification-control). This roadmap
+[Delivery](../DELIVERY.md#per-recipient-pipeline) and
+[Protocol](../../reference/PROTOCOL.md#mailbox-and-notification-control). This roadmap
 requires their release properties without maintaining a second transition
 table: a claim never proves Enter, a claimed staged doorbell settles only after
 exact clear proof, that settlement changes the attempt and retires its barrier
@@ -443,7 +443,7 @@ reasons to delay a correct release or to rewrite working code during hardening.
   while keeping tmux, journals, process identity, timers, locks, and RPC at the
   adapters. Land only narrow behavior-preserving slices with replay, mutation,
   and crash-boundary evidence. The executable sequence and deferrals are in
-  [NEXT.md](NEXT.md).
+  [NEXT.md](../NEXT.md).
 - Deepen pane runtime ownership so discovery, lifecycle, readiness, and process
   generation have one narrow public interface.
 - Separate durable endpoint adoption from live tmux route lookup.

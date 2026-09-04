@@ -5,32 +5,32 @@ job you have been handed, and which decisions were deliberate so you do not
 spend a day undoing one.
 
 For current behavior, start with this map and the behavior contracts below.
-The approved [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) and
-[Cyclops Beta Charter](CYCLOPS_BETA_CHARTER.md) record foundational architecture,
+The approved [Messaging Refactor Charter](archive/MESSAGING_REFACTOR_CHARTER.md) and
+[Cyclops Beta Charter](archive/CYCLOPS_BETA_CHARTER.md) record foundational architecture,
 invariants, and historical beta milestones. [NEXT.md](NEXT.md) is the current
-execution queue. The [Messaging Beta audit](MESSAGING_BETA_AUDIT.md) and
-[final beta acceptance audit](CYCLOPS_BETA_FINAL_AUDIT.md) preserve historical
+execution queue. The [Messaging Beta audit](archive/MESSAGING_BETA_AUDIT.md) and
+[final beta acceptance audit](archive/CYCLOPS_BETA_FINAL_AUDIT.md) preserve historical
 completion evidence, architectural decisions, and release gates.
 
 The
-[messaging architecture review](../MESSAGING_ARCHITECTURE_REVIEW.md) and its
-[addendum](../ADDENDUM_REVIEW.md) are supporting design records. They explain
+[messaging architecture review](archive/MESSAGING_ARCHITECTURE_REVIEW.md) and its
+[addendum](archive/ADDENDUM_REVIEW.md) are supporting design records. They explain
 the reasoning behind the approved charter, but the charter controls
 implementation when the documents differ. The
-[whole-system architecture review](../CYCLOPS_SYSTEM_ARCHITECTURE_REVIEW.md)
+[whole-system architecture review](archive/CYCLOPS_SYSTEM_ARCHITECTURE_REVIEW.md)
 is the supporting evidence behind the Cyclops Beta Charter. Its reviewed
 revision and measurements remain historical; the charter records current
 finding dispositions. The
-[CI and test architecture review](CI_TEST_ARCHITECTURE_REVIEW.md) is the
+[CI and test architecture review](archive/CI_TEST_ARCHITECTURE_REVIEW.md) is the
 supporting design record behind the implemented [current CI contract](CI.md),
 not messaging authority. The reusable
-[architecture review method](ARCHITECTURE_REVIEW_PROCESS.md) is methodology,
+[architecture review method](archive/ARCHITECTURE_REVIEW_PROCESS.md) is methodology,
 not a Cyclops behavior contract.
 
 The completed stabilization run is recorded in
-[STABILIZATION_HISTORY.md](STABILIZATION_HISTORY.md). The
-[reliability roadmap](RELIABILITY_ROADMAP.md) is a frozen historical gate record,
-and [V5.md](V5.md) is a historical design record. Do not use them as current
+[STABILIZATION_HISTORY.md](archive/STABILIZATION_HISTORY.md). The
+[reliability roadmap](archive/RELIABILITY_ROADMAP.md) is a frozen historical gate record,
+and [V5.md](archive/V5.md) is a historical design record. Do not use them as current
 implementation authority.
 
 Cyclops coordinates terminal coding agents that are already running in your
@@ -42,7 +42,7 @@ one append-only workspace journal. Pane state and legacy direct delivery use
 separate append-only session journals.
 
 For current messaging, start with [send.md](../guides/send.md),
-[PROTOCOL.md](../reference/PROTOCOL.md), `src/cyclopsd/src/mailbox.rs`, and
+[PROTOCOL.md](../reference/PROTOCOL.md), `src/cyclopsd/src/mailbox/`, and
 `src/cyclopsd/src/messaging.rs`. Sections explicitly labeled legacy describe
 the compatibility path used by hook self-tests and old session records, not
 standard `cyclops send`. `src/cyclopsd/src/session_history.rs` is the boundary
@@ -61,15 +61,9 @@ contracts, and historical records separate:
 | User operation | [User guides](../guides/README.md) | Install, message, monitor, recover, and use the workspace. |
 | Stable reference | [Technical reference](../reference/README.md) | Wire methods, manifests, hooks, and measured performance claims. |
 | Current behavior contracts | [Architecture](ARCHITECTURE.md), [delivery](DELIVERY.md), [invariants](INVARIANTS.md), [protocol](../reference/PROTOCOL.md), [goals](GOALS.md), and [style](STYLE.md) | Read before changing product behavior, wire behavior, rendering, or tests. |
-| Approved implementation authority | [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) and [Cyclops Beta Charter](CYCLOPS_BETA_CHARTER.md) | The charters record foundational messaging behavior, scope, and release gates. |
 | Current execution queue | [NEXT.md](NEXT.md) | Active priorities and execution rules on `main`. |
-| Messaging beta audit | [Messaging Beta audit](MESSAGING_BETA_AUDIT.md) | Historical architecture, regression, performance, migration, and reliability evidence. |
-| Final beta acceptance | [Final beta acceptance audit](CYCLOPS_BETA_FINAL_AUDIT.md) | Historical cross-track acceptance record and release evidence. |
-| Supporting design records | [Whole-system architecture review](../CYCLOPS_SYSTEM_ARCHITECTURE_REVIEW.md), [messaging architecture review](../MESSAGING_ARCHITECTURE_REVIEW.md), and [addendum](../ADDENDUM_REVIEW.md) | Revision-bound reasoning behind the charters, not independent implementation authority. |
-| CI design record | [CI and test architecture review](CI_TEST_ARCHITECTURE_REVIEW.md) | Evidence and rationale behind the implemented [CI contract](CI.md), not messaging authority. |
 | Measured evidence | [findings.md](../../findings.md) | Probe-backed constraints on current code. This is live evidence, not a roadmap or archive. |
-| General methodology | [Architecture review method](ARCHITECTURE_REVIEW_PROCESS.md) | Reusable audit process, not a Cyclops behavior contract. |
-| Frozen and historical records | [Reliability roadmap](RELIABILITY_ROADMAP.md), [stabilization history](STABILIZATION_HISTORY.md), [V5 line](V5.md), and [changelog](../../CHANGELOG.md) | Preserve the reasoning behind the current system. Do not treat old plans as current behavior. |
+| Archived historical and audit records | [Archive index](archive/README.md) and [changelog](../../CHANGELOG.md) | Revision-bound charters, audits, and design reviews that no longer govern current behavior; the changelog is the immutable release history. |
 | Internal release material | [Media plan](../public/README.md) and [archived demo checklist](archive/demo-day-checklist.md) | Maintainer and historical material, not public onboarding. |
 | Repository instructions | [Agent entrypoint](../../AGENTS.md), [contributing](../../CONTRIBUTING.md), and [security](../../SECURITY.md) | Rules for automated contributors, human contributors, and vulnerability reports. |
 
@@ -179,10 +173,10 @@ Read in this order:
    withdrawal coordination, body-free inbox, snapshot, follow, alarm, and
    attention-selection reads, the body-free status projection, and durable
    consequences of ordered typed pane observations.
-4. `src/cyclopsd/src/mailbox.rs` for the durable projection and mutations owned
+4. `src/cyclopsd/src/mailbox/projection.rs` for the durable projection and mutations owned
    behind that boundary.
 5. `src/cyclopsd/src/notification_adapter.rs` and the notification path in
-   `src/cyclopsd/src/delivery.rs` for the content-free wake.
+   `src/cyclopsd/src/delivery/mod.rs` for the content-free wake.
 
 The key boundary is durable acceptance before asynchronous notification. The
 recipient reads the body only by claiming the exact message. Standard send
@@ -204,7 +198,7 @@ internal transport tests. Read in this order:
    drive through it.
 3. `src/cyclopsd/src/session_history.rs`. The only entry to the retained writer,
    restart settlement, and session-journal replay.
-4. `src/cyclopsd/src/delivery.rs`, in call order: `msg_send` -> `worker_for` ->
+4. `src/cyclopsd/src/delivery/`, in call order: `msg_send` -> `worker_for` ->
    `worker_loop` -> `process` -> `gate` -> `attempt_delivery` -> `inject`
    -> `await_ack` -> `receipt_of`.
 5. The two diagrams in [ARCHITECTURE.md](ARCHITECTURE.md): the gate's eight

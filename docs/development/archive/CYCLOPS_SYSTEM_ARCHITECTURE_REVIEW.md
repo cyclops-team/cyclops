@@ -3,7 +3,7 @@
 > Supporting design record. This review covers the whole Cyclops product.
 > It does not replace current behavior contracts or authorize implementation.
 > The approved Messaging Refactor Charter controls accepted Track A behavior.
-> The approved [Cyclops beta charter](development/CYCLOPS_BETA_CHARTER.md)
+> The approved [Cyclops beta charter](CYCLOPS_BETA_CHARTER.md)
 > controls the remaining beta work when this review and the charter differ.
 
 **Current-state note, 2026-08-30:** The findings were reverified against
@@ -80,12 +80,12 @@ through an owner that knows the active tmux context.
 Current behavior remains authoritative in this order:
 
 1. Current code and focused regression evidence.
-2. [Invariants](development/INVARIANTS.md),
-   [delivery](development/DELIVERY.md), and
-   [protocol](reference/PROTOCOL.md) contracts.
-3. [Engineering map](development/HANDOFF.md) and [status](../STATUS.md).
+2. [Invariants](../INVARIANTS.md),
+   [delivery](../DELIVERY.md), and
+   [protocol](../../reference/PROTOCOL.md) contracts.
+3. [Engineering map](../HANDOFF.md) and [status](../../../STATUS.md).
 4. The approved
-   [Messaging Refactor Charter](development/MESSAGING_REFACTOR_CHARTER.md) for
+   [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) for
    the active messaging track.
 5. Supporting architecture and CI reviews as design evidence.
 

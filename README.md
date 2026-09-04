@@ -303,7 +303,7 @@ must be bound to a clean frozen SHA; they are not ordinary unit-test claims.
 Read the [engineering map](docs/development/HANDOFF.md),
 [invariants](docs/development/INVARIANTS.md), and
 [contributing guide](CONTRIBUTING.md) before changing the delivery path. The
-[stabilization history](docs/development/STABILIZATION_HISTORY.md) records the
+[stabilization history](docs/development/archive/STABILIZATION_HISTORY.md) records the
 failures and fixes that produced the current system. The
 [next architecture work](docs/development/NEXT.md) explains the planned
 behavior-preserving delivery-core extraction.

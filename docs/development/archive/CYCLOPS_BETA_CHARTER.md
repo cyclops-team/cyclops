@@ -8,7 +8,7 @@ decision complete for the audited candidate, operator release gate open
 **Integration branch:** **beta/messaging-rework**
 
 This charter authorizes and records the whole-product beta work. It uses the
-[whole-system architecture review](../CYCLOPS_SYSTEM_ARCHITECTURE_REVIEW.md)
+[whole-system architecture review](CYCLOPS_SYSTEM_ARCHITECTURE_REVIEW.md)
 as supporting evidence without repeating it.
 The [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) remains the
 authority for accepted Track A behavior and compatibility.
@@ -16,7 +16,7 @@ authority for accepted Track A behavior and compatibility.
 All approved implementation tracks are integrated into
 **beta/messaging-rework**. The [final beta acceptance audit](CYCLOPS_BETA_FINAL_AUDIT.md)
 records the completed technical decision. It does not authorize a beta-to-`main`
-pull request, a tag, or a release. [NEXT.md](NEXT.md) is the current queue.
+pull request, a tag, or a release. [NEXT.md](../NEXT.md) is the current queue.
 
 ## Outcome and user journeys
 
@@ -41,15 +41,15 @@ When documents differ, use this order:
 
 1. Current operator instructions.
 2. Current code and focused behavioral evidence.
-3. [Invariants](INVARIANTS.md), [delivery](DELIVERY.md),
-   [protocol](../reference/PROTOCOL.md), [architecture](ARCHITECTURE.md),
-   [goals](GOALS.md), and [style](STYLE.md).
+3. [Invariants](../INVARIANTS.md), [delivery](../DELIVERY.md),
+   [protocol](../../reference/PROTOCOL.md), [architecture](../ARCHITECTURE.md),
+   [goals](../GOALS.md), and [style](../STYLE.md).
 4. The Messaging Refactor Charter for Track A.
 5. This charter for the remaining beta scope.
-6. [HANDOFF.md](HANDOFF.md), [STATUS.md](../../STATUS.md),
-   [NEXT.md](NEXT.md), [CI.md](CI.md), and current guides and reference pages.
+6. [HANDOFF.md](../HANDOFF.md), [STATUS.md](../../../STATUS.md),
+   [NEXT.md](../NEXT.md), [CI.md](../CI.md), and current guides and reference pages.
 7. Architecture reviews, audits, CI reviews, benchmarks, and
-   [findings.md](../../findings.md) as revision-bound evidence.
+   [findings.md](../../../findings.md) as revision-bound evidence.
 8. Frozen roadmaps, stabilization records, V5, changelogs, and archived demo
    material as history.
 
@@ -178,7 +178,7 @@ and remains an independent rollback point.
 
 ## Evidence and performance
 
-Use the four lanes in [CI.md](CI.md): required pull-request correctness,
+Use the four lanes in [CI.md](../CI.md): required pull-request correctness,
 conditional integration, scheduled evidence, and release evidence. Prefer a
 pure state transition, then adapter, in-process IO, isolated process, real
 tmux, and full journey. Moving or removing evidence requires a named

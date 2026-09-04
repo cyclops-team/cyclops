@@ -1,7 +1,7 @@
 # Cyclops architecture review addendum
 
 > Supporting design record. The approved
-> [Messaging Refactor Charter](development/MESSAGING_REFACTOR_CHARTER.md)
+> [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md)
 > controls implementation when the documents differ.
 
 - Review date: 2026-08-29
@@ -580,8 +580,8 @@ implementation and tests cluster in the same oversized files.
 
 | File | Total lines | Test module starts | Approximate test lines |
 |---|---:|---:|---:|
-| `src/cyclopsd/src/mailbox.rs` | 18,050 | 8,055 | 9,996 |
-| `src/cyclopsd/src/delivery.rs` | 15,931 | 9,710 | 6,222 |
+| src/cyclopsd/src/mailbox.rs | 18,050 | 8,055 | 9,996 |
+| src/cyclopsd/src/delivery.rs | 15,931 | 9,710 | 6,222 |
 | `src/cyclopsd/src/fusion.rs` | 11,111 | 4,781 | 6,331 |
 | `src/cyclops-workspace/src/app.rs` | 12,716 | 6,935 | 5,782 |
 | `src/cyclopsd/src/server.rs` | 4,962 | 2,567 | 2,396 |

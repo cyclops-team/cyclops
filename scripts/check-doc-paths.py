@@ -17,6 +17,7 @@ Run it: python3 scripts/check-doc-paths.py
 Exit 0 when every path resolves, 1 with a report when one does not.
 """
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -84,8 +85,7 @@ LITERAL_SKIPS = {
     "tests/raw/m1-soak/summary.json": "one such run's verdict, quoted by BENCHMARKS.md as a local artifact",
     "tests/raw/m1-soak-2/summary.json": "one such run's verdict, quoted by BENCHMARKS.md as a local artifact",
     "@src/main.rs": "a reference in the OPERATOR's project, not this one: workspace-ui.md uses it to show that a file panel reference stays relative to the pane's folder after browsing elsewhere",
-    "src/cyclopsd/src/delivery.rs": "pre-modularization monolith path, now modularized under src/cyclopsd/src/delivery/",
-    "src/cyclopsd/src/mailbox.rs": "pre-modularization monolith path, now modularized under src/cyclopsd/src/mailbox/",
+    ".codex/hooks.json": "a project-local hooks file in whatever project Codex CLI is running, not this repo: docs/public/reference/configuration.mdx names it to explain why project-local hooks silently never fire",
 }
 
 # A code span is a candidate when it has a slash and no whitespace. That
@@ -119,13 +119,60 @@ def skip_reason(s):
 
 
 def docs():
-    """Every markdown page in the repo, top level and docs/ (recursively).
+    """Every documentation page in the repo.
 
-    docs/ is split into guides/, reference/, and development/; docs/public/
-    is Mintlify's published-docs tree and holds only `.mdx`, so the `*.md`
-    glob already excludes it without a special case.
+    Top level and docs/ (recursively) for `.md`; docs/ is split into
+    guides/, reference/, and development/. docs/public/ is Mintlify's
+    published-docs tree and holds `.mdx` instead, checked the same way:
+    its links and code-span paths are read by the same reader, so a wrong
+    path there is the same defect.
     """
-    return sorted(list(REPO.glob("*.md")) + list((REPO / "docs").rglob("*.md")))
+    return sorted(
+        list(REPO.glob("*.md"))
+        + list((REPO / "docs").rglob("*.md"))
+        + list((REPO / "docs" / "public").rglob("*.mdx"))
+    )
+
+
+MINTLIFY_ROOT = REPO / "docs" / "public"
+MINTLIFY_CONFIG = MINTLIFY_ROOT / "docs.json"
+
+
+def mintlify_page_path(slug):
+    """The `.mdx` file a Mintlify site-absolute link or nav entry names.
+
+    Mintlify addresses a page by slug from the site root, not by filesystem
+    path: `/guides/recovery` in a link, or `"guides/recovery"` in
+    docs.json, both mean `docs/public/guides/recovery.mdx`.
+    """
+    return MINTLIFY_ROOT / (slug.strip("/") + ".mdx")
+
+
+def mintlify_navigation_slugs():
+    """Every page slug docs.json's `navigation` tree names.
+
+    docs.json is Mintlify's site config; `navigation` is a tree of groups,
+    tabs, and page-slug strings. This walks any shape of it rather than
+    assuming today's `{"pages": [...]}` layout, so a future tab or anchor
+    group is still found instead of silently unindexed.
+    """
+    if not MINTLIFY_CONFIG.exists():
+        return []
+    config = json.loads(MINTLIFY_CONFIG.read_text())
+    slugs = []
+
+    def walk(node):
+        if isinstance(node, str):
+            slugs.append(node)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+        elif isinstance(node, dict):
+            for value in node.values():
+                walk(value)
+
+    walk(config.get("navigation", {}))
+    return slugs
 
 
 def check_links(page, text, bad):
@@ -136,6 +183,10 @@ def check_links(page, text, bad):
             continue
         path = target.split("#")[0]
         if not path:
+            continue
+        if page.suffix == ".mdx" and path.startswith("/"):
+            if not mintlify_page_path(path).exists():
+                bad.append((page, line_of(text, m.start()), target, "mdx link target"))
             continue
         if not (page.parent / path).exists():
             bad.append((page, line_of(text, m.start()), target, "link target"))
@@ -199,6 +250,12 @@ def check_orphans():
     public, reference, and engineering indexes while still catching pages
     that no reader can navigate to. Without this, a doc set either grows
     sideways or forces its root README to become a file inventory.
+
+    docs/public/ is a third front door, not reached by walking README.md or
+    HANDOFF.md: a Mintlify page is what a reader gets to through the
+    published site's own navigation, and that navigation is docs.json, not
+    a Markdown link chain. A page docs.json does not name is unreachable on
+    the actual published site even if some other page happens to link it.
     """
     reachable = set()
     pending = [(REPO / door).resolve() for door in FRONT_DOORS]
@@ -208,6 +265,11 @@ def check_orphans():
             continue
         reachable.add(page)
         pending.extend(linked_markdown_pages(page))
+
+    for slug in mintlify_navigation_slugs():
+        path = mintlify_page_path(slug)
+        if path.exists():
+            reachable.add(path.resolve())
 
     # notebook.md is the maintainer's working scratchpad of raw feedback,
     # not a documentation page: indexing it from a front door would put
@@ -241,29 +303,53 @@ Must not be caught: `~/.cyclops/config.toml`, `$CYCLOPS_HOME/sock`,
 `.github/workflows/ci.yml`, and [a real link](guides/install.md).
 """
 
+# A second probe, planted as `.mdx` under docs/public/, proves the
+# Mintlify-specific branch in check_links: a site-absolute slug resolves
+# against docs/public/, not against the page's own directory the way an
+# ordinary Markdown link does.
+SELFTEST_MDX_PAGE = """---
+title: "selftest"
+---
+
+Must be caught: [gone](/nope-{tag}).
+
+Must not be caught: [a real page](/introduction).
+"""
+
 MUST_CATCH = 3
+MDX_MUST_CATCH = 1
 
 
 def selftest():
     """Prove the gate reports what it should and nothing else."""
     page = REPO / "docs" / "zz-selftest-doc-paths.md"
+    mdx_page = MINTLIFY_ROOT / "zz-selftest-doc-paths.mdx"
     if page.exists():
         print(f"!! {page} is in the way; remove it and run again")
         return 1
+    if mdx_page.exists():
+        print(f"!! {mdx_page} is in the way; remove it and run again")
+        return 1
+
     page.write_text(SELFTEST_PAGE.format(tag="xyzzy"))
+    mdx_page.write_text(SELFTEST_MDX_PAGE.format(tag="xyzzy"))
     try:
         bad = []
-        text = page.read_text()
-        check_links(page, text, bad)
-        check_code_spans(page, text, bad)
+        check_links(page, page.read_text(), bad)
+        check_code_spans(page, page.read_text(), bad)
+        mdx_bad = []
+        check_links(mdx_page, mdx_page.read_text(), mdx_bad)
     finally:
         page.unlink()
+        mdx_page.unlink()
 
-    if len(bad) == MUST_CATCH:
-        print(f"== selftest: {MUST_CATCH} planted paths caught, no others")
+    want = MUST_CATCH + MDX_MUST_CATCH
+    got = len(bad) + len(mdx_bad)
+    if got == want:
+        print(f"== selftest: {want} planted paths caught, no others")
         return 0
-    print(f"== selftest FAILED: expected {MUST_CATCH} findings, got {len(bad)}")
-    for _, line, s, kind in bad:
+    print(f"== selftest FAILED: expected {want} findings, got {got}")
+    for _, line, s, kind in bad + mdx_bad:
         print(f"  line {line}  {kind}  {s}")
     print(
         "\nFewer than expected means the gate stopped catching something.\n"

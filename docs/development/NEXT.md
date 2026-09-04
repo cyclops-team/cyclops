@@ -6,7 +6,7 @@
 
 **Selected package:** `1.0.2`
 
-The [Cyclops Beta Charter](CYCLOPS_BETA_CHARTER.md) and [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md) record foundational architecture, invariants, and historical beta milestones.
+The [Cyclops Beta Charter](archive/CYCLOPS_BETA_CHARTER.md) and [Messaging Refactor Charter](archive/MESSAGING_REFACTOR_CHARTER.md) record foundational architecture, invariants, and historical beta milestones.
 
 ## Current priorities
 

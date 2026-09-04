@@ -1,11 +1,11 @@
 # Cyclops ideal messaging architecture and implementation audit
 
 > Supporting design record. The approved
-> [Messaging Refactor Charter](development/MESSAGING_REFACTOR_CHARTER.md)
+> [Messaging Refactor Charter](MESSAGING_REFACTOR_CHARTER.md)
 > controls implementation when the documents differ.
 
 Review date: 2026-08-29. The process for this review is found
-[here](development/ARCHITECTURE_REVIEW_PROCESS.md).
+[here](ARCHITECTURE_REVIEW_PROCESS.md).
 
 This review asks what the correct system should be, then audits Cyclops against
 that standard. The current implementation is evidence, not authority. Existing
@@ -1600,11 +1600,11 @@ automatic defects.
 | Code area | Verified shape | Architectural signal |
 |---|---|---|
 | `src/cyclopsd/src/lib.rs` | `Inner` starts at line 160 and contains 46 fields across configuration, identity, mailbox, observation, delivery, UI, lifecycle, and test control | The daemon composition root is also a shared mutable state bag |
-| `src/cyclopsd/src/mailbox.rs` | 18,050 lines; production code reaches line 8,054 before the main test module | Large behavior surface even after accounting for extensive tests |
+| src/cyclopsd/src/mailbox.rs | 18,050 lines; production code reaches line 8,054 before the main test module | Large behavior surface even after accounting for extensive tests |
 | `MailboxProjection` | 19 indexes or state collections spanning messages, claims, notification attempts, barriers, attention resolutions, and consumption evidence | The name "mailbox" hides several domains |
 | `MailboxError` | 82 variants spanning messaging, directory, notification, attention, replay, and persistence failures | Callers receive one broad error vocabulary instead of domain-local failures |
 | `MailboxService` | Holds the directory, store, change publisher, attention resolution, reconciliation, and consumption candidates | One implementation owns unrelated decisions because they share storage |
-| `src/cyclopsd/src/delivery.rs` | 15,838 lines; production code reaches line 9,703 before its main test module | Current notification and legacy direct delivery share one engine and recovery vocabulary |
+| src/cyclopsd/src/delivery.rs | 15,838 lines; production code reaches line 9,703 before its main test module | Current notification and legacy direct delivery share one engine and recovery vocabulary |
 | `src/cyclopsd/src/fusion.rs` | 11,111 lines; main production flow reaches line 4,780 | Observation recompute also performs recovery, acknowledgement, quota, attention, and chrome consequences |
 | `src/cyclops-workspace/src/app.rs` | 12,636 lines and one `App` owns workspace interaction plus message projection, composer, refresh, detail, and transport worker state | Product composition and messaging presentation have low locality |
 | Hidden Messages behavior | `WorkspacePrefs` defaults `messages_visible` to false; `pump_messages_refresh` returns while hidden; `MessagesChanged` only dirties that deferred projection | The optional view is real, but hidden arrival has no compact user-facing projection |
@@ -1986,7 +1986,7 @@ Recommendation levels:
 
 `docs/development/INVARIANTS.md` says "Human typing always wins." The actual
 implementation is careful but cannot prove that absolute claim. In
-`src/cyclopsd/src/delivery.rs:4200-4214`, the code intentionally performs
+src/cyclopsd/src/delivery.rs:4200-4214 (at the reviewed revision), the code intentionally performs
 spooling before the final composer proof so the proof is as late as possible,
 then states that the remaining command interval is irreducible. The final
 binding bookend and durable write intent still precede an asynchronous tmux

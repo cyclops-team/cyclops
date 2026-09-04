@@ -33,7 +33,7 @@ The first approved phase changes documentation plus the shipped Cyclops skill
 and its required current-body seeding hash. It does not change messaging
 runtime behavior, tests, the public command surface, durable data, or the
 running system. It approves and repairs this charter, rewrites
-[NEXT.md](NEXT.md), updates [HANDOFF.md](HANDOFF.md), repairs documentation
+[NEXT.md](../NEXT.md), updates [HANDOFF.md](../HANDOFF.md), repairs documentation
 authority and links, makes the shipped skill the emergency-doctrine source of
 truth, and synchronizes the installed copy. It does not create
 `cyclops-delivery-core`, a runner, a host adapter, or an MCP adapter.
@@ -47,18 +47,18 @@ knowledge from callers.
 
 When sources conflict, use this order:
 
-1. Current behavior contracts in [ARCHITECTURE.md](ARCHITECTURE.md),
-   [DELIVERY.md](DELIVERY.md), [INVARIANTS.md](INVARIANTS.md),
-   [PROTOCOL.md](../reference/PROTOCOL.md), [GOALS.md](GOALS.md), and
-   [STYLE.md](STYLE.md), except where current evidence proves that wording
+1. Current behavior contracts in [ARCHITECTURE.md](../ARCHITECTURE.md),
+   [DELIVERY.md](../DELIVERY.md), [INVARIANTS.md](../INVARIANTS.md),
+   [PROTOCOL.md](../../reference/PROTOCOL.md), [GOALS.md](../GOALS.md), and
+   [STYLE.md](../STYLE.md), except where current evidence proves that wording
    overstates implementation.
 2. This approved charter as implementation authority for the Messaging Beta
    Rework.
-3. [NEXT.md](NEXT.md) as the thin current execution queue.
+3. [NEXT.md](../NEXT.md) as the thin current execution queue.
 4. The
-   [messaging architecture review](../MESSAGING_ARCHITECTURE_REVIEW.md) and
-   [addendum](../ADDENDUM_REVIEW.md) as supporting design records.
-5. The implemented [CI contract](CI.md) for current CI behavior. Its supporting
+   [messaging architecture review](MESSAGING_ARCHITECTURE_REVIEW.md) and
+   [addendum](ADDENDUM_REVIEW.md) as supporting design records.
+5. The implemented [CI contract](../CI.md) for current CI behavior. Its supporting
    [CI review](CI_TEST_ARCHITECTURE_REVIEW.md) records the evidence and
    rationale. Neither document is a messaging milestone.
 6. Historical records and superseded plans, which are never current
@@ -200,7 +200,7 @@ All findings below were checked at the reviewed revision.
 | Finding | Current evidence | Classification |
 |---|---|---|
 | Official frame limits disagree | At the reviewed revision, the then-current UI wire module capped encoded and decoded frames at 1,048,576 JSON-object bytes. That module was consolidated and now lives in `src/cyclops-client/src/lib.rs`. `src/cyclopsd/src/server.rs` then used unbounded `lines()` and unbounded response/event serialization. `src/cyclops/src/client.rs` then used unbounded `read_line`, and `src/cyclops/src/main.rs` read complete stdin or files before validation. | Verified P1 interoperability and local resource defect |
-| Terminal non-interference was overstated | At the reviewed revision, `INVARIANTS.md` said “Human typing always wins.” `src/cyclopsd/src/delivery.rs` documents an irreducible final proof-to-paste command interval and exposes `post_final_prewrite`. | Verified contract defect; this documentation pass corrects the wording while preserving useful guards |
+| Terminal non-interference was overstated | At the reviewed revision, `INVARIANTS.md` said “Human typing always wins.” src/cyclopsd/src/delivery.rs documents an irreducible final proof-to-paste command interval and exposes `post_final_prewrite`. | Verified contract defect; this documentation pass corrects the wording while preserving useful guards |
 | Raw emergency doctrine is fragmented | `README.md` and `DELIVERY.md` already make raw tmux manual, unrecorded, and non-automatic. The active skill forbids autonomous bypass but does not state the operator-authorized confirmed-failure exception. | Verified authority and recovery gap; the literal contradiction was overstated |
 | Subscribe, snapshot, and follow roles are explicit | `events.subscribe` is an ephemeral push and accepts its old cursor only as compatibility input. `events.backfill` is a bounded body-free connection-epoch projection, current views use snapshots, and `messages.follow` owns durable mailbox progress. | Typed-contract mismatch corrected by Milestone 6 without removing the legacy input |
 | Daemon state has low locality | `cyclopsd::Inner` has 46 fields spanning mailbox, events, observation, registry, delivery, hooks, workspace, lifecycle, and fault controls. `Arc<Inner>` reaches through server, messaging, fusion, delivery, and recovery paths. | Verified structural problem |
@@ -279,7 +279,7 @@ publication, and tmux effects are too entangled to define an honest independent
 crate Interface today. Immediate extraction would either export daemon internals
 or replace direct coupling with callback-heavy shallow Interfaces.
 
-The useful part of [NEXT.md](NEXT.md) remains: pure decisions should converge on
+The useful part of [NEXT.md](../NEXT.md) remains: pure decisions should converge on
 the sans-IO shape `(state, input) -> (state, effects)`. That shape should first
 live behind the internal `WorkspaceMessaging` Interface, where one durable
 transaction and current behavior can remain intact. The Interface must not be a
@@ -445,7 +445,7 @@ repository gates. CI changes remain separately reviewable.
 
 The Milestone 1 decision stayed deliberately narrow. The later CI workstream
 has since resolved or reclassified these findings as recorded in the current
-[CI contract](CI.md):
+[CI contract](../CI.md):
 
 | CI or test finding | Milestone 1 decision | Current disposition |
 |---|---|---|
@@ -661,8 +661,8 @@ event, snapshot, and follow framing. Demonstrate that the new tests fail against
 the old uncapped daemon and CLI for the intended reason.
 
 **Repository gates.** After narrow evidence is green, run the current local
-gate in repository order. [CONTRIBUTING.md](../../CONTRIBUTING.md) and the
-[CI contract](CI.md) are the operational authorities when commands change:
+gate in repository order. [CONTRIBUTING.md](../../../CONTRIBUTING.md) and the
+[CI contract](../CI.md) are the operational authorities when commands change:
 
 ```bash
 ./tests/e2e/messaging-docs-parity.sh
@@ -728,7 +728,7 @@ and state what would make it obsolete. A test is not deleted until replacement
 evidence protects the original defect or durable contract.
 
 After narrow tests, production milestones run the current repository gate from
-[CONTRIBUTING.md](../../CONTRIBUTING.md) with `--no-fail-fast`. Tmux tests run
+[CONTRIBUTING.md](../../../CONTRIBUTING.md) with `--no-fail-fast`. Tmux tests run
 outside tmux. A change to either installer also requires byte-identical
 installer copies and parity with `--with-installer`. Website checks apply only
 to an explicitly approved website change.

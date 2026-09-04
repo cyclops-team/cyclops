@@ -238,8 +238,8 @@ restart settlement of direct-delivery chains, and replay of session journals
 linked across session renames. It does not make those paths the current
 messaging contract and does not promise indefinite support.
 
-The direct writer and restart settlement functions in `delivery.rs` require a
-private capability value that only `compatibility.rs` owns. The hook self-test
+The direct writer and restart settlement functions in `src/cyclopsd/src/delivery/mod.rs` require a
+private capability value that only `session_history.rs` owns. The hook self-test
 and `Daemon::deliver_payload` therefore cannot reach those writers without
 naming the compatibility boundary. `Daemon::deliver_payload` remains
 compatibility-sensitive and unchanged; its public support status is unverified.
@@ -257,10 +257,10 @@ This section documents the compatibility pipeline. The public `msg.send`
 endpoint uses the mailbox path: it returns durable acceptance, then schedules a
 separate notification attempt as specified in [DELIVERY.md](DELIVERY.md). The
 `compatibility::deliver_payload` entry point delegates to the retained direct
-writer in `delivery.rs`, which writes a session fact and fans out; one FIFO
+writer in `src/cyclopsd/src/delivery/mod.rs`, which writes a session fact and fans out; one FIFO
 worker per recipient pane then carries each chain on its own. The boundary is
 `src/cyclopsd/src/session_history.rs`; the pipeline remains in
-`src/cyclopsd/src/delivery.rs`.
+`src/cyclopsd/src/delivery/`.
 
 ### The call: what the sender gets back
 
@@ -353,7 +353,7 @@ settled on screen evidence.
 ### The gate
 
 The gate is the guard between a delivery and the wrong pane. It decides in
-this order and only in this order (`delivery.rs`, `gate`):
+this order and only in this order (`src/cyclopsd/src/delivery/gate.rs`, `gate`):
 
 ```mermaid
 flowchart TD
@@ -437,8 +437,8 @@ therefore not in the queue that a park drains.
 One transition is missing from the diagram because it has no single source.
 A daemon restart closes every chain still in flight to `attention_required`
 with cause `daemon_restart`, whatever state it was in
-(`compatibility::recover_direct_deliveries` delegates to the retained
-`delivery.rs` settlement). Limbo is a bug, so a restart never leaves a chain
+(`session_history::recover_direct_deliveries` delegates to the retained
+`src/cyclopsd/src/delivery/mod.rs` settlement). Limbo is a bug, so a restart never leaves a chain
 open.
 
 ## What needs a human, and who owns it
@@ -631,7 +631,7 @@ its own CI job).
 | Detection rules are per-CLI data, not code (H2) | `cyclops-manifest`, `resources/manifests/{claude,codex,agy,cursor}.toml` |
 | NDJSON Unix socket, hello line first, version mismatch warns never rejects (S2) | `src/cyclops-proto/src/wire.rs`; server in `src/cyclopsd/src/server.rs` |
 | Append-only NDJSON ledger, monotonic seq plus boot_id, replayable by cursor (C6) | Schema in `src/cyclops-proto/src/ledger.rs`; writer in `cyclops-ledger`. The daemon owns retained history traversal and serves the stream a bounded body-free `events.backfill` projection. `events.subscribe` is explicitly ephemeral; durable mailbox recovery uses `messages.follow` |
-| Delivery pipeline: queue, gate, paste, verify, submit, ACK; only proven pre-write failures retry, while after-write outcomes require attention | `src/cyclops-proto/src/ledger.rs` for the machine, `src/cyclopsd/src/delivery.rs` for the pipeline |
+| Delivery pipeline: queue, gate, paste, verify, submit, ACK; only proven pre-write failures retry, while after-write outcomes require attention | `src/cyclops-proto/src/ledger.rs` for the machine, `src/cyclopsd/src/delivery/` for the pipeline |
 | Turn detection from hooks via a `cyclops hook` receiver | `wire.rs` (`agent.state.report`), `src/cyclops/src/hook.rs`, `src/cyclopsd/src/ack.rs` |
 | Agent surface: thin CLI speaking NDJSON to the socket | `src/cyclops` |
 | v1 keepers: fail-closed ACL, data-only config, explicit pane adoption, identity from socket peer | `src/cyclopsd/src/identity.rs` (peer creds plus a pid-ancestry walk to a watched pane), `src/cyclopsd/src/registry.rs` |
@@ -654,14 +654,14 @@ than a lettered amendment; it lives in `cyclops-manifest` `Hooks.ack`
 | | Amendment | Lives at |
 |---|---|---|
 | a | `pause-after` set on the control connection at attach (2) | `src/cyclops-tmux/src/control.rs` attach handshake; F15 covers the `%extended-output` consequence |
-| b | `bracket_paste_flag` unavailable through tmux 3.6a, so post-paste composer verification is the gate (3) | `src/cyclops-tmux/src/version.rs`; verification with `<message_id>` substitution in `src/cyclopsd/src/delivery.rs` |
+| b | `bracket_paste_flag` unavailable through tmux 3.6a, so post-paste composer verification is the gate (3) | `src/cyclops-tmux/src/version.rs`; verification with `<message_id>` substitution in `src/cyclopsd/src/delivery/inject.rs` |
 | c | Daemon self-test proving hooks actually fire, F1: Codex loads zero hooks in untrusted dirs, silently (4) | `src/cyclopsd/src/selftest.rs`: per-pane edge liveness, `hooks.verify` / `hooks.selftest`, the `hooks_verified` bit, one F1 ping per zero-edge pane |
 | d | Dedupe hook events on (session_id, turn_id, event), F2: Codex double-fires across config layers (5) | `src/cyclopsd/src/ack.rs`, plus the reporter's own seq |
-| e | Unique tmux buffer name per delivery, F4: named buffers are global and concurrent senders race (6) | `src/cyclopsd/src/delivery.rs`: `cyc-<pid>-<seq>` loaded from a 0600 spool file in a 0700 directory |
-| f | Terminal `blocked_quota`: park and alert, never auto-retry, F11 (9) | `state.rs` `BlockedQuota`, `ledger.rs` `ParkedBlockedQuota` (terminal in the record; the operator resends after the reset), parking and the urgent notify in `delivery.rs` |
+| e | Unique tmux buffer name per delivery, F4: named buffers are global and concurrent senders race (6) | `src/cyclopsd/src/delivery/inject.rs`: `cyc-<pid>-<seq>` loaded from a 0600 spool file in a 0700 directory |
+| f | Terminal `blocked_quota`: park and alert, never auto-retry, F11 (9) | `state.rs` `BlockedQuota`, `ledger.rs` `ParkedBlockedQuota` (terminal in the record; the operator resends after the reset), parking and the urgent notify in `src/cyclopsd/src/delivery/gate.rs` |
 | g | Modal vocabulary is per-CLI data with explicit decline options, never a generic Enter or Escape, F3, F12, F20 (8) | `cyclops-manifest` `decline_keys` plus `auto_dismiss`; `resources/manifests/*.toml` |
 | h | Fusion is rare-blocked-state coverage, not steady-state accuracy (7) | `src/cyclops-proto/src/state.rs` module header; the tier order in `src/cyclopsd/src/fusion.rs` |
-| i | Delivery behind a trait so per-agent backends can swap without touching the layers above | `src/cyclopsd/src/delivery.rs`: the `Injector` trait (paste, submit, capture) with `TmuxInjector` as the M1 backend; gate, verify and ACK call through the seam only |
+| i | Delivery behind a trait so per-agent backends can swap without touching the layers above | `src/cyclopsd/src/delivery/inject.rs`: the `Injector` trait (paste, submit, capture) with `TmuxInjector` as the M1 backend; gate, verify and ACK call through the seam only |
 
 ## The zero-polling contract
 

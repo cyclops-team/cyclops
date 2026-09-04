@@ -4,7 +4,7 @@
 
 **Code reviewed:** `ead57c1691371a1deca5afeb89e90e8340accb69`
 
-**Status:** Supporting design record. The implemented [CI contract](CI.md)
+**Status:** Supporting design record. The implemented [CI contract](../CI.md)
 controls current behavior; this review remains evidence and rationale, not
 messaging authority.
 
@@ -121,8 +121,8 @@ large embedded test program:
 
 | File | Total lines | Embedded test module starts | Approximate test-module lines |
 |---|---:|---:|---:|
-| `src/cyclopsd/src/mailbox.rs` | 18,050 | 8,055 | 9,996 |
-| `src/cyclopsd/src/delivery.rs` | 15,931 | 9,710 | 6,222 |
+| src/cyclopsd/src/mailbox.rs | 18,050 | 8,055 | 9,996 |
+| src/cyclopsd/src/delivery.rs | 15,931 | 9,710 | 6,222 |
 | `src/cyclopsd/src/fusion.rs` | 11,111 | 4,781 | 6,331 |
 | `src/cyclops-workspace/src/app.rs` | 12,716 | 6,935 | 5,782 |
 | `src/cyclopsd/src/server.rs` | 4,962 | 2,567 | 2,396 |

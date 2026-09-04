@@ -153,13 +153,13 @@ they answer to.
 | `receipt_block_ms` | 2500ms | How long `msg.send` blocks for a receipt on the idle path | `src/cyclopsd/src/config.rs`, `Config::defaults` |
 | `ack_timeout_ms` | 1500ms | The tier-1 window: how long a delivery waits for the manifest hook ACK before falling back to screen evidence | `src/cyclopsd/src/config.rs`, `Config::defaults` |
 | `gate_hold_notify_ms` | 120000ms | One admin ping for a delivery wedged in gating. The hold itself keeps waiting on events | `src/cyclopsd/src/config.rs`, `Config::defaults` |
-| `SCREEN_ACK_DEADLINE` | 5s | Neither ACK tier by then means `attention_required`, cause `ack_timeout` | `src/cyclopsd/src/delivery.rs` |
-| `ACK_CHECKPOINTS_MS` | 250, 750, 1500, 3000, 5000 | One-shot screen-evidence checks after submit. Events also wake the waiter; these cap the captures per delivery | `src/cyclopsd/src/delivery.rs` |
-| `VERIFY_DELAYS_MS` | 0, 120, 240, 480 | Post-paste composer re-reads, because paste rendering can lag a frame | `src/cyclopsd/src/delivery.rs` |
-| `DECLINE_SPACING` | 250ms | Spacing between a manifest's modal decline keys | `src/cyclopsd/src/delivery.rs` |
+| `SCREEN_ACK_DEADLINE` | 5s | Neither ACK tier by then means `attention_required`, cause `ack_timeout` | `src/cyclopsd/src/delivery/mod.rs` |
+| `ACK_CHECKPOINTS_MS` | 250, 750, 1500, 3000, 5000 | One-shot screen-evidence checks after submit. Events also wake the waiter; these cap the captures per delivery | `src/cyclopsd/src/delivery/mod.rs` |
+| `VERIFY_DELAYS_MS` | 0, 120, 240, 480 | Post-paste composer re-reads, because paste rendering can lag a frame | `src/cyclopsd/src/delivery/mod.rs` |
+| `DECLINE_SPACING` | 250ms | Spacing between a manifest's modal decline keys | `src/cyclopsd/src/delivery/mod.rs` |
 | CLI connect / read | 2s / 5s | The `cyclops` client's own socket budget. The 5s read budget has to exceed `receipt_block_ms`, and does | `src/cyclops/src/client.rs` |
 | Workspace `IO_TIMEOUT` | 250ms | The full-screen workspace's budget for its small decoration, naming, and confirmation requests to the daemon. It never sends messages through this path | `src/cyclops-workspace/src/daemon.rs` |
-| `WAIT_DEFAULT_MS` / `WAIT_MAX_MS` | 60s / 600s | `agent.wait` | `src/cyclopsd/src/delivery.rs` |
+| `WAIT_DEFAULT_MS` / `WAIT_MAX_MS` | 60s / 600s | `agent.wait` | `src/cyclopsd/src/delivery/mod.rs` |
 
 The tiers those deadlines serve, in full, are in
 [DELIVERY.md](../development/DELIVERY.md); the receipts a user sees are in
@@ -416,7 +416,7 @@ the worst successful path is 43 processes and about 1.9 additional seconds.
 A Cyclops send spawns **zero**. `cyclopsd` holds one long-lived
 `tmux -u -L <socket> -f /dev/null -C attach-session` per watched session
 (`src/cyclops-tmux/src/control.rs`), and the delivery path writes through it:
-the `Injector` implementation in `src/cyclopsd/src/delivery.rs` calls
+the `Injector` implementation in `src/cyclopsd/src/delivery/inject.rs` calls
 `load_buffer`, `paste_buffer`, `send_keys` and `capture_pane` on the
 `ControlClient`, never a subprocess. Confirmed in `ps` during the timed
 sends: one control client, no new tmux processes.

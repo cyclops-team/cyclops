@@ -149,6 +149,6 @@ setup, start with [docs/guides/install.md](docs/guides/install.md) and
 [docs/guides/QUICKSTART.md](docs/guides/QUICKSTART.md). Historical milestone
 details remain in [CHANGELOG.md](CHANGELOG.md). The stabilization failures,
 rejected alternatives, and final evidence are in
-[docs/development/STABILIZATION_HISTORY.md](docs/development/STABILIZATION_HISTORY.md);
+[docs/development/archive/STABILIZATION_HISTORY.md](docs/development/archive/STABILIZATION_HISTORY.md);
 prioritized architecture follow-up is in
 [docs/development/NEXT.md](docs/development/NEXT.md).

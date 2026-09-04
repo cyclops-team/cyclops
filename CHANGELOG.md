@@ -413,7 +413,7 @@ context, not the current release summary or a source of product semantics.
 
 - `docs/reference/BENCHMARKS.md`: latency, throughput, and render numbers,
   each carrying its source.
-- `docs/development/V5.md`: the scope, the four sources that agree on it,
+- `docs/development/archive/V5.md`: the scope, the four sources that agree on it,
   and what is deliberately out.
 
 ### Added (v4)

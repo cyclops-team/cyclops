@@ -189,6 +189,6 @@ unexecuted vendor cells into passes.
 
 The current product behavior is stable enough to become the baseline for
 future work. The highest-priority follow-up is the behavior-preserving
-delivery-core extraction in [NEXT.md](NEXT.md). Large-fleet UI, Cursor live
+delivery-core extraction in [NEXT.md](../NEXT.md). Large-fleet UI, Cursor live
 coverage, raw-tmux fallback polish, and a generic administrator hold override
 are deferred and are not hidden release blockers.

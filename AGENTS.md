@@ -113,7 +113,7 @@ cargo doc --workspace --no-deps
 - How a message becomes a verified receipt: [docs/development/DELIVERY.md](docs/development/DELIVERY.md),
   then `src/cyclopsd/src/messaging.rs` for current mailbox acceptance. Retained
   direct delivery first crosses `src/cyclopsd/src/session_history.rs`, then
-  `src/cyclopsd/src/delivery.rs` in call order
+  `src/cyclopsd/src/delivery/` in call order
   (`msg_send` → `worker_loop` → `process` → `gate` → `attempt_delivery`).
 - What state a pane is in and why: `src/cyclopsd/src/fusion.rs`;
   per-sensor readings via `cyclops read <agent> --source detection`.

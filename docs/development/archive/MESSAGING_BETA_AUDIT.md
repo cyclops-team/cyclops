@@ -19,7 +19,7 @@ fail-before evidence.
 
 **Current release status:** This is a Track A acceptance record, not the live
 release queue. The current candidate uses `0.1.1-beta` / `v0.1.1-beta`; no new
-tag or GitHub Release has been created. See [NEXT.md](NEXT.md) for the current
+tag or GitHub Release has been created. See [NEXT.md](../NEXT.md) for the current
 exact-SHA evidence and operator-approval boundary.
 
 ## Verdict
@@ -309,7 +309,7 @@ whole-product implementation tracks are integrated on the beta branch, and the
 technical beta-acceptance decision for the audited candidate, not release
 authorization, is [CYCLOPS_BETA_FINAL_AUDIT.md](CYCLOPS_BETA_FINAL_AUDIT.md).
 Release-identity reconciliation remains a separate operator gate. See
-[NEXT.md](NEXT.md) for the current queue.
+[NEXT.md](../NEXT.md) for the current queue.
 
 Keep **beta/messaging-rework** as the integration branch. Explicit operator
 approval is still required before merging it into `main`, creating or moving a

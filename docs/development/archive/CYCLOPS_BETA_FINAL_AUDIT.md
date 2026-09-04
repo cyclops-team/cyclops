@@ -23,7 +23,7 @@ The independent architecture, regression and migration, user-journey and
 performance, and standards audits identified no unresolved implementation
 blocker. This decision does not authorize a merge to `main`, a tag, a version
 number, a GitHub Release, or publication. The current release queue is
-[NEXT.md](NEXT.md): the selected identity is `0.1.1-beta` / `v0.1.1-beta`, but
+[NEXT.md](../NEXT.md): the selected identity is `0.1.1-beta` / `v0.1.1-beta`, but
 merging `main`, tagging, creating a GitHub Release, and publication still need
 subsequent explicit operator approval.
 
@@ -46,7 +46,7 @@ the newest remote tag was `v0.2.0-beta` from 2026-08-27, and GitHub had no
 Release object. That is historical context, not the current release status.
 The current candidate uses `0.1.1-beta` / `v0.1.1-beta`; the historical tag
 remains unchanged and no new tag or Release has been created. See
-[NEXT.md](NEXT.md) for the current gated release sequence.
+[NEXT.md](../NEXT.md) for the current gated release sequence.
 
 ## Evidence reviewed
 
@@ -89,9 +89,9 @@ chrome-free pane-only workflow.
 ## Architecture acceptance
 
 The independent architecture and responsibility audit applied the boundaries
-in [ARCHITECTURE.md](ARCHITECTURE.md),
+in [ARCHITECTURE.md](../ARCHITECTURE.md),
 [CYCLOPS_BETA_CHARTER.md](CYCLOPS_BETA_CHARTER.md), and the supporting
-[whole-system architecture review](../CYCLOPS_SYSTEM_ARCHITECTURE_REVIEW.md),
+[whole-system architecture review](CYCLOPS_SYSTEM_ARCHITECTURE_REVIEW.md),
 and found the following rooms coherent:
 
 | Room | Accepted boundary |
@@ -135,7 +135,7 @@ state. This does not require eliminating every `Arc` or extracting a new crate.
 ## CI and regression evidence
 
 The ordinary pull-request path is measured against the Task 1 baseline in
-[CI.md](CI.md): 10m38 wall time and 32m29 runner minutes became 7m47 and
+[CI.md](../CI.md): 10m38 wall time and 32m29 runner minutes became 7m47 and
 15m16 for the final representative Milestone 7 run, a 26.8% wall-time and
 53.0% runner-minute reduction. Required check names remained stable.
 

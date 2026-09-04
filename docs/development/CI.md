@@ -559,7 +559,7 @@ post-merge scheduled run
 [33330374062](https://github.com/cyclops-team/cyclops/actions/runs/33330374062)
 then passed the full platform matrix, tmux HEAD, performance, repeated-race,
 soak, cleanup, and long-history lanes at exact integration commit `7de5ac8a`.
-The [final beta acceptance audit](CYCLOPS_BETA_FINAL_AUDIT.md) records the
+The [final beta acceptance audit](archive/CYCLOPS_BETA_FINAL_AUDIT.md) records the
 technical beta-acceptance decision for the audited candidate, not release
 authorization, and its functional-candidate release evidence. The
-[Messaging Beta audit](MESSAGING_BETA_AUDIT.md) remains the Track A record.
+[Messaging Beta audit](archive/MESSAGING_BETA_AUDIT.md) remains the Track A record.

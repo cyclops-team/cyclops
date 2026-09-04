@@ -10,11 +10,18 @@ the same system to terminals and scripts.
 | --- | --- |
 | `cyclops start` | Create or restore the default workspace and start the daemon if needed. |
 | `cyclops workspace save\|restore` | Save or rebuild a tmux session's panes, sizes, names, and directories. |
+| `cyclops sizing release` | Hand a session's window sizing back to tmux, and clear the ownership mark; safe to run twice. |
 | `cyclops status` | Show every watched pane's runtime state plus live composer, readiness, notification, and mailbox facts when they differ. |
 | `cyclops health` | Inspect binaries, daemon identity, setup, and bounded state metadata without changing them. |
+| `cyclops stop` | Stop Cyclops now; tmux panes and durable messages stay intact. |
 | `cyclops cleanup build-cache\|update-scratch` | Inventory named rebuildable assets; add `--apply` to remove exact validated assets. |
+| `cyclops data inventory\|export\|forget` | Inventory retained durable records, export them to a new directory, or preview and confirm removing every retained journal. |
+| `cyclops remove --all --confirm <token>` | Preview removal of the complete Cyclops state home, then require its exact confirmation token. |
 | `cyclops list` | Show every named agent, its state, and current detail. |
 | `cyclops name <pane> <label>` | Give a pane a stable address; `--clear` releases it. |
+| `cyclops clear [<agent>] [--status]` | Quiet queued pane notifications for one agent, or cleanse status with `--status`. |
+| `cyclops reset` | Reset status by clearing old, terminated, and stale processes and sessions. |
+| `cyclops flush [--prune]` | Flush message ledgers, cleanse state, and reset sessions to start clean; `--prune` (default true) also drops dead panes and stale sessions. |
 | `cyclops read <agent>` | Read visible/recent pane output or the detection evidence. |
 | `cyclops send <agent> --subject ... --summary ...` | Accept a durable message and print its wake receipt. |
 | `cyclops inbox list`; `cyclops inbox claim <id>` | List pending metadata or claim one exact message. |
@@ -38,6 +45,7 @@ the same system to terminals and scripts.
 | `cyclops update --rollback` | Reactivate a replay-proven retained pair without reverting state. |
 | `cyclops daemon status\|log\|stop\|restart` | Inspect, stop, or safely restart the exact daemon generation. |
 | `cyclops ping` | Measure a daemon round trip. |
+| `cyclops commands` | Show workspace, operations, and diagnostic commands. |
 
 ## Sending
 

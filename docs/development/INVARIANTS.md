@@ -41,7 +41,7 @@ irreversible steps after it:
 
 ```mermaid
 flowchart TD
-    g["gate: 8 ordered checks<br/>(delivery.rs, gate)"] -->|"admits: manifest id + pane_pid"| r1{"occupant still the<br/>admitted pid?"}
+    g["gate: 8 ordered checks<br/>(delivery/gate.rs, gate)"] -->|"admits: manifest id + pane_pid"| r1{"occupant still the<br/>admitted pid?"}
     r1 -->|"no before paste"| retry["retry_queued, cause pane_rebound<br/>back through the whole gate"]
     r1 -->|yes| paste["paste the buffer"]
     paste --> v{"composer shows this<br/>message id?"}
@@ -102,9 +102,10 @@ pipe fails its first write before accepting any command byte, Cyclops records
 partial write or flush failure never takes this path and remains an ambiguous
 post-write `paste_failed`.
 
-- Enforced at: `src/cyclopsd/src/delivery.rs`, `gate` (admission),
-  `occupant_unchanged` (both re-checks), `attempt_delivery` (the order),
-  `inject`, `staged_representation`, and `exact_staging_proof` (verification).
+- Enforced at: `src/cyclopsd/src/delivery/gate.rs`, `gate` (admission),
+  `occupant_unchanged` (both re-checks), and `attempt_delivery` (the order);
+  `src/cyclopsd/src/delivery/inject.rs`, `inject`, `staged_representation`,
+  and `exact_staging_proof` (verification).
 - Proven by: `src/cyclopsd/tests/gate.rs`,
   `pane_rebound_before_paste_never_pastes_into_the_new_occupant` and
   `pane_rebound_before_submit_withholds_the_submit_key`.
@@ -126,7 +127,7 @@ confirming key and requires the same rule to still be the winning match, so
 a dialog the human answered between keystrokes never receives the confirm.
 Declines are bounded, never looped.
 
-- Enforced at: `src/cyclopsd/src/delivery.rs`, `send_decline_keys` and
+- Enforced at: `src/cyclopsd/src/delivery/gate.rs`, `send_decline_keys` and
   `modal_still_matches`; the vocabulary is `decline_keys` / `auto_dismiss`
   in `resources/manifests/*.toml`.
 - Proven by: `src/cyclopsd/tests/gate.rs`,
@@ -172,7 +173,7 @@ exact `verify_failed` attempt and may therefore submit later human input. Its
 administrator setting, binding checks, forced reservation, and acceptance
 boundaries are described in [DELIVERY.md](DELIVERY.md).
 
-- Enforced at: `src/cyclopsd/src/delivery.rs`, the `AgentState::
+- Enforced at: `src/cyclopsd/src/delivery/gate.rs`, the `AgentState::
   IdleWithInput` arm of `gate`; `src/cyclopsd/src/fusion.rs` supplies
   the escaped capture; `resources/manifests/codex.toml` rules
   `composer_typed_input` and `composer_ghost_suggestion`.
@@ -200,7 +201,7 @@ They never retry automatically, but an administrator may start a fresh attempt
 with the guarded `cyclops requeue <message-id>` command after resolving the
 cause.
 
-- Enforced at: `src/cyclopsd/src/delivery.rs`, `park_recipient`;
+- Enforced at: `src/cyclopsd/src/delivery/gate.rs`, `park_recipient`;
   `ParkedBlockedQuota` has no outgoing transition in
   `cyclops_proto::DeliveryState::can_transition_to` except a fresh queue;
   `cyclops_proto::attention::delivery_needs_human` keeps it in front of a
@@ -229,7 +230,7 @@ most likely to break: an early return that logs and drops is limbo.
 
 - Enforced at: `src/cyclopsd/src/session_history.rs`,
   `recover_direct_deliveries`, delegating to the retained settlement in
-  `src/cyclopsd/src/delivery.rs`; every
+  `src/cyclopsd/src/delivery/mod.rs`; every
   transition goes through `advance`, which appends a line.
 - Proven by: `src/cyclopsd/tests/gate.rs`,
   `restart_closes_limbo_deliveries`; `src/cyclopsd/tests/gate.rs`,
@@ -300,7 +301,8 @@ Those are what a person deliberately sent, and recording them is the point.
 The rule is about what Cyclops reads off a screen on its own.
 
 - Enforced at: `src/cyclops-proto/src/ledger.rs` (schema and the rule);
-  `src/cyclopsd/src/delivery.rs`, `gate_line` and `parse_reset_hint`.
+  `src/cyclopsd/src/delivery/gate.rs`, `gate_line`, and
+  `src/cyclopsd/src/delivery/terminal.rs`, `parse_reset_hint`.
 - Proven by: `src/cyclopsd/tests/gate.rs`, which asserts the raw modal
   text and the raw quota banner are absent from the ledger;
   `src/cyclopsd/tests/gate.rs`, same assertion on the park path.
@@ -363,7 +365,7 @@ after it fires:
   hint, no timer: the deadline is armed by an event and disarmed by
   running, never rescheduled on its own.
 - **One-shot timers inside a delivery**, each bounded and each listed in
-  the header of `src/cyclopsd/src/delivery.rs`: the post-paste
+  the header of `src/cyclopsd/src/delivery/mod.rs`: the post-paste
   verification re-reads, the tier-1 ACK window, the screen-evidence
   checkpoints, the decline-key spacing, the idle-ambiguous-composer settle
   deadline, and the one-shot ping for a hold that has lasted too long. The
@@ -668,7 +670,7 @@ transition that never occurred.
 - Enforced at: `cyclops_proto::Detection::stamped`, which combines the
   sensor policy with the pane's own mode and writes the verdict onto the
   detection; `src/cyclopsd/src/fusion.rs` stamps before caching, so the
-  cache every surface reads already carries it. `src/cyclopsd/src/delivery.rs`
+  cache every surface reads already carries it. `src/cyclopsd/src/delivery/gate.rs`
   requires that positive stamp at the gate and again immediately before
   the paste, holding on `not_write_ready:<reason>`. Nothing re-derives the
   answer: a caller that could only see the sensors would answer a
@@ -688,7 +690,7 @@ transition that never occurred.
   `a_recovered_barrier_follows_its_physical_pane_across_a_session_route`;
   `src/cyclopsd/src/fusion.rs`,
   `a_recovered_exact_end_is_durable_before_runtime_clearance`;
-  `src/cyclopsd/src/mailbox.rs`,
+  `src/cyclopsd/src/mailbox/tests.rs`,
   `a_leaderless_write_binding_arms_restart_recovery_through_replay`;
   `src/cyclops-tmux/tests/watcher_events.rs`,
   `session_removal_does_not_report_a_server_wide_moved_pane_as_gone`;
