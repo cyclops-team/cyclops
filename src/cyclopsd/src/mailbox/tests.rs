@@ -4288,7 +4288,7 @@ fn invalid_summary_is_refused_before_acceptance_changes_projection_state() {
         sender: admin,
         recipients: vec![recipient],
         subject: Some("Review".into()),
-        summary: Some("Only one sentence.".into()),
+        summary: Some("First line.\nSecond line.".into()),
         body: Some("Private body".into()),
         reply_to: None,
         client_key: Some("invalid-summary".into()),
@@ -4733,8 +4733,12 @@ fn direct_delivery_retires_pending_without_forging_a_claim_and_replays() {
     assert!(!direct.contains("claimant"));
 }
 
+/// Replay only: an older daemon could leave a `notified` direct payload
+/// attempt with its entry still pending. The record and entry replay
+/// intact, nothing repairs them with a retired fact, and the exact
+/// recipient claim is what advances the FIFO.
 #[test]
-fn restart_finishes_a_notified_direct_attempt_before_advancing_the_fifo() {
+fn a_replayed_notified_direct_attempt_stays_pending_until_the_recipient_claims() {
     let scratch = StoreScratch::new("direct-delivery-restart");
     let root = scratch.root();
     let journal = Path::new("workspaces/current/messages.ndjson");
@@ -4780,41 +4784,33 @@ fn restart_finishes_a_notified_direct_attempt_before_advancing_the_fifo() {
         context.reserve_submit().unwrap();
         context.record_submitted().unwrap();
         context.record_notified().unwrap();
-        assert!(service
-            .store()
-            .unwrap()
+    }
+
+    let directory = MailboxDirectory::new(workspace, [identity]).unwrap();
+    let store = MessageStore::open(&root, journal, workspace, "boot-2").unwrap();
+    let service = MailboxService::new(directory, store);
+    {
+        let store = service.store().unwrap();
+        let record = store.projection().notification(bob, &first_id).unwrap();
+        assert_eq!(record.state, NotificationState::Notified);
+        assert_eq!(record.transport, NotificationTransport::DirectPayload);
+        assert!(store
             .projection()
             .get_entry(bob, &first_id)
             .unwrap()
             .state
             .is_pending());
     }
+    assert!(
+        service.prepare_oldest_notification(bob).unwrap().is_none(),
+        "a notified head waits for its claim; no retired fact repairs it"
+    );
+    let raw = fs::read_to_string(root.path().join(journal)).unwrap();
+    assert_eq!(raw.matches("message_delivered_direct").count(), 0);
 
-    let directory = MailboxDirectory::new(workspace, [identity]).unwrap();
-    let store = MessageStore::open(&root, journal, workspace, "boot-2").unwrap();
-    let service = MailboxService::new(directory, store);
+    service.claim(bob, first_id.clone()).unwrap();
     let next = service.prepare_oldest_notification(bob).unwrap().unwrap();
     assert_eq!(next.message_id, second_id);
-    let store = service.store().unwrap();
-    assert!(matches!(
-        store.projection().get_entry(bob, &first_id).unwrap().state,
-        MailboxEntryState::DeliveredDirect { .. }
-    ));
-    assert_eq!(
-        store
-            .projection()
-            .get_entry(bob, &first_id)
-            .unwrap()
-            .state
-            .claimant(),
-        None
-    );
-    drop(store);
-
-    let raw = fs::read_to_string(root.path().join(journal)).unwrap();
-    assert_eq!(raw.matches("message_delivered_direct").count(), 1);
-    let same = service.prepare_oldest_notification(bob).unwrap().unwrap();
-    assert_eq!(same.attempt_id, next.attempt_id);
 }
 
 #[test]

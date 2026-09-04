@@ -1,15 +1,12 @@
-//! The eye against a real daemon restart.
+//! The eye against a restart ping replayed from an older run.
 //!
-//! The restart-limbo closure is the one place the daemon pings about many
-//! things at once (delivery.rs `close_limbo`), and it is the ping a reader
-//! sees most: every restart with anything in flight emits it. The rule the
-//! whole milestone is about is that in a single frame the eye's glyph and
-//! the body cannot contradict each other, so this drives the real path,
-//! writes a real ledger, and reads it back through the real stream reader.
-//!
-//! A hand-built ping proves nothing here. What the daemon writes at boot
-//! has to be what the surface drawing the eye can hold to the register, so
-//! the ping under test is the one `cyclopsd::boot` actually wrote.
+//! Daemons before 1.1.0 closed every direct delivery a restart interrupted
+//! and pinged about all of them at once. Those records stay in the session
+//! ledger forever, and the rule the whole milestone is about is that in a
+//! single frame the eye's glyph and the body cannot contradict each other:
+//! the ping may not outlive the deliveries it names. This replays a real
+//! ledger of that shape through `cyclopsd::boot` and reads it back through
+//! the real stream reader.
 
 mod common;
 
@@ -21,29 +18,49 @@ use cyclops_ui::{
 };
 use serde_json::Value;
 
-/// A previous run's ledger with `chains` deliveries still in flight: msg
-/// lines whose delivery records never left `queued`, which is exactly what
-/// a daemon killed mid-send leaves behind.
+/// A ledger an older daemon left behind: `chains` deliveries it had
+/// accepted, then closed as attention_required at its next boot (cause:
+/// daemon_restart), plus the one aggregated ping naming all of them.
 ///
-/// Written by hand because the point is the state of the record at boot,
-/// and a real kill would leave the same four fields. Everything read back
-/// below is the NEW daemon's own output.
-fn ledger_with_deliveries_in_flight(home: &std::path::Path, chains: &[(&str, &str)]) {
-    let lines: String = chains
-        .iter()
-        .enumerate()
-        .map(|(i, (id, to))| {
-            format!(
-                "{}\n",
-                serde_json::json!({
-                    "seq": i + 1, "boot_id": "previous-run", "id": id, "ts": 1000 + i,
-                    "kind": "msg", "from": "admin", "to": [to],
-                    "subject": "in flight when the daemon died",
-                    "deliveries": [{"to": to, "state": "queued", "attempts": 0, "ts": 1000 + i}],
-                })
-            )
-        })
-        .collect();
+/// Written by hand because the point is the state of the record at boot.
+/// Everything read back below is the NEW daemon's own output.
+fn ledger_with_a_replayed_restart_closure(home: &std::path::Path, chains: &[(&str, &str)]) {
+    let mut seq = 0_u64;
+    let mut lines = String::new();
+    let mut line = |value: serde_json::Value| {
+        seq += 1;
+        let mut value = value;
+        value["seq"] = serde_json::json!(seq);
+        value["ts"] = serde_json::json!(1000 + seq);
+        value["boot_id"] = serde_json::json!("previous-run");
+        lines.push_str(&format!("{value}\n"));
+    };
+    for (id, to) in chains {
+        line(serde_json::json!({
+            "id": id, "kind": "msg", "from": "admin", "to": [to],
+            "subject": "in flight when the daemon died",
+            "deliveries": [{"to": to, "state": "queued", "attempts": 0, "ts": 1000}],
+        }));
+    }
+    for (id, to) in chains {
+        line(serde_json::json!({
+            "id": id, "kind": "state", "from": "cyclopsd", "to": [to],
+            "deliveries": [{"to": to, "state": "attention_required", "attempts": 0,
+                "ts": 1000, "cause": "daemon_restart"}],
+            "data": {"to": to, "recipient": null, "from": "queued",
+                "to_state": "attention_required", "cause": "daemon_restart"},
+        }));
+    }
+    line(serde_json::json!({
+        "id": "e-restart", "kind": "system", "from": "cyclopsd", "to": ["admin"],
+        "subject": "deliveries interrupted by daemon restart",
+        "body": format!(
+            "closed as attention_required (cause: daemon_restart): {}",
+            chains.iter().map(|(id, to)| format!("{id} -> {to}")).collect::<Vec<_>>().join(", ")
+        ),
+        "data": {"event": "admin_notify", "level": "action_required",
+            "deliveries": chains.iter().map(|(id, to)| serde_json::json!({"to": to, "id": id})).collect::<Vec<_>>()},
+    }));
     std::fs::write(home.join("ledger/main.ndjson"), lines).expect("seed the previous run's ledger");
 }
 
@@ -118,10 +135,10 @@ async fn the_restart_ping_never_outlives_the_deliveries_it_names() {
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(home.join("ledger")).expect("scratch home");
     let _guard = HomeGuard(home.clone());
-    // A watched session that never attaches: the limbo closure runs at
-    // boot from the replayed ledger alone, no tmux needed. The attach
-    // retries still autostart a server on this socket, so it goes through
-    // the rig like every other server (unique name, teardown on drop).
+    // A watched session that never attaches: the record replays at boot
+    // from the ledger alone, no tmux needed. The attach retries still
+    // autostart a server on this socket, so it goes through the rig like
+    // every other server (unique name, teardown on drop).
     let tmux = TmuxGuard::new("restart-eye-none");
     let socket = tmux.socket();
     std::fs::write(
@@ -129,13 +146,17 @@ async fn the_restart_ping_never_outlives_the_deliveries_it_names() {
         format!("sessions = [\"main\"]\ntmux_socket = \"{socket}\"\ntmux_config = \"/dev/null\"\n"),
     )
     .expect("config");
-    ledger_with_deliveries_in_flight(&home, &[("m-alpha", "reviewer"), ("m-beta", "implementer")]);
+    ledger_with_a_replayed_restart_closure(
+        &home,
+        &[("m-alpha", "reviewer"), ("m-beta", "implementer")],
+    );
 
     let (cfg, _) = cyclopsd::Config::load(&home).expect("config loads");
     let daemon = cyclopsd::boot(cfg).await.expect("daemon boots");
 
-    // 1. The daemon closed both chains and pinged once, naming both. The
+    // 1. The replayed ping names both closures and nothing else. The
     //    names are the register's key for a delivery: recipient, message.
+    //    A new daemon writes no closure of its own.
     let ledger: Vec<Value> = std::fs::read_to_string(home.join("ledger/main.ndjson"))
         .expect("ledger readable")
         .lines()
@@ -151,7 +172,13 @@ async fn the_restart_ping_never_outlives_the_deliveries_it_names() {
                     .is_some_and(|s| s.contains("interrupted by daemon restart"))
         })
         .collect();
-    assert_eq!(pings.len(), 1, "want one aggregated ping: {pings:?}");
+    assert_eq!(pings.len(), 1, "want one replayed ping: {pings:?}");
+    assert!(
+        ledger
+            .iter()
+            .all(|l| l["boot_id"] == "previous-run" || l["kind"] != "state"),
+        "the new daemon wrote a delivery transition: {ledger:#?}"
+    );
     assert_eq!(
         pings[0]["data"]["deliveries"],
         serde_json::json!([

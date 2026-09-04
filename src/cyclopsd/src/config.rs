@@ -46,11 +46,6 @@ pub struct Config {
     /// ambiguity that outlives this window is a manifest gap and gets a
     /// named, operator-visible block instead of an invisible wait.
     pub ambiguous_composer_settle_ms: u64,
-    /// One optional, bounded reminder for a doorbell that remains unclaimed.
-    ///
-    /// `None` is the shipped default. A configured positive duration arms one
-    /// exact-attempt timer after the first proven doorbell notification.
-    pub unclaimed_reminder_ms: Option<u64>,
     /// Automatic recovery for a notification already pasted into a composer
     /// but left in verify-failed attention. The daemon may press Enter once
     /// after this delay without exact composer-content proof.
@@ -78,7 +73,6 @@ impl Config {
             receipt_block_ms: 2500,
             gate_hold_notify_ms: 120_000,
             ambiguous_composer_settle_ms: 10_000,
-            unclaimed_reminder_ms: None,
             force_notification_submit: false,
             force_notification_submit_delay_ms: 5_000,
             chrome: true,
@@ -175,14 +169,6 @@ impl Config {
                         "`ambiguous_composer_settle_ms` must be a non-negative integer, not a {}; using {}",
                         value.type_str(),
                         cfg.ambiguous_composer_settle_ms
-                    )),
-                },
-                "unclaimed_reminder_ms" => match ms_value(value) {
-                    Some(0) => cfg.unclaimed_reminder_ms = None,
-                    Some(v) => cfg.unclaimed_reminder_ms = Some(v),
-                    None => warnings.push(format!(
-                        "`unclaimed_reminder_ms` must be a non-negative integer, not a {}; reminders remain off",
-                        value.type_str()
                     )),
                 },
                 "force_notification_submit" => match value.as_str() {
@@ -438,11 +424,10 @@ next_tab = "Alt+n"
         assert_eq!(cfg.receipt_block_ms, 2500);
         assert_eq!(cfg.gate_hold_notify_ms, 120_000);
         assert_eq!(cfg.ambiguous_composer_settle_ms, 10_000);
-        assert_eq!(cfg.unclaimed_reminder_ms, None);
         assert!(!cfg.force_notification_submit);
         assert_eq!(cfg.force_notification_submit_delay_ms, 5_000);
 
-        let text = "ack_timeout_ms = 200\ndelivery_retry_max = 0\nreceipt_block_ms = 900\ngate_hold_notify_ms = 300\nambiguous_composer_settle_ms = 250\nunclaimed_reminder_ms = 45000\nforce_notification_submit = \"on\"\nforce_notification_submit_delay_ms = 0\n";
+        let text = "ack_timeout_ms = 200\ndelivery_retry_max = 0\nreceipt_block_ms = 900\ngate_hold_notify_ms = 300\nambiguous_composer_settle_ms = 250\nforce_notification_submit = \"on\"\nforce_notification_submit_delay_ms = 0\n";
         let (cfg, warnings) = Config::parse(text, Path::new("/h")).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(cfg.ack_timeout_ms, 200);
@@ -450,14 +435,8 @@ next_tab = "Alt+n"
         assert_eq!(cfg.receipt_block_ms, 900);
         assert_eq!(cfg.gate_hold_notify_ms, 300);
         assert_eq!(cfg.ambiguous_composer_settle_ms, 250);
-        assert_eq!(cfg.unclaimed_reminder_ms, Some(45_000));
         assert!(cfg.force_notification_submit);
         assert_eq!(cfg.force_notification_submit_delay_ms, 0);
-
-        let (cfg, warnings) =
-            Config::parse("unclaimed_reminder_ms = 0\n", Path::new("/h")).unwrap();
-        assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(cfg.unclaimed_reminder_ms, None);
     }
 
     #[test]

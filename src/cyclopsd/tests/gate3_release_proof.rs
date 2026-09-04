@@ -2,8 +2,8 @@
 //!
 //! Covers the four Gate 3 proof invariants:
 //! 1. Multi-alarm clear is one append-only batch fact after complete validation.
-//! 2. Both mailbox notification workers and supported legacy direct-delivery workers
-//!    expose an exact in-flight attempt under the queue mutex.
+//! 2. Mailbox notification workers expose an exact in-flight attempt under
+//!    the queue mutex.
 //! 3. Supervised child recovery failure visibly faults the worker and never silently restarts.
 //! 4. Composer barriers cannot leak between the write boundary and durable state transition.
 
@@ -363,115 +363,6 @@ async fn in_flight_mailbox_attempt_is_exposed_under_queue_mutex_with_decoy_isola
 // ─────────────────────────────────────────────────────────────────────────────
 // Invariant 2B: Exact in-flight legacy direct-delivery worker is exposed under queue mutex
 // ─────────────────────────────────────────────────────────────────────────────
-
-#[tokio::test(flavor = "multi_thread")]
-async fn in_flight_legacy_attempt_is_exposed_under_queue_mutex_with_cross_session_decoy() {
-    if !tmux_available() {
-        eprintln!("skipping: tmux not on PATH");
-        return;
-    }
-
-    let manifest = recovery_manifest();
-    let sw = composer_pane();
-    // Two sessions: s0 and s1. In tmux, each session's initial pane is %0.
-    let mut rig = Rig::new_multi_without_mailbox_capability(
-        "gate3-in-flight-legacy-decoy",
-        &manifest,
-        &[("s0", &sw), ("s1", &sw)],
-        "receipt_block_ms = 500\n",
-    )
-    .await;
-
-    let p0 = rig.pane_ids_session(0).await[0].clone();
-    let p1 = rig.pane_ids_session(1).await[0].clone();
-
-    rig.label(&p0, "legacy_worker0").await;
-    rig.label(&p1, "legacy_worker1").await;
-
-    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
-    let hold = Arc::new(tokio::sync::Semaphore::new(0));
-    let paused = Arc::clone(&hold);
-
-    rig.daemon.set_inject_pause(move |current| {
-        let entered_tx = entered_tx.clone();
-        let paused = Arc::clone(&paused);
-        Box::pin(async move {
-            if current != "pre_paste" {
-                return;
-            }
-            let _ = entered_tx.send(());
-            paused.acquire_owned().await.unwrap().forget();
-        })
-    });
-
-    let (send_res, expected_legacy_id) = tokio::join!(
-        rig.daemon.deliver_payload(
-            "admin",
-            serde_json::from_value::<MsgSendParams>(json!({
-                "to": ["legacy_worker0"],
-                "subject": "Legacy hold",
-                "body": "Legacy payload",
-                "client_key": "legacy-in-flight"
-            }))
-            .unwrap(),
-        ),
-        async {
-            tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
-                .await
-                .expect("legacy delivery reached write boundary")
-                .expect("pause channel stayed open");
-
-            // 1. Query quiesce under the mutex boundary for legacy worker
-            let quiesced = rig
-                .ctl
-                .request("daemon.quiesce", json!({"timeout_ms": 100}))
-                .await;
-            assert!(
-                quiesced["error"].is_null(),
-                "legacy quiesce failed: {quiesced}"
-            );
-
-            let in_flight = quiesced["result"]["in_flight"]
-                .as_array()
-                .expect("in_flight array");
-            assert_eq!(
-                in_flight.len(),
-                1,
-                "exact legacy direct-delivery attempt must be exposed under queue mutex: {quiesced}"
-            );
-            let in_flight_str = in_flight[0].as_str().unwrap();
-            assert!(
-                in_flight_str.ends_with(" -> legacy_worker0"),
-                "in_flight must name target legacy worker: {in_flight_str}"
-            );
-            let expected_legacy_id = in_flight_str.split(" -> ").next().unwrap().to_string();
-
-            // 2. Query legacy worker registry: SAME pane_id in DIFFERENT session (session 1) must return None.
-            // If session_idx is ignored in the lookup, this query would return Some and fail.
-            assert_eq!(
-                rig.daemon.legacy_worker_current_for_test(1, &p0),
-                None,
-                "same pane_id in different session must not match any active worker job"
-            );
-            let current_legacy_msg_id = rig
-                .daemon
-                .legacy_worker_current_for_test(0, &p0)
-                .expect("legacy worker must own exact in-flight job under queue mutex");
-            assert_eq!(
-                current_legacy_msg_id, expected_legacy_id,
-                "legacy worker current job must match in-flight handle"
-            );
-
-            // Release pause and finish
-            hold.add_permits(1);
-            expected_legacy_id
-        }
-    );
-    let send_res = send_res.expect("deliver payload success");
-    assert_eq!(send_res["msg_id"], expected_legacy_id);
-
-    rig.shutdown().await;
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Invariant 3: Supervised child recovery failure visibly faults the worker and never silently restarts

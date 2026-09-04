@@ -20,16 +20,14 @@ use cyclops_tmux::{PaneRow, SessionWatcher};
 use tokio::time::Instant;
 use tracing::{debug, error, warn};
 
-use crate::compatibility::CompatibilityHistorySources;
 use crate::delivery;
-#[cfg(test)]
-use crate::mailbox::UnclaimedReminderQueue;
 use crate::mailbox::{
     AcceptResult, AttentionConsumptionSignal, AttentionResolutionStart, AttentionTarget,
     ClaimOutcome, ExactOwnedRecoveryAction, MailboxDirectory, MailboxError, MailboxIdentity,
     MailboxSend, MailboxService, MailboxServiceError, MessageStoreError,
 };
 use crate::notification_adapter::{NotificationAdapterError, NotificationContext};
+use crate::session_history::SessionHistorySources;
 
 pub(crate) struct NotificationRoute {
     pub(crate) session_idx: usize,
@@ -1181,8 +1179,6 @@ pub(crate) trait WorkspaceMessagingEffects: Send + Sync {
 
     fn reconcile_current_route(&self, session_idx: usize, pane_id: String);
 
-    fn schedule_unclaimed_reminder(&self, record: NotificationRecord);
-
     fn schedule_force_submit(&self, record: NotificationRecord);
 
     fn receipt_block(&self) -> Duration;
@@ -1547,7 +1543,7 @@ impl WorkspaceMessaging {
     /// Read the authorized workspace-first history projection.
     ///
     /// The caller supplies an authenticated durable identity and the immutable
-    /// sources returned by `CompatibilityHistoryAdapter`. Current journal
+    /// sources returned by `SessionHistoryAdapter`. Current journal
     /// access, collision rules, visibility, and body release remain inside
     /// this module. The publication lock is deliberately not held across replay.
     pub(crate) fn history(
@@ -1555,7 +1551,7 @@ impl WorkspaceMessaging {
         caller: MailboxIdentity,
         params: HistoryParams,
         cursor2: Option<String>,
-        compatibility: CompatibilityHistorySources,
+        compatibility: SessionHistorySources,
     ) -> Result<HistoryResult, cyclops_proto::WireError> {
         let reader = crate::history::HistoryReader::workspace(caller.label.clone(), caller.key);
         let record = self.history_record(compatibility);
@@ -1574,7 +1570,7 @@ impl WorkspaceMessaging {
         caller: MailboxIdentity,
         id: &str,
         reveal_body: bool,
-        compatibility: CompatibilityHistorySources,
+        compatibility: SessionHistorySources,
     ) -> Result<ThreadResult, cyclops_proto::WireError> {
         let reader = crate::history::HistoryReader::workspace(caller.label.clone(), caller.key);
         let record = self.history_record(compatibility);
@@ -1593,7 +1589,7 @@ impl WorkspaceMessaging {
     /// without exposing workspace message IDs to the status caller.
     pub(crate) fn retained_open_deliveries(
         &self,
-        compatibility: CompatibilityHistorySources,
+        compatibility: SessionHistorySources,
     ) -> Vec<OpenDelivery> {
         let record = self.history_record(compatibility);
         let mut open = crate::history::open_from_record(&record);
@@ -1612,7 +1608,7 @@ impl WorkspaceMessaging {
 
     fn history_record(
         &self,
-        compatibility: CompatibilityHistorySources,
+        compatibility: SessionHistorySources,
     ) -> crate::history::HistoryRecord {
         let workspace = match self.service.journal_lines() {
             Ok(lines) if !lines.is_empty() => {
@@ -1649,6 +1645,14 @@ impl WorkspaceMessaging {
 
     pub(crate) fn admin_identity(&self) -> MailboxIdentity {
         self.service.admin()
+    }
+
+    pub(crate) fn notification_for_message(
+        &self,
+        recipient: RecipientKey,
+        message_id: &MessageId,
+    ) -> Result<Option<NotificationRecord>, MailboxServiceError> {
+        self.service.notification_for_message(recipient, message_id)
     }
 
     pub(crate) fn identity_for_recipient(
@@ -1838,15 +1842,6 @@ impl WorkspaceMessaging {
             .map(|_| ())
     }
 
-    /// Apply the shared post-commit consequences of a direct mailbox delivery.
-    pub(crate) fn direct_delivery_settled(
-        &self,
-        recipient: RecipientKey,
-    ) -> Result<(), MailboxServiceError> {
-        self.effects.invalidate_unread(recipient);
-        self.notification_head_changed(recipient)
-    }
-
     /// Apply one immutable route observation without exposing reconciliation
     /// or worker topology to the observer.
     pub(crate) fn route_evidence_observed(&self, evidence: MessagingRouteEvidence) {
@@ -1886,18 +1881,6 @@ impl WorkspaceMessaging {
             if let Err(error) = self.effects.schedule_notification(&self.service, recipient) {
                 error!(%recipient, %error, "cannot schedule mailbox notification");
             }
-        }
-    }
-
-    /// Restore exact reminder timers from durable replay state.
-    pub(crate) fn restore_unclaimed_reminders(&self) {
-        match self.service.unclaimed_reminder_candidates() {
-            Ok(records) => {
-                for record in records {
-                    self.effects.schedule_unclaimed_reminder(record);
-                }
-            }
-            Err(error) => error!(%error, "cannot inspect unclaimed reminder candidates"),
         }
     }
 
@@ -2093,16 +2076,6 @@ impl WorkspaceMessaging {
                 debug!(%attempt_id, %error, "cannot park exact-attention work");
                 false
             }
-        }
-    }
-
-    /// Arm the optional reminder only for the first proven doorbell.
-    pub(crate) fn notification_became_notified(&self, record: NotificationRecord) {
-        if record.state == NotificationState::Notified
-            && record.transport == cyclops_proto::NotificationTransport::Doorbell
-            && record.unclaimed_reminder_count == 0
-        {
-            self.effects.schedule_unclaimed_reminder(record);
         }
     }
 
@@ -2954,9 +2927,7 @@ fn schedule_accepted_notifications(
 #[cfg(test)]
 mod tests {
     use crate::fusion::PaneMessagingObservation;
-    use crate::messaging_runtime::{
-        record_unowned_notification, wait_and_queue_unclaimed_reminder,
-    };
+    use crate::messaging_runtime::record_unowned_notification;
 
     use super::*;
     use std::fs;
@@ -3663,7 +3634,6 @@ mod tests {}
         SpawnExactAttentionWorker(NotificationAttemptId),
         ReconcileRouteEvidence(MessagingRouteEvidence),
         ReconcileCurrentRoute(usize, String),
-        ScheduleUnclaimedReminder(NotificationAttemptId),
         ScheduleForceSubmit(NotificationAttemptId),
     }
 
@@ -3829,13 +3799,6 @@ mod tests {}
                 .push(RecordedEffect::ReconcileCurrentRoute(session_idx, pane_id));
         }
 
-        fn schedule_unclaimed_reminder(&self, record: NotificationRecord) {
-            self.calls
-                .lock()
-                .expect("acceptance calls lock")
-                .push(RecordedEffect::ScheduleUnclaimedReminder(record.attempt_id));
-        }
-
         fn schedule_force_submit(&self, record: NotificationRecord) {
             self.calls
                 .lock()
@@ -3886,7 +3849,7 @@ mod tests {}
         legacy_only.to = vec!["observer".into()];
         legacy_only.subject = Some("legacy only".into());
         legacy_only.body = Some("legacy private body".into());
-        let compatibility = || CompatibilityHistorySources {
+        let compatibility = || SessionHistorySources {
             files: vec![(
                 "session-journal:legacy.ndjson".into(),
                 vec![collision.clone(), legacy_only.clone()],
@@ -4012,7 +3975,7 @@ mod tests {}
             "the legacy copy must be open when read without its current owner"
         );
 
-        let open = messaging.retained_open_deliveries(CompatibilityHistorySources {
+        let open = messaging.retained_open_deliveries(SessionHistorySources {
             files: vec![("session-journal:legacy.ndjson".into(), legacy)],
             unreadable_sources: 0,
         });
@@ -4044,7 +4007,7 @@ mod tests {}
             deliveries: Vec::new(),
             data: None,
         };
-        let compatibility = CompatibilityHistorySources {
+        let compatibility = SessionHistorySources {
             files: vec![(
                 "session-journal:only.ndjson".into(),
                 vec![line(1, "m-first"), line(2, "m-second")],
@@ -4257,16 +4220,8 @@ mod tests {}
         );
 
         messaging.notification_head_changed(reviewer).unwrap();
-        messaging.direct_delivery_settled(reviewer).unwrap();
 
-        assert_eq!(
-            effects.calls(),
-            vec![
-                RecordedEffect::Schedule(reviewer),
-                RecordedEffect::InvalidateUnread(reviewer),
-                RecordedEffect::Schedule(reviewer),
-            ]
-        );
+        assert_eq!(effects.calls(), vec![RecordedEffect::Schedule(reviewer)]);
     }
 
     // Obsolete if runtime observers or adapters again choose reconciliation,
@@ -4311,32 +4266,9 @@ mod tests {}
     }
 
     // Obsolete if delivery interprets durable notification variants to choose
-    // reminder, attention reconciliation, or force-submit scheduling.
+    // attention reconciliation or force-submit scheduling.
     #[test]
     fn workspace_messaging_owns_durable_notification_follow_up_policy() {
-        let (_scratch, service, events, _reviewer, _) =
-            mailbox_service("workspace-messaging-notified-policy", 8);
-        let effects = Arc::new(RecordingEffects::new(events));
-        let messaging = WorkspaceMessaging::new(
-            Arc::clone(&service),
-            Arc::new(StdMutex::new(())),
-            effects.clone(),
-        );
-        let (_accepted, context, _) = queued_attempt(&service);
-        let notified = record_notified_doorbell(&context);
-
-        messaging.notification_became_notified(notified.clone());
-        messaging.notification_became_notified(notified);
-
-        assert_eq!(
-            effects.calls(),
-            vec![
-                RecordedEffect::ScheduleUnclaimedReminder(context.attempt_id()),
-                RecordedEffect::ScheduleUnclaimedReminder(context.attempt_id()),
-            ],
-            "repeated mechanism calls remain safe because the runtime helper and durable queue are idempotent"
-        );
-
         let (_scratch, service, events, reviewer, _) =
             mailbox_service("workspace-messaging-attention-policy", 8);
         let effects = Arc::new(RecordingEffects::new(events));
@@ -4471,7 +4403,6 @@ mod tests {}
         for forbidden in [
             "messaging_runtime::schedule_available(",
             "messaging_runtime::schedule_pane_size_changed(",
-            "messaging_runtime::schedule_unclaimed_reminders(",
             "messaging_runtime::schedule_force_submit_candidates(",
         ] {
             assert!(
@@ -5387,26 +5318,6 @@ mod tests {}
         messaging.availability_changed();
 
         assert_eq!(effects.calls(), vec![RecordedEffect::Schedule(reviewer)]);
-
-        let (_scratch, service, events, _reviewer, _) =
-            mailbox_service("workspace-messaging-reminder-replay", 8);
-        let effects = Arc::new(RecordingEffects::new(events));
-        let messaging = WorkspaceMessaging::new(
-            Arc::clone(&service),
-            Arc::new(StdMutex::new(())),
-            effects.clone(),
-        );
-        let (_accepted, context, _) = queued_attempt(&service);
-        let notified = record_notified_doorbell(&context);
-
-        messaging.restore_unclaimed_reminders();
-
-        assert_eq!(
-            effects.calls(),
-            vec![RecordedEffect::ScheduleUnclaimedReminder(
-                notified.attempt_id
-            )]
-        );
     }
 
     #[test]
@@ -5459,20 +5370,6 @@ mod tests {}
                 Some(DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
             )
             .unwrap();
-    }
-
-    fn record_notified_doorbell(
-        context: &NotificationContext,
-    ) -> cyclops_proto::NotificationRecord {
-        context.record_gating().unwrap();
-        record_doorbell_write(context);
-        context.record_staged().unwrap();
-        assert_eq!(
-            context.reserve_submit().unwrap(),
-            crate::notification_adapter::SubmitReservation::Reserved
-        );
-        context.record_submitted().unwrap();
-        context.record_notified().unwrap()
     }
 
     fn composer_runtime(
@@ -6372,82 +6269,6 @@ mod tests {}
             dispositions[0].wake_block,
             Some(MessageWakeBlock::WorkerSupervisorExited)
         );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_due_reminder_waits_for_the_prior_barrier_then_queues_once() {
-        let (_scratch, service, events, _recipient, _) = mailbox_service("reminder-barrier", 8);
-        let (accepted, context, _) = queued_attempt(&service);
-        let notified = record_notified_doorbell(&context);
-        let attempt_id = notified.attempt_id;
-        let mut receiver = events.subscribe();
-        let wait_service = Arc::clone(&service);
-        let waiter = tokio::spawn(async move {
-            wait_and_queue_unclaimed_reminder(
-                &wait_service,
-                attempt_id,
-                Duration::from_secs(10),
-                &mut receiver,
-            )
-            .await
-        });
-
-        tokio::time::advance(Duration::from_secs(10)).await;
-        tokio::task::yield_now().await;
-        assert!(!waiter.is_finished(), "the old write barrier must win");
-        assert_eq!(
-            service.message_dispositions(&accepted.message_id).unwrap()[0].notification_state_raw,
-            Some(NotificationState::Notified)
-        );
-
-        service
-            .retire_notification_barrier(
-                &notified,
-                cyclops_proto::NotificationBarrierRetirementCause::ComposerObservedClear,
-                None,
-            )
-            .unwrap();
-        let queued = waiter.await.unwrap().unwrap().unwrap();
-        assert_eq!(queued.state, NotificationState::Gating);
-        assert_eq!(queued.attempt_id, attempt_id);
-        assert_eq!(queued.unclaimed_reminder_count, 1);
-        assert_eq!(
-            service.queue_unclaimed_reminder(attempt_id).unwrap(),
-            UnclaimedReminderQueue::Obsolete
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_claim_obsoletes_the_exact_reminder_without_a_fact_or_terminal_io() {
-        let (_scratch, service, events, recipient, _) = mailbox_service("reminder-claim", 8);
-        let (accepted, context, _) = queued_attempt(&service);
-        let notified = record_notified_doorbell(&context);
-        let attempt_id = notified.attempt_id;
-        let lines_before = service.journal_lines().unwrap().len();
-        let mut receiver = events.subscribe();
-        let wait_service = Arc::clone(&service);
-        let waiter = tokio::spawn(async move {
-            wait_and_queue_unclaimed_reminder(
-                &wait_service,
-                attempt_id,
-                Duration::from_secs(10),
-                &mut receiver,
-            )
-            .await
-        });
-        service.claim(recipient, accepted.message_id).unwrap();
-
-        tokio::time::advance(Duration::from_secs(10)).await;
-        assert_eq!(waiter.await.unwrap().unwrap(), None);
-        let lines = service.journal_lines().unwrap();
-        assert_eq!(lines.len(), lines_before + 1, "only the claim appends");
-        assert!(lines.iter().all(|line| {
-            line.data
-                .as_ref()
-                .and_then(|data| data.get("type"))
-                .and_then(|v| v.as_str())
-                != Some("notification_unclaimed_reminder_queued")
-        }));
     }
 
     #[tokio::test(start_paused = true)]

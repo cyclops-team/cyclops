@@ -120,14 +120,17 @@ async fn wait_submitted(rig: &mut Rig, id: &str) {
     wait_delivery_state(rig, id, "submitted").await;
 }
 
+/// Wait for the durable notification record. `delivered_verified` is the
+/// receipt vocabulary these tests keep: on the record it is `notified`,
+/// reached from the exact hook acknowledgement each test reports.
 async fn wait_delivery_state(rig: &mut Rig, id: &str, state: &str) {
-    rig.ev
-        .wait_event(Duration::from_secs(10), |e| {
-            e["event"] == "delivery-state"
-                && e["data"]["id"] == id
-                && e["data"]["to_state"] == state
-        })
-        .await;
+    let states: &[&str] = match state {
+        "submitted" => &["submitted", "submitted_unverified", "notified"],
+        "delivered_verified" => &["notified"],
+        "gating" => &["gating"],
+        other => panic!("no durable notification state for {other}"),
+    };
+    wait_notification_state(rig, id, states).await;
 }
 
 async fn acknowledge_codex_turn(rig: &mut Rig, subject: &str, session: &str, turn: &str) -> String {
@@ -142,18 +145,12 @@ async fn acknowledge_codex_turn(rig: &mut Rig, subject: &str, session: &str, tur
         json!({
             "session_id": session,
             "turn_id": turn,
-            "prompt": cyclopsd::render_payload(&id, "admin", subject, "b", false),
+            "prompt": doorbell_for(rig, &id),
         }),
     )
     .await;
     assert_eq!(ack["matched"], true, "{ack}");
-    rig.ev
-        .wait_event(Duration::from_secs(10), |e| {
-            e["event"] == "delivery-state"
-                && e["data"]["id"] == id.as_str()
-                && e["data"]["to_state"] == "delivered_verified"
-        })
-        .await;
+    wait_notification_state(rig, &id, &["notified"]).await;
     id
 }
 
@@ -185,7 +182,7 @@ async fn claude_unkeyed_dispatch_publishes_provisional_working_then_visual_recei
         "UserPromptSubmit",
         json!({
             "session_id": "session-1",
-            "prompt": cyclopsd::render_payload(&id, "admin", "unkeyed", "body", false),
+            "prompt": doorbell_for(&rig, &id),
         }),
     )
     .await;
@@ -206,8 +203,8 @@ async fn claude_unkeyed_dispatch_publishes_provisional_working_then_visual_recei
         "{provisional_state}"
     );
     assert_ne!(
-        rig.final_state(&id, "keyed").as_deref(),
-        Some("delivered_verified"),
+        notification_state(&rig, &id).as_deref(),
+        Some("notified"),
         "the hook dispatch became a receipt before visual acceptance"
     );
 
@@ -221,8 +218,8 @@ async fn claude_unkeyed_dispatch_publishes_provisional_working_then_visual_recei
         .unwrap_or_else(|| panic!("pane missing after provisional start: {status}"));
     assert_eq!(pane_status["state"], "working", "{status}");
     assert_ne!(
-        rig.final_state(&id, "keyed").as_deref(),
-        Some("delivered_verified"),
+        notification_state(&rig, &id).as_deref(),
+        Some("notified"),
         "status promoted the provisional hook dispatch into a receipt"
     );
 
@@ -232,8 +229,8 @@ async fn claude_unkeyed_dispatch_publishes_provisional_working_then_visual_recei
         .await
         .expect("visual acceptance did not reach the post-commit chrome boundary");
     assert_eq!(
-        rig.final_state(&id, "keyed").as_deref(),
-        Some("delivered_verified"),
+        notification_state(&rig, &id).as_deref(),
+        Some("notified"),
         "presentation began before the returned dispatch ACK was durable"
     );
     repaint.release();
@@ -245,13 +242,7 @@ async fn claude_unkeyed_dispatch_publishes_provisional_working_then_visual_recei
                 && event["data"]["working_confirmed"] == true
         })
         .await;
-    rig.ev
-        .wait_event(Duration::from_secs(10), |event| {
-            event["event"] == "delivery-state"
-                && event["data"]["id"] == id.as_str()
-                && event["data"]["to_state"] == "delivered_verified"
-        })
-        .await;
+    wait_notification_state(&rig, &id, &["notified"]).await;
 
     // Claude has no exact Stop key. Its lifecycle returns to idle from a
     // fresh clean visual frame, without inventing cross-event correlation.
@@ -314,7 +305,7 @@ async fn c6_human_prompt_holds_an_unrelated_cyclops_delivery() {
         .await;
     let id = sent["msg_id"].as_str().unwrap().to_string();
     wait_delivery_state(&mut rig, &id, "gating").await;
-    assert_eq!(rig.final_state(&id, "keyed").as_deref(), Some("gating"));
+    assert_eq!(notification_state(&rig, &id).as_deref(), Some("gating"));
     assert!(
         !rig.tmux.capture(&pane).contains(&id),
         "the unrelated delivery wrote while the human turn was working"
@@ -331,7 +322,7 @@ async fn c6_human_prompt_holds_an_unrelated_cyclops_delivery() {
                 && event["data"]["working_confirmed"] == true
         })
         .await;
-    assert_eq!(rig.final_state(&id, "keyed").as_deref(), Some("gating"));
+    assert_eq!(notification_state(&rig, &id).as_deref(), Some("gating"));
     assert!(
         !rig.tmux.capture(&pane).contains(&id),
         "visual confirmation released a delivery before the turn ended"
@@ -371,13 +362,7 @@ async fn unconfirmed_dispatch_cannot_be_revived_by_a_later_human_prompt() {
         "UserPromptSubmit",
         json!({
             "session_id": "cyclops-session",
-            "prompt": cyclopsd::render_payload(
-                &id,
-                "admin",
-                "unconfirmed",
-                "body",
-                false,
-            ),
+            "prompt": doorbell_for(&rig, &id),
         }),
     )
     .await;
@@ -403,8 +388,8 @@ async fn unconfirmed_dispatch_cannot_be_revived_by_a_later_human_prompt() {
     assert_eq!(pane_status["state"], "working", "{status}");
     assert_eq!(pane_status["working_confirmed"], false, "{status}");
     assert_ne!(
-        rig.final_state(&id, "keyed").as_deref(),
-        Some("delivered_verified"),
+        notification_state(&rig, &id).as_deref(),
+        Some("notified"),
         "a stable clean frame verified an unaccepted dispatch"
     );
 
@@ -428,8 +413,8 @@ async fn unconfirmed_dispatch_cannot_be_revived_by_a_later_human_prompt() {
         })
         .await;
     assert_ne!(
-        rig.final_state(&id, "keyed").as_deref(),
-        Some("delivered_verified"),
+        notification_state(&rig, &id).as_deref(),
+        Some("notified"),
         "a later human turn revived the retired Cyclops receipt candidate"
     );
 
@@ -467,7 +452,7 @@ async fn claude_dispatch_waits_for_visual_working_before_it_verifies() {
         json!({
             "session_id": "session-1",
             "prompt_id": "prompt-1",
-            "prompt": cyclopsd::render_payload(&id, "admin", "candidate", "body", false),
+            "prompt": doorbell_for(&rig, &id),
         }),
     )
     .await;
@@ -477,8 +462,8 @@ async fn claude_dispatch_waits_for_visual_working_before_it_verifies() {
         "candidate claimed runtime state: {start}"
     );
     assert_ne!(
-        rig.final_state(&id, "keyed").as_deref(),
-        Some("delivered_verified"),
+        notification_state(&rig, &id).as_deref(),
+        Some("notified"),
         "dispatch alone became a receipt"
     );
     send_fixture_key(&rig, &pane, "C-t");
@@ -490,13 +475,7 @@ async fn claude_dispatch_waits_for_visual_working_before_it_verifies() {
                 && event["data"]["state"] == "working"
         })
         .await;
-    rig.ev
-        .wait_event(Duration::from_secs(10), |event| {
-            event["event"] == "delivery-state"
-                && event["data"]["id"] == id.as_str()
-                && event["data"]["to_state"] == "delivered_verified"
-        })
-        .await;
+    wait_notification_state(&rig, &id, &["notified"]).await;
 
     let end = report(
         &rig,
@@ -509,21 +488,24 @@ async fn claude_dispatch_waits_for_visual_working_before_it_verifies() {
     send_fixture_key(&rig, &pane, "C-y");
     wait_pane_state(&mut rig, "idle").await;
 
-    let lines = rig.ledger_lines();
-    let working_at = lines
+    let working_ts = rig
+        .ledger_lines()
         .iter()
-        .position(|line| line["kind"] == "state" && line["data"]["state"] == "working")
+        .find(|line| line["kind"] == "state" && line["data"]["state"] == "working")
+        .and_then(|line| line["ts"].as_u64())
         .expect("Working state line");
-    let delivered_at = lines
-        .iter()
-        .position(|line| {
-            line["kind"] == "state"
-                && line["id"] == id.as_str()
-                && line["data"]["to_state"] == "delivered_verified"
+    let notified_ts = workspace_lines(&rig)
+        .into_iter()
+        .find(|line| {
+            line.id == id
+                && line.data.as_ref().is_some_and(|data| {
+                    data["type"] == "notification_transition" && data["state"] == "notified"
+                })
         })
-        .expect("verified delivery line");
+        .map(|line| line.ts)
+        .expect("notified transition");
     assert!(
-        working_at < delivered_at,
+        working_ts <= notified_ts,
         "receipt published before accepted Working"
     );
     rig.shutdown().await;
@@ -557,7 +539,7 @@ async fn claude_blocked_dispatch_never_becomes_a_receipt() {
         json!({
             "session_id": "session-1",
             "prompt_id": "prompt-1",
-            "prompt": cyclopsd::render_payload(&id, "admin", "blocked", "body", false),
+            "prompt": doorbell_for(&rig, &id),
         }),
     )
     .await;
@@ -568,23 +550,17 @@ async fn claude_blocked_dispatch_never_becomes_a_receipt() {
     );
     send_fixture_key(&rig, &pane, "C-l");
 
-    rig.ev
-        .wait_event(Duration::from_secs(10), |event| {
-            event["event"] == "delivery-state"
-                && event["data"]["id"] == id.as_str()
-                && event["data"]["to_state"] == "attention_required"
-        })
-        .await;
+    wait_notification_state(&rig, &id, &["attention_required"]).await;
     let screen = rig.tmux.capture(&pane);
     assert!(
-        screen.contains(&id),
-        "blocked payload left the composer: {screen}"
+        screen.contains(&doorbell_for(&rig, &id)),
+        "blocked doorbell left the composer: {screen}"
     );
-    assert!(!rig.ledger_lines().iter().any(|line| {
-        line["kind"] == "state"
-            && line["id"] == id.as_str()
-            && line["data"]["to_state"] == "delivered_verified"
-    }));
+    assert_ne!(
+        notification_state(&rig, &id).as_deref(),
+        Some("notified"),
+        "a blocked dispatch became a receipt"
+    );
     rig.shutdown().await;
 }
 
@@ -679,7 +655,7 @@ async fn claude_stopfailure_confirms_a_short_turn_without_late_working() {
         json!({
             "session_id": "session-short",
             "prompt_id": "prompt-short",
-            "prompt": cyclopsd::render_payload(&id, "admin", "short", "body", false),
+            "prompt": doorbell_for(&rig, &id),
         }),
     )
     .await;
@@ -751,7 +727,7 @@ async fn claude_stopfailure_before_dispatch_still_confirms_the_exact_message() {
         json!({
             "session_id": "session-reordered",
             "prompt_id": "prompt-reordered",
-            "prompt": cyclopsd::render_payload(&id, "admin", "reordered", "body", false),
+            "prompt": doorbell_for(&rig, &id),
         }),
     )
     .await;
@@ -799,7 +775,7 @@ async fn claude_stopfailure_confirms_a_superseded_exact_dispatch() {
         json!({
             "session_id": "session-superseded",
             "prompt_id": "prompt-a",
-            "prompt": cyclopsd::render_payload(&id, "admin", "first", "body", false),
+            "prompt": doorbell_for(&rig, &id),
         }),
     )
     .await;
@@ -878,7 +854,7 @@ async fn claude_stopfailure_does_not_override_visual_working_or_release_a_dirty_
         json!({
             "session_id": "session-active",
             "prompt_id": "prompt-active",
-            "prompt": cyclopsd::render_payload(&first_id, "admin", "first", "body", false),
+            "prompt": doorbell_for(&rig, &first_id),
         }),
     )
     .await;
@@ -886,6 +862,7 @@ async fn claude_stopfailure_does_not_override_visual_working_or_release_a_dirty_
     send_fixture_key(&rig, &pane, "C-t");
     wait_pane_state(&mut rig, "working").await;
     wait_delivery_state(&mut rig, &first_id, "delivered_verified").await;
+    claim(&rig, "keyed", &first_id);
 
     let (second, _) = rig
         .send(json!({"to": ["keyed"], "subject": "second", "body": "body"}))
@@ -922,7 +899,7 @@ async fn claude_stopfailure_does_not_override_visual_working_or_release_a_dirty_
         "{dirty}"
     );
     assert_eq!(
-        rig.final_state(&second_id, "keyed").as_deref(),
+        notification_state(&rig, &second_id).as_deref(),
         Some("gating")
     );
 
@@ -960,13 +937,14 @@ async fn claude_interrupt_updates_status_without_fabricating_an_exact_end() {
         json!({
             "session_id": "session-interrupt",
             "prompt_id": "prompt-interrupt",
-            "prompt": cyclopsd::render_payload(&first_id, "admin", "interrupt", "body", false),
+            "prompt": doorbell_for(&rig, &first_id),
         }),
     )
     .await;
     send_fixture_key(&rig, &pane, "C-t");
     wait_pane_state(&mut rig, "working").await;
     wait_delivery_state(&mut rig, &first_id, "delivered_verified").await;
+    claim(&rig, "keyed", &first_id);
 
     let (second, _) = rig
         .send(json!({"to": ["keyed"], "subject": "held", "body": "body"}))
@@ -991,7 +969,7 @@ async fn claude_interrupt_updates_status_without_fabricating_an_exact_end() {
         "visual idle must not fabricate the exact end: {interrupted}"
     );
     assert_eq!(
-        rig.final_state(&second_id, "keyed").as_deref(),
+        notification_state(&rig, &second_id).as_deref(),
         Some("gating")
     );
 
@@ -1150,13 +1128,12 @@ async fn an_out_of_order_turn_does_not_strand_the_composer() {
     macro_rules! submitted {
         ($id:expr) => {{
             let id: String = $id;
-            rig.ev
-                .wait_event(Duration::from_secs(10), |e| {
-                    e["event"] == "delivery-state"
-                        && e["data"]["id"] == id.as_str()
-                        && e["data"]["to_state"] == "submitted"
-                })
-                .await;
+            wait_notification_state(
+                &rig,
+                &id,
+                &["submitted", "submitted_unverified", "notified"],
+            )
+            .await;
         }};
     }
 
@@ -1189,7 +1166,7 @@ async fn an_out_of_order_turn_does_not_strand_the_composer() {
         "payload": {
             "session_id": "s1",
             "turn_id": "t1",
-            "prompt": cyclopsd::render_payload(&first, "admin", "first", "b", false),
+            "prompt": doorbell_for(&rig, &first),
         },
     });
     let resp = rig
@@ -1202,6 +1179,7 @@ async fn an_out_of_order_turn_does_not_strand_the_composer() {
     // The turn is over and the composer is free. A delivery queued behind
     // it has to reach the pane; before the fix it waited on a turn that
     // had already ended and nothing was left to say so.
+    claim(&rig, "keyed", &first);
     let (result, _) = rig
         .send(json!({"to": ["keyed"], "subject": "second", "body": "b"}))
         .await;
@@ -1230,7 +1208,8 @@ async fn a_partial_codex_turn_match_keeps_the_composer_held() {
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "keyed").await;
 
-    let _first = acknowledge_codex_turn(&mut rig, "first", "s1", "t1").await;
+    let first = acknowledge_codex_turn(&mut rig, "first", "s1", "t1").await;
+    claim(&rig, "keyed", &first);
 
     let (result, _) = rig
         .send(json!({"to": ["keyed"], "subject": "second", "body": "b"}))
@@ -1263,7 +1242,7 @@ async fn a_partial_codex_turn_match_keeps_the_composer_held() {
         );
     }
     assert_eq!(
-        rig.final_state(&second, "keyed").as_deref(),
+        notification_state(&rig, &second).as_deref(),
         Some("gating"),
         "a partial turn-key match released the next delivery"
     );
@@ -1302,7 +1281,8 @@ async fn a_detached_codex_end_releases_only_after_a_fresh_clean_capture() {
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "keyed").await;
 
-    let _first = acknowledge_codex_turn(&mut rig, "first", "s1", "t1").await;
+    let first = acknowledge_codex_turn(&mut rig, "first", "s1", "t1").await;
+    claim(&rig, "keyed", &first);
 
     let (result, _) = rig
         .send(json!({"to": ["keyed"], "subject": "second", "body": "b"}))
@@ -1335,19 +1315,23 @@ async fn a_detached_codex_end_releases_only_after_a_fresh_clean_capture() {
         .await;
     assert_eq!(read["result"]["detection"]["state"], "working", "{read}");
 
+    // Whatever the second doorbell recorded before the outage stands; the
+    // detached end must add nothing. A write needs a live watcher, and
+    // stored lifecycle evidence is not one.
     let held_socket = HeldTmuxSocket::disconnect(&rig, "main");
     rig.ev
         .wait_event(Duration::from_secs(10), |e| {
             e["event"] == "session" && e["data"]["attached"] == false
         })
         .await;
+    let before_detached_end = notification_states(&rig, &second);
     let end = report(&rig, "Stop", json!({"session_id": "s1", "turn_id": "t1"})).await;
     assert_eq!(end["applied"], true, "{end}");
     assert_eq!(end["live"], false, "{end}");
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(
-        rig.final_state(&second, "keyed").as_deref(),
-        Some("gating"),
+        notification_states(&rig, &second),
+        before_detached_end,
         "stored lifecycle evidence authorized a write while detached"
     );
 
@@ -1455,7 +1439,7 @@ async fn an_acknowledgement_in_the_submit_gap_still_resolves() {
             "payload": {
                 "session_id": "s1",
                 "turn_id": "t1",
-                "prompt": cyclopsd::render_payload(&msg_id, "admin", "gap", "b", false),
+                "prompt": doorbell_for(&rig, &msg_id),
             },
         });
         let resp = rig
@@ -1466,13 +1450,7 @@ async fn an_acknowledgement_in_the_submit_gap_still_resolves() {
         assert_eq!(resp["applied"], true, "{phase}: {resp}");
         release.add_permits(1);
 
-        rig.ev
-            .wait_event(Duration::from_secs(10), |e| {
-                e["event"] == "delivery-state"
-                    && e["data"]["id"] == msg_id.as_str()
-                    && e["data"]["to_state"] == "delivered_verified"
-            })
-            .await;
+        wait_notification_state(&rig, &msg_id, &["notified"]).await;
         rig.shutdown().await;
     }
 }

@@ -6,14 +6,14 @@ use std::path::Path;
 
 use cyclops_ledger::{now_ms, LedgerError, LedgerWriter};
 use cyclops_proto::{
-    doorbell_format_names_exact_attempt, Kind, LedgerLine, MailboxEntry, MailboxEntryState,
-    MailboxFact, MessageId, MessageMetadata, MessagePresentation, MessageWakeBlock,
-    NotificationAttemptId, NotificationAttentionCause, NotificationBarrierRetirementCause,
-    NotificationBinding, NotificationFact, NotificationPreWriteCause,
-    NotificationPreWriteObservation, NotificationRecord, NotificationRequeue,
-    NotificationResolution, NotificationResolutionConsumptionObservation, NotificationState,
-    NotificationTransport, NotificationVerifyOutcome, RecipientKey, WorkspaceId,
-    CANONICAL_RECORD_VERSION, DOORBELL_FORMAT_ATTEMPT_CLAIM, DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM,
+    doorbell_format_names_exact_attempt, Kind, LedgerLine, MailboxEntryState, MailboxFact,
+    MessageId, MessageMetadata, MessagePresentation, MessageWakeBlock, NotificationAttemptId,
+    NotificationAttentionCause, NotificationBarrierRetirementCause, NotificationBinding,
+    NotificationFact, NotificationPreWriteCause, NotificationPreWriteObservation,
+    NotificationRecord, NotificationRequeue, NotificationResolution,
+    NotificationResolutionConsumptionObservation, NotificationState, NotificationTransport,
+    NotificationVerifyOutcome, RecipientKey, WorkspaceId, CANONICAL_RECORD_VERSION,
+    DOORBELL_FORMAT_ATTEMPT_CLAIM, DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM,
     DOORBELL_FORMAT_COMPACT_CLAIM, NOTIFICATION_RESOLUTION_PROOF_VERSION,
 };
 use cyclops_state::StateRoot;
@@ -460,22 +460,16 @@ impl MessageStore {
         )
     }
 
-    pub fn mark_delivered_direct(
-        &mut self,
-        message_id: MessageId,
-        recipient: RecipientKey,
-        attempt_id: NotificationAttemptId,
-    ) -> Result<MailboxEntry, MessageStoreError> {
-        self.mark_delivered_direct_at(message_id, recipient, attempt_id, now_ms())
-    }
-
+    /// Replay only: no longer written since 1.1.0. Tests seed the fact an
+    /// older daemon wrote for a direct payload delivery.
+    #[cfg(test)]
     pub(crate) fn mark_delivered_direct_at(
         &mut self,
         message_id: MessageId,
         recipient: RecipientKey,
         attempt_id: NotificationAttemptId,
         ts: u64,
-    ) -> Result<MailboxEntry, MessageStoreError> {
+    ) -> Result<cyclops_proto::MailboxEntry, MessageStoreError> {
         if let Some(entry) = self.projection.get_entry(recipient, &message_id) {
             if matches!(
                 entry.state,
@@ -738,17 +732,9 @@ impl MessageStore {
         self.append_notification_fact_at(message_id, recipient, fact, ts)
     }
 
-    /// Spend the single reminder allowance for one exact pending doorbell.
-    ///
-    /// Obsolete timers are normal: a claim, withdrawal, or replacement may
-    /// win before the deadline. Those cases return `None` without appending.
-    pub(crate) fn queue_unclaimed_reminder(
-        &mut self,
-        attempt_id: NotificationAttemptId,
-    ) -> Result<Option<NotificationRecord>, MessageStoreError> {
-        self.queue_unclaimed_reminder_at(attempt_id, now_ms())
-    }
-
+    /// Replay only: no longer written since 1.1.0. Tests seed the fact an
+    /// older daemon wrote when it spent a doorbell's one reminder allowance.
+    #[cfg(test)]
     pub(crate) fn queue_unclaimed_reminder_at(
         &mut self,
         attempt_id: NotificationAttemptId,

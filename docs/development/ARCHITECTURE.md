@@ -232,7 +232,7 @@ no tested CLI hook identifies its modals or quota screens.
 
 ## Retained compatibility boundary
 
-`src/cyclopsd/src/compatibility.rs` is the explicit entry point for behavior
+`src/cyclopsd/src/session_history.rs` is the explicit entry point for behavior
 that predates the workspace mailbox: direct in-process payload delivery,
 restart settlement of direct-delivery chains, and replay of session journals
 linked across session renames. It does not make those paths the current
@@ -259,7 +259,7 @@ separate notification attempt as specified in [DELIVERY.md](DELIVERY.md). The
 `compatibility::deliver_payload` entry point delegates to the retained direct
 writer in `delivery.rs`, which writes a session fact and fans out; one FIFO
 worker per recipient pane then carries each chain on its own. The boundary is
-`src/cyclopsd/src/compatibility.rs`; the pipeline remains in
+`src/cyclopsd/src/session_history.rs`; the pipeline remains in
 `src/cyclopsd/src/delivery.rs`.
 
 ### The call: what the sender gets back

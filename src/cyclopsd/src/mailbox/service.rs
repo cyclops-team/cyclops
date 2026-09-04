@@ -12,8 +12,8 @@ use cyclops_proto::{
     NotificationAttemptId, NotificationBarrierRetirementCause, NotificationBinding,
     NotificationPreWriteCause, NotificationPreWriteObservation, NotificationRecord,
     NotificationRequeue, NotificationResolution, NotificationResolutionConsumptionEvidence,
-    NotificationResolutionConsumptionObservation, NotificationState, NotificationTransport,
-    ProcessInstanceId, RecipientKey, TmuxPaneId, WorkspaceId,
+    NotificationResolutionConsumptionObservation, NotificationState, ProcessInstanceId,
+    RecipientKey, TmuxPaneId, WorkspaceId,
 };
 use tokio::sync::broadcast;
 
@@ -32,13 +32,6 @@ pub struct MailboxService {
     pub(crate) exact_reconciliation: StdMutex<ExactReconciliationRequests>,
     pub(crate) attention_consumption_candidates:
         StdMutex<HashMap<NotificationAttemptId, AttentionConsumptionCandidate>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum UnclaimedReminderQueue {
-    Queued(Box<NotificationRecord>),
-    WaitingForPriorBarrier,
-    Obsolete,
 }
 
 #[derive(Default)]
@@ -483,53 +476,33 @@ impl MailboxService {
             )
             .then_some(record));
         }
-        loop {
-            let Some(message_id) =
-                Self::first_actionable_notification_message_id(&store, recipient)
-            else {
-                return Ok(None);
-            };
-            match store
-                .projection()
-                .notification(recipient, &message_id)
-                .cloned()
-            {
-                None => {
-                    let record = store.queue_notification(
-                        message_id,
-                        recipient,
-                        NotificationAttemptId::generate(),
-                    )?;
-                    self.publish_change(record.updated_seq, &[MessagesChangedArea::Notifications]);
-                    return Ok(Some(record));
-                }
-                Some(record)
-                    if matches!(
-                        record.state,
-                        NotificationState::Queued | NotificationState::Gating
-                    ) =>
-                {
-                    return Ok(Some(record));
-                }
-                Some(record)
-                    if record.state == NotificationState::Notified
-                        && record.transport == NotificationTransport::DirectPayload =>
-                {
-                    store.mark_delivered_direct(message_id, recipient, record.attempt_id)?;
-                    let seq = store
-                        .projection()
-                        .last_sequence()
-                        .expect("direct restart repair appends a mailbox fact");
-                    self.publish_change(
-                        seq,
-                        &[
-                            MessagesChangedArea::Messages,
-                            MessagesChangedArea::Mailboxes,
-                        ],
-                    );
-                }
-                Some(_) => return Ok(None),
+        let Some(message_id) = Self::first_actionable_notification_message_id(&store, recipient)
+        else {
+            return Ok(None);
+        };
+        match store
+            .projection()
+            .notification(recipient, &message_id)
+            .cloned()
+        {
+            None => {
+                let record = store.queue_notification(
+                    message_id,
+                    recipient,
+                    NotificationAttemptId::generate(),
+                )?;
+                self.publish_change(record.updated_seq, &[MessagesChangedArea::Notifications]);
+                Ok(Some(record))
             }
+            Some(record)
+                if matches!(
+                    record.state,
+                    NotificationState::Queued | NotificationState::Gating
+                ) =>
+            {
+                Ok(Some(record))
+            }
+            Some(_) => Ok(None),
         }
     }
 
@@ -915,34 +888,24 @@ impl MailboxService {
     }
 
     /// Content-free gate records for operational diagnostics.
+    /// The current notification attempt for one message and recipient.
+    pub(crate) fn notification_for_message(
+        &self,
+        recipient: RecipientKey,
+        message_id: &MessageId,
+    ) -> Result<Option<NotificationRecord>, MailboxServiceError> {
+        Ok(self
+            .store()?
+            .projection()
+            .notifications
+            .get(&(recipient, message_id.clone()))
+            .cloned())
+    }
+
     pub(crate) fn gating_notifications(
         &self,
     ) -> Result<Vec<NotificationRecord>, MailboxServiceError> {
         Ok(self.store()?.projection().gating_notifications())
-    }
-
-    /// Doorbells that may arm one exact-attempt reminder timer.
-    pub(crate) fn unclaimed_reminder_candidates(
-        &self,
-    ) -> Result<Vec<NotificationRecord>, MailboxServiceError> {
-        let store = self.store()?;
-        let mut records: Vec<_> = store
-            .projection()
-            .notifications
-            .values()
-            .filter(|record| {
-                record.state == NotificationState::Notified
-                    && record.transport == NotificationTransport::Doorbell
-                    && record.unclaimed_reminder_count == 0
-                    && store
-                        .projection()
-                        .get_entry(record.recipient, &record.message_id)
-                        .is_some_and(|entry| entry.state.is_pending())
-            })
-            .cloned()
-            .collect();
-        records.sort_by_key(|record| record.updated_seq);
-        Ok(records)
     }
 
     /// Exact verify-failed attempts eligible for the operator's opt-in timed
@@ -977,44 +940,6 @@ impl MailboxService {
     ) -> Result<bool, MailboxServiceError> {
         let store = self.store()?;
         Ok(store.projection().force_submit_target_is_pending(target))
-    }
-
-    /// Atomically classify or queue one due reminder under the store lock.
-    pub(crate) fn queue_unclaimed_reminder(
-        &self,
-        attempt_id: NotificationAttemptId,
-    ) -> Result<UnclaimedReminderQueue, MailboxServiceError> {
-        let mut store = self.store()?;
-        let Some(current) = store
-            .projection()
-            .notification_by_attempt(attempt_id)
-            .cloned()
-        else {
-            return Ok(UnclaimedReminderQueue::Obsolete);
-        };
-        let pending = store
-            .projection()
-            .get_entry(current.recipient, &current.message_id)
-            .is_some_and(|entry| entry.state.is_pending());
-        if !pending
-            || current.state != NotificationState::Notified
-            || current.transport != NotificationTransport::Doorbell
-            || current.unclaimed_reminder_count != 0
-        {
-            return Ok(UnclaimedReminderQueue::Obsolete);
-        }
-        if store
-            .projection()
-            .active_notification_barriers
-            .contains_key(&attempt_id)
-        {
-            return Ok(UnclaimedReminderQueue::WaitingForPriorBarrier);
-        }
-        let record = store
-            .queue_unclaimed_reminder(attempt_id)?
-            .expect("eligibility checked under the same store lock");
-        self.publish_change(record.updated_seq, &[MessagesChangedArea::Notifications]);
-        Ok(UnclaimedReminderQueue::Queued(Box::new(record)))
     }
 
     /// Persist one exact reason that a composer barrier no longer applies.

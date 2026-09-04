@@ -4,8 +4,9 @@ use std::str::FromStr;
 use std::sync::Barrier;
 
 use cyclops_proto::{
-    ComposerHold, MessageId, MessagePresentation, NotificationAttemptId, NotificationState,
-    RecipientKey, RecipientPresentation, SessionInstanceId, TmuxPaneId, WorkspaceId,
+    ComposerHold, MessageId, MessagePresentation, NotificationAttemptId,
+    NotificationRouteEvidenceId, NotificationState, RecipientKey, RecipientPresentation,
+    SessionInstanceId, TmuxPaneId, WorkspaceId,
 };
 use cyclops_state::StateRoot;
 
@@ -93,9 +94,23 @@ fn notification_fixture_with_summary(
         recipient,
         attempt_id,
     );
-    let doorbell = cyclops_proto::render_doorbell_v1(&message_id);
-    let handle = DeliveryHandle::for_notification("reviewer", "%1", 0, doorbell, context.clone());
+    let handle = handle_with(&context, "reviewer", "%1", 0);
+    handle.set_attempt_payload(
+        cyclops_proto::render_doorbell_v1(&message_id),
+        Some(NotificationTransport::Doorbell),
+    );
     (NotificationScratch(path), store, context, handle, recipient)
+}
+
+/// A handle for `context` that tests can queue, resolve, or inspect
+/// without touching a pane. The payload starts empty, as in production.
+fn handle_with(
+    context: &NotificationContext,
+    to: &str,
+    pane_id: &str,
+    session_idx: usize,
+) -> Arc<DeliveryHandle> {
+    DeliveryHandle::for_notification(to, pane_id, session_idx, context.clone())
 }
 
 #[test]
@@ -539,7 +554,7 @@ async fn notification_supervisor_wiring_distinguishes_retirement_from_child_loss
         inner
             .engine
             .notification_handle(attempt)
-            .and_then(|current| current.notification.as_ref().map(|n| n.attempt_id())),
+            .map(|current| current.notification.attempt_id()),
         Some(attempt),
         "recovery must keep the same durable attempt identity"
     );
@@ -579,7 +594,8 @@ async fn shutdown_latch_refuses_worker_creation_before_task_drain() {
     let engine = Engine::new();
     let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
     let recipient = churn_recipient(workspace, 900);
-    let handle = DeliveryHandle::new("m-stopping", "worker", "%1", 0, "body".into());
+    let (_scratch, _store, context, _seed, _recipient) = notification_fixture("stopping");
+    let handle = handle_with(&context, "worker", "%1", 0);
     let spawned = Arc::new(AtomicBool::new(false));
 
     engine.begin_stopping();
@@ -597,7 +613,6 @@ async fn shutdown_latch_refuses_worker_creation_before_task_drain() {
     );
     assert!(!spawned.load(Ordering::SeqCst));
     assert!(engine.take_notification_worker_tasks().is_empty());
-    assert!(engine.take_legacy_worker_tasks().is_empty());
 }
 
 #[tokio::test]
@@ -637,16 +652,11 @@ async fn status_worker_ownership_requires_a_live_current_or_queued_attempt() {
 async fn notification_workers_retire_across_recipient_session_churn() {
     let engine = Engine::new();
     let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
+    let (_scratch, _store, context, _seed, _recipient) = notification_fixture("churn");
 
     for ordinal in 0..512 {
         let recipient = churn_recipient(workspace, ordinal);
-        let handle = DeliveryHandle::new(
-            &format!("m-churn-{ordinal}"),
-            "worker",
-            "%1",
-            0,
-            "payload".into(),
-        );
+        let handle = handle_with(&context, "worker", "%1", 0);
         let worker = engine
             .enqueue_notification_worker(recipient, Arc::clone(&handle), |_| test_worker_task())
             .expect("engine is running");
@@ -674,7 +684,8 @@ async fn a_finished_notification_supervisor_stays_faulted_without_losing_its_fif
     let engine = Engine::new();
     let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
     let recipient = churn_recipient(workspace, 700);
-    let first = DeliveryHandle::new("m-worker-first", "worker", "%1", 0, "first".into());
+    let (_scratch, _store, context, _seed, _recipient) = notification_fixture("worker-first");
+    let first = handle_with(&context, "worker", "%1", 0);
     let fail = Arc::new(Notify::new());
     let worker = engine
         .enqueue_notification_worker(recipient, Arc::clone(&first), {
@@ -707,7 +718,7 @@ async fn a_finished_notification_supervisor_stays_faulted_without_losing_its_fif
     .await
     .expect("failed worker task finishes");
 
-    let second = DeliveryHandle::new("m-worker-second", "worker", "%1", 0, "second".into());
+    let second = handle_with(&context, "worker", "%1", 0);
     let refusal = engine
         .enqueue_notification_worker(recipient, Arc::clone(&second), |_| {
             panic!("a failed supervisor must not restart on later traffic")
@@ -764,16 +775,11 @@ async fn enqueue_and_idle_retirement_never_orphan_a_handle() {
     let engine = Arc::new(Engine::new());
     let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
     let runtime = tokio::runtime::Handle::current();
+    let (_scratch, _store, context, _seed, _recipient) = notification_fixture("orphan");
 
     for ordinal in 0..256 {
         let recipient = churn_recipient(workspace, ordinal);
-        let seed = DeliveryHandle::new(
-            &format!("m-seed-{ordinal}"),
-            "worker",
-            "%1",
-            0,
-            "seed".into(),
-        );
+        let seed = handle_with(&context, "worker", "%1", 0);
         let old_worker = engine
             .enqueue_notification_worker(recipient, Arc::clone(&seed), |_| test_worker_task())
             .expect("engine is running");
@@ -781,13 +787,7 @@ async fn enqueue_and_idle_retirement_never_orphan_a_handle() {
         assert_eq!(queued.len(), 1);
         assert!(Arc::ptr_eq(&queued[0], &seed));
 
-        let next = DeliveryHandle::new(
-            &format!("m-next-{ordinal}"),
-            "worker",
-            "%1",
-            0,
-            "next".into(),
-        );
+        let next = handle_with(&context, "worker", "%1", 0);
         let start = Arc::new(Barrier::new(3));
         let producer = tokio::task::spawn_blocking({
             let engine = Arc::clone(&engine);
@@ -852,172 +852,6 @@ async fn enqueue_and_idle_retirement_never_orphan_a_handle() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn legacy_enqueue_and_idle_retirement_never_orphan_a_handle() {
-    let engine = Arc::new(Engine::new());
-
-    for ordinal in 0..256 {
-        let pane = PaneKey::new(ordinal, "%1");
-        let seed = DeliveryHandle::new(
-            &format!("m-legacy-seed-{ordinal}"),
-            "worker",
-            "%1",
-            ordinal,
-            "seed".into(),
-        );
-        let old_worker = engine
-            .with_legacy_worker(
-                pane.clone(),
-                {
-                    let engine = Arc::clone(&engine);
-                    move |_| engine.spawn_descendant_task(std::future::pending())
-                },
-                |worker| {
-                    worker.enqueue_back(Arc::clone(&seed));
-                    Arc::clone(worker)
-                },
-            )
-            .expect("engine is running");
-        let queued = old_worker.drain_pending();
-        assert_eq!(queued.len(), 1);
-        assert!(Arc::ptr_eq(&queued[0], &seed));
-
-        let next = DeliveryHandle::new(
-            &format!("m-legacy-next-{ordinal}"),
-            "worker",
-            "%1",
-            ordinal,
-            "next".into(),
-        );
-        let start = Arc::new(Barrier::new(3));
-        let producer = tokio::task::spawn_blocking({
-            let engine = Arc::clone(&engine);
-            let pane = pane.clone();
-            let start = Arc::clone(&start);
-            let next = Arc::clone(&next);
-            move || {
-                start.wait();
-                let spawn_engine = Arc::clone(&engine);
-                engine
-                    .with_legacy_worker(
-                        pane,
-                        move |_| spawn_engine.spawn_descendant_task(std::future::pending()),
-                        |worker| {
-                            worker.enqueue_back(next);
-                            Arc::clone(worker)
-                        },
-                    )
-                    .expect("engine is running")
-            }
-        });
-        let retirement = tokio::task::spawn_blocking({
-            let engine = Arc::clone(&engine);
-            let pane = pane.clone();
-            let start = Arc::clone(&start);
-            let old_worker = Arc::clone(&old_worker);
-            move || {
-                start.wait();
-                engine.retire_legacy_worker(&pane, &old_worker)
-            }
-        });
-        tokio::task::block_in_place(|| start.wait());
-
-        let producer_worker = producer.await.unwrap();
-        let retired = retirement.await.unwrap();
-        let current_worker = {
-            let entries = engine.workers.lock().expect("workers lock");
-            Arc::clone(&entries.get(&pane).expect("producer leaves a worker").worker)
-        };
-        assert!(Arc::ptr_eq(&current_worker, &producer_worker));
-        assert_eq!(
-            current_worker
-                .state
-                .lock()
-                .expect("worker state lock")
-                .queue
-                .iter()
-                .filter(|queued| Arc::ptr_eq(queued, &next))
-                .count(),
-            1,
-            "concurrent legacy retirement orphaned or duplicated the enqueue"
-        );
-        if retired {
-            assert!(!Arc::ptr_eq(&current_worker, &old_worker));
-        } else {
-            assert!(Arc::ptr_eq(&current_worker, &old_worker));
-        }
-
-        current_worker.drain_pending();
-        assert!(engine.retire_legacy_worker(&pane, &current_worker));
-        assert!(!engine.legacy_worker_is_current(&pane, &current_worker));
-    }
-
-    engine.begin_stopping();
-    engine.wait_for_descendant_tasks().await;
-    assert!(engine.take_legacy_worker_tasks().is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_legacy_worker_loop_retires_its_registry_entry_when_idle() {
-    let path = cyclops_proto::scratch::scratch_dir(&format!(
-        "legacy-worker-retirement-{}",
-        uuid::Uuid::new_v4()
-    ));
-    let _scratch = NotificationScratch(path.clone());
-    let inner = unwritten_test_inner(&path);
-    let pane = PaneKey::new(0, "%1");
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-    let task_inner = Arc::clone(&inner);
-    let task_pane = pane.clone();
-
-    let worker = inner
-        .engine
-        .with_legacy_worker(
-            pane,
-            move |worker| {
-                tokio::spawn(async move {
-                    worker_supervisor(task_inner, task_pane, worker).await;
-                    let _ = done_tx.send(());
-                })
-            },
-            Arc::clone,
-        )
-        .expect("engine is running");
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if inner
-                .engine
-                .workers
-                .lock()
-                .expect("workers lock")
-                .is_empty()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the idle loop removes its exact registry entry");
-    tokio::time::timeout(Duration::from_secs(1), done_rx)
-        .await
-        .expect("registry retirement releases the supervisor")
-        .expect("supervisor completion sender stayed open");
-    assert_eq!(
-        worker
-            .state
-            .lock()
-            .expect("worker state lock")
-            .empty_restarts,
-        0,
-        "normal retirement must not be recovered as worker loss"
-    );
-
-    inner.engine.begin_stopping();
-    inner.engine.wait_for_descendant_tasks().await;
-    assert!(inner.engine.take_legacy_worker_tasks().is_empty());
-}
-
 fn prepare_notification_receipt(context: &NotificationContext) {
     context.record_gating().unwrap();
     context
@@ -1033,16 +867,6 @@ fn prepare_notification_receipt(context: &NotificationContext) {
     context.record_staged().unwrap();
     context.reserve_submit().unwrap();
     context.record_submitted().unwrap();
-}
-
-#[test]
-fn notification_and_direct_handles_have_distinct_projection_owners() {
-    let (_scratch, _store, _context, notification, _recipient) =
-        notification_fixture("projection-owner");
-    let direct = DeliveryHandle::new("m-direct-owner", "reviewer", "%1", 0, "payload".into());
-
-    assert!(!notification.owns_session_delivery_state());
-    assert!(direct.owns_session_delivery_state());
 }
 
 #[test]
@@ -1065,216 +889,44 @@ fn screen_and_hook_receipts_keep_the_canonical_barrier_active() {
 }
 
 #[test]
-fn an_unclaimed_reminder_can_only_select_the_content_free_exact_claim_doorbell() {
-    let (_scratch, store, context, _handle, recipient) =
-        notification_fixture("reminder-content-free");
-    prepare_notification_receipt(&context);
-    let notified = context.record_notified().unwrap();
-    let reminder = {
-        let mut store = store.lock().unwrap();
-        store
-            .retire_notification_barrier(
-                notified.message_id.clone(),
-                recipient,
-                notified.attempt_id,
-                cyclops_proto::NotificationBarrierRetirementCause::ComposerObservedClear,
-                None,
-            )
-            .unwrap();
-        store
-            .queue_unclaimed_reminder(notified.attempt_id)
-            .unwrap()
-            .unwrap()
-    };
-    let reminder_context = NotificationContext::new(
-        Arc::clone(&store),
-        reminder.message_id.clone(),
-        recipient,
-        reminder.attempt_id,
-    );
-    let handle = DeliveryHandle::for_notification(
-        "reviewer",
-        "%1",
-        0,
-        "stale placeholder must be replaced".into(),
-        reminder_context,
-    );
-    let manifest = Manifest::parse(
-        "[agent]\nid = \"fix\"\ndisplay_name = \"Fix\"\nprocess_names = [\"cat\"]\n",
-        Path::new("fix.toml"),
-    )
-    .unwrap();
-
-    let selected = select_attempt_payload(&handle, &manifest, None, None).unwrap();
-    assert_eq!(
-        selected.bytes,
-        cyclops_proto::render_doorbell_v3(reminder.attempt_id)
-    );
-    assert_eq!(selected.transport, Some(NotificationTransport::Doorbell));
-    assert_eq!(
-        selected.doorbell_format,
-        Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM)
-    );
-    assert!(selected.capability.is_none());
-    assert!(!selected.bytes.contains("Review the mailbox"));
-}
-
-#[test]
 fn a_summary_notification_keeps_its_operator_preview_in_a_narrow_pane() {
     let summary = "Yahir needs three jazz songs tonight. Reply with concise recommendations.";
     let (_scratch, _store, context, handle, _recipient) =
         notification_fixture_with_summary("narrow-summary", Some(summary));
-    let manifest = Manifest::parse(
-        "[agent]\nid = \"fix\"\ndisplay_name = \"Fix\"\nprocess_names = [\"cat\"]\n",
-        Path::new("fix.toml"),
-    )
-    .unwrap();
-
-    let selected = select_attempt_payload(&handle, &manifest, None, Some(60)).unwrap();
+    let selected = select_attempt_payload(&handle).unwrap();
 
     assert_eq!(
         selected.bytes,
         cyclops_proto::render_doorbell_v4("admin", summary, context.attempt_id())
     );
-    assert_eq!(selected.transport, Some(NotificationTransport::Doorbell));
     assert_eq!(
         selected.doorbell_format,
-        Some(cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM)
+        cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM
     );
     assert_eq!(
         selected.required_pane_width(),
         None,
         "format 4 may soft-wrap instead of dropping its human-readable summary"
     );
-}
 
-#[test]
-fn mailbox_capability_proof_is_exact_and_binding_scoped() {
-    let scratch = cyclops_proto::scratch::scratch_dir(&format!(
-        "mailbox-capability-{}",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&scratch).unwrap();
-    let capability_file = scratch.join("SKILL.md");
-    std::fs::write(&capability_file, mailbox_capability::SHIPPED_SKILL).unwrap();
-    let manifest = Manifest::parse(
-            &format!(
-                "[agent]\nid = \"fix\"\ndisplay_name = \"Fix\"\n[messaging]\nmailbox_capability_file = {:?}\n",
-                capability_file.to_string_lossy()
-            ),
-            Path::new("fix.toml"),
-        )
-        .unwrap();
-    let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
-    let session = SessionInstanceId::from_str("00000000-0000-4000-8000-000000000002").unwrap();
-    let recipient = RecipientKey::agent(workspace, session, TmuxPaneId::from_str("%1").unwrap());
-    let agent = crate::identity::ProcId { pid: 41, birth: 90 };
-    let proof = select_mailbox_capability(&manifest, recipient, agent, "fix")
-        .expect("canonical skill proves capability");
-    assert!(proof.recheck(recipient, agent, "fix"));
-    assert!(!proof.recheck(
-        recipient,
-        crate::identity::ProcId { pid: 41, birth: 91 },
-        "fix"
-    ));
-    assert!(!proof.recheck(recipient, agent, "replacement"));
-
-    std::fs::write(&capability_file, b"older shipped skill").unwrap();
-    assert!(select_mailbox_capability(&manifest, recipient, agent, "fix").is_none());
-    std::fs::write(&capability_file, b"operator edited this skill").unwrap();
-    assert!(!proof.recheck(recipient, agent, "fix"));
-    std::fs::remove_file(&capability_file).unwrap();
-    assert!(select_mailbox_capability(&manifest, recipient, agent, "fix").is_none());
-    std::fs::create_dir(&capability_file).unwrap();
-    assert!(select_mailbox_capability(&manifest, recipient, agent, "fix").is_none());
-    std::fs::remove_dir_all(&scratch).unwrap();
-}
-
-#[test]
-fn notification_prewrite_refusals_hold_without_a_legacy_terminal_state() {
-    let (_scratch, store, context, notification, recipient) =
-        notification_fixture("prewrite-policy");
-    let direct = DeliveryHandle::new("m-direct-policy", "reviewer", "%1", 0, "payload".into());
-
-    context.record_gating().unwrap();
+    // A message accepted without a summary still writes one exact row:
+    // the daemon derives the preview from the subject, never the body.
+    let (_scratch, _store, context, handle, _recipient) = notification_fixture("derived-summary");
+    let selected = select_attempt_payload(&handle).unwrap();
     assert_eq!(
-        notification_state(&store, recipient, context.message_id()).state,
-        cyclops_proto::NotificationState::Gating
+        selected.bytes,
+        cyclops_proto::render_doorbell_v4("admin", "Wake", context.attempt_id())
     );
-
-    for cause in ["no_such_pane", "pane_dead", "no_manifest", "blocked_quota"] {
-        assert_eq!(
-            workspace_prewrite_hold(&notification, cause).as_deref(),
-            Some(cause)
-        );
-        assert_eq!(workspace_prewrite_hold(&direct, cause), None);
-    }
-    assert_eq!(gate_hold_action(&notification, "blocked_quota"), "wait");
-    assert_eq!(gate_hold_action(&notification, "no_manifest"), "hold");
-    assert_eq!(gate_hold_action(&direct, "blocked_quota"), "hold");
-
-    assert!(workspace_prewrite_failure_is_deferred(
-        &notification,
-        &AttemptFailure::spool_failed()
-    ));
-    assert!(!workspace_prewrite_failure_is_deferred(
-        &notification,
-        &AttemptFailure::verify_failed()
-    ));
-    assert!(!workspace_prewrite_failure_is_deferred(
-        &direct,
-        &AttemptFailure::spool_failed()
-    ));
-}
-
-#[test]
-fn a_notification_bypasses_an_already_parked_legacy_worker() {
-    let (_scratch, _store, _context, notification, _recipient) =
-        notification_fixture("already-parked");
-    let direct = DeliveryHandle::new("m-parked-direct", "reviewer", "%1", 0, "payload".into());
-    let hint = Some("reset tomorrow".to_string());
-
-    assert!(legacy_park_hint(&notification, hint.clone()).is_none());
+    let record = context.current_record().unwrap();
+    let message = context.message_line().unwrap();
+    let mut written = record.clone();
+    written.transport = NotificationTransport::Doorbell;
+    written.doorbell_format = Some(cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM);
     assert_eq!(
-        legacy_park_hint(&direct, hint).as_deref(),
-        Some("reset tomorrow")
+        expected_notification_payload(&written, &message).as_deref(),
+        Some(selected.bytes.as_str()),
+        "recovery rebuilds the same derived row the write boundary selected"
     );
-}
-
-#[test]
-fn a_direct_quota_park_preserves_workspace_notifications_behind_it() {
-    let (_scratch, store, context, notification, recipient) =
-        notification_fixture("queued-behind-park");
-    let first = DeliveryHandle::new("m-parked-first", "reviewer", "%1", 0, "first".into());
-    let last = DeliveryHandle::new("m-parked-last", "reviewer", "%1", 0, "last".into());
-
-    let (direct, workspace) = split_legacy_parked_queue(vec![
-        Arc::clone(&first),
-        Arc::clone(&notification),
-        Arc::clone(&last),
-    ]);
-
-    assert_eq!(
-        direct
-            .iter()
-            .map(|handle| handle.msg_id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["m-parked-first", "m-parked-last"]
-    );
-    assert_eq!(workspace.len(), 1);
-    assert!(Arc::ptr_eq(&workspace[0], &notification));
-    assert_eq!(
-        notification_state(&store, recipient, context.message_id()).state,
-        cyclops_proto::NotificationState::Queued
-    );
-}
-
-#[test]
-fn restart_recovery_skips_workspace_messages_but_keeps_direct_deliveries() {
-    let workspace_ids = HashSet::from(["m-workspace".to_string()]);
-
-    assert!(!legacy_recovery_owns("m-workspace", &workspace_ids));
-    assert!(legacy_recovery_owns("m-direct", &workspace_ids));
 }
 
 fn supersede_notification(
@@ -1323,7 +975,7 @@ fn retry_policy_only_retries_failures_proven_before_the_write() {
         (
             AttemptFailure::paste_command_unwritten(),
             "paste_command_unwritten",
-            true,
+            false,
         ),
         (
             AttemptFailure::composer_ownership_unproven(),
@@ -1417,62 +1069,6 @@ fn retry_policy_only_retries_failures_proven_before_the_write() {
 }
 
 #[test]
-fn capability_loss_refuses_but_a_narrow_doorbell_may_soft_wrap() {
-    let scratch = NotificationScratch(cyclops_proto::scratch::scratch_dir(&format!(
-        "capability-bookend-{}",
-        uuid::Uuid::new_v4()
-    )));
-    std::fs::create_dir_all(&scratch.0).unwrap();
-    let file = scratch.0.join("SKILL.md");
-    std::fs::write(&file, mailbox_capability::SHIPPED_SKILL).unwrap();
-    let workspace = WorkspaceId::from_str("00000000-0000-4000-8000-000000000001").unwrap();
-    let session = SessionInstanceId::from_str("00000000-0000-4000-8000-000000000002").unwrap();
-    let recipient = RecipientKey::agent(workspace, session, TmuxPaneId::from_str("%1").unwrap());
-    let agent = crate::identity::ProcId { pid: 42, birth: 7 };
-    let selected = AttemptPayload {
-        bytes: "doorbell".to_string(),
-        transport: Some(NotificationTransport::Doorbell),
-        doorbell_format: Some(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM),
-        capability: Some(MailboxCapabilityProof {
-            recipient,
-            agent,
-            manifest: "codex".to_string(),
-            file: file.clone(),
-            expected_digest: mailbox_capability::file_digest(&file).unwrap(),
-        }),
-        capability_required: true,
-    };
-    let binding = fusion::Binding {
-        pane_root: crate::identity::ProcId { pid: 40, birth: 5 },
-        leader: crate::identity::ProcId { pid: 41, birth: 6 },
-        agent,
-        manifest: "codex".to_string(),
-    };
-    let narrow = cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH - 1;
-
-    assert_eq!(
-        notification_prewrite_bookend(&selected, Some(recipient), &binding, narrow),
-        None,
-        "operator-visible doorbells may soft-wrap in a narrow pane"
-    );
-    assert_eq!(
-        notification_prewrite_bookend(
-            &selected,
-            Some(recipient),
-            &binding,
-            cyclops_proto::DOORBELL_V3_MIN_PANE_WIDTH,
-        ),
-        None,
-        "an exact current capability passes the prewrite bookend"
-    );
-    std::fs::write(&file, "operator edit").unwrap();
-    assert_eq!(
-        notification_prewrite_bookend(&selected, Some(recipient), &binding, narrow),
-        Some("capability_changed".to_string())
-    );
-}
-
-#[test]
 fn exhausted_prewrite_failures_have_exact_recoverable_causes() {
     let cases = [
         (
@@ -1518,7 +1114,6 @@ fn exhausted_prewrite_failures_have_exact_recoverable_causes() {
     for failure in [
         AttemptFailure::barrier_held(),
         AttemptFailure::from_inject("binding_changed".into()),
-        AttemptFailure::from_inject("capability_changed".into()),
     ] {
         assert!(failure.regate_cause().is_some());
         assert!(failure.pre_write_block.is_none());
@@ -1527,11 +1122,11 @@ fn exhausted_prewrite_failures_have_exact_recoverable_causes() {
 
 #[test]
 fn write_boundary_regates_are_bounded_per_evidence_edge() {
-    let handle = DeliveryHandle::new("m-regate", "worker", "%1", 0, String::new());
+    let (_scratch, _store, _context, handle, _recipient) = notification_fixture("regate");
     assert_eq!(
         regate_action(&handle, RegateCause::BarrierHeld),
-        RegateAction::BlockPreWrite,
-        "a barrier race never gets an automatic retry"
+        RegateAction::Hold,
+        "a held composer waits for its owner, never a retry budget"
     );
     assert_eq!(
         regate_action(&handle, RegateCause::BindingChanged),
@@ -1542,22 +1137,13 @@ fn write_boundary_regates_are_bounded_per_evidence_edge() {
         RegateAction::BlockPreWrite,
         "unchanged binding evidence cannot spin"
     );
-    assert_eq!(
-        regate_action(&handle, RegateCause::CapabilityChanged),
-        RegateAction::ImmediateReproof,
-        "each distinct proof receives one bounded check"
-    );
-    assert_eq!(
-        regate_action(&handle, RegateCause::CapabilityChanged),
-        RegateAction::BlockPreWrite
-    );
 
     let cumulative = handle.state.lock().unwrap().regates;
-    assert_eq!(cumulative, 5);
+    assert_eq!(cumulative, 3);
 
     reset_immediate_regates(&handle);
     assert_eq!(
-        regate_action(&handle, RegateCause::CapabilityChanged),
+        regate_action(&handle, RegateCause::BindingChanged),
         RegateAction::ImmediateReproof,
         "a new pane edge opens one fresh proof"
     );
@@ -1613,19 +1199,6 @@ async fn closed_gate_channels_do_not_become_evidence_or_spin() {
         .is_err(),
         "a closed event channel must remain held until cancellation"
     );
-}
-
-/// Every transition the pipeline can perform must be legal in the
-/// frozen state machine. If the proto table changes, this fails before
-/// any integration test does.
-#[test]
-fn pipeline_transitions_are_legal() {
-    for (from, to) in PIPELINE_TRANSITIONS {
-        assert!(
-            from.can_transition_to(*to),
-            "pipeline performs illegal transition {from:?} -> {to:?}"
-        );
-    }
 }
 
 #[test]
@@ -1733,8 +1306,10 @@ fn a_hook_ack_verifies_the_payload_or_nothing() {
 #[test]
 fn c3_duplicate_exact_dispatch_candidates_confirm_neither() {
     let agent = crate::identity::ProcId { pid: 71, birth: 3 };
+    let (_scratch, _store, context, _seed, _recipient) = notification_fixture("c3-dispatch");
     let candidate = |id: &str| {
-        let handle = DeliveryHandle::new(id, "claude", "%1", 0, "same bytes".into());
+        let handle = handle_with(&context, "claude", "%1", 0);
+        handle.set_attempt_payload("same bytes".into(), Some(NotificationTransport::Doorbell));
         *handle.submitted_agent.lock().expect("submitted agent lock") = Some(agent);
         *handle
             .submitted_manifest
@@ -1810,33 +1385,6 @@ fn empty_body_payload_is_header_plus_hint() {
     assert_eq!(lines[2], "[cyclops:end m-1]");
 }
 
-#[test]
-fn verify_patterns_substitute_split_and_default() {
-    let m = Manifest::parse(
-        r#"
-[agent]
-id = "x"
-display_name = "x"
-[injection]
-verify_pattern = ["<message_id>", "Pasted text"]
-"#,
-        std::path::Path::new("x.toml"),
-    )
-    .unwrap();
-    let (id, other) = verify_patterns(&m, "m-ab12");
-    assert_eq!(id, vec!["m-ab12".to_string()]);
-    assert_eq!(other, vec!["Pasted text".to_string()]);
-
-    let empty = Manifest::parse(
-        "[agent]\nid = \"y\"\ndisplay_name = \"y\"\n",
-        std::path::Path::new("y.toml"),
-    )
-    .unwrap();
-    let (id, other) = verify_patterns(&empty, "m-1");
-    assert_eq!(id, vec!["m-1".to_string()]);
-    assert!(other.is_empty());
-}
-
 /// A manifest carrying the measured composer layout: a box rule then a
 /// status row, each described in plain and escaped form.
 pub(super) fn sentinel_manifest() -> cyclops_manifest::Manifest {
@@ -1868,238 +1416,6 @@ composer_continuation_regex = '^(?P<content>.*)$'
 
 /// The measured chrome block, escaped the way the vendor paints it.
 pub(super) const CHROME: &str = "\u{1b}[90m────────\n\u{1b}[38;5;152mModel x · Ctx: 78%";
-
-/// The failure this unit exists for: a long payload wraps, the leading
-/// id scrolls out of the region, and only the tail is visible.
-#[test]
-fn sentinel_verifies_a_wrapped_payload_whose_id_left_the_region() {
-    let m = sentinel_manifest();
-    let screen = format!(
-        "\u{1b}[39m❯ [cyclops m-3f9c2a] FROM: codex  SUBJECT: long\n\
-             wrapped continuation line one\n\
-             [cyclops:end m-3f9c2a]\n{CHROME}"
-    );
-    assert!(sentinel_verified(&m, &screen, "m-3f9c2a"));
-}
-
-/// Nothing may follow the token that proves nothing follows it.
-///
-/// The bug this pins: the sentinel row was compared after escape
-/// stripping. A torn `ESC [` swallows the rest of the line and a
-/// complete sequence is removed outright, so the sentinel plus any
-/// trailing bytes reduced to the exact token and verified. The
-/// measured row is unstyled, so the raw row itself has to be the
-/// token, with only the terminal's trailing padding removed.
-#[test]
-fn nothing_may_follow_the_terminal_sentinel() {
-    let m = sentinel_manifest();
-    let want = "[cyclops:end m-3f9c2a]";
-    for forged in [
-        // Torn CSI: the forgiving normalizer eats the remainder.
-        format!("{want}\u{1b}["),
-        format!("{want}\u{1b}[38;5and a whole sentence nobody sent"),
-        // Complete CSI, which normalizes away just as cleanly.
-        format!("{want}\u{1b}[0m"),
-        format!("{want}\u{1b}[2K"),
-        format!("{want}\u{1b}[1;5H"),
-        // Operating-system commands, both terminator forms.
-        format!("{want}\u{1b}]8;;http://example.com\u{7}"),
-        format!("{want}\u{1b}]0;title\u{1b}\\"),
-        // A bare ESC, dropped silently by the forgiving version.
-        format!("{want}\u{1b}"),
-        // And plain content, which was always refused.
-        format!("{want} plus a human sentence"),
-        // Whitespace a person can type is content. Only the
-        // terminal's ASCII padding is not.
-        format!("{want}\t"),
-        format!("{want}\u{a0}"),
-        format!("{want}\u{2003}"),
-        // Styling in front of the token is content on this row too:
-        // the measured row is unstyled.
-        format!("\u{1b}[39m{want}"),
-    ] {
-        let screen = format!("\u{1b}[39m❯ body\n{forged}\n{CHROME}");
-        assert!(
-            !sentinel_verified(&m, &screen, "m-3f9c2a"),
-            "must fail closed on {forged:?}"
-        );
-    }
-
-    // The measured shape still verifies: the row is exactly the token,
-    // and the terminal's trailing padding is not content.
-    let screen = format!("\u{1b}[39m❯ body\n{want}   \n{CHROME}");
-    assert!(sentinel_verified(&m, &screen, "m-3f9c2a"));
-}
-
-/// A sentinel split by the terminal edge proves nothing about what else
-/// the capture lost, so it refuses.
-#[test]
-fn truncated_or_wrapped_sentinel_fails_closed() {
-    let m = sentinel_manifest();
-    for tail in [
-        "[cyclops:end m-3f9c",
-        "[cyclops:end\nm-3f9c2a]",
-        "cyclops:end m-3f9c2a]",
-    ] {
-        let screen = format!("\u{1b}[39m❯ body\n{tail}\n{CHROME}");
-        assert!(
-            !sentinel_verified(&m, &screen, "m-3f9c2a"),
-            "must fail closed on {tail:?}"
-        );
-    }
-}
-
-/// Payload after the sentinel means the capture is not the whole story.
-#[test]
-fn payload_after_the_sentinel_fails_closed() {
-    let m = sentinel_manifest();
-    let screen = format!("\u{1b}[39m❯ body\n[cyclops:end m-1]\nstray text\n{CHROME}");
-    assert!(!sentinel_verified(&m, &screen, "m-1"));
-}
-
-/// Two identical sentinels are an ambiguity about which row transport
-/// owns, not a reason to prefer the lower one.
-#[test]
-fn a_duplicate_sentinel_fails_closed() {
-    let m = sentinel_manifest();
-    let screen = format!("\u{1b}[39m❯ body\n[cyclops:end m-1]\n[cyclops:end m-1]\n{CHROME}");
-    assert!(!sentinel_verified(&m, &screen, "m-1"));
-}
-
-/// A blank row after the sentinel is composer content: the sentinel
-/// was not the last thing on the row below. Filtering it away and
-/// accepting the chrome underneath is how a payload gap disappears.
-#[test]
-fn a_blank_row_after_the_sentinel_fails_closed() {
-    let m = sentinel_manifest();
-    for gap in ["\n", "\n\n"] {
-        let screen = format!("\u{1b}[39m❯ body\n[cyclops:end m-1]{gap}\n{CHROME}");
-        assert!(
-            !sentinel_verified(&m, &screen, "m-1"),
-            "blank payload row must refuse: {gap:?}"
-        );
-    }
-}
-
-/// Leading bytes belong to the composer, so the row is not the exact
-/// transport token however familiar it looks.
-#[test]
-fn leading_bytes_before_the_sentinel_fail_closed() {
-    let m = sentinel_manifest();
-    for lead in [" ", "\t", "x "] {
-        let screen = format!("\u{1b}[39m❯ body\n{lead}[cyclops:end m-1]\n{CHROME}");
-        assert!(
-            !sentinel_verified(&m, &screen, "m-1"),
-            "leading {lead:?} must refuse"
-        );
-    }
-}
-
-/// A capture that ends at the sentinel never saw the composer's chrome,
-/// so it never saw the composer. Vacuous truth is not evidence.
-#[test]
-fn a_sentinel_with_nothing_after_it_fails_closed() {
-    let m = sentinel_manifest();
-    assert!(!sentinel_verified(
-        &m,
-        "\u{1b}[39m❯ body\n[cyclops:end m-1]",
-        "m-1"
-    ));
-}
-
-/// A sentinel that scrolled into the transcript has the composer
-/// between it and the chrome, and a composer row claims no layout
-/// entry. Both an empty composer and one holding other text refuse.
-#[test]
-fn a_transcript_echo_of_the_sentinel_never_verifies() {
-    let m = sentinel_manifest();
-    for composer in ["\u{1b}[39m❯ ", "\u{1b}[39m❯ something else"] {
-        let screen = format!("[cyclops:end m-1]\n{composer}\n{CHROME}");
-        assert!(!sentinel_verified(&m, &screen, "m-1"), "{composer:?}");
-    }
-}
-
-/// Chrome-shaped prose inserted before the real chrome must not be
-/// walked past: it is unstyled, so it claims no layout entry.
-#[test]
-fn chrome_shaped_payload_before_the_chrome_fails_closed() {
-    let m = sentinel_manifest();
-    for line in ["Model y · Ctx: 50%", "────────"] {
-        let screen = format!("\u{1b}[39m❯ body\n[cyclops:end m-1]\n{line}\n{CHROME}");
-        assert!(
-            !sentinel_verified(&m, &screen, "m-1"),
-            "unstyled {line:?} must not pass as chrome"
-        );
-    }
-}
-
-/// Order is part of the layout: the status row cannot precede the rule.
-#[test]
-fn chrome_out_of_measured_order_fails_closed() {
-    let m = sentinel_manifest();
-    let screen = "\u{1b}[39m❯ body\n[cyclops:end m-1]\n\u{1b}[38;5;152mModel x · Ctx: 78%\n\u{1b}[90m────────";
-    assert!(!sentinel_verified(&m, screen, "m-1"));
-}
-
-/// Without an escaped capture the styling evidence is absent, so the
-/// answer is refuse rather than guess.
-#[test]
-fn a_plain_capture_never_verifies_the_sentinel() {
-    let m = sentinel_manifest();
-    assert!(!sentinel_verified(
-        &m,
-        "❯ body\n[cyclops:end m-1]\n────────\nModel x · Ctx: 78%",
-        "m-1"
-    ));
-}
-
-/// An unmeasured vendor cannot answer the terminality question at all.
-#[test]
-fn an_undeclared_vendor_never_verifies_by_sentinel() {
-    let bare = cyclops_manifest::Manifest::parse(
-        "[agent]\nid = \"x\"\ndisplay_name = \"x\"\n",
-        std::path::Path::new("x.toml"),
-    )
-    .unwrap();
-    let screen = format!("\u{1b}[39m❯ body\n[cyclops:end m-1]\n{CHROME}");
-    assert!(!sentinel_verified(&bare, &screen, "m-1"));
-}
-
-/// A visible leading id is not evidence: every one of these renders the
-/// header while the tail is missing or malformed, which is what a
-/// truncated paste looks like, and none may verify.
-#[test]
-fn a_visible_leading_id_never_verifies_without_a_sound_sentinel() {
-    let m = sentinel_manifest();
-    let (id, other) = verify_patterns(&m, "m-3f9c2a");
-    let head = "\u{1b}[39m❯ [cyclops m-3f9c2a] FROM: codex  SUBJECT: long";
-    for (name, screen) in [
-        ("missing sentinel", format!("{head}\nbody\n{CHROME}")),
-        (
-            "truncated sentinel",
-            format!("{head}\nbody\n[cyclops:end m-3f9\n{CHROME}"),
-        ),
-        (
-            "payload after sentinel",
-            format!("{head}\nbody\n[cyclops:end m-3f9c2a]\nstray\n{CHROME}"),
-        ),
-        (
-            "no chrome at all",
-            format!("{head}\nbody\n[cyclops:end m-3f9c2a]"),
-        ),
-    ] {
-        assert_eq!(
-            sentinel_representation(&m, &screen, &id, &other, "m-3f9c2a"),
-            None,
-            "{name} must not verify on the leading id"
-        );
-    }
-    let ok = format!("{head}\nbody\n[cyclops:end m-3f9c2a]\n{CHROME}");
-    assert_eq!(
-        sentinel_representation(&m, &ok, &id, &other, "m-3f9c2a"),
-        Some(StagedRepresentation::VisibleTarget)
-    );
-}
 
 /// The chip proof is manifest data plus a composer pin, and it needs
 /// both halves: the row must render as the vendor's chip AND sit on a
@@ -2133,17 +1449,17 @@ composer_trailer_required_prefix = 1
     .unwrap();
     // Staged and unsubmitted: the composer row IS the chip.
     let staged = "transcript\n\u{1b}[39m❯\u{a0}[Pasted text #1]\n? for shortcuts";
-    assert!(marker_in_composer(&m, staged));
+    assert!(collapsed_chip_row(&m, staged).is_some());
     // Submitted: composer cleared, the chip only in the transcript.
     let submitted = "old [Pasted text #1]\n\u{1b}[39m❯\u{a0}\n? for shortcuts";
-    assert!(!marker_in_composer(&m, submitted));
+    assert!(!collapsed_chip_row(&m, submitted).is_some());
     // A manifest with no chip syntax can never pin one.
     let bare = cyclops_manifest::Manifest::parse(
         "[agent]\nid = \"x\"\ndisplay_name = \"x\"\n",
         std::path::Path::new("x.toml"),
     )
     .unwrap();
-    assert!(!marker_in_composer(&bare, staged));
+    assert!(!collapsed_chip_row(&bare, staged).is_some());
 }
 
 #[test]
@@ -2161,15 +1477,6 @@ fn reset_hint_parses_and_stays_short() {
         Some("resets in 135h57m42s")
     );
     assert_eq!(parse_reset_hint("no hint here"), None);
-}
-
-#[test]
-fn mint_ids_are_unique_and_shaped() {
-    let e = Engine::new();
-    let a = e.mint_msg_id();
-    let b = e.mint_msg_id();
-    assert_ne!(a, b);
-    assert!(a.starts_with("m-") && a.len() == 8, "{a}");
 }
 
 // -----------------------------------------------------------------
@@ -2202,33 +1509,6 @@ composer_trailer_required_prefix = 1
 
 fn composer_manifest() -> Manifest {
     Manifest::parse(COMPOSER_MANIFEST, std::path::Path::new("c.toml")).unwrap()
-}
-
-#[test]
-fn stale_generic_pattern_does_not_verify() {
-    let m = composer_manifest();
-    let (id, other) = verify_patterns(&m, "m-new01");
-    // "Pasted text" from a PREVIOUS message sits in the transcript;
-    // the composer is empty. Nothing staged.
-    let screen =
-        "you: [Pasted text #1 +9 lines]\nassistant: done\n\u{1b}[39m❯\u{a0}\n? for shortcuts";
-    assert_eq!(
-        sentinel_representation(&m, screen, &id, &other, "m-new01"),
-        None
-    );
-    // The same chip on the composer line is a recognized representation.
-    let staged = "transcript\n\u{1b}[39m❯\u{a0}[Pasted text #2 +9 lines]\n? for shortcuts";
-    assert_eq!(
-        sentinel_representation(&m, staged, &id, &other, "m-new01"),
-        Some(StagedRepresentation::CollapsedChip)
-    );
-    // A visible id proves the head arrived and nothing more, which is
-    // also what a truncated paste looks like, so it does not verify.
-    let id_anywhere = "transcript\n❯ [cyclops m-new01] hello\n? for shortcuts";
-    assert_eq!(
-        sentinel_representation(&m, id_anywhere, &id, &other, "m-new01"),
-        None
-    );
 }
 
 /// The whole inject path with a mock backend: stale transcript chips
@@ -2393,19 +1673,17 @@ async fn run_unwritten_attempt_arm(
         &|| {
             latch_hold(inner, handle, binding)?;
             let mut unwritten_hold = UnwrittenHold::new(inner, handle, binding);
-            if let Some(notification) = &handle.notification {
-                notification
-                    .record_writing(
-                        ProcessInstanceId::new(binding.pane_root.pid, binding.pane_root.birth)
-                            .unwrap(),
-                        ProcessInstanceId::new(binding.leader.pid, binding.leader.birth).unwrap(),
-                        ProcessInstanceId::new(binding.agent.pid, binding.agent.birth).unwrap(),
-                        &binding.manifest,
-                        NotificationTransport::Doorbell,
-                        None,
-                    )
-                    .map_err(notification_write_cause)?;
-            }
+            handle
+                .notification
+                .record_writing(
+                    ProcessInstanceId::new(binding.pane_root.pid, binding.pane_root.birth).unwrap(),
+                    ProcessInstanceId::new(binding.leader.pid, binding.leader.birth).unwrap(),
+                    ProcessInstanceId::new(binding.agent.pid, binding.agent.birth).unwrap(),
+                    &binding.manifest,
+                    NotificationTransport::Doorbell,
+                    None,
+                )
+                .map_err(notification_write_cause)?;
             handle.write_boundary_crossed.store(true, Ordering::SeqCst);
             unwritten_hold.commit();
             Ok(())
@@ -2431,10 +1709,6 @@ impl MockInjector {
         let screens = self.screens.lock().unwrap();
         let i = self.cursor.fetch_add(1, Ordering::Relaxed);
         screens[i.min(screens.len() - 1)].clone()
-    }
-
-    pub(super) fn submitted_is_empty(&self) -> bool {
-        self.submitted.lock().unwrap().is_empty()
     }
 }
 
@@ -2579,15 +1853,10 @@ fn a_proven_unwritten_paste_restores_a_withdrawable_notification_state() {
     );
     let failure = AttemptFailure::paste_command_unwritten();
     assert_eq!(failure.boundary, WriteBoundary::BeforeWrite);
-    assert!(!should_retry_attempt(&handle, &failure, 0, 3));
-    let direct = DeliveryHandle::new(
-        "m-direct-unwritten",
-        "reviewer",
-        "%1",
-        0,
-        "payload".to_string(),
+    assert!(
+        !should_retry(&failure, 0, 3),
+        "the zero-byte correction stays withdrawable instead of replaying"
     );
-    assert!(should_retry_attempt(&direct, &failure, 0, 3));
 
     let message_id = context.message_id().clone();
     drop(handle);
@@ -2735,34 +2004,6 @@ async fn proven_unwritten_runs_through_attempt_and_retry_disposition() {
             .active_notification_barriers(),
         vec![writing]
     );
-
-    let direct = DeliveryHandle::new(
-        "m-direct-unwritten-production-arm",
-        "reviewer",
-        "%1",
-        0,
-        "payload".into(),
-    );
-    direct.state.lock().unwrap().attempts = 1;
-    assert!(advance(
-        &inner,
-        &direct,
-        &[DeliveryState::Queued],
-        Step::to(DeliveryState::Gating),
-    ));
-    assert!(advance(
-        &inner,
-        &direct,
-        &[DeliveryState::Gating],
-        Step::to(DeliveryState::Pasting),
-    ));
-    let direct_failure = match run_unwritten_attempt_arm(&inner, &direct, &binding).await {
-        AttemptOutcome::Failed(failure) => failure,
-        _ => panic!("direct unwritten paste must be an attempt failure"),
-    };
-    let direct_worker = Worker::new();
-    assert!(fail_attempt(&inner, &direct_worker, &direct, &direct_failure).await);
-    assert_eq!(direct.state(), DeliveryState::RetryQueued);
 }
 
 #[test]
@@ -3103,7 +2344,7 @@ async fn persistent_claimed_stage_settlement_failure_faults_the_exact_fifo_owner
     );
 
     let worker = Arc::new(Worker::new());
-    let follower = DeliveryHandle::new("m-follower", "reviewer", "%1", 0, String::new());
+    let follower = handle_with(&context, "reviewer", "%1", 0);
     worker.enqueue_back(Arc::clone(&handle));
     worker.enqueue_back(follower);
     assert!(Arc::ptr_eq(
@@ -3160,7 +2401,7 @@ async fn failed_prewrite_block_append_keeps_the_exact_fifo_owner() {
         .inject_next_pre_write_block_append_failure();
 
     let worker = Arc::new(Worker::new());
-    let follower = DeliveryHandle::new("m-follower", "reviewer", "%1", 0, String::new());
+    let follower = handle_with(&context, "reviewer", "%1", 0);
     worker.enqueue_back(Arc::clone(&handle));
     worker.enqueue_back(Arc::clone(&follower));
     assert!(Arc::ptr_eq(
@@ -3212,7 +2453,7 @@ async fn failed_readiness_block_append_keeps_the_exact_fifo_owner() {
         .inject_next_pre_write_block_append_failure();
 
     let worker = Arc::new(Worker::new());
-    let follower = DeliveryHandle::new("m-follower", "reviewer", "%1", 0, String::new());
+    let follower = handle_with(&context, "reviewer", "%1", 0);
     worker.enqueue_back(Arc::clone(&handle));
     worker.enqueue_back(Arc::clone(&follower));
     assert!(Arc::ptr_eq(
@@ -3982,8 +3223,8 @@ async fn failed_staging_proof_records_attention_without_retrying_the_paste() {
 #[tokio::test]
 async fn a_refused_write_boundary_never_pastes_and_never_spends_budget() {
     let m = composer_manifest();
-    let handle = DeliveryHandle::new("m-x", "worker", "%1", 0, "payload".into());
-    for cause in ["barrier_held", "binding_changed", "capability_changed"] {
+    let (_scratch, _store, _context, handle, _recipient) = notification_fixture("refused-write");
+    for cause in ["barrier_held", "binding_changed"] {
         let mock = MockInjector::new(vec!["transcript\n\u{1b}[39m❯\u{a0}\n? for shortcuts"]);
         let payload = handle.payload();
         mock.spool(&payload).await.expect("spool");
@@ -3992,7 +3233,7 @@ async fn a_refused_write_boundary_never_pastes_and_never_spends_budget() {
                 &mock,
                 &handle,
                 &m,
-                StagingTarget::Sentinel(&handle.msg_id),
+                StagingTarget::ExactRow(&payload),
                 &payload,
                 &|| Err(cause.to_string())
             )
@@ -4015,155 +3256,6 @@ async fn a_refused_write_boundary_never_pastes_and_never_spends_budget() {
             "{cause} belongs back at the gate, not in the retry budget"
         );
     }
-}
-
-#[tokio::test(start_paused = true)]
-async fn inject_rejects_stale_and_hidden_staging() {
-    let m = composer_manifest();
-    let handle = DeliveryHandle::new("m-new01", "worker", "%1", 0, "payload".into());
-
-    let stale = "you: [Pasted text #1 +9 lines]\nold turn\n\u{1b}[39m❯\u{a0}\n? for shortcuts";
-    let mock = MockInjector::new(vec![stale]);
-    let payload = handle.payload();
-    mock.spool(&payload).await.expect("spool");
-    assert_eq!(
-        inject(
-            &mock,
-            &handle,
-            &m,
-            StagingTarget::Sentinel(&handle.msg_id),
-            &payload,
-            &|| Ok(())
-        )
-        .await,
-        Err(InjectFailure::Other("verify_failed".to_string()))
-    );
-    assert_eq!(mock.pasted.lock().unwrap().len(), 1, "payload was pasted");
-
-    let staged = "transcript\n\u{1b}[39m❯\u{a0}[Pasted text #2 +9 lines]\n? for shortcuts";
-    let mock = MockInjector::new(vec![stale, staged]);
-    mock.spool(&payload).await.expect("spool");
-    assert_eq!(
-        inject(
-            &mock,
-            &handle,
-            &m,
-            StagingTarget::Sentinel(&handle.msg_id),
-            &payload,
-            &|| Ok(()),
-        )
-        .await,
-        Err(InjectFailure::Other("verify_failed".to_string()))
-    );
-    assert_eq!(mock.pasted.lock().unwrap().len(), 1, "payload was pasted");
-    assert!(mock.submitted_is_empty());
-}
-
-/// The shipped codex manifest, parsed as data for the two tests below:
-/// its only composer discriminators are `line_regex_esc` clauses, on
-/// purpose (a plain capture cannot tell its ghost text from typed
-/// text).
-fn codex_manifest() -> Manifest {
-    let m = Manifest::parse(
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../resources/manifests/codex.toml"
-        )),
-        std::path::Path::new("codex.toml"),
-    )
-    .expect("shipped codex manifest parses");
-    assert!(m.has_escaped_rules(), "codex discriminates by SGR");
-    m
-}
-
-/// Lines as codex-cli 0.147.0 actually draws them, captured from a
-/// live pane on 2026-08-17 (the full screens are
-/// cyclops-manifest/tests/fixtures/codex_pasted_chip_*). The chip is
-/// COLORED and the transcript glyph is bold-DIM where the composer's
-/// is bold-only; both facts decide the assertions below, and an
-/// invented approximation of either passed while the real thing
-/// failed.
-const CODEX_COMPOSER_CHIP: &str =
-    "\u{1b}[1m›\u{1b}[0m \u{1b}[38;5;6m[Pasted Content 2828 chars]\u{1b}[39m";
-const CODEX_COMPOSER_GHOST: &str = "\u{1b}[1m›\u{1b}[0m \u{1b}[2mSummarize recent commits\u{1b}[0m";
-/// The measured composer trailer below that chip, from the same
-/// capture: a blank row, then the model row. Both are painted every
-/// time, and they are what proves the chip is the last thing in the
-/// composer rather than merely present in it.
-const CODEX_TRAILER: &str = "\n\n  \u{1b}[38;2;246;226;183mgpt-5.6-sol high\u{1b}[39m · /tmp/x";
-const CODEX_TRANSCRIPT_LINE: &str =
-    "\u{1b}[1;2m›  \u{1b}[0m[cyclops m-diag01] FROM: tester  SUBJECT: verify chip rendering";
-
-/// The field failure this fixes, pinned on the shipped manifest and
-/// real captures: a message long enough to collapse renders as a
-/// "[Pasted Content N chars]" chip that hides the id, so the generic
-/// "Pasted" tier is the only staging evidence left. That tier
-/// pins the marker to the composer line, which for codex is
-/// recognizable only in an escaped capture. Every verify re-read
-/// failed, verify_before_submit withheld Enter, and the payload sat
-/// staged in the recipient's composer behind "outcome unknown".
-#[test]
-fn codex_collapsed_paste_verifies_through_the_escaped_composer_line() {
-    let m = codex_manifest();
-    let (id, other) = verify_patterns(&m, "m-jean01");
-
-    let staged = format!("transcript above\n{CODEX_COMPOSER_CHIP}{CODEX_TRAILER}");
-    assert_eq!(
-        sentinel_representation(&m, &staged, &id, &other, "m-x"),
-        Some(StagedRepresentation::CollapsedChip)
-    );
-
-    // A chip in the TRANSCRIPT (bold-dim glyph) over an empty
-    // composer: an earlier message, already submitted. Nothing staged.
-    let stale = format!(
-        "\u{1b}[1;2m›  \u{1b}[0m[Pasted Content 900 chars]\n{CODEX_COMPOSER_GHOST}{CODEX_TRAILER}"
-    );
-    assert_eq!(
-        sentinel_representation(&m, &stale, &id, &other, "m-x"),
-        None
-    );
-
-    // A short message renders literally: the id proves it anywhere in
-    // the region, chip or no chip.
-    // A short message renders literally, so its sentinel is on screen
-    // and is what verifies it: the id alone never does. The status row
-    // below it must arrive PAINTED, which is what separates the real
-    // chrome from prose shaped like it.
-    // Codex paints a blank separator between the composer and status.
-    let literal = format!(
-            "{CODEX_TRANSCRIPT_LINE}\n\u{1b}[1m›\u{1b}[0m [cyclops m-jean01] hello\n[cyclops:end m-jean01]\n\n  \u{1b}[38;2;246;226;183mgpt-5.6-sol high\u{1b}[39m · /tmp/x"
-        );
-    assert_eq!(
-        sentinel_representation(&m, &literal, &id, &other, "m-jean01"),
-        Some(StagedRepresentation::VisibleTarget)
-    );
-}
-
-/// A collapsed chip confirms representation, not exact composer bytes.
-/// The inject path must withhold Enter even when the escaped capture
-/// proves the chip belongs to the active composer.
-#[tokio::test(start_paused = true)]
-async fn inject_refuses_codex_collapse_without_exact_ownership() {
-    let m = codex_manifest();
-    let handle = DeliveryHandle::new("m-jean01", "codex", "%1", 0, "payload".into());
-    let staged = format!("transcript above\n{CODEX_COMPOSER_CHIP}{CODEX_TRAILER}");
-    let mock = MockInjector::new(vec![staged.as_str()]);
-    let payload = handle.payload();
-    mock.spool(&payload).await.expect("spool");
-    assert_eq!(
-        inject(
-            &mock,
-            &handle,
-            &m,
-            StagingTarget::Sentinel(&handle.msg_id),
-            &payload,
-            &|| Ok(()),
-        )
-        .await,
-        Err(InjectFailure::Other("verify_failed".to_string()))
-    );
-    assert_eq!(mock.pasted.lock().unwrap().len(), 1);
-    assert!(mock.submitted_is_empty());
 }
 
 // -----------------------------------------------------------------
@@ -4222,7 +3314,8 @@ fn tier2_changed_window_alone_needs_the_id_staged() {
 
 #[test]
 fn working_evidence_must_follow_submit_for_the_exact_session_and_binding() {
-    let handle = DeliveryHandle::new("m-state-evidence", "worker", "%1", 3, "payload".into());
+    let (_scratch, _store, context, _seed, _recipient) = notification_fixture("state-evidence");
+    let handle = handle_with(&context, "worker", "%1", 3);
     let agent = crate::identity::ProcId {
         pid: 4242,
         birth: 818_221,
@@ -4269,27 +3362,25 @@ fn working_evidence_must_follow_submit_for_the_exact_session_and_binding() {
         &handle
     ));
 
-    // The composed pane wait uses the same gate on its fresh live
-    // receiver. A confirmed Working edge from an earlier submit or a
-    // replacement process must not turn a later Idle into success.
-    assert!(!wait_working_event_is_eligible(
+    // A confirmed Working edge from an earlier submit or a replacement
+    // process is not this notification's turn evidence.
+    assert!(!submitted_working_state_event(
         &event(3, 999, agent.birth, true).expect("event"),
-        Some(&handle)
+        &handle
     ));
-    assert!(!wait_working_event_is_eligible(
+    assert!(!submitted_working_state_event(
         &event(3, 1_000, agent.birth + 1, true).expect("event"),
-        Some(&handle)
+        &handle
     ));
-    assert!(wait_working_event_is_eligible(
+    assert!(submitted_working_state_event(
         &event(3, 1_000, agent.birth, true).expect("event"),
-        Some(&handle)
+        &handle
     ));
 
-    // Standalone waits do not inherit a delivery identity; their outer
-    // loop has already selected the requested pane and session.
-    assert!(wait_working_event_is_eligible(
-        &event(2, 999, agent.birth + 1, true).expect("event"),
-        None
+    // `agent.wait` inherits no notification identity; its outer loop has
+    // already selected the requested pane and session.
+    assert!(confirmed_working_state_event(
+        &event(2, 999, agent.birth + 1, true).expect("event")
     ));
 }
 
@@ -4299,7 +3390,8 @@ fn buffered_working_evidence_survives_a_screen_checkpoint_race() {
     // watcher published a matching Working fact, and a screen checkpoint
     // is ready before the normal receipt loop reads that fact. The
     // checkpoint must not erase the turn evidence needed by `turn_ended`.
-    let handle = DeliveryHandle::new("m-buffered-working", "worker", "%1", 3, "payload".into());
+    let (_scratch, _store, context, _seed, _recipient) = notification_fixture("buffered-working");
+    let handle = handle_with(&context, "worker", "%1", 3);
     let agent = crate::identity::ProcId {
         pid: 4242,
         birth: 818_221,
@@ -4664,26 +3756,6 @@ fn a_receipt_calls_a_delivery_queued_only_before_the_paste() {
     }
 }
 
-#[test]
-fn only_the_position_zero_head_can_recover_a_hold_token() {
-    assert_eq!(
-        held_by_for_position(None, None, Some("working".into())),
-        None
-    );
-    assert_eq!(
-        held_by_for_position(Some(1), None, Some("working".into())),
-        None
-    );
-    assert_eq!(
-        held_by_for_position(Some(0), None, Some("working".into())),
-        Some("working".into())
-    );
-    assert_eq!(
-        held_by_for_position(Some(0), Some("blocked".into()), Some("working".into())),
-        Some("blocked".into())
-    );
-}
-
 // -----------------------------------------------------------------
 // Decline TOCTOU (fix G: modal must still match before the confirm)
 // -----------------------------------------------------------------
@@ -4816,7 +3888,10 @@ composer_trailer_required_prefix = 1
     fn a_chip_with_text_around_it_is_not_a_chip() {
         let m = chip_manifest();
         let good = "\u{1b}[39m❯\u{a0}[Pasted text #1 +8 lines]\n? for shortcuts";
-        assert!(marker_in_composer(&m, good), "the measured row must pass");
+        assert!(
+            collapsed_chip_row(&m, good).is_some(),
+            "the measured row must pass"
+        );
 
         for bad in [
             "\u{1b}[39m❯\u{a0}[Pasted text #1 +8 lines] and then some",
@@ -4824,7 +3899,7 @@ composer_trailer_required_prefix = 1
         ] {
             let screen = format!("{bad}\n? for shortcuts");
             assert!(
-                !marker_in_composer(&m, &screen),
+                !collapsed_chip_row(&m, &screen).is_some(),
                 "payload beside the chip must refuse: {bad:?}"
             );
         }
@@ -4834,7 +3909,7 @@ composer_trailer_required_prefix = 1
         // thing in the composer.
         let after = "\u{1b}[39m❯\u{a0}[Pasted text #1 +8 lines]\nand then some\n? for shortcuts";
         assert!(
-            !marker_in_composer(&m, after),
+            !collapsed_chip_row(&m, after).is_some(),
             "a row under the chip must refuse"
         );
     }
@@ -4852,7 +3927,7 @@ composer_trailer_required_prefix = 1
         ] {
             let screen = format!("{row}\n? for shortcuts");
             assert!(
-                !marker_in_composer(&m, &screen),
+                !collapsed_chip_row(&m, &screen).is_some(),
                 "a subject is not a chip: {row:?}"
             );
         }
@@ -4863,17 +3938,14 @@ composer_trailer_required_prefix = 1
     fn a_transcript_echo_of_a_chip_never_verifies() {
         let m = chip_manifest();
         let echo = "you: [Pasted text #1 +8 lines]\n\u{1b}[39m❯\u{a0}\n? for shortcuts";
-        assert!(!marker_in_composer(&m, echo));
+        assert!(!collapsed_chip_row(&m, echo).is_some());
     }
 
     /// Without an escaped capture the styling half cannot be checked.
     #[test]
     fn a_plain_capture_never_proves_a_chip() {
         let m = chip_manifest();
-        assert!(!marker_in_composer(
-            &m,
-            "❯ [Pasted text #1 +8 lines]\n? for shortcuts"
-        ));
+        assert!(!collapsed_chip_row(&m, "❯ [Pasted text #1 +8 lines]\n? for shortcuts").is_some());
     }
 }
 
@@ -4894,17 +3966,6 @@ mod shipped_chip_proof {
         .expect("shipped claude manifest parses")
     }
 
-    fn codex() -> Manifest {
-        Manifest::parse(
-            include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../resources/manifests/codex.toml"
-            )),
-            std::path::Path::new("codex.toml"),
-        )
-        .expect("shipped codex manifest parses")
-    }
-
     /// Codex paints a blank row between the composer and its model status
     /// row, so a raw-wrapped sentinel's suffix starts with a row the
     /// layout has to describe. It did not, and every raw-wrapped codex
@@ -4913,38 +3974,6 @@ mod shipped_chip_proof {
     ///
     /// The chrome here is verbatim from a real capture. The composer row
     /// is synthetic, so this proves only the declared trailer layout.
-    #[test]
-    fn a_codex_raw_wrap_verifies_through_its_measured_blank_separator() {
-        let real = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../cyclops-manifest/tests/fixtures/codex_pasted_chip_esc.txt"
-        ));
-        let mut rows: Vec<String> = real.split('\n').map(str::to_string).collect();
-        let chip = rows
-            .iter()
-            .position(|r| r.contains("[Pasted Content"))
-            .expect("the real capture's composer row");
-        // A raw wrap puts the payload in the composer instead of a chip,
-        // and the sentinel is its last row.
-        rows[chip] = "\u{1b}[1m›\u{1b}[0m the last line of the body".to_string();
-        rows.insert(chip + 1, sentinel_for("m-9f1"));
-        let screen = rows.join("\n");
-        assert!(
-            sentinel_verified(&codex(), &screen, "m-9f1"),
-            "the shipped codex layout still refuses its own chrome:\n{screen}"
-        );
-
-        // The blank row is declared, not ignored. A SECOND blank is a row
-        // the layout does not describe, which is what a truncated capture
-        // looks like, and it still refuses.
-        let mut extra = rows.clone();
-        extra.insert(chip + 2, String::new());
-        assert!(
-            !sentinel_verified(&codex(), &extra.join("\n"), "m-9f1"),
-            "an undeclared blank row was accepted"
-        );
-    }
-
     /// The shipped manifest against real captures, through the production
     /// proof rather than an inline fixture shaped to suit it.
     ///
@@ -4960,7 +3989,7 @@ mod shipped_chip_proof {
             "/../cyclops-manifest/tests/fixtures/claude_pasted_chip_esc.txt"
         ));
         assert!(
-            marker_in_composer(&m, staged),
+            collapsed_chip_row(&m, staged).is_some(),
             "the shipped chip row must prove a staged paste"
         );
 
@@ -4972,7 +4001,7 @@ mod shipped_chip_proof {
             "/../cyclops-manifest/tests/fixtures/claude_prompt_echo_esc.txt"
         ));
         assert!(
-            !marker_in_composer(&m, echo),
+            !collapsed_chip_row(&m, echo).is_some(),
             "an echo with no composer chip must not verify"
         );
 
@@ -4984,7 +4013,7 @@ mod shipped_chip_proof {
             env!("CARGO_MANIFEST_DIR"),
             "/../cyclops-manifest/tests/fixtures/claude_prompt_echo_plain.txt"
         ));
-        assert!(!marker_in_composer(&m, echo_plain));
+        assert!(!collapsed_chip_row(&m, echo_plain).is_some());
     }
 
     /// The halves disagreeing is the case an OR cannot survive: the chip
@@ -5020,7 +4049,7 @@ composer_trailer_required_prefix = 1
         .unwrap();
         let row = "\u{1b}[39m❯\u{a0}[Pasted text #1]";
         assert!(
-            !marker_in_composer(&m, row),
+            !collapsed_chip_row(&m, row).is_some(),
             "one satisfied clause is not the rule the manifest wrote"
         );
     }
@@ -5039,7 +4068,7 @@ composer_trailer_required_prefix = 1
             env!("CARGO_MANIFEST_DIR"),
             "/../cyclops-manifest/tests/fixtures/claude_pasted_chip_esc.txt"
         ));
-        assert!(marker_in_composer(&claude(), staged), "baseline");
+        assert!(collapsed_chip_row(&claude(), staged).is_some(), "baseline");
 
         let shipped = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -5065,7 +4094,7 @@ composer_trailer_required_prefix = 1
             let m = Manifest::parse(&broken, std::path::Path::new("claude.toml"))
                 .expect("broken manifest still parses");
             assert!(
-                !marker_in_composer(&m, staged),
+                !collapsed_chip_row(&m, staged).is_some(),
                 "breaking the shipped {half} clause must refuse the chip"
             );
         }
@@ -5517,40 +4546,6 @@ composer_trailer_required_prefix = 1
         );
     }
 
-    #[tokio::test]
-    async fn collapsed_chip_stops_the_delivery_before_submit() {
-        let manifest = claude();
-        let staged = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../cyclops-manifest/tests/fixtures/claude_pasted_chip_esc.txt"
-        ));
-        let handle = DeliveryHandle::new("m-chip-no-submit", "claude", "%1", 0, String::new());
-        let message_id = MessageId::new(&handle.msg_id).expect("valid message id");
-        let doorbell = cyclops_proto::render_doorbell_v1(&message_id);
-        let injector = MockInjector::new(vec![staged]);
-        injector.spool(&doorbell).await.expect("spool");
-
-        let result = inject(
-            &injector,
-            &handle,
-            &manifest,
-            StagingTarget::ExactRow(&doorbell),
-            &doorbell,
-            &|| Ok(()),
-        )
-        .await;
-
-        assert_eq!(
-            result.unwrap_err(),
-            InjectFailure::Other("verify_failed".to_string())
-        );
-        assert_eq!(injector.pasted.lock().unwrap().as_slice(), &[doorbell]);
-        assert!(
-            injector.submitted_is_empty(),
-            "representation evidence must not reach the submit key"
-        );
-    }
-
     #[test]
     fn human_draft_in_composer_refuses_verification() {
         let m = sentinel_manifest();
@@ -5661,7 +4656,7 @@ composer_trailer_required_prefix = 1
     #[tokio::test]
     async fn inject_verifies_exact_row_target() {
         let m = sentinel_manifest();
-        let handle = DeliveryHandle::new("m-exact01", "worker", "%1", 0, "payload".into());
+        let (_scratch, _store, _context, handle, _recipient) = notification_fixture("exact01");
         let msg_id = MessageId::new(&handle.msg_id).expect("valid message id");
         let doorbell = cyclops_proto::render_doorbell_v1(&msg_id);
         let screen = format!("\u{1b}[39m❯ {doorbell}\n{CHROME}");
@@ -5821,9 +4816,6 @@ composer_trailer_required_prefix = 1
 mod composer_content_proof {
     use super::*;
 
-    const PROBE_BODY: &str = "This is a deliberately long composer-only probe that wraps across physical terminal rows without being submitted to any model, and it contains punctuation: [] {} <> ! ? plus Unicode λ 漢字.";
-    const CLAUDE_TRAILER: &str = "\u{1b}[38;5;244m────────────────────────────────────────────────────────────────────────────────\n\u{1b}[39m  \u{1b}[38;5;174mOpus 5 (1M context)\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;216mxhigh\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;230m/tmp/project\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;181m5h: 92%\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;181m7d: 36%\u{1b}[38;5;246m \u{1b}[2m·\u{1b}[0m\u{1b}[38;5;246m \u{1b}[38;5;180m1000K window\u{1b}[39m";
-
     fn decoded_fixture(hex: &str) -> String {
         let compact: String = hex
             .chars()
@@ -5864,47 +4856,6 @@ mod composer_content_proof {
             _ => panic!("unknown shipped manifest {id}"),
         };
         Manifest::parse(source, std::path::Path::new(id)).expect("shipped manifest parses")
-    }
-
-    fn claude_capture(payload: &str) -> String {
-        let mut rows = payload.lines();
-        let first = rows.next().expect("payload has an envelope");
-        let mut screen = format!("\u{1b}[39m❯\u{a0}{first}");
-        for row in rows {
-            screen.push_str("\n  ");
-            screen.push_str(row);
-        }
-        screen.push('\n');
-        screen.push_str(CLAUDE_TRAILER);
-        screen
-    }
-
-    #[test]
-    fn current_raw_captures_extract_the_rebuilt_payload() {
-        let expected = render_payload("m-wrapprobe", "test", "exact wrap probe", PROBE_BODY, true);
-        for (vendor, capture) in [
-            (
-                "claude",
-                include_str!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../cyclops-manifest/tests/fixtures/claude_raw_composer_2_1_239_esc.txt"
-                ))
-                .to_string(),
-            ),
-            (
-                "codex",
-                decoded_fixture(include_str!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../cyclops-manifest/tests/fixtures/codex_raw_composer_0_149_0_esc.hex"
-                ))),
-            ),
-        ] {
-            assert_eq!(
-                composer_content_from_joined_capture(&shipped(vendor), &capture, "m-wrapprobe"),
-                ComposerContentProof::Visible(expected.clone()),
-                "{vendor} did not reconstruct the rendered payload"
-            );
-        }
     }
 
     /// AGY 1.1.21 keeps a compact doorbell visible as one prompt row. The
@@ -5999,19 +4950,6 @@ mod composer_content_proof {
     }
 
     #[test]
-    fn current_raw_claude_capture_is_safe_to_submit() {
-        let capture = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../cyclops-manifest/tests/fixtures/claude_raw_composer_2_1_239_esc.txt"
-        ));
-        assert!(sentinel_verified(
-            &shipped("claude"),
-            capture,
-            "m-wrapprobe"
-        ));
-    }
-
-    #[test]
     fn claude_current_fable_empty_composer_is_visible_across_box_palette() {
         let capture = concat!(
             "\u{1b}[38;5;244m────────────────────────────────────────────────\n",
@@ -6042,7 +4980,7 @@ mod composer_content_proof {
     }
 
     #[test]
-    fn claude_2_1_243_no_color_visible_sentinel_uses_structural_proof() {
+    fn claude_2_1_243_no_color_doorbell_is_exact() {
         let capture = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../cyclops-manifest/tests/fixtures/claude_staged_no_color_2_1_243.txt"
@@ -6051,10 +4989,6 @@ mod composer_content_proof {
         assert!(
             !capture.contains('\u{1b}'),
             "fixture unexpectedly contains SGR"
-        );
-        assert_eq!(
-            staged_representation(&manifest, capture, StagingTarget::Sentinel("m-no-color")),
-            Some(StagedRepresentation::VisibleTarget)
         );
 
         let doorbell_id = MessageId::new("m-no-color").expect("valid message id");
@@ -6095,31 +5029,6 @@ mod composer_content_proof {
             exact_composer_content_from_joined_capture(&manifest, &doorbell_after_echo),
             ComposerContentProof::Visible(doorbell)
         );
-
-        for invalid in [
-            capture.replace(
-                "  [cyclops:end m-no-color]\n",
-                "  [cyclops:end m-no-color]\n  typed after the sentinel\n",
-            ),
-            capture.replace(
-                "  [cyclops:end m-no-color]",
-                "  [cyclops:end m-no-color] trailing",
-            ),
-            capture.replace(
-                "  [cyclops:end m-no-color]\n",
-                "  [cyclops:end m-no-color]\n  [cyclops:end m-no-color]\n",
-            ),
-            capture.replace(
-                "  [cyclops:end m-no-color]\n",
-                concat!(
-                    "  [cyclops:end m-no-color]\n",
-                    "────────────────────────────────────────────────────────────────\n",
-                    "❯\u{a0}\n",
-                ),
-            ),
-        ] {
-            assert!(!sentinel_verified(&manifest, &invalid, "m-no-color"));
-        }
     }
 
     #[test]
@@ -6279,92 +5188,6 @@ mod composer_content_proof {
     }
 
     #[test]
-    fn no_color_trailer_does_not_hide_content_after_the_sentinel() {
-        let capture = concat!(
-            "❯\u{a0}[cyclops m-no-color] FROM: cyclopsd  SUBJECT: hook self-test\n",
-            "  [cyclops:end m-no-color]\n",
-            "  typed after the sentinel\n",
-            "────────────────────────────────────────────────────────────────\n",
-            "  Sonnet 5 · xhigh · ~ · 5h: 98% · 7d: 91% · 1000K window\n",
-        );
-        assert!(!sentinel_verified(
-            &shipped("claude"),
-            capture,
-            "m-no-color"
-        ));
-
-        let forged_boundary = concat!(
-            "❯\u{a0}[cyclops m-no-color] FROM: cyclopsd  SUBJECT: hook self-test\n",
-            "  [cyclops:end m-no-color]\n",
-            "  ──────────────────────────────────────────────────────────────\n",
-            "  Sonnet 5 · xhigh · ~ · 5h: 98% · 7d: 91% · 1000K window\n",
-        );
-        assert!(!sentinel_verified(
-            &shipped("claude"),
-            forged_boundary,
-            "m-no-color"
-        ));
-    }
-
-    #[test]
-    fn joined_capture_preserves_payload_trailing_spaces() {
-        let expected = render_payload("m-space", "test", "spaces", "body", true);
-        let edited_capture = claude_capture(&expected).replace(
-            "  body\n  [cyclops:end m-space]",
-            "  body \n  [cyclops:end m-space]",
-        );
-        let edited_payload = expected.replace("body\n", "body \n");
-        assert_eq!(
-            composer_content_from_joined_capture(&shipped("claude"), &edited_capture, "m-space"),
-            ComposerContentProof::Visible(edited_payload)
-        );
-
-        let edited_sentinel = claude_capture(&expected)
-            .replace("  [cyclops:end m-space]\n", "  [cyclops:end m-space] \n");
-        assert_eq!(
-            composer_content_from_joined_capture(&shipped("claude"), &edited_sentinel, "m-space"),
-            ComposerContentProof::Unprovable
-        );
-    }
-
-    #[test]
-    fn direct_staging_requires_the_reconstructed_payload_bytes() {
-        let manifest = shipped("claude");
-        let expected = render_payload("m-exact", "test", "subject", "body", true);
-        let exact = claude_capture(&expected);
-        assert_eq!(
-            exact_staging_proof(
-                &manifest,
-                &exact,
-                StagingTarget::Sentinel("m-exact"),
-                &expected,
-            ),
-            Some((true, expected.clone()))
-        );
-
-        let prefixed = exact.replace(
-            "  body\n  [cyclops:end m-exact]",
-            "  human draft\n  body\n  [cyclops:end m-exact]",
-        );
-        assert!(exact_staging_proof(
-            &manifest,
-            &prefixed,
-            StagingTarget::Sentinel("m-exact"),
-            &expected,
-        )
-        .is_none());
-
-        let trailing = exact.replace("  [cyclops:end m-exact]\n", "  [cyclops:end m-exact] \n");
-        assert!(exact_staging_proof(
-            &manifest,
-            &trailing,
-            StagingTarget::Sentinel("m-exact"),
-            &expected,
-        )
-        .is_none());
-    }
-
-    #[test]
     fn codex_hex_fixtures_preserve_measured_trailing_cells() {
         let raw = decoded_fixture(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -6380,119 +5203,6 @@ mod composer_content_proof {
         assert_eq!(raw_rows[4], " ");
         assert!(collapsed_rows[0].ends_with(' '));
         assert!(collapsed_rows[2].ends_with(' '));
-    }
-
-    #[test]
-    fn prompt_may_be_outside_the_sentinel_search_window() {
-        let body = (0..24)
-            .map(|line| format!("body line {line:02}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let expected = render_payload("m-long", "test", "long", &body, true);
-        let capture = claude_capture(&expected);
-        let prompt_at = composer_rows(&capture)
-            .iter()
-            .position(|(_, plain)| plain.starts_with("❯"))
-            .expect("prompt row");
-        assert!(
-            composer_rows(&capture).len() - prompt_at > VERIFY_REGION,
-            "fixture did not put the prompt outside the search window"
-        );
-        assert_eq!(
-            composer_content_from_joined_capture(&shipped("claude"), &capture, "m-long"),
-            ComposerContentProof::Visible(expected)
-        );
-    }
-
-    #[test]
-    fn terminal_composer_wins_over_a_prior_transcript_echo() {
-        let expected = render_payload("m-echo", "test", "current", "new body", true);
-        let active = claude_capture(&expected);
-        let echoed = format!(
-            "\u{1b}[38;5;239m\u{1b}[48;5;237m❯ \u{1b}[38;5;231m[cyclops m-echo] FROM: test  SUBJECT: old\u{1b}[39m\n  old body\n  [cyclops:end m-echo]\nassistant response\n{active}"
-        );
-        assert_eq!(
-            composer_content_from_joined_capture(&shipped("claude"), &echoed, "m-echo"),
-            ComposerContentProof::Visible(expected),
-            "the unique terminal trailer must bind the active composer"
-        );
-
-        let empty_composer = format!(
-            "\u{1b}[38;5;239m\u{1b}[48;5;237m❯ \u{1b}[38;5;231m[cyclops m-echo] FROM: test  SUBJECT: old\u{1b}[39m\n  old body\n  [cyclops:end m-echo]\nassistant response\n\u{1b}[39m❯\u{a0}\n{CLAUDE_TRAILER}"
-        );
-        assert_eq!(
-            composer_content_from_joined_capture(&shipped("claude"), &empty_composer, "m-echo"),
-            ComposerContentProof::Unprovable
-        );
-    }
-
-    #[test]
-    fn repeated_sentinel_and_trailing_content_refuse() {
-        let repeated = render_payload(
-            "m-repeat",
-            "test",
-            "quoted sentinel",
-            "before\n[cyclops:end m-repeat]\nafter",
-            true,
-        );
-        assert_eq!(
-            composer_content_from_joined_capture(
-                &shipped("claude"),
-                &claude_capture(&repeated),
-                "m-repeat"
-            ),
-            ComposerContentProof::Unprovable
-        );
-
-        let expected = render_payload("m-trail", "test", "trailing", "body", true);
-        let capture = claude_capture(&expected).replace(
-            "  [cyclops:end m-trail]\n\u{1b}[38;5;244m",
-            "  [cyclops:end m-trail]\n  human addition\n\u{1b}[38;5;244m",
-        );
-        assert_eq!(
-            composer_content_from_joined_capture(&shipped("claude"), &capture, "m-trail"),
-            ComposerContentProof::Unprovable
-        );
-
-        let distant_body = std::iter::once("[cyclops:end m-distant]".to_string())
-            .chain((0..20).map(|line| format!("body line {line:02}")))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let distant = render_payload(
-            "m-distant",
-            "test",
-            "distant duplicate",
-            &distant_body,
-            true,
-        );
-        let distant_capture = claude_capture(&distant);
-        let rows = joined_composer_rows(&distant_capture);
-        let first_duplicate = rows
-            .iter()
-            .position(|(_, plain)| plain == "  [cyclops:end m-distant]")
-            .expect("body sentinel");
-        assert!(
-            first_duplicate < rows.len().saturating_sub(VERIFY_REGION),
-            "duplicate remained inside the bounded search window"
-        );
-        assert_eq!(
-            composer_content_from_joined_capture(&shipped("claude"), &distant_capture, "m-distant"),
-            ComposerContentProof::Unprovable
-        );
-    }
-
-    #[test]
-    fn payload_chrome_shapes_spaces_and_blank_lines_are_preserved() {
-        let body = "  indented\n\n────────────────────────────────\nOpus 5 · xhigh · /tmp/x · 5h: 1% · 7d: 2% · 1000K window";
-        let expected = render_payload("m-shape", "test", "shapes", body, false);
-        assert_eq!(
-            composer_content_from_joined_capture(
-                &shipped("claude"),
-                &claude_capture(&expected),
-                "m-shape"
-            ),
-            ComposerContentProof::Visible(expected)
-        );
     }
 
     #[test]
@@ -6515,13 +5225,13 @@ mod composer_content_proof {
             ),
         ] {
             assert_eq!(
-                composer_content_from_joined_capture(&shipped(vendor), &capture, "m-hidden"),
+                exact_composer_content_from_joined_capture(&shipped(vendor), &capture),
                 ComposerContentProof::Hidden,
                 "{vendor} chip bytes were treated as visible"
             );
         }
         assert_eq!(
-            composer_content_from_joined_capture(&shipped("cursor"), "anything", "m-unsupported"),
+            exact_composer_content_from_joined_capture(&shipped("cursor"), "anything"),
             ComposerContentProof::Unsupported
         );
     }

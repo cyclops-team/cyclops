@@ -66,12 +66,11 @@ async fn recipients_are_ledgered_by_label_however_addressed() {
     let msg_id = result["msg_id"].as_str().unwrap().to_string();
     assert_eq!(result["deliveries"][0]["to"], "canon", "{result}");
 
-    let msg = rig
-        .ledger_lines()
+    let msg = workspace_lines(&rig)
         .into_iter()
-        .find(|l| l["kind"] == "msg" && l["id"] == msg_id.as_str())
+        .find(|l| matches!(l.kind, cyclops_proto::Kind::Msg) && l.id == msg_id)
         .expect("msg line");
-    assert_eq!(msg["to"], json!(["canon"]), "{msg}");
+    assert_eq!(msg.to, vec!["canon".to_string()], "{msg:?}");
 
     // History matches naturally on the label now.
     let resp = rig
@@ -89,7 +88,6 @@ async fn recipients_are_ledgered_by_label_however_addressed() {
         1,
         "alias forms must collapse to one delivery: {result}"
     );
-    rig.assert_ledger_legal(&[]);
     rig.shutdown().await;
 }
 
@@ -232,7 +230,7 @@ async fn history_reconstructs_a_two_pane_conversation() {
     // only, and codex to admin (no admin pane: attention_required).
     let r1 = rig
         .daemon
-        .deliver_payload(
+        .msg_send(
             "codex",
             params(json!({
                 "to": ["reviewer"],
@@ -246,10 +244,10 @@ async fn history_reconstructs_a_two_pane_conversation() {
 
     let r2 = rig
         .daemon
-        .deliver_payload(
+        .msg_send(
             "reviewer",
             params(json!({
-                "to": ["codex"],
+                "to": [],
                 "subject": "Re: Review the rate limiter",
                 "body": "Done. One nit in the retry path.",
                 "reply_to": m1,
@@ -258,11 +256,34 @@ async fn history_reconstructs_a_two_pane_conversation() {
         .await
         .expect("send 2");
     let m2 = r2["msg_id"].as_str().expect("msg id").to_string();
+    // Each recipient claims its head before the next doorbell is scheduled.
+    wait_notification_state(&rig, &m1, &["notified", "submitted_unverified"]).await;
+    claim(&rig, "reviewer", &m1);
+    wait_notification_state(&rig, &m2, &["notified", "submitted_unverified"]).await;
+    claim(&rig, "codex", &m2);
 
     let (r3, _) = rig
         .send(json!({"to": ["codex", "reviewer"], "subject": "Standup in 5", "fyi": true}))
         .await;
     let m3 = r3["msg_id"].as_str().expect("msg id").to_string();
+    {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while notification_states(&rig, &m3)
+            .iter()
+            .filter(|state| *state == "notified")
+            .count()
+            < 2
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "broadcast never notified both recipients: {:?}",
+                notification_states(&rig, &m3)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+    claim(&rig, "codex", &m3);
+    claim(&rig, "reviewer", &m3);
 
     let (r4, _) = rig
         .send(json!({"to": ["codex"], "subject": "Only for codex", "body": "b"}))
@@ -271,28 +292,34 @@ async fn history_reconstructs_a_two_pane_conversation() {
 
     let r5 = rig
         .daemon
-        .deliver_payload(
+        .msg_send(
             "codex",
             params(json!({"to": ["admin"], "subject": "Need a decision", "body": "Ship or hold?"})),
         )
         .await
         .expect("send 5");
     let m5 = r5["msg_id"].as_str().expect("msg id").to_string();
-    assert_eq!(r5["deliveries"][0]["state"], "attention_required", "{r5}");
 
     // A send can return while a recipient is still finishing the preceding
-    // turn. History is an eventual ledger fold, so settle every background
-    // delivery before asserting both its result and that reads append nothing.
-    for (message, recipient) in [(&m3, "codex"), (&m3, "reviewer"), (&m4, "codex")] {
-        if rig.final_state(message, recipient).as_deref() != Some("delivered_unverified") {
-            rig.ev
-                .wait_event(std::time::Duration::from_secs(10), |event| {
-                    event["event"] == "delivery-state"
-                        && event["data"]["id"] == message.as_str()
-                        && event["data"]["to"] == recipient
-                        && event["data"]["to_state"] == "delivered_unverified"
-                })
-                .await;
+    // turn. History is an eventual fold, so settle every background
+    // notification before asserting both its result and that reads append
+    // nothing. The broadcast carries one notification per recipient.
+    for (message, recipients) in [(&m1, 1), (&m2, 1), (&m3, 2), (&m4, 1)] {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let notified = notification_states(&rig, message)
+                .iter()
+                .filter(|state| *state == "notified")
+                .count();
+            if notified >= recipients {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{message} never notified {recipients} recipients: {:?}",
+                notification_states(&rig, message)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
     }
 
@@ -328,15 +355,10 @@ async fn history_reconstructs_a_two_pane_conversation() {
     assert!(resp["error"].is_null(), "{resp}");
     assert_eq!(line_ids(&resp), vec![m1.clone(), m2.clone(), m3.clone()]);
     let lines = resp["result"]["lines"].as_array().unwrap();
-    for l in lines {
-        for d in l["deliveries"].as_array().expect("deliveries") {
-            assert_eq!(d["state"], "delivered_unverified", "folded state in {l}");
-        }
-    }
     // The broadcast reads coherently: ONE msg fact, N delivery badges.
     let cast = lines.iter().find(|l| l["id"] == m3.as_str()).unwrap();
     assert_eq!(cast["kind"], "fyi");
-    assert_eq!(cast["deliveries"].as_array().unwrap().len(), 2);
+    assert_eq!(cast["to"].as_array().map(Vec::len), Some(2), "{cast}");
     assert_eq!(cast["subject"], "Standup in 5");
 
     // Direction filters narrow one side each.
@@ -352,28 +374,28 @@ async fn history_reconstructs_a_two_pane_conversation() {
     assert_eq!(line_ids(&resp), vec![m3.clone(), m4.clone()]);
     let resp = rig.ctl.request("msg.history", json!({"to": "me"})).await;
     assert_eq!(line_ids(&resp), vec![m5.clone()]);
-    let to_admin = &resp["result"]["lines"][0]["deliveries"][0];
-    assert_eq!(to_admin["state"], "attention_required");
-    assert_eq!(to_admin["cause"], "no_such_pane");
 
     // Tail plus cursor walk: the newest limit first, then a gapless,
-    // dupe-free forward walk over everything.
+    // dupe-free forward walk over everything. History reads the workspace
+    // journal and the session ledger, so the walk uses the composite
+    // cursor2; the per-journal seq cursor is refused with several sources.
     let resp = rig.ctl.request("msg.history", json!({"limit": 2})).await;
     assert_eq!(line_ids(&resp), vec![m4.clone(), m5.clone()]);
-    let mut cursor = json!(0);
+    let mut cursor2 = json!("");
     let mut walked: Vec<String> = Vec::new();
     loop {
         let resp = rig
             .ctl
-            .request("msg.history", json!({"limit": 2, "cursor": cursor}))
+            .request("msg.history", json!({"limit": 2, "cursor2": cursor2}))
             .await;
+        assert!(resp["error"].is_null(), "{resp}");
         let ids = line_ids(&resp);
         if ids.is_empty() {
             break;
         }
         walked.extend(ids);
-        cursor = resp["result"]["next_cursor"].clone();
-        assert!(cursor.is_u64(), "{resp}");
+        cursor2 = resp["result"]["next_cursor2"].clone();
+        assert!(cursor2.is_string(), "{resp}");
     }
     assert_eq!(
         walked,
@@ -389,29 +411,10 @@ async fn history_reconstructs_a_two_pane_conversation() {
         .filter(|l| l["kind"] == "msg" && l["id"] == m1.as_str())
         .collect();
     assert_eq!(msg_facts.len(), 1, "one msg fact: {resp}");
-    assert_eq!(
-        msg_facts[0]["deliveries"][0]["state"],
-        "delivered_unverified"
-    );
+    assert_eq!(msg_facts[0]["to"], json!(["reviewer"]), "{resp}");
     assert!(
         lines.iter().any(|l| l["id"] == m2.as_str()),
         "reply missing: {resp}"
-    );
-    let chain: Vec<&str> = lines
-        .iter()
-        .filter(|l| l["kind"] == "state" && l["id"] == m1.as_str())
-        .filter_map(|l| l["data"]["to_state"].as_str())
-        .collect();
-    assert_eq!(
-        chain,
-        vec![
-            "gating",
-            "pasting",
-            "staged",
-            "submitted",
-            "delivered_unverified"
-        ],
-        "{resp}"
     );
     for other in [&m3, &m4, &m5] {
         assert!(
@@ -430,7 +433,6 @@ async fn history_reconstructs_a_two_pane_conversation() {
     // The history API reads the durable message journal without mutating it.
     // Session-state observations may still arrive on the separate pane ledger.
     assert_eq!(workspace_journal_bytes(&rig), journal_before);
-    rig.assert_ledger_legal(&[]);
 
     // The record survives the daemon: a fresh boot on the same home
     // answers the same conversation from the replayed ledger.

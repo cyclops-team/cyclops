@@ -105,7 +105,7 @@ post-write `paste_failed`.
 - Enforced at: `src/cyclopsd/src/delivery.rs`, `gate` (admission),
   `occupant_unchanged` (both re-checks), `attempt_delivery` (the order),
   `inject`, `staged_representation`, and `exact_staging_proof` (verification).
-- Proven by: `src/cyclopsd/tests/m1_blockers.rs`,
+- Proven by: `src/cyclopsd/tests/gate.rs`,
   `pane_rebound_before_paste_never_pastes_into_the_new_occupant` and
   `pane_rebound_before_submit_withholds_the_submit_key`.
 
@@ -129,10 +129,10 @@ Declines are bounded, never looped.
 - Enforced at: `src/cyclopsd/src/delivery.rs`, `send_decline_keys` and
   `modal_still_matches`; the vocabulary is `decline_keys` / `auto_dismiss`
   in `resources/manifests/*.toml`.
-- Proven by: `src/cyclopsd/tests/m1.rs`,
+- Proven by: `src/cyclopsd/tests/gate.rs`,
   `modal_declined_with_manifest_keys` and
   `modal_without_auto_dismiss_holds_and_notifies`;
-  `src/cyclopsd/tests/m1_fixes.rs`,
+  `src/cyclopsd/tests/gate.rs`,
   `decline_aborts_when_the_modal_changes_between_keys`.
 
 ## 3. Cyclops writes only with fresh positive composer and occupant evidence
@@ -176,7 +176,7 @@ boundaries are described in [DELIVERY.md](DELIVERY.md).
   IdleWithInput` arm of `gate`; `src/cyclopsd/src/fusion.rs` supplies
   the escaped capture; `resources/manifests/codex.toml` rules
   `composer_typed_input` and `composer_ghost_suggestion`.
-- Proven by: `src/cyclopsd/tests/m1_blockers.rs`,
+- Proven by: `src/cyclopsd/tests/gate.rs`,
   `escaped_capture_flips_typed_text_to_idle_with_input_and_gates`.
 
 ## 4. Legacy `blocked_quota` parks and never auto-retries
@@ -205,7 +205,7 @@ cause.
   `cyclops_proto::DeliveryState::can_transition_to` except a fresh queue;
   `cyclops_proto::attention::delivery_needs_human` keeps it in front of a
   human until then.
-- Proven by: `src/cyclopsd/tests/m1.rs`,
+- Proven by: `src/cyclopsd/tests/gate.rs`,
   `quota_parks_everything_and_never_retries`.
 
 ## 5. Every delivery ends in a named state
@@ -227,12 +227,12 @@ broadcast recorded in another session's ledger is never falsely closed.
 If you add a new failure path to the pipeline, this is the rule you are
 most likely to break: an early return that logs and drops is limbo.
 
-- Enforced at: `src/cyclopsd/src/compatibility.rs`,
+- Enforced at: `src/cyclopsd/src/session_history.rs`,
   `recover_direct_deliveries`, delegating to the retained settlement in
   `src/cyclopsd/src/delivery.rs`; every
   transition goes through `advance`, which appends a line.
-- Proven by: `src/cyclopsd/tests/m1_fixes.rs`,
-  `restart_closes_limbo_deliveries`; `src/cyclopsd/tests/m1_blockers.rs`,
+- Proven by: `src/cyclopsd/tests/gate.rs`,
+  `restart_closes_limbo_deliveries`; `src/cyclopsd/tests/gate.rs`,
   `restart_closes_pre_hosted_field_ledger_chains`.
 
 ## 6. The sender is whoever connected, not whoever says so
@@ -301,9 +301,9 @@ The rule is about what Cyclops reads off a screen on its own.
 
 - Enforced at: `src/cyclops-proto/src/ledger.rs` (schema and the rule);
   `src/cyclopsd/src/delivery.rs`, `gate_line` and `parse_reset_hint`.
-- Proven by: `src/cyclopsd/tests/m1.rs`, which asserts the raw modal
+- Proven by: `src/cyclopsd/tests/gate.rs`, which asserts the raw modal
   text and the raw quota banner are absent from the ledger;
-  `src/cyclopsd/tests/m1_blockers.rs`, same assertion on the park path.
+  `src/cyclopsd/tests/gate.rs`, same assertion on the park path.
 
 ## 8. The record appends, it does not retract
 
@@ -692,10 +692,10 @@ transition that never occurred.
   `a_leaderless_write_binding_arms_restart_recovery_through_replay`;
   `src/cyclops-tmux/tests/watcher_events.rs`,
   `session_removal_does_not_report_a_server_wide_moved_pane_as_gone`;
-  `src/cyclopsd/tests/m1_fixes.rs`,
+  `src/cyclopsd/tests/gate.rs`,
   `a_readiness_change_with_no_state_change_is_still_broadcast` and
   `a_second_message_waits_for_the_first_turn_and_then_lands`;
-  `src/cyclopsd/tests/m1_blockers.rs`,
+  `src/cyclopsd/tests/gate.rs`,
   `escaped_capture_flips_typed_text_to_idle_with_input_and_gates`, which
   proves the refusal and the release end to end.
 

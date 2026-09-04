@@ -1390,28 +1390,6 @@ composer_continuation_regex = '^  (?P<content>.*)$'
     }
 
     #[test]
-    fn exact_extraction_refuses_duplicate_marker_and_trailing_input() {
-        let manifest = manifest();
-        let exact = "> [cyclops m-one] FROM: admin  SUBJECT: Test\n  body\n  [cyclops:end m-one]\n\u{1b}[2mTRAILER\u{1b}[0m";
-        assert!(matches!(
-            delivery::composer_content_from_joined_capture(&manifest, exact, "m-one"),
-            delivery::ComposerContentProof::Visible(_)
-        ));
-
-        let duplicate = "> [cyclops m-one] FROM: admin  SUBJECT: Test\n  [cyclops:end m-one]\n  [cyclops:end m-one]\n\u{1b}[2mTRAILER\u{1b}[0m";
-        assert_eq!(
-            delivery::composer_content_from_joined_capture(&manifest, duplicate, "m-one"),
-            delivery::ComposerContentProof::Unprovable
-        );
-
-        let trailing = "> [cyclops m-one] FROM: admin  SUBJECT: Test\n  [cyclops:end m-one]\n  human text\n\u{1b}[2mTRAILER\u{1b}[0m";
-        assert_eq!(
-            delivery::composer_content_from_joined_capture(&manifest, trailing, "m-one"),
-            delivery::ComposerContentProof::Unprovable
-        );
-    }
-
-    #[test]
     fn attention_assessment_uses_canonical_format_rejection() {
         let message_id = cyclops_proto::MessageId::new("m-format").unwrap();
         let workspace = "00000000-0000-0000-0000-000000000001"

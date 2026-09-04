@@ -1,85 +1,57 @@
-//! Explicit boundary for retained pre-workspace messaging behavior.
+//! Session journals (`ledger/<session>.ndjson`) as history sources.
 //!
-//! This module does not declare these paths publicly supported and does not
-//! promise indefinite compatibility. It makes the currently retained boundary
-//! visible: direct in-process delivery, restart settlement for direct delivery
-//! chains, and session-journal replay all enter through here. Every readable
-//! format remains readable; deletion needs a separate caller and history
-//! decision.
+//! Every session journal ever written stays readable for `msg.history`,
+//! `msg.thread`, and id preload: journal discovery, rename-link traversal,
+//! and the `session-journal:<file>` source label live here. Nothing in this
+//! module rewrites, truncates, or deletes a journal.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use cyclops_ledger::LedgerWriter;
-use cyclops_proto::{LedgerLine, MsgSendParams, WireError};
+use cyclops_proto::LedgerLine;
 use cyclops_state::StateRoot;
-use serde_json::Value;
 use tracing::{error, warn};
 
-use crate::{delivery, Inner};
-
-/// Capability proving that a direct-delivery writer entered through this
-/// compatibility boundary. The field and the only value stay private here, so
-/// new callers cannot reach the retained writer or restart settlement by
-/// accident.
-pub(crate) struct BoundaryToken(());
-
-const BOUNDARY: BoundaryToken = BoundaryToken(());
-
-/// Compatibility-sensitive in-process delivery used by self-test, repository
-/// tests, and possible external embedders. Public support status is unverified.
-pub(crate) async fn deliver_payload(
-    inner: &Arc<Inner>,
-    from: &str,
-    params: MsgSendParams,
-) -> Result<Value, WireError> {
-    delivery::msg_send(inner, from, params, &BOUNDARY).await
-}
-
-/// Settle direct-delivery chains left open by a prior daemon run.
-pub(crate) fn recover_direct_deliveries(inner: &Arc<Inner>, replayed: &[(usize, Vec<LedgerLine>)]) {
-    delivery::close_limbo(inner, replayed, &BOUNDARY);
-}
+use crate::Inner;
 
 pub(crate) struct SessionJournalReplay {
     /// Globally unique files for id preload and the history read model.
     pub(crate) files: Vec<(String, Vec<LedgerLine>)>,
-    /// One causally ordered stream per unambiguous configured root.
-    pub(crate) recovery: Vec<(usize, Vec<LedgerLine>)>,
-    /// Sources named by the retained history graph that were not readable.
+    /// Sources named by the history graph that were not readable.
     pub(crate) unreadable_sources: usize,
 }
 
-pub(crate) struct CompatibilityHistorySources {
+pub(crate) struct SessionHistorySources {
     pub(crate) files: Vec<(String, Vec<LedgerLine>)>,
     pub(crate) unreadable_sources: usize,
 }
 
-struct CompatibilityHistoryRoot {
+struct SessionHistoryRoot {
     owner: usize,
     name: String,
     journal: String,
     ledger: Arc<LedgerWriter>,
 }
 
-/// Narrow adapter for retained pre-workspace session journals.
+/// Narrow adapter for session journals.
 ///
 /// The adapter captures only the validated state root and ordered ledger
-/// handles needed for compatibility traversal. A history read cannot reach
-/// live panes, the mailbox projection, or any other daemon state through it.
-pub(crate) struct CompatibilityHistoryAdapter {
+/// handles needed for journal traversal. A history read cannot reach live
+/// panes, the mailbox projection, or any other daemon state through it.
+pub(crate) struct SessionHistoryAdapter {
     state_root: Arc<StateRoot>,
-    roots: Vec<CompatibilityHistoryRoot>,
+    roots: Vec<SessionHistoryRoot>,
 }
 
-impl CompatibilityHistoryAdapter {
+impl SessionHistoryAdapter {
     pub(crate) fn capture(inner: &Inner) -> Self {
         let roots = inner
             .session_slots()
             .into_iter()
             .enumerate()
-            .map(|(owner, slot)| CompatibilityHistoryRoot {
+            .map(|(owner, slot)| SessionHistoryRoot {
                 owner,
                 name: slot.name(),
                 journal: slot.journal_file_name().unwrap_or_default(),
@@ -92,10 +64,10 @@ impl CompatibilityHistoryAdapter {
         }
     }
 
-    /// Read retained sources in their historical order and count unreadable
+    /// Read every journal in its historical order and count unreadable
     /// sources. Source labels are encoded in `cursor2`, so changing a label
     /// invalidates an active history cursor.
-    pub(crate) fn read(&self) -> CompatibilityHistorySources {
+    pub(crate) fn read(&self) -> SessionHistorySources {
         let mut unreadable_sources = 0;
         let roots = self
             .roots
@@ -113,7 +85,7 @@ impl CompatibilityHistoryAdapter {
             .into_iter()
             .map(|(journal, lines)| (format!("session-journal:{journal}"), lines))
             .collect();
-        CompatibilityHistorySources {
+        SessionHistorySources {
             files,
             unreadable_sources,
         }
@@ -129,12 +101,10 @@ struct SessionJournalNode {
 
 /// Root session journals plus every rename-linked journal they reach.
 ///
-/// History and boot recovery share this traversal so a linked compatibility
-/// chain cannot be visible to readers while remaining invisible to id preload
-/// or restart settlement. History sees each file once. Recovery sees each
-/// unambiguous family descendants-first and its configured root last, so a
-/// terminal fact appended to the root on an earlier boot follows the linked
-/// message that fact closes.
+/// History and id preload share this traversal so a linked journal cannot be
+/// visible to readers while remaining invisible to id preload. History sees
+/// each file once, unambiguous families descendants-first and configured
+/// root last, then every ambiguously owned or unreachable file.
 pub(crate) fn session_journal_replay(
     state_root: &StateRoot,
     roots: Vec<(usize, String, Vec<LedgerLine>)>,
@@ -205,7 +175,7 @@ pub(crate) fn session_journal_replay(
             error!(
                 journal = node.journal,
                 owners = ?node.owners,
-                "linked session journal has more than one configured owner; restart recovery will leave it untouched"
+                "linked session journal has more than one configured owner"
             );
         }
     }
@@ -232,7 +202,6 @@ pub(crate) fn session_journal_replay(
         order.push(node_idx);
     }
 
-    let mut recovery = Vec::new();
     let mut history_order = Vec::new();
     let mut history_seen = HashSet::new();
     for (owner, root_idx) in root_nodes {
@@ -246,16 +215,11 @@ pub(crate) fn session_journal_replay(
             &mut visited,
             &mut family,
         );
-        let lines = family
-            .iter()
-            .flat_map(|node_idx| nodes[*node_idx].lines.iter().cloned())
-            .collect();
         for node_idx in family {
             if history_seen.insert(node_idx) {
                 history_order.push(node_idx);
             }
         }
-        recovery.push((owner, lines));
     }
     // Ambiguously owned or otherwise unreachable nodes stay visible to
     // history and id preload, but follow the unambiguous causal families.
@@ -274,7 +238,6 @@ pub(crate) fn session_journal_replay(
         .collect();
     SessionJournalReplay {
         files,
-        recovery,
         unreadable_sources,
     }
 }
@@ -310,7 +273,7 @@ fn read_session(name: &str, ledger: &LedgerWriter) -> (Vec<LedgerLine>, bool) {
     match ledger.read_after(0) {
         Ok(lines) => (lines, false),
         Err(error) => {
-            warn!(session = %name, error = %error, "compatibility history read failed; treating as empty");
+            warn!(session = %name, error = %error, "session journal read failed; treating as empty");
             (Vec::new(), true)
         }
     }
@@ -331,7 +294,7 @@ mod tests {
     impl Scratch {
         fn new(tag: &str) -> Self {
             Self(cyclops_proto::scratch::scratch_dir(&format!(
-                "compatibility-{tag}-{}",
+                "session-history-{tag}-{}",
                 uuid::Uuid::new_v4().simple()
             )))
         }
@@ -384,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_linked_history_is_unique_and_recovery_is_descendants_first() {
+    fn rename_linked_history_is_unique_and_descendants_first() {
         let scratch = Scratch::new("linked");
         let root = scratch.root();
         write_journal(&root, "child.ndjson", &[line("child")]);
@@ -402,18 +365,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["child.ndjson", "root.ndjson"]
         );
-        assert_eq!(
-            replay.recovery[0]
-                .1
-                .iter()
-                .map(|line| line.id.as_str())
-                .collect::<Vec<_>>(),
-            ["child", "root"]
-        );
     }
 
     #[test]
-    fn compatibility_history_adapter_preserves_link_order_and_reports_read_loss() {
+    fn session_history_adapter_preserves_link_order_and_reports_read_loss() {
         let scratch = Scratch::new("adapter");
         let root = Arc::new(scratch.root());
         write_journal(&root, "child.ndjson", &[line("child")]);
@@ -431,9 +386,9 @@ mod tests {
             .append(link("unreadable", "unreadable.ndjson"))
             .expect("unreadable link appends");
 
-        let report = CompatibilityHistoryAdapter {
+        let report = SessionHistoryAdapter {
             state_root: Arc::clone(&root),
-            roots: vec![CompatibilityHistoryRoot {
+            roots: vec![SessionHistoryRoot {
                 owner: 0,
                 name: "root".into(),
                 journal: "root.ndjson".into(),
@@ -467,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguously_owned_history_stays_readable_but_cannot_drive_recovery() {
+    fn ambiguously_owned_history_stays_readable() {
         let scratch = Scratch::new("ambiguous");
         let root = scratch.root();
         write_journal(&root, "shared.ndjson", &[line("shared")]);
@@ -488,12 +443,15 @@ mod tests {
             ],
         );
 
-        assert!(replay.files.iter().any(|(journal, lines)| {
-            journal == "shared.ndjson" && lines.iter().any(|line| line.id == "shared")
-        }));
-        assert!(replay
-            .recovery
-            .iter()
-            .all(|(_, lines)| lines.iter().all(|line| line.id != "shared")));
+        assert_eq!(
+            replay
+                .files
+                .iter()
+                .filter(|(journal, lines)| {
+                    journal == "shared.ndjson" && lines.iter().any(|line| line.id == "shared")
+                })
+                .count(),
+            1
+        );
     }
 }

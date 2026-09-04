@@ -1,4 +1,4 @@
-//! M2 hook liveness and self-test: hooks.verify, hooks.selftest, the
+//! Hook liveness and self-test: hooks.verify, hooks.selftest, the
 //! hooks_verified status bit, and the F1 regression shape (a tier-1 pane
 //! with zero hook edges downgrades cleanly and notifies, no hang, no
 //! loss). Isolated tmux rig from tests/common; hook edges are simulated
@@ -56,49 +56,37 @@ async fn selftest_verifies_with_simulated_hook_edge() {
         assert!(e["last_seen_ms_ago"].is_null(), "never seen yet: {verify}");
     }
 
-    // Self-test with the hook edge simulated at submit time: the marker
-    // round trip resolves delivered_verified and reports hook_ack.
+    // Self-test with the hook edge simulated at submit time: the exact
+    // doorbell round trip resolves delivered_verified and reports hook_ack.
     let daemon = &rig.daemon;
-    let ev = &mut rig.ev;
     let params: cyclops_proto::HooksSelftestParams =
         serde_json::from_value(json!({"target": "hooky"})).unwrap();
     let (selftest, msg_id) = tokio::join!(daemon.hooks_selftest(params), async {
-        let msg = ev
-            .wait_event(Duration::from_secs(8), |e| {
-                e["event"] == "msg" && e["data"]["subject"] == SELFTEST_SUBJECT
-            })
-            .await;
-        let msg_id = msg["data"]["id"].as_str().expect("msg id").to_string();
-        assert_eq!(msg["data"]["fyi"], true, "self-test is flagged fyi");
-        assert!(
-            msg["data"].get("body").is_none(),
-            "shared message events stay body-free: {msg}"
-        );
-        ev.wait_event(Duration::from_secs(8), |e| {
-            e["event"] == "delivery-state"
-                && e["data"]["id"] == msg_id.as_str()
-                && e["data"]["to_state"] == "submitted"
-        })
-        .await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        let msg_id = loop {
+            let found = workspace_lines(&rig).into_iter().find(|line| {
+                matches!(line.kind, cyclops_proto::Kind::Fyi)
+                    && line.subject.as_deref() == Some(SELFTEST_SUBJECT)
+            });
+            if let Some(line) = found {
+                break line.id;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the self-test message was never accepted"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        wait_notification_state(&rig, &msg_id, &["submitted", "submitted_unverified"]).await;
         // The simulated ACK hook: the trusted in-process report path,
-        // payload carrying the marker (the message id).
+        // carrying the exact row the daemon pasted.
         let resp = daemon
             .report_state(
                 serde_json::from_value(json!({
                     "agent": "hooky",
                     "event": "UserPromptSubmit",
                     "seq": 1,
-                    // The exact payload: a hook acknowledgement verifies
-                    // the bytes this delivery sent, or nothing. The
-                    // self-test sends as `cyclopsd` with fyi set, so
-                    // there is no reply hint.
-                    "payload": {"prompt": cyclopsd::render_payload(
-                        &msg_id,
-                        "cyclopsd",
-                        SELFTEST_SUBJECT,
-                        "Reply not needed.",
-                        true,
-                    )},
+                    "payload": {"prompt": doorbell_for(&rig, &msg_id)},
                 }))
                 .unwrap(),
             )
@@ -132,23 +120,22 @@ async fn selftest_verifies_with_simulated_hook_edge() {
     assert_eq!(ups["event"], "UserPromptSubmit", "{verify}");
     assert!(ups["last_seen_ms_ago"].is_u64(), "{verify}");
 
-    // The result is a recorded system fact, and the fyi msg line carries
-    // the self-test subject and body.
-    let lines = rig.ledger_lines();
-    let sys = lines
-        .iter()
+    // The result is a recorded system fact, and the fyi message is a
+    // durable mailbox record with the self-test subject and body.
+    let sys = rig
+        .ledger_lines()
+        .into_iter()
         .find(|l| l["kind"] == "system" && l["data"]["event"] == "hook_selftest")
         .expect("hook_selftest system line");
     assert_eq!(sys["id"], msg_id.as_str());
     assert_eq!(sys["data"]["hook_ack"], true);
     assert_eq!(sys["data"]["state"], "delivered_verified");
-    let msg = lines
-        .iter()
-        .find(|l| l["kind"] == "fyi" && l["id"] == msg_id.as_str())
-        .expect("self-test fyi msg line");
-    assert_eq!(msg["subject"], SELFTEST_SUBJECT);
-    assert_eq!(msg["body"], "Reply not needed.");
-    rig.assert_ledger_legal(&[]);
+    let msg = workspace_lines(&rig)
+        .into_iter()
+        .find(|l| matches!(l.kind, cyclops_proto::Kind::Fyi) && l.id == msg_id)
+        .expect("self-test fyi message");
+    assert_eq!(msg.subject.as_deref(), Some(SELFTEST_SUBJECT));
+    assert_eq!(msg.body.as_deref(), Some("Reply not needed."));
     rig.shutdown().await;
 }
 
@@ -229,18 +216,20 @@ async fn f1_zero_edge_tier1_downgrades_notifies_once_and_loses_nothing() {
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert!(rig.tmux.capture(&pane).contains(&m1), "marker not in pane");
+    assert!(
+        rig.tmux.capture(&pane).contains(&doorbell_for(&rig, &m1)),
+        "doorbell not in pane"
+    );
 
-    // A second delivery downgrades the same way but does NOT re-notify:
-    // one F1 ping per pane.
+    // A second notification downgrades the same way but does NOT
+    // re-notify: one F1 ping per pane. The recipient claims the first
+    // message so the next doorbell is scheduled.
+    claim(&rig, "hooky", &m1);
     let (r2, _) = rig
         .send(json!({"to": ["hooky"], "subject": "after", "body": "b"}))
         .await;
     let m2 = r2["msg_id"].as_str().unwrap().to_string();
-    assert_eq!(
-        r2["deliveries"][0]["state"], "delivered_unverified",
-        "second delivery left a positively write-ready frame: {r2}"
-    );
+    wait_notification_state(&rig, &m2, &["notified"]).await;
     let f1_notifies = rig
         .ledger_lines()
         .iter()
@@ -253,15 +242,8 @@ async fn f1_zero_edge_tier1_downgrades_notifies_once_and_loses_nothing() {
         .count();
     assert_eq!(f1_notifies, 1, "F1 notify must fire once per pane");
 
-    assert_eq!(
-        rig.final_state(&m1, "hooky").as_deref(),
-        Some("delivered_unverified")
-    );
-    assert_eq!(
-        rig.final_state(&m2, "hooky").as_deref(),
-        Some("delivered_unverified")
-    );
-    rig.assert_ledger_legal(&[]);
+    assert_eq!(notification_state(&rig, &m1).as_deref(), Some("notified"));
+    assert_eq!(notification_state(&rig, &m2).as_deref(), Some("notified"));
     rig.shutdown().await;
 }
 
@@ -291,15 +273,9 @@ async fn forged_report_over_the_socket_is_denied_and_ingests_nothing() {
         .send(json!({"to": ["hooky"], "subject": "forge me", "body": "a\nb"}))
         .await;
     let msg_id = result["msg_id"].as_str().unwrap().to_string();
-    rig.ev
-        .wait_event(Duration::from_secs(8), |e| {
-            e["event"] == "delivery-state"
-                && e["data"]["id"] == msg_id.as_str()
-                && e["data"]["to_state"] == "submitted"
-        })
-        .await;
+    wait_notification_state(&rig, &msg_id, &["submitted", "submitted_unverified"]).await;
 
-    // The forged tier-1 ACK, marker and all, from outside the pane.
+    // The forged tier-1 ACK, row and all, from outside the pane.
     let resp = rig
         .ctl
         .request(
@@ -328,32 +304,12 @@ async fn forged_report_over_the_socket_is_denied_and_ingests_nothing() {
         .await;
     assert_eq!(resp["error"]["code"], "denied", "{resp}");
 
-    // Nothing was ingested: the delivery resolves on the SCREEN tier when
-    // the real hook window times out, and no verified transition exists.
-    rig.ev
-        .wait_event(Duration::from_secs(8), |e| {
-            e["event"] == "delivery-state"
-                && e["data"]["id"] == msg_id.as_str()
-                && e["data"]["to_state"] == "delivered_unverified"
-        })
-        .await;
-    assert_eq!(
-        rig.final_state(&msg_id, "hooky").as_deref(),
-        Some("delivered_unverified"),
-        "the forged ACK must not verify the delivery"
-    );
-    assert!(
-        !rig.ledger_lines().iter().any(|l| {
-            l["kind"] == "state"
-                && l["id"] == msg_id.as_str()
-                && l["data"]["to_state"] == "delivered_verified"
-        }),
-        "a delivered_verified line reached the ledger from a forged report"
-    );
+    // Nothing was ingested: the notification resolves on the SCREEN tier
+    // when the real hook window times out.
+    wait_notification_state(&rig, &msg_id, &["notified"]).await;
     // No liveness recorded: the pane still reads hooks unverified.
     let status = rig.ctl.request("status", json!({})).await;
     assert_eq!(status_pane(&status)["hooks_verified"], false, "{status}");
-    rig.assert_ledger_legal(&[]);
     rig.shutdown().await;
 }
 
@@ -423,10 +379,7 @@ async fn occupant_swap_preserves_the_name_and_renews_the_f1_ping() {
         .send(json!({"to": ["hooky"], "subject": "after swap", "body": "b"}))
         .await;
     let msg_id = result["msg_id"].as_str().unwrap().to_string();
-    assert_eq!(
-        result["deliveries"][0]["state"], "delivered_unverified",
-        "{result}"
-    );
+    wait_notification_state(&rig, &msg_id, &["notified"]).await;
     let notify = rig
         .ev
         .wait_event(Duration::from_secs(8), |e| {
@@ -440,7 +393,6 @@ async fn occupant_swap_preserves_the_name_and_renews_the_f1_ping() {
         notify["data"]["body"].as_str().unwrap().contains(&msg_id),
         "{notify}"
     );
-    rig.assert_ledger_legal(&[]);
     rig.shutdown().await;
 }
 

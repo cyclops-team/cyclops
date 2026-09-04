@@ -236,6 +236,7 @@ async fn test_three_agent_journey() {
         json!({
             "to": ["gemmy", "claudey"],
             "subject": "PR #219 Review Request",
+            "summary": "A review request is waiting. Claim it from the mailbox.",
             "body": broadcast_secret,
             "client_key": "broadcast-codey-1",
         }),

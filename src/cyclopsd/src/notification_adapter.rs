@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex as StdMutex};
 
 use cyclops_proto::{
-    LedgerLine, MailboxEntry, MailboxEntryState, MessageId, MessageWakeBlock, MessagesChangedArea,
+    LedgerLine, MailboxEntryState, MessageId, MessageWakeBlock, MessagesChangedArea,
     NotificationAttemptId, NotificationAttentionCause, NotificationBinding, NotificationManifestId,
     NotificationPreWriteCause, NotificationPreWriteObservation, NotificationRecord,
     NotificationState, NotificationTransport, ProcessInstanceId, RecipientKey,
@@ -416,34 +416,6 @@ impl NotificationContext {
             }
         }
         Ok(record)
-    }
-
-    pub(crate) fn record_delivered_direct(
-        &self,
-    ) -> Result<(MailboxEntry, u64), NotificationAdapterError> {
-        let mut store = self
-            .store
-            .lock()
-            .map_err(|_| NotificationAdapterError::StoreLockPoisoned)?;
-        let entry = store.mark_delivered_direct(
-            self.message_id.clone(),
-            self.recipient,
-            self.attempt_id,
-        )?;
-        let seq = store
-            .projection()
-            .last_sequence()
-            .expect("direct disposition appended after its message");
-        if let Some(publisher) = &self.changes {
-            publisher.publish(
-                seq,
-                &[
-                    MessagesChangedArea::Messages,
-                    MessagesChangedArea::Mailboxes,
-                ],
-            );
-        }
-        Ok((entry, seq))
     }
 
     pub(crate) fn record_attention(

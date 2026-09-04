@@ -1,4 +1,4 @@
-//! Notification and direct-delivery worker loops and supervisor lifecycle.
+//! Notification worker loop and supervisor lifecycle.
 
 use super::*;
 
@@ -7,19 +7,11 @@ pub(crate) struct NotificationWorker {
     pub(crate) task: JoinHandle<()>,
 }
 
-pub(crate) struct LegacyWorker {
-    pub(crate) worker: Arc<Worker>,
-    pub(crate) task: JoinHandle<()>,
-}
-
-/// Per-recipient FIFO worker. Notification workers sleep on `notify`; legacy
-/// workers retire their registry entry once the FIFO becomes idle.
+/// Per-recipient FIFO worker. It sleeps on `notify` and retires its
+/// registry entry once the FIFO becomes idle.
 pub(crate) struct Worker {
     pub(crate) state: StdMutex<WorkerState>,
     pub(crate) notify: Notify,
-    /// Set when quota parking hit this recipient; carries the reset hint.
-    /// Cleared only by an operator recovery verb. Never auto-retried.
-    pub(crate) parked: StdMutex<Option<String>>,
 }
 
 pub(crate) struct WorkerState {
@@ -42,7 +34,6 @@ impl Worker {
                 empty_restarts: 0,
             }),
             notify: Notify::new(),
-            parked: StdMutex::new(None),
         }
     }
 
@@ -52,6 +43,18 @@ impl Worker {
             .expect("worker state lock")
             .queue
             .push_back(handle);
+    }
+
+    /// Test seam: take every queued handle so a registry test can inspect
+    /// and empty the FIFO without running the worker loop.
+    #[cfg(test)]
+    pub(crate) fn drain_pending(&self) -> Vec<Arc<DeliveryHandle>> {
+        self.state
+            .lock()
+            .expect("worker state lock")
+            .queue
+            .drain(..)
+            .collect()
     }
 
     /// Return the exact in-flight job to the FIFO head without releasing
@@ -68,22 +71,6 @@ impl Worker {
             state.queue.push_front(current);
         }
         owns
-    }
-
-    pub(crate) fn drain_pending(&self) -> Vec<Arc<DeliveryHandle>> {
-        self.state
-            .lock()
-            .expect("worker state lock")
-            .queue
-            .drain(..)
-            .collect()
-    }
-
-    pub(crate) fn prepend(&self, handles: Vec<Arc<DeliveryHandle>>) {
-        let mut state = self.state.lock().expect("worker state lock");
-        for handle in handles.into_iter().rev() {
-            state.queue.push_front(handle);
-        }
     }
 
     /// Return the already-owned job after a supervisor restart, or take the FIFO head.
@@ -154,7 +141,8 @@ impl Worker {
             .is_some()
     }
 
-    /// Deliveries ahead of `handle` from the sender's point of view.
+    /// Notifications ahead of `handle` in this FIFO.
+    #[cfg(test)]
     pub(crate) fn position_of(&self, handle: &Arc<DeliveryHandle>) -> u32 {
         let state = self.state.lock().expect("worker state lock");
         let busy = state.current.is_some() as u32;
@@ -166,35 +154,7 @@ impl Worker {
     }
 }
 
-/// Run one queue publication against the FIFO worker owning one pane.
-pub(crate) fn with_worker<T, F>(
-    inner: &Arc<Inner>,
-    session_idx: usize,
-    pane_id: &str,
-    action: F,
-) -> Option<T>
-where
-    F: FnOnce(&Arc<Worker>) -> T,
-{
-    let pane = PaneKey::new(session_idx, pane_id);
-    let task_inner = Arc::clone(inner);
-    let task_pane = pane.clone();
-    inner.engine.with_legacy_worker(
-        pane,
-        move |worker| {
-            tokio::spawn(worker_supervisor(
-                task_inner,
-                task_pane,
-                Arc::clone(&worker),
-            ))
-        },
-        action,
-    )
-}
-
-/// Attach an already-queued mailbox notification to the pane's existing FIFO worker.
-///
-/// Recipient selection and oldest-pending policy belong to the coordinator.
+/// Why a durable attempt could not be attached to a live FIFO worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NotificationEnqueueRefusal {
     DaemonStopping,
@@ -265,25 +225,6 @@ pub(crate) fn recover_outer_worker(inner: &Arc<Inner>, worker: &Arc<Worker>) -> 
     }
 }
 
-pub(crate) async fn worker_supervisor(inner: Arc<Inner>, pane: PaneKey, worker: Arc<Worker>) {
-    supervise_worker_task(
-        || {
-            inner.engine.spawn_descendant_task(worker_loop(
-                Arc::clone(&inner),
-                pane.clone(),
-                Arc::clone(&worker),
-            ))
-        },
-        || recover_outer_worker(&inner, &worker),
-        || {
-            inner.engine.is_stopping()
-                || worker.is_faulted()
-                || !inner.engine.legacy_worker_is_current(&pane, &worker)
-        },
-    )
-    .await;
-}
-
 pub(crate) async fn notification_worker_supervisor(
     inner: Arc<Inner>,
     recipient: RecipientKey,
@@ -307,56 +248,6 @@ pub(crate) async fn notification_worker_supervisor(
         },
     )
     .await;
-}
-
-pub(crate) async fn worker_loop(inner: Arc<Inner>, pane: PaneKey, worker: Arc<Worker>) {
-    loop {
-        // A quiesce holds the pipeline still: finish nothing new until
-        // resume_workers notifies. Jobs stay queued (pre-paste, safe
-        // across the restart the quiesce is for).
-        if inner.engine.paused.load(Ordering::SeqCst) {
-            worker.notify.notified().await;
-            continue;
-        }
-        let job = worker.current_or_next();
-        match job {
-            Some(handle) => {
-                let parked_hint =
-                    legacy_park_hint(&handle, worker.parked.lock().expect("parked lock").clone());
-                if let Some(hint) = parked_hint {
-                    // A job that raced in around the parking moment parks
-                    // too. Workspace notifications bypass this legacy
-                    // flag and let their own gate hold on live quota state.
-                    advance(
-                        &inner,
-                        &handle,
-                        &[DeliveryState::Queued],
-                        Step::to(DeliveryState::ParkedBlockedQuota)
-                            .cause("blocked_quota")
-                            .note(hint),
-                    );
-                    worker.finish(&handle);
-                    continue;
-                }
-                match supervised_process(&inner, &worker, &handle).await {
-                    Ok(()) => {
-                        worker.finish(&handle);
-                    }
-                    Err(error) => {
-                        error!(id = %handle.msg_id, %error, "legacy delivery worker failed");
-                        if !recover_failed_job(&inner, &worker, &handle) {
-                            return;
-                        }
-                    }
-                }
-            }
-            None => {
-                if inner.engine.retire_legacy_worker(&pane, &worker) {
-                    return;
-                }
-            }
-        }
-    }
 }
 
 pub(crate) async fn notification_worker_loop(
@@ -393,23 +284,21 @@ pub(crate) async fn notification_worker_loop(
                             .claimed_notification_rerun_requested
                             .swap(false, Ordering::SeqCst)
                     {
-                        if let Some(notification) = &handle.notification {
-                            if let Some(messaging) = inner.workspace_messaging() {
-                                if let Err(error) =
-                                    messaging.notification_head_changed(notification.recipient())
-                                {
-                                    error!(
-                                        id = %handle.msg_id,
-                                        %error,
-                                        "cannot reschedule claimed notification after readiness edge"
-                                    );
-                                }
-                            } else {
+                        if let Some(messaging) = inner.workspace_messaging() {
+                            if let Err(error) =
+                                messaging.notification_head_changed(handle.notification.recipient())
+                            {
                                 error!(
                                     id = %handle.msg_id,
-                                    "cannot reschedule claimed notification without workspace messaging"
+                                    %error,
+                                    "cannot reschedule claimed notification after readiness edge"
                                 );
                             }
+                        } else {
+                            error!(
+                                id = %handle.msg_id,
+                                "cannot reschedule claimed notification without workspace messaging"
+                            );
                         }
                     }
                 }
@@ -462,7 +351,8 @@ pub(crate) fn recover_failed_job(
     handle: &Arc<DeliveryHandle>,
 ) -> bool {
     let recovery = handle.worker_recoveries.fetch_add(1, Ordering::SeqCst);
-    if let Some(notification) = &handle.notification {
+    let notification = &handle.notification;
+    {
         let current = match notification.current_record() {
             Ok(current) => current,
             Err(error) => {
@@ -484,7 +374,6 @@ pub(crate) fn recover_failed_job(
                     &handle.to,
                     &handle.pane_id,
                     handle.session_idx,
-                    cyclops_proto::render_doorbell_v3(notification.attempt_id()),
                     notification.clone(),
                 );
                 fresh.worker_recoveries.store(1, Ordering::SeqCst);
@@ -553,25 +442,6 @@ pub(crate) fn recover_failed_job(
             }
             NotificationState::Notified => {
                 unregister_ack(inner, handle);
-                if current.transport == NotificationTransport::DirectPayload {
-                    if let Err(error) = notification.record_delivered_direct() {
-                        worker.set_fault(format!("direct settlement recovery failed: {error}"));
-                        return false;
-                    }
-                    let recipient = notification.recipient();
-                    if let Some(messaging) = inner.workspace_messaging() {
-                        if let Err(error) = messaging.direct_delivery_settled(recipient) {
-                            worker
-                                .set_fault(format!("direct settlement scheduling failed: {error}"));
-                            return false;
-                        }
-                    } else {
-                        worker.set_fault(
-                            "direct settlement scheduling failed: workspace messaging unavailable",
-                        );
-                        return false;
-                    }
-                }
                 let _ = advance(
                     inner,
                     handle,
@@ -598,49 +468,6 @@ pub(crate) fn recover_failed_job(
                 true
             }
         }
-    } else if !handle.write_boundary_crossed.load(Ordering::SeqCst) && recovery == 0 {
-        let state = handle.state();
-        if state != DeliveryState::Queued
-            && state != DeliveryState::RetryQueued
-            && !advance(
-                inner,
-                handle,
-                &[DeliveryState::Gating, DeliveryState::Pasting],
-                Step::to(DeliveryState::RetryQueued).cause("worker_recovered_before_write"),
-            )
-        {
-            worker.set_fault("legacy pre-write recovery could not requeue its exact job");
-            return false;
-        }
-        true
-    } else {
-        let cause = if handle.write_boundary_crossed.load(Ordering::SeqCst) {
-            "worker_failed_after_write"
-        } else {
-            "worker_failed_before_write"
-        };
-        let moved = advance(
-            inner,
-            handle,
-            &[
-                DeliveryState::Queued,
-                DeliveryState::Gating,
-                DeliveryState::Pasting,
-                DeliveryState::Staged,
-                DeliveryState::Submitted,
-                DeliveryState::RetryQueued,
-            ],
-            Step::to(DeliveryState::AttentionRequired).cause(cause),
-        );
-        if moved {
-            notify_attention(inner, handle, cause);
-        }
-        worker.finish(handle);
-        if !moved {
-            worker.set_fault(format!("legacy recovery stopped in {:?}", handle.state()));
-            return false;
-        }
-        true
     }
 }
 
@@ -657,9 +484,7 @@ pub(crate) async fn persist_notification_prewrite_block(
     cause: NotificationPreWriteCause,
     observation: Option<NotificationPreWriteObservation>,
 ) {
-    let Some(notification) = &handle.notification else {
-        return;
-    };
+    let notification = &handle.notification;
     let route_evidence = inner.route_evidence_id(handle.session_idx, &handle.pane_id);
     // Test seam: an admitting edge can land between the gate's verdict and
     // this append. The reconcile below must catch it, never strand it.
@@ -706,34 +531,33 @@ pub(crate) async fn persist_notification_prewrite_block(
     }
 }
 
-/// Drive one delivery through gate, inject, submit, ACK, bounded retry.
+/// Drive one notification through gate, inject, submit, ACK, bounded retry.
 pub(crate) async fn process(
     inner: &Arc<Inner>,
     worker: &Arc<Worker>,
     handle: &Arc<DeliveryHandle>,
 ) {
-    if let Some(notification) = &handle.notification {
-        match notification.claimed_notification_barrier() {
-            Ok(Some(barrier)) => {
-                if let AttemptOutcome::Failed(failure) =
-                    reconcile_recovered_claimed_notification_barrier(inner, handle, barrier).await
-                {
-                    inject_pause(inner, "post_claimed_notification_refusal").await;
-                    if !fault_notification_worker(worker, &failure) {
-                        let _ = fail_attempt(inner, worker, handle, &failure).await;
-                    }
+    let notification = &handle.notification;
+    match notification.claimed_notification_barrier() {
+        Ok(Some(barrier)) => {
+            if let AttemptOutcome::Failed(failure) =
+                reconcile_recovered_claimed_notification_barrier(inner, handle, barrier).await
+            {
+                inject_pause(inner, "post_claimed_notification_refusal").await;
+                if !fault_notification_worker(worker, &failure) {
+                    let _ = fail_attempt(inner, worker, handle, &failure).await;
                 }
-                return;
             }
-            Ok(None) => {}
-            Err(error) => {
-                error!(id = %handle.msg_id, %error, "cannot classify staged claim recovery");
-                return;
-            }
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            error!(id = %handle.msg_id, %error, "cannot classify staged claim recovery");
+            return;
         }
     }
-    // retry_queued alongside queued: a chain requeued across a daemon
-    // restart, or parked by a quiesce, re-enters here in that state.
+    // retry_queued alongside queued: an attempt parked by a quiesce
+    // re-enters here in that state.
     if !advance(
         inner,
         handle,
@@ -742,41 +566,34 @@ pub(crate) async fn process(
     ) {
         return;
     }
-    if let Some(notification) = &handle.notification {
-        match notification.record_gating() {
-            Ok(_) => {}
-            Err(NotificationAdapterError::NoLongerCurrentBeforeWrite) => {
-                // A claim or replacement retired this attempt before it
-                // touched the pane.
-                return;
-            }
-            Err(error) => {
-                error!(id = %handle.msg_id, error = %error, "notification gating fact failed");
-                notify_notification_deferred(inner, handle, NOTIFICATION_RECORD_FAILED);
-                return;
-            }
+    match notification.record_gating() {
+        Ok(_) => {}
+        Err(NotificationAdapterError::NoLongerCurrentBeforeWrite) => {
+            // A claim or replacement retired this attempt before it
+            // touched the pane.
+            return;
+        }
+        Err(error) => {
+            error!(id = %handle.msg_id, error = %error, "notification gating fact failed");
+            notify_notification_deferred(inner, handle, NOTIFICATION_RECORD_FAILED);
+            return;
         }
     }
     let mut regate_hold = None;
     loop {
         let gate_outcome = gate(inner, handle, regate_hold.take()).await;
-        if let Some(notification) = &handle.notification {
-            match notification.ensure_current_gating() {
-                Ok(()) => {}
-                Err(NotificationAdapterError::NoLongerCurrentBeforeWrite) => return,
-                Err(error) => {
-                    error!(id = %handle.msg_id, error = %error, "notification gate outcome recheck failed");
-                    notify_notification_deferred(inner, handle, NOTIFICATION_RECORD_FAILED);
-                    return;
-                }
+        match notification.ensure_current_gating() {
+            Ok(()) => {}
+            Err(NotificationAdapterError::NoLongerCurrentBeforeWrite) => return,
+            Err(error) => {
+                error!(id = %handle.msg_id, error = %error, "notification gate outcome recheck failed");
+                notify_notification_deferred(inner, handle, NOTIFICATION_RECORD_FAILED);
+                return;
             }
         }
         match gate_outcome {
             GateOutcome::Withdrawn => return,
             GateOutcome::BlockedPreWrite { cause, observation } => {
-                if handle.notification.is_none() {
-                    return;
-                }
                 persist_notification_prewrite_block(
                     inner,
                     worker,
@@ -792,17 +609,7 @@ pub(crate) async fn process(
                 return;
             }
             GateOutcome::Park { hint } => {
-                park_recipient(inner, worker, handle, hint).await;
-                return;
-            }
-            GateOutcome::Attention { cause } => {
-                advance(
-                    inner,
-                    handle,
-                    &[DeliveryState::Gating],
-                    Step::to(DeliveryState::AttentionRequired).cause(&cause),
-                );
-                notify_attention(inner, handle, &cause);
+                park_recipient(inner, handle, hint).await;
                 return;
             }
             GateOutcome::Proceed {
@@ -813,11 +620,11 @@ pub(crate) async fn process(
                 if regate_evidence_changed {
                     reset_immediate_regates(handle);
                 }
-                // A quiesce that landed while this delivery was at the
-                // gate: nothing may cross the paste boundary now. Park
+                // A quiesce that landed while this notification was at
+                // the gate: nothing may cross the paste boundary now. Park
                 // pre-paste and hand the job back; it re-enters when the
-                // pipeline resumes or requeues across the restart the
-                // quiesce was for.
+                // pipeline resumes, or the next boot schedules the durable
+                // attempt again.
                 if inner.engine.paused.load(Ordering::SeqCst) {
                     if advance(
                         inner,
@@ -859,9 +666,8 @@ pub(crate) async fn process(
                         if let Some(regate_cause) = failure.regate_cause() {
                             let action = regate_action(handle, regate_cause);
                             // The legal path back to the gate runs through
-                            // RetryQueued. A mailbox race that cannot be
-                            // re-proven settles as a durable pre-write block;
-                            // legacy direct delivery waits on pane evidence.
+                            // RetryQueued. A race that cannot be re-proven
+                            // settles as a durable pre-write block.
                             if !advance(
                                 inner,
                                 handle,
@@ -884,21 +690,15 @@ pub(crate) async fn process(
                                     regate_hold = Some(failure.cause.clone());
                                 }
                                 RegateAction::BlockPreWrite => {
-                                    if handle.notification.is_some() {
-                                        persist_notification_prewrite_block(
-                                            inner,
-                                            worker,
-                                            handle,
-                                            NotificationPreWriteCause::WriteReadinessChanged,
-                                            None,
-                                        )
-                                        .await;
-                                        return;
-                                    }
-                                    // Legacy direct delivery has no durable
-                                    // mailbox state or withdrawal verb. Keep
-                                    // it held until exact pane evidence moves.
-                                    regate_hold = Some(failure.cause.clone());
+                                    persist_notification_prewrite_block(
+                                        inner,
+                                        worker,
+                                        handle,
+                                        NotificationPreWriteCause::WriteReadinessChanged,
+                                        None,
+                                    )
+                                    .await;
+                                    return;
                                 }
                             }
                             continue;

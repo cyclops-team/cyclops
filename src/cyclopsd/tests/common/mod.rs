@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use cyclops_proto::{DeliveryState, Kind, LedgerLine};
+use cyclops_proto::{DeliveryState, Kind, LedgerLine, NotificationAttemptId};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -823,42 +823,12 @@ impl Rig {
         Rig::new_multi(tag, manifest, &[("main", pane_cmd)], cfg_extra).await
     }
 
-    /// Boot without installed mailbox capability evidence.
-    pub async fn new_without_mailbox_capability(
-        tag: &str,
-        manifest: &str,
-        pane_cmd: &str,
-        cfg_extra: &str,
-    ) -> Rig {
-        Rig::new_multi_inner(tag, manifest, &[("main", pane_cmd)], cfg_extra, false).await
-    }
-
-    /// Boot multiple sessions without installed mailbox capability evidence.
-    pub async fn new_multi_without_mailbox_capability(
-        tag: &str,
-        manifest: &str,
-        sessions: &[(&str, &str)],
-        cfg_extra: &str,
-    ) -> Rig {
-        Rig::new_multi_inner(tag, manifest, sessions, cfg_extra, false).await
-    }
-
     /// Boot with several watched sessions, each with one starting pane.
     pub async fn new_multi(
         tag: &str,
         manifest: &str,
         sessions: &[(&str, &str)],
         cfg_extra: &str,
-    ) -> Rig {
-        Rig::new_multi_inner(tag, manifest, sessions, cfg_extra, true).await
-    }
-
-    async fn new_multi_inner(
-        tag: &str,
-        manifest: &str,
-        sessions: &[(&str, &str)],
-        cfg_extra: &str,
-        install_mailbox_capability: bool,
     ) -> Rig {
         // A rig owns a tmux server, daemon, ledgers, and socket clients.
         // Bound per-process concurrency so the suite also passes with the
@@ -883,20 +853,6 @@ impl Rig {
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(home.join("manifests")).expect("create scratch home");
         let home_guard = HomeGuard(home.clone());
-        let manifest = if install_mailbox_capability && !manifest.contains("[messaging]") {
-            let capability = home.join("cyclops-skill.md");
-            std::fs::write(
-                &capability,
-                include_bytes!("../../../../skills/cyclops/SKILL.md"),
-            )
-            .expect("write mailbox capability evidence");
-            format!(
-                "{manifest}\n[messaging]\nmailbox_capability_file = {:?}\n",
-                capability.display().to_string()
-            )
-        } else {
-            manifest.to_string()
-        };
         std::fs::write(home.join("manifests/fix.toml"), manifest).expect("write manifest");
         let names: Vec<String> = sessions.iter().map(|(n, _)| n.to_string()).collect();
         write_config(&home, socket, &names, cfg_extra);
@@ -1040,25 +996,15 @@ impl Rig {
         assert_eq!(resp["result"]["label"], label, "{resp}");
     }
 
-    /// msg.send with the sender already resolved, for tests about
-    /// DELIVERY rather than about who sent it.
-    ///
-    /// Deliberately not the socket path. Socket sends resolve the sender
-    /// from the calling process's ancestry, and a test runner's ancestry
-    /// is not the daemon's business: a suite run from inside an agent CLI
-    /// is a vendor descendant outside every watched pane, which the
-    /// daemon correctly refuses to call the operator. Routing delivery
-    /// tests through that would make them pass or fail on where the suite
-    /// happened to be started.
-    ///
-    /// This is the documented embedding entry point, not a test-only
-    /// door, and it resolves nothing. Attribution has its own tests,
-    /// over the real socket with real process trees, in
+    /// Send as the operator through the durable mailbox, the same entry the
+    /// socket `msg.send` uses once the caller is resolved. The sender is
+    /// pre-resolved to `admin` because these tests are about notification
+    /// and delivery; attribution has its own tests over the real socket in
     /// `tests/sender_identity.rs`.
     pub async fn send(&mut self, params: Value) -> (Value, Duration) {
         let params = serde_json::from_value(params).expect("msg.send params");
         let t = Instant::now();
-        let result = self.daemon.deliver_payload("admin", params).await;
+        let result = self.daemon.msg_send("admin", params).await;
         let elapsed = t.elapsed();
         let result = result.unwrap_or_else(|e| panic!("msg.send failed: {}", e.message));
         (result, elapsed)
@@ -1253,4 +1199,120 @@ pub fn hold_script(marker: &str) -> String {
 pub fn hold_then_manual_lifecycle_script(marker: &str) -> String {
     let tail = format!("{} --manual-lifecycle", composer_tail());
     format!("sh -c 'echo {marker}; read x; printf \"\\033[2J\\033[H\"; {tail}'")
+}
+
+// ---------------------------------------------------------------------------
+// Workspace journal helpers (the durable mailbox record)
+// ---------------------------------------------------------------------------
+
+/// Every complete line of the workspace message journal.
+pub fn workspace_lines(rig: &Rig) -> Vec<LedgerLine> {
+    let workspace = std::fs::read_dir(rig.home.join("workspaces"))
+        .expect("workspace directory")
+        .next()
+        .expect("one workspace")
+        .expect("workspace entry")
+        .path();
+    let raw = std::fs::read_to_string(workspace.join("messages.ndjson"))
+        .expect("workspace journal readable");
+    // Ignore only a final line that a concurrent writer has not terminated yet.
+    let complete = if raw.ends_with('\n') {
+        raw.as_str()
+    } else {
+        raw.rsplit_once('\n').map_or("", |(lines, _)| lines)
+    };
+    complete
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("workspace journal line parses"))
+        .collect()
+}
+
+/// Notification transition states recorded for one message, in journal order.
+pub fn notification_states(rig: &Rig, message_id: &str) -> Vec<String> {
+    workspace_lines(rig)
+        .into_iter()
+        .filter(|line| line.id == message_id)
+        .filter_map(|line| {
+            let data = line.data?;
+            (data["type"] == "notification_transition")
+                .then(|| data["state"].as_str().unwrap_or_default().to_string())
+        })
+        .collect()
+}
+
+/// The latest recorded notification state for one message, if any.
+pub fn notification_state(rig: &Rig, message_id: &str) -> Option<String> {
+    notification_states(rig, message_id).pop()
+}
+
+/// The attempt currently owning one message's notification.
+pub fn notification_attempt(rig: &Rig, message_id: &str) -> Option<NotificationAttemptId> {
+    workspace_lines(rig)
+        .into_iter()
+        .filter(|line| line.id == message_id)
+        .filter_map(|line| {
+            let data = line.data?;
+            (data["type"] == "notification_transition")
+                .then(|| NotificationAttemptId::parse(data["attempt_id"].as_str()?).ok())
+                .flatten()
+        })
+        .next_back()
+}
+
+/// The exact row the daemon pastes for one message: the sender label, the
+/// sender-authored or derived summary, and the current attempt's claim
+/// command (Format 4). Rebuilt from the durable record the way the daemon
+/// rebuilds it, so a hook prompt or a screen capture can be compared byte
+/// for byte.
+pub fn doorbell_for(rig: &Rig, message_id: &str) -> String {
+    let message = workspace_lines(rig)
+        .into_iter()
+        .find(|line| line.id == message_id && matches!(line.kind, Kind::Msg | Kind::Fyi))
+        .expect("message line");
+    let data = message.data.as_ref().expect("message metadata");
+    // The line's `from` is the sender's presentation label, the same value
+    // the daemon writes into the row.
+    let sender_label = message.from.as_str();
+    let summary = data["summary"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            cyclops_proto::derive_message_summary(
+                message.body.as_deref().unwrap_or_default(),
+                message.subject.as_deref().unwrap_or_default(),
+            )
+        })
+        .expect("a summary derives from the body or subject");
+    let attempt = notification_attempt(rig, message_id).expect("notification attempt");
+    cyclops_proto::render_doorbell_v4(sender_label, &summary, attempt)
+}
+
+/// Wait until one message's notification records any of `states`.
+pub async fn wait_notification_state(rig: &Rig, message_id: &str, states: &[&str]) -> String {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(state) = notification_states(rig, message_id)
+            .into_iter()
+            .find(|state| states.contains(&state.as_str()))
+        {
+            return state;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "notification {message_id} never reached {states:?}: {:?}",
+            notification_states(rig, message_id)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Claim one message as `recipient`, the way the agent's `cyclops inbox
+/// claim` does. A doorbell leaves the mailbox entry pending until this
+/// claim, and the next notification for the same recipient is scheduled
+/// only after it.
+pub fn claim(rig: &Rig, recipient: &str, message_id: &str) {
+    rig.daemon
+        .claim_message_for_test(recipient, message_id)
+        .unwrap_or_else(|e| panic!("claim {message_id} as {recipient} failed: {}", e.message));
 }

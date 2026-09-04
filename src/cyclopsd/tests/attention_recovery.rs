@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{faketui_path, tmux_available, Rig, CAT_MANIFEST};
+use common::{doorbell_for, faketui_path, tmux_available, Rig, CAT_MANIFEST};
 use cyclops_proto::{
     Kind, LedgerLine, MsgSendParams, NotificationResolution, NOTIFICATION_RESOLUTION_PROOF_VERSION,
 };
@@ -335,37 +335,24 @@ async fn assert_snapshot_resolved(
         .expect("workspace sequence")
 }
 
-async fn exercise_resolution(resolution: NotificationResolution, direct_fallback: bool) {
+async fn exercise_resolution(resolution: NotificationResolution) {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
         return;
     }
 
     let manifest = recovery_manifest();
-    let tag = match (resolution, direct_fallback) {
-        (NotificationResolution::Complete, false) => "attention-complete",
-        (NotificationResolution::Discard, false) => "attention-discard",
-        (NotificationResolution::Complete, true) => "attention-direct-complete",
-        (NotificationResolution::Discard, true) => "attention-direct-discard",
+    let tag = match resolution {
+        NotificationResolution::Complete => "attention-complete",
+        NotificationResolution::Discard => "attention-discard",
     };
-    let pane_command = recovery_composer_pane();
-    let mut rig = if direct_fallback {
-        Rig::new_without_mailbox_capability(
-            tag,
-            &manifest,
-            &pane_command,
-            "receipt_block_ms = 100\nack_timeout_ms = 300\n",
-        )
-        .await
-    } else {
-        Rig::new(
-            tag,
-            &manifest,
-            &pane_command,
-            "receipt_block_ms = 100\nack_timeout_ms = 300\n",
-        )
-        .await
-    };
+    let mut rig = Rig::new(
+        tag,
+        &manifest,
+        &recovery_composer_pane(),
+        "receipt_block_ms = 100\nack_timeout_ms = 300\n",
+    )
+    .await;
     let pane = rig.pane_ids().await[0].clone();
     rig.label(&pane, "worker").await;
 
@@ -385,20 +372,8 @@ async fn exercise_resolution(resolution: NotificationResolution, direct_fallback
         .unwrap();
     let message_id = sent["msg_id"].as_str().expect("message id").to_string();
     let attempt_id = wait_for_alarm(&mut rig, &message_id).await;
-    let doorbell = cyclops_proto::render_doorbell_v3(
-        cyclops_proto::NotificationAttemptId::parse(&attempt_id).unwrap(),
-    );
-    let expected = if direct_fallback {
-        cyclopsd::render_payload(
-            &message_id,
-            "admin",
-            "Recover staged notification",
-            "private body",
-            false,
-        )
-    } else {
-        doorbell.clone()
-    };
+    let doorbell = doorbell_for(&rig, &message_id);
+    let expected = doorbell.clone();
     let staged = rig.tmux.capture(&pane);
     assert!(
         staged.contains(expected.lines().next().unwrap()),
@@ -425,21 +400,10 @@ async fn exercise_resolution(resolution: NotificationResolution, direct_fallback
         .as_u64()
         .is_some_and(|birth| birth > 0));
     assert!(binding.get("transport").is_none());
-    assert_eq!(
-        writing.data.as_ref().unwrap()["transport"],
-        if direct_fallback {
-            "direct_payload"
-        } else {
-            "doorbell"
-        }
-    );
+    assert_eq!(writing.data.as_ref().unwrap()["transport"], "doorbell");
     assert_eq!(
         writing.data.as_ref().unwrap()["doorbell_format"],
-        if direct_fallback {
-            serde_json::Value::Null
-        } else {
-            json!(cyclops_proto::DOORBELL_FORMAT_ATTEMPT_ONLY_CLAIM)
-        }
+        json!(cyclops_proto::DOORBELL_FORMAT_SUMMARY_CLAIM)
     );
 
     let shown = rig
@@ -624,12 +588,12 @@ async fn exercise_resolution(resolution: NotificationResolution, direct_fallback
 
 #[tokio::test(flavor = "multi_thread")]
 async fn complete_submits_one_exact_staged_notification_and_replays_resolution() {
-    exercise_resolution(NotificationResolution::Complete, false).await;
+    exercise_resolution(NotificationResolution::Complete).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn discard_clears_one_exact_staged_notification_and_replays_resolution() {
-    exercise_resolution(NotificationResolution::Discard, false).await;
+    exercise_resolution(NotificationResolution::Discard).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -955,16 +919,6 @@ async fn claimed_exact_owned_doorbell_clears_without_another_submit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn direct_fallback_complete_submits_the_exact_canonical_payload() {
-    exercise_resolution(NotificationResolution::Complete, true).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn direct_fallback_discard_clears_the_exact_canonical_payload() {
-    exercise_resolution(NotificationResolution::Discard, true).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn admin_diff_exposes_only_the_content_free_doorbell() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
@@ -992,6 +946,7 @@ async fn admin_diff_exposes_only_the_content_free_doorbell() {
             serde_json::from_value::<MsgSendParams>(json!({
                 "to": ["recipient"],
                 "subject": "Agent private subject",
+                "summary": "A sender-authored preview. Nothing private is in it.",
                 "body": "agent private body",
                 "client_key": "agent-private-attention"
             }))
@@ -1012,9 +967,7 @@ async fn admin_diff_exposes_only_the_content_free_doorbell() {
     assert_eq!(shown["result"]["checks"]["process_matches"], true);
     assert_eq!(shown["result"]["checks"]["manifest_matches"], true);
     assert_eq!(shown["result"]["checks"]["terminal_action_safe"], true);
-    let doorbell = cyclops_proto::render_doorbell_v3(
-        cyclops_proto::NotificationAttemptId::parse(&attempt_id).unwrap(),
-    );
+    let doorbell = doorbell_for(&rig, &message_id);
     assert_eq!(shown["result"]["expected"], doorbell);
     assert_eq!(shown["result"]["observed"], doorbell);
     let encoded = shown.to_string();
@@ -1030,150 +983,6 @@ async fn admin_diff_exposes_only_the_content_free_doorbell() {
         resolution_lines(&workspace_lines(&rig), &attempt_id).len(),
         0
     );
-    rig.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn direct_fallback_refuses_a_doorbell_staged_for_the_same_message() {
-    if !tmux_available() {
-        eprintln!("skipping: tmux not on PATH");
-        return;
-    }
-
-    let manifest = recovery_manifest();
-    let mut rig = Rig::new_without_mailbox_capability(
-        "attention-direct-cross-transport",
-        &manifest,
-        &recovery_composer_pane(),
-        "receipt_block_ms = 100\nack_timeout_ms = 300\n",
-    )
-    .await;
-    let pane = rig.pane_ids().await[0].clone();
-    rig.label(&pane, "worker").await;
-    let sent = rig
-        .daemon
-        .msg_send(
-            "admin",
-            serde_json::from_value::<MsgSendParams>(json!({
-                "to": ["worker"],
-                "subject": "Direct transport",
-                "body": "private direct body",
-                "client_key": "direct-cross-transport"
-            }))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    let message_id = sent["msg_id"].as_str().unwrap().to_string();
-    let attempt_id = wait_for_alarm(&mut rig, &message_id).await;
-    let expected = cyclopsd::render_payload(
-        &message_id,
-        "admin",
-        "Direct transport",
-        "private direct body",
-        false,
-    );
-    let doorbell = cyclops_proto::render_doorbell_v3(
-        cyclops_proto::NotificationAttemptId::parse(&attempt_id).unwrap(),
-    );
-
-    rig.tmux.run_ok(&["send-keys", "-t", &pane, "C-c"]);
-    wait_for_empty_composer(&rig, &pane).await;
-    rig.tmux
-        .run_ok(&["send-keys", "-t", &pane, "-l", &doorbell]);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !rig.tmux.capture(&pane).contains(&doorbell) {
-        assert!(Instant::now() < deadline, "doorbell was not staged");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    let shown = rig
-        .ctl
-        .request("attention.show", json!({"id": attempt_id, "diff": true}))
-        .await;
-    assert!(shown["error"].is_null(), "attention show failed: {shown}");
-    assert_eq!(shown["result"]["checks"]["trailer_anchored"], true);
-    assert_eq!(shown["result"]["checks"]["notification_exact"], false);
-    assert_eq!(shown["result"]["expected"], expected);
-    assert_eq!(shown["result"]["observed"], doorbell);
-
-    let refused = rig
-        .ctl
-        .request("attention.complete", json!({"id": attempt_id}))
-        .await;
-    assert_eq!(refused["error"]["code"], "attention_evidence_failed");
-    assert!(intent_lines(&workspace_lines(&rig), &attempt_id).is_empty());
-    rig.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn direct_fallback_refuses_an_altered_canonical_payload() {
-    if !tmux_available() {
-        eprintln!("skipping: tmux not on PATH");
-        return;
-    }
-
-    let manifest = recovery_manifest();
-    let mut rig = Rig::new_without_mailbox_capability(
-        "attention-direct-altered",
-        &manifest,
-        &recovery_composer_pane(),
-        "receipt_block_ms = 100\nack_timeout_ms = 300\n",
-    )
-    .await;
-    let pane = rig.pane_ids().await[0].clone();
-    rig.label(&pane, "worker").await;
-    let sent = rig
-        .daemon
-        .msg_send(
-            "admin",
-            serde_json::from_value::<MsgSendParams>(json!({
-                "to": ["worker"],
-                "subject": "Altered direct transport",
-                "body": "private direct body",
-                "client_key": "direct-altered"
-            }))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    let message_id = sent["msg_id"].as_str().unwrap().to_string();
-    let attempt_id = wait_for_alarm(&mut rig, &message_id).await;
-    let expected = cyclopsd::render_payload(
-        &message_id,
-        "admin",
-        "Altered direct transport",
-        "private direct body",
-        false,
-    );
-
-    rig.tmux
-        .run_ok(&["send-keys", "-t", &pane, "-l", "trailing human input"]);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !rig.tmux.capture(&pane).contains("trailing human input") {
-        assert!(Instant::now() < deadline, "trailing input was not staged");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    let shown = rig
-        .ctl
-        .request("attention.show", json!({"id": attempt_id, "diff": true}))
-        .await;
-    assert!(shown["error"].is_null(), "attention show failed: {shown}");
-    assert_eq!(shown["result"]["checks"]["trailer_anchored"], true);
-    assert_eq!(shown["result"]["checks"]["notification_exact"], false);
-    assert_eq!(shown["result"]["expected"], expected);
-    assert_eq!(
-        shown["result"]["observed"],
-        format!("{expected}trailing human input")
-    );
-
-    let refused = rig
-        .ctl
-        .request("attention.complete", json!({"id": attempt_id}))
-        .await;
-    assert_eq!(refused["error"]["code"], "attention_evidence_failed");
-    assert!(intent_lines(&workspace_lines(&rig), &attempt_id).is_empty());
     rig.shutdown().await;
 }
 
@@ -1201,6 +1010,7 @@ async fn diff_returns_only_the_trailer_bound_composer_candidate() {
             serde_json::from_value::<MsgSendParams>(json!({
                 "to": ["worker"],
                 "subject": "Durable secret subject",
+                "summary": "A sender-authored preview. Nothing private is in it.",
                 "body": "Durable secret body",
                 "client_key": "unsafe-diff"
             }))
@@ -1222,9 +1032,7 @@ async fn diff_returns_only_the_trailer_bound_composer_candidate() {
         .ctl
         .request("attention.show", json!({"id": attempt_id, "diff": true}))
         .await;
-    let doorbell = cyclops_proto::render_doorbell_v3(
-        cyclops_proto::NotificationAttemptId::parse(&attempt_id).unwrap(),
-    );
+    let doorbell = doorbell_for(&rig, &message_id);
     assert_eq!(shown["result"]["expected"], doorbell);
     assert_eq!(
         shown["result"]["observed"],

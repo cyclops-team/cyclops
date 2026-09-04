@@ -45,7 +45,7 @@ For current messaging, start with [send.md](../guides/send.md),
 [PROTOCOL.md](../reference/PROTOCOL.md), `src/cyclopsd/src/mailbox.rs`, and
 `src/cyclopsd/src/messaging.rs`. Sections explicitly labeled legacy describe
 the compatibility path used by hook self-tests and old session records, not
-standard `cyclops send`. `src/cyclopsd/src/compatibility.rs` is the boundary
+standard `cyclops send`. `src/cyclopsd/src/session_history.rs` is the boundary
 around retained direct-delivery writers, restart settlement, and
 `CompatibilityHistoryAdapter`. `WorkspaceMessaging` owns policy for current
 history and threads. The adapter only discovers and replays retained session
@@ -202,7 +202,7 @@ internal transport tests. Read in this order:
 2. `src/cyclops-proto/src/ledger.rs`, `DeliveryState::can_transition_to`. The
    legal moves are a table you can read in a minute; everything below is a
    drive through it.
-3. `src/cyclopsd/src/compatibility.rs`. The only entry to the retained writer,
+3. `src/cyclopsd/src/session_history.rs`. The only entry to the retained writer,
    restart settlement, and session-journal replay.
 4. `src/cyclopsd/src/delivery.rs`, in call order: `msg_send` -> `worker_for` ->
    `worker_loop` -> `process` -> `gate` -> `attempt_delivery` -> `inject`

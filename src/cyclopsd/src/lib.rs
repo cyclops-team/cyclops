@@ -48,7 +48,6 @@
 mod ack;
 mod attention_resolution;
 mod chrome;
-mod compatibility;
 mod composer_recovery;
 pub mod config;
 mod deadlock;
@@ -65,6 +64,7 @@ mod notification_adapter;
 mod registry;
 mod selftest;
 mod server;
+mod session_history;
 mod sessionid;
 mod sessionstore;
 pub(crate) mod turnkey;
@@ -1021,12 +1021,6 @@ impl messaging::WorkspaceMessagingEffects for DaemonWorkspaceMessagingEffects {
     fn reconcile_current_route(&self, session_idx: usize, pane_id: String) {
         if let Some(inner) = self.inner.upgrade() {
             messaging_runtime::schedule_route_reconciliation(&inner, session_idx, &pane_id);
-        }
-    }
-
-    fn schedule_unclaimed_reminder(&self, record: cyclops_proto::NotificationRecord) {
-        if let Some(inner) = self.inner.upgrade() {
-            messaging_runtime::schedule_unclaimed_reminder(&inner, record);
         }
     }
 
@@ -2594,8 +2588,7 @@ impl Daemon {
                 let _ = task.await;
             }
         }
-        let mut workers = self.inner.engine.take_legacy_worker_tasks();
-        workers.extend(self.inner.engine.take_notification_worker_tasks());
+        let workers = self.inner.engine.take_notification_worker_tasks();
         for worker in &workers {
             worker.abort();
         }
@@ -2881,20 +2874,6 @@ impl Daemon {
             .map_err(server::mailbox_service_error)
     }
 
-    /// Compatibility-sensitive in-process delivery seam used by repository
-    /// tests and possible embedders. Public support status is unverified.
-    ///
-    /// This bypasses the durable mailbox contract. Its optional composed
-    /// wait is an occupant-pinned pane-state heuristic, not proof that a
-    /// specific message or task completed.
-    pub async fn deliver_payload(
-        &self,
-        from: &str,
-        params: MsgSendParams,
-    ) -> Result<Value, WireError> {
-        compatibility::deliver_payload(&self.inner, from, params).await
-    }
-
     /// In-process agent.state.report with a pre-trusted origin, mirroring
     /// [`Daemon::msg_send`]'s design: embedders and tests call this
     /// directly. The SOCKET path instead pins every report to the
@@ -3109,18 +3088,6 @@ impl Daemon {
         let service = self.inner.mailbox.as_ref()?;
         let id = service.identity_for_address(recipient_label).ok()?;
         self.inner.engine.mailbox_worker_current_for_test(id.key)
-    }
-
-    /// Test seam: inspect exact in-flight job owned by a legacy worker
-    /// under the queue mutex boundary.
-    #[doc(hidden)]
-    pub fn legacy_worker_current_for_test(
-        &self,
-        session_idx: usize,
-        pane_id: &str,
-    ) -> Option<String> {
-        let key = PaneKey::new(session_idx, pane_id);
-        self.inner.engine.legacy_worker_current_for_test(&key)
     }
 
     /// Test seam: inspect composer hold and owner for a pane.
@@ -4218,7 +4185,6 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
     let (manifests, manifest_dir) = load_manifests(&cfg);
     let mut sessions = Vec::with_capacity(cfg.sessions.len());
     let mut boot_identities: Vec<(SessionIdentityBinding, usize)> = Vec::new();
-    let mut replay_roots: Vec<(usize, String, Vec<LedgerLine>)> = Vec::new();
     let engine = delivery::Engine::new();
     for (idx, configured_name) in cfg.sessions.iter().enumerate() {
         let descendant = PathBuf::from("ledger").join(format!("{configured_name}.ndjson"));
@@ -4228,8 +4194,8 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
                 state_root.path().join(&descendant).display()
             )
         })?;
-        // The roots and every rename-linked journal discovered from them
-        // feed both id preload and restart-limbo settlement below.
+        // The journal names the live session this slot followed on the
+        // previous run; the slot boots under that name.
         let mut boot_name = configured_name.clone();
         let mut boot_identity = None;
         match ledger.read_after(0) {
@@ -4245,10 +4211,9 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
                         );
                     }
                 }
-                replay_roots.push((idx, format!("{configured_name}.ndjson"), lines));
             }
             Err(e) => {
-                warn!(session = %configured_name, error = %e, "ledger replay for id preload failed")
+                warn!(session = %configured_name, error = %e, "ledger replay for session identity failed")
             }
         }
         let slot = Arc::new(match boot_identity {
@@ -4271,14 +4236,6 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         }
         sessions.push(slot);
     }
-    let replay = compatibility::session_journal_replay(&state_root, replay_roots);
-    // This is the first Engine use after construction, so every historical
-    // id is reserved before any request can mint one. Files stay separate for
-    // history; restart recovery receives one descendant-first stream per root.
-    for (_, lines) in &replay.files {
-        engine.preload_ids(lines);
-    }
-    let replayed = replay.recovery;
     // Adoptions from the previous run. Nothing is trusted onto a pane
     // yet; each session prunes its own entries against the live pane
     // table when it attaches (registry::restore_session).
@@ -4422,11 +4379,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<Daemon> {
         );
     }
 
-    // Any delivery the previous run left unresolved gets a named ending now.
-    compatibility::recover_direct_deliveries(&inner, &replayed);
-    drop(replayed);
     if let Some(messaging) = inner.workspace_messaging() {
-        messaging.restore_unclaimed_reminders();
         messaging.force_submit_enabled();
     }
 
@@ -4569,14 +4522,6 @@ pub(crate) async fn watch_session(
                     },
                 )?,
             );
-            // Same id-preload boot does: message ids stay unique across
-            // restarts and every session this daemon has watched.
-            match ledger.read_after(0) {
-                Ok(lines) => inner.engine.preload_ids(&lines),
-                Err(e) => {
-                    warn!(session = %name, error = %e, "ledger replay for id preload failed")
-                }
-            }
             ledger
         }
     };
@@ -7567,202 +7512,6 @@ mod tests {
         assert_eq!(inbox[0].entry.message_id, message_id);
         second.shutdown().await;
         drop(second);
-        std::fs::remove_dir_all(home).unwrap();
-    }
-
-    #[tokio::test]
-    async fn two_boots_settle_a_rename_linked_legacy_journal_once() {
-        let home = cyclops_proto::scratch::scratch_dir(&format!(
-            "cyc-linked-boot-replay-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let state_root = StateRoot::open_or_create(&home).unwrap();
-        let configured =
-            LedgerWriter::open(&state_root, Path::new("ledger/research.ndjson"), "old-boot")
-                .unwrap();
-        let linked =
-            LedgerWriter::open(&state_root, Path::new("ledger/runtime.ndjson"), "old-boot")
-                .unwrap();
-
-        let legacy_id = "m-abcdef";
-        let skewed_id = "m-123456";
-        let assert_terminal_history =
-            |configured_lines: Vec<LedgerLine>, linked_lines: Vec<LedgerLine>| {
-                // The replay traversal presents a family descendants-first
-                // and configured-root-last. Wall clocks in the older file
-                // may be ahead; causal family order still decides.
-                let history = history::merge_files(&[linked_lines, configured_lines], None);
-                let records = history
-                    .iter()
-                    .filter(|line| line.id == legacy_id)
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    records.len(),
-                    1,
-                    "linked history must expose one message after recovery"
-                );
-                assert_eq!(
-                    records[0].deliveries[0].state,
-                    cyclops_proto::DeliveryState::AttentionRequired,
-                    "the terminal root fact must dominate the linked submitted copy"
-                );
-                let gating = history
-                    .iter()
-                    .filter(|line| line.id == skewed_id)
-                    .collect::<Vec<_>>();
-                assert_eq!(gating.len(), 1, "the skewed chain remains one message");
-                assert_eq!(
-                    gating[0].deliveries[0].state,
-                    cyclops_proto::DeliveryState::RetryQueued,
-                    "the root retry fact must follow the future-dated linked gating fact"
-                );
-            };
-        let mut message = daemon_line(Kind::Msg, legacy_id.into(), json!({"hosted": ["%0"]}));
-        message.from = "admin".into();
-        message.to = vec!["%0".into()];
-        message.subject = Some("linked before restart".into());
-        message.body = Some("body".into());
-        message.deliveries = vec![cyclops_proto::Delivery {
-            to: "%0".into(),
-            state: cyclops_proto::DeliveryState::Submitted,
-            verified_by: None,
-            attempts: 1,
-            ts: unix_ms(),
-            cause: None,
-        }];
-        linked.append(message).unwrap();
-        let future_ms = unix_ms().saturating_add(86_400_000);
-        let mut gating = daemon_line(Kind::Msg, skewed_id.into(), json!({"hosted": ["%1"]}));
-        gating.ts = future_ms;
-        gating.from = "admin".into();
-        gating.to = vec!["%1".into()];
-        gating.subject = Some("future-dated before restart".into());
-        gating.body = Some("body".into());
-        gating.deliveries = vec![cyclops_proto::Delivery {
-            to: "%1".into(),
-            state: cyclops_proto::DeliveryState::Gating,
-            verified_by: None,
-            attempts: 1,
-            ts: future_ms,
-            cause: None,
-        }];
-        linked.append(gating).unwrap();
-        configured
-            .append(daemon_line(
-                Kind::System,
-                "e-alias".into(),
-                json!({
-                    "event": "session_slot_aliased",
-                    "session": "research",
-                    "canonical_session_idx": 1,
-                    "canonical_journal": "runtime.ndjson",
-                }),
-            ))
-            .unwrap();
-        drop(linked);
-        drop(configured);
-        drop(state_root);
-
-        let mut cfg = Config::defaults(&home);
-        cfg.sessions = vec!["research".into()];
-        let daemon = boot(cfg.clone()).await.unwrap();
-        assert_eq!(
-            daemon
-                .inner
-                .engine
-                .mint_msg_id_from(&[legacy_id, skewed_id, "m-fedcba"]),
-            "m-fedcba",
-            "an id visible through linked history must be rejected by the real mint path"
-        );
-
-        let lines = daemon
-            .inner
-            .session(0)
-            .unwrap()
-            .ledger
-            .read_after(0)
-            .unwrap();
-        let settlements = lines
-            .iter()
-            .filter(|line| {
-                line.id == legacy_id
-                    && line.kind == Kind::State
-                    && line.data.as_ref().is_some_and(|data| {
-                        data["to_state"] == "attention_required"
-                            && data["cause"] == "daemon_restart"
-                    })
-            })
-            .count();
-        assert_eq!(settlements, 1, "linked in-flight chain must settle once");
-        let retries = lines
-            .iter()
-            .filter(|line| {
-                line.id == skewed_id
-                    && line.kind == Kind::State
-                    && line.data.as_ref().is_some_and(|data| {
-                        data["to_state"] == "retry_queued" && data["cause"] == "daemon_restart"
-                    })
-            })
-            .count();
-        assert_eq!(retries, 1, "linked gating chain must requeue once");
-        let linked_lines = cyclops_ledger::read_after(
-            &daemon.inner.state_root,
-            Path::new("ledger/runtime.ndjson"),
-            0,
-        )
-        .unwrap();
-        assert_terminal_history(lines, linked_lines);
-
-        daemon.shutdown().await;
-        drop(daemon);
-
-        let daemon = boot(cfg).await.unwrap();
-        let configured_lines = daemon
-            .inner
-            .session(0)
-            .unwrap()
-            .ledger
-            .read_after(0)
-            .unwrap();
-        let settlements = configured_lines
-            .iter()
-            .filter(|line| {
-                line.id == legacy_id
-                    && line.kind == Kind::State
-                    && line.data.as_ref().is_some_and(|data| {
-                        data["to_state"] == "attention_required"
-                            && data["cause"] == "daemon_restart"
-                    })
-            })
-            .count();
-        assert_eq!(
-            settlements, 1,
-            "a linked chain already settled into its root must not settle again"
-        );
-        let retries = configured_lines
-            .iter()
-            .filter(|line| {
-                line.id == skewed_id
-                    && line.kind == Kind::State
-                    && line.data.as_ref().is_some_and(|data| {
-                        data["to_state"] == "retry_queued" && data["cause"] == "daemon_restart"
-                    })
-            })
-            .count();
-        assert_eq!(
-            retries, 1,
-            "future timestamps must not make a linked gating fact requeue twice"
-        );
-        let linked_lines = cyclops_ledger::read_after(
-            &daemon.inner.state_root,
-            Path::new("ledger/runtime.ndjson"),
-            0,
-        )
-        .unwrap();
-        assert_terminal_history(configured_lines, linked_lines);
-
-        daemon.shutdown().await;
-        drop(daemon);
         std::fs::remove_dir_all(home).unwrap();
     }
 

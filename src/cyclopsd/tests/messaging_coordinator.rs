@@ -12,8 +12,8 @@ use common::{
     MODAL_MANIFEST, QUOTA_MANIFEST,
 };
 use cyclops_proto::{
-    ComposerHold, Kind, LedgerLine, MessageId, MsgSendParams, NotificationAttemptId,
-    NotificationState, RecipientKey,
+    ComposerHold, Kind, LedgerLine, MsgSendParams, NotificationAttemptId, NotificationState,
+    RecipientKey,
 };
 use serde_json::{json, Value};
 use tokio::net::UnixDatagram;
@@ -177,6 +177,9 @@ async fn wait_for_workspace_fact(rig: &Rig, message_id: &str, fact_type: &str) -
     }
 }
 
+/// The pasted row carries the sender-authored preview; these tests assert
+/// that neither subject nor body ever reaches the pane, so the preview is
+/// fixed and content-free.
 async fn send_workspace_message(rig: &Rig, client_key: &str, subject: &str, body: &str) -> Value {
     rig.daemon
         .msg_send(
@@ -184,6 +187,7 @@ async fn send_workspace_message(rig: &Rig, client_key: &str, subject: &str, body
             serde_json::from_value(json!({
                 "to": ["worker"],
                 "subject": subject,
+                "summary": "A message is waiting. Claim it from the mailbox.",
                 "body": body,
                 "client_key": client_key
             }))
@@ -448,10 +452,6 @@ fn compact_doorbell(rig: &Rig, message_id: &str) -> String {
         .unwrap_or_else(|| panic!("message {message_id} has no notification attempt"))
 }
 
-fn legacy_doorbell(message_id: &str) -> String {
-    cyclops_proto::render_legacy_doorbell(&MessageId::new(message_id).unwrap())
-}
-
 #[test]
 fn current_doorbell_follows_the_attempt_owned_by_a_requeue_fact() {
     fn line(seq: u64, message_id: &str, data: Value) -> LedgerLine {
@@ -674,6 +674,7 @@ async fn private_body_shapes_never_reach_the_notification_pane() {
             serde_json::from_value(json!({
                 "to": ["worker"],
                 "subject": "Private transport shapes",
+                "summary": "A message is waiting. Claim it from the mailbox.",
                 "body": body,
                 "client_key": "private-shapes"
             }))
@@ -2707,150 +2708,6 @@ async fn an_exact_submitted_claim_needs_fresh_clean_composer_then_wakes_fifo() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn recipient_without_exact_mailbox_evidence_gets_direct_delivery_without_a_claim() {
-    if !tmux_available() {
-        eprintln!("skipping: tmux not on PATH");
-        return;
-    }
-    let mut rig = Rig::new_without_mailbox_capability(
-        "workspace-direct-fallback",
-        CAT_MANIFEST,
-        &composer_pane(),
-        "",
-    )
-    .await;
-    let pane = rig.pane_ids().await[0].clone();
-    rig.label(&pane, "worker").await;
-
-    let pair = send_waiting_pair(&rig, "direct-fallback").await;
-    wait_for_workspace_fact(&rig, &pair.first, "message_delivered_direct").await;
-    wait_for_workspace_fact(&rig, &pair.second, "message_delivered_direct").await;
-
-    let lines = workspace_lines(&rig);
-    for message_id in [&pair.first, &pair.second] {
-        assert!(lines.iter().any(|line| {
-            line.id == *message_id
-                && line.data.as_ref().is_some_and(|data| {
-                    data["type"] == "notification_transition"
-                        && data["state"] == "writing"
-                        && data["transport"] == "direct_payload"
-                })
-        }));
-        assert!(lines.iter().all(|line| {
-            line.id != *message_id
-                || line
-                    .data
-                    .as_ref()
-                    .is_none_or(|data| data["type"] != "message_claimed")
-        }));
-    }
-    let screen = pane_history(&rig, &pane);
-    assert!(screen.contains("first body"));
-    assert!(screen.contains("second body"));
-    for message_id in [&pair.first, &pair.second] {
-        assert!(!screen.contains(&compact_doorbell(&rig, message_id)));
-        assert!(!screen.contains(&legacy_doorbell(message_id)));
-    }
-
-    let snapshot = rig.ctl.request("messages.snapshot", json!({})).await;
-    let rows = snapshot["result"]["rows"].as_array().unwrap();
-    for message_id in [&pair.first, &pair.second] {
-        let row = rows
-            .iter()
-            .find(|row| row["message_id"].as_str() == Some(message_id.as_str()))
-            .expect("directly delivered message remains visible in the snapshot");
-        assert_eq!(
-            row["recipients"][0]["mailbox"]["status"],
-            "delivered_direct"
-        );
-    }
-
-    rig.daemon.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn mailbox_evidence_drift_before_the_write_falls_back_without_a_doorbell() {
-    if !tmux_available() {
-        eprintln!("skipping: tmux not on PATH");
-        return;
-    }
-    let mut rig = Rig::new(
-        "workspace-capability-drift",
-        CAT_MANIFEST,
-        &composer_pane(),
-        "",
-    )
-    .await;
-    let pane = rig.pane_ids().await[0].clone();
-    rig.label(&pane, "worker").await;
-
-    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
-    let hold = Arc::new(tokio::sync::Semaphore::new(0));
-    let pause = Arc::clone(&hold);
-    let first_pause = Arc::new(AtomicBool::new(true));
-    rig.daemon.set_inject_pause({
-        let first_pause = Arc::clone(&first_pause);
-        move |phase| {
-            let entered_tx = entered_tx.clone();
-            let pause = Arc::clone(&pause);
-            let should_pause = phase == "pre_paste" && first_pause.swap(false, Ordering::SeqCst);
-            Box::pin(async move {
-                if !should_pause {
-                    return;
-                }
-                let _ = entered_tx.send(());
-                pause.acquire_owned().await.unwrap().forget();
-            })
-        }
-    });
-
-    let sent = send_workspace_message(
-        &rig,
-        "capability-drift",
-        "Capability changed",
-        "direct body after capability drift",
-    )
-    .await;
-    let message_id = sent["msg_id"].as_str().unwrap().to_string();
-    tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
-        .await
-        .expect("doorbell attempt reached the prewrite pause")
-        .expect("pause sender stayed open");
-    fs::write(rig.home.join("cyclops-skill.md"), b"outdated skill bytes").unwrap();
-    hold.add_permits(1);
-
-    wait_for_workspace_fact(&rig, &message_id, "message_delivered_direct").await;
-    let lines = workspace_lines(&rig);
-    let writing: Vec<_> = lines
-        .iter()
-        .filter(|line| {
-            line.id == message_id
-                && line.data.as_ref().is_some_and(|data| {
-                    data["type"] == "notification_transition" && data["state"] == "writing"
-                })
-        })
-        .collect();
-    assert_eq!(writing.len(), 1);
-    assert_eq!(
-        writing[0].data.as_ref().unwrap()["transport"],
-        "direct_payload"
-    );
-    assert!(lines.iter().all(|line| {
-        line.id != message_id
-            || line
-                .data
-                .as_ref()
-                .is_none_or(|data| data["type"] != "message_claimed")
-    }));
-    let screen = pane_history(&rig, &pane);
-    assert!(screen.contains("direct body after capability drift"));
-    assert!(!screen.contains(&compact_doorbell(&rig, &message_id)));
-    assert!(!screen.contains(&legacy_doorbell(&message_id)));
-
-    rig.daemon.shutdown().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn a_human_draft_holds_one_notification_attempt_until_its_turn_finishes() {
     if !tmux_available() {
         eprintln!("skipping: tmux not on PATH");
@@ -3199,6 +3056,7 @@ async fn workspace_messages_schedule_only_the_oldest_without_session_message_row
     let first_request = json!({
         "to": ["worker"],
         "subject": "First private subject",
+        "summary": "A message is waiting. Claim it from the mailbox.",
         "body": "First private body",
         "client_key": "first-key"
     });
@@ -3221,6 +3079,7 @@ async fn workspace_messages_schedule_only_the_oldest_without_session_message_row
     let second_request = json!({
         "to": ["worker"],
         "subject": "Second private subject",
+        "summary": "A message is waiting. Claim it from the mailbox.",
         "body": "Second private body",
         "client_key": "second-key"
     });
@@ -3312,6 +3171,7 @@ async fn queued_notification_resumes_after_restart_without_a_second_attempt() {
             serde_json::from_value(json!({
                 "to": ["worker"],
                 "subject": "Resume",
+                "summary": "A message is waiting. Claim it from the mailbox.",
                 "body": "Durable body",
                 "client_key": "restart-key"
             }))
@@ -5473,106 +5333,6 @@ async fn a_stop_for_a_superseded_turn_does_not_withhold_a_working_clean_enter() 
         .expect("the fake composer did not receive Enter")
         .expect("read fake composer submit event");
     assert_eq!(&event[..received], b"submit");
-
-    rig.daemon.shutdown().await;
-}
-
-/// An opt-in stale reminder is another run of the ordinary notification
-/// worker, not a second injection path. It reuses the exact attempt locator,
-/// passes through the same composer gate, and spends one durable allowance.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_unclaimed_doorbell_reminds_once_through_the_ordinary_gate() {
-    if !tmux_available() {
-        eprintln!("skipping: tmux not on PATH");
-        return;
-    }
-    let mut rig = Rig::new(
-        "workspace-unclaimed-reminder",
-        CAT_MANIFEST,
-        &composer_pane(),
-        "delivery_retry_max = 0\nunclaimed_reminder_ms = 100\n",
-    )
-    .await;
-    let pane = rig.pane_ids().await[0].clone();
-    rig.label(&pane, "worker").await;
-
-    let sent = send_workspace_message(
-        &rig,
-        "unclaimed-reminder",
-        "Reminder envelope",
-        "private body never reaches the pane",
-    )
-    .await;
-    let message_id = sent["msg_id"].as_str().unwrap().to_string();
-    let doorbell = compact_doorbell(&rig, &message_id);
-
-    let deadline = Instant::now() + Duration::from_secs(12);
-    loop {
-        let lines = workspace_lines(&rig);
-        let reminder_facts = lines
-            .iter()
-            .filter(|line| {
-                line.id == message_id
-                    && line.data.as_ref().is_some_and(|data| {
-                        data["type"] == "notification_unclaimed_reminder_queued"
-                    })
-            })
-            .count();
-        let notified = notification_state_count(&rig, &message_id, NotificationState::Notified);
-        if reminder_facts == 1 && notified == 2 {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "one reminder did not complete: reminder_facts={reminder_facts}, notified={notified}, lines={lines:#?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    let history = pane_history(&rig, &pane);
-    assert!(history.contains(&doorbell), "{history}");
-    assert_eq!(
-        history.matches("FAKETUI-WORKING").count(),
-        2,
-        "the original doorbell and its reminder must each execute once: {history}"
-    );
-    assert_eq!(notification_attempts(&rig, &message_id).len(), 1);
-    for state in [
-        NotificationState::Writing,
-        NotificationState::Staged,
-        NotificationState::Submitted,
-        NotificationState::Notified,
-    ] {
-        assert_eq!(
-            notification_state_count(&rig, &message_id, state),
-            2,
-            "both writes must stay on the exact attempt and complete {state:?} once"
-        );
-    }
-    assert!(!history.contains("Reminder envelope"), "{history}");
-    assert!(
-        !history.contains("private body never reaches the pane"),
-        "{history}"
-    );
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        workspace_lines(&rig)
-            .iter()
-            .filter(|line| {
-                line.id == message_id
-                    && line.data.as_ref().is_some_and(|data| {
-                        data["type"] == "notification_unclaimed_reminder_queued"
-                    })
-            })
-            .count(),
-        1,
-        "the exact attempt has one durable reminder allowance"
-    );
-    assert_eq!(
-        pane_history(&rig, &pane).matches("FAKETUI-WORKING").count(),
-        2
-    );
 
     rig.daemon.shutdown().await;
 }

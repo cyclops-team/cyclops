@@ -199,10 +199,7 @@ impl Injector for TmuxInjector {
 /// The expected staged target to verify in the active composer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StagingTarget<'a> {
-    /// Multi-line payload ending in terminal sentinel `[cyclops:end <msg_id>]`.
-    Sentinel(&'a str),
     /// Single-line payload matching exact expected terminal composer row.
-    #[cfg_attr(not(test), allow(dead_code))]
     ExactRow(&'a str),
 }
 
@@ -265,18 +262,17 @@ pub(crate) async fn inject<I: Injector>(
             Err(e) => debug!(error = %e, "verify capture failed"),
         }
     }
-    if handle.notification.is_some() {
-        let capture = injector
-            .capture_joined_escaped(&handle.pane_id)
-            .await
-            .unwrap_or_default();
-        return Ok((
-            bottom_window(&strip_csi(&capture), COMPOSER_WINDOW),
-            false,
-            String::new(),
-        ));
-    }
-    Err(InjectFailure::Other("verify_failed".to_string()))
+    // Staging was unobservable. The doorbell proceeds to submit once and
+    // finishes as delivered_unverified.
+    let capture = injector
+        .capture_joined_escaped(&handle.pane_id)
+        .await
+        .unwrap_or_default();
+    Ok((
+        bottom_window(&strip_csi(&capture), COMPOSER_WINDOW),
+        false,
+        String::new(),
+    ))
 }
 
 /// What representation is visible in the active composer.
@@ -295,87 +291,22 @@ pub(crate) fn staged_representation(
     screen: &str,
     target: StagingTarget<'_>,
 ) -> Option<StagedRepresentation> {
-    match target {
-        StagingTarget::Sentinel(msg_id) => {
-            if sentinel_verified(manifest, screen, msg_id) {
-                return Some(StagedRepresentation::VisibleTarget);
-            }
-            if marker_in_composer(manifest, screen) {
-                return Some(StagedRepresentation::CollapsedChip);
-            }
-            None
-        }
-        StagingTarget::ExactRow(expected_row) => {
-            if exact_row_verified(manifest, screen, expected_row) {
-                return Some(StagedRepresentation::VisibleTarget);
-            }
-            match exact_composer_content_from_joined_capture(manifest, screen) {
-                ComposerContentProof::Visible(content)
-                    if content.contains('\n')
-                        && visible_single_line_payload_matches(&content, expected_row) =>
-                {
-                    Some(StagedRepresentation::VisibleTarget)
-                }
-                ComposerContentProof::Hidden => Some(StagedRepresentation::CollapsedChip),
-                ComposerContentProof::Visible(_)
-                | ComposerContentProof::Unsupported
-                | ComposerContentProof::Unprovable => None,
-            }
-        }
+    let StagingTarget::ExactRow(expected_row) = target;
+    if exact_row_verified(manifest, screen, expected_row) {
+        return Some(StagedRepresentation::VisibleTarget);
     }
-}
-
-#[cfg(test)]
-pub(crate) fn sentinel_representation(
-    manifest: &Manifest,
-    screen: &str,
-    _id_patterns: &[String],
-    _other_patterns: &[String],
-    msg_id: &str,
-) -> Option<StagedRepresentation> {
-    staged_representation(manifest, screen, StagingTarget::Sentinel(msg_id))
-}
-
-/// Is this delivery's sentinel the last payload row of the ACTIVE composer?
-///
-/// The question is structural, not a vocabulary lookup. Below the composer
-/// every supported vendor paints a fixed sequence of rows: a box rule, a
-/// model status row, sometimes a hint or a mode row. That measured layout
-/// is `injection.composer_trailer_regex` (plain) and
-/// `composer_trailer_regex_esc` (the same rows in the escaped capture),
-/// entry i describing row i.
-///
-/// Verification proves, in order:
-///
-/// 1. The layout is measured for this vendor, and an escaped capture is in
-///    hand. Neither is inferable, so both missing means refuse.
-/// 2. The exact sentinel for this delivery appears as a whole row, and
-///    exactly once. The comparison keeps left-side bytes: a row reading
-///    " [cyclops:end <id>]" carries a leading space that the composer put
-///    there, and two identical sentinels are an ambiguity about which one
-///    transport owns rather than a reason to prefer the lower.
-/// 3. At least one row follows it. Every measured vendor paints chrome
-///    below the composer, so a capture that ends at the sentinel is a
-///    capture that did not see the composer.
-/// 4. The layout's REQUIRED prefix appears first, in order, immediately
-///    below the sentinel, and anything after it is a later declared row,
-///    still in order and never more rows than the layout has. Requiring
-///    the anchors is what stops an arbitrary plausible tail from passing
-///    with the box rule and status row simply absent, and order plus
-///    cardinality is what binds the sentinel to the ACTIVE composer: a
-///    sentinel left in the transcript has composer rows between it and
-///    the chrome, and those claim no layout entry.
-/// 5. Each following row matches its layout entry in BOTH forms. The
-///    escaped form is the discriminator plain text cannot carry: on every
-///    layout measured so far the vendor paints its chrome while a pasted
-///    payload row arrives unstyled, so prose shaped like a status row fails
-///    the escaped half. That is a property of those measured layouts rather
-///    than of terminals in general.
-///
-/// Anything unproven refuses. A truncated or wrapped sentinel matches no
-/// row; an unknown row ends the walk; a missing style ends it too.
-pub(crate) fn sentinel_verified(manifest: &Manifest, screen: &str, msg_id: &str) -> bool {
-    sentinel_proof(manifest, screen, msg_id).is_some()
+    match exact_composer_content_from_joined_capture(manifest, screen) {
+        ComposerContentProof::Visible(content)
+            if content.contains('\n')
+                && visible_single_line_payload_matches(&content, expected_row) =>
+        {
+            Some(StagedRepresentation::VisibleTarget)
+        }
+        ComposerContentProof::Hidden => Some(StagedRepresentation::CollapsedChip),
+        ComposerContentProof::Visible(_)
+        | ComposerContentProof::Unsupported
+        | ComposerContentProof::Unprovable => None,
+    }
 }
 
 /// The proven staged rows, when the sentinel path validates: every visible
@@ -510,90 +441,6 @@ pub(crate) fn trailer_follows(manifest: &Manifest, suffix: &[(&str, String)]) ->
     true
 }
 
-pub(crate) fn sentinel_proof(manifest: &Manifest, screen: &str, msg_id: &str) -> Option<String> {
-    let want = sentinel_for(msg_id);
-    let rows = composer_rows(screen);
-    // The bounded tail is where the sentinel is looked for, so a token
-    // further up the transcript can never be mistaken for the staged one.
-    // The PROOF returned below still spans every visible row through it:
-    // an edit above the search window is still an edit to the payload.
-    let start = rows.len().saturating_sub(VERIFY_REGION);
-    let window = &rows[start..];
-    // Exactly one exact sentinel for THIS delivery. Two is ambiguity
-    // about which one transport owns, and ambiguity fails closed.
-    //
-    // The token row is matched in the vendor's measured continuation shape,
-    // with only the terminal's own trailing padding removed. Some composers
-    // prefix every logical continuation row, including the sentinel. The raw
-    // row must still equal the plain row so styling cannot hide extra bytes.
-    //
-    // KNOWN LIMIT, measured on tmux 3.6a: the default capture erases
-    // trailing spaces a person typed, exactly as it erases the grid's own
-    // padding, so spaces after the token are not distinguishable from
-    // padding by any capture this takes. Every other trailing code point
-    // is content and refuses. Closing the space case needs the composer
-    // endpoint observed independently, bound to this same snapshot.
-    let raw_hits: Vec<usize> = window
-        .iter()
-        .enumerate()
-        .filter(|(_, (raw, plain))| {
-            if raw != plain {
-                return false;
-            }
-            *plain == want
-                || manifest
-                    .composer_continuation
-                    .as_ref()
-                    .is_some_and(|continuation| {
-                        captured_continuation_content(manifest, continuation, plain)
-                            == Some(want.as_str())
-                    })
-        })
-        .map(|(i, _)| i)
-        .collect();
-    let hits: Vec<usize> = raw_hits
-        .iter()
-        .copied()
-        .filter(|at| trailer_follows(manifest, &window[at + 1..]))
-        .collect();
-    let [at] = hits[..] else {
-        return None;
-    };
-    if let Some(prompt) = manifest.composer_prompt.as_ref() {
-        let want_header = format!("[cyclops {msg_id}] FROM:");
-        let prompt_at = window[..=at]
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, (_, plain))| {
-                captured_content(prompt, plain)
-                    .is_some_and(|content| content.starts_with(&want_header))
-                    .then_some(index)
-            });
-        if let Some(prompt_at) = prompt_at {
-            if raw_hits
-                .iter()
-                .filter(|hit| **hit >= prompt_at && **hit <= at)
-                .count()
-                != 1
-            {
-                return None;
-            }
-        } else if raw_hits.len() != 1 {
-            return None;
-        }
-    } else if raw_hits.len() != 1 {
-        return None;
-    }
-    Some(
-        rows[..=start + at]
-            .iter()
-            .map(|(_, plain)| plain.as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
-}
-
 /// The proven staged row, when an exact single-line composer row validates:
 /// the unique terminal composer row matching the expected text (with optional
 /// vendor prompt prefix verified against the manifest), followed directly by
@@ -679,26 +526,6 @@ pub(crate) fn exact_row_verified(manifest: &Manifest, screen: &str, expected_row
     exact_row_proof(manifest, screen, expected_row).is_some()
 }
 
-/// Substituted staging patterns, split into id-carrying (contain the
-/// message id after substitution) and generic. The id is always an
-/// id-carrying pattern.
-#[cfg(test)]
-pub(crate) fn verify_patterns(manifest: &Manifest, msg_id: &str) -> (Vec<String>, Vec<String>) {
-    let mut id = Vec::new();
-    let mut other = Vec::new();
-    for p in &manifest.injection.verify_pattern {
-        if p.contains("<message_id>") {
-            id.push(p.replace("<message_id>", msg_id));
-        } else {
-            other.push(p.clone());
-        }
-    }
-    if id.is_empty() {
-        id.push(msg_id.to_string());
-    }
-    (id, other)
-}
-
 /// Last `n` non-empty lines of a capture, top-down, joined.
 pub(crate) fn bottom_window(screen: &str, n: usize) -> String {
     let mut lines: Vec<&str> = screen
@@ -730,13 +557,7 @@ pub(crate) fn exact_staging_proof(
     {
         return None;
     }
-    let content = match target {
-        StagingTarget::Sentinel(msg_id) => {
-            composer_content_from_joined_capture(manifest, screen, msg_id)
-        }
-        StagingTarget::ExactRow(_) => exact_composer_content_from_joined_capture(manifest, screen),
-    };
-    match content {
+    match exact_composer_content_from_joined_capture(manifest, screen) {
         ComposerContentProof::Visible(content)
             if visible_single_line_payload_matches(&content, expected_payload) =>
         {
@@ -920,84 +741,6 @@ pub fn prove_composer_representation(
     ComposerRepresentationProof::HiddenOrAmbiguous
 }
 
-/// Extract exact visible composer rows from a joined escaped capture.
-///
-/// The caller must use `capture-pane -J -e`. Joining removes only rows tmux
-/// marked as physical wraps. Application-rendered line breaks remain and
-/// need the manifest's prompt and continuation patterns. The terminal
-/// sentinel plus the measured styled trailer bind the extraction to the
-/// active composer rather than a transcript echo.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn composer_content_from_joined_capture(
-    manifest: &Manifest,
-    screen: &str,
-    msg_id: &str,
-) -> ComposerContentProof {
-    if collapsed_chip_row(manifest, screen).is_some() {
-        return ComposerContentProof::Hidden;
-    }
-    let (Some(prompt), Some(continuation)) = (
-        manifest.composer_prompt.as_ref(),
-        manifest.composer_continuation.as_ref(),
-    ) else {
-        return ComposerContentProof::Unsupported;
-    };
-
-    let rows = joined_composer_rows(screen);
-    let start = rows.len().saturating_sub(VERIFY_REGION);
-    let want_sentinel = sentinel_for(msg_id);
-    let sentinel_hits: Vec<usize> = rows[start..]
-        .iter()
-        .enumerate()
-        .filter_map(|(offset, (_, plain))| {
-            (captured_continuation_content(manifest, continuation, plain)
-                == Some(want_sentinel.as_str()))
-            .then_some(start + offset)
-        })
-        .filter(|at| trailer_follows(manifest, &rows[*at + 1..]))
-        .collect();
-    let &[sentinel_at] = sentinel_hits.as_slice() else {
-        return ComposerContentProof::Unprovable;
-    };
-
-    let want_header = format!("[cyclops {msg_id}] FROM:");
-    let header = rows[..=sentinel_at]
-        .iter()
-        .enumerate()
-        .rev()
-        .filter_map(|(at, (_, plain))| {
-            captured_content(prompt, plain)
-                .filter(|content| content.starts_with(&want_header))
-                .map(|content| (at, content))
-        })
-        .next();
-    let Some((prompt_at, first)) = header else {
-        return ComposerContentProof::Unprovable;
-    };
-
-    let mut content = vec![first.to_string()];
-    let mut sentinel_count = 0;
-    for (_, plain) in &rows[prompt_at + 1..=sentinel_at] {
-        if captured_content(prompt, plain).is_some() {
-            return ComposerContentProof::Unprovable;
-        }
-        if plain.is_empty() {
-            content.push(String::new());
-        } else if let Some(line) = captured_continuation_content(manifest, continuation, plain) {
-            if line == want_sentinel {
-                sentinel_count += 1;
-            }
-            content.push(line.to_string());
-        } else {
-            return ComposerContentProof::Unprovable;
-        }
-    }
-    if sentinel_count != 1 || content.last().is_none_or(|line| line != &want_sentinel) {
-        return ComposerContentProof::Unprovable;
-    }
-    ComposerContentProof::Visible(content.join("\n"))
-}
-
 /// Extract the active single-line notification composer for a local diff.
 ///
 /// The prompt must satisfy both the manifest extraction pattern and an
@@ -1169,10 +912,6 @@ pub(crate) fn captured_continuation_content<'a>(
 pub(crate) fn whole_row(re: &cyclops_manifest::Regex, row: &str) -> bool {
     re.find(row)
         .is_some_and(|m| m.start() == 0 && m.end() == row.len())
-}
-
-pub(crate) fn marker_in_composer(manifest: &Manifest, screen: &str) -> bool {
-    collapsed_chip_row(manifest, screen).is_some()
 }
 
 /// The recognized chip row when the collapsed representation matches.

@@ -2311,7 +2311,10 @@ mod tests {
         // would have worked.
         let why = refuse(&["cluade", "codex"], &duo, "preset duo");
         assert!(why.starts_with("no agent CLI called \"cluade\""), "{why}");
-        assert!(why.contains("agy, claude, codex, cursor"), "{why}");
+        assert!(
+            why.contains("agy, aider, amp, claude, codex, crush, cursor, gemini, goose, kimi, opencode, qwen"),
+            "{why}"
+        );
 
         // An empty id: a stray comma, not a CLI called "".
         assert!(refuse(&["claude", ""], &duo, "preset duo").contains("empty id"));
