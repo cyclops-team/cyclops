@@ -44,6 +44,10 @@ starts and asserts a real daemon. `workspace_boot_sizing`'s sizing assertion
 does not require a daemon and tolerates daemon-start failure.
 
 ```bash
+# ./scripts/check.sh --quick runs only this one-to-two-minute subset:
+#   cargo fmt --all --check
+#   cargo clippy --workspace --all-targets -- -D warnings
+#   cargo nextest run --workspace -E 'kind(lib) | kind(bin)' --no-fail-fast
 ./tests/e2e/messaging-docs-parity.sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings

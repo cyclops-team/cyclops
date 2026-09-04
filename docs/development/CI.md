@@ -313,6 +313,19 @@ Run the path classifier's contract examples with:
 python3 scripts/ci-paths.py --selftest
 ```
 
+### Local quick tier
+
+`./scripts/check.sh --quick` is not a CI lane; no workflow calls it. It is a
+one-to-two-minute local subset for the middle of editing, cheaper than
+`--fast`: formatting, Clippy, and `cargo nextest run --workspace -E
+'kind(lib) | kind(bin)'`, the unit tests compiled into each crate's own
+`kind(lib)`/`kind(bin)` target. Every tmux-backed and daemon-backed
+integration test, including the three retained performance binaries, is a
+separate `kind(test)` target discovered from a crate's `tests/` directory,
+so that one filter excludes all of them without naming each one. Still run
+`--fast` or the full gate before a push; `--quick` only shortens the loop
+before that.
+
 ## Scheduled evidence
 
 `.github/workflows/scheduled-evidence.yml` runs after every merge to
@@ -497,6 +510,31 @@ The final `beta release evidence complete` job becomes green only when every
 release responsibility, including the candidate's tmux-HEAD and bounded
 reliability evidence, succeeds. Operator approval is still required before
 merging **beta/messaging-rework** into **main** or publishing a release.
+
+## Release binaries
+
+`.github/workflows/release-binaries.yml` is a separate, later workflow: it
+does not decide whether a candidate is safe to release, only packages and
+publishes one already tagged. A pushed `v*` tag triggers it. It never
+shares a job name with `release-evidence.yml` and neither reads the other's
+output.
+
+`check-version` fails the run before anything builds if the tag does not
+match the `version` in the workspace's `Cargo.toml`. `build` then compiles
+the matched `cyclops`/`cyclopsd` pair with `cargo build --profile dist` for
+`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`,
+and `aarch64-unknown-linux-gnu`, on a native GitHub-hosted runner for three
+of the four; `x86_64-apple-darwin` cross-compiles from the arm64 macOS
+runner, the one cross-compile Xcode's toolchain needs no extra linker for.
+Each target is packaged as `cyclops-<version>-<target>.tar.gz`, containing
+`cyclops`, `cyclopsd`, and a `SHA256SUMS` covering both. `publish` uploads
+every archive to the GitHub Release for that tag, creating the release
+first if the tag has none yet.
+
+`scripts/install.sh` downloads and verifies these exact archives; see its
+own comments and [install.md](../guides/install.md) for the pair-activation
+contract a downloaded pair goes through, which is the same one a source
+build goes through.
 
 ## Final comparison record
 
